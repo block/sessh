@@ -23,15 +23,15 @@ shell-evaluated command model.
 
 `sessh` runs a local Python CLI and a small POSIX `sh` bootstrap over ssh. The
 remote side creates or attaches to a tmux session on a `sessh`-owned socket,
-with tmux configured to stay out of the way.
+with tmux configured unobtrusively: native mouse behavior and no alt screen.
 
 Because the session lives in tmux on the remote host, shell state and scrollback
 survive local disconnects.
 
 ## Requirements
 
-- No server install beyond `sshd`.
-- `tmux` must be installed on the remote host.
+- No server install beyond `sshd`, but `tmux` must be installed on the remote
+  host.
 
 ## SSH Compatibility
 
