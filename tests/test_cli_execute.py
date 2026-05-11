@@ -1,10 +1,9 @@
 import io
-import os
-import pty
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from sessh.cli import execute, format_session_list, parse_args
+from sessh.cli import execute, format_session_list, main, parse_args
 from sessh.config import Config
 from sessh.sessions import SessionInfo
 
@@ -27,27 +26,65 @@ class CliExecuteTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_args(["--preserve-args", "example.com", "--list"])
 
-    def test_run_requires_stdout_and_stderr_ttys(self):
-        args = parse_args(["example.com", "true"])
-        master_fd, slave_fd = pty.openpty()
-        os.close(master_fd)
+    def test_session_commands_require_ttys_before_config_or_ssh(self):
+        cases = {
+            "new": ["example.com"],
+            "attach": ["example.com", "--attach", "k7m4q2"],
+            "run": ["example.com", "true"],
+        }
+        for command, argv in cases.items():
+            for stream_name in ("stdin", "stdout", "stderr"):
+                with self.subTest(command=command, stream=stream_name):
+                    streams = {
+                        "stdin": TtyStringIO(),
+                        "stdout": TtyStringIO(),
+                        "stderr": TtyStringIO(),
+                    }
+                    streams[stream_name] = NonTtyStringIO()
 
-        try:
-            with os.fdopen(slave_fd, "w", encoding="utf-8") as stderr:
-                with self.assertRaisesRegex(RuntimeError, "stdout"):
-                    execute(
-                        args,
-                        stdout=io.StringIO(),
-                        stderr=stderr,
-                        config_loader=lambda **kwargs: Config(
-                            shell="bash", history_limit=50
-                        ),
-                    )
-        finally:
-            try:
-                os.close(slave_fd)
-            except OSError:
-                pass
+                    with self.assertRaisesRegex(RuntimeError, stream_name):
+                        execute(
+                            parse_args(argv),
+                            **streams,
+                            config_loader=self._unexpected_config_loader,
+                            client_factory=UnexpectedClient,
+                        )
+
+    def test_list_does_not_require_ttys(self):
+        stdout = NonTtyStringIO()
+
+        exit_status = execute(
+            parse_args(["example.com", "--list"]),
+            stdin=NonTtyStringIO(),
+            stdout=stdout,
+            stderr=NonTtyStringIO(),
+            config_loader=lambda **kwargs: Config(
+                shell="bash",
+                history_limit=50,
+                remote_init="",
+                remote_rc="remote-rc",
+            ),
+            client_factory=FakeListClient,
+        )
+
+        self.assertEqual(exit_status, 0)
+        self.assertEqual(
+            stdout.getvalue(), "ID\tATTACHED\tCREATED\tCWD\tCOMMAND\tTITLE\n"
+        )
+
+    def test_main_reports_non_tty_error(self):
+        stderr = NonTtyStringIO()
+
+        with (
+            patch("sys.stdin", NonTtyStringIO()),
+            patch("sys.stdout", NonTtyStringIO()),
+            patch("sys.stderr", stderr),
+        ):
+            exit_status = main(["example.com"])
+
+        self.assertEqual(exit_status, 1)
+        self.assertIn("sessh: sessh sessions require", stderr.getvalue())
+        self.assertIn("stdin, stdout, and stderr", stderr.getvalue())
 
     def test_run_uses_evaluated_args_by_default(self):
         remote_argv = self._execute_run_and_capture_remote_argv(
@@ -162,10 +199,18 @@ class CliExecuteTests(unittest.TestCase):
         self.assertIsNotNone(captured_kwargs)
         return captured_kwargs
 
+    def _unexpected_config_loader(self, **kwargs):
+        self.fail("config should not be loaded before TTY validation")
+
 
 class TtyStringIO(io.StringIO):
     def isatty(self):
         return True
+
+
+class NonTtyStringIO(io.StringIO):
+    def isatty(self):
+        return False
 
 
 class FakeClient:
@@ -174,6 +219,16 @@ class FakeClient:
     def __init__(self, *, host, ssh_options):
         self.host = host
         self.ssh_options = ssh_options
+
+
+class FakeListClient(FakeClient):
+    def run(self, remote_argv, *, check):  # noqa: ARG002
+        return SimpleNamespace(stdout="")
+
+
+class UnexpectedClient(FakeClient):
+    def __init__(self, *, host, ssh_options):  # noqa: ARG002
+        raise AssertionError("ssh client should not be created before TTY validation")
 
 
 if __name__ == "__main__":

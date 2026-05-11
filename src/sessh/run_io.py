@@ -7,23 +7,61 @@ class SupportsIsatty(Protocol):
     def isatty(self) -> bool: ...
 
 
-class RunTtyError(RuntimeError):
+class TtyError(RuntimeError):
     pass
 
 
-def validate_run_ttys(*, stdout: SupportsIsatty, stderr: SupportsIsatty) -> None:
-    validate_run_tty_state(stdout_is_tty=stdout.isatty(), stderr_is_tty=stderr.isatty())
+RunTtyError = TtyError
 
 
-def validate_run_tty_state(*, stdout_is_tty: bool, stderr_is_tty: bool) -> None:
-    if stdout_is_tty and stderr_is_tty:
-        return
-    if not stdout_is_tty and not stderr_is_tty:
-        raise RunTtyError(
-            "sessh remote commands require stdout and stderr to be connected to a TTY"
-        )
+def validate_session_ttys(
+    *,
+    stdin: SupportsIsatty,
+    stdout: SupportsIsatty,
+    stderr: SupportsIsatty,
+) -> None:
+    validate_session_tty_state(
+        stdin_is_tty=stdin.isatty(),
+        stdout_is_tty=stdout.isatty(),
+        stderr_is_tty=stderr.isatty(),
+    )
+
+
+def validate_run_ttys(
+    *,
+    stdin: SupportsIsatty,
+    stdout: SupportsIsatty,
+    stderr: SupportsIsatty,
+) -> None:
+    validate_session_ttys(stdin=stdin, stdout=stdout, stderr=stderr)
+
+
+def validate_session_tty_state(
+    *, stdin_is_tty: bool, stdout_is_tty: bool, stderr_is_tty: bool
+) -> None:
+    missing = []
+    if not stdin_is_tty:
+        missing.append("stdin")
     if not stdout_is_tty:
-        raise RunTtyError(
-            "sessh remote commands require stdout to be connected to a TTY"
-        )
-    raise RunTtyError("sessh remote commands require stderr to be connected to a TTY")
+        missing.append("stdout")
+    if not stderr_is_tty:
+        missing.append("stderr")
+
+    if not missing:
+        return
+
+    raise TtyError(
+        f"sessh sessions require {_format_stream_list(missing)} "
+        "to be connected to a TTY"
+    )
+
+
+validate_run_tty_state = validate_session_tty_state
+
+
+def _format_stream_list(streams: list[str]) -> str:
+    if len(streams) == 1:
+        return streams[0]
+    if len(streams) == 2:
+        return f"{streams[0]} and {streams[1]}"
+    return f"{', '.join(streams[:-1])}, and {streams[-1]}"

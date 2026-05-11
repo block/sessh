@@ -24,7 +24,7 @@ from sessh.remote_transaction import (
     build_run_transaction,
     parse_session_rows,
 )
-from sessh.run_io import validate_run_ttys
+from sessh.run_io import validate_session_ttys
 from sessh.sessions import SessionInfo
 
 
@@ -312,8 +312,8 @@ def execute(
     stderr = sys.stderr if stderr is None else stderr
     stdin = sys.stdin if stdin is None else stdin
 
-    if args.command == "run":
-        validate_run_ttys(stdout=stdout, stderr=stderr)
+    if args.command != "list":
+        validate_session_ttys(stdin=stdin, stdout=stdout, stderr=stderr)
 
     progress = ProgressReporter(stream=stderr, verbose=args.verbose, quiet=args.quiet)
     progress.update(f"connecting to {args.host}")
