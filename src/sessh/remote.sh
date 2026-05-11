@@ -383,11 +383,16 @@ sessh_apply_options() {
   fi
 }
 
-sessh_terminal_padding_lines() {
+sessh_terminal_lines() {
   sessh_lines=$(tput lines 2>/dev/null || printf 24)
   case "$sessh_lines" in
     ''|*[!0-9]*|0) sessh_lines=24 ;;
   esac
+  printf '%s\n' "$sessh_lines"
+}
+
+sessh_terminal_padding_lines() {
+  sessh_lines=$(sessh_terminal_lines)
   sessh_padding_lines=$((sessh_lines - 1))
   if [ "$sessh_padding_lines" -lt 0 ]; then
     sessh_padding_lines=0
@@ -407,7 +412,8 @@ sessh_terminal_padding_lf() {
 sessh_terminal_prelude() {
   sessh_label=$1
   sessh_resume_id=$2
-  sessh_terminal_boundary "$sessh_label" "$sessh_resume_id"
+  sessh_note=${3:-}
+  sessh_terminal_boundary "$sessh_label" "$sessh_resume_id" "$sessh_note"
   sessh_terminal_padding_lf
 }
 
@@ -421,7 +427,26 @@ sessh_terminal_epilogue() {
 sessh_terminal_boundary() {
   sessh_label=$1
   sessh_resume_id=$2
-  printf '%s%s%s%s\n' '--- ' "$sessh_label " "$sessh_resume_id" ' ---' >&2
+  sessh_note=${3:-}
+  printf '%s%s%s%s%s\n' '--- ' "$sessh_label " "$sessh_resume_id" "$sessh_note" ' ---' >&2
+}
+
+sessh_scrollback_note() {
+  sessh_target=$1
+  sessh_scrollback=$2
+  sessh_history_size=$(sessh_tmux display-message -p -t "$sessh_target" '#{history_size}' 2>/dev/null || printf '0')
+  case "$sessh_history_size" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  if [ "$sessh_history_size" -le "$sessh_scrollback" ]; then
+    return 0
+  fi
+  sessh_skipped=$((sessh_history_size - sessh_scrollback))
+  if [ "$sessh_skipped" -eq 1 ]; then
+    printf '%s' '; skipped 1 line of scrollback'
+  else
+    printf '%s%s%s' '; skipped ' "$sessh_skipped" ' lines of scrollback'
+  fi
 }
 
 sessh_clear_tmux_exit_message() {
@@ -562,12 +587,19 @@ sessh_attach_existing_session() {
     printf 'sessh: session not found: %s\n' "$sessh_resume_id" >&2
     exit 1
   fi
+  sessh_target="$sessh_session_name:0.0"
+  sessh_attach_note=$(sessh_scrollback_note "$sessh_target" "$sessh_scrollback")
   sessh_emit_event attached "$sessh_resume_id"
-  sessh_terminal_prelude "$sessh_attach_label" "$sessh_resume_id"
+  if [ "$sessh_scrollback" -gt 0 ]; then
+    sessh_terminal_boundary "$sessh_attach_label" "$sessh_resume_id" "$sessh_attach_note"
+  else
+    sessh_terminal_prelude "$sessh_attach_label" "$sessh_resume_id" "$sessh_attach_note"
+  fi
   set +e
   if [ "$sessh_scrollback" -gt 0 ]; then
-    sessh_tmux capture-pane -p -S "-$sessh_scrollback" -E -1 -t "$sessh_session_name:0.0"
+    sessh_tmux capture-pane -p -S "-$sessh_scrollback" -E -1 -t "$sessh_target"
     printf '%s\n' '--- sessh live boundary ---' >&2
+    sessh_terminal_padding_lf
     sessh_tmux attach-session -d -t "$sessh_session_name"
   else
     sessh_tmux attach-session -d -t "$sessh_session_name"

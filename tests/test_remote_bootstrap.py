@@ -224,7 +224,7 @@ class RemoteBootstrapTests(unittest.TestCase):
                         "",
                         "abc123",
                         "localhost",
-                        "3",
+                        "4",
                     ]
                 )
                 outer.wait_for_text("hist-2")
@@ -233,20 +233,25 @@ class RemoteBootstrapTests(unittest.TestCase):
                 self.assertEqual(outer.wait_for_exit(), 0)
                 terminal_payload = outer.terminal_payload()
 
-            self.assertIn("--- sessh attached abc123 ---", terminal_payload)
-            self.assertIn("hist-0\nhist-1\nhist-2\n", terminal_payload)
-            self.assertIn("--- sessh live boundary ---", terminal_payload)
-            self.assertIn("hist-7", terminal_payload)
-            self.assertLess(
-                terminal_payload.index("hist-2"), terminal_payload.index("hist-7")
-            )
-            self.assertLess(
-                terminal_payload.index("hist-2"),
-                terminal_payload.index("--- sessh live boundary ---"),
-            )
-            self.assertLess(
-                terminal_payload.index("--- sessh live boundary ---"),
-                terminal_payload.index("hist-7"),
+            self.assertEqual(
+                terminal_payload.splitlines(),
+                [
+                    "--- sessh attached abc123 ---",
+                    "hist-0",
+                    "hist-1",
+                    "hist-2",
+                    "hist-3",
+                    "--- sessh live boundary ---",
+                    *[""] * 14,
+                    "hist-0",
+                    "hist-1",
+                    "hist-2",
+                    "hist-3",
+                    "hist-4",
+                    "hist-5",
+                    "hist-6",
+                    "hist-7",
+                ],
             )
 
     def test_interactive_reattach_replays_long_scrollback_before_live_screen(self):
@@ -288,20 +293,80 @@ class RemoteBootstrapTests(unittest.TestCase):
                 self.assertEqual(outer.wait_for_exit(), 0)
                 terminal_payload = outer.terminal_payload()
 
-        lines = [line.rstrip() for line in terminal_payload.splitlines()]
-        nonblank_lines = [line for line in lines if line]
-        live_boundary_index = nonblank_lines.index("--- sessh live boundary ---")
-        scrollback_numbers = nonblank_lines[1:live_boundary_index]
-        live_numbers = nonblank_lines[live_boundary_index + 1 :]
-
-        self.assertEqual(nonblank_lines[0], "--- sessh attached abc123 ---")
-        self.assertTrue(scrollback_numbers)
-        self.assertTrue(live_numbers)
         self.assertEqual(
-            scrollback_numbers + live_numbers,
-            [str(number) for number in range(1, 201)],
+            terminal_payload.splitlines(),
+            [
+                "--- sessh attached abc123 ---",
+                *[str(number) for number in range(1, 190)],
+                "--- sessh live boundary ---",
+                *[""] * 12,
+                *[str(number) for number in range(190, 201)],
+            ],
         )
-        self.assertEqual(int(scrollback_numbers[-1]) + 1, int(live_numbers[0]))
+
+    def test_interactive_reattach_banner_reports_skipped_scrollback(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        with LocalRemoteHarness(self) as remote:
+            remote.bootstrap(history_limit=300)
+            remote.tmux(
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "12",
+                "-s",
+                "sessh-abc123",
+                "seq 500; sleep 3600",
+            )
+            remote.wait_for_pane_text("sessh-abc123:0.0", "500")
+            history_size = int(
+                remote.tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "sessh-abc123:0.0",
+                    "#{history_size}",
+                ).stdout.strip()
+            )
+            self.assertGreater(history_size, 200)
+            expected_banner = (
+                f"--- sessh attached abc123; skipped {history_size - 200} "
+                "lines of scrollback ---"
+            )
+
+            with remote.outer_tmux(width=100, height=12, history_limit=1000) as outer:
+                outer.start_driver(
+                    [
+                        "attach-interactive",
+                        "bash",
+                        "300",
+                        "",
+                        "",
+                        "",
+                        "abc123",
+                        "localhost",
+                        "200",
+                    ]
+                )
+                outer.wait_for_text(expected_banner)
+                outer.wait_for_text("500")
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+        self.assertEqual(
+            terminal_payload.splitlines(),
+            [
+                expected_banner,
+                *[str(number) for number in range(290, 490)],
+                "--- sessh live boundary ---",
+                *[""] * 12,
+                *[str(number) for number in range(490, 501)],
+            ],
+        )
 
 
 def require_tool(tool):
