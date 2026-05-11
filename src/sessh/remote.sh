@@ -195,7 +195,7 @@ sessh_print_unattached_hint() {
   printf '\nUnattached sessh sessions on %s:\n' "$sessh_host" >&2
   printf '%s\n' "$sessh_rows" | awk -F '\t' '{ printf "  %s  %s  %s  created %s\n", $1, $4, $5, $3 }' >&2
   sessh_first_id=$(printf '%s\n' "$sessh_rows" | awk -F '\t' 'NR == 1 { print $1 }')
-  printf '\nTo attach to one, exit this session and run:\n  sessh %s attach %s\n\n' "$sessh_host" "$sessh_first_id" >&2
+  printf '\nTo attach to one, exit this session and run:\n  sessh %s --attach %s\n\n' "$sessh_host" "$sessh_first_id" >&2
 }
 
 sessh_pick_session_id() {
@@ -453,7 +453,7 @@ sessh_exit_detached_session() {
   sessh_clean_attach_status=$4
   sessh_emit_event detached "$sessh_resume_id"
   sessh_terminal_boundary 'sessh detached' "$sessh_resume_id"
-  printf '\n%s\n  sessh %s attach %s\n' "$sessh_message" "$sessh_host" "$sessh_resume_id" >&2
+  printf '\n%s\n  sessh %s --attach %s\n' "$sessh_message" "$sessh_host" "$sessh_resume_id" >&2
   if [ "$SESSH_ATTACH_STATUS" -eq 0 ]; then
     exit "$sessh_clean_attach_status"
   fi

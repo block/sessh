@@ -145,7 +145,7 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "list",
+                    "--list",
                 ]
             ),
             stdout=stdout,
@@ -197,7 +197,7 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "list",
+                    "--list",
                 ]
             ),
             stdout=stdout,
@@ -216,7 +216,7 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "run",
+                    "--preserve-args",
                     "python3",
                     "-c",
                     "import sys; [print(arg) for arg in sys.argv[1:]]; sys.exit(3)",
@@ -270,9 +270,6 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "run",
-                    "sh",
-                    "-c",
                     "printf 'status-255\\n'; exit 255",
                 ],
             )
@@ -293,7 +290,7 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
             ],
         )
 
-    def test_cli_run_over_real_ssh_applies_remote_rc_and_eval_mode(self):
+    def test_cli_run_over_real_ssh_applies_remote_rc_and_evaluates_args(self):
         config = self._write_cli_config(
             "cli-run-eval",
             remote_rc="export SESSH_TEST_RC='from remote rc; $HOME'\n",
@@ -301,12 +298,10 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         with OuterTmuxSession(self) as outer:
             outer.start_driver(
                 [
-                    "--eval-args",
                     "--config",
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "run",
                     'printf \'eval:%s\\nrc:%s\\nremote_rc:%s\\n\' "$HOME" "$SESSH_TEST_RC" "$SESSH_REMOTE_RC"',
                 ],
             )
@@ -340,7 +335,6 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "run",
                     "printf",
                     "listed",
                 ]
@@ -358,7 +352,7 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "list",
+                    "--list",
                 ]
             ),
             stdout=stdout,
@@ -380,7 +374,6 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                     str(run_config),
                     *self.ssh_options,
                     self.host,
-                    "run",
                     "printf",
                     "listed",
                 ]
@@ -414,7 +407,7 @@ done
                         str(attached_config),
                         *self.ssh_options,
                         self.host,
-                        "list",
+                        "--list",
                     ]
                 ),
                 stdout=stdout,
@@ -501,7 +494,7 @@ exit 0
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "attach",
+                    "--attach",
                     resume_id,
                 ]
             )
@@ -551,7 +544,7 @@ exit 0
 
         with OuterTmuxSession(self) as outer:
             outer.start_driver(
-                ["--config", str(config), *self.ssh_options, self.host, "attach"]
+                ["--config", str(config), *self.ssh_options, self.host, "--attach"]
             )
             outer.wait_for_text("Attach session [1-1, default 1, q to cancel]:")
             outer.send_line("1")
@@ -606,7 +599,7 @@ done
                 "detach-ready",
                 f"--- sessh detached {resume_id} ---",
                 "To attach to this session, run:",
-                f"  sessh {self.host} attach {resume_id}",
+                f"  sessh {self.host} --attach {resume_id}",
             ],
         )
 
@@ -644,9 +637,6 @@ done
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "run",
-                    "sh",
-                    "-c",
                     "printf 'run-detach-ready\\n'; while :; do sleep 1; done",
                 ]
             )
@@ -678,7 +668,7 @@ done
                 "run-detach-ready",
                 f"--- sessh detached {resume_id} ---",
                 "Run session is still active. To inspect it, run:",
-                f"  sessh {self.host} attach {resume_id}",
+                f"  sessh {self.host} --attach {resume_id}",
             ],
         )
         self.assertTrue(self._has_session(resume_id))

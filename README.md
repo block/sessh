@@ -6,10 +6,10 @@
 
 ```sh
 sessh HOST
-sessh HOST list
-sessh HOST attach
-sessh HOST attach ID
-sessh HOST run COMMAND [ARG...]
+sessh HOST --list
+sessh HOST --attach
+sessh HOST --attach ID
+sessh HOST COMMAND [ARG...]
 ```
 
 When a live session disconnects, `sessh` prints:
@@ -17,7 +17,7 @@ When a live session disconnects, `sessh` prints:
 ```text
 --- sessh detached k7m4q2 ---
 To attach to this session, run:
-  sessh work.example.com attach k7m4q2
+  sessh work.example.com --attach k7m4q2
 ```
 
 ## Architecture
@@ -34,9 +34,11 @@ creates or attaches a tmux session on a `sessh`-owned socket.
 `sessh` configures tmux to be quiet: no status bar, no mouse reporting, no
 normal tmux prefix, and no user tmux socket/config interference.
 
-`sessh run` also uses tmux. It preserves argv by default, keeps completed output
-in a dead pane, and exits locally with the remote command status. For now, `run`
-requires stdout and stderr to be TTYs.
+Remote commands also use tmux. By default, their arguments follow ssh's
+shell-evaluated command model. `--preserve-args` quotes the command arguments
+so the remote command sees the same argv boundaries that sessh received. Remote
+commands keep completed output in a dead pane and exit locally with the remote
+command status. For now, remote commands require stdout and stderr to be TTYs.
 
 The use of tmux means that `sessh` is able to persist and restore the
 scrollback buffer.
@@ -81,18 +83,22 @@ the remote host.
 unchanged, so commands like `sessh -p 2222 -J jump.example.com work.example.com`
 work as expected.
 
-Unlike `ssh`, arguments after `HOST` are interpreted as sessh commands:
-`attach`, `list`, or `run`. To execute a remote command, use `run`:
+Like `ssh`, arguments after `HOST` are interpreted as a remote command:
 
 ```sh
-sessh HOST run COMMAND [ARG...]
+sessh HOST COMMAND [ARG...]
 ```
 
-For `run`, sessh preserves argument boundaries. `sessh HOST run printf '%s\n'
-'hello quoted world'` runs remote `printf` with two arguments after the command
-name; it does not join them into one shell command string for another round of
-shell parsing, which is the source of many `ssh HOST command arg...` quoting
-surprises.
+`--attach` and `--list` are sessh options and may appear after `HOST`. Use `--`
+to end sessh option parsing when the remote command itself starts with `--`.
+
+By default, sessh matches ssh's evaluated remote command behavior. Use
+`--preserve-args` when the remote command should receive the exact argv
+boundaries that sessh received:
+
+```sh
+sessh HOST --preserve-args printf '%s\n' 'hello quoted world'
+```
 
 Options that remove the remote TTY, remove the remote command, background the
 connection, or replace the SSH stream are incompatible with sessh's tmux-backed

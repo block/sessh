@@ -64,7 +64,7 @@ def build_run_transaction(
         resume_id,
         host,
         "1" if eval_args else "0",
-        "" if eval_args else _command_name(command[0]),
+        _command_name(command[0]),
         *command,
         metadata_nonce=metadata_nonce,
     )

@@ -95,7 +95,7 @@ class ParsedArgs:
     config: Path | None = None
     shell: str | None = None
     history_limit: int | None = None
-    eval_args: bool = False
+    preserve_args: bool = False
     verbose: bool = False
     quiet: bool = False
     resume_id: str | None = None
@@ -108,14 +108,25 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
     config: Path | None = None
     shell: str | None = None
     history_limit: int | None = None
-    eval_args = False
+    preserve_args = False
     verbose = False
     quiet = False
+    requested_command: str | None = None
+    resume_id: str | None = None
 
     i = 0
     host: str | None = None
+    parse_post_host_options = True
     while i < len(tokens):
         token = tokens[i]
+        if token == "--":
+            try:
+                host = tokens[i + 1]
+            except IndexError as exc:
+                raise SystemExit("missing HOST") from exc
+            i += 2
+            parse_post_host_options = False
+            break
         if token == "--help":
             _raise_usage()
         if token == "--version":
@@ -138,8 +149,33 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
                 raise SystemExit("--history-limit must be an integer") from exc
             i += 2
             continue
-        if token == "--eval-args":
-            eval_args = True
+        if token == "--preserve-args":
+            preserve_args = True
+            i += 1
+            continue
+        if token == "--list":
+            requested_command = _select_requested_command(
+                requested_command, "list", token
+            )
+            i += 1
+            continue
+        if token == "--attach":
+            requested_command = _select_requested_command(
+                requested_command, "attach", token
+            )
+            i += 1
+            continue
+        if token.startswith("--attach="):
+            requested_command = _select_requested_command(
+                requested_command, "attach", "--attach"
+            )
+            if resume_id is not None:
+                raise SystemExit("--attach id was provided more than once")
+            resume_id = token.split("=", 1)[1]
+            if not resume_id:
+                raise SystemExit(
+                    "--attach requires a non-empty id when using --attach=ID"
+                )
             i += 1
             continue
         if token in {"--verbose", "-v"}:
@@ -168,61 +204,24 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
         raise SystemExit("--verbose and --quiet cannot be used together")
 
     remainder = tokens[i:]
-    if not remainder:
-        if eval_args:
-            raise SystemExit("--eval-args is only valid with run")
-        return ParsedArgs(
-            host=host,
-            command="new",
-            ssh_options=ssh_options,
-            config=config,
-            shell=shell,
-            history_limit=history_limit,
-            eval_args=eval_args,
-            verbose=verbose,
-            quiet=quiet,
+    remote_argv: list[str] = []
+    if parse_post_host_options:
+        requested_command, resume_id, preserve_args, remote_argv = (
+            _parse_post_host_args(
+                remainder,
+                requested_command=requested_command,
+                resume_id=resume_id,
+                preserve_args=preserve_args,
+            )
         )
+    else:
+        remote_argv = remainder
 
-    command = remainder[0]
-    if command in {"resume", "attach"}:
-        if eval_args:
-            raise SystemExit("--eval-args is only valid with run")
-        if len(remainder) > 2:
-            raise SystemExit(f"{command} accepts at most one id")
-        return ParsedArgs(
-            host=host,
-            command="attach",
-            ssh_options=ssh_options,
-            config=config,
-            shell=shell,
-            history_limit=history_limit,
-            eval_args=eval_args,
-            verbose=verbose,
-            quiet=quiet,
-            resume_id=remainder[1] if len(remainder) == 2 else None,
-        )
-
-    if command == "list":
-        if eval_args:
-            raise SystemExit("--eval-args is only valid with run")
-        if len(remainder) != 1:
-            raise SystemExit("list does not accept arguments")
-        return ParsedArgs(
-            host=host,
-            command="list",
-            ssh_options=ssh_options,
-            config=config,
-            shell=shell,
-            history_limit=history_limit,
-            eval_args=eval_args,
-            verbose=verbose,
-            quiet=quiet,
-        )
-
-    if command == "run":
-        remote_argv = remainder[1:]
-        if not remote_argv:
-            raise SystemExit("run requires a command")
+    if remote_argv:
+        if requested_command == "attach":
+            raise SystemExit("--attach does not accept remote command arguments")
+        if requested_command == "list":
+            raise SystemExit("--list does not accept remote command arguments")
         return ParsedArgs(
             host=host,
             command="run",
@@ -230,15 +229,53 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
             config=config,
             shell=shell,
             history_limit=history_limit,
-            eval_args=eval_args,
+            preserve_args=preserve_args,
             verbose=verbose,
             quiet=quiet,
             remote_argv=remote_argv,
         )
 
-    if command.startswith("-"):
-        raise SystemExit("options must appear before HOST")
-    raise SystemExit(f"unknown command after HOST: {command}")
+    if preserve_args:
+        raise SystemExit("--preserve-args is only valid with a remote command")
+
+    if requested_command == "attach":
+        return ParsedArgs(
+            host=host,
+            command="attach",
+            ssh_options=ssh_options,
+            config=config,
+            shell=shell,
+            history_limit=history_limit,
+            preserve_args=preserve_args,
+            verbose=verbose,
+            quiet=quiet,
+            resume_id=resume_id,
+        )
+
+    if requested_command == "list":
+        return ParsedArgs(
+            host=host,
+            command="list",
+            ssh_options=ssh_options,
+            config=config,
+            shell=shell,
+            history_limit=history_limit,
+            preserve_args=preserve_args,
+            verbose=verbose,
+            quiet=quiet,
+        )
+
+    return ParsedArgs(
+        host=host,
+        command="new",
+        ssh_options=ssh_options,
+        config=config,
+        shell=shell,
+        history_limit=history_limit,
+        preserve_args=preserve_args,
+        verbose=verbose,
+        quiet=quiet,
+    )
 
 
 ConfigLoader = Callable[..., Config]
@@ -295,7 +332,7 @@ def execute(
                 stderr=stderr,
                 stdin=stdin,
                 progress=progress,
-                resume_command=f"sessh {args.host} attach {resume_id}",
+                resume_command=f"sessh {args.host} --attach {resume_id}",
                 resume_id=resume_id,
                 metadata_nonce=metadata_nonce,
             )
@@ -315,7 +352,7 @@ def execute(
                     stderr=stderr,
                     stdin=stdin,
                     progress=progress,
-                    resume_command=f"sessh {args.host} attach",
+                    resume_command=f"sessh {args.host} --attach",
                     resume_id=None,
                     metadata_nonce=metadata_nonce,
                 )
@@ -335,7 +372,7 @@ def execute(
                 stderr=stderr,
                 stdin=stdin,
                 progress=progress,
-                resume_command=f"sessh {args.host} attach {args.resume_id}",
+                resume_command=f"sessh {args.host} --attach {args.resume_id}",
                 resume_id=args.resume_id,
                 metadata_nonce=metadata_nonce,
             )
@@ -348,7 +385,7 @@ def execute(
                 config,
                 resume_id=resume_id,
                 command=args.remote_argv,
-                eval_args=args.eval_args,
+                eval_args=not args.preserve_args,
                 host=args.host,
                 metadata_nonce=metadata_nonce,
             )
@@ -358,7 +395,7 @@ def execute(
                 stderr=stderr,
                 stdin=stdin,
                 progress=progress,
-                resume_command=f"sessh {args.host} attach {resume_id}",
+                resume_command=f"sessh {args.host} --attach {resume_id}",
                 resume_id=resume_id,
                 metadata_nonce=metadata_nonce,
             )
@@ -412,6 +449,68 @@ def _next_value(tokens: Sequence[str], index: int, option: str) -> str:
         return tokens[index + 1]
     except IndexError as exc:
         raise SystemExit(f"{option} requires a value") from exc
+
+
+def _parse_post_host_args(
+    tokens: Sequence[str],
+    *,
+    requested_command: str | None,
+    resume_id: str | None,
+    preserve_args: bool,
+) -> tuple[str | None, str | None, bool, list[str]]:
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--":
+            return requested_command, resume_id, preserve_args, list(tokens[i + 1 :])
+        if token == "--preserve-args":
+            preserve_args = True
+            i += 1
+            continue
+        if token == "--list":
+            requested_command = _select_requested_command(
+                requested_command, "list", token
+            )
+            i += 1
+            continue
+        if token == "--attach":
+            requested_command = _select_requested_command(
+                requested_command, "attach", token
+            )
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+                if resume_id is not None:
+                    raise SystemExit("--attach id was provided more than once")
+                resume_id = tokens[i + 1]
+                i += 2
+                continue
+            i += 1
+            continue
+        if token.startswith("--attach="):
+            requested_command = _select_requested_command(
+                requested_command, "attach", "--attach"
+            )
+            if resume_id is not None:
+                raise SystemExit("--attach id was provided more than once")
+            resume_id = token.split("=", 1)[1]
+            if not resume_id:
+                raise SystemExit(
+                    "--attach requires a non-empty id when using --attach=ID"
+                )
+            i += 1
+            continue
+        if token.startswith("--"):
+            raise SystemExit(
+                f"unknown option after HOST: {token}; use -- before remote commands that start with --"
+            )
+        return requested_command, resume_id, preserve_args, list(tokens[i:])
+
+    return requested_command, resume_id, preserve_args, []
+
+
+def _select_requested_command(current: str | None, new: str, option: str) -> str:
+    if current is not None and current != new:
+        raise SystemExit(f"{option} conflicts with --{current}")
+    return new
 
 
 def _parse_ssh_option(
@@ -501,6 +600,41 @@ def _attached_ssh_option(token: str, options: set[str]) -> str | None:
 
 
 def _raise_usage() -> None:
-    parser = argparse.ArgumentParser(prog="sessh")
+    parser = argparse.ArgumentParser(
+        prog="sessh",
+        usage=(
+            "sessh [OPTIONS] HOST "
+            "[--attach [ID] | --list | [--preserve-args] COMMAND [ARG...]]"
+        ),
+        description="SSH with persistent tmux-backed sessions.",
+        epilog=(
+            "Common ssh options before HOST are passed through. "
+            "Use -- after HOST before remote commands that start with --."
+        ),
+    )
+    parser.add_argument("--version", action="store_true", help="show version and exit")
+    parser.add_argument("--config", metavar="PATH", help="read config from PATH")
+    parser.add_argument("--shell", metavar="SHELL", help="remote shell to configure")
+    parser.add_argument("--history-limit", metavar="N", help="tmux history limit")
+    parser.add_argument(
+        "--preserve-args",
+        action="store_true",
+        help="preserve remote command argv boundaries instead of ssh-style evaluation",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="list sessh sessions on HOST",
+    )
+    parser.add_argument(
+        "--attach",
+        metavar="ID",
+        nargs="?",
+        help="attach to a session by ID, or pick one interactively",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="show progress")
+    parser.add_argument("-q", "--quiet", action="store_true", help="hide progress")
+    parser.add_argument("HOST", nargs="?")
+    parser.add_argument("COMMAND", nargs=argparse.REMAINDER)
     parser.print_help()
     raise SystemExit(0)

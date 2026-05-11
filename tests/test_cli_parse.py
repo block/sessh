@@ -242,43 +242,69 @@ class CliParseTests(unittest.TestCase):
         )
 
     def test_attach_picker(self):
-        args = parse_args(["example.com", "attach"])
+        args = parse_args(["example.com", "--attach"])
 
         self.assertEqual(args.command, "attach")
         self.assertIsNone(args.resume_id)
 
     def test_attach_id(self):
-        args = parse_args(["example.com", "attach", "k7m4q2"])
+        args = parse_args(["example.com", "--attach", "k7m4q2"])
 
         self.assertEqual(args.command, "attach")
         self.assertEqual(args.resume_id, "k7m4q2")
 
-    def test_resume_is_attach_synonym(self):
-        args = parse_args(["example.com", "resume", "k7m4q2"])
+    def test_attach_id_with_equals(self):
+        args = parse_args(["example.com", "--attach=k7m4q2"])
 
         self.assertEqual(args.command, "attach")
         self.assertEqual(args.resume_id, "k7m4q2")
 
-    def test_resume_picker_is_attach_picker_synonym(self):
-        args = parse_args(["example.com", "resume"])
+    def test_attach_id_with_equals_before_host(self):
+        args = parse_args(["--attach=k7m4q2", "example.com"])
 
         self.assertEqual(args.command, "attach")
-        self.assertIsNone(args.resume_id)
+        self.assertEqual(args.resume_id, "k7m4q2")
 
     def test_list(self):
-        args = parse_args(["example.com", "list"])
+        args = parse_args(["example.com", "--list"])
 
         self.assertEqual(args.command, "list")
 
-    def test_run_keeps_all_remaining_args(self):
+    def test_list_before_host(self):
+        args = parse_args(["--list", "example.com"])
+
+        self.assertEqual(args.command, "list")
+
+    def test_remote_command_uses_evaluated_args_by_default(self):
         args = parse_args(
-            ["--eval-args", "-t", "example.com", "run", "--flag", "hello world"]
+            ["-t", "example.com", "printf", "%s\\n", "hello world", "$HOME"]
         )
 
-        self.assertTrue(args.eval_args)
+        self.assertFalse(args.preserve_args)
         self.assertEqual(args.ssh_options, ["-t"])
         self.assertEqual(args.command, "run")
+        self.assertEqual(args.remote_argv, ["printf", "%s\\n", "hello world", "$HOME"])
+
+    def test_preserve_args_is_valid_with_remote_command(self):
+        args = parse_args(
+            ["example.com", "--preserve-args", "printf", "%s\\n", "hello world"]
+        )
+
+        self.assertTrue(args.preserve_args)
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.remote_argv, ["printf", "%s\\n", "hello world"])
+
+    def test_double_dash_allows_remote_command_starting_with_long_option(self):
+        args = parse_args(["example.com", "--", "--flag", "hello world"])
+
+        self.assertEqual(args.command, "run")
         self.assertEqual(args.remote_argv, ["--flag", "hello world"])
+
+    def test_command_words_after_host_are_remote_argv(self):
+        args = parse_args(["example.com", "list"])
+
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.remote_argv, ["list"])
 
     def test_verbose_option_before_host(self):
         args = parse_args(["--verbose", "-p", "2222", "example.com"])
@@ -300,21 +326,47 @@ class CliParseTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_args(["--verbose", "--quiet", "example.com"])
 
-    def test_verbose_after_run_is_remote_argv(self):
-        args = parse_args(["example.com", "run", "--verbose", "echo"])
+    def test_unknown_long_option_after_host_requires_double_dash(self):
+        with self.assertRaises(SystemExit) as raised:
+            parse_args(["example.com", "--verbose", "echo"])
 
-        self.assertFalse(args.verbose)
-        self.assertEqual(args.remote_argv, ["--verbose", "echo"])
+        self.assertIn("unknown option after HOST: --verbose", str(raised.exception))
+        self.assertIn(
+            "use -- before remote commands that start with --", str(raised.exception)
+        )
 
-    def test_options_after_host_are_not_parsed_as_ssh_options(self):
-        with self.assertRaises(SystemExit):
-            parse_args(["example.com", "-p", "2222"])
+    def test_single_dash_options_after_host_are_remote_argv(self):
+        args = parse_args(["example.com", "-p", "2222"])
 
-    def test_eval_args_after_run_is_remote_argv(self):
-        args = parse_args(["example.com", "run", "--eval-args", "echo $HOME"])
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.remote_argv, ["-p", "2222"])
 
-        self.assertFalse(args.eval_args)
-        self.assertEqual(args.remote_argv, ["--eval-args", "echo $HOME"])
+    def test_preserve_args_without_remote_command_is_rejected(self):
+        with self.assertRaises(SystemExit) as raised:
+            parse_args(["example.com", "--preserve-args"])
+
+        self.assertEqual(
+            str(raised.exception),
+            "--preserve-args is only valid with a remote command",
+        )
+
+    def test_attach_rejects_remote_command_args(self):
+        with self.assertRaises(SystemExit) as raised:
+            parse_args(["example.com", "--attach", "k7m4q2", "echo"])
+
+        self.assertEqual(
+            str(raised.exception),
+            "--attach does not accept remote command arguments",
+        )
+
+    def test_list_rejects_remote_command_args(self):
+        with self.assertRaises(SystemExit) as raised:
+            parse_args(["example.com", "--list", "echo"])
+
+        self.assertEqual(
+            str(raised.exception),
+            "--list does not accept remote command arguments",
+        )
 
 
 if __name__ == "__main__":

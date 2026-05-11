@@ -20,8 +20,10 @@ def validate_run_tty_state(*, stdout_is_tty: bool, stderr_is_tty: bool) -> None:
         return
     if not stdout_is_tty and not stderr_is_tty:
         raise RunTtyError(
-            "sessh run requires stdout and stderr to be connected to a TTY"
+            "sessh remote commands require stdout and stderr to be connected to a TTY"
         )
     if not stdout_is_tty:
-        raise RunTtyError("sessh run requires stdout to be connected to a TTY")
-    raise RunTtyError("sessh run requires stderr to be connected to a TTY")
+        raise RunTtyError(
+            "sessh remote commands require stdout to be connected to a TTY"
+        )
+    raise RunTtyError("sessh remote commands require stderr to be connected to a TTY")
