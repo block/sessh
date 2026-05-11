@@ -599,6 +599,86 @@ done
             ],
         )
 
+    def test_cli_auto_reattach_recovers_after_transport_disconnect(self):
+        continue_file = f"{REMOTE_STATE}/auto-continue"
+        remote_rc = f"""printf 'auto-ready\\n'
+while [ ! -f {continue_file} ]; do
+  sleep 0.05
+done
+printf 'auto-done\\n'
+exit 0
+"""
+        config = self._write_cli_config("cli-auto-reattach", remote_rc=remote_rc)
+
+        with OuterTmuxSession(self) as outer:
+            outer.start_driver(
+                [
+                    "--quiet",
+                    "--auto-reattach",
+                    "--config",
+                    str(config),
+                    *self.ssh_options,
+                    self.host,
+                ]
+            )
+            outer.wait_for_text("auto-ready")
+            resume_id = find_boundary_resume_id(
+                self, outer.terminal_lines(), "sessh created"
+            )
+            self._drop_remote_ssh_sessions()
+            outer.wait_for_text("auto-reattaching")
+            outer.send_line("")
+            outer.wait_for_text(f"--- sessh attached {resume_id} ---")
+            self.client().run(["touch", continue_file])
+            exit_status = outer.wait_for_exit()
+            lines = outer.terminal_lines()
+
+        self.assertEqual(exit_status, 0)
+        self.assertIn(f"--- sessh detached {resume_id} ---", lines)
+        self.assertIn(f"--- sessh attached {resume_id} ---", lines)
+        self.assertGreaterEqual(lines.count("auto-ready"), 2)
+        self.assertIn("auto-done", lines)
+        self.assertIn(f"--- sessh exited {resume_id} ---", lines)
+        self.assertFalse(self._has_session(resume_id))
+
+    def test_cli_auto_reattach_does_not_retry_ssh_escape_disconnect(self):
+        remote_rc = """printf 'auto-escape-ready\\n'
+while :; do
+  sleep 1
+done
+"""
+        config = self._write_cli_config("cli-auto-escape", remote_rc=remote_rc)
+
+        with OuterTmuxSession(self) as outer:
+            outer.start_driver(
+                [
+                    "--quiet",
+                    "--auto-reattach",
+                    "--config",
+                    str(config),
+                    *self.ssh_options,
+                    self.host,
+                ]
+            )
+            outer.wait_for_text("auto-escape-ready")
+            outer.send_ssh_disconnect()
+            exit_status = outer.wait_for_exit()
+            lines = outer.terminal_lines()
+
+        self.assertEqual(exit_status, 255)
+        resume_id = parse_boundary_resume_id(self, lines[0], "sessh created")
+        self.assertEqual(
+            lines,
+            [
+                f"--- sessh created {resume_id} ---",
+                "auto-escape-ready",
+                f"--- sessh detached {resume_id} ---",
+                "To attach to this session, run:",
+                f"  sessh {self.host} --attach {resume_id}",
+            ],
+        )
+        self.assertTrue(self._has_session(resume_id))
+
     def test_cli_restores_local_tty_when_ssh_process_is_killed(self):
         remote_rc = """printf 'tty-restore-ready\\n'
 while :; do
@@ -757,6 +837,13 @@ done
             stderr=subprocess.PIPE,
         )
         return result.returncode == 0
+
+    def _drop_remote_ssh_sessions(self):
+        self.client().run(
+            ["sh", "-c", "pkill -KILL -f 'sshd: sessh'"],
+            check=False,
+            stderr=subprocess.PIPE,
+        )
 
     def _write_cli_config(
         self, name, *, remote_init="", remote_rc=None, history_limit=200

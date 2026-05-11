@@ -96,6 +96,7 @@ class ParsedArgs:
     shell: str | None = None
     history_limit: int | None = None
     preserve_args: bool = False
+    auto_reattach: bool | None = None
     verbose: bool = False
     quiet: bool = False
     resume_id: str | None = None
@@ -109,6 +110,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
     shell: str | None = None
     history_limit: int | None = None
     preserve_args = False
+    auto_reattach: bool | None = None
     verbose = False
     quiet = False
     requested_command: str | None = None
@@ -151,6 +153,14 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
             continue
         if token == "--preserve-args":
             preserve_args = True
+            i += 1
+            continue
+        if token == "--auto-reattach":
+            auto_reattach = True
+            i += 1
+            continue
+        if token == "--no-auto-reattach":
+            auto_reattach = False
             i += 1
             continue
         if token == "--list":
@@ -206,12 +216,13 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
     remainder = tokens[i:]
     remote_argv: list[str] = []
     if parse_post_host_options:
-        requested_command, resume_id, preserve_args, remote_argv = (
+        requested_command, resume_id, preserve_args, auto_reattach, remote_argv = (
             _parse_post_host_args(
                 remainder,
                 requested_command=requested_command,
                 resume_id=resume_id,
                 preserve_args=preserve_args,
+                auto_reattach=auto_reattach,
             )
         )
     else:
@@ -230,6 +241,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
             shell=shell,
             history_limit=history_limit,
             preserve_args=preserve_args,
+            auto_reattach=auto_reattach,
             verbose=verbose,
             quiet=quiet,
             remote_argv=remote_argv,
@@ -247,6 +259,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
             shell=shell,
             history_limit=history_limit,
             preserve_args=preserve_args,
+            auto_reattach=auto_reattach,
             verbose=verbose,
             quiet=quiet,
             resume_id=resume_id,
@@ -261,6 +274,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
             shell=shell,
             history_limit=history_limit,
             preserve_args=preserve_args,
+            auto_reattach=auto_reattach,
             verbose=verbose,
             quiet=quiet,
         )
@@ -273,6 +287,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
         shell=shell,
         history_limit=history_limit,
         preserve_args=preserve_args,
+        auto_reattach=auto_reattach,
         verbose=verbose,
         quiet=quiet,
     )
@@ -306,6 +321,9 @@ def execute(
         config = config_loader(
             path=args.config, shell=args.shell, history_limit=args.history_limit
         )
+        auto_reattach = (
+            config.auto_reattach if args.auto_reattach is None else args.auto_reattach
+        )
         client = client_factory(host=args.host, ssh_options=args.ssh_options)
 
         if args.command == "list":
@@ -326,6 +344,9 @@ def execute(
                 host=args.host,
                 metadata_nonce=metadata_nonce,
             )
+            reattach_remote_argv_builder = _reattach_remote_argv_builder(
+                config, host=args.host, metadata_nonce=metadata_nonce
+            )
             return attach_remote_transaction(
                 client,
                 remote_argv,
@@ -335,6 +356,8 @@ def execute(
                 resume_command=f"sessh {args.host} --attach {resume_id}",
                 resume_id=resume_id,
                 metadata_nonce=metadata_nonce,
+                auto_reattach=auto_reattach,
+                reattach_remote_argv_builder=reattach_remote_argv_builder,
             )
 
         if args.command == "attach":
@@ -346,6 +369,9 @@ def execute(
                     host=args.host,
                     metadata_nonce=metadata_nonce,
                 )
+                reattach_remote_argv_builder = _reattach_remote_argv_builder(
+                    config, host=args.host, metadata_nonce=metadata_nonce
+                )
                 return attach_remote_transaction(
                     client,
                     remote_argv,
@@ -355,6 +381,8 @@ def execute(
                     resume_command=f"sessh {args.host} --attach",
                     resume_id=None,
                     metadata_nonce=metadata_nonce,
+                    auto_reattach=auto_reattach,
+                    reattach_remote_argv_builder=reattach_remote_argv_builder,
                 )
             if not is_valid_resume_id(args.resume_id):
                 raise RuntimeError(f"invalid session id: {args.resume_id}")
@@ -366,6 +394,9 @@ def execute(
                 host=args.host,
                 metadata_nonce=metadata_nonce,
             )
+            reattach_remote_argv_builder = _reattach_remote_argv_builder(
+                config, host=args.host, metadata_nonce=metadata_nonce
+            )
             return attach_remote_transaction(
                 client,
                 remote_argv,
@@ -375,6 +406,8 @@ def execute(
                 resume_command=f"sessh {args.host} --attach {args.resume_id}",
                 resume_id=args.resume_id,
                 metadata_nonce=metadata_nonce,
+                auto_reattach=auto_reattach,
+                reattach_remote_argv_builder=reattach_remote_argv_builder,
             )
 
         if args.command == "run":
@@ -389,6 +422,9 @@ def execute(
                 host=args.host,
                 metadata_nonce=metadata_nonce,
             )
+            reattach_remote_argv_builder = _reattach_remote_argv_builder(
+                config, host=args.host, metadata_nonce=metadata_nonce
+            )
             return attach_remote_transaction(
                 client,
                 remote_argv,
@@ -398,6 +434,8 @@ def execute(
                 resume_command=f"sessh {args.host} --attach {resume_id}",
                 resume_id=resume_id,
                 metadata_nonce=metadata_nonce,
+                auto_reattach=auto_reattach,
+                reattach_remote_argv_builder=reattach_remote_argv_builder,
             )
     except Exception:
         progress.clear()
@@ -422,6 +460,20 @@ def format_session_list(sessions: Sequence[SessionInfo]) -> str:
             )
         )
     return "\n".join(lines) + "\n"
+
+
+def _reattach_remote_argv_builder(
+    config: Config, *, host: str, metadata_nonce: str
+) -> Callable[[str], list[str]]:
+    def build(resume_id: str) -> list[str]:
+        return build_attach_interactive_transaction(
+            config,
+            resume_id=resume_id,
+            host=host,
+            metadata_nonce=metadata_nonce,
+        )
+
+    return build
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -457,14 +509,29 @@ def _parse_post_host_args(
     requested_command: str | None,
     resume_id: str | None,
     preserve_args: bool,
-) -> tuple[str | None, str | None, bool, list[str]]:
+    auto_reattach: bool | None,
+) -> tuple[str | None, str | None, bool, bool | None, list[str]]:
     i = 0
     while i < len(tokens):
         token = tokens[i]
         if token == "--":
-            return requested_command, resume_id, preserve_args, list(tokens[i + 1 :])
+            return (
+                requested_command,
+                resume_id,
+                preserve_args,
+                auto_reattach,
+                list(tokens[i + 1 :]),
+            )
         if token == "--preserve-args":
             preserve_args = True
+            i += 1
+            continue
+        if token == "--auto-reattach":
+            auto_reattach = True
+            i += 1
+            continue
+        if token == "--no-auto-reattach":
+            auto_reattach = False
             i += 1
             continue
         if token == "--list":
@@ -502,9 +569,15 @@ def _parse_post_host_args(
             raise SystemExit(
                 f"unknown option after HOST: {token}; use -- before remote commands that start with --"
             )
-        return requested_command, resume_id, preserve_args, list(tokens[i:])
+        return (
+            requested_command,
+            resume_id,
+            preserve_args,
+            auto_reattach,
+            list(tokens[i:]),
+        )
 
-    return requested_command, resume_id, preserve_args, []
+    return requested_command, resume_id, preserve_args, auto_reattach, []
 
 
 def _select_requested_command(current: str | None, new: str, option: str) -> str:
@@ -604,18 +677,25 @@ def _raise_usage() -> None:
         prog="sessh",
         usage=(
             "sessh [OPTIONS] HOST "
-            "[--attach [ID] | --list | [--preserve-args] COMMAND [ARG...]]"
+            "[--attach [ID] | --list | [--auto-reattach] [--preserve-args] COMMAND [ARG...]]"
         ),
         description="SSH with persistent tmux-backed sessions.",
-        epilog=(
-            "Common ssh options before HOST are passed through. "
-            "Use -- after HOST before remote commands that start with --."
-        ),
+        epilog="Common ssh options before HOST are passed through.",
     )
     parser.add_argument("--version", action="store_true", help="show version and exit")
     parser.add_argument("--config", metavar="PATH", help="read config from PATH")
     parser.add_argument("--shell", metavar="SHELL", help="remote shell to configure")
     parser.add_argument("--history-limit", metavar="N", help="tmux history limit")
+    parser.add_argument(
+        "--auto-reattach",
+        action="store_true",
+        help="automatically reattach after transport disconnects",
+    )
+    parser.add_argument(
+        "--no-auto-reattach",
+        action="store_true",
+        help="disable auto reattach even when config enables it",
+    )
     parser.add_argument(
         "--preserve-args",
         action="store_true",

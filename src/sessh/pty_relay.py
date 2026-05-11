@@ -23,6 +23,7 @@ class RelayResult:
     resume_id: str | None = None
     final_event: str | None = None
     remote_exit_status: int | None = None
+    user_requested_disconnect: bool = False
 
 
 def run_pty_relay(
@@ -39,6 +40,7 @@ def run_pty_relay(
     child = PtyProcess.spawn(list(argv), env=dict(env), dimensions=(rows, cols))
     parser = SideChannelParser(nonce)
     result = RelayResult(exit_status=1)
+    escape_detector = SshEscapeDisconnectDetector()
     previous_winch = signal.getsignal(signal.SIGWINCH)
 
     def resize_child(signum, frame):  # noqa: ARG001
@@ -57,6 +59,8 @@ def run_pty_relay(
                 if stdin_fd in readable:
                     data = os.read(stdin_fd, 65536)
                     if data:
+                        if escape_detector.feed(data):
+                            result.user_requested_disconnect = True
                         child.write(data)
                     else:
                         stdin_open = False
@@ -85,6 +89,29 @@ def run_pty_relay(
     else:
         result.exit_status = 1
     return result
+
+
+class SshEscapeDisconnectDetector:
+    def __init__(self) -> None:
+        self._at_line_start = True
+        self._after_tilde_at_line_start = False
+
+    def feed(self, data: bytes) -> bool:
+        user_requested_disconnect = False
+        for byte in data:
+            if self._after_tilde_at_line_start:
+                if byte == ord("."):
+                    user_requested_disconnect = True
+                self._after_tilde_at_line_start = False
+                self._at_line_start = byte in {ord("\r"), ord("\n")}
+                continue
+
+            if self._at_line_start and byte == ord("~"):
+                self._after_tilde_at_line_start = True
+                continue
+
+            self._at_line_start = byte in {ord("\r"), ord("\n")}
+        return user_requested_disconnect
 
 
 def _record_events(result: RelayResult, events: list[SideChannelEvent]) -> None:

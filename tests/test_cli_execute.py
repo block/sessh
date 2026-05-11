@@ -67,6 +67,46 @@ class CliExecuteTests(unittest.TestCase):
         self.assertEqual(remote_argv[13], "printf")
         self.assertEqual(remote_argv[14:], ["printf", "$HOME"])
 
+    def test_auto_reattach_defaults_from_config(self):
+        captured_kwargs = self._execute_new_and_capture_attach_kwargs(
+            parse_args(["example.com"]),
+            Config(
+                shell="bash",
+                history_limit=50,
+                auto_reattach=True,
+                remote_rc="remote-rc",
+            ),
+        )
+
+        self.assertTrue(captured_kwargs["auto_reattach"])
+        self.assertIsNotNone(captured_kwargs["reattach_remote_argv_builder"])
+
+    def test_no_auto_reattach_suppresses_config_default(self):
+        captured_kwargs = self._execute_new_and_capture_attach_kwargs(
+            parse_args(["--no-auto-reattach", "example.com"]),
+            Config(
+                shell="bash",
+                history_limit=50,
+                auto_reattach=True,
+                remote_rc="remote-rc",
+            ),
+        )
+
+        self.assertFalse(captured_kwargs["auto_reattach"])
+
+    def test_auto_reattach_cli_override_enables_config_default(self):
+        captured_kwargs = self._execute_new_and_capture_attach_kwargs(
+            parse_args(["--auto-reattach", "example.com"]),
+            Config(
+                shell="bash",
+                history_limit=50,
+                auto_reattach=False,
+                remote_rc="remote-rc",
+            ),
+        )
+
+        self.assertTrue(captured_kwargs["auto_reattach"])
+
     def _execute_run_and_capture_remote_argv(self, args):
         captured_remote_argv = None
 
@@ -96,6 +136,31 @@ class CliExecuteTests(unittest.TestCase):
         self.assertEqual(exit_status, 0)
         self.assertIsNotNone(captured_remote_argv)
         return captured_remote_argv
+
+    def _execute_new_and_capture_attach_kwargs(self, args, config):
+        captured_kwargs = None
+
+        def fake_attach_remote_transaction(client, remote_argv, **kwargs):  # noqa: ARG001
+            nonlocal captured_kwargs
+            captured_kwargs = dict(kwargs)
+            return 0
+
+        with patch(
+            "sessh.cli.attach_remote_transaction", fake_attach_remote_transaction
+        ):
+            exit_status = execute(
+                args,
+                stdin=TtyStringIO(),
+                stdout=TtyStringIO(),
+                stderr=TtyStringIO(),
+                config_loader=lambda **kwargs: config,
+                client_factory=FakeClient,
+                id_generator=lambda existing_ids: "abc123",
+            )
+
+        self.assertEqual(exit_status, 0)
+        self.assertIsNotNone(captured_kwargs)
+        return captured_kwargs
 
 
 class TtyStringIO(io.StringIO):

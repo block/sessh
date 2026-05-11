@@ -17,6 +17,7 @@ DEFAULT_HISTORY_LIMIT = 10_000
 class Config:
     shell: str
     history_limit: int
+    auto_reattach: bool = False
     remote_init: str = ""
     remote_rc: str | None = None
 
@@ -61,6 +62,7 @@ def load_config(
         config = Config(
             shell=defaults.get("shell", config.shell),
             history_limit=defaults.get("history-limit", config.history_limit),
+            auto_reattach=defaults.get("auto-reattach", config.auto_reattach),
             remote_init=remote_init,
             remote_rc=remote_rc,
         )
@@ -69,6 +71,7 @@ def load_config(
         config = Config(
             shell=shell,
             history_limit=config.history_limit,
+            auto_reattach=config.auto_reattach,
             remote_init=config.remote_init,
             remote_rc=config.remote_rc,
         )
@@ -76,6 +79,7 @@ def load_config(
         config = Config(
             shell=config.shell,
             history_limit=history_limit,
+            auto_reattach=config.auto_reattach,
             remote_init=config.remote_init,
             remote_rc=config.remote_rc,
         )
@@ -85,6 +89,7 @@ def load_config(
         config = Config(
             shell=config.shell,
             history_limit=config.history_limit,
+            auto_reattach=config.auto_reattach,
             remote_init=config.remote_init,
             remote_rc=default_remote_rc(config.shell),
         )
@@ -96,6 +101,8 @@ def _validate_config(config: Config) -> None:
         raise ValueError(f"unsupported shell: {config.shell}")
     if type(config.history_limit) is not int or config.history_limit <= 0:
         raise ValueError("history-limit must be a positive integer")
+    if type(config.auto_reattach) is not bool:
+        raise ValueError("auto-reattach must be a boolean")
     if not isinstance(config.remote_init, str):
         raise ValueError("remote-init must be a string")
     if config.remote_rc is not None and not isinstance(config.remote_rc, str):

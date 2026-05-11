@@ -22,13 +22,18 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.yaml"
             path.write_text(
-                "defaults:\n  shell: zsh\n  history-limit: 1234\n", encoding="utf-8"
+                "defaults:\n"
+                "  shell: zsh\n"
+                "  history-limit: 1234\n"
+                "  auto-reattach: true\n",
+                encoding="utf-8",
             )
 
             config = load_config(path, current_shell="/bin/bash")
 
         self.assertEqual(config.shell, "zsh")
         self.assertEqual(config.history_limit, 1234)
+        self.assertTrue(config.auto_reattach)
         self.assertEqual(config.remote_rc, default_remote_rc("zsh"))
 
     def test_cli_overrides_config_file(self):
@@ -110,6 +115,16 @@ remote-rc: |
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.yaml"
             path.write_text("defaults:\n  history-limit: true\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                load_config(path, current_shell="/bin/bash")
+
+    def test_rejects_non_boolean_auto_reattach(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(
+                "defaults:\n  auto-reattach: yes please\n", encoding="utf-8"
+            )
 
             with self.assertRaises(ValueError):
                 load_config(path, current_shell="/bin/bash")

@@ -326,6 +326,30 @@ class CliParseTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_args(["--verbose", "--quiet", "example.com"])
 
+    def test_auto_reattach_before_host(self):
+        args = parse_args(["--auto-reattach", "example.com"])
+
+        self.assertTrue(args.auto_reattach)
+        self.assertEqual(args.command, "new")
+
+    def test_no_auto_reattach_before_host(self):
+        args = parse_args(["--no-auto-reattach", "example.com"])
+
+        self.assertFalse(args.auto_reattach)
+        self.assertEqual(args.command, "new")
+
+    def test_auto_reattach_after_host(self):
+        args = parse_args(["example.com", "--auto-reattach", "--attach", "k7m4q2"])
+
+        self.assertTrue(args.auto_reattach)
+        self.assertEqual(args.command, "attach")
+        self.assertEqual(args.resume_id, "k7m4q2")
+
+    def test_no_auto_reattach_overrides_auto_reattach(self):
+        args = parse_args(["--auto-reattach", "example.com", "--no-auto-reattach"])
+
+        self.assertFalse(args.auto_reattach)
+
     def test_unknown_long_option_after_host_requires_double_dash(self):
         with self.assertRaises(SystemExit) as raised:
             parse_args(["example.com", "--verbose", "echo"])

@@ -1,13 +1,17 @@
 import os
 import pty
+import io
 import unittest
+from unittest.mock import patch
 
 from sessh.attach import (
+    attach_remote_transaction,
     attach_environment,
     force_tty_ssh_options,
     format_terminal_boundary,
     write_terminal_boundary_on_new_line,
 )
+from sessh.pty_relay import RelayResult
 
 
 class AttachTests(unittest.TestCase):
@@ -73,6 +77,213 @@ class AttachTests(unittest.TestCase):
             format_terminal_boundary("sessh exited", resume_id="abc123"),
             "--- sessh exited abc123 ---\n",
         )
+
+    def test_auto_reattach_retries_after_learned_session_disconnect(self):
+        stderr = TtyStringIO()
+        built_resume_ids = []
+        results = iter(
+            [
+                RelayResult(exit_status=255, resume_id="abc123"),
+                RelayResult(exit_status=7, resume_id="abc123"),
+            ]
+        )
+
+        def build_reattach(resume_id):
+            built_resume_ids.append(resume_id)
+            return ["attach", resume_id]
+
+        with patch(
+            "sessh.attach.run_pty_relay", side_effect=lambda *a, **kw: next(results)
+        ):
+            exit_status = attach_remote_transaction(
+                FakeClient(),
+                ["new"],
+                stdin=TtyStringIO(),
+                stderr=stderr,
+                metadata_nonce="nonce",
+                auto_reattach=True,
+                reattach_remote_argv_builder=build_reattach,
+                auto_reattach_initial_delay=0,
+            )
+
+        self.assertEqual(exit_status, 7)
+        self.assertEqual(built_resume_ids, ["abc123"])
+        self.assertIn("--- sessh detached abc123 ---", stderr.getvalue())
+        self.assertIn("sessh: reattaching session abc123", stderr.getvalue())
+
+    def test_auto_reattach_retries_after_remote_detached_event(self):
+        stderr = TtyStringIO()
+        built_resume_ids = []
+        results = iter(
+            [
+                RelayResult(
+                    exit_status=255,
+                    resume_id="abc123",
+                    final_event="detached",
+                ),
+                RelayResult(exit_status=0, resume_id="abc123"),
+            ]
+        )
+
+        def build_reattach(resume_id):
+            built_resume_ids.append(resume_id)
+            return ["attach", resume_id]
+
+        with patch(
+            "sessh.attach.run_pty_relay", side_effect=lambda *a, **kw: next(results)
+        ):
+            exit_status = attach_remote_transaction(
+                FakeClient(),
+                ["new"],
+                stdin=TtyStringIO(),
+                stderr=stderr,
+                metadata_nonce="nonce",
+                auto_reattach=True,
+                reattach_remote_argv_builder=build_reattach,
+                auto_reattach_initial_delay=0,
+            )
+
+        self.assertEqual(exit_status, 0)
+        self.assertEqual(built_resume_ids, ["abc123"])
+        self.assertNotIn("--- sessh detached abc123 ---", stderr.getvalue())
+        self.assertIn("sessh: reattaching session abc123", stderr.getvalue())
+
+    def test_auto_reattach_waits_until_session_id_was_learned(self):
+        with patch(
+            "sessh.attach.run_pty_relay",
+            return_value=RelayResult(exit_status=255),
+        ) as run_pty_relay:
+            exit_status = attach_remote_transaction(
+                FakeClient(),
+                ["new"],
+                stdin=TtyStringIO(),
+                stderr=TtyStringIO(),
+                metadata_nonce="nonce",
+                auto_reattach=True,
+                reattach_remote_argv_builder=lambda resume_id: ["attach", resume_id],
+                auto_reattach_initial_delay=0,
+            )
+
+        self.assertEqual(exit_status, 255)
+        self.assertEqual(run_pty_relay.call_count, 1)
+
+    def test_auto_reattach_does_not_retry_user_requested_disconnect(self):
+        with patch(
+            "sessh.attach.run_pty_relay",
+            return_value=RelayResult(
+                exit_status=255,
+                resume_id="abc123",
+                user_requested_disconnect=True,
+            ),
+        ) as run_pty_relay:
+            exit_status = attach_remote_transaction(
+                FakeClient(),
+                ["new"],
+                stdin=TtyStringIO(),
+                stderr=TtyStringIO(),
+                resume_command="sessh example.com --attach abc123",
+                resume_id="abc123",
+                metadata_nonce="nonce",
+                auto_reattach=True,
+                reattach_remote_argv_builder=lambda resume_id: ["attach", resume_id],
+                auto_reattach_initial_delay=0,
+            )
+
+        self.assertEqual(exit_status, 255)
+        self.assertEqual(run_pty_relay.call_count, 1)
+
+    def test_manual_resume_message_is_not_duplicated_after_remote_detached_event(self):
+        stderr = TtyStringIO()
+        with patch(
+            "sessh.attach.run_pty_relay",
+            return_value=RelayResult(
+                exit_status=255,
+                resume_id="abc123",
+                final_event="detached",
+            ),
+        ) as run_pty_relay:
+            exit_status = attach_remote_transaction(
+                FakeClient(),
+                ["new"],
+                stdin=TtyStringIO(),
+                stderr=stderr,
+                resume_command="sessh example.com --attach abc123",
+                resume_id="abc123",
+                metadata_nonce="nonce",
+            )
+
+        self.assertEqual(exit_status, 255)
+        self.assertEqual(run_pty_relay.call_count, 1)
+        self.assertNotIn("To attach to this session", stderr.getvalue())
+
+    def test_auto_reattach_does_not_retry_remote_exit_255(self):
+        with patch(
+            "sessh.attach.run_pty_relay",
+            return_value=RelayResult(
+                exit_status=255,
+                resume_id="abc123",
+                final_event="exited",
+                remote_exit_status=255,
+            ),
+        ) as run_pty_relay:
+            exit_status = attach_remote_transaction(
+                FakeClient(),
+                ["new"],
+                stdin=TtyStringIO(),
+                stderr=TtyStringIO(),
+                metadata_nonce="nonce",
+                auto_reattach=True,
+                reattach_remote_argv_builder=lambda resume_id: ["attach", resume_id],
+                auto_reattach_initial_delay=0,
+            )
+
+        self.assertEqual(exit_status, 255)
+        self.assertEqual(run_pty_relay.call_count, 1)
+
+    def test_auto_reattach_retries_exited_event_without_remote_status(self):
+        built_resume_ids = []
+        results = iter(
+            [
+                RelayResult(
+                    exit_status=255,
+                    resume_id="abc123",
+                    final_event="exited",
+                ),
+                RelayResult(exit_status=0, resume_id="abc123"),
+            ]
+        )
+
+        def build_reattach(resume_id):
+            built_resume_ids.append(resume_id)
+            return ["attach", resume_id]
+
+        with patch(
+            "sessh.attach.run_pty_relay", side_effect=lambda *a, **kw: next(results)
+        ):
+            exit_status = attach_remote_transaction(
+                FakeClient(),
+                ["new"],
+                stdin=TtyStringIO(),
+                stderr=TtyStringIO(),
+                metadata_nonce="nonce",
+                auto_reattach=True,
+                reattach_remote_argv_builder=build_reattach,
+                auto_reattach_initial_delay=0,
+            )
+
+        self.assertEqual(exit_status, 0)
+        self.assertEqual(built_resume_ids, ["abc123"])
+
+
+class TtyStringIO(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class FakeClient:
+    host = "example.com"
+    ssh_options = []
+    ssh_bin = "ssh"
 
 
 def _read_available(fd):
