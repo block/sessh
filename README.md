@@ -45,6 +45,36 @@ scrollback buffer.
 
 - No server required (other than `sshd`), but `tmux` must be installed on the remote host.
 
+## Installation
+
+From a checkout:
+
+```sh
+uv tool install .
+```
+
+For local development without installing:
+
+```sh
+uv run --with-editable . sessh --help
+```
+
+## Configuration
+
+By default, `sessh` reads `~/.config/sessh/config.yaml`, or
+`$XDG_CONFIG_HOME/sessh/config.yaml` when `XDG_CONFIG_HOME` is set.
+
+```yaml
+defaults:
+  shell: zsh
+  history-limit: 10000
+remote-init: |
+  export PATH="$HOME/bin:$PATH"
+```
+
+`shell` must be `bash` or `zsh`. `remote-init` runs before sessh starts tmux on
+the remote host.
+
 ## SSH Compatibility
 
 `sessh` aims to accept common `ssh` options before `HOST` and pass them through
@@ -71,3 +101,7 @@ session model.
 ## Release
 
 See [RELEASE.md](RELEASE.md).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).

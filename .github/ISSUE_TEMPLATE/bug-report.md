@@ -1,31 +1,40 @@
 ---
-name: 🐛 Bug Report
-about: Thank you for taking the time, please report a reproducible bug
-title: "[Bug] <Bug Title Here>"
+name: Bug report
+about: Report a reproducible sessh bug
+title: ""
 labels: bug
-assignees: add codeowner's @name here 
+assignees: tcmulcahy
 
 ---
 
-**Describe the bug**
-*A clear and concise description of what the bug is.*
+**Summary**
+A clear description of the problem.
 
-**To Reproduce:**
-*Steps to reproduce the behavior:*
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+**Steps to reproduce**
+1.
+2.
+3.
 
-**Expected behavior:**
-*A clear and concise description of what you expected to happen.*
+**Command**
 
-**Supporting Material**
-*If applicable, add screenshots, output log and/or other documentation to help explain your problem.*
+```sh
+sessh HOST
+```
 
-**Environment (please complete the following information):**
- - OS: [ex: iOS]
- - Version 
+**Actual behavior**
+What happened, including terminal output if available.
+
+**Expected behavior**
+What you expected to happen.
+
+**Environment**
+- Local OS:
+- Local shell:
+- Remote OS:
+- Remote shell:
+- tmux version on the remote host:
+- sessh version (`sessh --version`):
+- Python version (`python --version`):
 
 **Additional context**
-Add any other context that you feel is relevant about the problem here.
+Any other context that may help reproduce or explain the issue.
