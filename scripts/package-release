@@ -1,0 +1,197 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat <<'EOF'
+usage: scripts/package-release [--check] [--repo OWNER/REPO] [--formula NAME]
+
+Builds the sessh release artifacts used by GitHub Releases and Homebrew.
+
+Options:
+  --check          Validate release metadata without building artifacts.
+  --repo VALUE     GitHub repository used in the release artifact URL.
+  --formula VALUE  Homebrew formula name. Defaults to sessh.
+EOF
+}
+
+die() {
+  printf 'scripts/package-release: %s\n' "$*" >&2
+  exit 1
+}
+
+github_repo_from_remote() {
+  remote_url=$(git config --get remote.origin.url 2>/dev/null || true)
+  case "$remote_url" in
+    git@github.com:*.git)
+      repo=${remote_url#git@github.com:}
+      printf '%s\n' "${repo%.git}"
+      ;;
+    git@github.com:*)
+      printf '%s\n' "${remote_url#git@github.com:}"
+      ;;
+    https://github.com/*.git)
+      repo=${remote_url#https://github.com/}
+      printf '%s\n' "${repo%.git}"
+      ;;
+    https://github.com/*)
+      printf '%s\n' "${remote_url#https://github.com/}"
+      ;;
+    *)
+      printf '\n'
+      ;;
+  esac
+}
+
+read_versions() {
+  python - <<'PY'
+from pathlib import Path
+import ast
+import tomllib
+
+project_version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+tree = ast.parse(Path("src/sessh/__init__.py").read_text(encoding="utf-8"))
+package_version = None
+for node in tree.body:
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "__version__":
+                package_version = ast.literal_eval(node.value)
+if package_version is None:
+    raise SystemExit("src/sessh/__init__.py does not define __version__")
+print(project_version)
+print(package_version)
+PY
+}
+
+sha256_file() {
+  path=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return
+  fi
+  die "neither sha256sum nor shasum is available"
+}
+
+mode=build
+repo=${GITHUB_REPOSITORY:-}
+formula=sessh
+tag=${GITHUB_REF_NAME:-}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check)
+      mode=check
+      ;;
+    --repo)
+      shift
+      [ "$#" -gt 0 ] || die "--repo requires a value"
+      repo=$1
+      ;;
+    --formula)
+      shift
+      [ "$#" -gt 0 ] || die "--formula requires a value"
+      formula=$1
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 64
+      ;;
+  esac
+  shift
+done
+
+versions=$(read_versions)
+project_version=$(printf '%s\n' "$versions" | sed -n '1p')
+package_version=$(printf '%s\n' "$versions" | sed -n '2p')
+
+[ "$project_version" = "$package_version" ] || die "pyproject.toml version $project_version does not match package version $package_version"
+
+version=$project_version
+expected_tag=v$version
+
+if [ "$mode" = check ]; then
+  printf 'release metadata OK for %s\n' "$expected_tag"
+  exit 0
+fi
+
+case "$tag" in
+  refs/tags/*)
+    tag=${tag#refs/tags/}
+    ;;
+esac
+[ -n "$tag" ] || tag=$expected_tag
+[ "$tag" = "$expected_tag" ] || die "tag $tag does not match project version $version; expected $expected_tag"
+
+if [ -z "$repo" ]; then
+  repo=$(github_repo_from_remote)
+fi
+[ -n "$repo" ] || die "could not infer GitHub repo; pass --repo OWNER/REPO"
+
+case "$repo" in
+  */*) ;;
+  *) die "--repo must be OWNER/REPO" ;;
+esac
+
+rm -rf dist
+uv build
+
+archive=dist/sessh-$version.tar.gz
+wheel=dist/sessh-$version-py3-none-any.whl
+[ -f "$archive" ] || die "expected source archive $archive was not built"
+[ -f "$wheel" ] || die "expected wheel $wheel was not built"
+
+sha=$(sha256_file "$archive")
+sha_file=$archive.sha256
+homebrew_bump_file=dist/homebrew-bump.txt
+release_notes=dist/release-notes.md
+release_env=dist/release.env
+artifact_url=https://github.com/$repo/releases/download/$tag/$(basename "$archive")
+
+printf '%s  %s\n' "$sha" "$(basename "$archive")" > "$sha_file"
+
+cat > "$homebrew_bump_file" <<EOF
+gh workflow run bump-formula.yaml \\
+  --repo block/homebrew-tap \\
+  -f repo=$repo \\
+  -f formula=$formula \\
+  -f tag=$tag \\
+  -f artifact_url=$artifact_url \\
+  -f sha256=$sha
+EOF
+
+cat > "$release_notes" <<EOF
+# sessh $version
+
+Release archive SHA-256:
+
+\`\`\`text
+$sha  $(basename "$archive")
+\`\`\`
+
+The Homebrew tap bump command is attached as $(basename "$homebrew_bump_file").
+EOF
+
+cat > "$release_env" <<EOF
+VERSION=$version
+TAG=$tag
+ASSET=$archive
+WHEEL=$wheel
+SHA256=$sha
+SHA256_FILE=$sha_file
+HOMEBREW_BUMP_FILE=$homebrew_bump_file
+RELEASE_NOTES=$release_notes
+ARTIFACT_URL=$artifact_url
+EOF
+
+printf 'built %s\n' "$archive"
+printf 'built %s\n' "$wheel"
+printf 'wrote %s\n' "$sha_file"
+printf 'wrote %s\n' "$homebrew_bump_file"

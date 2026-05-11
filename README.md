@@ -1,36 +1,73 @@
-# sessh README
+# sessh
 
-Congrats, project leads! You got a new project to grow!
+`sessh` is `ssh` with persistent sessions: if your connection drops you can re-attach.
 
-This stub is meant to help you form a strong community around your work. It's yours to adapt, and may 
-diverge from this initial structure. Just keep the files seeded in this repo, and the rest is yours to evolve! 
+## Basic Use
 
-## Introduction
+```sh
+sessh HOST
+sessh HOST list
+sessh HOST attach
+sessh HOST attach ID
+sessh HOST run COMMAND [ARG...]
+```
 
-Orient users to the project here. This is a good place to start with an assumption
-that the user knows very little - so start with the Big Picture and show how this
-project fits into it.
+When a live session disconnects, `sessh` prints:
 
-Then maybe a dive into what this project does.
+```text
+--- sessh detached k7m4q2 ---
+To attach to this session, run:
+  sessh work.example.com attach k7m4q2
+```
 
-Diagrams and other visuals are helpful here. Perhaps code snippets showing usage.
+## Architecture
 
-Project leads should complete, alongside this `README`:
+`sessh` has a local Python CLI and a POSIX `sh` program that runs remotely.
+TTY-backed commands run SSH under a client-side PTY relay. The relay passes
+terminal bytes through unchanged except for nonce-scoped sessh metadata frames,
+which let the local client learn the selected session id and clean remote exit
+status.
 
-* [CODEOWNERS](./CODEOWNERS) - set project lead(s)
-* [CONTRIBUTING.md](./CONTRIBUTING.md) - Fill out how to: install prereqs, build, test, run, access CI, chat, discuss, file issues
-* [Bug-report.md](.github/ISSUE_TEMPLATE/bug-report.md) - Fill out `Assignees` add codeowners @names
-* [config.yml](.github/ISSUE_TEMPLATE/config.yml) - remove "(/add your discord channel..)" and replace the url with your Discord channel if applicable
+Each command starts one SSH transaction. The remote script initializes state and
+creates or attaches a tmux session on a `sessh`-owned socket.
 
-The other files in this template repo may be used as-is:
+`sessh` configures tmux to be quiet: no status bar, no mouse reporting, no
+normal tmux prefix, and no user tmux socket/config interference.
 
-* [GOVERNANCE.md](./GOVERNANCE.md)
-* [LICENSE](./LICENSE)
+`sessh run` also uses tmux. It preserves argv by default, keeps completed output
+in a dead pane, and exits locally with the remote command status. For now, `run`
+requires stdout and stderr to be TTYs.
 
-## Project Resources
+The use of tmux means that `sessh` is able to persist and restore the
+scrollback buffer.
 
-| Resource                                   | Description                                                                    |
-| ------------------------------------------ | ------------------------------------------------------------------------------ |
-| [CODEOWNERS](./CODEOWNERS)                 | Outlines the project lead(s)                                                   |
-| [GOVERNANCE.md](./GOVERNANCE.md)           | Project governance                                                             |
-| [LICENSE](./LICENSE)                       | Apache License, Version 2.0                                                    |
+## Requirements
+
+- No server required (other than `sshd`), but `tmux` must be installed on the remote host.
+
+## SSH Compatibility
+
+`sessh` aims to accept common `ssh` options before `HOST` and pass them through
+unchanged, so commands like `sessh -p 2222 -J jump.example.com work.example.com`
+work as expected.
+
+Unlike `ssh`, arguments after `HOST` are interpreted as sessh commands:
+`attach`, `list`, or `run`. To execute a remote command, use `run`:
+
+```sh
+sessh HOST run COMMAND [ARG...]
+```
+
+For `run`, sessh preserves argument boundaries. `sessh HOST run printf '%s\n'
+'hello quoted world'` runs remote `printf` with two arguments after the command
+name; it does not join them into one shell command string for another round of
+shell parsing, which is the source of many `ssh HOST command arg...` quoting
+surprises.
+
+Options that remove the remote TTY, remove the remote command, background the
+connection, or replace the SSH stream are incompatible with sessh's tmux-backed
+session model.
+
+## Release
+
+See [RELEASE.md](RELEASE.md).

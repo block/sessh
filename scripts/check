@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat <<'EOF'
+usage: scripts/check [--fast]
+
+Runs the full sessh verification suite, including the real SSH/tmux Podman
+integration tests.
+
+Options:
+  --fast    Skip the real SSH/tmux Podman integration suite.
+EOF
+}
+
+run() {
+  printf '\n==> %s\n' "$*"
+  "$@"
+}
+
+run_podman=1
+case "${1-}" in
+  "")
+    ;;
+  --fast)
+    run_podman=0
+    shift
+    ;;
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 64
+    ;;
+esac
+
+if [ "$#" -ne 0 ]; then
+  usage >&2
+  exit 64
+fi
+
+run uv run shellcheck scripts/check scripts/package-release src/sessh/remote.sh
+run scripts/package-release --check
+run uv run --no-project --with-editable . python -m unittest discover -s tests
+
+if [ "$run_podman" -eq 1 ] || [ "${SESSH_RUN_PODMAN_TESTS:-}" = 1 ]; then
+  run env SESSH_RUN_PODMAN_TESTS=1 uv run --no-project --with-editable . python -m unittest tests.integration.test_ssh_bootstrap_podman.PodmanSshBootstrapTests
+else
+  printf '\n==> skipping Podman integration tests in --fast mode\n'
+fi
+
+run git diff --check
+run uv build
