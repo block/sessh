@@ -165,10 +165,54 @@ class CliParseTests(unittest.TestCase):
         self.assertEqual(args.host, "example.com")
 
     def test_incompatible_ssh_options_are_rejected(self):
-        for option in ["-T", "-n", "-f", "-N", "-W", "-s"]:
+        cases = {
+            "-T": "disables remote TTY allocation",
+            "-n": "redirects stdin",
+            "-f": "backgrounds ssh",
+            "-N": "prevents ssh from running a remote command",
+            "-W": "forwards stdio",
+            "-s": "requests an ssh subsystem",
+            "-G": "prints resolved ssh configuration",
+            "-O": "controls an existing ssh multiplex master",
+            "-Q": "queries ssh capabilities",
+        }
+        for option, reason in cases.items():
             with self.subTest(option=option):
-                with self.assertRaises(SystemExit):
+                with self.assertRaises(SystemExit) as raised:
                     parse_args([option, "example.com"])
+
+                self.assertIn(f"ssh option {option} is not compatible with sessh", str(raised.exception))
+                self.assertIn(reason, str(raised.exception))
+
+    def test_incompatible_attached_ssh_option_is_rejected_with_reason(self):
+        with self.assertRaises(SystemExit) as raised:
+            parse_args(["-Wexample.com:22", "example.com"])
+
+        self.assertIn("ssh option -Wexample.com:22 is not compatible with sessh", str(raised.exception))
+        self.assertIn("forwards stdio", str(raised.exception))
+
+    def test_incompatible_ssh_config_options_are_rejected(self):
+        cases = {
+            "ForkAfterAuthentication=yes": "backgrounds ssh",
+            "RemoteCommand=echo hello": "must supply its own remote tmux bootstrap command",
+            "RequestTTY=no": "disables remote TTY allocation",
+            "SessionType=none": "prevents sessh from running its remote tmux bootstrap command",
+            "StdinNull=yes": "prevents ssh from reading stdin",
+        }
+        for option, reason in cases.items():
+            with self.subTest(option=option):
+                with self.assertRaises(SystemExit) as raised:
+                    parse_args(["-o", option, "example.com"])
+
+                self.assertIn("ssh option -o", str(raised.exception))
+                self.assertIn("is not compatible with sessh", str(raised.exception))
+                self.assertIn(reason, str(raised.exception))
+
+    def test_attached_incompatible_ssh_config_option_is_rejected(self):
+        with self.assertRaises(SystemExit) as raised:
+            parse_args(["-oRequestTTY=no", "example.com"])
+
+        self.assertIn("ssh option -o RequestTTY=no is not compatible with sessh", str(raised.exception))
 
     def test_attach_picker(self):
         args = parse_args(["example.com", "attach"])

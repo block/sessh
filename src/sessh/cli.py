@@ -48,7 +48,29 @@ SSH_OPTIONS_WITH_VALUES = {
     "-R",
 }
 SSH_FLAG_OPTIONS = {"-4", "-6", "-A", "-a", "-C", "-g", "-K", "-k", "-t", "-tt", "-X", "-x", "-Y"}
-INCOMPATIBLE_SSH_OPTIONS = {"-f", "-G", "-N", "-n", "-O", "-Q", "-s", "-T", "-W"}
+INCOMPATIBLE_SSH_OPTIONS = {
+    "-f": (
+        "it backgrounds ssh after authentication, "
+        "but sessh must keep ssh in the foreground to relay the terminal"
+    ),
+    "-G": "it prints resolved ssh configuration instead of opening a session",
+    "-N": (
+        "it prevents ssh from running a remote command, "
+        "but sessh must run its remote tmux bootstrap"
+    ),
+    "-n": "it redirects stdin from /dev/null, but sessh needs stdin for interactive sessions",
+    "-O": "it controls an existing ssh multiplex master instead of opening a session",
+    "-Q": "it queries ssh capabilities instead of opening a session",
+    "-s": "it requests an ssh subsystem, but sessh must run its remote tmux bootstrap",
+    "-T": (
+        "it disables remote TTY allocation, "
+        "but sessh requires a remote TTY for tmux-backed sessions"
+    ),
+    "-W": (
+        "it forwards stdio to another host and replaces the remote session stream "
+        "that sessh needs"
+    ),
+}
 
 
 @dataclass
@@ -378,17 +400,77 @@ def _next_value(tokens: Sequence[str], index: int, option: str) -> str:
 
 def _parse_ssh_option(tokens: Sequence[str], index: int) -> tuple[list[str], int] | None:
     token = tokens[index]
-    if token in INCOMPATIBLE_SSH_OPTIONS or _attached_ssh_option(token, INCOMPATIBLE_SSH_OPTIONS) is not None:
-        raise SystemExit(f"ssh option {token} is not compatible with sessh")
+    incompatible_option = _incompatible_ssh_option(token)
+    if incompatible_option is not None:
+        raise SystemExit(_format_incompatible_ssh_option_error(token, incompatible_option))
     if token in SSH_OPTIONS_WITH_VALUES:
         value = _next_value(tokens, index, token)
+        if token == "-o":
+            _reject_incompatible_ssh_config_option(value)
         return [token, value], index + 2
     attached_option = _attached_ssh_option(token, SSH_OPTIONS_WITH_VALUES)
     if attached_option is not None:
-        return [attached_option, token[len(attached_option) :]], index + 1
+        value = token[len(attached_option) :]
+        if attached_option == "-o":
+            _reject_incompatible_ssh_config_option(value)
+        return [attached_option, value], index + 1
     if token in SSH_FLAG_OPTIONS:
         return [token], index + 1
     return None
+
+
+def _incompatible_ssh_option(token: str) -> str | None:
+    if token in INCOMPATIBLE_SSH_OPTIONS:
+        return token
+    return _attached_ssh_option(token, set(INCOMPATIBLE_SSH_OPTIONS))
+
+
+def _format_incompatible_ssh_option_error(token: str, option: str) -> str:
+    return f"ssh option {token} is not compatible with sessh: {INCOMPATIBLE_SSH_OPTIONS[option]}"
+
+
+def _reject_incompatible_ssh_config_option(value: str) -> None:
+    option, option_value = _parse_ssh_config_option(value)
+    if option == "forkafterauthentication" and _is_ssh_config_yes(option_value):
+        raise SystemExit(
+            "ssh option -o ForkAfterAuthentication=yes is not compatible with sessh: "
+            "it backgrounds ssh and implies StdinNull=yes, but sessh must relay an interactive terminal"
+        )
+    if option == "remotecommand" and option_value.lower() != "none":
+        raise SystemExit(
+            "ssh option -o RemoteCommand is not compatible with sessh: "
+            "sessh must supply its own remote tmux bootstrap command"
+        )
+    if option == "requesttty" and option_value.lower() == "no":
+        raise SystemExit(
+            "ssh option -o RequestTTY=no is not compatible with sessh: "
+            "it disables remote TTY allocation, but sessh requires a remote TTY for tmux-backed sessions"
+        )
+    if option == "sessiontype" and option_value.lower() != "default":
+        raise SystemExit(
+            f"ssh option -o SessionType={option_value} is not compatible with sessh: "
+            "it prevents sessh from running its remote tmux bootstrap command"
+        )
+    if option == "stdinnull" and _is_ssh_config_yes(option_value):
+        raise SystemExit(
+            "ssh option -o StdinNull=yes is not compatible with sessh: "
+            "it prevents ssh from reading stdin, but sessh needs stdin for interactive sessions"
+        )
+
+
+def _parse_ssh_config_option(value: str) -> tuple[str, str]:
+    stripped = value.strip()
+    if "=" in stripped:
+        option, option_value = stripped.split("=", 1)
+    else:
+        parts = stripped.split(None, 1)
+        option = parts[0] if parts else ""
+        option_value = parts[1] if len(parts) == 2 else ""
+    return option.lower(), option_value.strip()
+
+
+def _is_ssh_config_yes(value: str) -> bool:
+    return value.lower() in {"yes", "true"}
 
 
 def _attached_ssh_option(token: str, options: set[str]) -> str | None:
