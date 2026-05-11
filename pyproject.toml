@@ -21,5 +21,6 @@ packages = ["src/sessh"]
 
 [dependency-groups]
 dev = [
+    "ruff>=0.15.12",
     "shellcheck-py>=0.11.0.1",
 ]

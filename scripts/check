@@ -42,6 +42,8 @@ if [ "$#" -ne 0 ]; then
 fi
 
 run uv run shellcheck scripts/check scripts/package-release src/sessh/remote.sh
+run uv run ruff format --check .
+run uv run ruff check .
 run scripts/package-release --check
 run uv run --no-project --with-editable . python -m unittest discover -s tests
 
