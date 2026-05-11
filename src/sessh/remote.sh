@@ -422,19 +422,20 @@ sessh_terminal_padding_lf() {
   done
 }
 
-sessh_terminal_prelude() {
-  sessh_label=$1
-  sessh_resume_id=$2
-  sessh_note=${3:-}
-  sessh_terminal_boundary "$sessh_label" "$sessh_resume_id" "$sessh_note"
-  sessh_terminal_padding_lf
-}
-
-sessh_terminal_epilogue() {
-  sessh_label=$1
-  sessh_resume_id=$2
-  sessh_terminal_boundary "$sessh_label" "$sessh_resume_id"
-  sessh_terminal_padding_lf
+sessh_terminal_preserve_screen() {
+  sessh_lines=$(sessh_terminal_lines)
+  sessh_preserve_lines=$((sessh_lines - 1))
+  if [ "$sessh_preserve_lines" -lt 0 ]; then
+    sessh_preserve_lines=0
+  fi
+  sessh_i=0
+  while [ "$sessh_i" -lt "$sessh_preserve_lines" ]; do
+    printf '\n' >&2
+    sessh_i=$((sessh_i + 1))
+  done
+  if [ "$sessh_preserve_lines" -gt 0 ]; then
+    printf '\033[%sA' "$sessh_preserve_lines" >&2
+  fi
 }
 
 sessh_terminal_boundary() {
@@ -606,7 +607,8 @@ sessh_attach_existing_session() {
   if [ "$sessh_scrollback" -gt 0 ]; then
     sessh_terminal_boundary "$sessh_attach_label" "$sessh_resume_id" "$sessh_attach_note"
   else
-    sessh_terminal_prelude "$sessh_attach_label" "$sessh_resume_id" "$sessh_attach_note"
+    sessh_terminal_preserve_screen
+    sessh_terminal_boundary "$sessh_attach_label" "$sessh_resume_id" "$sessh_attach_note"
   fi
   set +e
   if [ "$sessh_scrollback" -gt 0 ]; then

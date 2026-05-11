@@ -243,6 +243,86 @@ class RemoteBootstrapTests(unittest.TestCase):
             self.assertFalse(remote.has_session("abc123"))
             self.assertFalse((remote.sessions_dir / "abc123").exists())
 
+    def test_new_interactive_attach_does_not_insert_blank_padding(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        with LocalRemoteHarness(self) as remote:
+            with remote.outer_tmux(height=12, history_limit=200) as outer:
+                outer.start_driver(
+                    [
+                        "new-interactive",
+                        "bash",
+                        "200",
+                        "",
+                        "PS1='PROMPT> '\n",
+                        "",
+                        "abc123",
+                        "localhost",
+                        "0",
+                    ]
+                )
+                outer.wait_for_text("PROMPT>")
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+            self.assertEqual(
+                terminal_payload,
+                "\n".join(
+                    [
+                        "--- sessh created abc123 ---",
+                        "PROMPT>",
+                    ]
+                )
+                + "\n",
+            )
+
+    def test_new_interactive_attach_preserves_previous_terminal_lines(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        with LocalRemoteHarness(self) as remote:
+            with remote.outer_tmux(height=8, history_limit=200) as outer:
+                outer.start_driver(
+                    [
+                        "new-interactive",
+                        "bash",
+                        "200",
+                        "",
+                        "PS1='PROMPT> '\n",
+                        "",
+                        "abc123",
+                        "localhost",
+                        "0",
+                    ],
+                    before_transaction=[
+                        "before-1",
+                        "before-2",
+                        "before-3",
+                        "before-4",
+                    ],
+                )
+                outer.wait_for_text("PROMPT>")
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+            self.assertEqual(
+                terminal_payload,
+                "\n".join(
+                    [
+                        "before-1",
+                        "before-2",
+                        "before-3",
+                        "before-4",
+                        "--- sessh created abc123 ---",
+                        "PROMPT>",
+                    ]
+                )
+                + "\n",
+            )
+
     def test_interactive_attach_replays_configured_scrollback_before_attach(self):
         require_tool("tmux")
         require_tool("bash")
@@ -576,10 +656,13 @@ class LocalOuterTmuxDriver:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
-    def start_driver(self, remote_argv):
+    def start_driver(self, remote_argv, *, before_transaction=()):
         script = files("sessh").joinpath("remote.sh").read_text(encoding="utf-8")
         self.transaction.write_text(script + '\nsessh_main "$@"\n', encoding="utf-8")
         self.transaction.chmod(0o700)
+        before_transaction_lines = [
+            f"printf '%s\\n' {shlex.quote(line)}" for line in before_transaction
+        ]
         self.driver.write_text(
             "\n".join(
                 [
@@ -590,6 +673,7 @@ class LocalOuterTmuxDriver:
                     f"LINES={self.height}",
                     f"COLUMNS={self.width}",
                     "export HOME XDG_STATE_HOME LINES COLUMNS",
+                    *before_transaction_lines,
                     " ".join(
                         [
                             shlex.quote(str(self.transaction)),
