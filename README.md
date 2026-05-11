@@ -37,8 +37,11 @@ normal tmux prefix, and no user tmux socket/config interference.
 Remote commands also use tmux. By default, their arguments follow ssh's
 shell-evaluated command model. `--preserve-args` quotes the command arguments
 so the remote command sees the same argv boundaries that sessh received. Remote
-commands keep completed output in a dead pane and exit locally with the remote
-command status. For now, remote commands require stdout and stderr to be TTYs.
+commands stream output from a tmux `pipe-pane` transcript and exit locally with
+the remote command status. If the live SSH transaction disconnects before the
+run is drained, `--attach` replays the transcript from the beginning and follows
+new output until completion. For now, remote commands require stdout and stderr
+to be TTYs.
 
 The use of tmux means that `sessh` is able to persist and restore the
 scrollback buffer.

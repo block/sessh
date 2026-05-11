@@ -212,6 +212,7 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         with OuterTmuxSession(self) as outer:
             outer.start_driver(
                 [
+                    "--quiet",
                     "--config",
                     str(config),
                     *self.ssh_options,
@@ -227,45 +228,35 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                 ],
             )
             exit_status = outer.wait_for_exit()
-            lines = outer.terminal_lines()
+            payload = outer.terminal_payload()
+            lines = payload.splitlines()
 
         self.assertEqual(exit_status, 3)
         resume_id = parse_boundary_resume_id(self, lines[0], "sessh created")
         self.assertEqual(
-            lines,
-            [
-                f"--- sessh created {resume_id} ---",
-                "hello world",
-                "$HOME",
-                "*.log",
-                "semi;colon",
-                "sessh run exited with status 3",
-                f"--- sessh exited {resume_id} ---",
-                "hello world",
-                "$HOME",
-                "*.log",
-                "semi;colon",
-                "sessh run exited with status 3",
-            ],
+            payload,
+            "\n".join(
+                [
+                    f"--- sessh created {resume_id} ---",
+                    "hello world",
+                    "$HOME",
+                    "*.log",
+                    "semi;colon",
+                    "sessh run exited with status 3",
+                    f"--- sessh exited {resume_id} ---",
+                ]
+            )
+            + "\n",
         )
-        self.assertTrue(self._has_session(resume_id))
-        self.client().run(
-            ["test", "!", "-e", f"{REMOTE_STATE}/sessions/{resume_id}/completion.json"]
-        )
-        self.client().run(
-            [
-                "test",
-                "!",
-                "-e",
-                f"{REMOTE_STATE}/sessions/{resume_id}/completion.json.tmp",
-            ]
-        )
+        self.assertFalse(self._has_session(resume_id))
+        self.client().run(["test", "!", "-d", f"{REMOTE_STATE}/sessions/{resume_id}"])
 
     def test_cli_run_exit_255_is_not_reported_as_transport_disconnect(self):
         config = self._write_cli_config("cli-run-255")
         with OuterTmuxSession(self) as outer:
             outer.start_driver(
                 [
+                    "--quiet",
                     "--config",
                     str(config),
                     *self.ssh_options,
@@ -274,21 +265,24 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                 ],
             )
             exit_status = outer.wait_for_exit()
-            lines = outer.terminal_lines()
+            payload = outer.terminal_payload()
+            lines = payload.splitlines()
 
         self.assertEqual(exit_status, 255)
         resume_id = parse_boundary_resume_id(self, lines[0], "sessh created")
         self.assertEqual(
-            lines,
-            [
-                f"--- sessh created {resume_id} ---",
-                "status-255",
-                "sessh run exited with status 255",
-                f"--- sessh exited {resume_id} ---",
-                "status-255",
-                "sessh run exited with status 255",
-            ],
+            payload,
+            "\n".join(
+                [
+                    f"--- sessh created {resume_id} ---",
+                    "status-255",
+                    "sessh run exited with status 255",
+                    f"--- sessh exited {resume_id} ---",
+                ]
+            )
+            + "\n",
         )
+        self.assertFalse(self._has_session(resume_id))
 
     def test_cli_run_over_real_ssh_applies_remote_rc_and_evaluates_args(self):
         config = self._write_cli_config(
@@ -298,6 +292,7 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         with OuterTmuxSession(self) as outer:
             outer.start_driver(
                 [
+                    "--quiet",
                     "--config",
                     str(config),
                     *self.ssh_options,
@@ -306,41 +301,42 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                 ],
             )
             exit_status = outer.wait_for_exit()
-            lines = outer.terminal_lines()
+            payload = outer.terminal_payload()
+            lines = payload.splitlines()
 
         self.assertEqual(exit_status, 0)
         resume_id = parse_boundary_resume_id(self, lines[0], "sessh created")
         self.assertEqual(
-            lines,
-            [
-                f"--- sessh created {resume_id} ---",
-                "eval:/home/sessh",
-                "rc:from remote rc; $HOME",
-                f"remote_rc:{REMOTE_STATE}/remote-rc",
-                "sessh run exited with status 0",
-                f"--- sessh exited {resume_id} ---",
-                "eval:/home/sessh",
-                "rc:from remote rc; $HOME",
-                f"remote_rc:{REMOTE_STATE}/remote-rc",
-                "sessh run exited with status 0",
-            ],
+            payload,
+            "\n".join(
+                [
+                    f"--- sessh created {resume_id} ---",
+                    "eval:/home/sessh",
+                    "rc:from remote rc; $HOME",
+                    f"remote_rc:{REMOTE_STATE}/remote-rc",
+                    "sessh run exited with status 0",
+                    f"--- sessh exited {resume_id} ---",
+                ]
+            )
+            + "\n",
         )
+        self.assertFalse(self._has_session(resume_id))
 
-    def test_cli_list_shows_completed_run_session(self):
+    def test_cli_list_omits_completed_run_session_after_live_drain(self):
         config = self._write_cli_config("cli-list-run")
         with OuterTmuxSession(self) as outer:
             outer.start_driver(
                 [
+                    "--quiet",
                     "--config",
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "printf",
-                    "listed",
+                    "printf 'listed\\n'",
                 ]
             )
             self.assertEqual(outer.wait_for_exit(), 0)
-            run_lines = outer.terminal_lines()
+            run_lines = outer.terminal_payload_lines()
         resume_id = parse_boundary_resume_id(self, run_lines[0], "sessh created")
         stdout = io.StringIO()
 
@@ -361,25 +357,28 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         self.assertEqual(exit_status, 0)
         rows = [line.split("\t") for line in stdout.getvalue().splitlines()[1:]]
         matching_rows = [row for row in rows if row[0] == resume_id]
-        self.assertEqual(len(matching_rows), 1)
-        self.assertEqual(matching_rows[0][1], "no")
-        self.assertEqual(matching_rows[0][4], "printf")
+        self.assertEqual(matching_rows, [])
 
     def test_cli_list_sorts_unattached_before_attached_sessions(self):
         run_config = self._write_cli_config("cli-list-sort-run")
         with OuterTmuxSession(self) as outer:
             outer.start_driver(
                 [
+                    "--quiet",
                     "--config",
                     str(run_config),
                     *self.ssh_options,
                     self.host,
-                    "printf",
-                    "listed",
+                    "--preserve-args",
+                    "sh",
+                    "-c",
+                    "printf 'listed-ready\\n'; while :; do sleep 1; done",
                 ]
             )
-            self.assertEqual(outer.wait_for_exit(), 0)
+            outer.wait_for_text("listed-ready")
             run_lines = outer.terminal_lines()
+            outer.send_ssh_disconnect()
+            self.assertEqual(outer.wait_for_exit(), 255)
         run_id = parse_boundary_resume_id(self, run_lines[0], "sessh created")
 
         attached_config = self._write_cli_config(
@@ -420,7 +419,7 @@ done
         rows = [line.split("\t") for line in stdout.getvalue().splitlines()[1:]]
         row_by_id = {row[0]: row for row in rows}
         self.assertEqual(row_by_id[run_id][1], "no")
-        self.assertEqual(row_by_id[run_id][4], "printf")
+        self.assertEqual(row_by_id[run_id][4], "sh")
         self.assertEqual(row_by_id[attached_id][1], "yes")
         self.assertLess(
             rows.index(row_by_id[run_id]), rows.index(row_by_id[attached_id])
@@ -627,17 +626,24 @@ done
         self.assertNotEqual(exit_status, 0)
         self.assertEqual(final_tty_state, initial_tty_state)
 
-    def test_cli_run_clean_detach_prints_run_detached_boundary_and_attach_command(self):
+    def test_cli_run_transport_disconnect_leaves_session_and_attach_replays_output(
+        self,
+    ):
+        continue_file = f"{REMOTE_STATE}/run-detach-continue"
         config = self._write_cli_config("cli-run-detach")
 
         with OuterTmuxSession(self) as outer:
             outer.start_driver(
                 [
+                    "--quiet",
                     "--config",
                     str(config),
                     *self.ssh_options,
                     self.host,
-                    "printf 'run-detach-ready\\n'; while :; do sleep 1; done",
+                    "--preserve-args",
+                    "sh",
+                    "-c",
+                    f"printf 'run-detach-ready\\n'; while [ ! -f {continue_file} ]; do sleep 0.05; done; printf 'run-detach-done\\n'; exit 4",
                 ]
             )
             initial_tty_state = outer.wait_for_initial_tty_state()
@@ -645,21 +651,12 @@ done
             resume_id = find_boundary_resume_id(
                 self, outer.terminal_lines(), "sessh created"
             )
-            self.client().run(
-                [
-                    "tmux",
-                    "-S",
-                    f"{REMOTE_STATE}/sockets/tmux.sock",
-                    "detach-client",
-                    "-s",
-                    f"sessh-{resume_id}",
-                ]
-            )
+            outer.send_ssh_disconnect()
             exit_status = outer.wait_for_exit()
             final_tty_state = outer.wait_for_final_tty_state()
             lines = outer.terminal_lines()
 
-        self.assertEqual(exit_status, 1)
+        self.assertEqual(exit_status, 255)
         self.assertEqual(final_tty_state, initial_tty_state)
         self.assertEqual(
             lines,
@@ -667,11 +664,44 @@ done
                 f"--- sessh created {resume_id} ---",
                 "run-detach-ready",
                 f"--- sessh detached {resume_id} ---",
-                "Run session is still active. To inspect it, run:",
+                "To attach to this session, run:",
                 f"  sessh {self.host} --attach {resume_id}",
             ],
         )
         self.assertTrue(self._has_session(resume_id))
+
+        with OuterTmuxSession(self) as outer:
+            outer.start_driver(
+                [
+                    "--quiet",
+                    "--config",
+                    str(config),
+                    *self.ssh_options,
+                    self.host,
+                    "--attach",
+                    resume_id,
+                ]
+            )
+            outer.wait_for_text("run-detach-ready")
+            self.client().run(["touch", continue_file])
+            self.assertEqual(outer.wait_for_exit(), 4)
+            attached_payload = outer.terminal_payload()
+
+        self.assertEqual(
+            attached_payload,
+            "\n".join(
+                [
+                    f"--- sessh attached {resume_id} ---",
+                    "run-detach-ready",
+                    "run-detach-done",
+                    "sessh run exited with status 4",
+                    f"--- sessh exited {resume_id} ---",
+                ]
+            )
+            + "\n",
+        )
+        self.assertFalse(self._has_session(resume_id))
+        self.client().run(["test", "!", "-d", f"{REMOTE_STATE}/sessions/{resume_id}"])
 
     @classmethod
     def _container_port(cls) -> str:
@@ -864,7 +894,7 @@ sys.exit(main({list(argv)!r}))
             "sessh_driver_status=$?; "
             f"stty -g > {shlex.quote(str(self.final_tty_state_file))}; "
             f"printf '%s\\n' \"$sessh_driver_status\" > {shlex.quote(str(self.status_file))}; "
-            "printf '\\n__SESSH_DRIVER_DONE__=%s\\n' \"$sessh_driver_status\"; "
+            "printf '__SESSH_DRIVER_DONE__=%s\\n' \"$sessh_driver_status\"; "
             "sleep 3600"
         )
         self._tmux(
@@ -947,6 +977,16 @@ sys.exit(main({list(argv)!r}))
 
     def terminal_lines(self):
         return terminal_lines(self.capture())
+
+    def terminal_payload(self):
+        capture = self.capture()
+        marker = "__SESSH_DRIVER_DONE__="
+        marker_index = capture.find(marker)
+        self.testcase.assertNotEqual(marker_index, -1, capture)
+        return capture[:marker_index]
+
+    def terminal_payload_lines(self):
+        return self.terminal_payload().splitlines()
 
     def _tmux(self, *args, check=True):
         result = subprocess.run(

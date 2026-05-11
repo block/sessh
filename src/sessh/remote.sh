@@ -38,7 +38,7 @@ sessh_main() {
       sessh_eval_args=${1:?}; shift
       sessh_command_name=${1-}; shift
       sessh_create_run_session "$sessh_resume_id" "$sessh_command_name" "$sessh_eval_args" "$@"
-      sessh_attach_run_session "$sessh_resume_id" "$sessh_host" 'sessh created'
+      sessh_attach_run_session "$sessh_resume_id" 'sessh created' 1
       ;;
     *)
       printf 'sessh: unknown remote transaction mode: %s\n' "$sessh_mode" >&2
@@ -160,6 +160,115 @@ sessh_session_command_name() {
   sed -n '1p' "$sessh_command_name_file"
 }
 
+sessh_run_transcript_file() {
+  printf '%s/transcript' "$(sessh_session_dir "$1")"
+}
+
+sessh_run_status_file() {
+  printf '%s/exit-status' "$(sessh_session_dir "$1")"
+}
+
+sessh_run_start_channel() {
+  printf 'sessh-start-%s' "$1"
+}
+
+sessh_file_size() {
+  if [ ! -e "$1" ]; then
+    printf '0\n'
+    return 0
+  fi
+  wc -c < "$1" | tr -d ' '
+}
+
+sessh_stream_file_range() {
+  sessh_stream_file=$1
+  sessh_stream_offset=$2
+  sessh_stream_count=$3
+  [ "$sessh_stream_count" -gt 0 ] || return 0
+  dd if="$sessh_stream_file" bs=1 skip="$sessh_stream_offset" count="$sessh_stream_count" >&2 2>/dev/null
+}
+
+sessh_drain_run_transcript_available() {
+  sessh_transcript_file=$1
+  sessh_transcript_offset=$2
+  sessh_transcript_size=$(sessh_file_size "$sessh_transcript_file")
+  if [ "$sessh_transcript_size" -gt "$sessh_transcript_offset" ]; then
+    sessh_stream_file_range "$sessh_transcript_file" "$sessh_transcript_offset" "$((sessh_transcript_size - sessh_transcript_offset))"
+    sessh_transcript_offset=$sessh_transcript_size
+  fi
+  printf '%s\n' "$sessh_transcript_offset"
+}
+
+sessh_record_run_pane_status_if_dead() {
+  sessh_resume_id=$1
+  sessh_status_file=$(sessh_run_status_file "$sessh_resume_id")
+  [ ! -r "$sessh_status_file" ] || return 0
+  sessh_session_name=$(sessh_session_name "$sessh_resume_id")
+  sessh_pane_state=$(sessh_tmux display-message -p -t "$sessh_session_name:0.0" '#{pane_dead}	#{pane_dead_status}	#{pane_dead_signal}' 2>/dev/null || printf '0		')
+  sessh_pane_dead=$(printf '%s\n' "$sessh_pane_state" | cut -f1)
+  [ "$sessh_pane_dead" = 1 ] || return 0
+  sessh_exit_status=$(printf '%s\n' "$sessh_pane_state" | cut -f2)
+  sessh_exit_signal=$(printf '%s\n' "$sessh_pane_state" | cut -f3)
+  case "$sessh_exit_status" in
+    ''|*[!0-9]*)
+      case "$sessh_exit_signal" in
+        ''|*[!0-9]*) sessh_exit_status=1 ;;
+        *) sessh_exit_status=$((128 + sessh_exit_signal)) ;;
+      esac
+      ;;
+  esac
+  sessh_status_tmp="${sessh_status_file}.pane.tmp"
+  printf '%s\n' "$sessh_exit_status" > "$sessh_status_tmp"
+  mv "$sessh_status_tmp" "$sessh_status_file"
+}
+
+sessh_stream_run_transcript() {
+  sessh_resume_id=$1
+  sessh_transcript_file=$(sessh_run_transcript_file "$sessh_resume_id")
+  sessh_status_file=$(sessh_run_status_file "$sessh_resume_id")
+  sessh_transcript_offset=0
+  while :; do
+    sessh_transcript_offset=$(sessh_drain_run_transcript_available "$sessh_transcript_file" "$sessh_transcript_offset")
+    sessh_record_run_pane_status_if_dead "$sessh_resume_id"
+    if [ -r "$sessh_status_file" ]; then
+      sessh_stable_passes=0
+      while [ "$sessh_stable_passes" -lt 2 ]; do
+        sleep 0.05
+        sessh_previous_offset=$sessh_transcript_offset
+        sessh_transcript_offset=$(sessh_drain_run_transcript_available "$sessh_transcript_file" "$sessh_transcript_offset")
+        if [ "$sessh_transcript_offset" = "$sessh_previous_offset" ]; then
+          sessh_stable_passes=$((sessh_stable_passes + 1))
+        else
+          sessh_stable_passes=0
+        fi
+      done
+      return 0
+    fi
+    sleep 0.05
+  done
+}
+
+sessh_read_run_exit_status() {
+  sessh_status_file=$(sessh_run_status_file "$1")
+  if [ ! -r "$sessh_status_file" ]; then
+    printf '1\n'
+    return 0
+  fi
+  sessh_exit_status=$(sed -n '1p' "$sessh_status_file")
+  case "$sessh_exit_status" in
+    ''|*[!0-9]*) printf '1\n' ;;
+    *) printf '%s\n' "$sessh_exit_status" ;;
+  esac
+}
+
+sessh_cleanup_session() {
+  sessh_resume_id=$1
+  sessh_session_name=$(sessh_session_name "$sessh_resume_id")
+  sessh_session_dir=$(sessh_session_dir "$sessh_resume_id")
+  sessh_tmux kill-session -t "$sessh_session_name" >/dev/null 2>&1 || true
+  rm -rf "$sessh_session_dir"
+}
+
 sessh_session_rows_unsorted() {
   sessh_panes=$(sessh_tmux list-panes -a -F '#{session_name}	#{session_attached}	#{session_created}	#{window_active}	#{pane_active}	#{pane_current_path}	#{pane_current_command}	#{window_name}' 2>/dev/null || true)
   [ -n "$sessh_panes" ] || return 0
@@ -256,7 +365,7 @@ sessh_apply_options() {
   sessh_tmux set-window-option -t "$sessh_target" pane-border-status off
   sessh_tmux set-window-option -t "$sessh_target" remain-on-exit "$sessh_remain_on_exit"
   if [ "$sessh_remain_on_exit" = on ]; then
-    sessh_tmux set-window-option -t "$sessh_target" remain-on-exit-format 'sessh run exited with status #{pane_dead_status}'
+    sessh_tmux set-window-option -t "$sessh_target" remain-on-exit-format ''
   fi
 }
 
@@ -466,6 +575,9 @@ sessh_attach_interactive_session() {
   sessh_attach_label=$3
   sessh_session_name=$(sessh_session_name "$sessh_resume_id")
   sessh_session_dir=$(sessh_session_dir "$sessh_resume_id")
+  if [ -r "$(sessh_run_transcript_file "$sessh_resume_id")" ]; then
+    sessh_attach_run_session "$sessh_resume_id" "$sessh_attach_label" 0
+  fi
   sessh_attach_existing_session "$sessh_resume_id" "$sessh_attach_label"
   if sessh_tmux has-session -t "$sessh_session_name" >/dev/null 2>&1; then
     sessh_exit_detached_session "$sessh_resume_id" "$sessh_host" 'To attach to this session, run:' 0
@@ -493,17 +605,20 @@ sessh_create_run_session() {
   else
     rm -f "$sessh_session_dir/command-name"
   fi
+  sessh_transcript_file=$(sessh_run_transcript_file "$sessh_resume_id")
+  sessh_status_file=$(sessh_run_status_file "$sessh_resume_id")
+  : > "$sessh_transcript_file"
+  rm -f "$sessh_status_file" "$sessh_status_file.tmp" "$sessh_status_file.pane.tmp"
   sessh_write_run_entrypoint "$sessh_resume_id" "$sessh_eval_args" "$@"
   sessh_entrypoint="$sessh_session_dir/run.sh"
-  sessh_start_channel="sessh-start-$sessh_resume_id"
+  sessh_start_channel=$(sessh_run_start_channel "$sessh_resume_id")
   sessh_start_command="$(sessh_quote "$SESSH_TMUX") -S $(sessh_quote "$SESSH_SOCKET") wait-for $(sessh_quote "$sessh_start_channel"); sh $(sessh_quote "$sessh_entrypoint")"
   sessh_width=${COLUMNS:-80}
   sessh_height=${LINES:-24}
   sessh_tmux new-session -d -s "$sessh_session_name" -x "$sessh_width" -y "$sessh_height" "$sessh_start_command"
   sessh_apply_options "$sessh_session_name" on
-  sessh_detach_command="$(sessh_quote "$SESSH_TMUX") -S $(sessh_quote "$SESSH_SOCKET") detach-client -s $(sessh_quote "$sessh_session_name") >/dev/null 2>&1 || true"
-  sessh_tmux set-hook -p -t "$sessh_session_name:0.0" pane-died "run-shell -b $(sessh_quote "$sessh_detach_command")"
-  sessh_tmux set-hook -t "$sessh_session_name" client-attached "wait-for -S $sessh_start_channel"
+  sessh_pipe_command="cat >> $(sessh_quote "$sessh_transcript_file")"
+  sessh_tmux pipe-pane -o -t "$sessh_session_name:0.0" "$sessh_pipe_command"
   sessh_emit_event created "$sessh_resume_id"
 }
 
@@ -518,26 +633,37 @@ sessh_write_run_entrypoint() {
     sessh_write_assignment SESSH_REMOTE_RC "$SESSH_REMOTE_RC"
     sessh_write_assignment SESSH_SHELL "$SESSH_SHELL"
     sessh_write_assignment SESSH_EVAL_ARGS "$sessh_eval_args"
+    sessh_write_assignment SESSH_STATUS_FILE "$(sessh_run_status_file "$sessh_resume_id")"
     printf '%s' 'set --'
     for sessh_arg do
       printf ' %s' "$(sessh_quote "$sessh_arg")"
     done
     printf '\n'
     cat <<'SESSH_RUN_ENTRYPOINT'
-export SESSH_REMOTE_RC SESSH_EVAL_ARGS
+export SESSH_REMOTE_RC SESSH_EVAL_ARGS SESSH_STATUS_FILE
 "$SESSH_SHELL" -c '
 SESSH_REMOTE_RC=${SESSH_REMOTE_RC:?}; export SESSH_REMOTE_RC
 if [ -r "$SESSH_REMOTE_RC" ]; then
   . "$SESSH_REMOTE_RC"
 fi
 if [ "$SESSH_EVAL_ARGS" = 1 ]; then
-  eval "$*"
+  ( eval "$*" )
 else
-  "$@"
+  ( "$@" )
 fi
 sessh_run_status=$?
+sessh_status_tmp="${SESSH_STATUS_FILE}.tmp"
+printf "%s\n" "$sessh_run_status" > "$sessh_status_tmp"
+mv "$sessh_status_tmp" "$SESSH_STATUS_FILE"
 exit "$sessh_run_status"
 ' -- "$@"
+sessh_run_status=$?
+if [ ! -r "$SESSH_STATUS_FILE" ]; then
+  sessh_status_tmp="${SESSH_STATUS_FILE}.tmp"
+  printf '%s\n' "$sessh_run_status" > "$sessh_status_tmp"
+  mv "$sessh_status_tmp" "$SESSH_STATUS_FILE"
+fi
+exit "$sessh_run_status"
 SESSH_RUN_ENTRYPOINT
   } > "$sessh_entrypoint"
   chmod 700 "$sessh_entrypoint"
@@ -545,29 +671,29 @@ SESSH_RUN_ENTRYPOINT
 
 sessh_attach_run_session() {
   sessh_resume_id=$1
-  sessh_host=$2
-  sessh_attach_label=$3
+  sessh_attach_label=$2
+  sessh_start_run=$3
   sessh_session_name=$(sessh_session_name "$sessh_resume_id")
-  sessh_attach_existing_session "$sessh_resume_id" "$sessh_attach_label"
-
-  sessh_pane_state=$(sessh_tmux display-message -p -t "$sessh_session_name:0.0" '#{pane_dead}	#{pane_dead_status}	#{pane_dead_signal}' 2>/dev/null || printf '0		')
-  sessh_pane_dead=$(printf '%s\n' "$sessh_pane_state" | cut -f1)
-  sessh_exit_status=$(printf '%s\n' "$sessh_pane_state" | cut -f2)
-  sessh_exit_signal=$(printf '%s\n' "$sessh_pane_state" | cut -f3)
-  if [ "$sessh_pane_dead" != 1 ]; then
-    sessh_exit_detached_session "$sessh_resume_id" "$sessh_host" 'Run session is still active. To inspect it, run:' 1
+  sessh_transcript_file=$(sessh_run_transcript_file "$sessh_resume_id")
+  sessh_status_file=$(sessh_run_status_file "$sessh_resume_id")
+  if [ ! -r "$sessh_transcript_file" ]; then
+    printf 'sessh: session not found: %s\n' "$sessh_resume_id" >&2
+    exit 1
   fi
-  case "$sessh_exit_status" in
-    ''|*[!0-9]*)
-      case "$sessh_exit_signal" in
-        ''|*[!0-9]*) sessh_exit_status=1 ;;
-        *) sessh_exit_status=$((128 + sessh_exit_signal)) ;;
-      esac
-      ;;
-  esac
+  if [ ! -r "$sessh_status_file" ] && ! sessh_tmux has-session -t "$sessh_session_name" >/dev/null 2>&1; then
+    printf 'sessh: session not found: %s\n' "$sessh_resume_id" >&2
+    exit 1
+  fi
+  sessh_emit_event attached "$sessh_resume_id"
+  sessh_terminal_boundary "$sessh_attach_label" "$sessh_resume_id"
+  if [ "$sessh_start_run" = 1 ]; then
+    sessh_tmux wait-for -S "$(sessh_run_start_channel "$sessh_resume_id")"
+  fi
+  sessh_stream_run_transcript "$sessh_resume_id"
+  sessh_exit_status=$(sessh_read_run_exit_status "$sessh_resume_id")
   sessh_emit_event exited "$sessh_resume_id" "$sessh_exit_status"
-  sessh_terminal_epilogue 'sessh exited' "$sessh_resume_id"
-  printf '\033[H\033[2J' >&2
-  sessh_tmux capture-pane -p -S "-$SESSH_HISTORY_LIMIT" -E - -t "$sessh_session_name:0.0" >&2 || true
+  printf 'sessh run exited with status %s\n' "$sessh_exit_status" >&2
+  sessh_terminal_boundary 'sessh exited' "$sessh_resume_id"
+  sessh_cleanup_session "$sessh_resume_id"
   exit "$sessh_exit_status"
 }
