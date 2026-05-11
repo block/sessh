@@ -96,6 +96,54 @@ class RemoteBootstrapTests(unittest.TestCase):
                 ],
             )
 
+    def test_remote_shell_reports_missing_tmux_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_home = root / "state"
+            empty_path = root / "empty-path"
+            empty_path.mkdir()
+            script = (
+                files("sessh").joinpath("remote.sh").read_text(encoding="utf-8")
+                + '\nsessh_main "$@"\n'
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    script,
+                    "sessh",
+                    "list",
+                    "bash",
+                    "77",
+                    f"PATH={empty_path}; export PATH",
+                    default_remote_rc("bash"),
+                    "",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "HOME": str(root),
+                    "XDG_STATE_HOME": str(state_home),
+                },
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 127)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(
+                result.stderr,
+                "\n".join(
+                    [
+                        "sessh: required remote tool not found: tmux",
+                        "sessh: install tmux on the remote host or make it available in PATH",
+                    ]
+                )
+                + "\n",
+            )
+
     def test_run_streams_exact_outer_terminal_state_from_transcript(self):
         require_tool("tmux")
         require_tool("bash")

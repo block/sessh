@@ -641,6 +641,35 @@ exit 0
         self.assertIn(f"--- sessh exited {resume_id} ---", lines)
         self.assertFalse(self._has_session(resume_id))
 
+    def test_cli_missing_tmux_reports_dependency_error_without_auto_reattach(self):
+        config = self._write_cli_config(
+            "cli-missing-tmux",
+            remote_init="PATH=/tmp/sessh-no-tmux; export PATH",
+        )
+
+        with OuterTmuxSession(self) as outer:
+            outer.start_driver(
+                [
+                    "--quiet",
+                    "--auto-reattach",
+                    "--config",
+                    str(config),
+                    *self.ssh_options,
+                    self.host,
+                ]
+            )
+            exit_status = outer.wait_for_exit()
+            lines = outer.terminal_lines()
+
+        self.assertEqual(exit_status, 127)
+        self.assertEqual(
+            lines,
+            [
+                "sessh: required remote tool not found: tmux",
+                "sessh: install tmux on the remote host or make it available in PATH",
+            ],
+        )
+
     def test_cli_auto_reattach_does_not_retry_ssh_escape_disconnect(self):
         remote_rc = """printf 'auto-escape-ready\\n'
 while :; do

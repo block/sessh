@@ -105,6 +105,7 @@ sessh_bootstrap() {
 sessh_require_tool() {
   if ! command -v "$1" >/dev/null 2>&1; then
     printf '%s\n' "sessh: required remote tool not found: $1" >&2
+    printf '%s\n' "sessh: install $1 on the remote host or make it available in PATH" >&2
     exit 127
   fi
 }

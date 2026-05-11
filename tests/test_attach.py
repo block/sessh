@@ -167,6 +167,28 @@ class AttachTests(unittest.TestCase):
         self.assertEqual(exit_status, 255)
         self.assertEqual(run_pty_relay.call_count, 1)
 
+    def test_auto_reattach_does_not_retry_remote_dependency_failure(self):
+        stderr = TtyStringIO()
+        with patch(
+            "sessh.attach.run_pty_relay",
+            return_value=RelayResult(exit_status=127, resume_id="abc123"),
+        ) as run_pty_relay:
+            exit_status = attach_remote_transaction(
+                FakeClient(),
+                ["new"],
+                stdin=TtyStringIO(),
+                stderr=stderr,
+                metadata_nonce="nonce",
+                auto_reattach=True,
+                reattach_remote_argv_builder=lambda resume_id: ["attach", resume_id],
+                auto_reattach_initial_delay=0,
+            )
+
+        self.assertEqual(exit_status, 127)
+        self.assertEqual(run_pty_relay.call_count, 1)
+        self.assertNotIn("auto-reattaching", stderr.getvalue())
+        self.assertNotIn("reattaching session", stderr.getvalue())
+
     def test_auto_reattach_does_not_retry_user_requested_disconnect(self):
         with patch(
             "sessh.attach.run_pty_relay",
