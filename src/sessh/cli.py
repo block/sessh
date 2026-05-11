@@ -12,7 +12,7 @@ from typing import Sequence
 
 from sessh import __version__
 from sessh.attach import attach_remote_transaction, restore_terminal_on_exit
-from sessh.config import load_config
+from sessh.config import Config, load_config
 from sessh.diagnostics import ProgressReporter
 from sessh.ids import generate_resume_id, is_valid_resume_id
 from sessh.remote import SshClient
@@ -241,8 +241,8 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
     raise SystemExit(f"unknown command after HOST: {command}")
 
 
-ConfigLoader = Callable[..., object]
-ClientFactory = Callable[..., object]
+ConfigLoader = Callable[..., Config]
+ClientFactory = Callable[..., SshClient]
 IdGenerator = Callable[[set[str]], str]
 
 
