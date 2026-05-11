@@ -195,6 +195,114 @@ class RemoteBootstrapTests(unittest.TestCase):
             self.assertFalse(remote.has_session("abc123"))
             self.assertFalse((remote.sessions_dir / "abc123").exists())
 
+    def test_interactive_attach_replays_configured_scrollback_before_attach(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        with LocalRemoteHarness(self) as remote:
+            remote.bootstrap(history_limit=200)
+            remote.tmux(
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "5",
+                "-s",
+                "sessh-abc123",
+                "i=0; while [ $i -lt 8 ]; do echo hist-$i; i=$((i + 1)); done; sleep 3600",
+            )
+
+            with remote.outer_tmux(height=10) as outer:
+                outer.start_driver(
+                    [
+                        "attach-interactive",
+                        "bash",
+                        "200",
+                        "",
+                        "",
+                        "",
+                        "abc123",
+                        "localhost",
+                        "3",
+                    ]
+                )
+                outer.wait_for_text("hist-2")
+                outer.wait_for_text("hist-7")
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+            self.assertIn("--- sessh attached abc123 ---", terminal_payload)
+            self.assertIn("hist-0\nhist-1\nhist-2\n", terminal_payload)
+            self.assertIn("--- sessh live boundary ---", terminal_payload)
+            self.assertIn("hist-7", terminal_payload)
+            self.assertLess(
+                terminal_payload.index("hist-2"), terminal_payload.index("hist-7")
+            )
+            self.assertLess(
+                terminal_payload.index("hist-2"),
+                terminal_payload.index("--- sessh live boundary ---"),
+            )
+            self.assertLess(
+                terminal_payload.index("--- sessh live boundary ---"),
+                terminal_payload.index("hist-7"),
+            )
+
+    def test_interactive_reattach_replays_long_scrollback_before_live_screen(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        with LocalRemoteHarness(self) as remote:
+            remote.bootstrap(history_limit=300)
+            remote.tmux(
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "12",
+                "-s",
+                "sessh-abc123",
+                "seq 200; sleep 3600",
+            )
+            remote.wait_for_pane_text("sessh-abc123:0.0", "200")
+
+            with remote.outer_tmux(width=100, height=12, history_limit=1000) as outer:
+                outer.start_driver(
+                    [
+                        "attach-interactive",
+                        "bash",
+                        "300",
+                        "",
+                        "",
+                        "",
+                        "abc123",
+                        "localhost",
+                        "200",
+                    ]
+                )
+                outer.wait_for_text("--- sessh live boundary ---")
+                outer.wait_for_text("200")
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+        lines = [line.rstrip() for line in terminal_payload.splitlines()]
+        nonblank_lines = [line for line in lines if line]
+        live_boundary_index = nonblank_lines.index("--- sessh live boundary ---")
+        scrollback_numbers = nonblank_lines[1:live_boundary_index]
+        live_numbers = nonblank_lines[live_boundary_index + 1 :]
+
+        self.assertEqual(nonblank_lines[0], "--- sessh attached abc123 ---")
+        self.assertTrue(scrollback_numbers)
+        self.assertTrue(live_numbers)
+        self.assertEqual(
+            scrollback_numbers + live_numbers,
+            [str(number) for number in range(1, 201)],
+        )
+        self.assertEqual(int(scrollback_numbers[-1]) + 1, int(live_numbers[0]))
+
 
 def require_tool(tool):
     if shutil.which(tool) is None:
@@ -228,10 +336,45 @@ class LocalRemoteHarness:
         )
         self.tmp.cleanup()
 
-    def outer_tmux(self):
-        return LocalOuterTmuxDriver(self.testcase, self)
+    def outer_tmux(self, *, width=100, height=20, history_limit=2000):
+        return LocalOuterTmuxDriver(
+            self.testcase,
+            self,
+            width=width,
+            height=height,
+            history_limit=history_limit,
+        )
 
-    def has_session(self, resume_id):
+    def bootstrap(self, *, shell="bash", history_limit=200):
+        script = files("sessh").joinpath("remote.sh").read_text(encoding="utf-8")
+        subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                script + '\nsessh_main "$@"\n',
+                "sessh",
+                "list",
+                shell,
+                str(history_limit),
+                "",
+                default_remote_rc(shell),
+                "",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env(),
+            check=True,
+        )
+
+    def env(self):
+        return {
+            **os.environ,
+            "HOME": str(self.home),
+            "XDG_STATE_HOME": str(self.state_home),
+        }
+
+    def tmux(self, *args, check=True):
         result = subprocess.run(
             [
                 "tmux",
@@ -239,14 +382,20 @@ class LocalRemoteHarness:
                 str(self.sessh_state / "sockets" / "tmux.sock"),
                 "-f",
                 str(self.sessh_state / "tmux.conf"),
-                "has-session",
-                "-t",
-                f"sessh-{resume_id}",
+                *args,
             ],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        if check and result.returncode != 0:
+            self.testcase.fail(
+                f"tmux command failed: {args!r}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        return result
+
+    def has_session(self, resume_id):
+        result = self.tmux("has-session", "-t", f"sessh-{resume_id}", check=False)
         return result.returncode == 0
 
     def wait_for_status(self, resume_id, *, timeout=10):
@@ -257,6 +406,24 @@ class LocalRemoteHarness:
                 return int(status_file.read_text(encoding="utf-8").strip())
             time.sleep(0.05)
         self.testcase.fail(f"timed out waiting for {status_file}")
+
+    def wait_for_pane_text(self, target, text, *, history_limit=1000, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            capture = self.tmux(
+                "capture-pane",
+                "-p",
+                "-S",
+                f"-{history_limit}",
+                "-E",
+                "-",
+                "-t",
+                target,
+            ).stdout
+            if text in capture:
+                return
+            time.sleep(0.05)
+        self.testcase.fail(f"timed out waiting for {text!r} in {target}:\n{capture}")
 
 
 class LocalOuterTmuxDriver:

@@ -17,10 +17,16 @@ def build_new_interactive_transaction(
     *,
     resume_id: str,
     host: str,
+    scrollback: int,
     metadata_nonce: str,
 ) -> list[str]:
     return _transaction_argv(
-        config, "new-interactive", resume_id, host, metadata_nonce=metadata_nonce
+        config,
+        "new-interactive",
+        resume_id,
+        host,
+        str(scrollback),
+        metadata_nonce=metadata_nonce,
     )
 
 
@@ -29,10 +35,16 @@ def build_attach_interactive_transaction(
     *,
     resume_id: str,
     host: str,
+    scrollback: int,
     metadata_nonce: str,
 ) -> list[str]:
     return _transaction_argv(
-        config, "attach-interactive", resume_id, host, metadata_nonce=metadata_nonce
+        config,
+        "attach-interactive",
+        resume_id,
+        host,
+        str(scrollback),
+        metadata_nonce=metadata_nonce,
     )
 
 
@@ -40,10 +52,11 @@ def build_attach_picker_transaction(
     config: Config,
     *,
     host: str,
+    scrollback: int,
     metadata_nonce: str,
 ) -> list[str]:
     return _transaction_argv(
-        config, "attach-picker", host, metadata_nonce=metadata_nonce
+        config, "attach-picker", host, str(scrollback), metadata_nonce=metadata_nonce
     )
 
 

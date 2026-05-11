@@ -95,6 +95,7 @@ class ParsedArgs:
     config: Path | None = None
     shell: str | None = None
     history_limit: int | None = None
+    scrollback: int | None = None
     preserve_args: bool = False
     auto_reattach: bool | None = None
     verbose: bool = False
@@ -109,6 +110,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
     config: Path | None = None
     shell: str | None = None
     history_limit: int | None = None
+    scrollback: int | None = None
     preserve_args = False
     auto_reattach: bool | None = None
     verbose = False
@@ -145,11 +147,17 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
             continue
         if token == "--history-limit":
             value = _next_value(tokens, i, token)
-            try:
-                history_limit = int(value)
-            except ValueError as exc:
-                raise SystemExit("--history-limit must be an integer") from exc
+            history_limit = _parse_positive_int(value, token)
             i += 2
+            continue
+        if token == "--scrollback":
+            value = _next_value(tokens, i, token)
+            scrollback = _parse_non_negative_int(value, token)
+            i += 2
+            continue
+        if token.startswith("--scrollback="):
+            scrollback = _parse_non_negative_int(token.split("=", 1)[1], "--scrollback")
+            i += 1
             continue
         if token == "--preserve-args":
             preserve_args = True
@@ -216,14 +224,20 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
     remainder = tokens[i:]
     remote_argv: list[str] = []
     if parse_post_host_options:
-        requested_command, resume_id, preserve_args, auto_reattach, remote_argv = (
-            _parse_post_host_args(
-                remainder,
-                requested_command=requested_command,
-                resume_id=resume_id,
-                preserve_args=preserve_args,
-                auto_reattach=auto_reattach,
-            )
+        (
+            requested_command,
+            resume_id,
+            preserve_args,
+            auto_reattach,
+            scrollback,
+            remote_argv,
+        ) = _parse_post_host_args(
+            remainder,
+            requested_command=requested_command,
+            resume_id=resume_id,
+            preserve_args=preserve_args,
+            auto_reattach=auto_reattach,
+            scrollback=scrollback,
         )
     else:
         remote_argv = remainder
@@ -240,6 +254,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
             config=config,
             shell=shell,
             history_limit=history_limit,
+            scrollback=scrollback,
             preserve_args=preserve_args,
             auto_reattach=auto_reattach,
             verbose=verbose,
@@ -258,6 +273,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
             config=config,
             shell=shell,
             history_limit=history_limit,
+            scrollback=scrollback,
             preserve_args=preserve_args,
             auto_reattach=auto_reattach,
             verbose=verbose,
@@ -273,6 +289,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
             config=config,
             shell=shell,
             history_limit=history_limit,
+            scrollback=scrollback,
             preserve_args=preserve_args,
             auto_reattach=auto_reattach,
             verbose=verbose,
@@ -286,6 +303,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArgs:
         config=config,
         shell=shell,
         history_limit=history_limit,
+        scrollback=scrollback,
         preserve_args=preserve_args,
         auto_reattach=auto_reattach,
         verbose=verbose,
@@ -324,6 +342,7 @@ def execute(
         auto_reattach = (
             config.auto_reattach if args.auto_reattach is None else args.auto_reattach
         )
+        scrollback = config.scrollback if args.scrollback is None else args.scrollback
         client = client_factory(host=args.host, ssh_options=args.ssh_options)
 
         if args.command == "list":
@@ -342,10 +361,14 @@ def execute(
                 config,
                 resume_id=resume_id,
                 host=args.host,
+                scrollback=scrollback,
                 metadata_nonce=metadata_nonce,
             )
             reattach_remote_argv_builder = _reattach_remote_argv_builder(
-                config, host=args.host, metadata_nonce=metadata_nonce
+                config,
+                host=args.host,
+                scrollback=scrollback,
+                metadata_nonce=metadata_nonce,
             )
             return attach_remote_transaction(
                 client,
@@ -367,10 +390,14 @@ def execute(
                 remote_argv = build_attach_picker_transaction(
                     config,
                     host=args.host,
+                    scrollback=scrollback,
                     metadata_nonce=metadata_nonce,
                 )
                 reattach_remote_argv_builder = _reattach_remote_argv_builder(
-                    config, host=args.host, metadata_nonce=metadata_nonce
+                    config,
+                    host=args.host,
+                    scrollback=scrollback,
+                    metadata_nonce=metadata_nonce,
                 )
                 return attach_remote_transaction(
                     client,
@@ -392,10 +419,14 @@ def execute(
                 config,
                 resume_id=args.resume_id,
                 host=args.host,
+                scrollback=scrollback,
                 metadata_nonce=metadata_nonce,
             )
             reattach_remote_argv_builder = _reattach_remote_argv_builder(
-                config, host=args.host, metadata_nonce=metadata_nonce
+                config,
+                host=args.host,
+                scrollback=scrollback,
+                metadata_nonce=metadata_nonce,
             )
             return attach_remote_transaction(
                 client,
@@ -423,7 +454,10 @@ def execute(
                 metadata_nonce=metadata_nonce,
             )
             reattach_remote_argv_builder = _reattach_remote_argv_builder(
-                config, host=args.host, metadata_nonce=metadata_nonce
+                config,
+                host=args.host,
+                scrollback=scrollback,
+                metadata_nonce=metadata_nonce,
             )
             return attach_remote_transaction(
                 client,
@@ -463,13 +497,14 @@ def format_session_list(sessions: Sequence[SessionInfo]) -> str:
 
 
 def _reattach_remote_argv_builder(
-    config: Config, *, host: str, metadata_nonce: str
+    config: Config, *, host: str, scrollback: int, metadata_nonce: str
 ) -> Callable[[str], list[str]]:
     def build(resume_id: str) -> list[str]:
         return build_attach_interactive_transaction(
             config,
             resume_id=resume_id,
             host=host,
+            scrollback=scrollback,
             metadata_nonce=metadata_nonce,
         )
 
@@ -503,6 +538,27 @@ def _next_value(tokens: Sequence[str], index: int, option: str) -> str:
         raise SystemExit(f"{option} requires a value") from exc
 
 
+def _parse_positive_int(value: str, option: str) -> int:
+    parsed = _parse_int(value, option)
+    if parsed <= 0:
+        raise SystemExit(f"{option} must be a positive integer")
+    return parsed
+
+
+def _parse_non_negative_int(value: str, option: str) -> int:
+    parsed = _parse_int(value, option)
+    if parsed < 0:
+        raise SystemExit(f"{option} must be a non-negative integer")
+    return parsed
+
+
+def _parse_int(value: str, option: str) -> int:
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise SystemExit(f"{option} must be an integer") from exc
+
+
 def _parse_post_host_args(
     tokens: Sequence[str],
     *,
@@ -510,7 +566,8 @@ def _parse_post_host_args(
     resume_id: str | None,
     preserve_args: bool,
     auto_reattach: bool | None,
-) -> tuple[str | None, str | None, bool, bool | None, list[str]]:
+    scrollback: int | None,
+) -> tuple[str | None, str | None, bool, bool | None, int | None, list[str]]:
     i = 0
     while i < len(tokens):
         token = tokens[i]
@@ -520,6 +577,7 @@ def _parse_post_host_args(
                 resume_id,
                 preserve_args,
                 auto_reattach,
+                scrollback,
                 list(tokens[i + 1 :]),
             )
         if token == "--preserve-args":
@@ -532,6 +590,15 @@ def _parse_post_host_args(
             continue
         if token == "--no-auto-reattach":
             auto_reattach = False
+            i += 1
+            continue
+        if token == "--scrollback":
+            value = _next_value(tokens, i, token)
+            scrollback = _parse_non_negative_int(value, token)
+            i += 2
+            continue
+        if token.startswith("--scrollback="):
+            scrollback = _parse_non_negative_int(token.split("=", 1)[1], "--scrollback")
             i += 1
             continue
         if token == "--list":
@@ -574,10 +641,11 @@ def _parse_post_host_args(
             resume_id,
             preserve_args,
             auto_reattach,
+            scrollback,
             list(tokens[i:]),
         )
 
-    return requested_command, resume_id, preserve_args, auto_reattach, []
+    return requested_command, resume_id, preserve_args, auto_reattach, scrollback, []
 
 
 def _select_requested_command(current: str | None, new: str, option: str) -> str:
@@ -677,7 +745,8 @@ def _raise_usage() -> None:
         prog="sessh",
         usage=(
             "sessh [OPTIONS] HOST "
-            "[--attach [ID] | --list | [--auto-reattach] [--preserve-args] COMMAND [ARG...]]"
+            "[--attach [ID] | --list | [--scrollback N] [--auto-reattach] "
+            "[--preserve-args] COMMAND [ARG...]]"
         ),
         description="SSH with persistent tmux-backed sessions.",
         epilog="Common ssh options before HOST are passed through.",
@@ -686,6 +755,14 @@ def _raise_usage() -> None:
     parser.add_argument("--config", metavar="PATH", help="read config from PATH")
     parser.add_argument("--shell", metavar="SHELL", help="remote shell to configure")
     parser.add_argument("--history-limit", metavar="N", help="tmux history limit")
+    parser.add_argument(
+        "--scrollback",
+        metavar="N",
+        help=(
+            "replay N tmux history lines before interactive attach; capture and "
+            "attach are not atomic, so busy panes may race"
+        ),
+    )
     parser.add_argument(
         "--auto-reattach",
         action="store_true",

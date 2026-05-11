@@ -332,6 +332,18 @@ class CliParseTests(unittest.TestCase):
         self.assertTrue(args.auto_reattach)
         self.assertEqual(args.command, "new")
 
+    def test_scrollback_before_host(self):
+        args = parse_args(["--scrollback", "50", "example.com"])
+
+        self.assertEqual(args.scrollback, 50)
+        self.assertEqual(args.command, "new")
+
+    def test_scrollback_with_equals_before_host(self):
+        args = parse_args(["--scrollback=50", "example.com"])
+
+        self.assertEqual(args.scrollback, 50)
+        self.assertEqual(args.command, "new")
+
     def test_no_auto_reattach_before_host(self):
         args = parse_args(["--no-auto-reattach", "example.com"])
 
@@ -344,6 +356,20 @@ class CliParseTests(unittest.TestCase):
         self.assertTrue(args.auto_reattach)
         self.assertEqual(args.command, "attach")
         self.assertEqual(args.resume_id, "k7m4q2")
+
+    def test_scrollback_after_host(self):
+        args = parse_args(["example.com", "--scrollback", "50", "--attach", "k7m4q2"])
+
+        self.assertEqual(args.scrollback, 50)
+        self.assertEqual(args.command, "attach")
+        self.assertEqual(args.resume_id, "k7m4q2")
+
+    def test_invalid_scrollback_is_rejected(self):
+        cases = ["wat", "-1"]
+        for value in cases:
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit):
+                    parse_args(["--scrollback", value, "example.com"])
 
     def test_no_auto_reattach_overrides_auto_reattach(self):
         args = parse_args(["--auto-reattach", "example.com", "--no-auto-reattach"])

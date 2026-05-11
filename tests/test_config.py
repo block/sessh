@@ -25,6 +25,7 @@ class ConfigTests(unittest.TestCase):
                 "defaults:\n"
                 "  shell: zsh\n"
                 "  history-limit: 1234\n"
+                "  scrollback: 42\n"
                 "  auto-reattach: true\n",
                 encoding="utf-8",
             )
@@ -33,6 +34,7 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.shell, "zsh")
         self.assertEqual(config.history_limit, 1234)
+        self.assertEqual(config.scrollback, 42)
         self.assertTrue(config.auto_reattach)
         self.assertEqual(config.remote_rc, default_remote_rc("zsh"))
 
@@ -125,6 +127,22 @@ remote-rc: |
             path.write_text(
                 "defaults:\n  auto-reattach: yes please\n", encoding="utf-8"
             )
+
+            with self.assertRaises(ValueError):
+                load_config(path, current_shell="/bin/bash")
+
+    def test_rejects_negative_scrollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text("defaults:\n  scrollback: -1\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                load_config(path, current_shell="/bin/bash")
+
+    def test_rejects_boolean_scrollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text("defaults:\n  scrollback: true\n", encoding="utf-8")
 
             with self.assertRaises(ValueError):
                 load_config(path, current_shell="/bin/bash")

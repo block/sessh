@@ -18,19 +18,22 @@ sessh_main() {
     new-interactive)
       sessh_resume_id=${1:?}; shift
       sessh_host=${1:?}; shift
+      sessh_scrollback=${1:-0}; shift || true
       sessh_print_unattached_hint "$sessh_host"
       sessh_create_interactive_session "$sessh_resume_id"
-      sessh_attach_interactive_session "$sessh_resume_id" "$sessh_host" 'sessh created'
+      sessh_attach_interactive_session "$sessh_resume_id" "$sessh_host" 'sessh created' "$sessh_scrollback"
       ;;
     attach-interactive)
       sessh_resume_id=${1:?}; shift
       sessh_host=${1:?}; shift
-      sessh_attach_interactive_session "$sessh_resume_id" "$sessh_host" 'sessh attached'
+      sessh_scrollback=${1:-0}; shift || true
+      sessh_attach_interactive_session "$sessh_resume_id" "$sessh_host" 'sessh attached' "$sessh_scrollback"
       ;;
     attach-picker)
       sessh_host=${1:?}; shift
+      sessh_scrollback=${1:-0}; shift || true
       sessh_resume_id=$(sessh_pick_session_id "$sessh_host")
-      sessh_attach_interactive_session "$sessh_resume_id" "$sessh_host" 'sessh attached'
+      sessh_attach_interactive_session "$sessh_resume_id" "$sessh_host" 'sessh attached' "$sessh_scrollback"
       ;;
     run)
       sessh_resume_id=${1:?}; shift
@@ -158,6 +161,17 @@ sessh_session_command_name() {
   sessh_command_name_file="$SESSH_SESSIONS/$1/command-name"
   [ -r "$sessh_command_name_file" ] || return 1
   sed -n '1p' "$sessh_command_name_file"
+}
+
+sessh_validate_non_negative_integer() {
+  sessh_name=$1
+  sessh_value=$2
+  case "$sessh_value" in
+    ''|*[!0-9]*)
+      printf 'sessh: %s must be a non-negative integer\n' "$sessh_name" >&2
+      exit 64
+      ;;
+  esac
 }
 
 sessh_run_transcript_file() {
@@ -541,7 +555,9 @@ SESSH_INTERACTIVE_ENTRYPOINT
 sessh_attach_existing_session() {
   sessh_resume_id=$1
   sessh_attach_label=$2
+  sessh_scrollback=$3
   sessh_session_name=$(sessh_session_name "$sessh_resume_id")
+  sessh_validate_non_negative_integer scrollback "$sessh_scrollback"
   if ! sessh_tmux has-session -t "$sessh_session_name" >/dev/null 2>&1; then
     printf 'sessh: session not found: %s\n' "$sessh_resume_id" >&2
     exit 1
@@ -549,7 +565,13 @@ sessh_attach_existing_session() {
   sessh_emit_event attached "$sessh_resume_id"
   sessh_terminal_prelude "$sessh_attach_label" "$sessh_resume_id"
   set +e
-  sessh_tmux attach-session -d -t "$sessh_session_name"
+  if [ "$sessh_scrollback" -gt 0 ]; then
+    sessh_tmux capture-pane -p -S "-$sessh_scrollback" -E -1 -t "$sessh_session_name:0.0"
+    printf '%s\n' '--- sessh live boundary ---' >&2
+    sessh_tmux attach-session -d -t "$sessh_session_name"
+  else
+    sessh_tmux attach-session -d -t "$sessh_session_name"
+  fi
   SESSH_ATTACH_STATUS=$?
   set -e
   sessh_clear_tmux_exit_message
@@ -573,12 +595,13 @@ sessh_attach_interactive_session() {
   sessh_resume_id=$1
   sessh_host=$2
   sessh_attach_label=$3
+  sessh_scrollback=$4
   sessh_session_name=$(sessh_session_name "$sessh_resume_id")
   sessh_session_dir=$(sessh_session_dir "$sessh_resume_id")
   if [ -r "$(sessh_run_transcript_file "$sessh_resume_id")" ]; then
     sessh_attach_run_session "$sessh_resume_id" "$sessh_attach_label" 0
   fi
-  sessh_attach_existing_session "$sessh_resume_id" "$sessh_attach_label"
+  sessh_attach_existing_session "$sessh_resume_id" "$sessh_attach_label" "$sessh_scrollback"
   if sessh_tmux has-session -t "$sessh_session_name" >/dev/null 2>&1; then
     sessh_exit_detached_session "$sessh_resume_id" "$sessh_host" 'To attach to this session, run:' 0
   else

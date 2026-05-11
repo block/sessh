@@ -144,6 +144,32 @@ class CliExecuteTests(unittest.TestCase):
 
         self.assertTrue(captured_kwargs["auto_reattach"])
 
+    def test_scrollback_defaults_from_config(self):
+        remote_argv = self._execute_new_and_capture_remote_argv(
+            parse_args(["example.com"]),
+            Config(
+                shell="bash",
+                history_limit=50,
+                scrollback=25,
+                remote_rc="remote-rc",
+            ),
+        )
+
+        self.assertEqual(remote_argv[12], "25")
+
+    def test_scrollback_cli_override_takes_priority_over_config(self):
+        remote_argv = self._execute_new_and_capture_remote_argv(
+            parse_args(["--scrollback", "5", "example.com"]),
+            Config(
+                shell="bash",
+                history_limit=50,
+                scrollback=25,
+                remote_rc="remote-rc",
+            ),
+        )
+
+        self.assertEqual(remote_argv[12], "5")
+
     def _execute_run_and_capture_remote_argv(self, args):
         captured_remote_argv = None
 
@@ -166,6 +192,31 @@ class CliExecuteTests(unittest.TestCase):
                     remote_init="",
                     remote_rc="remote-rc",
                 ),
+                client_factory=FakeClient,
+                id_generator=lambda existing_ids: "abc123",
+            )
+
+        self.assertEqual(exit_status, 0)
+        self.assertIsNotNone(captured_remote_argv)
+        return captured_remote_argv
+
+    def _execute_new_and_capture_remote_argv(self, args, config):
+        captured_remote_argv = None
+
+        def fake_attach_remote_transaction(client, remote_argv, **kwargs):  # noqa: ARG001
+            nonlocal captured_remote_argv
+            captured_remote_argv = list(remote_argv)
+            return 0
+
+        with patch(
+            "sessh.cli.attach_remote_transaction", fake_attach_remote_transaction
+        ):
+            exit_status = execute(
+                args,
+                stdin=TtyStringIO(),
+                stdout=TtyStringIO(),
+                stderr=TtyStringIO(),
+                config_loader=lambda **kwargs: config,
                 client_factory=FakeClient,
                 id_generator=lambda existing_ids: "abc123",
             )
