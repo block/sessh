@@ -187,6 +187,16 @@ wheels = [
 ]
 
 [[package]]
+name = "pex"
+version = "2.94.0"
+source = { registry = "https://global.block-artifacts.com/artifactory/api/pypi/block-pypi/simple" }
+sdist = { url = "https://global.block-artifacts.com/artifactory/api/pypi/block-pypi/packages/packages/53/86/659759b9f16d29c1a526348ec931092046255479108c9b3a10138c007f46/pex-2.94.0.tar.gz", hash = "sha256:2d93bdeac8742e51ac4ba2334a646384bae428ffca1a5fde888582a9c1aaa22c" }
+wheels = [
+    { url = "https://global.block-artifacts.com/artifactory/api/pypi/block-pypi/packages/packages/fd/38/d174a37bdd50e23a76473b7d99beaf12164a8486f8467b58aee043404842/pex-2.94.0-py2.py35.py36.py37.py38.py39.py310.py311-none-any.whl", hash = "sha256:d75a69e2c440edb088db74af22bc0278af07a3e19e3bf9c14fdd45275c2ae318" },
+    { url = "https://global.block-artifacts.com/artifactory/api/pypi/block-pypi/packages/packages/54/b4/4c2f3aafec1e7305e3bbfd6fdad8e75f3d90967f9d3ffdf56b57d6088d96/pex-2.94.0-py3.py312-none-any.whl", hash = "sha256:dc9b986166f65413a9f3ac06318f78fffb7fb18c2032ec3eff577da6d0e5a1c7" },
+]
+
+[[package]]
 name = "ptyprocess"
 version = "0.7.0"
 source = { registry = "https://global.block-artifacts.com/artifactory/api/pypi/block-pypi/simple" }
@@ -287,6 +297,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "mypy" },
+    { name = "pex" },
     { name = "ruff" },
     { name = "shellcheck-py" },
     { name = "types-pyyaml" },
@@ -301,6 +312,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "mypy", specifier = ">=2.0.0" },
+    { name = "pex", specifier = ">=2.94.0" },
     { name = "ruff", specifier = ">=0.15.12" },
     { name = "shellcheck-py", specifier = ">=0.11.0.1" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20260508" },

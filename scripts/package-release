@@ -140,22 +140,47 @@ case "$repo" in
   *) die "--repo must be OWNER/REPO" ;;
 esac
 
+: "${SOURCE_DATE_EPOCH:=0}"
+export SOURCE_DATE_EPOCH
+
 rm -rf dist
 uv build
 
-archive=dist/sessh-$version.tar.gz
+sdist=dist/sessh-$version.tar.gz
 wheel=dist/sessh-$version-py3-none-any.whl
-[ -f "$archive" ] || die "expected source archive $archive was not built"
+[ -f "$sdist" ] || die "expected source archive $sdist was not built"
 [ -f "$wheel" ] || die "expected wheel $wheel was not built"
 
-sha=$(sha256_file "$archive")
-sha_file=$archive.sha256
+release_root=dist/release
+release_binary=$release_root/sessh
+release_archive=dist/sessh-release.tar.gz
+constraints=dist/release-constraints.txt
+
+uv export --no-dev --no-emit-project --format requirements.txt --no-hashes --no-header --no-annotate --output-file "$constraints" >/dev/null
+
+set -- --project "$wheel" -c sessh --venv --python-shebang "/usr/bin/env python3"
+for python_tag in 311 312 313 314; do
+  set -- "$@" --platform "macosx_11_0_arm64-cp-${python_tag}-cp${python_tag}"
+  set -- "$@" --platform "macosx_10_13_x86_64-cp-${python_tag}-cp${python_tag}"
+  set -- "$@" --platform "manylinux2014_x86_64-cp-${python_tag}-cp${python_tag}"
+  set -- "$@" --platform "manylinux2014_aarch64-cp-${python_tag}-cp${python_tag}"
+done
+set -- "$@" --constraint "$constraints" -o "$release_binary"
+
+mkdir -p "$release_root"
+uv run pex "$@"
+chmod 0755 "$release_binary"
+touch -t 198001010000 "$release_binary"
+COPYFILE_DISABLE=1 tar -czf "$release_archive" -C "$release_root" sessh
+
+sha=$(sha256_file "$release_archive")
+sha_file=$release_archive.sha256
 homebrew_bump_file=dist/homebrew-bump.txt
 release_notes=dist/release-notes.md
 release_env=dist/release.env
-artifact_url=https://github.com/$repo/releases/download/$tag/$(basename "$archive")
+artifact_url=https://github.com/$repo/releases/download/$tag/$(basename "$release_archive")
 
-printf '%s  %s\n' "$sha" "$(basename "$archive")" > "$sha_file"
+printf '%s  %s\n' "$sha" "$(basename "$release_archive")" > "$sha_file"
 
 cat > "$homebrew_bump_file" <<EOF
 gh workflow run bump-formula.yaml \\
@@ -173,7 +198,7 @@ cat > "$release_notes" <<EOF
 Release archive SHA-256:
 
 \`\`\`text
-$sha  $(basename "$archive")
+$sha  $(basename "$release_archive")
 \`\`\`
 
 The Homebrew tap bump command is attached as $(basename "$homebrew_bump_file").
@@ -182,7 +207,8 @@ EOF
 cat > "$release_env" <<EOF
 VERSION=$version
 TAG=$tag
-ASSET=$archive
+ASSET=$release_archive
+SDIST=$sdist
 WHEEL=$wheel
 SHA256=$sha
 SHA256_FILE=$sha_file
@@ -191,7 +217,8 @@ RELEASE_NOTES=$release_notes
 ARTIFACT_URL=$artifact_url
 EOF
 
-printf 'built %s\n' "$archive"
+printf 'built %s\n' "$release_archive"
+printf 'built %s\n' "$sdist"
 printf 'built %s\n' "$wheel"
 printf 'wrote %s\n' "$sha_file"
 printf 'wrote %s\n' "$homebrew_bump_file"

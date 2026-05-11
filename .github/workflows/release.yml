@@ -38,6 +38,7 @@ jobs:
         run: |
           gh release create "$TAG" \
             "$ASSET" \
+            "$SDIST" \
             "$WHEEL" \
             "$SHA256_FILE" \
             "$HOMEBREW_BUMP_FILE" \
