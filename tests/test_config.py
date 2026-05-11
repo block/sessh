@@ -10,7 +10,9 @@ from sessh.remote_rc import default_remote_rc
 class ConfigTests(unittest.TestCase):
     def test_builtin_shell_defaults_from_supported_current_shell(self):
         self.assertEqual(Config.built_in(current_shell="/bin/zsh").shell, "zsh")
-        self.assertEqual(Config.built_in(current_shell="/usr/local/bin/bash").shell, "bash")
+        self.assertEqual(
+            Config.built_in(current_shell="/usr/local/bin/bash").shell, "bash"
+        )
 
     def test_builtin_shell_defaults_to_bash_for_other_shells(self):
         self.assertEqual(Config.built_in(current_shell="/bin/fish").shell, "bash")
@@ -19,7 +21,9 @@ class ConfigTests(unittest.TestCase):
     def test_load_config_reads_defaults_table(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.yaml"
-            path.write_text("defaults:\n  shell: zsh\n  history-limit: 1234\n", encoding="utf-8")
+            path.write_text(
+                "defaults:\n  shell: zsh\n  history-limit: 1234\n", encoding="utf-8"
+            )
 
             config = load_config(path, current_shell="/bin/bash")
 
@@ -30,9 +34,13 @@ class ConfigTests(unittest.TestCase):
     def test_cli_overrides_config_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.yaml"
-            path.write_text("defaults:\n  shell: zsh\n  history-limit: 1234\n", encoding="utf-8")
+            path.write_text(
+                "defaults:\n  shell: zsh\n  history-limit: 1234\n", encoding="utf-8"
+            )
 
-            config = load_config(path, current_shell="/bin/bash", shell="bash", history_limit=99)
+            config = load_config(
+                path, current_shell="/bin/bash", shell="bash", history_limit=99
+            )
 
         self.assertEqual(config.shell, "bash")
         self.assertEqual(config.history_limit, 99)
@@ -53,7 +61,10 @@ remote-init: |
 
             config = load_config(path, current_shell="/bin/bash")
 
-        self.assertEqual(config.remote_init, 'export PATH="/custom/bin:$PATH"\nprintf \'remote init\\n\' >&2\n')
+        self.assertEqual(
+            config.remote_init,
+            "export PATH=\"/custom/bin:$PATH\"\nprintf 'remote init\\n' >&2\n",
+        )
 
     def test_load_config_reads_inline_remote_rc(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -108,7 +119,9 @@ remote-rc: |
             old = os.environ.get("XDG_CONFIG_HOME")
             os.environ["XDG_CONFIG_HOME"] = tmp
             try:
-                self.assertEqual(Config.default_path(), Path(tmp) / "sessh" / "config.yaml")
+                self.assertEqual(
+                    Config.default_path(), Path(tmp) / "sessh" / "config.yaml"
+                )
             finally:
                 if old is None:
                     os.environ.pop("XDG_CONFIG_HOME", None)

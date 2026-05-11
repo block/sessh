@@ -33,7 +33,10 @@ class RemoteBootstrapTests(unittest.TestCase):
             state_home = root / "state"
             marker = root / "remote-init-marker"
             remote_init = f"printf 'init\\n' > {marker}\n"
-            script = files("sessh").joinpath("remote.sh").read_text(encoding="utf-8") + '\nsessh_main "$@"\n'
+            script = (
+                files("sessh").joinpath("remote.sh").read_text(encoding="utf-8")
+                + '\nsessh_main "$@"\n'
+            )
 
             result = subprocess.run(
                 [
@@ -62,10 +65,18 @@ class RemoteBootstrapTests(unittest.TestCase):
             self.assertEqual(result.stdout, "")
             self.assertEqual(marker.read_text(encoding="utf-8"), "init\n")
             self.assertFalse((state_home / "sessh" / "remote-init.sh").exists())
-            self.assertEqual((state_home / "sessh" / "remote-rc").read_text(encoding="utf-8"), default_remote_rc("bash"))
-            self.assertEqual((state_home / "sessh" / "zsh" / ".zshrc").read_text(encoding="utf-8"), default_remote_rc("bash"))
             self.assertEqual(
-                (state_home / "sessh" / "tmux.conf").read_text(encoding="utf-8").splitlines(),
+                (state_home / "sessh" / "remote-rc").read_text(encoding="utf-8"),
+                default_remote_rc("bash"),
+            )
+            self.assertEqual(
+                (state_home / "sessh" / "zsh" / ".zshrc").read_text(encoding="utf-8"),
+                default_remote_rc("bash"),
+            )
+            self.assertEqual(
+                (state_home / "sessh" / "tmux.conf")
+                .read_text(encoding="utf-8")
+                .splitlines(),
                 [
                     "set-option -g status off",
                     "set-option -g mouse off",

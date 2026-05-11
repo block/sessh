@@ -54,14 +54,20 @@ def attach_remote_transaction(
         raise
 
     if result.exit_status == 255 and result.final_event in {"detached", "exited"}:
-        return result.remote_exit_status if result.remote_exit_status is not None else result.exit_status
+        return (
+            result.remote_exit_status
+            if result.remote_exit_status is not None
+            else result.exit_status
+        )
 
     if result.exit_status == 255 and resume_command is not None:
         known_resume_id = result.resume_id or resume_id
         known_resume_command = resume_command
         if resume_id is None and known_resume_id is not None:
             known_resume_command = f"{resume_command} {known_resume_id}"
-        write_terminal_boundary_on_new_line(stderr, "sessh detached", resume_id=known_resume_id)
+        write_terminal_boundary_on_new_line(
+            stderr, "sessh detached", resume_id=known_resume_id
+        )
         stderr.write(f"\nTo attach to this session, run:\n  {known_resume_command}\n")
         stderr.flush()
     return result.exit_status
@@ -109,10 +115,19 @@ def attach_environment(environ: Mapping[str, str] | None = None) -> dict[str, st
 
 
 def _is_portable_term(term: str) -> bool:
-    return term in {"xterm", "xterm-256color", "screen", "screen-256color", "tmux", "tmux-256color"}
+    return term in {
+        "xterm",
+        "xterm-256color",
+        "screen",
+        "screen-256color",
+        "tmux",
+        "tmux-256color",
+    }
 
 
-def write_terminal_boundary_on_new_line(stream: TextIO, label: str, *, resume_id: str | None = None) -> None:
+def write_terminal_boundary_on_new_line(
+    stream: TextIO, label: str, *, resume_id: str | None = None
+) -> None:
     try:
         if not stream.isatty():
             return

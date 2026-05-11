@@ -22,7 +22,9 @@ class Config:
 
     @classmethod
     def built_in(cls, current_shell: str | None = None) -> "Config":
-        current_shell = os.environ.get("SHELL", "") if current_shell is None else current_shell
+        current_shell = (
+            os.environ.get("SHELL", "") if current_shell is None else current_shell
+        )
         shell_name = Path(current_shell).name
         shell = shell_name if shell_name in VALID_SHELLS else "bash"
         return cls(shell=shell, history_limit=DEFAULT_HISTORY_LIMIT)

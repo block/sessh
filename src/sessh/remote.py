@@ -10,12 +10,18 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 class RemoteCommandError(RuntimeError):
-    def __init__(self, argv: Sequence[str], returncode: int, stdout: str, stderr: str) -> None:
+    def __init__(
+        self, argv: Sequence[str], returncode: int, stdout: str, stderr: str
+    ) -> None:
         self.argv = list(argv)
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
-        detail = stderr.strip() or stdout.strip() or f"remote command exited with status {returncode}"
+        detail = (
+            stderr.strip()
+            or stdout.strip()
+            or f"remote command exited with status {returncode}"
+        )
         super().__init__(detail)
 
 
@@ -58,5 +64,7 @@ class SshClient:
         except KeyboardInterrupt:
             raise
         if check and result.returncode != 0:
-            raise RemoteCommandError(argv, result.returncode, result.stdout or "", result.stderr or "")
+            raise RemoteCommandError(
+                argv, result.returncode, result.stdout or "", result.stderr or ""
+            )
         return result

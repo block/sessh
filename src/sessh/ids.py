@@ -20,4 +20,3 @@ def generate_resume_id(existing: Collection[str]) -> str:
         value = "".join(secrets.choice(ID_ALPHABET) for _ in range(ID_LENGTH))
         if value not in existing_set:
             return value
-

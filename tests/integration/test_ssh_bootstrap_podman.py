@@ -25,7 +25,10 @@ def podman_tests_enabled() -> bool:
     return os.environ.get("SESSH_RUN_PODMAN_TESTS") == "1"
 
 
-@unittest.skipUnless(podman_tests_enabled(), "set SESSH_RUN_PODMAN_TESTS=1 to run Podman SSH integration tests")
+@unittest.skipUnless(
+    podman_tests_enabled(),
+    "set SESSH_RUN_PODMAN_TESTS=1 to run Podman SSH integration tests",
+)
 class PodmanSshBootstrapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -35,9 +38,16 @@ class PodmanSshBootstrapTests(unittest.TestCase):
             raise unittest.SkipTest("tmux is not installed")
         if shutil.which("ssh-keygen") is None:
             raise unittest.SkipTest("ssh-keygen is not installed")
-        podman_info = subprocess.run(["podman", "info"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        podman_info = subprocess.run(
+            ["podman", "info"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         if podman_info.returncode != 0:
-            raise unittest.SkipTest(podman_info.stderr.strip() or "podman is not usable")
+            raise unittest.SkipTest(
+                podman_info.stderr.strip() or "podman is not usable"
+            )
 
         cls.tmp = tempfile.TemporaryDirectory()
         cls.root = Path(cls.tmp.name)
@@ -102,9 +112,17 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
     def tearDownClass(cls):
         try:
             if getattr(cls, "container", None):
-                subprocess.run(["podman", "rm", "-f", cls.container], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                subprocess.run(
+                    ["podman", "rm", "-f", cls.container],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
             if getattr(cls, "image", None):
-                subprocess.run(["podman", "rmi", "-f", cls.image], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                subprocess.run(
+                    ["podman", "rmi", "-f", cls.image],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
         finally:
             if getattr(cls, "tmp", None):
                 cls.tmp.cleanup()
@@ -120,12 +138,23 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         stdout = io.StringIO()
 
         exit_status = execute(
-            parse_args(["--quiet", "--config", str(config), *self.ssh_options, self.host, "list"]),
+            parse_args(
+                [
+                    "--quiet",
+                    "--config",
+                    str(config),
+                    *self.ssh_options,
+                    self.host,
+                    "list",
+                ]
+            ),
             stdout=stdout,
         )
 
         self.assertEqual(exit_status, 0)
-        self.assertEqual(stdout.getvalue(), "ID\tATTACHED\tCREATED\tCWD\tCOMMAND\tTITLE\n")
+        self.assertEqual(
+            stdout.getvalue(), "ID\tATTACHED\tCREATED\tCWD\tCOMMAND\tTITLE\n"
+        )
         self.assertEqual(
             self.client().run(["cat", f"{REMOTE_STATE}/tmux.conf"]).stdout.splitlines(),
             [
@@ -143,8 +172,14 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                 "set-window-option -g pane-border-status off",
             ],
         )
-        self.assertEqual(self.client().run(["cat", f"{REMOTE_STATE}/remote-rc"]).stdout, default_remote_rc("bash"))
-        self.assertEqual(self.client().run(["cat", f"{REMOTE_STATE}/zsh/.zshrc"]).stdout, default_remote_rc("bash"))
+        self.assertEqual(
+            self.client().run(["cat", f"{REMOTE_STATE}/remote-rc"]).stdout,
+            default_remote_rc("bash"),
+        )
+        self.assertEqual(
+            self.client().run(["cat", f"{REMOTE_STATE}/zsh/.zshrc"]).stdout,
+            default_remote_rc("bash"),
+        )
 
     def test_cli_uses_inline_yaml_remote_init(self):
         marker = f"/home/sessh/yaml-remote-init-{uuid.uuid4().hex}"
@@ -155,7 +190,16 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         stdout = io.StringIO()
 
         exit_status = execute(
-            parse_args(["--quiet", "--config", str(config), *self.ssh_options, self.host, "list"]),
+            parse_args(
+                [
+                    "--quiet",
+                    "--config",
+                    str(config),
+                    *self.ssh_options,
+                    self.host,
+                    "list",
+                ]
+            ),
             stdout=stdout,
         )
 
@@ -205,8 +249,17 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
             ],
         )
         self.assertTrue(self._has_session(resume_id))
-        self.client().run(["test", "!", "-e", f"{REMOTE_STATE}/sessions/{resume_id}/completion.json"])
-        self.client().run(["test", "!", "-e", f"{REMOTE_STATE}/sessions/{resume_id}/completion.json.tmp"])
+        self.client().run(
+            ["test", "!", "-e", f"{REMOTE_STATE}/sessions/{resume_id}/completion.json"]
+        )
+        self.client().run(
+            [
+                "test",
+                "!",
+                "-e",
+                f"{REMOTE_STATE}/sessions/{resume_id}/completion.json.tmp",
+            ]
+        )
 
     def test_cli_run_exit_255_is_not_reported_as_transport_disconnect(self):
         config = self._write_cli_config("cli-run-255")
@@ -254,7 +307,7 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                     *self.ssh_options,
                     self.host,
                     "run",
-                    "printf 'eval:%s\\nrc:%s\\nremote_rc:%s\\n' \"$HOME\" \"$SESSH_TEST_RC\" \"$SESSH_REMOTE_RC\"",
+                    'printf \'eval:%s\\nrc:%s\\nremote_rc:%s\\n\' "$HOME" "$SESSH_TEST_RC" "$SESSH_REMOTE_RC"',
                 ],
             )
             exit_status = outer.wait_for_exit()
@@ -281,14 +334,33 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
     def test_cli_list_shows_completed_run_session(self):
         config = self._write_cli_config("cli-list-run")
         with OuterTmuxSession(self) as outer:
-            outer.start_driver(["--config", str(config), *self.ssh_options, self.host, "run", "printf", "listed"])
+            outer.start_driver(
+                [
+                    "--config",
+                    str(config),
+                    *self.ssh_options,
+                    self.host,
+                    "run",
+                    "printf",
+                    "listed",
+                ]
+            )
             self.assertEqual(outer.wait_for_exit(), 0)
             run_lines = outer.terminal_lines()
         resume_id = parse_boundary_resume_id(self, run_lines[0], "sessh created")
         stdout = io.StringIO()
 
         exit_status = execute(
-            parse_args(["--quiet", "--config", str(config), *self.ssh_options, self.host, "list"]),
+            parse_args(
+                [
+                    "--quiet",
+                    "--config",
+                    str(config),
+                    *self.ssh_options,
+                    self.host,
+                    "list",
+                ]
+            ),
             stdout=stdout,
         )
 
@@ -302,7 +374,17 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
     def test_cli_list_sorts_unattached_before_attached_sessions(self):
         run_config = self._write_cli_config("cli-list-sort-run")
         with OuterTmuxSession(self) as outer:
-            outer.start_driver(["--config", str(run_config), *self.ssh_options, self.host, "run", "printf", "listed"])
+            outer.start_driver(
+                [
+                    "--config",
+                    str(run_config),
+                    *self.ssh_options,
+                    self.host,
+                    "run",
+                    "printf",
+                    "listed",
+                ]
+            )
             self.assertEqual(outer.wait_for_exit(), 0)
             run_lines = outer.terminal_lines()
         run_id = parse_boundary_resume_id(self, run_lines[0], "sessh created")
@@ -316,14 +398,25 @@ done
 """,
         )
         with OuterTmuxSession(self) as outer:
-            outer.start_driver(["--config", str(attached_config), *self.ssh_options, self.host])
+            outer.start_driver(
+                ["--config", str(attached_config), *self.ssh_options, self.host]
+            )
             outer.wait_for_text("attached-ready")
             attached_lines = outer.terminal_lines()
             attached_id = find_boundary_resume_id(self, attached_lines, "sessh created")
             stdout = io.StringIO()
 
             exit_status = execute(
-                parse_args(["--quiet", "--config", str(attached_config), *self.ssh_options, self.host, "list"]),
+                parse_args(
+                    [
+                        "--quiet",
+                        "--config",
+                        str(attached_config),
+                        *self.ssh_options,
+                        self.host,
+                        "list",
+                    ]
+                ),
                 stdout=stdout,
             )
 
@@ -336,7 +429,9 @@ done
         self.assertEqual(row_by_id[run_id][1], "no")
         self.assertEqual(row_by_id[run_id][4], "printf")
         self.assertEqual(row_by_id[attached_id][1], "yes")
-        self.assertLess(rows.index(row_by_id[run_id]), rows.index(row_by_id[attached_id]))
+        self.assertLess(
+            rows.index(row_by_id[run_id]), rows.index(row_by_id[attached_id])
+        )
 
     def test_cli_new_interactive_over_real_ssh_attaches_and_cleans_state(self):
         remote_output = f"{REMOTE_STATE}/new-output"
@@ -370,7 +465,10 @@ exit 0
                 f"--- sessh exited {resume_id} ---",
             ],
         )
-        self.assertEqual(self.client().run(["cat", remote_output]).stdout, f"new:{REMOTE_STATE}/remote-rc\n")
+        self.assertEqual(
+            self.client().run(["cat", remote_output]).stdout,
+            f"new:{REMOTE_STATE}/remote-rc\n",
+        )
         self.assertFalse(self._has_session(resume_id))
         self.client().run(["test", "!", "-d", f"{REMOTE_STATE}/sessions/{resume_id}"])
 
@@ -397,7 +495,16 @@ exit 0
         self.assertTrue(self._has_session(resume_id))
 
         with OuterTmuxSession(self) as outer:
-            outer.start_driver(["--config", str(config), *self.ssh_options, self.host, "attach", resume_id])
+            outer.start_driver(
+                [
+                    "--config",
+                    str(config),
+                    *self.ssh_options,
+                    self.host,
+                    "attach",
+                    resume_id,
+                ]
+            )
             outer.wait_for_text("attach-ready")
             self.client().run(["touch", continue_file])
             exit_status = outer.wait_for_exit()
@@ -413,7 +520,10 @@ exit 0
                 f"--- sessh exited {resume_id} ---",
             ],
         )
-        self.assertEqual(self.client().run(["cat", remote_output]).stdout, f"attach:{REMOTE_STATE}/remote-rc\n")
+        self.assertEqual(
+            self.client().run(["cat", remote_output]).stdout,
+            f"attach:{REMOTE_STATE}/remote-rc\n",
+        )
         self.assertFalse(self._has_session(resume_id))
         self.client().run(["test", "!", "-d", f"{REMOTE_STATE}/sessions/{resume_id}"])
 
@@ -440,7 +550,9 @@ exit 0
         self.assertTrue(self._has_session(resume_id))
 
         with OuterTmuxSession(self) as outer:
-            outer.start_driver(["--config", str(config), *self.ssh_options, self.host, "attach"])
+            outer.start_driver(
+                ["--config", str(config), *self.ssh_options, self.host, "attach"]
+            )
             outer.wait_for_text("Attach session [1-1, default 1, q to cancel]:")
             outer.send_line("1")
             outer.wait_for_text("picker-ready")
@@ -451,7 +563,9 @@ exit 0
 
         self.assertEqual(exit_status, 0)
         self.assertEqual(raw_capture.find("\x1b]sessh;"), -1)
-        attached_boundary_index = attached_lines.index(f"--- sessh attached {resume_id} ---")
+        attached_boundary_index = attached_lines.index(
+            f"--- sessh attached {resume_id} ---"
+        )
         self.assertEqual(
             attached_lines[attached_boundary_index:],
             [
@@ -461,7 +575,10 @@ exit 0
                 f"--- sessh exited {resume_id} ---",
             ],
         )
-        self.assertEqual(self.client().run(["cat", remote_output]).stdout, f"picker:{REMOTE_STATE}/remote-rc\n")
+        self.assertEqual(
+            self.client().run(["cat", remote_output]).stdout,
+            f"picker:{REMOTE_STATE}/remote-rc\n",
+        )
         self.assertFalse(self._has_session(resume_id))
         self.client().run(["test", "!", "-d", f"{REMOTE_STATE}/sessions/{resume_id}"])
 
@@ -535,7 +652,9 @@ done
             )
             initial_tty_state = outer.wait_for_initial_tty_state()
             outer.wait_for_text("run-detach-ready")
-            resume_id = find_boundary_resume_id(self, outer.terminal_lines(), "sessh created")
+            resume_id = find_boundary_resume_id(
+                self, outer.terminal_lines(), "sessh created"
+            )
             self.client().run(
                 [
                     "tmux",
@@ -585,7 +704,9 @@ done
         deadline = time.monotonic() + 30
         last_stderr = ""
         while time.monotonic() < deadline:
-            result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            result = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
             if result.returncode == 0:
                 return
             last_stderr = result.stderr
@@ -597,7 +718,11 @@ done
 
     def _reset_remote_state(self):
         client = self.client()
-        client.run(["tmux", "-S", f"{REMOTE_STATE}/sockets/tmux.sock", "kill-server"], check=False, stderr=subprocess.PIPE)
+        client.run(
+            ["tmux", "-S", f"{REMOTE_STATE}/sockets/tmux.sock", "kill-server"],
+            check=False,
+            stderr=subprocess.PIPE,
+        )
         client.run(["rm", "-rf", REMOTE_STATE], check=False, stderr=subprocess.PIPE)
 
     def _has_session(self, resume_id):
@@ -617,7 +742,9 @@ done
         )
         return result.returncode == 0
 
-    def _write_cli_config(self, name, *, remote_init="", remote_rc=None, history_limit=200):
+    def _write_cli_config(
+        self, name, *, remote_init="", remote_rc=None, history_limit=200
+    ):
         config = self.root / f"{name}.yaml"
         content = f"defaults:\n  shell: bash\n  history-limit: {history_limit}\n"
         content += yaml_literal("remote-init", remote_init)
@@ -630,7 +757,7 @@ done
 def yaml_literal(key, value):
     lines = value.splitlines()
     if not lines:
-        return f"{key}: \"\"\n"
+        return f'{key}: ""\n'
     return f"{key}: |\n" + "".join(f"  {line}\n" for line in lines)
 
 
@@ -639,7 +766,7 @@ def parse_boundary_resume_id(testcase, line, label):
     suffix = " ---"
     testcase.assertTrue(line.startswith(prefix), line)
     testcase.assertTrue(line.endswith(suffix), line)
-    return line[len(prefix):-len(suffix)]
+    return line[len(prefix) : -len(suffix)]
 
 
 def find_boundary_resume_id(testcase, lines, label):
@@ -660,7 +787,9 @@ def wait_for_child_process(testcase, parent_pid, command_basename, *, timeout=30
         if matching_pids:
             return matching_pids[0]
         time.sleep(0.05)
-    testcase.fail(f"timed out waiting for child process {command_basename!r} of pid {parent_pid}")
+    testcase.fail(
+        f"timed out waiting for child process {command_basename!r} of pid {parent_pid}"
+    )
 
 
 def local_processes():
@@ -772,7 +901,9 @@ sys.exit(main({list(argv)!r}))
         return self._wait_for_file(self.final_tty_state_file, timeout=timeout)
 
     def current_tty_state(self):
-        tty = self._tmux("display-message", "-p", "-t", self.target, "#{pane_tty}").stdout.strip()
+        tty = self._tmux(
+            "display-message", "-p", "-t", self.target, "#{pane_tty}"
+        ).stdout.strip()
         return stty_state_for_tty(tty)
 
     def _wait_for_file(self, path, *, timeout=30):
@@ -790,7 +921,9 @@ sys.exit(main({list(argv)!r}))
             if text in capture:
                 return
             time.sleep(0.05)
-        self.testcase.fail(f"timed out waiting for {text!r} in outer tmux pane:\n{self.capture()}")
+        self.testcase.fail(
+            f"timed out waiting for {text!r} in outer tmux pane:\n{self.capture()}"
+        )
 
     def wait_for_exit(self, *, timeout=30):
         deadline = time.monotonic() + timeout
@@ -798,7 +931,9 @@ sys.exit(main({list(argv)!r}))
             if self.status_file.exists():
                 return int(self.status_file.read_text(encoding="utf-8").strip())
             time.sleep(0.05)
-        self.testcase.fail(f"timed out waiting for sessh driver to exit:\n{self.capture()}")
+        self.testcase.fail(
+            f"timed out waiting for sessh driver to exit:\n{self.capture()}"
+        )
 
     def send_line(self, text):
         self._tmux("send-keys", "-t", self.target, "-l", text)
@@ -845,7 +980,9 @@ def stty_state_for_tty(tty):
     ]
     errors = []
     for command in commands:
-        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(
+            command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
         if result.returncode == 0:
             return result.stdout.strip()
         errors.append(f"{command!r}: {result.stderr.strip()}")

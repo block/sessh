@@ -29,7 +29,9 @@ class ReleasePackagingTests(unittest.TestCase):
             check=True,
         )
 
-        self.assertEqual(result.stdout, f"release metadata OK for v{sessh.__version__}\n")
+        self.assertEqual(
+            result.stdout, f"release metadata OK for v{sessh.__version__}\n"
+        )
         self.assertEqual(result.stderr, "")
 
     def test_package_release_rejects_tag_that_does_not_match_version(self):

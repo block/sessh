@@ -21,9 +21,17 @@ class SshCommandTests(unittest.TestCase):
             ],
         )
 
-        result = subprocess.run(["sh", "-c", argv[-1]], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        result = subprocess.run(
+            ["sh", "-c", argv[-1]],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
 
-        self.assertEqual(json.loads(result.stdout), ["hello world", "$HOME", "*.log", "semi;colon"])
+        self.assertEqual(
+            json.loads(result.stdout), ["hello world", "$HOME", "*.log", "semi;colon"]
+        )
 
     def test_rejects_empty_remote_argv(self):
         with self.assertRaises(ValueError):
@@ -31,7 +39,11 @@ class SshCommandTests(unittest.TestCase):
 
     def test_rejects_remote_command_above_size_budget(self):
         with self.assertRaisesRegex(ValueError, "remote command is too large"):
-            build_ssh_argv(ssh_options=[], host="example.com", remote_argv=["printf", "x" * 100_000])
+            build_ssh_argv(
+                ssh_options=[],
+                host="example.com",
+                remote_argv=["printf", "x" * 100_000],
+            )
 
     def test_shell_quote_command_round_trips_metacharacters(self):
         command = shell_quote_command(
@@ -46,9 +58,17 @@ class SshCommandTests(unittest.TestCase):
             ]
         )
 
-        result = subprocess.run(["sh", "-c", command], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        result = subprocess.run(
+            ["sh", "-c", command],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
 
-        self.assertEqual(json.loads(result.stdout), ["hello world", "$HOME", "*.log", "semi;colon"])
+        self.assertEqual(
+            json.loads(result.stdout), ["hello world", "$HOME", "*.log", "semi;colon"]
+        )
 
 
 if __name__ == "__main__":

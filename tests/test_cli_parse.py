@@ -12,9 +12,27 @@ class CliParseTests(unittest.TestCase):
         self.assertEqual(args.command, "new")
 
     def test_common_ssh_flags_pass_through(self):
-        args = parse_args(["-4", "-6", "-A", "-a", "-C", "-g", "-K", "-k", "-X", "-x", "-Y", "example.com"])
+        args = parse_args(
+            [
+                "-4",
+                "-6",
+                "-A",
+                "-a",
+                "-C",
+                "-g",
+                "-K",
+                "-k",
+                "-X",
+                "-x",
+                "-Y",
+                "example.com",
+            ]
+        )
 
-        self.assertEqual(args.ssh_options, ["-4", "-6", "-A", "-a", "-C", "-g", "-K", "-k", "-X", "-x", "-Y"])
+        self.assertEqual(
+            args.ssh_options,
+            ["-4", "-6", "-A", "-a", "-C", "-g", "-K", "-k", "-X", "-x", "-Y"],
+        )
         self.assertEqual(args.host, "example.com")
 
     def test_common_ssh_options_with_separate_values_pass_through(self):
@@ -181,14 +199,20 @@ class CliParseTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as raised:
                     parse_args([option, "example.com"])
 
-                self.assertIn(f"ssh option {option} is not compatible with sessh", str(raised.exception))
+                self.assertIn(
+                    f"ssh option {option} is not compatible with sessh",
+                    str(raised.exception),
+                )
                 self.assertIn(reason, str(raised.exception))
 
     def test_incompatible_attached_ssh_option_is_rejected_with_reason(self):
         with self.assertRaises(SystemExit) as raised:
             parse_args(["-Wexample.com:22", "example.com"])
 
-        self.assertIn("ssh option -Wexample.com:22 is not compatible with sessh", str(raised.exception))
+        self.assertIn(
+            "ssh option -Wexample.com:22 is not compatible with sessh",
+            str(raised.exception),
+        )
         self.assertIn("forwards stdio", str(raised.exception))
 
     def test_incompatible_ssh_config_options_are_rejected(self):
@@ -212,7 +236,10 @@ class CliParseTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             parse_args(["-oRequestTTY=no", "example.com"])
 
-        self.assertIn("ssh option -o RequestTTY=no is not compatible with sessh", str(raised.exception))
+        self.assertIn(
+            "ssh option -o RequestTTY=no is not compatible with sessh",
+            str(raised.exception),
+        )
 
     def test_attach_picker(self):
         args = parse_args(["example.com", "attach"])
@@ -244,7 +271,9 @@ class CliParseTests(unittest.TestCase):
         self.assertEqual(args.command, "list")
 
     def test_run_keeps_all_remaining_args(self):
-        args = parse_args(["--eval-args", "-t", "example.com", "run", "--flag", "hello world"])
+        args = parse_args(
+            ["--eval-args", "-t", "example.com", "run", "--flag", "hello world"]
+        )
 
         self.assertTrue(args.eval_args)
         self.assertEqual(args.ssh_options, ["-t"])

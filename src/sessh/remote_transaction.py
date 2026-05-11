@@ -19,7 +19,9 @@ def build_new_interactive_transaction(
     host: str,
     metadata_nonce: str,
 ) -> list[str]:
-    return _transaction_argv(config, "new-interactive", resume_id, host, metadata_nonce=metadata_nonce)
+    return _transaction_argv(
+        config, "new-interactive", resume_id, host, metadata_nonce=metadata_nonce
+    )
 
 
 def build_attach_interactive_transaction(
@@ -29,7 +31,9 @@ def build_attach_interactive_transaction(
     host: str,
     metadata_nonce: str,
 ) -> list[str]:
-    return _transaction_argv(config, "attach-interactive", resume_id, host, metadata_nonce=metadata_nonce)
+    return _transaction_argv(
+        config, "attach-interactive", resume_id, host, metadata_nonce=metadata_nonce
+    )
 
 
 def build_attach_picker_transaction(
@@ -38,7 +42,9 @@ def build_attach_picker_transaction(
     host: str,
     metadata_nonce: str,
 ) -> list[str]:
-    return _transaction_argv(config, "attach-picker", host, metadata_nonce=metadata_nonce)
+    return _transaction_argv(
+        config, "attach-picker", host, metadata_nonce=metadata_nonce
+    )
 
 
 def build_run_transaction(
@@ -86,7 +92,9 @@ def parse_session_rows(output: str) -> list[SessionInfo]:
     return sessions
 
 
-def _transaction_argv(config: Config, mode: str, *args: str, metadata_nonce: str) -> list[str]:
+def _transaction_argv(
+    config: Config, mode: str, *args: str, metadata_nonce: str
+) -> list[str]:
     if config.remote_rc is None:
         raise ValueError("remote_rc must be populated")
     return [

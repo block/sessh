@@ -47,7 +47,21 @@ SSH_OPTIONS_WITH_VALUES = {
     "-p",
     "-R",
 }
-SSH_FLAG_OPTIONS = {"-4", "-6", "-A", "-a", "-C", "-g", "-K", "-k", "-t", "-tt", "-X", "-x", "-Y"}
+SSH_FLAG_OPTIONS = {
+    "-4",
+    "-6",
+    "-A",
+    "-a",
+    "-C",
+    "-g",
+    "-K",
+    "-k",
+    "-t",
+    "-tt",
+    "-X",
+    "-x",
+    "-Y",
+}
 INCOMPATIBLE_SSH_OPTIONS = {
     "-f": (
         "it backgrounds ssh after authentication, "
@@ -252,7 +266,9 @@ def execute(
     progress = ProgressReporter(stream=stderr, verbose=args.verbose, quiet=args.quiet)
     progress.update(f"connecting to {args.host}")
     try:
-        config = config_loader(path=args.config, shell=args.shell, history_limit=args.history_limit)
+        config = config_loader(
+            path=args.config, shell=args.shell, history_limit=args.history_limit
+        )
         client = client_factory(host=args.host, ssh_options=args.ssh_options)
 
         if args.command == "list":
@@ -398,11 +414,15 @@ def _next_value(tokens: Sequence[str], index: int, option: str) -> str:
         raise SystemExit(f"{option} requires a value") from exc
 
 
-def _parse_ssh_option(tokens: Sequence[str], index: int) -> tuple[list[str], int] | None:
+def _parse_ssh_option(
+    tokens: Sequence[str], index: int
+) -> tuple[list[str], int] | None:
     token = tokens[index]
     incompatible_option = _incompatible_ssh_option(token)
     if incompatible_option is not None:
-        raise SystemExit(_format_incompatible_ssh_option_error(token, incompatible_option))
+        raise SystemExit(
+            _format_incompatible_ssh_option_error(token, incompatible_option)
+        )
     if token in SSH_OPTIONS_WITH_VALUES:
         value = _next_value(tokens, index, token)
         if token == "-o":

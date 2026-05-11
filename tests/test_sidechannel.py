@@ -1,6 +1,10 @@
 import unittest
 
-from sessh.sidechannel import SideChannelEvent, SideChannelParser, format_sidechannel_frame
+from sessh.sidechannel import (
+    SideChannelEvent,
+    SideChannelParser,
+    format_sidechannel_frame,
+)
 
 
 class SideChannelTests(unittest.TestCase):

@@ -38,7 +38,9 @@ class CliExecuteTests(unittest.TestCase):
                         args,
                         stdout=io.StringIO(),
                         stderr=stderr,
-                        config_loader=lambda **kwargs: Config(shell="bash", history_limit=50),
+                        config_loader=lambda **kwargs: Config(
+                            shell="bash", history_limit=50
+                        ),
                     )
         finally:
             try:
