@@ -11,6 +11,10 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      UV_NO_CONFIG: "1"
+      UV_DEFAULT_INDEX: https://pypi.org/simple
+      PIP_CONFIG_FILE: /dev/null
 
     steps:
       - name: Check out repository

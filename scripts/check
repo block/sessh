@@ -41,10 +41,10 @@ if [ "$#" -ne 0 ]; then
   exit 64
 fi
 
-run uv run shellcheck scripts/check scripts/package-release src/sessh/remote.sh
-run uv run ruff format --check .
-run uv run ruff check .
-run uv run mypy src
+run uv run --no-project --with shellcheck-py==0.11.0.1 shellcheck scripts/check scripts/package-release src/sessh/remote.sh
+run uv run --no-project --with ruff==0.15.12 ruff format --check .
+run uv run --no-project --with ruff==0.15.12 ruff check .
+run uv run --no-project --with mypy==2.0.0 --with types-PyYAML==6.0.12.20260508 mypy src
 run scripts/package-release --check
 run uv run --no-project --with-editable . python -m unittest discover -s tests
 

@@ -156,7 +156,7 @@ release_binary=$release_root/sessh
 release_archive=dist/sessh-release.tar.gz
 constraints=dist/release-constraints.txt
 
-uv export --no-dev --no-emit-project --format requirements.txt --no-hashes --no-header --no-annotate --output-file "$constraints" >/dev/null
+uv export --no-config --default-index https://pypi.org/simple --locked --no-dev --no-emit-project --format requirements.txt --no-hashes --no-header --no-annotate --output-file "$constraints" >/dev/null
 
 set -- --project "$wheel" -c sessh --venv --python-shebang "/usr/bin/env python3"
 for python_tag in 311 312 313 314; do
@@ -168,7 +168,7 @@ done
 set -- "$@" --constraint "$constraints" -o "$release_binary"
 
 mkdir -p "$release_root"
-uv run pex "$@"
+uv run --no-project --with pex==2.94.0 pex "$@"
 chmod 0755 "$release_binary"
 touch -t 198001010000 "$release_binary"
 COPYFILE_DISABLE=1 tar -czf "$release_archive" -C "$release_root" sessh
