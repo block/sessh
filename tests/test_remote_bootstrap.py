@@ -290,7 +290,7 @@ class RemoteBootstrapTests(unittest.TestCase):
                     "hist-2",
                     "hist-3",
                     "--- sessh live boundary ---",
-                    *[""] * 14,
+                    *[""] * 10,
                     "hist-0",
                     "hist-1",
                     "hist-2",
@@ -587,8 +587,15 @@ class LocalOuterTmuxDriver:
                     "set +e",
                     f"HOME={shlex.quote(str(self.remote.home))}",
                     f"XDG_STATE_HOME={shlex.quote(str(self.remote.state_home))}",
-                    "export HOME XDG_STATE_HOME",
-                    f'{shlex.quote(str(self.transaction))} "$@"',
+                    f"LINES={self.height}",
+                    f"COLUMNS={self.width}",
+                    "export HOME XDG_STATE_HOME LINES COLUMNS",
+                    " ".join(
+                        [
+                            shlex.quote(str(self.transaction)),
+                            *[shlex.quote(arg) for arg in remote_argv],
+                        ]
+                    ),
                     "sessh_driver_status=$?",
                     f"printf '%s\\n' \"$sessh_driver_status\" > {shlex.quote(str(self.status_file))}",
                     "printf '__SESSH_DRIVER_DONE__=%s\\n' \"$sessh_driver_status\"",
@@ -599,9 +606,6 @@ class LocalOuterTmuxDriver:
             encoding="utf-8",
         )
         self.driver.chmod(0o700)
-        command = " ".join(
-            [shlex.quote(str(self.driver)), *[shlex.quote(arg) for arg in remote_argv]]
-        )
         self._tmux(
             "new-session",
             "-d",
@@ -611,7 +615,7 @@ class LocalOuterTmuxDriver:
             str(self.height),
             "-s",
             self.session,
-            command,
+            shlex.quote(str(self.driver)),
         )
 
     def close(self):

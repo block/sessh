@@ -18,7 +18,10 @@ sessh_main() {
     new-interactive)
       sessh_resume_id=${1:?}; shift
       sessh_host=${1:?}; shift
-      sessh_scrollback=${1:-0}; shift || true
+      sessh_scrollback=${1:-0}
+      if [ "$#" -gt 0 ]; then
+        shift
+      fi
       sessh_print_unattached_hint "$sessh_host"
       sessh_create_interactive_session "$sessh_resume_id"
       sessh_attach_interactive_session "$sessh_resume_id" "$sessh_host" 'sessh created' "$sessh_scrollback"
@@ -26,12 +29,18 @@ sessh_main() {
     attach-interactive)
       sessh_resume_id=${1:?}; shift
       sessh_host=${1:?}; shift
-      sessh_scrollback=${1:-0}; shift || true
+      sessh_scrollback=${1:-0}
+      if [ "$#" -gt 0 ]; then
+        shift
+      fi
       sessh_attach_interactive_session "$sessh_resume_id" "$sessh_host" 'sessh attached' "$sessh_scrollback"
       ;;
     attach-picker)
       sessh_host=${1:?}; shift
-      sessh_scrollback=${1:-0}; shift || true
+      sessh_scrollback=${1:-0}
+      if [ "$#" -gt 0 ]; then
+        shift
+      fi
       sessh_resume_id=$(sessh_pick_session_id "$sessh_host")
       sessh_attach_interactive_session "$sessh_resume_id" "$sessh_host" 'sessh attached' "$sessh_scrollback"
       ;;
@@ -385,7 +394,10 @@ sessh_apply_options() {
 }
 
 sessh_terminal_lines() {
-  sessh_lines=$(tput lines 2>/dev/null || printf 24)
+  sessh_lines=${LINES:-}
+  case "$sessh_lines" in
+    ''|*[!0-9]*|0) sessh_lines=$(tput lines 2>/dev/null || printf 24) ;;
+  esac
   case "$sessh_lines" in
     ''|*[!0-9]*|0) sessh_lines=24 ;;
   esac
@@ -394,7 +406,7 @@ sessh_terminal_lines() {
 
 sessh_terminal_padding_lines() {
   sessh_lines=$(sessh_terminal_lines)
-  sessh_padding_lines=$((sessh_lines - 1))
+  sessh_padding_lines=$((sessh_lines * 2 - 1))
   if [ "$sessh_padding_lines" -lt 0 ]; then
     sessh_padding_lines=0
   fi
