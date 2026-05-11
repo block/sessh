@@ -129,7 +129,6 @@ class RemoteBootstrapTests(unittest.TestCase):
                         "--- sessh created abc123 ---",
                         "hello world",
                         "goodbye",
-                        "sessh run exited with status 0",
                         "--- sessh exited abc123 ---",
                     ]
                 )
@@ -188,7 +187,6 @@ class RemoteBootstrapTests(unittest.TestCase):
                         "--- sessh attached abc123 ---",
                         "before",
                         "after",
-                        "sessh run exited with status 7",
                         "--- sessh exited abc123 ---",
                     ]
                 )

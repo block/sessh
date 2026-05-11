@@ -692,7 +692,6 @@ sessh_attach_run_session() {
   sessh_stream_run_transcript "$sessh_resume_id"
   sessh_exit_status=$(sessh_read_run_exit_status "$sessh_resume_id")
   sessh_emit_event exited "$sessh_resume_id" "$sessh_exit_status"
-  printf 'sessh run exited with status %s\n' "$sessh_exit_status" >&2
   sessh_terminal_boundary 'sessh exited' "$sessh_resume_id"
   sessh_cleanup_session "$sessh_resume_id"
   exit "$sessh_exit_status"

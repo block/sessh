@@ -242,7 +242,6 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                     "$HOME",
                     "*.log",
                     "semi;colon",
-                    "sessh run exited with status 3",
                     f"--- sessh exited {resume_id} ---",
                 ]
             )
@@ -276,7 +275,6 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                 [
                     f"--- sessh created {resume_id} ---",
                     "status-255",
-                    "sessh run exited with status 255",
                     f"--- sessh exited {resume_id} ---",
                 ]
             )
@@ -314,7 +312,6 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
                     "eval:/home/sessh",
                     "rc:from remote rc; $HOME",
                     f"remote_rc:{REMOTE_STATE}/remote-rc",
-                    "sessh run exited with status 0",
                     f"--- sessh exited {resume_id} ---",
                 ]
             )
@@ -694,7 +691,6 @@ done
                     f"--- sessh attached {resume_id} ---",
                     "run-detach-ready",
                     "run-detach-done",
-                    "sessh run exited with status 4",
                     f"--- sessh exited {resume_id} ---",
                 ]
             )
