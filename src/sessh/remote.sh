@@ -452,17 +452,74 @@ sessh_terminal_scroll_after_boundary() {
   done
 }
 
+sessh_capture_pane_line_count() {
+  sessh_target=$1
+  sessh_start=$2
+  sessh_end=$3
+  sessh_count=$(
+    sessh_tmux capture-pane -p -S "$sessh_start" -E "$sessh_end" -t "$sessh_target" 2>/dev/null |
+      wc -l |
+      tr -d '[:space:]'
+  )
+  case "$sessh_count" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$sessh_count"
+}
+
+sessh_capture_pane_history_size() {
+  sessh_target=$1
+  sessh_all_lines=$(sessh_capture_pane_line_count "$sessh_target" - -) || return 1
+  sessh_visible_lines=$(sessh_capture_pane_line_count "$sessh_target" 0 -) || return 1
+  sessh_history_size=$((sessh_all_lines - sessh_visible_lines))
+  if [ "$sessh_history_size" -lt 0 ]; then
+    sessh_history_size=0
+  fi
+  printf '%s\n' "$sessh_history_size"
+}
+
+sessh_pane_height() {
+  sessh_target=$1
+  sessh_pane_height=$(sessh_tmux display-message -p -t "$sessh_target" '#{pane_height}' 2>/dev/null || true)
+  case "$sessh_pane_height" in
+    ''|*[!0-9]*|0)
+      sessh_pane_height=$(sessh_capture_pane_line_count "$sessh_target" 0 -) || return 1
+      ;;
+  esac
+  case "$sessh_pane_height" in
+    ''|*[!0-9]*|0) return 1 ;;
+  esac
+  printf '%s\n' "$sessh_pane_height"
+}
+
 sessh_scrollback_note() {
   sessh_target=$1
   sessh_scrollback=$2
-  sessh_history_size=$(sessh_tmux display-message -p -t "$sessh_target" '#{history_size}' 2>/dev/null || printf '0')
+  sessh_history_size=$(
+    sessh_capture_pane_history_size "$sessh_target" ||
+      sessh_tmux display-message -p -t "$sessh_target" '#{history_size}' 2>/dev/null ||
+      printf '0'
+  )
   case "$sessh_history_size" in
     ''|*[!0-9]*) return 0 ;;
   esac
   if [ "$sessh_history_size" -le "$sessh_scrollback" ]; then
     return 0
   fi
-  sessh_skipped=$((sessh_history_size - sessh_scrollback))
+  sessh_visible_history_after_resize=0
+  sessh_terminal_lines=$(sessh_terminal_lines 2>/dev/null || printf '0\n')
+  sessh_pane_height=$(sessh_pane_height "$sessh_target" || printf '%s\n' "$sessh_terminal_lines")
+  if [ "$sessh_terminal_lines" -gt "$sessh_pane_height" ]; then
+    sessh_visible_history_after_resize=$((sessh_terminal_lines - sessh_pane_height))
+  fi
+  sessh_covered_history=$sessh_scrollback
+  if [ "$sessh_visible_history_after_resize" -gt "$sessh_covered_history" ]; then
+    sessh_covered_history=$sessh_visible_history_after_resize
+  fi
+  if [ "$sessh_history_size" -le "$sessh_covered_history" ]; then
+    return 0
+  fi
+  sessh_skipped=$((sessh_history_size - sessh_covered_history))
   if [ "$sessh_skipped" -eq 1 ]; then
     printf '%s' '; skipped 1 line of scrollback'
   else

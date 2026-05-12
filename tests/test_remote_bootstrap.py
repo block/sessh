@@ -57,6 +57,56 @@ class RemoteBootstrapTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "sessh: unable to determine terminal height\n")
 
+    def test_scrollback_note_uses_captured_pane_history_when_format_is_unavailable(
+        self,
+    ):
+        script = files("sessh").joinpath("remote.sh").read_text(encoding="utf-8")
+
+        result = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                script
+                + """
+sessh_tmux() {
+  case "$1" in
+    capture-pane)
+      sessh_start=
+      sessh_end=
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          -S) sessh_start=$2; shift 2 ;;
+          -E) sessh_end=$2; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      case "$sessh_start:$sessh_end" in
+        "-:-") printf '%s\\n' hist-1 hist-2 hist-3 visible-1 visible-2 ;;
+        "0:-") printf '%s\\n' visible-1 visible-2 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    display-message)
+      printf '%s\\n' '#{history_size}'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+sessh_scrollback_note ignored-target 1
+""",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, "LINES": "2"},
+            check=True,
+        )
+
+        self.assertEqual(result.stdout, "; skipped 2 lines of scrollback")
+        self.assertEqual(result.stderr, "")
+
     def test_remote_shell_bootstraps_state_with_real_tools(self):
         if shutil.which("tmux") is None:
             raise unittest.SkipTest("tmux is not installed")
@@ -487,6 +537,276 @@ class RemoteBootstrapTests(unittest.TestCase):
                 )
                 + "\n",
             )
+
+    def test_cli_attach_interactive_reports_skipped_scrollback(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        with LocalRemoteHarness(self) as remote:
+            remote.bootstrap(history_limit=300)
+            remote.write_fake_ssh()
+            remote.write_cli_config(history_limit=300)
+            remote.tmux(
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "12",
+                "-s",
+                "sessh-abc123",
+                "seq 500; sleep 3600",
+            )
+            remote.wait_for_pane_text("sessh-abc123:0.0", "500")
+            history_size = int(
+                remote.tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "sessh-abc123:0.0",
+                    "#{history_size}",
+                ).stdout.strip()
+            )
+            self.assertGreater(history_size, 200)
+            expected_banner = (
+                f"--- sessh attached abc123; skipped {history_size - 200} "
+                "lines of scrollback ---"
+            )
+
+            with remote.outer_tmux(width=100, height=12, history_limit=1000) as outer:
+                outer.start_cli_driver(
+                    [
+                        "--config",
+                        str(remote.cli_config),
+                        "fakehost",
+                        "--scrollback",
+                        "200",
+                        "--attach",
+                        "abc123",
+                    ]
+                )
+                outer.wait_for_text(expected_banner)
+                outer.wait_for_text("500")
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+        self.assertEqual(
+            terminal_payload.splitlines(),
+            [
+                expected_banner,
+                *[str(number) for number in range(290, 490)],
+                "--- sessh live boundary ---",
+                *[""] * 12,
+                *[str(number) for number in range(490, 501)],
+            ],
+        )
+
+    def test_cli_attach_interactive_without_scrollback_reports_skipped_history(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        with LocalRemoteHarness(self) as remote:
+            remote.bootstrap(history_limit=300)
+            remote.write_fake_ssh()
+            remote.write_cli_config(history_limit=300)
+            remote.tmux(
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "12",
+                "-s",
+                "sessh-abc123",
+                "seq 200; sleep 3600",
+            )
+            remote.wait_for_pane_text("sessh-abc123:0.0", "200")
+            history_size = int(
+                remote.tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "sessh-abc123:0.0",
+                    "#{history_size}",
+                ).stdout.strip()
+            )
+            self.assertEqual(history_size, 189)
+            expected_banner = (
+                f"--- sessh attached abc123; skipped {history_size} "
+                "lines of scrollback ---"
+            )
+
+            with remote.outer_tmux(width=100, height=12, history_limit=1000) as outer:
+                outer.start_cli_driver(
+                    [
+                        "--config",
+                        str(remote.cli_config),
+                        "fakehost",
+                        "--attach",
+                        "abc123",
+                    ]
+                )
+                outer.wait_for_text(expected_banner)
+                outer.wait_for_text("200")
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+        self.assertEqual(
+            terminal_payload.splitlines(),
+            [
+                expected_banner,
+                *[str(number) for number in range(190, 201)],
+            ],
+        )
+
+    def test_interactive_attach_without_scrollback_reports_skipped_lines(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        before_lines = numbered_terminal_lines(10)
+        with LocalRemoteHarness(self) as remote:
+            remote.bootstrap(history_limit=200)
+            rc = remote.root / "prompt.bashrc"
+            rc.write_text("PS1='PROMPT> '\n", encoding="utf-8")
+            remote.tmux(
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "5",
+                "-s",
+                "sessh-abc123",
+                (
+                    "i=0; while [ $i -lt 8 ]; do "
+                    "echo hist-$i; i=$((i + 1)); done; "
+                    f"bash --rcfile {shlex.quote(str(rc))} -i"
+                ),
+            )
+            remote.wait_for_pane_text("sessh-abc123:0.0", "PROMPT>")
+            history_size = int(
+                remote.tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "sessh-abc123:0.0",
+                    "#{history_size}",
+                ).stdout.strip()
+            )
+            self.assertGreater(history_size, 0)
+
+            with remote.outer_tmux(height=8, history_limit=200) as outer:
+                outer.start_driver(
+                    [
+                        "attach-interactive",
+                        "bash",
+                        "200",
+                        "",
+                        "",
+                        "",
+                        "abc123",
+                        "localhost",
+                        "0",
+                    ],
+                    before_transaction=before_lines,
+                )
+                outer.wait_for_text("PROMPT>")
+                live_terminal = outer.capture()
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+        expected_lines = [
+            *before_lines,
+            "--- sessh attached abc123; skipped 1 line of scrollback ---",
+            "hist-1",
+            "hist-2",
+            "hist-3",
+            "hist-4",
+            "hist-5",
+            "hist-6",
+            "hist-7",
+            "PROMPT>",
+        ]
+        self.assertEqual(live_terminal, "\n".join(expected_lines) + "\n")
+        self.assertEqual(terminal_payload, "\n".join(expected_lines) + "\n")
+
+    def test_interactive_attach_without_scrollback_omits_note_when_attach_covers_history(
+        self,
+    ):
+        require_tool("tmux")
+        require_tool("bash")
+
+        before_lines = numbered_terminal_lines(10)
+        with LocalRemoteHarness(self) as remote:
+            remote.bootstrap(history_limit=200)
+            rc = remote.root / "prompt.bashrc"
+            rc.write_text("PS1='PROMPT> '\n", encoding="utf-8")
+            remote.tmux(
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "5",
+                "-s",
+                "sessh-abc123",
+                (
+                    "i=0; while [ $i -lt 8 ]; do "
+                    "echo hist-$i; i=$((i + 1)); done; "
+                    f"bash --rcfile {shlex.quote(str(rc))} -i"
+                ),
+            )
+            remote.wait_for_pane_text("sessh-abc123:0.0", "PROMPT>")
+            history_size = int(
+                remote.tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "sessh-abc123:0.0",
+                    "#{history_size}",
+                ).stdout.strip()
+            )
+            self.assertGreater(history_size, 0)
+
+            with remote.outer_tmux(height=9, history_limit=200) as outer:
+                outer.start_driver(
+                    [
+                        "attach-interactive",
+                        "bash",
+                        "200",
+                        "",
+                        "",
+                        "",
+                        "abc123",
+                        "localhost",
+                        "0",
+                    ],
+                    before_transaction=before_lines,
+                )
+                outer.wait_for_text("PROMPT>")
+                live_terminal = outer.capture()
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+        expected_lines = [
+            *before_lines,
+            "--- sessh attached abc123 ---",
+            "hist-0",
+            "hist-1",
+            "hist-2",
+            "hist-3",
+            "hist-4",
+            "hist-5",
+            "hist-6",
+            "hist-7",
+            "PROMPT>",
+        ]
+        self.assertEqual(live_terminal, "\n".join(expected_lines) + "\n")
+        self.assertEqual(terminal_payload, "\n".join(expected_lines) + "\n")
 
     def test_interactive_attach_replays_configured_scrollback_before_attach(self):
         require_tool("tmux")
