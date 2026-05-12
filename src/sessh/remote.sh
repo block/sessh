@@ -396,10 +396,19 @@ sessh_apply_options() {
 sessh_terminal_lines() {
   sessh_lines=${LINES:-}
   case "$sessh_lines" in
-    ''|*[!0-9]*|0) sessh_lines=$(tput lines 2>/dev/null || printf 24) ;;
+    ''|*[!0-9]*|0)
+      sessh_stty_size=$(stty size 2>/dev/null || true)
+      sessh_lines=${sessh_stty_size%% *}
+      ;;
   esac
   case "$sessh_lines" in
-    ''|*[!0-9]*|0) sessh_lines=24 ;;
+    ''|*[!0-9]*|0) sessh_lines=$(tput lines 2>/dev/null || true) ;;
+  esac
+  case "$sessh_lines" in
+    ''|*[!0-9]*|0)
+      printf '%s\n' 'sessh: unable to determine terminal height' >&2
+      exit 64
+      ;;
   esac
   printf '%s\n' "$sessh_lines"
 }
@@ -422,8 +431,16 @@ sessh_terminal_padding_lf() {
   done
 }
 
-sessh_terminal_preserve_screen() {
+sessh_terminal_boundary() {
+  sessh_label=$1
+  sessh_resume_id=$2
+  sessh_note=${3:-}
+  printf '%s%s%s%s%s\n' '--- ' "$sessh_label " "$sessh_resume_id" "$sessh_note" ' ---' >&2
+}
+
+sessh_terminal_scroll_after_boundary() {
   sessh_lines=$(sessh_terminal_lines)
+  # Scroll the current screen plus the just-written boundary into history before tmux repaints.
   sessh_preserve_lines=$((sessh_lines - 1))
   if [ "$sessh_preserve_lines" -lt 0 ]; then
     sessh_preserve_lines=0
@@ -433,16 +450,6 @@ sessh_terminal_preserve_screen() {
     printf '\n' >&2
     sessh_i=$((sessh_i + 1))
   done
-  if [ "$sessh_preserve_lines" -gt 0 ]; then
-    printf '\033[%sA' "$sessh_preserve_lines" >&2
-  fi
-}
-
-sessh_terminal_boundary() {
-  sessh_label=$1
-  sessh_resume_id=$2
-  sessh_note=${3:-}
-  printf '%s%s%s%s%s\n' '--- ' "$sessh_label " "$sessh_resume_id" "$sessh_note" ' ---' >&2
 }
 
 sessh_scrollback_note() {
@@ -524,15 +531,23 @@ _sessh_pad_exit_screen() {
   fi
 
   case "$sessh_lines" in
-    ''|*[!0-9]*|0) sessh_lines=$(tput lines 2>/dev/null || printf 24) ;;
+    ''|*[!0-9]*|0)
+      sessh_stty_size=$(stty size 2>/dev/null || true)
+      sessh_lines=${sessh_stty_size%% *}
+      ;;
   esac
   case "$sessh_lines" in
-    ''|*[!0-9]*|0) sessh_lines=24 ;;
+    ''|*[!0-9]*|0) sessh_lines=$(tput lines 2>/dev/null || true) ;;
   esac
-  sessh_padding_lines=$((sessh_lines - 1))
-  if [ "$sessh_padding_lines" -lt 0 ]; then
-    sessh_padding_lines=0
-  fi
+  case "$sessh_lines" in
+    ''|*[!0-9]*|0) sessh_padding_lines=0 ;;
+    *)
+      sessh_padding_lines=$((sessh_lines - 1))
+      if [ "$sessh_padding_lines" -lt 0 ]; then
+        sessh_padding_lines=0
+      fi
+      ;;
+  esac
 
   _sessh_write_exit_boundary_lf() {
     if [ -n "${SESSH_RESUME_ID:-}" ]; then
@@ -607,8 +622,8 @@ sessh_attach_existing_session() {
   if [ "$sessh_scrollback" -gt 0 ]; then
     sessh_terminal_boundary "$sessh_attach_label" "$sessh_resume_id" "$sessh_attach_note"
   else
-    sessh_terminal_preserve_screen
     sessh_terminal_boundary "$sessh_attach_label" "$sessh_resume_id" "$sessh_attach_note"
+    sessh_terminal_scroll_after_boundary
   fi
   set +e
   if [ "$sessh_scrollback" -gt 0 ]; then

@@ -2,6 +2,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -24,6 +25,37 @@ class RemoteBootstrapTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             check=True,
         )
+
+    def test_terminal_height_detection_fails_without_rows(self):
+        script = files("sessh").joinpath("remote.sh").read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            for tool in ("stty", "tput"):
+                path = fakebin / tool
+                path.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+                path.chmod(0o700)
+
+            result = subprocess.run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    script + "\nsessh_terminal_lines\n",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "LINES": "0",
+                    "PATH": str(fakebin),
+                },
+            )
+
+        self.assertEqual(result.returncode, 64)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "sessh: unable to determine terminal height\n")
 
     def test_remote_shell_bootstraps_state_with_real_tools(self):
         if shutil.which("tmux") is None:
@@ -247,6 +279,7 @@ class RemoteBootstrapTests(unittest.TestCase):
         require_tool("tmux")
         require_tool("bash")
 
+        before_lines = bottom_terminal_lines(12)
         with LocalRemoteHarness(self) as remote:
             with remote.outer_tmux(height=12, history_limit=200) as outer:
                 outer.start_driver(
@@ -260,17 +293,32 @@ class RemoteBootstrapTests(unittest.TestCase):
                         "abc123",
                         "localhost",
                         "0",
-                    ]
+                    ],
+                    before_transaction=before_lines,
                 )
                 outer.wait_for_text("PROMPT>")
+                live_terminal = outer.capture()
                 remote.tmux("kill-session", "-t", "sessh-abc123")
                 self.assertEqual(outer.wait_for_exit(), 0)
                 terminal_payload = outer.terminal_payload()
 
             self.assertEqual(
+                live_terminal,
+                "\n".join(
+                    [
+                        *before_lines,
+                        "--- sessh created abc123 ---",
+                        "PROMPT>",
+                        *[""] * 11,
+                    ]
+                )
+                + "\n",
+            )
+            self.assertEqual(
                 terminal_payload,
                 "\n".join(
                     [
+                        *before_lines,
                         "--- sessh created abc123 ---",
                         "PROMPT>",
                     ]
@@ -282,6 +330,7 @@ class RemoteBootstrapTests(unittest.TestCase):
         require_tool("tmux")
         require_tool("bash")
 
+        before_lines = numbered_terminal_lines(100)
         with LocalRemoteHarness(self) as remote:
             with remote.outer_tmux(height=8, history_limit=200) as outer:
                 outer.start_driver(
@@ -296,27 +345,143 @@ class RemoteBootstrapTests(unittest.TestCase):
                         "localhost",
                         "0",
                     ],
-                    before_transaction=[
-                        "before-1",
-                        "before-2",
-                        "before-3",
-                        "before-4",
-                    ],
+                    before_transaction=before_lines,
                 )
                 outer.wait_for_text("PROMPT>")
+                live_terminal = outer.capture()
                 remote.tmux("kill-session", "-t", "sessh-abc123")
                 self.assertEqual(outer.wait_for_exit(), 0)
                 terminal_payload = outer.terminal_payload()
 
             self.assertEqual(
+                live_terminal,
+                "\n".join(
+                    [
+                        *before_lines,
+                        "--- sessh created abc123 ---",
+                        "PROMPT>",
+                        *[""] * 7,
+                    ]
+                )
+                + "\n",
+            )
+            self.assertEqual(
                 terminal_payload,
                 "\n".join(
                     [
-                        "before-1",
-                        "before-2",
-                        "before-3",
-                        "before-4",
+                        *before_lines,
                         "--- sessh created abc123 ---",
+                        "PROMPT>",
+                    ]
+                )
+                + "\n",
+            )
+
+    def test_cli_new_interactive_banner_survives_pty_relay(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        before_lines = numbered_terminal_lines(100)
+        with LocalRemoteHarness(self) as remote:
+            remote.write_fake_ssh()
+            remote.write_cli_config()
+            (remote.home / ".bashrc").write_text("PS1='PROMPT> '\n", encoding="utf-8")
+
+            with remote.outer_tmux(height=8, history_limit=200) as outer:
+                outer.start_cli_driver(
+                    ["--config", str(remote.cli_config), "fakehost"],
+                    fixed_resume_id="abc123",
+                    before_transaction=before_lines,
+                )
+                outer.wait_for_text("PROMPT>")
+                live_terminal = outer.capture()
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+            self.assertEqual(
+                live_terminal,
+                "\n".join(
+                    [
+                        *before_lines,
+                        "--- sessh created abc123 ---",
+                        "PROMPT>",
+                        *[""] * 7,
+                    ]
+                )
+                + "\n",
+            )
+            self.assertEqual(
+                terminal_payload,
+                "\n".join(
+                    [
+                        *before_lines,
+                        "--- sessh created abc123 ---",
+                        "PROMPT>",
+                    ]
+                )
+                + "\n",
+            )
+
+    def test_cli_attach_interactive_banner_survives_pty_relay(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        before_lines = numbered_terminal_lines(100)
+        with LocalRemoteHarness(self) as remote:
+            remote.bootstrap(history_limit=200)
+            remote.write_fake_ssh()
+            remote.write_cli_config()
+            rc = remote.root / "prompt.bashrc"
+            rc.write_text("PS1='PROMPT> '\n", encoding="utf-8")
+            remote.tmux(
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "8",
+                "-s",
+                "sessh-abc123",
+                f"bash --rcfile {shlex.quote(str(rc))} -i",
+            )
+            remote.wait_for_pane_text("sessh-abc123:0.0", "PROMPT>")
+
+            with remote.outer_tmux(height=8, history_limit=200) as outer:
+                outer.start_cli_driver(
+                    [
+                        "--config",
+                        str(remote.cli_config),
+                        "fakehost",
+                        "--attach",
+                        "abc123",
+                    ],
+                    before_transaction=before_lines,
+                )
+                outer.wait_for_text("PROMPT>")
+                live_terminal = outer.capture()
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_payload = outer.terminal_payload()
+
+            self.assertEqual(
+                live_terminal,
+                "\n".join(
+                    [
+                        *before_lines,
+                        "--- sessh attached abc123 ---",
+                        "PROMPT>",
+                        *[""] * 7,
+                    ]
+                )
+                + "\n",
+            )
+            self.assertEqual(
+                terminal_payload,
+                "\n".join(
+                    [
+                        *before_lines,
+                        "--- sessh attached abc123 ---",
                         "PROMPT>",
                     ]
                 )
@@ -502,6 +667,14 @@ def require_tool(tool):
         raise unittest.SkipTest(f"{tool} is not installed")
 
 
+def bottom_terminal_lines(height):
+    return [f"before-{index}" for index in range(1, height + 2)]
+
+
+def numbered_terminal_lines(count):
+    return [str(index) for index in range(1, count + 1)]
+
+
 class LocalRemoteHarness:
     def __init__(self, testcase):
         self.testcase = testcase
@@ -511,6 +684,8 @@ class LocalRemoteHarness:
         self.state_home = self.root / "state"
         self.sessh_state = self.state_home / "sessh"
         self.sessions_dir = self.sessh_state / "sessions"
+        self.fakebin = self.root / "fakebin"
+        self.cli_config = self.root / "config.yaml"
         self.home.mkdir()
 
     def __enter__(self):
@@ -537,6 +712,45 @@ class LocalRemoteHarness:
             height=height,
             history_limit=history_limit,
         )
+
+    def write_cli_config(self, *, shell="bash", history_limit=200):
+        self.cli_config.write_text(
+            "\n".join(
+                [
+                    "defaults:",
+                    f"  shell: {shell}",
+                    f"  history-limit: {history_limit}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    def write_fake_ssh(self):
+        self.fakebin.mkdir(exist_ok=True)
+        fake_ssh = self.fakebin / "ssh"
+        fake_ssh.write_text(
+            "\n".join(
+                [
+                    "#!/bin/sh",
+                    'while [ "$#" -gt 0 ]; do',
+                    '  case "$1" in',
+                    "    -t|-tt|-T) shift ;;",
+                    "    -o) shift 2 ;;",
+                    "    -*) shift ;;",
+                    "    *) shift; break ;;",
+                    "  esac",
+                    "done",
+                    f"HOME={shlex.quote(str(self.home))}",
+                    f"XDG_STATE_HOME={shlex.quote(str(self.state_home))}",
+                    "export HOME XDG_STATE_HOME",
+                    'exec /bin/sh -c "$1"',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fake_ssh.chmod(0o700)
 
     def bootstrap(self, *, shell="bash", history_limit=200):
         script = files("sessh").joinpath("remote.sh").read_text(encoding="utf-8")
@@ -678,6 +892,65 @@ class LocalOuterTmuxDriver:
                         [
                             shlex.quote(str(self.transaction)),
                             *[shlex.quote(arg) for arg in remote_argv],
+                        ]
+                    ),
+                    "sessh_driver_status=$?",
+                    f"printf '%s\\n' \"$sessh_driver_status\" > {shlex.quote(str(self.status_file))}",
+                    "printf '__SESSH_DRIVER_DONE__=%s\\n' \"$sessh_driver_status\"",
+                    "sleep 3600",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        self.driver.chmod(0o700)
+        self._tmux(
+            "new-session",
+            "-d",
+            "-x",
+            str(self.width),
+            "-y",
+            str(self.height),
+            "-s",
+            self.session,
+            shlex.quote(str(self.driver)),
+        )
+
+    def start_cli_driver(
+        self,
+        argv,
+        *,
+        fixed_resume_id=None,
+        before_transaction=(),
+    ):
+        if fixed_resume_id is None:
+            python_code = (
+                "import sys; from sessh.cli import main; sys.exit(main(sys.argv[1:]))"
+            )
+        else:
+            python_code = (
+                "import sys; "
+                "from sessh.cli import execute, parse_args; "
+                f"sys.exit(execute(parse_args(sys.argv[1:]), "
+                f"id_generator=lambda existing: {fixed_resume_id!r}))"
+            )
+        before_transaction_lines = [
+            f"printf '%s\\n' {shlex.quote(line)}" for line in before_transaction
+        ]
+        self.driver.write_text(
+            "\n".join(
+                [
+                    "#!/bin/sh",
+                    "set +e",
+                    f"PATH={shlex.quote(str(self.remote.fakebin))}:$PATH",
+                    "export PATH",
+                    *before_transaction_lines,
+                    " ".join(
+                        [
+                            shlex.quote(sys.executable),
+                            "-c",
+                            shlex.quote(python_code),
+                            *[shlex.quote(arg) for arg in argv],
                         ]
                     ),
                     "sessh_driver_status=$?",
