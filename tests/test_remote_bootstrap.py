@@ -587,6 +587,7 @@ sessh_scrollback_note ignored-target 1
                 )
                 outer.wait_for_text(expected_banner)
                 outer.wait_for_text("500")
+                remote.wait_for_session_attached("sessh-abc123")
                 remote.tmux("kill-session", "-t", "sessh-abc123")
                 self.assertEqual(outer.wait_for_exit(), 0)
                 terminal_payload = outer.terminal_payload()
@@ -597,10 +598,77 @@ sessh_scrollback_note ignored-target 1
                 expected_banner,
                 *[str(number) for number in range(290, 490)],
                 "--- sessh live boundary ---",
-                *[""] * 12,
+                *[str(number) for number in range(490, 501)],
                 *[str(number) for number in range(490, 501)],
             ],
         )
+
+    def test_cli_attach_interactive_small_scrollback_has_no_padding_gap(self):
+        require_tool("tmux")
+        require_tool("bash")
+
+        with LocalRemoteHarness(self) as remote:
+            remote.bootstrap(history_limit=300)
+            remote.write_fake_ssh()
+            remote.write_cli_config(history_limit=300)
+            remote.tmux(
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "54",
+                "-s",
+                "sessh-abc123",
+                "seq 150; sleep 3600",
+            )
+            remote.wait_for_pane_text("sessh-abc123:0.0", "150")
+            history_size = int(
+                remote.tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "sessh-abc123:0.0",
+                    "#{history_size}",
+                ).stdout.strip()
+            )
+            self.assertEqual(history_size, 97)
+            expected_banner = (
+                f"--- sessh attached abc123; skipped {history_size - 10} "
+                "lines of scrollback ---"
+            )
+
+            with remote.outer_tmux(width=100, height=54, history_limit=1000) as outer:
+                outer.start_cli_driver(
+                    [
+                        "--config",
+                        str(remote.cli_config),
+                        "fakehost",
+                        "--attach",
+                        "abc123",
+                        "--scrollback",
+                        "10",
+                    ]
+                )
+                outer.wait_for_text(expected_banner)
+                outer.wait_for_text("150")
+                remote.wait_for_session_attached("sessh-abc123")
+                live_terminal_lines = outer.capture().splitlines()
+                remote.tmux("kill-session", "-t", "sessh-abc123")
+                self.assertEqual(outer.wait_for_exit(), 0)
+                terminal_lines = outer.terminal_payload().splitlines()
+
+        expected_lines = [
+            expected_banner,
+            *[str(number) for number in range(88, 98)],
+            "--- sessh live boundary ---",
+            *[str(number) for number in range(98, 151)],
+            *[str(number) for number in range(98, 151)],
+        ]
+        live_boundary_index = live_terminal_lines.index("--- sessh live boundary ---")
+        self.assertEqual(live_terminal_lines[live_boundary_index + 1], "98")
+        self.assertEqual(terminal_lines, expected_lines)
+        self.assertEqual(terminal_lines, live_terminal_lines[:-1])
 
     def test_cli_attach_interactive_without_scrollback_reports_skipped_history(self):
         require_tool("tmux")
@@ -842,6 +910,7 @@ sessh_scrollback_note ignored-target 1
                 )
                 outer.wait_for_text("hist-2")
                 outer.wait_for_text("hist-7")
+                remote.wait_for_session_attached("sessh-abc123")
                 remote.tmux("kill-session", "-t", "sessh-abc123")
                 self.assertEqual(outer.wait_for_exit(), 0)
                 terminal_payload = outer.terminal_payload()
@@ -855,7 +924,15 @@ sessh_scrollback_note ignored-target 1
                     "hist-2",
                     "hist-3",
                     "--- sessh live boundary ---",
-                    *[""] * 10,
+                    "hist-4",
+                    "hist-5",
+                    "hist-6",
+                    "hist-7",
+                    "",
+                    "hist-4",
+                    "hist-5",
+                    "hist-6",
+                    "hist-7",
                     "hist-0",
                     "hist-1",
                     "hist-2",
@@ -902,6 +979,7 @@ sessh_scrollback_note ignored-target 1
                 )
                 outer.wait_for_text("--- sessh live boundary ---")
                 outer.wait_for_text("200")
+                remote.wait_for_session_attached("sessh-abc123")
                 remote.tmux("kill-session", "-t", "sessh-abc123")
                 self.assertEqual(outer.wait_for_exit(), 0)
                 terminal_payload = outer.terminal_payload()
@@ -912,7 +990,7 @@ sessh_scrollback_note ignored-target 1
                 "--- sessh attached abc123 ---",
                 *[str(number) for number in range(1, 190)],
                 "--- sessh live boundary ---",
-                *[""] * 12,
+                *[str(number) for number in range(190, 201)],
                 *[str(number) for number in range(190, 201)],
             ],
         )
@@ -966,6 +1044,7 @@ sessh_scrollback_note ignored-target 1
                 )
                 outer.wait_for_text(expected_banner)
                 outer.wait_for_text("500")
+                remote.wait_for_session_attached("sessh-abc123")
                 remote.tmux("kill-session", "-t", "sessh-abc123")
                 self.assertEqual(outer.wait_for_exit(), 0)
                 terminal_payload = outer.terminal_payload()
@@ -976,7 +1055,7 @@ sessh_scrollback_note ignored-target 1
                 expected_banner,
                 *[str(number) for number in range(290, 490)],
                 "--- sessh live boundary ---",
-                *[""] * 12,
+                *[str(number) for number in range(490, 501)],
                 *[str(number) for number in range(490, 501)],
             ],
         )
@@ -1151,6 +1230,22 @@ class LocalRemoteHarness:
                 return
             time.sleep(0.05)
         self.testcase.fail(f"timed out waiting for {text!r} in {target}:\n{capture}")
+
+    def wait_for_session_attached(self, session_name, *, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = self.tmux(
+                "display-message",
+                "-p",
+                "-t",
+                session_name,
+                "#{session_attached}",
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip() not in {"", "0"}:
+                return
+            time.sleep(0.05)
+        self.testcase.fail(f"timed out waiting for {session_name} to be attached")
 
 
 class LocalOuterTmuxDriver:

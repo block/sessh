@@ -413,24 +413,6 @@ sessh_terminal_lines() {
   printf '%s\n' "$sessh_lines"
 }
 
-sessh_terminal_padding_lines() {
-  sessh_lines=$(sessh_terminal_lines)
-  sessh_padding_lines=$((sessh_lines * 2 - 1))
-  if [ "$sessh_padding_lines" -lt 0 ]; then
-    sessh_padding_lines=0
-  fi
-  printf '%s\n' "$sessh_padding_lines"
-}
-
-sessh_terminal_padding_lf() {
-  sessh_padding_lines=$(sessh_terminal_padding_lines)
-  sessh_i=0
-  while [ "$sessh_i" -lt "$sessh_padding_lines" ]; do
-    printf '\n' >&2
-    sessh_i=$((sessh_i + 1))
-  done
-}
-
 sessh_terminal_boundary() {
   sessh_label=$1
   sessh_resume_id=$2
@@ -506,15 +488,15 @@ sessh_scrollback_note() {
   if [ "$sessh_history_size" -le "$sessh_scrollback" ]; then
     return 0
   fi
-  sessh_visible_history_after_resize=0
-  sessh_terminal_lines=$(sessh_terminal_lines 2>/dev/null || printf '0\n')
-  sessh_pane_height=$(sessh_pane_height "$sessh_target" || printf '%s\n' "$sessh_terminal_lines")
-  if [ "$sessh_terminal_lines" -gt "$sessh_pane_height" ]; then
-    sessh_visible_history_after_resize=$((sessh_terminal_lines - sessh_pane_height))
-  fi
-  sessh_covered_history=$sessh_scrollback
-  if [ "$sessh_visible_history_after_resize" -gt "$sessh_covered_history" ]; then
-    sessh_covered_history=$sessh_visible_history_after_resize
+  if [ "$sessh_scrollback" -gt 0 ]; then
+    sessh_covered_history=$sessh_scrollback
+  else
+    sessh_covered_history=0
+    sessh_terminal_lines=$(sessh_terminal_lines 2>/dev/null || printf '0\n')
+    sessh_pane_height=$(sessh_pane_height "$sessh_target" || printf '%s\n' "$sessh_terminal_lines")
+    if [ "$sessh_terminal_lines" -gt "$sessh_pane_height" ]; then
+      sessh_covered_history=$((sessh_terminal_lines - sessh_pane_height))
+    fi
   fi
   if [ "$sessh_history_size" -le "$sessh_covered_history" ]; then
     return 0
@@ -525,6 +507,30 @@ sessh_scrollback_note() {
   else
     printf '%s%s%s' '; skipped ' "$sessh_skipped" ' lines of scrollback'
   fi
+}
+
+sessh_replay_visible_screen() {
+  sessh_target=$1
+  sessh_terminal_lines=$(sessh_terminal_lines 2>/dev/null || printf '0\n')
+  case "$sessh_terminal_lines" in
+    ''|*[!0-9]*|0)
+      return
+      ;;
+  esac
+  # Push the live boundary into terminal history with real pane content, not
+  # blank padding. Replaying can duplicate lines, which is acceptable on attach.
+  sessh_tmux capture-pane -p -S 0 -E - -t "$sessh_target" |
+    awk -v wanted="$sessh_terminal_lines" '
+      { lines[++line_count] = $0 }
+      END {
+        if (line_count == 0) {
+          exit
+        }
+        for (i = 1; i <= wanted; i++) {
+          print lines[((i - 1) % line_count) + 1]
+        }
+      }
+    '
 }
 
 sessh_clear_tmux_exit_message() {
@@ -686,7 +692,7 @@ sessh_attach_existing_session() {
   if [ "$sessh_scrollback" -gt 0 ]; then
     sessh_tmux capture-pane -p -S "-$sessh_scrollback" -E -1 -t "$sessh_target"
     printf '%s\n' '--- sessh live boundary ---' >&2
-    sessh_terminal_padding_lf
+    sessh_replay_visible_screen "$sessh_target"
     sessh_tmux attach-session -d -t "$sessh_session_name"
   else
     sessh_tmux attach-session -d -t "$sessh_session_name"
