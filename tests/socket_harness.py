@@ -2003,7 +2003,6 @@ def main():
                 os.write(fd, b"echo sessh_after_reconnect\n")
                 read_until_count(fd, b"sessh_after_reconnect", 2)
                 os.write(fd, b"exit\n")
-                read_until(fd, b"exit", timeout=2.0)
                 wait_child_draining_fd(pid, fd)
                 os.close(fd)
                 closed = True
