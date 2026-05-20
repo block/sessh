@@ -381,6 +381,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 }
             };
 
+            try reconnect_ui.showReconnectedBriefly();
             try reconnect_ui.clearBanner();
             try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
             reconnect_ui.deinit();

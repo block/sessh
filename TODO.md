@@ -1,4 +1,3 @@
-- Make sure banners work even when the screen is a single line (we should just show the banner at the very top line)
 - Create client logs and write to them
   - disconnection/reconnection events
   - when we detect stderr traffic from ssh
@@ -7,10 +6,6 @@
   - expect a draw from every batch of input (if the input doesn't result in a draw then we should emit an empty draw, possibly after some timeout)
   - have a configurable ping/pong when there hasn't been any input after some time period
   - show a banner when lag is detected (maybe allowing LEADER-S to force reconnection)
-- Responsive banners
-  - when you press space, the banner should immediately change to "reconnecting..."
-  - show countdown time in seconds when it's less than 1min, update every second
-  - show a banner briefly after we reconnect
 - Repaint should make scrollback optional - we don't need to repaint the scrollback when we just want to erase a banner
   - there is a possibility of banners appearing in scrollback - this will
     happen when we have a banner present and we process draws that cause us to

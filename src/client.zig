@@ -213,6 +213,8 @@ pub const RuntimeSession = struct {
 };
 
 pub const ReconnectUi = struct {
+    const reconnected_banner_ms = 500;
+
     mode_guard: terminal.TerminalModeGuard,
     escape_filter: terminal.EscapeFilter = .{ .at_line_start = false },
     buffered_input: std.ArrayList(u8) = .empty,
@@ -237,24 +239,31 @@ pub const ReconnectUi = struct {
     pub fn waitForReconnect(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
         try self.drawBanner(delay_ms);
         const deadline = std.time.milliTimestamp() + @as(i64, @intCast(delay_ms));
-        var next_banner_update = std.time.milliTimestamp() + 60_000;
+        var next_banner_update = std.time.milliTimestamp() + @as(i64, @intCast(nextBannerUpdateDelayMs(delay_ms)));
 
         while (true) {
             const now = std.time.milliTimestamp();
-            if (now >= deadline) return .wait_elapsed;
+            if (now >= deadline) {
+                try self.drawStaticBanner("--- sessh: reconnecting... CTRL-C aborts ---");
+                return .wait_elapsed;
+            }
 
             const next_wake = @min(deadline, next_banner_update);
             const wait_ms: i32 = @intCast(@min(next_wake - now, @as(i64, std.math.maxInt(i32))));
             switch (try self.pollInput(wait_ms)) {
                 .abort => return .abort,
-                .reconnect_now => return .reconnect_now,
+                .reconnect_now => {
+                    try self.drawStaticBanner("--- sessh: reconnecting... CTRL-C aborts ---");
+                    return .reconnect_now;
+                },
                 .wait_elapsed => {},
             }
 
             const after_poll = std.time.milliTimestamp();
             if (after_poll >= next_banner_update and after_poll < deadline) {
-                try self.drawBanner(@intCast(deadline - after_poll));
-                next_banner_update = after_poll + 60_000;
+                const remaining_ms: u64 = @intCast(deadline - after_poll);
+                try self.drawBanner(remaining_ms);
+                next_banner_update = after_poll + @as(i64, @intCast(nextBannerUpdateDelayMs(remaining_ms)));
             }
         }
     }
@@ -316,6 +325,12 @@ pub const ReconnectUi = struct {
         try renderer.moveCursor(origin, 0);
     }
 
+    pub fn showReconnectedBriefly(self: *ReconnectUi) !void {
+        if (c.isatty(1) == 0) return;
+        try self.drawStaticBanner("--- sessh: reconnected ---");
+        std.Thread.sleep(reconnected_banner_ms * std.time.ns_per_ms);
+    }
+
     fn drawBanner(self: *ReconnectUi, delay_ms: u64) !void {
         var delay_buf: [16]u8 = undefined;
         const delay = try formatDelay(delay_ms, &delay_buf);
@@ -325,6 +340,10 @@ pub const ReconnectUi = struct {
             "--- sessh: disconnected. Retry in {s}. SPACE retries now. CTRL-C aborts ---",
             .{delay},
         );
+        try self.drawStaticBanner(message);
+    }
+
+    fn drawStaticBanner(self: *ReconnectUi, message: []const u8) !void {
         if (c.isatty(1) == 0) {
             try io_helpers.writeAll(1, "\r\n");
             try io_helpers.writeAll(1, message);
@@ -334,10 +353,7 @@ pub const ReconnectUi = struct {
 
         const size = terminal.currentWindowSize();
         const top_row = self.origin_row orelse 0;
-        const banner_row = if (size.rows > 1)
-            @min(top_row +| 1, size.rows - 1)
-        else
-            @as(u16, 0);
+        const banner_row = bannerRowForSize(size.rows, top_row);
         const visible_message = if (message.len > size.cols) message[0..size.cols] else message;
         const col: u16 = if (size.cols > visible_message.len)
             @intCast((@as(usize, size.cols) - visible_message.len) / 2)
@@ -367,11 +383,22 @@ pub const ReconnectUi = struct {
     }
 };
 
+fn bannerRowForSize(rows: u16, top_row: u16) u16 {
+    if (rows <= 1) return 0;
+    return @min(top_row +| 1, rows - 1);
+}
+
 fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
     const seconds = @max(@divTrunc(delay_ms + 999, 1000), 1);
     if (seconds < 60) return std.fmt.bufPrint(buf, "{}sec", .{seconds});
     const minutes = @divTrunc(seconds + 59, 60);
     return std.fmt.bufPrint(buf, "{}min", .{minutes});
+}
+
+fn nextBannerUpdateDelayMs(remaining_ms: u64) u64 {
+    if (remaining_ms <= 1_000) return remaining_ms;
+    if (remaining_ms <= 60_000) return 1_000;
+    return @min(remaining_ms - 59_000, 60_000);
 }
 
 const DrawPayload = struct {
@@ -423,6 +450,19 @@ test "formatDelay uses compact reconnect labels" {
     try std.testing.expectEqualStrings("20sec", try formatDelay(20_000, &buf));
     try std.testing.expectEqualStrings("1min", try formatDelay(60_000, &buf));
     try std.testing.expectEqualStrings("10min", try formatDelay(600_000, &buf));
+}
+
+test "reconnect banner row handles single-line terminals" {
+    try std.testing.expectEqual(@as(u16, 0), bannerRowForSize(1, 0));
+    try std.testing.expectEqual(@as(u16, 1), bannerRowForSize(24, 0));
+    try std.testing.expectEqual(@as(u16, 23), bannerRowForSize(24, 23));
+}
+
+test "reconnect banner updates every second under one minute" {
+    try std.testing.expectEqual(@as(u64, 1_000), nextBannerUpdateDelayMs(59_000));
+    try std.testing.expectEqual(@as(u64, 1_000), nextBannerUpdateDelayMs(60_000));
+    try std.testing.expectEqual(@as(u64, 2_000), nextBannerUpdateDelayMs(61_000));
+    try std.testing.expectEqual(@as(u64, 60_000), nextBannerUpdateDelayMs(600_000));
 }
 
 /// Implements the public `sessh :local:` path. This is both the local testing
