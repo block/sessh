@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+import argparse
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+REMOTE = "origin"
+MAIN_BRANCH = "main"
+GITHUB_REPO = "block/sessh"
+
+
+def fail(message: str) -> None:
+    print(f"scripts/release: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run(*args: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    print("==> " + " ".join(args), flush=True)
+    return subprocess.run(
+        args,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+
+
+def output(*args: str, check: bool = True) -> str:
+    result = run(*args, check=check, capture=True)
+    return result.stdout.strip()
+
+
+def require_clean_tree() -> None:
+    if run("git", "diff", "--quiet", check=False).returncode != 0:
+        fail("working tree must be clean before releasing")
+    if run("git", "diff", "--cached", "--quiet", check=False).returncode != 0:
+        fail("working tree must be clean before releasing")
+    if output("git", "status", "--porcelain", "--untracked-files=normal"):
+        fail("working tree must be clean before releasing")
+
+
+def release_remote_url() -> str:
+    remote_url = output("git", "remote", "get-url", REMOTE)
+    allowed = {
+        "git@github.com:block/sessh.git",
+        "https://github.com/block/sessh.git",
+        "https://github.com/block/sessh",
+    }
+    if remote_url not in allowed:
+        fail(f"refusing to push to non-release remote {remote_url!r}; expected github.com:block/sessh")
+    return remote_url
+
+
+def read_config_version() -> str:
+    text = Path("src/config.zig").read_text()
+    match = re.search(r'^pub const version = "([^"]+)";$', text, flags=re.MULTILINE)
+    if not match:
+        fail("could not read version from src/config.zig")
+    return match.group(1)
+
+
+def parse_release_version(config_version: str) -> tuple[str, str, str]:
+    if not config_version.endswith("-dev"):
+        fail(f"src/config.zig version must end in -dev: {config_version}")
+
+    release_version = config_version.removesuffix("-dev")
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", release_version)
+    if not match:
+        fail(f"release version must be X.Y.Z: {release_version}")
+
+    major, minor, _patch = (int(part) for part in match.groups())
+    next_dev = f"{major}.{minor + 1}.0-dev"
+    next_package = next_dev.removesuffix("-dev")
+    return release_version, next_dev, next_package
+
+
+def update_versions(binary_version: str, package_version: str) -> None:
+    config = Path("src/config.zig")
+    config_text, config_count = re.subn(
+        r'^pub const version = "([^"]+)";$',
+        f'pub const version = "{binary_version}";',
+        config.read_text(),
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if config_count != 1:
+        fail("could not update src/config.zig version")
+    config.write_text(config_text)
+
+    zon = Path("build.zig.zon")
+    zon_text, zon_count = re.subn(
+        r'(\.version = )"([^"]+)",',
+        rf'\1"{package_version}",',
+        zon.read_text(),
+        count=1,
+    )
+    if zon_count != 1:
+        fail("could not update build.zig.zon version")
+    zon.write_text(zon_text)
+
+
+def github_release_exists(tag: str) -> bool:
+    return run("gh", "release", "view", tag, "--repo", GITHUB_REPO, check=False, capture=True).returncode == 0
+
+
+def find_release_run(release_sha: str) -> str:
+    for _attempt in range(60):
+        run_id = output(
+            "gh",
+            "run",
+            "list",
+            "--repo",
+            GITHUB_REPO,
+            "--workflow",
+            "release.yml",
+            "--commit",
+            release_sha,
+            "--event",
+            "push",
+            "--json",
+            "databaseId",
+            "--jq",
+            ".[0].databaseId // \"\"",
+            "--limit",
+            "10",
+        )
+        if run_id:
+            return run_id
+        time.sleep(5)
+    fail(f"release workflow did not appear for {release_sha}")
+
+
+def commit_staged(message: str) -> None:
+    if run("git", "diff", "--cached", "--quiet", check=False).returncode == 0:
+        fail("version files did not change; refusing to create an empty commit")
+    run("git", "commit", "-m", message)
+
+
+def confirm_release(release_version: str, tag: str, release_branch: str, next_dev: str, remote_url: str) -> None:
+    print()
+    print("Release plan:")
+    print(f"  release:        {release_version}")
+    print(f"  tag:            {tag}")
+    print(f"  branch:         {release_branch}")
+    print(f"  next dev:       {next_dev}")
+    print(f"  remote:         {REMOTE} ({remote_url})")
+    print(f"  main branch:    {MAIN_BRANCH}")
+    print()
+    answer = input("Proceed with release? Type 'yes' to continue: ")
+    if answer != "yes":
+        fail("release aborted")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="scripts/release",
+        description=(
+            "Create a release branch/tag, wait for the release workflow, "
+            "then merge the release commit to main and bump to the next dev version."
+        )
+    )
+    parser.parse_args()
+
+    remote_url = release_remote_url()
+    require_clean_tree()
+
+    release_version, next_dev, next_package = parse_release_version(read_config_version())
+    tag = f"v{release_version}"
+    release_branch = f"release/{tag}"
+
+    if github_release_exists(tag):
+        fail(f"GitHub Release {tag} already exists; refusing to move the release tag")
+
+    confirm_release(release_version, tag, release_branch, next_dev, remote_url)
+
+    run("git", "fetch", "--tags", REMOTE, MAIN_BRANCH)
+    run("git", "switch", MAIN_BRANCH)
+    run("git", "pull", "--ff-only", REMOTE, MAIN_BRANCH)
+    run("git", "switch", "-C", release_branch, MAIN_BRANCH)
+
+    update_versions(release_version, release_version)
+    run("git", "add", "src/config.zig", "build.zig.zon")
+    commit_staged(f"Release {tag}")
+    release_sha = output("git", "rev-parse", "HEAD")
+
+    if run("scripts/check", "--fast", check=False).returncode != 0:
+        run("git", "switch", MAIN_BRANCH)
+        fail(f"local check failed for {tag}; commit fixes to {MAIN_BRANCH} and re-run scripts/release")
+
+    run("git", "tag", "-f", tag, release_sha)
+    run("git", "push", "--force-with-lease", REMOTE, f"HEAD:refs/heads/{release_branch}")
+    run("git", "push", "--force", REMOTE, f"refs/tags/{tag}:refs/tags/{tag}")
+
+    print(f"==> waiting for release workflow for {tag} ({release_sha})", flush=True)
+    run_id = find_release_run(release_sha)
+    if run("gh", "run", "watch", run_id, "--repo", GITHUB_REPO, "--exit-status", check=False).returncode != 0:
+        run("git", "switch", MAIN_BRANCH)
+        fail(f"release workflow failed for {tag}; commit fixes to {MAIN_BRANCH} and re-run scripts/release")
+
+    run("git", "switch", MAIN_BRANCH)
+    run("git", "pull", "--ff-only", REMOTE, MAIN_BRANCH)
+    if run("git", "merge-base", "--is-ancestor", "HEAD", release_sha, check=False).returncode == 0:
+        run("git", "merge", "--ff-only", release_sha)
+    else:
+        run("git", "cherry-pick", release_sha)
+
+    update_versions(next_dev, next_package)
+    run("git", "add", "src/config.zig", "build.zig.zon")
+    commit_staged(f"Begin {next_dev}")
+    run("git", "push", REMOTE, MAIN_BRANCH)
+
+    print(f"scripts/release: released {tag} and bumped {MAIN_BRANCH} to {next_dev}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

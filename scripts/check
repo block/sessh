@@ -150,6 +150,8 @@ protoc_bin=$(find_protoc)
 export SESSH_PROTOC=$protoc_bin
 
 run "$zig_bin" build gen-proto
+run sh -n scripts/build scripts/check
+run python3 -m py_compile scripts/release
 run "$zig_bin" fmt --check build.zig build.zig.zon src/*.zig
 run "$zig_bin" build
 run "$zig_bin" build install-dev

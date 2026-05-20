@@ -16,13 +16,11 @@ sessh-X.Y.Z/
   libexec/sessh/sessh-linux-x86_64
 ```
 
-## Before Tagging
+## Before Releasing
 
-1. Update the release version in `src/config.zig`.
-2. Update the package version in `build.zig.zon`.
+1. Make sure the current branch is `main`.
+2. Make sure the working tree is clean.
 3. Run `scripts/check`.
-4. Run `scripts/build --version X.Y.Z` and inspect `dist/sessh-X.Y.Z.tar.gz`.
-5. Commit the version changes.
 
 The release workflow checks that the tag version matches both version fields.
 A tag `vX.Y.Z` should produce a binary whose `sessh --version` output is
@@ -31,11 +29,34 @@ A tag `vX.Y.Z` should produce a binary whose `sessh --version` output is
 ## Cutting A Release
 
 ```sh
-git tag vX.Y.Z
-git push origin vX.Y.Z
+scripts/release
 ```
 
-The GitHub release workflow:
+The release script:
+
+1. creates or resets `release/vX.Y.Z` from the current `main`;
+2. infers `X.Y.Z` from `src/config.zig` by stripping `-dev`;
+3. updates `src/config.zig` and `build.zig.zon` for `X.Y.Z`;
+4. commits `Release vX.Y.Z`;
+5. tags that commit as `vX.Y.Z`;
+6. pushes the release branch and tag to `origin`;
+7. waits for the release workflow to succeed;
+8. integrates the release version commit into `main`;
+9. bumps `main` to the next development version and pushes it.
+
+For example, if `src/config.zig` says `0.4.0-dev`, `scripts/release` releases
+`0.4.0` and bumps `main` to `0.5.0-dev` after the release succeeds.
+
+Before mutating git state, the script prints the inferred release plan and
+requires typing `yes`.
+
+Re-running the same release after CI failure is supported. Commit the fix to
+`main`, then run `scripts/release` again. As long as `src/config.zig` still has
+the same `X.Y.Z-dev` version, the script will reset the release branch from the
+updated `main` and move the tag to the new release commit. It refuses to move
+the tag once a GitHub Release already exists for that version.
+
+The GitHub release workflow triggered by the tag:
 
 1. installs Zig 0.15.2 and protobuf;
 2. runs `scripts/check --fast`;
