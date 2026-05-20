@@ -56,6 +56,11 @@ the same `X.Y.Z-dev` version, the script will reset the release branch from the
 updated `main` and move the tag to the new release commit. It refuses to move
 the tag once a GitHub Release already exists for that version.
 
+If the release workflow fails after the GitHub Release has already been
+published, the script still integrates the release commit into `main` and bumps
+to the next development version. This lets a release complete even when a later
+publishing side effect, such as the Homebrew tap bump, needs separate follow-up.
+
 The GitHub release workflow triggered by the tag:
 
 1. installs Zig 0.15.2 and protobuf;

@@ -197,8 +197,13 @@ def main() -> int:
     print(f"==> waiting for release workflow for {tag} ({release_sha})", flush=True)
     run_id = find_release_run(release_sha)
     if run("gh", "run", "watch", run_id, "--repo", GITHUB_REPO, "--exit-status", check=False).returncode != 0:
-        run("git", "switch", MAIN_BRANCH)
-        fail(f"release workflow failed for {tag}; commit fixes to {MAIN_BRANCH} and re-run scripts/release")
+        if not github_release_exists(tag):
+            run("git", "switch", MAIN_BRANCH)
+            fail(f"release workflow failed before publishing {tag}; commit fixes to {MAIN_BRANCH} and re-run scripts/release")
+        print(
+            f"scripts/release: release workflow failed after publishing {tag}; continuing with main version bump",
+            file=sys.stderr,
+        )
 
     run("git", "switch", MAIN_BRANCH)
     run("git", "pull", "--ff-only", REMOTE, MAIN_BRANCH)
