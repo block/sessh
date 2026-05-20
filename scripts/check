@@ -116,6 +116,23 @@ EOF
   fi
 }
 
+check_python_protobuf() {
+  if ! python3 - <<'PY' >/dev/null 2>&1
+import google.protobuf
+PY
+  then
+    cat >&2 <<'EOF'
+missing Python protobuf package.
+
+Install it into the Python environment used by scripts/check, for example:
+  python3 -m pip install protobuf
+
+If you use a virtualenv, activate it before running scripts/check.
+EOF
+    exit 1
+  fi
+}
+
 fast=0
 
 case "${1-}" in
@@ -148,6 +165,7 @@ if [ "$zig_version" != "0.15.2" ]; then
 fi
 protoc_bin=$(find_protoc)
 export SESSH_PROTOC=$protoc_bin
+check_python_protobuf
 
 run "$zig_bin" build gen-proto
 run sh -n scripts/build scripts/check

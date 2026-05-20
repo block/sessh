@@ -44,6 +44,13 @@ jobs:
           tar -C "$RUNNER_TEMP/zig" --strip-components=1 -xf "$RUNNER_TEMP/zig.tar.xz"
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/python"
+          "$RUNNER_TEMP/python/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/python/bin/python" -m pip install protobuf
+          echo "$RUNNER_TEMP/python/bin" >> "$GITHUB_PATH"
+
       - name: Validate release version
         shell: bash
         run: |
