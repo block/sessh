@@ -1,6 +1,6 @@
 # sessh
 
-`sessh` is `ssh` with seamless connection recovery.
+`sessh` is `ssh` with persistent sessions and seamless connection recovery.
 
 - no more losing work due to network disconnections
 - no need to install anything remotely: `sessh` will bootstrap
@@ -20,4 +20,4 @@ To get started:
 User-facing commands and configuration:
 [User Manual](docs/USER_MANUAL.md).
 
-Powered by libghostty-vt. Details in [Architecture](docs/ARCHITECTURE.md).
+Implementation details in [Architecture](docs/ARCHITECTURE.md).

@@ -722,6 +722,12 @@ def run_terminal_modes_protocol_test(base_env):
                 for seq in (b"\x1b[?1h", b"\x1b[?1000h", b"\x1b[?1006h", b"\x1b[?1004h", b"\x1b[?2004h"):
                     if seq not in output:
                         raise AssertionError(f"missing terminal mode sequence {seq!r}: {output!r}, last={draw!r}")
+                if b"\x1b[6n" in output:
+                    raise AssertionError(f"mouse mode should not require a cursor-position query: {output!r}")
+                ready_index = output.index(b"MODES_READY")
+                for seq in (b"\x1b[?1000h", b"\x1b[?1006h"):
+                    if output.index(seq) < ready_index:
+                        raise AssertionError(f"mouse reporting was enabled before viewport redraw: {output!r}")
             finally:
                 conn.close()
         finally:

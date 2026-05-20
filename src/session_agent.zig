@@ -78,7 +78,6 @@ const Attachment = struct {
     rows: u16 = 24,
     cols: u16 = 80,
     origin: ?TerminalOrigin = null,
-    origin_query: ?OriginQuery = null,
     active: bool = false,
     close_after_flush: bool = false,
     presentation: PresentationState = .{},
@@ -157,10 +156,15 @@ const PresentationState = struct {
     ) !void {
         try self.setActiveScreen(screen.active_screen);
 
-        if (align_viewport) try self.alignViewportTop(renderer, session_rows);
+        const desired_modes = vtModesToClient(screen.modes);
+        const mouse_requested = desired_modes.mouse_tracking != .disabled;
+
+        if (align_viewport) {
+            try self.alignViewportTop(renderer, session_rows);
+            if (mouse_requested) self.full_height_rendering = true;
+        }
         const min_rendered_rows: u16 = if (self.full_height_rendering and
-            screen.modes.mouse_tracking != 0 and
-            screen.modes.mouse_sgr)
+            mouse_requested)
             session_rows
         else
             0;
@@ -198,9 +202,13 @@ const PresentationState = struct {
         }
 
         if (screen.title_dirty) try renderer.setTitle(screen.title);
-        try self.applyTerminalModes(renderer, vtModesToClient(screen.modes));
+        const modes_to_apply = if (mouse_requested and !self.full_height_rendering)
+            terminalModesWithoutMouse(desired_modes)
+        else
+            desired_modes;
+        try self.applyTerminalModes(renderer, modes_to_apply);
         try self.applyDefaultColors(renderer, try vtDefaultColorsToClient(screen.default_colors));
-        if (screen.modes.mouse_tracking == 0 or !screen.modes.mouse_sgr) {
+        if (!mouse_requested) {
             self.full_height_rendering = false;
         }
 
@@ -221,31 +229,6 @@ const PresentationState = struct {
         try renderer.carriageReturn();
         self.initialized = false;
         self.rendered_rows = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-    }
-
-    fn alignViewportFromOrigin(
-        self: *PresentationState,
-        renderer: client_renderer.Renderer,
-        session_rows: u16,
-        origin_row: u16,
-        cursor_row: u16,
-    ) !void {
-        if (session_rows == 0) return;
-        const bounded_cursor_row = @min(cursor_row, session_rows - 1);
-        try renderer.cursorDown(session_rows - 1 - bounded_cursor_row);
-        try renderer.carriageReturn();
-
-        var scrolled: u16 = 0;
-        while (scrolled < origin_row) : (scrolled += 1) {
-            try renderer.newline();
-        }
-
-        try renderer.cursorUp(session_rows - 1);
-        try renderer.carriageReturn();
-        self.initialized = true;
-        self.rendered_rows = session_rows;
         self.cursor_row = 0;
         self.cursor_col = 0;
     }
@@ -491,22 +474,6 @@ const TerminalOrigin = struct {
     col: u16,
 };
 
-const OriginQueryPhase = enum {
-    discover,
-    confirm_aligned,
-};
-
-const OriginQuery = struct {
-    phase: OriginQueryPhase,
-    cursor_row: u16,
-    cursor_col: u16,
-};
-
-const MouseAlignment = struct {
-    origin: TerminalOrigin,
-    cursor_row: u16,
-};
-
 const AttachRequest = struct {
     session_id: ?[]const u8,
     initial_scrollback_row_count: ?u32,
@@ -611,6 +578,13 @@ fn vtModesToClient(modes: vt.TerminalModes) client_renderer.TerminalModes {
         },
         .mouse_sgr = modes.mouse_sgr,
     };
+}
+
+fn terminalModesWithoutMouse(modes: client_renderer.TerminalModes) client_renderer.TerminalModes {
+    var without_mouse = modes;
+    without_mouse.mouse_tracking = .disabled;
+    without_mouse.mouse_sgr = false;
+    return without_mouse;
 }
 
 fn vtDefaultColorsToClient(colors: vt.DefaultColors) !client_renderer.DefaultColors {
@@ -1316,10 +1290,11 @@ fn queueScrollbackRowsAndScreenDraw(
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+    const effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, align_viewport);
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    try attachment.presentation.applyScreen(renderer, session.rows, screen, true, align_viewport);
-    if (align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
-    try updateMouseOriginAfterDraw(attachment, &bytes);
+    try attachment.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
+    if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
+    updateMouseOriginAfterDraw(attachment, screen);
 
     var cleanup_bytes = std.ArrayList(u8).empty;
     defer cleanup_bytes.deinit(app_allocator.allocator());
@@ -1356,20 +1331,24 @@ fn appendScrollbackTruncatedMarker(bytes: *std.ArrayList(u8), renderer: client_r
     try renderer.newline();
 }
 
-fn updateMouseOriginAfterDraw(attachment: *Attachment, bytes: *std.ArrayList(u8)) !void {
-    if (!attachmentSgrMouseActive(attachment)) {
+fn updateMouseOriginAfterDraw(attachment: *Attachment, screen: *const vt.RenderedScreen) void {
+    if (!screenWantsMouseReporting(screen)) {
         attachment.origin = null;
-        attachment.origin_query = null;
         return;
     }
-    if (attachment.origin != null or attachment.origin_query != null) return;
 
-    attachment.origin_query = .{
-        .phase = .discover,
-        .cursor_row = attachment.presentation.cursor_row,
-        .cursor_col = attachment.presentation.cursor_col,
-    };
-    try bytes.appendSlice(app_allocator.allocator(), "\x1b[6n");
+    if (attachment.presentation.full_height_rendering) {
+        attachment.origin = .{ .row = 0, .col = 0 };
+    }
+}
+
+fn screenWantsMouseReporting(screen: *const vt.RenderedScreen) bool {
+    return screen.modes.mouse_tracking != 0;
+}
+
+fn shouldAlignViewportForDraw(attachment: *const Attachment, screen: *const vt.RenderedScreen, requested: bool) bool {
+    return requested or
+        (screenWantsMouseReporting(screen) and !attachment.presentation.full_height_rendering);
 }
 
 fn queueScreenDraw(
@@ -1396,9 +1375,10 @@ fn queueScreenDraw(
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try attachment.presentation.applyScreen(renderer, session.rows, screen, force_redraw, align_viewport);
-    if (align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
-    try updateMouseOriginAfterDraw(attachment, &bytes);
+    const effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, align_viewport);
+    try attachment.presentation.applyScreen(renderer, session.rows, screen, force_redraw, effective_align_viewport);
+    if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
+    updateMouseOriginAfterDraw(attachment, screen);
     if (bytes.items.len > 0) {
         var cleanup_bytes = std.ArrayList(u8).empty;
         defer cleanup_bytes.deinit(app_allocator.allocator());
@@ -1428,75 +1408,6 @@ fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session) 
     try queueDrawFrame(attachment, session, 0, bytes.items, null);
 }
 
-fn queueMouseAlignmentDraw(
-    attachment: *Attachment,
-    session: *const Session,
-    screen: *const vt.RenderedScreen,
-    cleanup_screen: ?*const vt.RenderedScreen,
-    alignment: MouseAlignment,
-) !void {
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try attachment.presentation.alignViewportFromOrigin(
-        renderer,
-        session.rows,
-        alignment.origin.row,
-        alignment.cursor_row,
-    );
-    attachment.origin = .{ .row = 0, .col = 0 };
-    attachment.presentation.full_height_rendering = true;
-    try attachment.presentation.applyScreen(renderer, session.rows, screen, true, false);
-    attachment.origin_query = .{
-        .phase = .confirm_aligned,
-        .cursor_row = attachment.presentation.cursor_row,
-        .cursor_col = attachment.presentation.cursor_col,
-    };
-    try bytes.appendSlice(app_allocator.allocator(), "\x1b[6n");
-
-    var cleanup_bytes = std.ArrayList(u8).empty;
-    defer cleanup_bytes.deinit(app_allocator.allocator());
-    const cleanup: ?[]const u8 = if (cleanup_screen) |primary| cleanup: {
-        var cleanup_presentation = attachment.presentation;
-        const cleanup_renderer = client_renderer.Renderer.buffered(&cleanup_bytes, .{ .kind = .xterm_compatible });
-        try cleanup_presentation.applyScreen(cleanup_renderer, session.rows, primary, true, false);
-        break :cleanup cleanup_bytes.items;
-    } else if (screen.active_screen == 0)
-        ""
-    else
-        null;
-
-    try queueDrawFrame(attachment, session, 0, bytes.items, cleanup);
-}
-
-fn queueMouseAlignmentForAttachment(
-    session_agent: *SessionAgent,
-    attachment_index: usize,
-    alignment: MouseAlignment,
-) !void {
-    const attachment = &session_agent.attachments[attachment_index];
-    const session = &session_agent.sessions[attachment.session_index];
-    const model = session.terminal_model orelse return;
-
-    var screen = try model.renderedScreen(app_allocator.allocator());
-    defer screen.deinit(app_allocator.allocator());
-
-    var primary_screen: ?vt.RenderedScreen = null;
-    defer if (primary_screen) |*primary| primary.deinit(app_allocator.allocator());
-    if (screen.active_screen == 1) {
-        primary_screen = try model.renderedPrimaryScreen(app_allocator.allocator());
-    }
-
-    try queueMouseAlignmentDraw(
-        attachment,
-        session,
-        &screen,
-        if (primary_screen) |*primary| primary else null,
-        alignment,
-    );
-    model.markRendered(screen.rows.len);
-}
-
 fn queueRepaintDraw(
     attachment: *Attachment,
     session: *Session,
@@ -1514,9 +1425,9 @@ fn queueRepaintDraw(
     try renderer.clearForReplace();
     if (truncated_rows > 0) try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
     try renderTranscriptRows(renderer, rows);
-    try attachment.presentation.applyScreen(renderer, session.rows, screen, true, false);
+    try attachment.presentation.applyScreen(renderer, session.rows, screen, true, screenWantsMouseReporting(screen));
     attachment.origin = .{ .row = 0, .col = 0 };
-    try updateMouseOriginAfterDraw(attachment, &bytes);
+    updateMouseOriginAfterDraw(attachment, screen);
     try queueDrawFrame(attachment, session, truncated_rows + @as(u64, @intCast(rows.len)), bytes.items, null);
 }
 
@@ -1966,23 +1877,10 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, paylo
 
     var translated = std.ArrayList(u8).empty;
     defer translated.deinit(app_allocator.allocator());
-    const input_result = translateAttachmentInput(attachment, session, input.data, &translated) catch {
+    translateAttachmentInput(attachment, session, input.data, &translated) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };
-    if (input_result.mouse_alignment) |alignment| {
-        logSessionAgent(session_agent, "event=mouse_align id={s} origin_row={} origin_col={} cursor_row={}", .{
-            session.idSlice(),
-            alignment.origin.row,
-            alignment.origin.col,
-            alignment.cursor_row,
-        });
-        queueMouseAlignmentForAttachment(session_agent, attachment_index, alignment) catch {
-            detachAttachment(session_agent, attachment_index);
-            return;
-        };
-        flushAttachmentOutput(session_agent, attachment_index);
-    }
     if (translated.items.len == 0) return;
 
     io.writeAll(session.pty_fd, translated.items) catch {
@@ -2004,36 +1902,19 @@ const SgrMouseParse = union(enum) {
     complete: SgrMouseReport,
 };
 
-const CursorPositionReport = struct {
-    row: u32,
-    col: u32,
-    end: usize,
-};
-
-const CursorPositionParse = union(enum) {
-    not_report,
-    incomplete,
-    complete: CursorPositionReport,
-};
-
-const InputTranslationResult = struct {
-    mouse_alignment: ?MouseAlignment = null,
-};
-
 fn translateAttachmentInput(
     attachment: *Attachment,
     session: *const Session,
     bytes: []const u8,
     out: *std.ArrayList(u8),
-) !InputTranslationResult {
-    var result = InputTranslationResult{};
+) !void {
     if (!attachmentLocalInputParserActive(attachment)) {
         if (attachment.input_pending_len > 0) {
             try out.appendSlice(app_allocator.allocator(), attachment.input_pending[0..attachment.input_pending_len]);
             attachment.input_pending_len = 0;
         }
         try out.appendSlice(app_allocator.allocator(), bytes);
-        return result;
+        return;
     }
 
     var input = std.ArrayList(u8).empty;
@@ -2052,29 +1933,6 @@ fn translateAttachmentInput(
             continue;
         }
 
-        if (attachment.origin_query != null) {
-            switch (parseCursorPositionReport(input.items, index)) {
-                .complete => |report| {
-                    if (applyCursorPositionReport(attachment, report)) |alignment| {
-                        result.mouse_alignment = alignment;
-                    }
-                    index = report.end;
-                    continue;
-                },
-                .incomplete => {
-                    const pending = input.items[index..];
-                    if (pending.len <= attachment.input_pending.len) {
-                        @memcpy(attachment.input_pending[0..pending.len], pending);
-                        attachment.input_pending_len = pending.len;
-                    } else {
-                        try out.appendSlice(app_allocator.allocator(), pending);
-                    }
-                    return result;
-                },
-                .not_report => {},
-            }
-        }
-
         if (!attachmentSgrMouseActive(attachment)) {
             try out.append(app_allocator.allocator(), input.items[index]);
             index += 1;
@@ -2083,9 +1941,7 @@ fn translateAttachmentInput(
 
         switch (parseSgrMouseReport(input.items, index)) {
             .complete => |report| {
-                if (attachment.origin_query == null and result.mouse_alignment == null) {
-                    try appendTranslatedSgrMouseReport(attachment, session, report, out);
-                }
+                try appendTranslatedSgrMouseReport(attachment, session, report, out);
                 index = report.end;
             },
             .incomplete => {
@@ -2096,7 +1952,7 @@ fn translateAttachmentInput(
                 } else {
                     try out.appendSlice(app_allocator.allocator(), pending);
                 }
-                return result;
+                return;
             },
             .not_mouse => {
                 try out.append(app_allocator.allocator(), input.items[index]);
@@ -2104,79 +1960,16 @@ fn translateAttachmentInput(
             },
         }
     }
-    return result;
 }
 
 fn attachmentLocalInputParserActive(attachment: *const Attachment) bool {
-    return attachment.origin_query != null or attachmentSgrMouseActive(attachment);
+    return attachmentSgrMouseActive(attachment);
 }
 
 fn attachmentSgrMouseActive(attachment: *const Attachment) bool {
     return attachment.presentation.terminal_modes_initialized and
         attachment.presentation.terminal_modes.mouse_tracking != .disabled and
         attachment.presentation.terminal_modes.mouse_sgr;
-}
-
-fn parseCursorPositionReport(input: []const u8, start: usize) CursorPositionParse {
-    if (input[start] != 0x1b) return .not_report;
-    if (start + 1 >= input.len) return .incomplete;
-    if (input[start + 1] != '[') return .not_report;
-
-    var index = start + 2;
-    const row = parseSgrMouseNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_report;
-    if (index >= input.len) return .incomplete;
-    if (input[index] != ';') return .not_report;
-    index += 1;
-
-    const col = parseSgrMouseNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_report;
-    if (index >= input.len) return .incomplete;
-    if (input[index] != 'R') return .not_report;
-
-    return .{ .complete = .{
-        .row = row,
-        .col = col,
-        .end = index + 1,
-    } };
-}
-
-fn applyCursorPositionReport(attachment: *Attachment, report: CursorPositionReport) ?MouseAlignment {
-    const query = attachment.origin_query orelse return null;
-    defer attachment.origin_query = null;
-
-    const origin = originFromCursorReport(query, report) orelse {
-        attachment.origin = null;
-        return null;
-    };
-
-    switch (query.phase) {
-        .discover => {
-            attachment.origin = origin;
-            return .{ .origin = origin, .cursor_row = query.cursor_row };
-        },
-        .confirm_aligned => {
-            if (origin.row == 0 and origin.col == 0) {
-                attachment.origin = origin;
-            } else {
-                attachment.origin = null;
-            }
-            return null;
-        },
-    }
-}
-
-fn originFromCursorReport(query: OriginQuery, report: CursorPositionReport) ?TerminalOrigin {
-    if (report.row == 0 or report.col == 0) return null;
-    const outer_row = report.row - 1;
-    const outer_col = report.col - 1;
-    if (outer_row < query.cursor_row or outer_col < query.cursor_col) return null;
-
-    const origin_row = outer_row - query.cursor_row;
-    const origin_col = outer_col - query.cursor_col;
-    if (origin_row > std.math.maxInt(u16) or origin_col > std.math.maxInt(u16)) return null;
-    return .{
-        .row = @intCast(origin_row),
-        .col = @intCast(origin_col),
-    };
 }
 
 fn parseSgrMouseReport(input: []const u8, start: usize) SgrMouseParse {
@@ -2260,40 +2053,12 @@ test "SGR mouse input is translated from outer to inner coordinates" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(app_allocator.allocator());
 
-    const translated = try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;5M", &out);
-    try std.testing.expect(translated.mouse_alignment == null);
+    try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;5M", &out);
     try std.testing.expectEqualStrings("\x1b[<0;12;1M", out.items);
 
     out.clearRetainingCapacity();
-    _ = try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;3M", &out);
+    try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;3M", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
-}
-
-test "cursor position response requests mouse viewport alignment" {
-    var attachment = Attachment{
-        .origin_query = .{ .phase = .discover, .cursor_row = 1, .cursor_col = 0 },
-        .presentation = .{
-            .terminal_modes = .{ .mouse_tracking = .normal, .mouse_sgr = true },
-            .terminal_modes_initialized = true,
-        },
-    };
-    const session = Session{ .rows = 24, .cols = 80 };
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(app_allocator.allocator());
-
-    const result = try translateAttachmentInput(&attachment, &session, "\x1b[6;1R\x1b[<0;12;5M", &out);
-    try std.testing.expect(result.mouse_alignment != null);
-    try std.testing.expectEqual(@as(usize, 0), out.items.len);
-
-    attachment.origin = .{ .row = 0, .col = 0 };
-    attachment.origin_query = .{ .phase = .confirm_aligned, .cursor_row = 0, .cursor_col = 0 };
-    const pending = try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;1M", &out);
-    try std.testing.expect(pending.mouse_alignment == null);
-    try std.testing.expectEqual(@as(usize, 0), out.items.len);
-
-    const translated = try translateAttachmentInput(&attachment, &session, "\x1b[1;1R\x1b[<0;12;1M", &out);
-    try std.testing.expect(translated.mouse_alignment == null);
-    try std.testing.expectEqualStrings("\x1b[<0;12;1M", out.items);
 }
 
 fn handleResizeFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
