@@ -5,6 +5,9 @@ from pathlib import Path
 def isolated_env(root):
     root = Path(root)
     env = os.environ.copy()
+    # Terminal rendering tests assert xterm-compatible control sequences. Do not
+    # inherit the runner's TERM, which may be missing or "dumb" in CI.
+    env["TERM"] = "xterm-256color"
     env["HOME"] = str(root / "home")
     env["XDG_RUNTIME_DIR"] = str(root / "runtime")
     env["XDG_CACHE_HOME"] = str(root / "cache")
