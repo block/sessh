@@ -126,6 +126,42 @@ def write_fake_ssh(path):
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def tmux_session_env_args(env):
+    args = []
+    for key in (
+        "HOME",
+        "HISTFILE",
+        "XDG_RUNTIME_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "TMPDIR",
+        "PATH",
+    ):
+        args.extend(["-e", f"{key}={env[key]}"])
+    return args
+
+
+def new_tmux_session(env, session, width, height):
+    run(
+        env,
+        [
+            *TMUX_ARGS,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-x",
+            str(width),
+            "-y",
+            str(height),
+            *tmux_session_env_args(env),
+            "/bin/sh",
+        ],
+    )
+
+
 def main():
     if TMUX is None:
         raise SystemExit("missing tmux")
@@ -181,7 +217,7 @@ def main():
 
         cleanup_runtime(env)
         try:
-            run(env, [*TMUX_ARGS, "new-session", "-d", "-s", session, "-x", "80", "-y", "24", "/bin/sh"])
+            new_tmux_session(env, session, 80, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
             wait_capture(env, session, PROMPT)
@@ -216,7 +252,7 @@ def main():
                 raise AssertionError(f"reconnect damaged outer scrollback:\n{final}")
 
             idle_detach_session = f"{detach_session}-idle"
-            run(env, [*TMUX_ARGS, "new-session", "-d", "-s", idle_detach_session, "-x", "140", "-y", "24", "/bin/sh"])
+            new_tmux_session(env, idle_detach_session, 140, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", idle_detach_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
             wait_capture(env, idle_detach_session, PROMPT)
@@ -232,7 +268,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "printf 'OUTER_IDLE_DETACHED\\n'", "Enter"])
             wait_capture(env, idle_detach_session, "OUTER_IDLE_DETACHED")
 
-            run(env, [*TMUX_ARGS, "new-session", "-d", "-s", detach_session, "-x", "80", "-y", "24", "/bin/sh"])
+            new_tmux_session(env, detach_session, 80, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", detach_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
             wait_capture(env, detach_session, PROMPT)
