@@ -34,12 +34,17 @@ setup_isolation() {
 }
 
 check_isolation_empty() {
+  context=${1-}
   leaked=0
   for dir in "$SESSH_CHECK_HOME" "$SESSH_CHECK_XDG_RUNTIME_DIR" "$SESSH_CHECK_XDG_CACHE_HOME" "$SESSH_CHECK_XDG_CONFIG_HOME" "$SESSH_CHECK_XDG_DATA_HOME" "$SESSH_CHECK_XDG_STATE_HOME" "$SESSH_CHECK_TMPDIR"; do
     first=$(find "$dir" -mindepth 1 -print -quit)
     if [ -n "$first" ]; then
       leaked=1
-      printf 'scripts/check: isolation directory is not empty: %s\n' "$dir" >&2
+      if [ -n "$context" ]; then
+        printf 'scripts/check: isolation directory is not empty after %s: %s\n' "$context" "$dir" >&2
+      else
+        printf 'scripts/check: isolation directory is not empty: %s\n' "$dir" >&2
+      fi
       find "$dir" -mindepth 1 -maxdepth 4 -print >&2
     fi
   done
@@ -73,6 +78,7 @@ run_isolated() {
     XDG_STATE_HOME=$SESSH_CHECK_XDG_STATE_HOME \
     TMPDIR=$SESSH_CHECK_TMPDIR \
     "$@"
+  check_isolation_empty "$*"
 }
 
 find_zig() {

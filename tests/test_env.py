@@ -8,6 +8,9 @@ def isolated_env(root):
     # Terminal rendering tests assert xterm-compatible control sequences. Do not
     # inherit the runner's TERM, which may be missing or "dumb" in CI.
     env["TERM"] = "xterm-256color"
+    # Interactive login shells may otherwise write ~/.bash_history or similar
+    # files into the isolated HOME, which should stay clean after each test run.
+    env["HISTFILE"] = "/dev/null"
     env["HOME"] = str(root / "home")
     env["XDG_RUNTIME_DIR"] = str(root / "runtime")
     env["XDG_CACHE_HOME"] = str(root / "cache")
