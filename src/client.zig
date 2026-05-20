@@ -1206,7 +1206,7 @@ fn relayTerminal(
             if (result.bytes.len > 0) try sendInput(write_fd, result.bytes);
             if (result.end) |end| switch (end) {
                 .detach => return finishRelay(requestSessionDetach(read_fd, write_fd, session_id), &pending_cleanup),
-                .repaint => sendRepaint(write_fd) catch return .transport_closed,
+                .repaint => sendRepaint(write_fd, true) catch return .transport_closed,
                 .reconnect => return .reconnect,
             };
         }
@@ -1303,8 +1303,8 @@ fn sendResize(socket_fd: c.fd_t, size: WindowSize) !void {
     try protocol.sendFrame(socket_fd, .FRAME_TYPE_RESIZE, payload);
 }
 
-fn sendRepaint(socket_fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Repaint{});
+fn sendRepaint(socket_fd: c.fd_t, include_scrollback: bool) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Repaint{ .include_scrollback = include_scrollback });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(socket_fd, .FRAME_TYPE_REPAINT, payload);
 }

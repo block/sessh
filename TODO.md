@@ -3,15 +3,6 @@
   - expect a draw from every batch of input (if the input doesn't result in a draw then we should emit an empty draw, possibly after some timeout)
   - have a configurable ping/pong when there hasn't been any input after some time period
   - show a banner when lag is detected (maybe allowing LEADER-S to force reconnection)
-- Repaint should make scrollback optional - we don't need to repaint the scrollback when we just want to erase a banner
-  - there is a possibility of banners appearing in scrollback - this will
-    happen when we have a banner present and we process draws that cause us to
-    scroll
-  - being robust against this is hard - the DRAW will tell us that it's causing scroll, but we'd need to stop processing DRAWs until we get a response from a REPAINT
-  - and the REPAINT would have to be extra special - because it'd be coming
-    possibly OOB - maybe we could make it a rule that DRAW packets always leave
-    things in a defined state?
-  - this means we'd need sequencing numbers of some form
 - thorough auditing of the code
 
 - cursor query

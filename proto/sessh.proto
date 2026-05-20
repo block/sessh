@@ -148,9 +148,13 @@ message Resize {
 
 // Framed payload, client -> session agent.
 //
-// Requests that the session agent redraw retained scrollback and the current screen.
-// This message has no fields, so the encoded protobuf payload is empty.
-message Repaint {}
+// Requests that the session agent redraw terminal state for this attachment.
+message Repaint {
+  // True means clear local retained scrollback and redraw session-agent-retained
+  // scrollback before the visible screen. False means redraw only the visible
+  // screen in place.
+  bool include_scrollback = 1;
+}
 
 // Framed payload, session agent -> client.
 //

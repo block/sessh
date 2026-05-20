@@ -248,6 +248,10 @@ def send_resize(conn, rows=24, cols=80):
     send_frame(conn, 0x0016, sessh_pb().Resize(terminal_rows=rows, terminal_cols=cols).SerializeToString())
 
 
+def pack_repaint(include_scrollback):
+    return sessh_pb().Repaint(include_scrollback=include_scrollback).SerializeToString()
+
+
 def unpack_session_attached(payload):
     message = sessh_pb().SessionAttached()
     message.ParseFromString(payload)
@@ -1114,6 +1118,20 @@ def run_scrollback_attach_draw_protocol_test(base_env):
                 scroll_count = sum(draw["scroll_count"] for draw in draws)
                 if scroll_count == 0 or b"history_01" not in output:
                     raise AssertionError(f"missing live scrollback DRAW: scroll_count={scroll_count}, output={output!r}")
+
+                send_frame(conn, 0x0017, pack_repaint(False))
+                screen_only = recv_draw(conn)
+                if screen_only["scroll_count"] != 0:
+                    raise AssertionError(f"screen-only repaint should not advance scrollback cursor: {screen_only!r}")
+                if b"history_01" in screen_only["bytes"] or b"\x1b[3J" in screen_only["bytes"]:
+                    raise AssertionError(f"screen-only repaint included retained scrollback: {screen_only!r}")
+                if b"AFTER$" not in screen_only["bytes"]:
+                    raise AssertionError(f"screen-only repaint did not redraw visible screen: {screen_only!r}")
+
+                send_frame(conn, 0x0017, pack_repaint(True))
+                full_repaint = recv_draw(conn)
+                if full_repaint["scroll_count"] == 0 or b"history_01" not in full_repaint["bytes"]:
+                    raise AssertionError(f"full repaint did not include retained scrollback: {full_repaint!r}")
             finally:
                 conn.close()
 

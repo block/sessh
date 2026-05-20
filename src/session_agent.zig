@@ -1586,6 +1586,10 @@ fn readScrollbackCursor(cursor: pb.ScrollbackCursor) ScrollbackCursor {
     };
 }
 
+fn readRepaintRequest(payload: []const u8) !pb.Repaint {
+    return protocol.decodePayload(pb.Repaint, app_allocator.allocator(), payload);
+}
+
 fn createSession(
     session_agent: *SessionAgent,
     rows: u16,
@@ -2076,26 +2080,37 @@ fn handleResizeFrame(session_agent: *SessionAgent, attachment_index: usize, payl
 fn handleRepaintFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
     const attachment = &session_agent.attachments[attachment_index];
     const session = &session_agent.sessions[attachment.session_index];
-    if (payload.len != 0) {
-        detachAttachment(session_agent, attachment_index);
-        return;
-    }
-    const model = session.terminal_model orelse return;
-    var scrollback = model.scrollbackSnapshot(app_allocator.allocator()) catch {
+    var request = readRepaintRequest(payload) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };
-    defer scrollback.deinit(app_allocator.allocator());
+    defer request.deinit(app_allocator.allocator());
+
+    const model = session.terminal_model orelse return;
     var screen = model.renderedScreen(app_allocator.allocator()) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };
     defer screen.deinit(app_allocator.allocator());
-    queueRepaintDraw(attachment, session, scrollback.truncated_rows, scrollback.rows, &screen) catch {
-        detachAttachment(session_agent, attachment_index);
-        return;
-    };
-    model.markScrollbackReported();
+
+    if (request.include_scrollback) {
+        var scrollback = model.scrollbackSnapshot(app_allocator.allocator()) catch {
+            detachAttachment(session_agent, attachment_index);
+            return;
+        };
+        defer scrollback.deinit(app_allocator.allocator());
+        queueRepaintDraw(attachment, session, scrollback.truncated_rows, scrollback.rows, &screen) catch {
+            detachAttachment(session_agent, attachment_index);
+            return;
+        };
+        model.markScrollbackReported();
+    } else {
+        queueScreenDraw(attachment, session, &screen, null, true, false) catch {
+            detachAttachment(session_agent, attachment_index);
+            return;
+        };
+    }
+
     model.markRendered(screen.rows.len);
     flushAttachmentOutput(session_agent, attachment_index);
 }

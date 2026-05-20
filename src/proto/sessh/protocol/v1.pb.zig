@@ -748,10 +748,13 @@ pub const Resize = struct {
 
 /// Framed payload, client -> session agent.
 ///
-/// Requests that the session agent redraw retained scrollback and the current screen.
-/// This message has no fields, so the encoded protobuf payload is empty.
+/// Requests that the session agent redraw terminal state for this attachment.
 pub const Repaint = struct {
-    pub const _desc_table = .{};
+    include_scrollback: bool = false,
+
+    pub const _desc_table = .{
+        .include_scrollback = fd(1, .{ .scalar = .bool }),
+    };
 
     /// Encodes the message to the writer
     /// The allocator is used to generate submessages internally.
