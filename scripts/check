@@ -70,6 +70,7 @@ cleanup_isolation() {
 run_isolated() {
   printf '\n==> %s\n' "$*"
   HOME=$SESSH_CHECK_HOME \
+    HISTFILE=/dev/null \
     SESSH_BIN=zig-out/bin/sessh-dev \
     XDG_RUNTIME_DIR=$SESSH_CHECK_XDG_RUNTIME_DIR \
     XDG_CACHE_HOME=$SESSH_CHECK_XDG_CACHE_HOME \

@@ -66,10 +66,11 @@ exec sh -c "$1"
 """
 
 
-def run(args, **kwargs):
+def run(env, args, **kwargs):
     return subprocess.run(
         args,
         cwd=ROOT,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -78,41 +79,41 @@ def run(args, **kwargs):
     )
 
 
-def capture(session):
-    return run([*TMUX_ARGS, "capture-pane", "-p", "-S", "-200", "-t", session]).stdout
+def capture(env, session):
+    return run(env, [*TMUX_ARGS, "capture-pane", "-p", "-S", "-200", "-t", session]).stdout
 
 
-def capture_visible(session):
-    return run([*TMUX_ARGS, "capture-pane", "-p", "-t", session]).stdout
+def capture_visible(env, session):
+    return run(env, [*TMUX_ARGS, "capture-pane", "-p", "-t", session]).stdout
 
 
-def wait_capture(session, needle, timeout=8.0):
+def wait_capture(env, session, needle, timeout=8.0):
     end = time.monotonic() + timeout
     last = ""
     while time.monotonic() < end:
-        last = capture(session)
+        last = capture(env, session)
         if needle in last:
             return last
         time.sleep(0.05)
     raise AssertionError(f"did not see {needle!r}; pane contained:\n{last}")
 
 
-def wait_capture_absent(session, needle, timeout=8.0):
+def wait_capture_absent(env, session, needle, timeout=8.0):
     end = time.monotonic() + timeout
     last = ""
     while time.monotonic() < end:
-        last = capture(session)
+        last = capture(env, session)
         if needle not in last:
             return last
         time.sleep(0.05)
     raise AssertionError(f"still saw {needle!r}; pane contained:\n{last}")
 
 
-def wait_visible_absent(session, needle, timeout=8.0):
+def wait_visible_absent(env, session, needle, timeout=8.0):
     end = time.monotonic() + timeout
     last = ""
     while time.monotonic() < end:
-        last = capture_visible(session)
+        last = capture_visible(env, session)
         if needle not in last:
             return last
         time.sleep(0.05)
@@ -180,33 +181,33 @@ def main():
 
         cleanup_runtime(env)
         try:
-            run([*TMUX_ARGS, "new-session", "-d", "-s", session, "-x", "80", "-y", "24", "/bin/sh"])
-            run([*TMUX_ARGS, "set-window-option", "-t", session, "remain-on-exit", "on"])
-            run([*TMUX_ARGS, "send-keys", "-t", session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
-            wait_capture(session, PROMPT)
-            run([*TMUX_ARGS, "send-keys", "-t", session, "printf 'OUTER_BEFORE_1\\nOUTER_BEFORE_2\\n'", "Enter"])
-            wait_capture(session, "OUTER_BEFORE_2")
+            run(env, [*TMUX_ARGS, "new-session", "-d", "-s", session, "-x", "80", "-y", "24", "/bin/sh"])
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", session, "printf 'OUTER_BEFORE_1\\nOUTER_BEFORE_2\\n'", "Enter"])
+            wait_capture(env, session, "OUTER_BEFORE_2")
 
             sessh_cmd = shlex.quote(str(sessh_wrapper))
-            run([*TMUX_ARGS, "send-keys", "-t", session, sessh_cmd, "Enter"])
-            wait_capture(session, "REMOTE_PROMPT$")
-            before = capture_visible(session)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", session, sessh_cmd, "Enter"])
+            wait_capture(env, session, "REMOTE_PROMPT$")
+            before = capture_visible(env, session)
             remote_top_index = before.splitlines().index("REMOTE_TOP")
 
-            run([*TMUX_ARGS, "send-keys", "-t", session, "C-a", "s"])
-            wait_capture(session, "sessh: disconnected. Retry in 5sec")
-            banner = capture_visible(session).splitlines()
+            run(env, [*TMUX_ARGS, "send-keys", "-t", session, "C-a", "s"])
+            wait_capture(env, session, "sessh: disconnected. Retry in 5sec")
+            banner = capture_visible(env, session).splitlines()
             if remote_top_index + 1 >= len(banner) or "sessh: disconnected. Retry in 5sec" not in banner[remote_top_index + 1]:
                 raise AssertionError(
                     "reconnect banner was not drawn one row below the sessh screen top\n"
                     f"before:\n{before}\n"
-                    f"banner:\n{capture_visible(session)}"
+                    f"banner:\n{capture_visible(env, session)}"
                 )
 
-            run([*TMUX_ARGS, "send-keys", "-t", session, "Space"])
-            wait_visible_absent(session, "sessh: disconnected. Retry", timeout=10.0)
-            run([*TMUX_ARGS, "send-keys", "-t", session, "after-reconnect", "Enter"])
-            final = wait_capture(session, "REMOTE:after-reconnect")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", session, "Space"])
+            wait_visible_absent(env, session, "sessh: disconnected. Retry", timeout=10.0)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", session, "after-reconnect", "Enter"])
+            final = wait_capture(env, session, "REMOTE:after-reconnect")
             if "sessh: disconnected. Retry" in final:
                 raise AssertionError(f"reconnect banner leaked into final pane:\n{final}")
             if final.count("REMOTE_TOP") != 1:
@@ -215,38 +216,38 @@ def main():
                 raise AssertionError(f"reconnect damaged outer scrollback:\n{final}")
 
             idle_detach_session = f"{detach_session}-idle"
-            run([*TMUX_ARGS, "new-session", "-d", "-s", idle_detach_session, "-x", "140", "-y", "24", "/bin/sh"])
-            run([*TMUX_ARGS, "set-window-option", "-t", idle_detach_session, "remain-on-exit", "on"])
-            run([*TMUX_ARGS, "send-keys", "-t", idle_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
-            wait_capture(idle_detach_session, PROMPT)
-            run([*TMUX_ARGS, "send-keys", "-t", idle_detach_session, sessh_cmd, "Enter"])
-            wait_capture(idle_detach_session, "REMOTE_PROMPT$")
-            run([*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "C-a", "d"])
+            run(env, [*TMUX_ARGS, "new-session", "-d", "-s", idle_detach_session, "-x", "140", "-y", "24", "/bin/sh"])
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", idle_detach_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, idle_detach_session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, sessh_cmd, "Enter"])
+            wait_capture(env, idle_detach_session, "REMOTE_PROMPT$")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "C-a", "d"])
             time.sleep(0.5)
-            idle_after = capture(idle_detach_session)
+            idle_after = capture(env, idle_detach_session)
             if "sessh: detached" not in idle_after or "sessh test-host --leader CTRL-A --scrollback-limit 321 --attach " not in idle_after:
                 raise AssertionError(f"detach did not print a reattach banner:\n{idle_after}")
             if f"REMOTE_PROMPT$ {PROMPT}" in idle_after or f"REMOTE_PROMPT${PROMPT}" in idle_after:
                 raise AssertionError(f"detach drew the outer prompt at the inner cursor:\n{idle_after}")
-            run([*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "printf 'OUTER_IDLE_DETACHED\\n'", "Enter"])
-            wait_capture(idle_detach_session, "OUTER_IDLE_DETACHED")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "printf 'OUTER_IDLE_DETACHED\\n'", "Enter"])
+            wait_capture(env, idle_detach_session, "OUTER_IDLE_DETACHED")
 
-            run([*TMUX_ARGS, "new-session", "-d", "-s", detach_session, "-x", "80", "-y", "24", "/bin/sh"])
-            run([*TMUX_ARGS, "set-window-option", "-t", detach_session, "remain-on-exit", "on"])
-            run([*TMUX_ARGS, "send-keys", "-t", detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
-            wait_capture(detach_session, PROMPT)
-            run([*TMUX_ARGS, "send-keys", "-t", detach_session, f"{sessh_cmd} --attach", "Enter"])
-            wait_capture(detach_session, "REMOTE_PROMPT$")
-            run([*TMUX_ARGS, "send-keys", "-t", detach_session, "spam", "Enter"])
-            wait_capture(detach_session, "REMOTE_SPAM_")
-            run([*TMUX_ARGS, "send-keys", "-t", detach_session, "C-a", "d"])
+            run(env, [*TMUX_ARGS, "new-session", "-d", "-s", detach_session, "-x", "80", "-y", "24", "/bin/sh"])
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", detach_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, detach_session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, f"{sessh_cmd} --attach", "Enter"])
+            wait_capture(env, detach_session, "REMOTE_PROMPT$")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, "spam", "Enter"])
+            wait_capture(env, detach_session, "REMOTE_SPAM_")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, "C-a", "d"])
             time.sleep(0.5)
-            immediate_after_detach = capture_visible(detach_session)
+            immediate_after_detach = capture_visible(env, detach_session)
             if "REMOTE_SPAM_" not in immediate_after_detach:
                 raise AssertionError(f"detach did not leave flowing output visible:\n{immediate_after_detach}")
-            run([*TMUX_ARGS, "send-keys", "-t", detach_session, "printf 'OUTER_SPAM_DETACHED\\n'", "Enter"])
-            detached = wait_capture(detach_session, "OUTER_SPAM_DETACHED", timeout=10.0)
-            visible_after_detach = capture_visible(detach_session)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, "printf 'OUTER_SPAM_DETACHED\\n'", "Enter"])
+            detached = wait_capture(env, detach_session, "OUTER_SPAM_DETACHED", timeout=10.0)
+            visible_after_detach = capture_visible(env, detach_session)
             if not visible_after_detach.strip():
                 raise AssertionError(f"detach left a blank visible pane:\n{detached}")
             if "REMOTE_SPAM_" not in detached:
@@ -256,6 +257,7 @@ def main():
                 subprocess.run(
                     [*TMUX_ARGS, "kill-session", "-t", tmux_session],
                     cwd=ROOT,
+                    env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=False,
