@@ -241,11 +241,16 @@ def main():
                 )
 
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "Space"])
-            wait_visible_absent(env, session, "sessh: disconnected. Retry", timeout=10.0)
+            success_banner = "sessh: reconnected"
+            wait_capture(env, session, success_banner, timeout=10.0)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", session, "Space"])
+            wait_visible_absent(env, session, success_banner, timeout=2.0)
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "after-reconnect", "Enter"])
             final = wait_capture(env, session, "REMOTE:after-reconnect")
             if "sessh: disconnected. Retry" in final:
                 raise AssertionError(f"reconnect banner leaked into final pane:\n{final}")
+            if "sessh: reconnected" in final:
+                raise AssertionError(f"reconnected banner leaked into final pane:\n{final}")
             if final.count("REMOTE_TOP") != 1:
                 raise AssertionError(f"reconnect duplicated session screen content:\n{final}")
             if "OUTER_BEFORE_1" not in final or "OUTER_BEFORE_2" not in final:

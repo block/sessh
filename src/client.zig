@@ -214,6 +214,10 @@ pub const RuntimeSession = struct {
 
 pub const ReconnectUi = struct {
     const reconnected_banner_ms = 500;
+    const reconnected_banner_message = std.fmt.comptimePrint(
+        "--- sessh: reconnected. Dismiss with SPACE (or wait {}ms) ---",
+        .{reconnected_banner_ms},
+    );
 
     mode_guard: terminal.TerminalModeGuard,
     escape_filter: terminal.EscapeFilter = .{ .at_line_start = false },
@@ -327,8 +331,8 @@ pub const ReconnectUi = struct {
 
     pub fn showReconnectedBriefly(self: *ReconnectUi) !void {
         if (c.isatty(1) == 0) return;
-        try self.drawStaticBanner("--- sessh: reconnected ---");
-        std.Thread.sleep(reconnected_banner_ms * std.time.ns_per_ms);
+        try self.drawStaticBanner(reconnected_banner_message);
+        try self.waitForReconnectedBannerDismiss(reconnected_banner_ms);
     }
 
     fn drawBanner(self: *ReconnectUi, delay_ms: u64) !void {
@@ -368,6 +372,47 @@ pub const ReconnectUi = struct {
         try io_helpers.writeAll(1, visible_message);
         try io_helpers.writeAll(1, "\x1b[0m");
         try renderer.moveCursor(top_row, 0);
+    }
+
+    fn waitForReconnectedBannerDismiss(self: *ReconnectUi, timeout_ms: u64) !void {
+        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        var dismiss_allowed = true;
+
+        while (true) {
+            const now = std.time.milliTimestamp();
+            if (now >= deadline) return;
+
+            const wait_ms: i32 = @intCast(@min(deadline - now, @as(i64, std.math.maxInt(i32))));
+            if (try self.pollReconnectedBannerDismiss(wait_ms, &dismiss_allowed)) return;
+        }
+    }
+
+    fn pollReconnectedBannerDismiss(self: *ReconnectUi, timeout_ms: i32, dismiss_allowed: *bool) !bool {
+        var pollfds = [_]posix.pollfd{.{
+            .fd = 0,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, timeout_ms);
+        if (ready == 0) return false;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return true;
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) return false;
+
+        var input: [256]u8 = undefined;
+        const n = c.read(0, &input, input.len);
+        if (n <= 0) return true;
+
+        var dismissed = false;
+        for (input[0..@intCast(n)]) |byte| {
+            if (dismiss_allowed.* and byte == ' ') {
+                dismissed = true;
+                dismiss_allowed.* = false;
+                continue;
+            }
+            dismiss_allowed.* = false;
+            try self.buffered_input.append(app_allocator.allocator(), byte);
+        }
+        return dismissed;
     }
 
     fn hideCursor(self: *ReconnectUi) !void {
@@ -463,6 +508,14 @@ test "reconnect banner updates every second under one minute" {
     try std.testing.expectEqual(@as(u64, 1_000), nextBannerUpdateDelayMs(60_000));
     try std.testing.expectEqual(@as(u64, 2_000), nextBannerUpdateDelayMs(61_000));
     try std.testing.expectEqual(@as(u64, 60_000), nextBannerUpdateDelayMs(600_000));
+}
+
+test "reconnected banner documents space dismissal and timeout" {
+    var timeout_buf: [16]u8 = undefined;
+    const timeout_text = try std.fmt.bufPrint(&timeout_buf, "{}ms", .{ReconnectUi.reconnected_banner_ms});
+
+    try std.testing.expect(std.mem.indexOf(u8, ReconnectUi.reconnected_banner_message, "Dismiss with SPACE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ReconnectUi.reconnected_banner_message, timeout_text) != null);
 }
 
 /// Implements the public `sessh :local:` path. This is both the local testing
