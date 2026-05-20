@@ -907,7 +907,7 @@ def test_ssh_leader_sever_reconnects(tmp):
         raise AssertionError("reconnect did not force ssh BatchMode=yes")
 
 
-def test_ssh_reconnect_suppresses_raw_ssh_stderr(tmp):
+def test_ssh_reconnect_buffers_and_displays_ssh_stderr_with_timestamps(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -940,12 +940,52 @@ def test_ssh_reconnect_suppresses_raw_ssh_stderr(tmp):
         raise AssertionError(result)
     if "sessh: disconnected. Retry in 5sec" not in result.stdout:
         raise AssertionError(result)
+    if raw_ssh_error in result.stdout:
+        raise AssertionError(result)
     for line in raw_ssh_error.splitlines():
-        if line in result.stderr or line in result.stdout:
+        expected = f"level=warn ssh stderr: {line}"
+        if expected not in result.stderr:
             raise AssertionError(result)
+    if "ts_ms=" not in result.stderr:
+        raise AssertionError(result.stderr)
+    if (Path(env["XDG_CACHE_HOME"]) / "sessh" / "clients").exists():
+        raise AssertionError("client logs were written to persistent cache")
 
 
-def test_ssh_session_suppresses_raw_ssh_stderr_after_attach(tmp):
+def test_ssh_log_level_quiet_suppresses_buffered_stderr_display(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_RECONNECT_QUIET_READY"
+    raw_ssh_error = "client_loop: send disconnect: Broken pipe"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_STDERR_ON_BATCH"] = raw_ssh_error
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh_reconnect_probe(
+        ["test-host", "--leader", "CTRL-B", "--log-level", "quiet"],
+        env,
+        marker,
+        "after-reconnect",
+        timeout=30.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if raw_ssh_error in result.stderr or raw_ssh_error in result.stdout:
+        raise AssertionError(result)
+    if "sessh: log" in result.stderr:
+        raise AssertionError(result)
+
+
+def test_ssh_session_buffers_and_displays_stderr_after_attach(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -997,8 +1037,13 @@ def test_ssh_session_suppresses_raw_ssh_stderr_after_attach(tmp):
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if raw_ssh_error in result.stderr or raw_ssh_error in result.stdout:
+    if raw_ssh_error in result.stdout:
         raise AssertionError(result)
+    expected = f"level=warn ssh stderr: {raw_ssh_error}"
+    if expected not in result.stderr or "ts_ms=" not in result.stderr:
+        raise AssertionError(result)
+    if (Path(env["XDG_CACHE_HOME"]) / "sessh" / "clients").exists():
+        raise AssertionError("client logs were written to persistent cache")
 
 
 def test_ssh_reconnect_does_not_apply_active_screen_cleanup(tmp):
@@ -1287,7 +1332,7 @@ def test_ssh_version_mismatch_uses_compat_path(tmp):
         raise AssertionError(log_text)
     expected_args = (
         f"compat_args=:local: --compat-version {sessh_version()} "
-        "--attach --leader CTRL-B --scrollback-limit 2000 --initial-scrollback -1"
+        "--attach --leader CTRL-B --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
     )
     if expected_args not in log_text:
         raise AssertionError(log_text)
@@ -1323,7 +1368,7 @@ def test_ssh_force_compat_uses_compat_path(tmp):
         raise AssertionError(log_text)
     expected_args = (
         f"compat_args=:local: --compat-version {sessh_version()} "
-        "--attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0"
+        "--attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
     )
     if expected_args not in log_text:
         raise AssertionError(log_text)
@@ -1396,12 +1441,16 @@ def main():
             test_ssh_leader_sever_reconnects,
         ),
         (
-            "ssh reconnect suppresses raw ssh stderr",
-            test_ssh_reconnect_suppresses_raw_ssh_stderr,
+            "ssh reconnect buffers and displays ssh stderr with timestamps",
+            test_ssh_reconnect_buffers_and_displays_ssh_stderr_with_timestamps,
         ),
         (
-            "ssh session suppresses raw ssh stderr after attach",
-            test_ssh_session_suppresses_raw_ssh_stderr_after_attach,
+            "ssh log level quiet suppresses buffered stderr display",
+            test_ssh_log_level_quiet_suppresses_buffered_stderr_display,
+        ),
+        (
+            "ssh session buffers and displays stderr after attach",
+            test_ssh_session_buffers_and_displays_stderr_after_attach,
         ),
         (
             "ssh reconnect does not apply active screen cleanup",

@@ -4,6 +4,7 @@ const c = std.c;
 const posix = std.posix;
 
 const client = @import("client.zig");
+const client_log = @import("client_log.zig");
 const config = @import("config.zig");
 const io = @import("io.zig");
 const process_exit = @import("process_exit.zig");
@@ -105,6 +106,8 @@ const ParsedSshArgs = struct {
     scrollback_row_count_set: bool = false,
     initial_scrollback_row_count: ?u32 = null,
     initial_scrollback_row_count_set: bool = false,
+    client_log_level: client_log.Level = .warn,
+    client_log_level_set: bool = false,
     bootstrap: bool = true,
     bootstrap_set: bool = false,
     force_compat: bool = false,
@@ -191,9 +194,9 @@ fn stderrPumpMain(state: *SshStderrPump.State) void {
     while (true) {
         const n = c.read(state.fd, &buf, buf.len);
         if (n <= 0) return;
-        if (state.forward.load(.acquire)) {
-            io.writeAll(2, buf[0..@intCast(n)]) catch {};
-        }
+        const bytes = buf[0..@intCast(n)];
+        const forward = state.forward.load(.acquire);
+        client_log.appendSshStderr(bytes, forward);
     }
 }
 
@@ -216,6 +219,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
         return process_exit.request(64);
     };
+    client_log.setLevel(parsed_ssh_args.client_log_level);
 
     if (parsed_ssh_args.force_compat) {
         try runRemoteCompat(allocator, parsed_ssh_args, .forced);
@@ -319,21 +323,29 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         switch (end) {
             .detach => {
+                client_log.debug("event=detach host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.terminate();
+                client_log.flush(2);
                 client.writeDetachBannerForTarget(parsed_ssh_args.options, parsed_ssh_args.host, parsed_ssh_args.banner_args.slice(), session.idSlice());
                 return;
             },
             .session_ended => {
+                client_log.debug("event=session_ended host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.closeStdin();
                 _ = child.wait() catch {};
+                client_log.flush(2);
                 return;
             },
             .reconnect => {
+                client_log.debug("event=disconnect reason=leader_sever host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.terminate();
+                client_log.flush(2);
             },
             .transport_closed => {
+                client_log.debug("event=disconnect reason=transport_closed host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.closeStdin();
                 _ = child.wait() catch {};
+                client_log.flush(2);
             },
         }
 
@@ -342,9 +354,30 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         defer if (reconnect_ui_active) reconnect_ui.deinit();
         var reconnect_attempt: usize = 0;
         while (true) {
-            switch (try reconnect_ui.waitForReconnect(reconnectDelayMs(reconnect_attempt))) {
-                .abort => return,
-                .reconnect_now, .wait_elapsed => {},
+            const delay_ms = reconnectDelayMs(reconnect_attempt);
+            client_log.debug("event=reconnect_wait host={s} session={s} attempt={} delay_ms={}", .{
+                parsed_ssh_args.host,
+                session.idSlice(),
+                reconnect_attempt,
+                delay_ms,
+            });
+            switch (try reconnect_ui.waitForReconnect(delay_ms)) {
+                .abort => {
+                    client_log.debug("event=reconnect_abort host={s} session={s} attempt={}", .{
+                        parsed_ssh_args.host,
+                        session.idSlice(),
+                        reconnect_attempt,
+                    });
+                    client_log.flush(2);
+                    return;
+                },
+                .reconnect_now, .wait_elapsed => {
+                    client_log.debug("event=reconnect_attempt host={s} session={s} attempt={}", .{
+                        parsed_ssh_args.host,
+                        session.idSlice(),
+                        reconnect_attempt,
+                    });
+                },
             }
 
             child = startRuntimeConnection(
@@ -359,6 +392,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 error.ReconnectAborted => return,
                 error.OutOfMemory => return err,
                 else => {
+                    client_log.warn("event=reconnect_failed stage=transport host={s} session={s} attempt={} error={t}", .{
+                        parsed_ssh_args.host,
+                        session.idSlice(),
+                        reconnect_attempt,
+                        err,
+                    });
+                    client_log.flush(2);
                     reconnect_attempt += 1;
                     continue;
                 },
@@ -375,6 +415,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                     error.ExitRequested => return err,
                     error.OutOfMemory => return err,
                     else => {
+                        client_log.warn("event=reconnect_failed stage=attach host={s} session={s} attempt={} error={t}", .{
+                            parsed_ssh_args.host,
+                            session.idSlice(),
+                            reconnect_attempt,
+                            err,
+                        });
+                        client_log.flush(2);
                         reconnect_attempt += 1;
                         continue;
                     },
@@ -382,6 +429,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             };
 
             try reconnect_ui.showReconnectedBriefly();
+            client_log.debug("event=reconnect_success host={s} session={s} attempt={}", .{
+                parsed_ssh_args.host,
+                session.idSlice(),
+                reconnect_attempt,
+            });
+            client_log.flush(2);
             try reconnect_ui.clearBanner();
             try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
             reconnect_ui.deinit();
@@ -576,6 +629,9 @@ fn localCompatArgs(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs)
     try appendCompatArg(allocator, &out, "--initial-scrollback");
     try appendCompatArg(allocator, &out, initial_scrollback_count);
 
+    try appendCompatArg(allocator, &out, "--log-level");
+    try appendCompatArg(allocator, &out, client_log.levelName(parsed_ssh_args.client_log_level));
+
     return out.toOwnedSlice(allocator);
 }
 
@@ -607,6 +663,50 @@ fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !v
     if (!parsed.bootstrap_set) {
         if (file_config.bootstrap) |enabled| parsed.bootstrap = enabled;
     }
+    if (!parsed.client_log_level_set) {
+        if (file_config.client_log_level) |level| {
+            parsed.client_log_level = level;
+        } else {
+            parsed.client_log_level = inferredClientLogLevel(parsed.options);
+        }
+    }
+}
+
+fn inferredClientLogLevel(ssh_options: []const []const u8) client_log.Level {
+    const verbosity = sshVerbosity(ssh_options);
+    if (verbosity >= 3) return .verbose;
+    if (verbosity == 2) return .debug;
+    if (verbosity == 1) return .info;
+    return .warn;
+}
+
+fn sshVerbosity(ssh_options: []const []const u8) usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < ssh_options.len) {
+        const arg = ssh_options[i];
+        if (!std.mem.startsWith(u8, arg, "-") or std.mem.eql(u8, arg, "-") or std.mem.startsWith(u8, arg, "--")) {
+            i += 1;
+            continue;
+        }
+
+        var pos: usize = 1;
+        while (pos < arg.len) : (pos += 1) {
+            const option = arg[pos];
+            if (option == 'v') total += 1;
+            if (option == 'o' or sshOptionRequiresValue(option) or isUnsafeSshOptionWithValue(option)) {
+                if (pos + 1 < arg.len) {
+                    i += 1;
+                } else {
+                    i += 2;
+                }
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    return total;
 }
 
 fn reconnectDelayMs(attempt: usize) u64 {
@@ -652,18 +752,16 @@ fn startRuntimeConnection(
     child.expand_arg0 = .expand;
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
-    const pump_stderr = reconnect_ui == null;
-    child.stderr_behavior = if (pump_stderr) .Pipe else .Ignore;
+    const forward_stderr = reconnect_ui == null;
+    child.stderr_behavior = .Pipe;
     try child.spawn();
     var connection = RuntimeConnection{ .child = child };
-    if (pump_stderr) {
-        const stderr_file = connection.child.stderr.?;
-        connection.child.stderr = null;
-        connection.stderr_pump = SshStderrPump.start(allocator, stderr_file, true) catch |err| {
-            connection.terminate();
-            return err;
-        };
-    }
+    const stderr_file = connection.child.stderr.?;
+    connection.child.stderr = null;
+    connection.stderr_pump = SshStderrPump.start(allocator, stderr_file, forward_stderr) catch |err| {
+        connection.terminate();
+        return err;
+    };
 
     const artifact_set = artifacts orelse return connection;
 
@@ -1098,6 +1196,14 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             try parsed.banner_args.append(arg);
             try parsed.banner_args.append(args[index.*]);
             index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--log-level")) {
+            index.* += 1;
+            if (index.* >= args.len) return error.MissingClientLogLevel;
+            parsed.client_log_level = try client_log.parseLevel(args[index.*]);
+            parsed.client_log_level_set = true;
+            try parsed.banner_args.append(arg);
+            try parsed.banner_args.append(args[index.*]);
+            index.* += 1;
         } else if (std.mem.eql(u8, arg, "--bootstrap")) {
             parsed.bootstrap = true;
             parsed.bootstrap_set = true;
@@ -1140,6 +1246,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--leader") or
         std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--initial-scrollback") or
+        std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
         std.mem.eql(u8, arg, "--force-compat") or
@@ -1270,12 +1377,14 @@ fn printSshArgError(err: anyerror) !void {
         error.MissingLeader => try io.writeAll(2, "sessh: --leader requires a value\n"),
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),
+        error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: ssh option is missing its value\n"),
         error.ConflictingSesshAction => try io.writeAll(2, "sessh: conflicting sessh actions\n"),
         error.DangerousLeader => try io.writeAll(2, "sessh: dangerous leader\n"),
         error.InvalidLeader => try io.writeAll(2, "sessh: invalid leader\n"),
         error.InvalidScrollbackRowCount => try io.writeAll(2, "sessh: invalid scrollback row count\n"),
         error.InvalidInitialScrollback => try io.writeAll(2, "sessh: invalid initial scrollback\n"),
+        error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
         error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
         error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands are not supported yet\n"),
         error.UnsafeSshOption => try io.writeAll(2, "sessh: ssh option is not safe for sessh transport\n"),
@@ -1617,6 +1726,14 @@ test "parseSshArgs passes through ssh options before host" {
     try std.testing.expectEqualStrings("-vvC", parsed.options[5]);
 }
 
+test "ssh verbosity maps to inferred client log level" {
+    try std.testing.expectEqual(client_log.Level.warn, inferredClientLogLevel(&.{}));
+    try std.testing.expectEqual(client_log.Level.info, inferredClientLogLevel(&.{"-v"}));
+    try std.testing.expectEqual(client_log.Level.debug, inferredClientLogLevel(&.{"-vv"}));
+    try std.testing.expectEqual(client_log.Level.verbose, inferredClientLogLevel(&.{"-vvv"}));
+    try std.testing.expectEqual(client_log.Level.verbose, inferredClientLogLevel(&.{ "-vC", "-vv" }));
+}
+
 test "parseSshArgs rejects protocol-breaking ssh options" {
     try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(&.{
         "sessh",
@@ -1669,6 +1786,8 @@ test "parseSshArgs accepts sessh attach options after host" {
         "42",
         "--initial-scrollback",
         "0",
+        "--log-level",
+        "debug",
         "--bootstrap",
     });
 
@@ -1680,16 +1799,20 @@ test "parseSshArgs accepts sessh attach options after host" {
         .ctrl => |byte| try std.testing.expectEqual(@as(u8, 'B'), byte),
         .none => return error.ExpectedLeader,
     }
-    try std.testing.expectEqual(@as(usize, 7), parsed.banner_args.len);
+    try std.testing.expectEqual(@as(usize, 9), parsed.banner_args.len);
     try std.testing.expectEqualStrings("--leader", parsed.banner_args.buf[0]);
     try std.testing.expectEqualStrings("CTRL-B", parsed.banner_args.buf[1]);
     try std.testing.expectEqualStrings("--scrollback-limit", parsed.banner_args.buf[2]);
     try std.testing.expectEqualStrings("42", parsed.banner_args.buf[3]);
     try std.testing.expectEqualStrings("--initial-scrollback", parsed.banner_args.buf[4]);
     try std.testing.expectEqualStrings("0", parsed.banner_args.buf[5]);
-    try std.testing.expectEqualStrings("--bootstrap", parsed.banner_args.buf[6]);
+    try std.testing.expectEqualStrings("--log-level", parsed.banner_args.buf[6]);
+    try std.testing.expectEqualStrings("debug", parsed.banner_args.buf[7]);
+    try std.testing.expectEqualStrings("--bootstrap", parsed.banner_args.buf[8]);
     try std.testing.expectEqual(@as(u32, 42), parsed.scrollback_row_count);
     try std.testing.expectEqual(@as(?u32, 0), parsed.initial_scrollback_row_count);
+    try std.testing.expectEqual(client_log.Level.debug, parsed.client_log_level);
+    try std.testing.expect(parsed.client_log_level_set);
     try std.testing.expect(parsed.bootstrap);
     try std.testing.expect(parsed.bootstrap_set);
 }

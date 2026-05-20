@@ -4,6 +4,7 @@ const c = std.c;
 const posix = std.posix;
 
 const config = @import("config.zig");
+const client_log = @import("client_log.zig");
 const client_renderer = @import("client_renderer.zig");
 const io_helpers = @import("io.zig");
 const protocol = @import("protocol.zig");
@@ -35,6 +36,8 @@ const LocalOptions = struct {
     scrollback_row_count_set: bool = false,
     initial_scrollback_row_count: ?u32 = null,
     initial_scrollback_row_count_set: bool = false,
+    client_log_level: client_log.Level = .warn,
+    client_log_level_set: bool = false,
     compat_version: ?[]const u8 = null,
 };
 
@@ -58,6 +61,7 @@ pub const FileConfig = struct {
     scrollback_row_count: ?u32 = null,
     initial_scrollback_row_count: ?u32 = null,
     initial_scrollback_row_count_set: bool = false,
+    client_log_level: ?client_log.Level = null,
     bootstrap: ?bool = null,
 };
 
@@ -115,6 +119,8 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
         } else if (keyMatches(key, "initial-scrollback")) {
             parsed.initial_scrollback_row_count = try parseInitialScrollbackRowCount(value);
             parsed.initial_scrollback_row_count_set = true;
+        } else if (keyMatches(key, "client-log-level")) {
+            parsed.client_log_level = try client_log.parseLevel(value);
         } else if (keyMatches(key, "bootstrap")) {
             parsed.bootstrap = try parseBool(value);
         } else {
@@ -467,6 +473,7 @@ test "parseEnvConfig accepts sessh env keys" {
         \\leader=CTRL-B
         \\scrollback-limit=42
         \\initial-scrollback=0
+        \\client-log-level=debug
         \\bootstrap=false
         \\
     );
@@ -478,6 +485,7 @@ test "parseEnvConfig accepts sessh env keys" {
     try std.testing.expectEqual(@as(?u32, 42), parsed.scrollback_row_count);
     try std.testing.expect(parsed.initial_scrollback_row_count_set);
     try std.testing.expectEqual(@as(?u32, 0), parsed.initial_scrollback_row_count);
+    try std.testing.expectEqual(@as(?client_log.Level, .debug), parsed.client_log_level);
     try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
 }
 
@@ -529,6 +537,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try io_helpers.stderrPrint("sessh: invalid config: {t}\n", .{err});
         return process_exit.request(64);
     };
+    client_log.setLevel(options.client_log_level);
 
     return runBrokerClient(allocator, args, options);
 }
@@ -733,6 +742,14 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             try options.banner_args.append(arg);
             try options.banner_args.append(args[i]);
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--log-level")) {
+            i += 1;
+            if (i >= args.len) return error.MissingClientLogLevel;
+            options.client_log_level = try client_log.parseLevel(args[i]);
+            options.client_log_level_set = true;
+            try options.banner_args.append(arg);
+            try options.banner_args.append(args[i]);
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--compat-version")) {
             i += 1;
             if (i >= args.len) return error.MissingCompatVersion;
@@ -755,6 +772,9 @@ fn applyFileConfigToLocal(allocator: std.mem.Allocator, options: *LocalOptions) 
     }
     if (!options.initial_scrollback_row_count_set and file_config.initial_scrollback_row_count_set) {
         options.initial_scrollback_row_count = file_config.initial_scrollback_row_count;
+    }
+    if (!options.client_log_level_set) {
+        if (file_config.client_log_level) |level| options.client_log_level = level;
     }
 }
 

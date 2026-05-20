@@ -1,6 +1,3 @@
-- Create client logs and write to them
-  - disconnection/reconnection events
-  - when we detect stderr traffic from ssh
 - Auto-detect lag
   - allow empty input/draw to be used as ping/pong
   - expect a draw from every batch of input (if the input doesn't result in a draw then we should emit an empty draw, possibly after some timeout)

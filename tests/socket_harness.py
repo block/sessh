@@ -2107,7 +2107,9 @@ def main():
                     fd,
                     b"python3 -c 'import os,sys; sys.stdout.write(\"x\"*200000); sys.stdout.flush(); open(os.environ[\"XDG_RUNTIME_DIR\"]+\"/detached_drain_done\",\"w\").write(\"done\")'\n",
                 )
-                read_until(fd, b"detached_drain_done")
+                # Wait for real command output, not text from the echoed command
+                # line; PTY wrapping can split the path substring.
+                read_until(fd, b"x" * 64)
                 os.write(fd, b"~.")
             finally:
                 close_client(pid, fd)

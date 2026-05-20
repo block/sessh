@@ -58,6 +58,7 @@ hyphens. Supported keys with their default values:
 leader=None
 scrollback-limit=2000
 initial-scrollback=-1
+client-log-level=warn
 bootstrap=true
 ```
 
@@ -66,6 +67,11 @@ bootstrap=true
 - `initial-scrollback`: set how many retained scrollback lines are drawn when
   attaching to an existing session. `-1` means all retained scrollback, `0`
   means draw only the current screen.
+- `client-log-level`: configure client logging level. Supported values
+  are `quiet`, `error`, `warn`, `info`, `debug`, and `verbose`. If unset, the
+  ssh transport infers `info`, `debug`, or `verbose` from `-v`, `-vv`, or
+  `-vvv`; otherwise it defaults to `warn`. Client logs will be buffered while
+  attached and displayed upon detach.
 - `bootstrap`: enable or disable loading the `sessh` binary onto hosts. If
   disabled, `sessh` will attempt to find itself remotely in `$PATH`.
 
@@ -76,6 +82,7 @@ The options in the config file can be overridden on the command-line:
 - `--leader`
 - `--scrollback-limit`
 - `--initial-scrollback`
+- `--log-level`
 - `--bootstrap` or `--no-bootstrap`
 
 ## Sessions

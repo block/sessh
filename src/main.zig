@@ -79,6 +79,7 @@ fn usage(code: u8) !void {
         \\  --leader CTRL-KEY|None
         \\  --scrollback-limit N
         \\  --initial-scrollback N
+        \\  --log-level quiet|error|warn|info|debug|verbose
         \\  --bootstrap | --no-bootstrap
         \\  --force-compat
         \\
