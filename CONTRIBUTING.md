@@ -30,7 +30,7 @@ Use Podman only for slower end-to-end coverage across a real ssh boundary.
 
 ## Releases
 
-Releases are cut from version tags. See [RELEASE.md](RELEASE.md) for the exact
+Releases are cut from version tags. See [RELEASING.md](RELEASING.md) for the exact
 release process.
 
 ## Issues

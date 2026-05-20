@@ -11,42 +11,123 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    env:
-      UV_NO_CONFIG: "1"
-      UV_DEFAULT_INDEX: https://pypi.org/simple
-      PIP_CONFIG_FILE: /dev/null
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client protobuf-compiler tmux
 
-      - name: Install uv
-        run: python -m pip install --upgrade uv
+      - name: Install Zig 0.15.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig_url="https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz"
+          zig_sha256="02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239"
+          curl -fsSL "$zig_url" -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$zig_sha256  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -C "$RUNNER_TEMP/zig" --strip-components=1 -xf "$RUNNER_TEMP/zig.tar.xz"
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          config_version="$(sed -n 's/^pub const version = "\(.*\)";$/\1/p' src/config.zig)"
+          package_version="$(sed -n 's/.*\.version = "\(.*\)",$/\1/p' build.zig.zon | head -n 1)"
+          if [[ -z "$version" || "$version" == "$GITHUB_REF_NAME" ]]; then
+            echo "Release tags must be named vX.Y.Z; got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          if [[ "$config_version" != "$version" ]]; then
+            echo "src/config.zig version is $config_version, but tag is $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          if [[ "$package_version" != "$version" ]]; then
+            echo "build.zig.zon version is $package_version, but tag is $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
 
       - name: Verify
         run: scripts/check --fast
 
-      - name: Package release
+      - name: Build release archive
+        run: scripts/build --version "${GITHUB_REF_NAME#v}"
+
+      - name: Verify release archive
+        shell: bash
         run: |
-          scripts/package-release --repo "$GITHUB_REPOSITORY"
-          cat dist/release.env >> "$GITHUB_ENV"
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="dist/sessh-$version.tar.gz"
+          test -f "$archive"
+          test -f "$archive.sha256"
+          test -x "dist/sessh-$version/bin/sessh"
+          actual_version="$(dist/sessh-$version/bin/sessh --version)"
+          if [[ "$actual_version" != "sessh $version" ]]; then
+            echo "archive binary reported '$actual_version', expected 'sessh $version'" >&2
+            exit 1
+          fi
+
+      - name: Collect release metadata
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="dist/sessh-$version.tar.gz"
+          checksum="$archive.sha256"
+          sha256="$(awk '{print $1}' "$checksum")"
+          artifact_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$(basename "$archive")"
+
+          {
+            echo "version=$version"
+            echo "archive=$archive"
+            echo "checksum=$checksum"
+            echo "sha256=$sha256"
+            echo "artifact_url=$artifact_url"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ARCHIVE: ${{ steps.release.outputs.archive }}
+          CHECKSUM: ${{ steps.release.outputs.checksum }}
         run: |
           gh release create "$TAG" \
-            "$ASSET" \
-            "$SDIST" \
-            "$WHEEL" \
-            "$SHA256_FILE" \
-            "$HOMEBREW_BUMP_FILE" \
+            "$ARCHIVE" \
+            "$CHECKSUM" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "$TAG" \
-            --notes-file "$RELEASE_NOTES"
+            --generate-notes
+
+      - name: Generate token for tap release
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BLOCK_HOMEBREW_TAP_APP_ID }}
+          private-key: ${{ secrets.BLOCK_HOMEBREW_TAP_PRIVATE_KEY }}
+          owner: block
+          repositories: homebrew-tap
+
+      - name: Trigger Homebrew formula bump
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          TAG: ${{ github.ref_name }}
+          ARTIFACT_URL: ${{ steps.release.outputs.artifact_url }}
+          SHA256: ${{ steps.release.outputs.sha256 }}
+        run: |
+          gh workflow run bump-formula.yaml \
+            --repo block/homebrew-tap \
+            -f repo=block/sessh \
+            -f formula=sessh \
+            -f "tag=$TAG" \
+            -f "artifact_url=$ARTIFACT_URL" \
+            -f "sha256=$SHA256"
