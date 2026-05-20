@@ -1,0 +1,144 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat <<'EOF'
+usage: scripts/build [--version VERSION] [--dist DIR]
+
+Builds the release install tree, archive, and SHA-256 checksum.
+
+Options:
+  --version VERSION  Package directory/archive version. Defaults to src/config.zig.
+  --dist DIR         Output directory. Defaults to dist.
+EOF
+}
+
+find_zig() {
+  if [ -n "${ZIG:-}" ]; then
+    printf '%s\n' "$ZIG"
+  elif [ -x /opt/homebrew/opt/zig@0.15/bin/zig ]; then
+    printf '%s\n' /opt/homebrew/opt/zig@0.15/bin/zig
+  elif [ -x /usr/local/opt/zig@0.15/bin/zig ]; then
+    printf '%s\n' /usr/local/opt/zig@0.15/bin/zig
+  elif command -v zig >/dev/null 2>&1; then
+    command -v zig
+  else
+    echo "missing Zig 0.15.2" >&2
+    exit 1
+  fi
+}
+
+find_protoc() {
+  if [ -n "${SESSH_PROTOC:-}" ]; then
+    printf '%s\n' "$SESSH_PROTOC"
+  elif command -v protoc-33.0.0 >/dev/null 2>&1; then
+    command -v protoc-33.0.0
+  elif [ -x /opt/homebrew/opt/protobuf/bin/protoc ]; then
+    printf '%s\n' /opt/homebrew/opt/protobuf/bin/protoc
+  elif [ -x /usr/local/opt/protobuf/bin/protoc ]; then
+    printf '%s\n' /usr/local/opt/protobuf/bin/protoc
+  elif command -v protoc >/dev/null 2>&1 && protoc --version >/dev/null 2>&1; then
+    command -v protoc
+  else
+    cat >&2 <<'EOF'
+missing protobuf protoc.
+
+Install it with:
+  brew install protobuf
+
+If your PATH has a wrapper protoc, set SESSH_PROTOC to the real protobuf binary,
+for example:
+  SESSH_PROTOC=/opt/homebrew/opt/protobuf/bin/protoc scripts/build
+EOF
+    exit 1
+  fi
+}
+
+version_from_config() {
+  sed -n 's/^pub const version = "\(.*\)";$/\1/p' src/config.zig
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    echo "missing SHA-256 tool: need shasum or sha256sum" >&2
+    exit 1
+  fi
+}
+
+version=
+dist=dist
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "scripts/build: missing --version value" >&2
+        exit 64
+      fi
+      version=$1
+      shift
+      ;;
+    --dist)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "scripts/build: missing --dist value" >&2
+        exit 64
+      fi
+      dist=$1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 64
+      ;;
+  esac
+done
+
+if [ -z "$version" ]; then
+  version=$(version_from_config)
+fi
+if [ -z "$version" ]; then
+  echo "scripts/build: could not read version from src/config.zig" >&2
+  exit 1
+fi
+
+zig_bin=$(find_zig)
+zig_version=$("$zig_bin" version)
+if [ "$zig_version" != "0.15.2" ]; then
+  echo "expected Zig 0.15.2, got $zig_version from $zig_bin" >&2
+  exit 1
+fi
+protoc_bin=$(find_protoc)
+export SESSH_PROTOC=$protoc_bin
+"$zig_bin" build gen-proto
+
+package="sessh-$version"
+prefix="$dist/$package"
+archive="$dist/$package.tar.gz"
+checksum="$archive.sha256"
+case "$prefix" in
+  /*) prefix_abs=$prefix ;;
+  *) prefix_abs=$PWD/$prefix ;;
+esac
+
+rm -rf "$prefix" "$archive" "$checksum"
+mkdir -p "$dist"
+
+"$zig_bin" build --prefix "$prefix_abs"
+
+tar -C "$dist" -czf "$archive" "$package"
+hash=$(sha256_file "$archive")
+printf '%s  %s\n' "$hash" "$(basename "$archive")" > "$checksum"
+
+printf 'built %s\n' "$prefix"
+printf 'built %s\n' "$archive"
+printf 'built %s\n' "$checksum"

@@ -5,11 +5,12 @@ usage() {
   cat <<'EOF'
 usage: scripts/check [--fast]
 
-Runs the full sessh verification suite, including the real SSH/tmux Podman
-integration tests.
+Runs the sessh Zig build, bootstrapper harness, fake-ssh harness,
+socket harness, tmux terminal harness, terminal conformance harness, and slow
+Podman ssh harness.
 
 Options:
-  --fast    Skip the real SSH/tmux Podman integration suite.
+  --fast    Skip the slow terminal conformance and Podman ssh harnesses.
 EOF
 }
 
@@ -18,12 +19,110 @@ run() {
   "$@"
 }
 
-run_podman=1
+setup_isolation() {
+  isolation_parent=${TMPDIR:-/tmp}
+  SESSH_CHECK_ISOLATION_ROOT=$(mktemp -d "$isolation_parent/sessh-check.XXXXXX")
+  SESSH_CHECK_HOME=$SESSH_CHECK_ISOLATION_ROOT/home
+  SESSH_CHECK_XDG_RUNTIME_DIR=$SESSH_CHECK_ISOLATION_ROOT/runtime
+  SESSH_CHECK_XDG_CACHE_HOME=$SESSH_CHECK_ISOLATION_ROOT/cache
+  SESSH_CHECK_XDG_CONFIG_HOME=$SESSH_CHECK_ISOLATION_ROOT/config
+  SESSH_CHECK_XDG_DATA_HOME=$SESSH_CHECK_ISOLATION_ROOT/data
+  SESSH_CHECK_XDG_STATE_HOME=$SESSH_CHECK_ISOLATION_ROOT/state
+  SESSH_CHECK_TMPDIR=$SESSH_CHECK_ISOLATION_ROOT/tmp
+  mkdir -p "$SESSH_CHECK_HOME" "$SESSH_CHECK_XDG_RUNTIME_DIR" "$SESSH_CHECK_XDG_CACHE_HOME" "$SESSH_CHECK_XDG_CONFIG_HOME" "$SESSH_CHECK_XDG_DATA_HOME" "$SESSH_CHECK_XDG_STATE_HOME" "$SESSH_CHECK_TMPDIR"
+  chmod 700 "$SESSH_CHECK_HOME" "$SESSH_CHECK_XDG_RUNTIME_DIR" "$SESSH_CHECK_XDG_CACHE_HOME" "$SESSH_CHECK_XDG_CONFIG_HOME" "$SESSH_CHECK_XDG_DATA_HOME" "$SESSH_CHECK_XDG_STATE_HOME" "$SESSH_CHECK_TMPDIR"
+}
+
+check_isolation_empty() {
+  leaked=0
+  for dir in "$SESSH_CHECK_HOME" "$SESSH_CHECK_XDG_RUNTIME_DIR" "$SESSH_CHECK_XDG_CACHE_HOME" "$SESSH_CHECK_XDG_CONFIG_HOME" "$SESSH_CHECK_XDG_DATA_HOME" "$SESSH_CHECK_XDG_STATE_HOME" "$SESSH_CHECK_TMPDIR"; do
+    first=$(find "$dir" -mindepth 1 -print -quit)
+    if [ -n "$first" ]; then
+      leaked=1
+      printf 'scripts/check: isolation directory is not empty: %s\n' "$dir" >&2
+      find "$dir" -mindepth 1 -maxdepth 4 -print >&2
+    fi
+  done
+  return "$leaked"
+}
+
+cleanup_isolation() {
+  status=$?
+  if [ -n "${SESSH_CHECK_ISOLATION_ROOT:-}" ]; then
+    if [ "$status" -eq 0 ]; then
+      if ! check_isolation_empty; then
+        status=1
+      else
+        rm -rf "$SESSH_CHECK_ISOLATION_ROOT"
+      fi
+    else
+      printf 'scripts/check: leaving isolation root for inspection: %s\n' "$SESSH_CHECK_ISOLATION_ROOT" >&2
+    fi
+  fi
+  exit "$status"
+}
+
+run_isolated() {
+  printf '\n==> %s\n' "$*"
+  HOME=$SESSH_CHECK_HOME \
+    SESSH_BIN=zig-out/bin/sessh-dev \
+    XDG_RUNTIME_DIR=$SESSH_CHECK_XDG_RUNTIME_DIR \
+    XDG_CACHE_HOME=$SESSH_CHECK_XDG_CACHE_HOME \
+    XDG_CONFIG_HOME=$SESSH_CHECK_XDG_CONFIG_HOME \
+    XDG_DATA_HOME=$SESSH_CHECK_XDG_DATA_HOME \
+    XDG_STATE_HOME=$SESSH_CHECK_XDG_STATE_HOME \
+    TMPDIR=$SESSH_CHECK_TMPDIR \
+    "$@"
+}
+
+find_zig() {
+  if [ -n "${ZIG:-}" ]; then
+    printf '%s\n' "$ZIG"
+  elif [ -x /opt/homebrew/opt/zig@0.15/bin/zig ]; then
+    printf '%s\n' /opt/homebrew/opt/zig@0.15/bin/zig
+  elif [ -x /usr/local/opt/zig@0.15/bin/zig ]; then
+    printf '%s\n' /usr/local/opt/zig@0.15/bin/zig
+  elif command -v zig >/dev/null 2>&1; then
+    command -v zig
+  else
+    echo "missing Zig 0.15.2" >&2
+    exit 1
+  fi
+}
+
+find_protoc() {
+  if [ -n "${SESSH_PROTOC:-}" ]; then
+    printf '%s\n' "$SESSH_PROTOC"
+  elif command -v protoc-33.0.0 >/dev/null 2>&1; then
+    command -v protoc-33.0.0
+  elif [ -x /opt/homebrew/opt/protobuf/bin/protoc ]; then
+    printf '%s\n' /opt/homebrew/opt/protobuf/bin/protoc
+  elif [ -x /usr/local/opt/protobuf/bin/protoc ]; then
+    printf '%s\n' /usr/local/opt/protobuf/bin/protoc
+  elif command -v protoc >/dev/null 2>&1 && protoc --version >/dev/null 2>&1; then
+    command -v protoc
+  else
+    cat >&2 <<'EOF'
+missing protobuf protoc.
+
+Install it with:
+  brew install protobuf
+
+If your PATH has a wrapper protoc, set SESSH_PROTOC to the real protobuf binary,
+for example:
+  SESSH_PROTOC=/opt/homebrew/opt/protobuf/bin/protoc scripts/check
+EOF
+    exit 1
+  fi
+}
+
+fast=0
+
 case "${1-}" in
   "")
     ;;
   --fast)
-    run_podman=0
+    fast=1
     shift
     ;;
   --help|-h)
@@ -41,18 +140,31 @@ if [ "$#" -ne 0 ]; then
   exit 64
 fi
 
-run uv run --no-project --with shellcheck-py==0.11.0.1 shellcheck scripts/check scripts/package-release src/sessh/remote.sh
-run uv run --no-project --with ruff==0.15.12 ruff format --check .
-run uv run --no-project --with ruff==0.15.12 ruff check .
-run uv run --no-project --with mypy==2.0.0 --with types-PyYAML==6.0.12.20260508 mypy src
-run scripts/package-release --check
-run uv run --no-project --with-editable . python -m unittest discover -s tests
-
-if [ "$run_podman" -eq 1 ] || [ "${SESSH_RUN_PODMAN_TESTS:-}" = 1 ]; then
-  run env SESSH_RUN_PODMAN_TESTS=1 uv run --no-project --with-editable . python -m unittest tests.integration.test_ssh_bootstrap_podman.PodmanSshBootstrapTests
-else
-  printf '\n==> skipping Podman integration tests in --fast mode\n'
+zig_bin=$(find_zig)
+zig_version=$("$zig_bin" version)
+if [ "$zig_version" != "0.15.2" ]; then
+  echo "expected Zig 0.15.2, got $zig_version from $zig_bin" >&2
+  exit 1
 fi
+protoc_bin=$(find_protoc)
+export SESSH_PROTOC=$protoc_bin
 
+run "$zig_bin" build gen-proto
+run "$zig_bin" fmt --check build.zig build.zig.zon src/*.zig
+run "$zig_bin" build
+run "$zig_bin" build install-dev
+run "$zig_bin" build test
+setup_isolation
+trap cleanup_isolation EXIT
+run_isolated python3 tests/bootstrapper_harness.py
+run_isolated python3 tests/ssh_harness.py
+run_isolated python3 tests/ssh_reconnect_tmux_harness.py
+run_isolated python3 tests/socket_harness.py
+run_isolated python3 tests/tmux_harness.py
+if [ "$fast" -eq 0 ]; then
+  printf '\n==> Slow terminal conformance harness is about to start. Run `scripts/check --fast` to skip it.\n'
+  run_isolated python3 tests/terminal_conformance_harness.py
+  printf '\n==> Slow Podman ssh harness is about to start. Run `scripts/check --fast` to skip it.\n'
+  run_isolated python3 tests/podman_ssh_harness.py
+fi
 run git diff --check
-run uv build

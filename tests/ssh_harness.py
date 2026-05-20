@@ -1,0 +1,1254 @@
+#!/usr/bin/env python3
+import hashlib
+import os
+import select
+import shlex
+import socket
+import stat
+import struct
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+from harness_cleanup import cleanup_runtime, sessions_dir
+from test_env import isolated_env
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
+
+
+FAKE_SSH = """#!/bin/sh
+set -eu
+
+saw_t=0
+host=
+config=
+batch_mode=0
+verbose=
+plain_option=
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o)
+      shift
+      if [ "$#" -eq 0 ]; then
+        printf 'fake ssh: missing -o argument\\n' >&2
+        exit 97
+      fi
+      if [ "$1" = "BatchMode=yes" ]; then
+        batch_mode=1
+      fi
+      shift
+      ;;
+    -o*)
+      if [ "${1#-o}" = "BatchMode=yes" ]; then
+        batch_mode=1
+      fi
+      shift
+      ;;
+    -T)
+      saw_t=1
+      shift
+      ;;
+    -F)
+      shift
+      if [ "$#" -eq 0 ]; then
+        printf 'fake ssh: missing -F argument\\n' >&2
+        exit 97
+      fi
+      config=$1
+      shift
+      ;;
+    -v*)
+      verbose=${1#-}
+      case "$verbose" in
+        *[!v]*)
+          printf 'fake ssh: unsupported option: %s\\n' "$1" >&2
+          exit 97
+          ;;
+      esac
+      shift
+      ;;
+    -t|-tt|-N)
+      if [ -n "${SESSH_FAKE_SSH_ALLOW_PLAIN:-}" ]; then
+        plain_option=$1
+        shift
+      else
+        printf 'fake ssh: unsupported option: %s\\n' "$1" >&2
+        exit 97
+      fi
+      ;;
+    -*)
+      printf 'fake ssh: unsupported option: %s\\n' "$1" >&2
+      exit 97
+      ;;
+    *)
+      host=$1
+      shift
+      break
+      ;;
+  esac
+done
+
+if [ "$saw_t" -ne 1 ]; then
+  if [ -n "${SESSH_FAKE_SSH_ALLOW_PLAIN:-}" ]; then
+    printf 'invoked=1\\n' >>"$SESSH_FAKE_SSH_LOG"
+    printf 'plain_ssh=1\\n' >>"$SESSH_FAKE_SSH_LOG"
+    printf 'plain_host=%s\\n' "$host" >>"$SESSH_FAKE_SSH_LOG"
+    if [ -n "$plain_option" ]; then
+      printf 'plain_option=%s\\n' "$plain_option" >>"$SESSH_FAKE_SSH_LOG"
+    fi
+    if [ "$#" -gt 0 ]; then
+      printf 'plain_remote_command=%s\\n' "$*" >>"$SESSH_FAKE_SSH_LOG"
+    fi
+    export SESSH_TEST_HOST=$host
+    printf 'PLAIN_SSH host=%s\\n' "$host"
+    exit 0
+  fi
+  printf 'fake ssh: missing -T\\n' >&2
+  exit 97
+fi
+if [ -z "$host" ]; then
+  printf 'fake ssh: missing host\\n' >&2
+  exit 97
+fi
+if [ "$#" -ne 1 ]; then
+  printf 'fake ssh: expected one remote command\\n' >&2
+  exit 97
+fi
+
+printf 'invoked=1\\n' >>"$SESSH_FAKE_SSH_LOG"
+if [ -n "$config" ]; then
+  printf 'config=%s\\n' "$config" >>"$SESSH_FAKE_SSH_LOG"
+fi
+if [ "$batch_mode" -eq 1 ]; then
+  printf 'batch_mode=1\\n' >>"$SESSH_FAKE_SSH_LOG"
+fi
+if [ -n "$verbose" ]; then
+  printf 'verbose=%s\\n' "$verbose" >>"$SESSH_FAKE_SSH_LOG"
+fi
+export SESSH_TEST_HOST=$host
+if [ "$batch_mode" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_DELAY_ON_BATCH:-}" ]; then
+  sleep "$SESSH_FAKE_SSH_DELAY_ON_BATCH"
+fi
+if [ -n "${SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND:-}" ]; then
+  printf 'fake ssh failed before remote command\\n' >&2
+  exit "$SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"
+fi
+if [ -n "${SESSH_FAKE_SSH_REMOTE_PATH:-}" ]; then
+  PATH=$SESSH_FAKE_SSH_REMOTE_PATH:$PATH
+  export PATH
+fi
+if [ -n "${SESSH_FAKE_SSH_REMOTE_SHELL:-}" ]; then
+  SHELL=$SESSH_FAKE_SSH_REMOTE_SHELL
+  export SHELL
+fi
+exec sh -c "$1"
+"""
+
+
+def write_fake_ssh(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(FAKE_SSH)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def write_fake_uname(path, os_name, arch):
+    path.write_text(
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        f"  -s) printf '%s\\n' {shlex.quote(os_name)} ;;\n"
+        f"  -m) printf '%s\\n' {shlex.quote(arch)} ;;\n"
+        f"  *) printf '%s\\n' {shlex.quote(os_name)} ;;\n"
+        "esac\n"
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def run_sessh(args, env, timeout=5.0):
+    return subprocess.run(
+        [str(BIN), *args],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def read_until_pipe(pipe, needle, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    data = b""
+    while needle not in data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"timed out waiting for {needle!r}; got {data!r}")
+        ready, _, _ = select.select([pipe], [], [], remaining)
+        if not ready:
+            raise AssertionError(f"timed out waiting for {needle!r}; got {data!r}")
+        chunk = os.read(pipe.fileno(), 4096)
+        if not chunk:
+            raise AssertionError(f"process exited before {needle!r}; got {data!r}")
+        data += chunk
+    return data
+
+
+def run_sessh_until_stdout(args, env, needle, timeout=10.0):
+    proc = subprocess.Popen(
+        [str(BIN), *args],
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = read_until_pipe(proc.stdout, needle.encode("utf-8"), timeout)
+    proc.stdin.close()
+    returncode = proc.wait(timeout=timeout)
+    stdout += proc.stdout.read()
+    stderr = proc.stderr.read()
+    return subprocess.CompletedProcess(
+        [str(BIN), *args],
+        returncode,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
+
+
+def run_sessh_reconnect_probe(args, env, ready, after, during=None, timeout=30.0):
+    proc = subprocess.Popen(
+        [str(BIN), *args],
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
+    proc.stdin.write(b"\x02s")
+    proc.stdin.flush()
+    stdout += read_until_pipe(proc.stdout, b"sessh: disconnected. Retry in 5sec", timeout)
+    if during is not None:
+        proc.stdin.write(during.encode("utf-8") + b"\n")
+        proc.stdin.flush()
+    proc.stdin.write(b" ")
+    proc.stdin.flush()
+    stdout += read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
+    if during is not None:
+        during_needle = f"REMOTE:{during}".encode("utf-8")
+        if during_needle not in stdout:
+            stdout += read_until_pipe(proc.stdout, during_needle, timeout)
+    proc.stdin.write(after.encode("utf-8") + b"\n")
+    proc.stdin.flush()
+    after_needle = f"REMOTE:{after}".encode("utf-8")
+    if after_needle not in stdout:
+        stdout += read_until_pipe(proc.stdout, after_needle, timeout)
+    proc.stdin.close()
+    returncode = proc.wait(timeout=timeout)
+    stdout += proc.stdout.read()
+    stderr = proc.stderr.read()
+    return subprocess.CompletedProcess(
+        [str(BIN), *args],
+        returncode,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
+
+
+def run_sessh_abort_reconnect_probe(args, env, ready, abort_bytes=b"\r~.", timeout=10.0):
+    proc = subprocess.Popen(
+        [str(BIN), *args],
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
+    proc.stdin.write(b"\x02s")
+    proc.stdin.flush()
+    stdout += read_until_pipe(proc.stdout, b"sessh: disconnected. Retry in 5sec", timeout)
+    proc.stdin.write(abort_bytes)
+    proc.stdin.flush()
+    proc.stdin.close()
+    returncode = proc.wait(timeout=timeout)
+    stdout += proc.stdout.read()
+    stderr = proc.stderr.read()
+    return subprocess.CompletedProcess(
+        [str(BIN), *args],
+        returncode,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
+
+
+def run_sessh_detach_probe(args, env, ready, timeout=10.0):
+    proc = subprocess.Popen(
+        [str(BIN), *args],
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
+    proc.stdin.write(b"\x02d")
+    proc.stdin.flush()
+    proc.stdin.close()
+    returncode = proc.wait(timeout=timeout)
+    stdout += proc.stdout.read()
+    stderr = proc.stderr.read()
+    return subprocess.CompletedProcess(
+        [str(BIN), *args],
+        returncode,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def canonical_local_platform():
+    sysname = os.uname().sysname
+    machine = os.uname().machine
+    if sysname == "Darwin":
+        os_name = "macos"
+    elif sysname == "Linux":
+        os_name = "linux"
+    else:
+        raise AssertionError(f"unsupported test OS: {sysname}")
+
+    if machine in ("x86_64", "amd64"):
+        arch = "x86_64"
+    elif machine in ("i386", "i486", "i586", "i686"):
+        arch = "x86"
+    elif machine in ("arm", "armv6l", "armv7l", "armv8l"):
+        arch = "arm32"
+    elif machine in ("aarch64", "arm64"):
+        arch = "aarch64"
+    elif machine == "riscv64":
+        arch = "riscv64"
+    else:
+        raise AssertionError(f"unsupported test arch: {machine}")
+    return os_name, arch
+
+
+def local_artifact():
+    os_name, arch = canonical_local_platform()
+    return ROOT / "zig-out" / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+
+
+def remote_path_artifact():
+    if BIN.name == "sessh-dev":
+        return BIN if BIN.is_absolute() else ROOT / BIN
+    return local_artifact()
+
+
+def artifact_cache_path(env, artifact):
+    return Path(env["XDG_CACHE_HOME"]) / "sessh" / "bin" / sessh_version() / sha256(artifact)
+
+
+def sessh_version():
+    for line in (ROOT / "src" / "config.zig").read_text().splitlines():
+        if line.startswith("pub const version = "):
+            return line.split('"')[1]
+    raise AssertionError("could not find sessh version")
+
+
+def session_compat_path(env, session_id="s1"):
+    return sessions_dir(env) / session_id / "compat"
+
+
+def assert_session_compat_points_to_cached_artifact(env, artifact, session_id, context):
+    cached = artifact_cache_path(env, artifact)
+    compat = session_compat_path(env, session_id)
+    assert_cached_artifact(env, artifact, context)
+    if not compat.is_symlink():
+        raise AssertionError(f"{context}: session compat path is not a symlink")
+    if not compat.exists() or not os.path.samefile(cached, compat):
+        raise AssertionError(f"{context}: session compat path does not resolve to cached artifact")
+
+
+def assert_cached_artifact(env, artifact, context):
+    cached = artifact_cache_path(env, artifact)
+    if not cached.exists():
+        raise AssertionError(f"{context}: cached artifact was not created at {cached}")
+    if cached.read_bytes() != artifact.read_bytes():
+        raise AssertionError(f"{context}: cached artifact does not match source binary")
+    if not os.access(cached, os.X_OK):
+        raise AssertionError(f"{context}: cached artifact is not executable")
+
+
+def write_compat_marker(path, marker):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        "printf 'compat_invoked=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "printf 'compat_args=%s\\n' \"$*\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        f"printf '{marker}\\n'\n"
+    )
+    path.chmod(0o700)
+
+
+def version_mismatch_frame():
+    payload = protobuf_string_field(1, b"VERSION_MISMATCH")
+    payload += protobuf_string_field(2, b"existing remote sessh is incompatible with this client")
+    payload += protobuf_string_field(3, b"Use the matching remote sessh binary")
+    return struct.pack(">IH", len(payload), 0x0003) + payload
+
+
+def start_version_mismatch_agent(env, session_id="s1"):
+    session = sessions_dir(env) / session_id
+    session.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (session / "detached").write_text("")
+    sock_path = session / "s"
+    try:
+        sock_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)
+    observed = {}
+
+    def serve():
+        try:
+            server.settimeout(10.0)
+            conn, _ = server.accept()
+            with conn:
+                conn.settimeout(10.0)
+                header = conn.recv(6)
+                observed["header"] = header
+                if len(header) == 6:
+                    payload_len, _ = struct.unpack(">IH", header)
+                    conn.recv(payload_len)
+                conn.sendall(version_mismatch_frame())
+        except Exception as exc:
+            observed["error"] = repr(exc)
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    return server, thread, observed
+
+
+def protobuf_string_field(field_number, value):
+    key = (field_number << 3) | 2
+    return protobuf_varint(key) + protobuf_varint(len(value)) + value
+
+
+def protobuf_varint(value):
+    out = bytearray()
+    while value >= 0x80:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def test_fake_ssh_exports_host_to_remote_command(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    result = subprocess.run(
+        ["ssh", "-T", "test-host", "printf 'host=%s\\n' \"$SESSH_TEST_HOST\""],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5.0,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if result.stdout != "host=test-host\n":
+        raise AssertionError(result)
+    if result.stderr:
+        raise AssertionError(result)
+
+
+def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_config = tmp / "ssh_config"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_ATTACH_READY"
+    fake_config.write_text("Host test-host\n")
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
+
+    if not fake_log.exists():
+        raise AssertionError(f"fake ssh was not invoked: {result}")
+    expected_log = f"invoked=1\nconfig={fake_config}\n"
+    if fake_log.read_text() != expected_log:
+        raise AssertionError(fake_log.read_text())
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(f"ssh attach did not render remote output: {result}")
+    if "ssh runtime attach is not implemented yet" in result.stderr:
+        raise AssertionError(result.stderr)
+    if any(token in result.stdout or token in result.stderr for token in ("MISSING ", "UPLOAD ", "OK\n")):
+        raise AssertionError(result)
+
+    installed = artifact_cache_path(env, local_artifact())
+    if installed.read_bytes() != local_artifact().read_bytes():
+        raise AssertionError("uploaded artifact was not installed")
+    if not os.access(installed, os.X_OK):
+        raise AssertionError("uploaded artifact is not executable")
+    session_meta = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s1" / "meta"
+    if not session_meta.exists():
+        raise AssertionError("uploaded broker did not create a session agent")
+
+
+def test_ssh_session_uses_remote_shell_not_local_client_shell(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    local_shell = tmp / "local-shell"
+    remote_shell = tmp / "remote-shell"
+    local_marker = "LOCAL_CLIENT_SHELL_USED"
+    remote_marker = "REMOTE_LOGIN_SHELL_USED"
+    local_shell.write_text(f"#!/bin/sh\nprintf '{local_marker}\\n'\n")
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{remote_marker}\\n'\n")
+    local_shell.chmod(0o700)
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_SHELL"] = str(remote_shell)
+    env["SHELL"] = str(local_shell)
+
+    result = run_sessh(["test-host"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if remote_marker not in result.stdout:
+        raise AssertionError(result)
+    if local_marker in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_verbose_flags_are_passed_to_ssh(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_VERBOSE_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["-vvv", "test-host"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    if "verbose=vvv" not in fake_log.read_text():
+        raise AssertionError(fake_log.read_text())
+
+
+def test_ssh_failure_uses_ssh_exit_status_and_visible_args(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "255"
+
+    result = run_sessh(["-vvv", "test-host"], env, timeout=5.0)
+
+    if result.returncode != 255:
+        raise AssertionError(result)
+    if "fake ssh failed before remote command" not in result.stderr:
+        raise AssertionError(result)
+    if "sessh: `ssh -vvv test-host` failed (exitcode=255)" not in result.stderr:
+        raise AssertionError(result)
+    if "EndOfStream" in result.stderr or "ssh bootstrap failed before response" in result.stderr:
+        raise AssertionError(result.stderr)
+
+
+def test_ssh_unsupported_option_falls_back_to_plain_ssh(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+
+    result = run_sessh(["-tt", "test-host"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "PLAIN_SSH host=test-host" not in result.stdout:
+        raise AssertionError(result)
+    if "fallback to plain-ssh due to ssh option incompatible with sessh transport" not in result.stderr:
+        raise AssertionError(result.stderr)
+    log_text = fake_log.read_text()
+    if "plain_ssh=1" not in log_text or "plain_option=-tt" not in log_text:
+        raise AssertionError(log_text)
+    if "bootstrapper=1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_remote_command_falls_back_to_plain_ssh(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+
+    result = run_sessh(["test-host", "echo", "hello"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "PLAIN_SSH host=test-host" not in result.stdout:
+        raise AssertionError(result)
+    if "fallback to plain-ssh due to non-interactive invocation" not in result.stderr:
+        raise AssertionError(result.stderr)
+    log_text = fake_log.read_text()
+    if "plain_ssh=1" not in log_text or "plain_remote_command=echo hello" not in log_text:
+        raise AssertionError(log_text)
+    if "bootstrapper=1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_unsupported_option_does_not_fallback_for_sessh_action(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+
+    result = run_sessh(["-tt", "test-host", "--attach", "s1"], env, timeout=5.0)
+
+    if result.returncode != 64:
+        raise AssertionError(result)
+    if "ssh option is not safe for sessh transport" not in result.stderr:
+        raise AssertionError(result.stderr)
+    if fake_log.exists():
+        raise AssertionError(fake_log.read_text())
+
+
+def test_ssh_bootstrap_overrides_config_false_and_uploads(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_BOOTSTRAP_FLAG_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.chmod(0o700)
+    config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "sessh.env").write_text("bootstrap=false\n")
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["test-host", "--bootstrap"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "direct_broker=1" in log_text:
+        raise AssertionError(log_text)
+    installed = artifact_cache_path(env, local_artifact())
+    if installed.read_bytes() != local_artifact().read_bytes():
+        raise AssertionError("bootstrap flag did not upload artifact")
+
+
+def test_ssh_no_bootstrap_uses_remote_path_sessh(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_NO_BOOTSTRAP_FLAG_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.chmod(0o700)
+    config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "sessh.env").write_text("bootstrap=true\n")
+    write_fake_ssh(fake_bin / "ssh")
+    (fake_bin / "sessh").write_text(
+        "#!/bin/sh\n"
+        "printf 'direct_broker=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        f"exec {shlex.quote(str(BIN))} \"$@\"\n"
+    )
+    (fake_bin / "sessh").chmod(0o700)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["test-host", "--no-bootstrap"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "direct_broker=1" not in log_text:
+        raise AssertionError(log_text)
+    if "bootstrapper=1" in log_text:
+        raise AssertionError(log_text)
+    assert_cached_artifact(env, remote_path_artifact(), "--no-bootstrap")
+
+
+def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_NO_BOOTSTRAP_CONFIG_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.chmod(0o700)
+    config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "sessh.env").write_text("bootstrap=false\n")
+    write_fake_ssh(fake_bin / "ssh")
+    (fake_bin / "sessh").write_text(
+        "#!/bin/sh\n"
+        "printf 'direct_broker=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        f"exec {shlex.quote(str(BIN))} \"$@\"\n"
+    )
+    (fake_bin / "sessh").chmod(0o700)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["test-host"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "direct_broker=1" not in log_text:
+        raise AssertionError(log_text)
+    if "bootstrapper=1" in log_text:
+        raise AssertionError(log_text)
+    assert_cached_artifact(env, remote_path_artifact(), "bootstrap=false")
+
+
+def test_ssh_attach_option_is_sessh_option_after_host(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    result = run_sessh(["test-host", "--attach"], env, timeout=30.0)
+
+    if not fake_log.exists():
+        raise AssertionError(f"fake ssh was not invoked: {result}")
+    if result.returncode != 1:
+        raise AssertionError(result)
+    if "ERROR no sessions" not in result.stderr:
+        raise AssertionError(result)
+    if "remote commands are not supported yet" in result.stderr:
+        raise AssertionError(result.stderr)
+
+
+def test_ssh_attach_without_id_reattaches_latest_session(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_ATTACH_LATEST_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\nwhile :; do sleep 1; done\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    first = run_sessh_until_stdout(["test-host"], env, marker)
+    if first.returncode != 0:
+        raise AssertionError(first)
+
+    attached = run_sessh_until_stdout(["test-host", "--attach"], env, marker)
+
+    if attached.returncode != 0:
+        raise AssertionError(attached)
+    if marker not in attached.stdout:
+        raise AssertionError(attached)
+    if "remote commands are not supported yet" in attached.stderr:
+        raise AssertionError(attached.stderr)
+
+
+def test_ssh_leader_sever_reconnects(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_RECONNECT_READY"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "1"
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh_reconnect_probe(
+        ["test-host", "--leader", "CTRL-B"],
+        env,
+        marker,
+        "after-reconnect",
+        during="during-reconnect",
+        timeout=30.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "sessh: disconnected. Retry in 5sec" not in result.stdout:
+        raise AssertionError(result)
+    if "REMOTE:after-reconnect" not in result.stdout:
+        raise AssertionError(result)
+    if "REMOTE:during-reconnect" not in result.stdout:
+        raise AssertionError(result)
+    if "ReconnectUnsupported" in result.stderr:
+        raise AssertionError(result.stderr)
+    if "batch_mode=1" not in fake_log.read_text():
+        raise AssertionError("reconnect did not force ssh BatchMode=yes")
+
+
+def test_ssh_reconnect_can_be_aborted_while_bootstrapping(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_RECONNECT_ABORT_READY"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "20"
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh_abort_reconnect_probe(
+        ["test-host", "--leader", "CTRL-B"],
+        env,
+        marker,
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "sessh: disconnected. Retry in 5sec" not in result.stdout:
+        raise AssertionError(result)
+    if "REMOTE:" in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_reconnect_can_be_aborted_with_ctrl_c(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_RECONNECT_CTRL_C_READY"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "20"
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh_abort_reconnect_probe(
+        ["test-host", "--leader", "CTRL-B"],
+        env,
+        marker,
+        abort_bytes=b"\x03",
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "sessh: disconnected. Retry in 5sec" not in result.stdout:
+        raise AssertionError(result)
+    if "REMOTE:" in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_leader_detach_exits_while_remote_output_is_flowing(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_DETACH_STREAM_READY"
+    remote_shell.write_text(
+        "#!/bin/sh\n"
+        f"printf '{marker}\\n'\n"
+        "i=1\n"
+        "while :; do\n"
+        "  printf 'SSH_DETACH_STREAM_%06d\\n' \"$i\"\n"
+        "  i=$((i + 1))\n"
+        "done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh_detach_probe(
+        ["test-host", "--leader", "CTRL-B"],
+        env,
+        marker,
+        timeout=30.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_unsupported_remote_platform_falls_back_to_plain_ssh(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    remote_bin = tmp / "fake-remote-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    remote_bin.mkdir(parents=True, exist_ok=True)
+    write_fake_uname(remote_bin / "uname", "Plan9", "sparc")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_REMOTE_PATH"] = str(remote_bin)
+
+    result = run_sessh(["test-host", "--leader", "CTRL-B"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "PLAIN_SSH host=test-host" not in result.stdout:
+        raise AssertionError(result)
+    if "using plain-ssh-fallback without persistence" not in result.stderr:
+        raise AssertionError(result)
+    if "unsupported" not in result.stderr:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if log_text.splitlines().count("invoked=1") != 2:
+        raise AssertionError(log_text)
+    if "plain_ssh=1" not in log_text or "plain_host=test-host" not in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_unsupported_remote_platform_does_not_plain_ssh_fallback_for_attach(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    remote_bin = tmp / "fake-remote-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    remote_bin.mkdir(parents=True, exist_ok=True)
+    write_fake_uname(remote_bin / "uname", "Plan9", "sparc")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_REMOTE_PATH"] = str(remote_bin)
+
+    result = run_sessh(["test-host", "--attach", "s1"], env, timeout=30.0)
+
+    if result.returncode == 0:
+        raise AssertionError(result)
+    if "PLAIN_SSH" in result.stdout:
+        raise AssertionError(result)
+    if "plain_ssh=1" in fake_log.read_text():
+        raise AssertionError(fake_log.read_text())
+    if "remote platform is unsupported; cannot attach a sessh session" not in result.stderr:
+        raise AssertionError(result)
+
+
+def test_ssh_remote_session_commands_use_broker(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_REMOTE_COMMAND_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\nwhile :; do sleep 1; done\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    first = run_sessh_until_stdout(["test-host"], env, marker)
+    if first.returncode != 0:
+        raise AssertionError(first)
+
+    assert_session_compat_points_to_cached_artifact(env, local_artifact(), "s1", "remote session command")
+
+    listed = run_sessh(["test-host", "--list"], env, timeout=30.0)
+    if listed.returncode != 0:
+        raise AssertionError(listed)
+    if "ID\tATTACHED\tPID" not in listed.stdout or "s1\tno\t" not in listed.stdout:
+        raise AssertionError(listed)
+
+    killed = run_sessh(["test-host", "--kill", "s1"], env, timeout=30.0)
+    if killed.returncode != 0:
+        raise AssertionError(killed)
+    if "ENDED s1" not in killed.stdout:
+        raise AssertionError(killed)
+
+    listed = run_sessh(["test-host", "--list"], env, timeout=30.0)
+    if listed.returncode != 0:
+        raise AssertionError(listed)
+    if "s1" in listed.stdout:
+        raise AssertionError(listed)
+
+    stopped = run_sessh(["test-host", "--kill-all"], env, timeout=30.0)
+    if stopped.returncode != 0:
+        raise AssertionError(stopped)
+    if "KILLING_ALL" not in stopped.stdout:
+        raise AssertionError(stopped)
+
+
+def test_ssh_remote_kill_all_does_not_start_agent(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    stopped = run_sessh(["test-host", "--kill-all"], env, timeout=30.0)
+
+    if stopped.returncode != 0:
+        raise AssertionError(stopped)
+    if "KILLING_ALL" not in stopped.stdout:
+        raise AssertionError(stopped)
+    registry = sessions_dir(env)
+    if registry.exists() and any(registry.iterdir()):
+        raise AssertionError("remote kill-all started a session agent")
+
+
+def test_ssh_version_mismatch_uses_compat_path(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    marker = "SSH_VERSION_FALLBACK_READY"
+    write_fake_ssh(fake_bin / "ssh")
+    write_compat_marker(session_compat_path(env, "s1"), marker)
+    server, thread, observed = start_version_mismatch_agent(env, "s1")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    try:
+        result = run_sessh(["test-host", "--attach", "--leader", "CTRL-B"], env, timeout=30.0)
+    finally:
+        server.close()
+        thread.join(timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if thread.is_alive():
+        raise AssertionError("version mismatch agent did not receive a connection")
+    if observed.get("error"):
+        raise AssertionError(observed)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    if "sessh: existing remote sessh is incompatible; falling back to compat-mode" not in result.stderr:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if log_text.splitlines().count("invoked=1") != 2:
+        raise AssertionError(log_text)
+    if "batch_mode=1" not in log_text:
+        raise AssertionError(log_text)
+    if "compat_invoked=1" not in log_text:
+        raise AssertionError(log_text)
+    expected_args = (
+        f"compat_args=:local: --compat-version {sessh_version()} "
+        "--attach --leader CTRL-B --scrollback-limit 2000 --initial-scrollback -1"
+    )
+    if expected_args not in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_force_compat_uses_compat_path(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    marker = "SSH_FORCE_COMPAT_READY"
+    config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "sessh.env").write_text(
+        "leader=None\nscrollback-limit=77\ninitial-scrollback=0\n"
+    )
+    write_fake_ssh(fake_bin / "ssh")
+    write_compat_marker(session_compat_path(env, "s1"), marker)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    result = run_sessh(["test-host", "--force-compat", "--attach", "s1", "--leader", "CTRL-B"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    if "using compat-fallback" in result.stderr:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if log_text.splitlines().count("invoked=1") != 1:
+        raise AssertionError(log_text)
+    if "batch_mode=1" in log_text:
+        raise AssertionError(log_text)
+    expected_args = (
+        f"compat_args=:local: --compat-version {sessh_version()} "
+        "--attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0"
+    )
+    if expected_args not in log_text:
+        raise AssertionError(log_text)
+
+
+def run_test(name, fn):
+    with tempfile.TemporaryDirectory(prefix="sessh-ssh-", dir="/tmp") as tmp:
+        root = Path(tmp)
+        env = isolated_env(root)
+        try:
+            fn(root)
+        finally:
+            cleanup_runtime(env)
+    print(f"ok {name}")
+
+
+def main():
+    tests = (
+        ("fake ssh exports host to remote command", test_fake_ssh_exports_host_to_remote_command),
+        (
+            "ssh transport uploads artifact and reaches broker",
+            test_ssh_transport_uploads_artifact_and_reaches_broker,
+        ),
+        (
+            "ssh session uses remote shell, not local client shell",
+            test_ssh_session_uses_remote_shell_not_local_client_shell,
+        ),
+        (
+            "ssh verbose flags are passed to ssh",
+            test_ssh_verbose_flags_are_passed_to_ssh,
+        ),
+        (
+            "ssh failure uses ssh exit status and visible args",
+            test_ssh_failure_uses_ssh_exit_status_and_visible_args,
+        ),
+        (
+            "ssh unsupported option falls back to plain ssh",
+            test_ssh_unsupported_option_falls_back_to_plain_ssh,
+        ),
+        (
+            "ssh remote command falls back to plain ssh",
+            test_ssh_remote_command_falls_back_to_plain_ssh,
+        ),
+        (
+            "ssh unsupported option does not fallback for sessh action",
+            test_ssh_unsupported_option_does_not_fallback_for_sessh_action,
+        ),
+        (
+            "ssh bootstrap overrides config false and uploads",
+            test_ssh_bootstrap_overrides_config_false_and_uploads,
+        ),
+        (
+            "ssh no-bootstrap uses remote path sessh",
+            test_ssh_no_bootstrap_uses_remote_path_sessh,
+        ),
+        (
+            "ssh bootstrap false config uses remote path sessh",
+            test_ssh_bootstrap_false_config_uses_remote_path_sessh,
+        ),
+        (
+            "ssh attach is parsed as sessh option after host",
+            test_ssh_attach_option_is_sessh_option_after_host,
+        ),
+        (
+            "ssh attach without id reattaches latest session",
+            test_ssh_attach_without_id_reattaches_latest_session,
+        ),
+        (
+            "ssh leader sever reconnects",
+            test_ssh_leader_sever_reconnects,
+        ),
+        (
+            "ssh reconnect can be aborted while bootstrapping",
+            test_ssh_reconnect_can_be_aborted_while_bootstrapping,
+        ),
+        (
+            "ssh reconnect can be aborted with ctrl-c",
+            test_ssh_reconnect_can_be_aborted_with_ctrl_c,
+        ),
+        (
+            "ssh leader detach exits while remote output is flowing",
+            test_ssh_leader_detach_exits_while_remote_output_is_flowing,
+        ),
+        (
+            "ssh unsupported remote platform uses plain-ssh-fallback",
+            test_ssh_unsupported_remote_platform_falls_back_to_plain_ssh,
+        ),
+        (
+            "ssh unsupported remote platform does not use plain-ssh-fallback for attach",
+            test_ssh_unsupported_remote_platform_does_not_plain_ssh_fallback_for_attach,
+        ),
+        (
+            "ssh remote session commands use broker",
+            test_ssh_remote_session_commands_use_broker,
+        ),
+        (
+            "ssh remote kill-all does not start agent",
+            test_ssh_remote_kill_all_does_not_start_agent,
+        ),
+        (
+            "ssh version mismatch uses compat path",
+            test_ssh_version_mismatch_uses_compat_path,
+        ),
+        (
+            "ssh force compat uses compat path",
+            test_ssh_force_compat_uses_compat_path,
+        ),
+    )
+    for name, fn in tests:
+        run_test(name, fn)
+
+
+if __name__ == "__main__":
+    main()

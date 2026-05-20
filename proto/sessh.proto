@@ -1,0 +1,206 @@
+syntax = "proto3";
+
+package sessh.protocol.v1;
+
+// Runtime frame type ids. These are the numeric values stored in the fixed
+// frame header described in docs/PROTOCOL.md.
+enum FrameType {
+  FRAME_TYPE_UNSPECIFIED = 0;
+
+  // Payload: Hello. Starts the runtime handshake.
+  FRAME_TYPE_HELLO = 0x0001;
+  // Payload: Hello. Accepts the runtime handshake.
+  FRAME_TYPE_HELLO_OK = 0x0002;
+  // Payload: Error.
+  FRAME_TYPE_ERROR = 0x0003;
+
+  // Payload: CommandRequest.
+  FRAME_TYPE_COMMAND_REQUEST = 0x0010;
+  // Payload: SessionNew.
+  FRAME_TYPE_SESSION_NEW = 0x0011;
+  // Payload: SessionAttach.
+  FRAME_TYPE_SESSION_ATTACH = 0x0012;
+  // Payload: Input.
+  FRAME_TYPE_INPUT = 0x0015;
+  // Payload: Resize.
+  FRAME_TYPE_RESIZE = 0x0016;
+  // Payload: Repaint.
+  FRAME_TYPE_REPAINT = 0x0017;
+
+  // Payload: CommandResponse.
+  FRAME_TYPE_COMMAND_RESPONSE = 0x0020;
+  // Payload: SessionAttached.
+  FRAME_TYPE_SESSION_ATTACHED = 0x0021;
+  // Payload: SessionEnded.
+  FRAME_TYPE_SESSION_ENDED = 0x0022;
+  // Payload: Draw.
+  FRAME_TYPE_DRAW = 0x0027;
+}
+
+// Framed payload, bidirectional.
+//
+// The client sends this as HELLO to start the runtime handshake. The session agent
+// sends this as HELLO_OK when the handshake is accepted.
+message Hello {
+  // Runtime protocol major version. sessh currently requires an exact match.
+  uint32 protocol_major = 1;
+  // Runtime protocol minor version. sessh currently requires an exact match.
+  uint32 protocol_minor = 2;
+  // Binary version string for the sender.
+  string version = 3;
+}
+
+// Framed payload, session agent -> client.
+//
+// Reports protocol, versioning, session, or session agent errors.
+message Error {
+  // Stable machine-readable error code, such as VERSION_MISMATCH.
+  string code = 1;
+  // Human-readable error message.
+  string message = 2;
+  // Optional suggested user action. Empty means there is no hint.
+  string hint = 3;
+}
+
+// Framed payload, client -> session agent.
+//
+// Runs a management command that does not attach to a session.
+message CommandRequest {
+  // Supported commands are ["list"], ["kill", ID], and ["kill-all"].
+  repeated string argv = 1;
+}
+
+// Embedded in SessionNew.
+//
+// Environment value used when creating a new session.
+message EnvironmentEntry {
+  string name = 1;
+  string value = 2;
+}
+
+// Embedded in SessionNew.
+//
+// Outer terminal default colors reported by the client.
+message DefaultColors {
+  // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
+  uint32 foreground_color = 1;
+  // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
+  uint32 background_color = 2;
+}
+
+// Framed payload, client -> session agent.
+//
+// Creates a new interactive PTY session.
+//
+// The client must send Resize before SessionNew. A successful SessionNew is
+// followed by SessionAttached for the new session, then Draw messages.
+message SessionNew {
+  // Maximum session-agent-retained scrollback rows for this session.
+  uint32 scrollback_row_limit = 1;
+  // Session environment entries. Currently SHELL is the only used key.
+  repeated EnvironmentEntry environment = 2;
+  // Colors the session agent may use to answer early OSC 10/11 queries.
+  DefaultColors query_default_colors = 3;
+}
+
+// Embedded in SessionAttach.
+//
+// Client reconnect cursor into session-agent-retained scrollback.
+message ScrollbackCursor {
+  // Retained-scrollback generation known by the client.
+  uint64 scrollback_epoch = 1;
+  // Number of rows from that generation already materialized locally.
+  uint64 seen_scrollback_rows = 2;
+}
+
+// Framed payload, client -> session agent.
+//
+// Attaches to an existing session.
+//
+// The client must send Resize before SessionAttach. A successful SessionAttach
+// is followed by SessionAttached for the selected session, then Draw messages.
+message SessionAttach {
+  // If absent, attach to the most recently detached attachable session.
+  optional string session_id = 1;
+  // Initial retained scrollback row count. Absent means all retained rows.
+  optional uint32 initial_scrollback_row_count = 2;
+  // Present only for automatic reconnect.
+  optional ScrollbackCursor reconnect_cursor = 3;
+}
+
+// Framed payload, client -> session agent.
+//
+// Local terminal input bytes.
+message Input {
+  // Raw bytes read from the local terminal.
+  bytes data = 1;
+}
+
+// Framed payload, client -> session agent.
+//
+// Current terminal size for this attachment.
+message Resize {
+  // Rows visible in the local terminal. The session agent bounds this to u16.
+  uint32 terminal_rows = 1;
+  // Columns visible in the local terminal. The session agent bounds this to u16.
+  uint32 terminal_cols = 2;
+}
+
+// Framed payload, client -> session agent.
+//
+// Requests that the session agent redraw retained scrollback and the current screen.
+// This message has no fields, so the encoded protobuf payload is empty.
+message Repaint {}
+
+// Framed payload, session agent -> client.
+//
+// Process-like response for a CommandRequest.
+message CommandResponse {
+  // Exit status for the management command. The client bounds this to u8.
+  uint32 exit_status = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+}
+
+// Framed payload, session agent -> client.
+//
+// Confirms the session selected for this connection.
+//
+// The session agent sends this after either SessionNew or SessionAttach succeeds. From
+// this point on, the runtime connection is bound to the returned session_id.
+message SessionAttached {
+  string session_id = 1;
+}
+
+// Framed payload, session agent -> client.
+//
+// Tells an attached client that the session has ended.
+message SessionEnded {
+  // 0: process exited itself; 1: killed by client command; 2: session agent shutdown.
+  uint32 reason = 1;
+  // 0: no status; 1: exited with status; 2: terminated by signal.
+  uint32 exit_kind = 2;
+  // Exit status or signal number, ignored when exit_kind is 0.
+  sint32 status = 3;
+  // End timestamp in Unix milliseconds, or 0 when not applicable.
+  uint64 ended_at_unix_ms = 4;
+}
+
+// Framed payload, session agent -> client.
+//
+// Session-agent-generated terminal bytes for the attached session.
+message Draw {
+  // Retained-scrollback generation after this draw.
+  uint64 scrollback_epoch = 1;
+  // Session-agent-retained scrollback rows newly materialized or represented by this
+  // draw. This is a reconnect cursor, not a physical terminal-scroll count.
+  uint64 scroll_count = 2;
+  // Modeled inner cursor row after this draw. The client uses this for
+  // reconnect UI placement; it must not parse bytes or maintain a cell grid.
+  uint32 cursor_row = 3;
+  // Terminal bytes to write to the outer terminal in protocol order.
+  bytes bytes = 4;
+  // Emergency cleanup bytes to install after bytes has been written. Absent
+  // leaves existing cleanup unchanged; present empty clears it.
+  optional bytes cleanup_after = 5;
+}

@@ -1,0 +1,1683 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const c = std.c;
+const posix = std.posix;
+
+const client = @import("client.zig");
+const config = @import("config.zig");
+const io = @import("io.zig");
+const process_exit = @import("process_exit.zig");
+const terminal = @import("terminal.zig");
+
+const bootstrapper_script = @embedFile("bootstrapper.sh");
+const max_artifact_bytes = 64 * 1024 * 1024;
+
+const ArtifactSet = struct {
+    allocator: std.mem.Allocator,
+    artifact_set_id: []u8,
+    entries: []ArtifactEntry,
+
+    fn deinit(self: *ArtifactSet) void {
+        self.allocator.free(self.artifact_set_id);
+        for (self.entries) |*entry| entry.deinit(self.allocator);
+        self.allocator.free(self.entries);
+        self.* = undefined;
+    }
+
+    fn sendExec(self: *const ArtifactSet, fd: c.fd_t, reconnect_ui: ?*client.ReconnectUi) !void {
+        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_ui);
+        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_ui);
+        for (self.entries) |entry| {
+            try writeAllMaybeCancellable(fd, " ", reconnect_ui);
+            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_ui);
+        }
+        try writeAllMaybeCancellable(fd, "\n", reconnect_ui);
+    }
+
+    fn find(self: *const ArtifactSet, platform: Platform) ?*const ArtifactEntry {
+        for (self.entries) |*entry| {
+            if (platformsEqual(entry.platform(), platform)) return entry;
+        }
+        return null;
+    }
+};
+
+const ArtifactEntry = struct {
+    id: []u8,
+    os: []u8,
+    arch: []u8,
+    path: []u8,
+    hash_hex: [64]u8,
+    size: u64,
+
+    fn deinit(self: *ArtifactEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.os);
+        allocator.free(self.arch);
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+
+    fn platform(self: *const ArtifactEntry) Platform {
+        return .{ .os = self.os, .arch = self.arch };
+    }
+};
+
+const Platform = struct {
+    os: []const u8,
+    arch: []const u8,
+};
+
+const PackagedArtifactTarget = struct {
+    os: []const u8,
+    arch: []const u8,
+    filename: []const u8,
+};
+
+const packaged_artifact_targets = [_]PackagedArtifactTarget{
+    .{ .os = "macos", .arch = "aarch64", .filename = "sessh-macos-aarch64" },
+    .{ .os = "macos", .arch = "x86_64", .filename = "sessh-macos-x86_64" },
+    .{ .os = "linux", .arch = "arm32", .filename = "sessh-linux-arm32" },
+    .{ .os = "linux", .arch = "aarch64", .filename = "sessh-linux-aarch64" },
+    .{ .os = "linux", .arch = "x86_64", .filename = "sessh-linux-x86_64" },
+    .{ .os = "linux", .arch = "x86", .filename = "sessh-linux-x86" },
+    .{ .os = "linux", .arch = "riscv64", .filename = "sessh-linux-riscv64" },
+};
+
+const SshAction = enum {
+    new,
+    attach,
+    list,
+    kill,
+    kill_all,
+};
+
+const ParsedSshArgs = struct {
+    options: []const []const u8,
+    host: []const u8,
+    action: SshAction = .new,
+    attach_id: ?[]const u8 = null,
+    kill_id: ?[]const u8 = null,
+    leader: terminal.Leader = .none,
+    leader_set: bool = false,
+    banner_args: client.DetachBannerArgs = .{},
+    scrollback_row_count: u32 = config.default_scrollback_row_count,
+    scrollback_row_count_set: bool = false,
+    initial_scrollback_row_count: ?u32 = null,
+    initial_scrollback_row_count_set: bool = false,
+    bootstrap: bool = true,
+    bootstrap_set: bool = false,
+    force_compat: bool = false,
+};
+
+const CompatModeReason = enum {
+    version_mismatch,
+    forced,
+};
+
+/// Start the ssh transport by running the bootstrapper as the remote command.
+///
+/// The bootstrapper eventually execs `sessh :internal-host-broker:`, at which
+/// point the normal framed runtime protocol can flow over ssh stdio. Installed
+/// packages keep one binary per supported platform in libexec/sessh, named
+/// `sessh-<os>-<arch>`. If that layout is unavailable, upload the current
+/// binary for same-platform development tests.
+pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var parsed_ssh_args = parseSshArgs(args) catch |err| {
+        if (shouldUsePlainSshFallbackForArgError(args, err)) {
+            try runPlainSshFallbackForUnsupportedArgs(allocator, args, err);
+        }
+        try printSshArgError(err);
+        return process_exit.request(64);
+    };
+    applyFileConfigToSsh(allocator, &parsed_ssh_args) catch |err| {
+        try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
+        return process_exit.request(64);
+    };
+
+    if (parsed_ssh_args.force_compat) {
+        try runRemoteCompat(allocator, parsed_ssh_args, .forced);
+    }
+
+    var artifacts_storage: ?ArtifactSet = if (parsed_ssh_args.bootstrap) try loadArtifactSet(allocator) else null;
+    defer if (artifacts_storage) |*artifacts| artifacts.deinit();
+    const artifacts = if (artifacts_storage) |*value| value else null;
+
+    const remote_command = if (parsed_ssh_args.bootstrap)
+        try bootstrapCommand(allocator)
+    else
+        try directBrokerCommand(allocator);
+    defer allocator.free(remote_command);
+
+    if (isRemoteManagementAction(parsed_ssh_args.action)) {
+        var command_child = try startRuntimeConnection(
+            allocator,
+            parsed_ssh_args,
+            artifacts,
+            remote_command,
+            false,
+            null,
+        );
+        const exit_status = (switch (parsed_ssh_args.action) {
+            .list => client.runCommandOnRuntime(
+                command_child.stdout.?.handle,
+                command_child.stdin.?.handle,
+                &.{"list"},
+            ),
+            .kill => client.runCommandOnRuntime(
+                command_child.stdout.?.handle,
+                command_child.stdin.?.handle,
+                &.{ "kill", parsed_ssh_args.kill_id.? },
+            ),
+            .kill_all => client.runCommandOnRuntime(
+                command_child.stdout.?.handle,
+                command_child.stdin.?.handle,
+                &.{"kill-all"},
+            ),
+            .new, .attach => unreachable,
+        }) catch |err| {
+            closeChildStdin(&command_child);
+            _ = command_child.wait() catch {};
+            if (err == error.VersionMismatch) try runRemoteCompat(allocator, parsed_ssh_args, .version_mismatch);
+            if (process_exit.is(err)) return err;
+            try io.stderrPrint("sessh: remote command failed: {t}\n", .{err});
+            return process_exit.request(1);
+        };
+        closeChildStdin(&command_child);
+        _ = command_child.wait() catch {};
+        if (exit_status != 0) return process_exit.request(exit_status);
+        return;
+    }
+
+    var child = try startRuntimeConnection(
+        allocator,
+        parsed_ssh_args,
+        artifacts,
+        remote_command,
+        false,
+        null,
+    );
+
+    var session = (switch (parsed_ssh_args.action) {
+        .new => client.startNewSessionOnRuntime(
+            child.stdout.?.handle,
+            child.stdin.?.handle,
+            parsed_ssh_args.scrollback_row_count,
+        ),
+        .attach => client.startAttachSessionOnRuntime(
+            child.stdout.?.handle,
+            child.stdin.?.handle,
+            parsed_ssh_args.attach_id orelse "",
+            parsed_ssh_args.initial_scrollback_row_count,
+        ),
+        .list, .kill, .kill_all => unreachable,
+    }) catch |err| {
+        closeChildStdin(&child);
+        _ = child.wait() catch {};
+        if (err == error.VersionMismatch) try runRemoteCompat(allocator, parsed_ssh_args, .version_mismatch);
+        if (process_exit.is(err)) return err;
+        try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
+        return process_exit.request(1);
+    };
+
+    while (true) {
+        const end = client.relayRuntimeSession(
+            child.stdout.?.handle,
+            child.stdin.?.handle,
+            &session,
+            parsed_ssh_args.leader,
+        ) catch |err| {
+            closeChildStdin(&child);
+            _ = child.wait() catch {};
+            if (process_exit.is(err)) return err;
+            try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
+            return process_exit.request(1);
+        };
+
+        switch (end) {
+            .detach => {
+                terminateChild(&child);
+                client.writeDetachBannerForTarget(parsed_ssh_args.options, parsed_ssh_args.host, parsed_ssh_args.banner_args.slice(), session.idSlice());
+                return;
+            },
+            .session_ended => {
+                closeChildStdin(&child);
+                _ = child.wait() catch {};
+                return;
+            },
+            .reconnect => {
+                terminateChild(&child);
+            },
+            .transport_closed => {
+                closeChildStdin(&child);
+                _ = child.wait() catch {};
+            },
+        }
+
+        var reconnect_ui = try client.ReconnectUi.begin(session.origin_row, session.cursor_row);
+        var reconnect_ui_active = true;
+        defer if (reconnect_ui_active) reconnect_ui.deinit();
+        var reconnect_attempt: usize = 0;
+        while (true) {
+            switch (try reconnect_ui.waitForReconnect(reconnectDelayMs(reconnect_attempt))) {
+                .abort => return,
+                .reconnect_now, .wait_elapsed => {},
+            }
+
+            child = startRuntimeConnection(
+                allocator,
+                parsed_ssh_args,
+                artifacts,
+                remote_command,
+                true,
+                &reconnect_ui,
+            ) catch |err| switch (err) {
+                error.ExitRequested => return err,
+                error.ReconnectAborted => return,
+                error.OutOfMemory => return err,
+                else => {
+                    reconnect_attempt += 1;
+                    continue;
+                },
+            };
+
+            client.reconnectSessionOnRuntime(
+                child.stdout.?.handle,
+                child.stdin.?.handle,
+                &session,
+            ) catch |err| {
+                closeChildStdin(&child);
+                _ = child.wait() catch {};
+                switch (err) {
+                    error.ExitRequested => return err,
+                    error.OutOfMemory => return err,
+                    else => {
+                        reconnect_attempt += 1;
+                        continue;
+                    },
+                }
+            };
+
+            try reconnect_ui.clearBanner();
+            try reconnect_ui.flushBufferedInput(child.stdin.?.handle);
+            reconnect_ui.deinit();
+            reconnect_ui_active = false;
+            break;
+        }
+    }
+}
+
+fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, reason: CompatModeReason) !noreturn {
+    if (reason == .version_mismatch) {
+        try io.writeAll(2, "sessh: existing remote sessh is incompatible; falling back to compat-mode\n");
+    }
+
+    const command_script = try remoteCompatCommandScript(allocator, parsed_ssh_args);
+    defer allocator.free(command_script);
+    const remote_command = try shCommand(allocator, command_script);
+    defer allocator.free(remote_command);
+
+    const batch_mode = reason == .version_mismatch;
+    const extra_options: usize = if (batch_mode) 1 else 0;
+    const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + extra_options + 4);
+    defer allocator.free(ssh_argv);
+    ssh_argv[0] = "ssh";
+    var arg_index: usize = 1;
+    if (batch_mode) {
+        ssh_argv[arg_index] = "-oBatchMode=yes";
+        arg_index += 1;
+    }
+    @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.options.len], parsed_ssh_args.options);
+    arg_index += parsed_ssh_args.options.len;
+    ssh_argv[arg_index] = "-T";
+    ssh_argv[arg_index + 1] = parsed_ssh_args.host;
+    ssh_argv[ssh_argv.len - 1] = remote_command;
+
+    var child = std.process.Child.init(ssh_argv, allocator);
+    child.expand_arg0 = .expand;
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| return process_exit.request(code),
+        .Signal => |signal| {
+            try io.stderrPrint("sessh: remote compat-fallback ended by signal {}\n", .{signal});
+            return process_exit.request(255);
+        },
+        else => {
+            try io.stderrPrint("sessh: remote compat-fallback ended unexpectedly: {t}\n", .{term});
+            return process_exit.request(255);
+        },
+    }
+}
+
+fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs) ![]u8 {
+    const local_args = try localCompatArgs(allocator, parsed_ssh_args);
+    defer allocator.free(local_args);
+    const compat_version = try shellQuote(allocator, config.version);
+    defer allocator.free(compat_version);
+    const action = compatActionName(parsed_ssh_args.action);
+    const action_quoted = try shellQuote(allocator, action);
+    defer allocator.free(action_quoted);
+    const session_id = compatSessionId(parsed_ssh_args) orelse "";
+    const session_id_quoted = try shellQuote(allocator, session_id);
+    defer allocator.free(session_id_quoted);
+
+    return std.fmt.allocPrint(allocator,
+        \\set -u
+        \\compat_action={s}
+        \\compat_session_id={s}
+        \\if [ -n "${{XDG_RUNTIME_DIR:-}}" ]; then
+        \\  runtime_root=$XDG_RUNTIME_DIR/sessh
+        \\else
+        \\  runtime_root=/tmp/sessh-$(id -u)
+        \\fi
+        \\find_latest_session_id() {{
+        \\  detached=$(ls -t "$runtime_root"/s/s*/detached 2>/dev/null | sed -n '1p')
+        \\  if [ -z "$detached" ]; then
+        \\    printf 'sessh: no detached session is available for compat-mode\n' >&2
+        \\    exit 1
+        \\  fi
+        \\  basename "$(dirname "$detached")"
+        \\}}
+        \\exec_one_compat() {{
+        \\  compat=$1
+        \\  if [ ! -x "$compat" ]; then
+        \\    printf 'sessh: session compat binary is unavailable\n' >&2
+        \\    exit 1
+        \\  fi
+        \\  exec "$compat" :local: --compat-version {s}{s}
+        \\}}
+        \\run_each_compat() {{
+        \\  found=0
+        \\  status=0
+        \\  for compat in "$runtime_root"/s/s*/compat; do
+        \\    [ -e "$compat" ] || continue
+        \\    found=1
+        \\    "$compat" :local: --compat-version {s}{s}
+        \\    code=$?
+        \\    if [ "$code" -ne 0 ]; then
+        \\      status=$code
+        \\    fi
+        \\  done
+        \\  if [ "$found" -eq 0 ]; then
+        \\    printf 'sessh: session compat binary is unavailable\n' >&2
+        \\    exit 1
+        \\  fi
+        \\  exit "$status"
+        \\}}
+        \\case "$compat_action" in
+        \\  attach)
+        \\    if [ -z "$compat_session_id" ]; then
+        \\      compat_session_id=$(find_latest_session_id)
+        \\    fi
+        \\    exec_one_compat "$runtime_root/s/$compat_session_id/compat"
+        \\    ;;
+        \\  kill)
+        \\    exec_one_compat "$runtime_root/s/$compat_session_id/compat"
+        \\    ;;
+        \\  list|kill-all)
+        \\    run_each_compat
+        \\    ;;
+        \\  *)
+        \\    printf 'sessh: compat-mode requires an existing session\n' >&2
+        \\  exit 1
+        \\    ;;
+        \\esac
+        \\
+    , .{
+        action_quoted,
+        session_id_quoted,
+        compat_version,
+        local_args,
+        compat_version,
+        local_args,
+    });
+}
+
+fn compatActionName(action: SshAction) []const u8 {
+    return switch (action) {
+        .new => "new",
+        .attach => "attach",
+        .list => "list",
+        .kill => "kill",
+        .kill_all => "kill-all",
+    };
+}
+
+fn compatSessionId(parsed_ssh_args: ParsedSshArgs) ?[]const u8 {
+    return switch (parsed_ssh_args.action) {
+        .attach => parsed_ssh_args.attach_id,
+        .kill => parsed_ssh_args.kill_id,
+        .new, .list, .kill_all => null,
+    };
+}
+
+fn localCompatArgs(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    switch (parsed_ssh_args.action) {
+        .new => {},
+        .attach => {
+            try appendCompatArg(allocator, &out, "--attach");
+            if (parsed_ssh_args.attach_id) |id| try appendCompatArg(allocator, &out, id);
+        },
+        .list => try appendCompatArg(allocator, &out, "--list"),
+        .kill => {
+            try appendCompatArg(allocator, &out, "--kill");
+            try appendCompatArg(allocator, &out, parsed_ssh_args.kill_id.?);
+        },
+        .kill_all => try appendCompatArg(allocator, &out, "--kill-all"),
+    }
+
+    var leader_buf: [8]u8 = undefined;
+    const leader = resolvedLeaderArg(parsed_ssh_args.leader, &leader_buf);
+    try appendCompatArg(allocator, &out, "--leader");
+    try appendCompatArg(allocator, &out, leader);
+
+    var scrollback_buf: [16]u8 = undefined;
+    const scrollback_count = try std.fmt.bufPrint(&scrollback_buf, "{}", .{parsed_ssh_args.scrollback_row_count});
+    try appendCompatArg(allocator, &out, "--scrollback-limit");
+    try appendCompatArg(allocator, &out, scrollback_count);
+
+    var initial_scrollback_buf: [16]u8 = undefined;
+    const initial_scrollback_count = if (parsed_ssh_args.initial_scrollback_row_count) |value|
+        try std.fmt.bufPrint(&initial_scrollback_buf, "{}", .{value})
+    else
+        "-1";
+    try appendCompatArg(allocator, &out, "--initial-scrollback");
+    try appendCompatArg(allocator, &out, initial_scrollback_count);
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendCompatArg(allocator: std.mem.Allocator, out: *std.ArrayList(u8), arg: []const u8) !void {
+    const quoted = try shellQuote(allocator, arg);
+    defer allocator.free(quoted);
+    try out.append(allocator, ' ');
+    try out.appendSlice(allocator, quoted);
+}
+
+fn resolvedLeaderArg(leader: terminal.Leader, buf: []u8) []const u8 {
+    return switch (leader) {
+        .none => "None",
+        .ctrl => |byte| std.fmt.bufPrint(buf, "CTRL-{c}", .{byte}) catch unreachable,
+    };
+}
+
+fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !void {
+    const file_config = try client.loadFileConfig(allocator);
+    if (!parsed.leader_set) {
+        if (file_config.leader) |leader| parsed.leader = leader;
+    }
+    if (!parsed.scrollback_row_count_set) {
+        if (file_config.scrollback_row_count) |count| parsed.scrollback_row_count = count;
+    }
+    if (!parsed.initial_scrollback_row_count_set and file_config.initial_scrollback_row_count_set) {
+        parsed.initial_scrollback_row_count = file_config.initial_scrollback_row_count;
+    }
+    if (!parsed.bootstrap_set) {
+        if (file_config.bootstrap) |enabled| parsed.bootstrap = enabled;
+    }
+}
+
+fn reconnectDelayMs(attempt: usize) u64 {
+    const delays = [_]u64{
+        5_000,
+        10_000,
+        20_000,
+        60_000,
+        120_000,
+        240_000,
+        600_000,
+    };
+    return if (attempt < delays.len) delays[attempt] else delays[delays.len - 1];
+}
+
+fn startRuntimeConnection(
+    allocator: std.mem.Allocator,
+    parsed_ssh_args: ParsedSshArgs,
+    artifacts: ?*const ArtifactSet,
+    remote_command: []const u8,
+    batch_mode: bool,
+    reconnect_ui: ?*client.ReconnectUi,
+) !std.process.Child {
+    const reconnect_options: usize = if (batch_mode) 1 else 0;
+    const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + reconnect_options + 4);
+    defer allocator.free(ssh_argv);
+    ssh_argv[0] = "ssh";
+    var arg_index: usize = 1;
+    if (batch_mode) {
+        // Reconnect must fail cleanly instead of letting ssh prompt on stdio.
+        // Put this before user/config options because OpenSSH uses the first
+        // value it sees for many config keys.
+        ssh_argv[arg_index] = "-oBatchMode=yes";
+        arg_index += 1;
+    }
+    @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.options.len], parsed_ssh_args.options);
+    arg_index += parsed_ssh_args.options.len;
+    ssh_argv[arg_index] = "-T";
+    ssh_argv[arg_index + 1] = parsed_ssh_args.host;
+    ssh_argv[ssh_argv.len - 1] = remote_command;
+
+    var child = std.process.Child.init(ssh_argv, allocator);
+    child.expand_arg0 = .expand;
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+
+    const artifact_set = artifacts orelse return child;
+
+    artifact_set.sendExec(child.stdin.?.handle, reconnect_ui) catch |err| {
+        terminateChild(&child);
+        return err;
+    };
+
+    var line = readBootstrapLine(allocator, child.stdout.?.handle, reconnect_ui) catch |err| {
+        closeChildStdin(&child);
+        if (err == error.ReconnectAborted) {
+            terminateChild(&child);
+            return err;
+        }
+        if (batch_mode) {
+            _ = child.wait() catch {};
+            return err;
+        }
+        const term = child.wait() catch null;
+        try exitAfterSshBootstrapFailure(allocator, parsed_ssh_args, term, err);
+    };
+    defer allocator.free(line);
+
+    if (std.mem.startsWith(u8, line, "MISSING ")) {
+        const remote_platform = parseMissingPlatform(line) catch {
+            closeChildStdin(&child);
+            _ = child.wait() catch {};
+            try io.stderrPrint("sessh: invalid bootstrap response: {s}\n", .{line});
+            return process_exit.request(1);
+        };
+        const artifact = artifact_set.find(remote_platform) orelse {
+            closeChildStdin(&child);
+            _ = child.wait() catch {};
+            if (artifactFilenameForPlatform(remote_platform) == null and canUsePlainSshFallback(parsed_ssh_args, batch_mode, reconnect_ui)) {
+                try runPlainSshFallback(allocator, parsed_ssh_args, remote_platform);
+            }
+            if (artifactFilenameForPlatform(remote_platform) == null) {
+                try exitUnsupportedPlatform(parsed_ssh_args, remote_platform);
+            }
+            try io.stderrPrint(
+                "sessh: no packaged artifact is available for {s} {s}\n",
+                .{ remote_platform.os, remote_platform.arch },
+            );
+            return process_exit.request(1);
+        };
+
+        sendUpload(allocator, child.stdin.?.handle, artifact, reconnect_ui) catch |err| {
+            closeChildStdin(&child);
+            if (err == error.ReconnectAborted) {
+                terminateChild(&child);
+                return err;
+            }
+            _ = child.wait() catch {};
+            return err;
+        };
+
+        allocator.free(line);
+        line = readBootstrapLine(allocator, child.stdout.?.handle, reconnect_ui) catch |err| {
+            closeChildStdin(&child);
+            if (err == error.ReconnectAborted) {
+                terminateChild(&child);
+                return err;
+            }
+            if (batch_mode) {
+                _ = child.wait() catch {};
+                return err;
+            }
+            const term = child.wait() catch null;
+            try exitAfterSshBootstrapFailure(allocator, parsed_ssh_args, term, err);
+        };
+    }
+
+    if (std.mem.eql(u8, line, "OK")) {
+        return child;
+    }
+
+    if (std.mem.startsWith(u8, line, "ERR ")) {
+        closeChildStdin(&child);
+        _ = child.wait() catch {};
+        if (isUnsupportedPlatformBootstrapError(line) and canUsePlainSshFallback(parsed_ssh_args, batch_mode, reconnect_ui)) {
+            try runPlainSshFallback(allocator, parsed_ssh_args, null);
+        }
+        if (isUnsupportedPlatformBootstrapError(line)) {
+            try exitUnsupportedPlatform(parsed_ssh_args, null);
+        }
+        try io.stderrPrint("sessh: remote bootstrap failed: {s}\n", .{line});
+        return process_exit.request(1);
+    }
+
+    closeChildStdin(&child);
+    _ = child.wait() catch {};
+    try io.stderrPrint("sessh: unexpected bootstrap response: {s}\n", .{line});
+    return process_exit.request(1);
+}
+
+fn isUnsupportedPlatformBootstrapError(line: []const u8) bool {
+    return std.mem.startsWith(u8, line, "ERR UNSUPPORTED_PLATFORM ");
+}
+
+fn canUsePlainSshFallback(
+    parsed_ssh_args: ParsedSshArgs,
+    batch_mode: bool,
+    reconnect_ui: ?*client.ReconnectUi,
+) bool {
+    return parsed_ssh_args.action == .new and !batch_mode and reconnect_ui == null;
+}
+
+fn shouldUsePlainSshFallbackForArgError(args: []const []const u8, err: anyerror) bool {
+    switch (err) {
+        error.UnsupportedSshOption,
+        error.UnsafeSshOption,
+        error.UnsupportedSesshOption,
+        error.RemoteCommandUnsupported,
+        => {},
+        else => return false,
+    }
+
+    return !hasSesshSpecificRequest(args);
+}
+
+fn hasSesshSpecificRequest(args: []const []const u8) bool {
+    const host_index = plainSshHostIndex(args);
+    const before_host_end = host_index orelse args.len;
+
+    var i: usize = 1;
+    while (i < before_host_end) : (i += 1) {
+        if (isSesshLongOption(args[i])) return true;
+    }
+
+    const host = host_index orelse return false;
+    i = host + 1;
+    while (i < args.len) {
+        const arg = args[i];
+        if (!isSesshLongOption(arg)) return false;
+        return true;
+    }
+
+    return false;
+}
+
+fn plainSshHostIndex(args: []const []const u8) ?usize {
+    var i: usize = 1;
+    while (i < args.len) {
+        const arg = args[i];
+        if (arg.len == 0) return i;
+
+        if (std.mem.eql(u8, arg, "--")) {
+            return if (i + 1 < args.len) i + 1 else null;
+        }
+
+        if (!std.mem.startsWith(u8, arg, "-") or std.mem.eql(u8, arg, "-")) return i;
+
+        if (std.mem.startsWith(u8, arg, "--")) {
+            i += 1;
+            continue;
+        }
+
+        var pos: usize = 1;
+        var consumed_value = false;
+        while (pos < arg.len) : (pos += 1) {
+            if (sshOptionConsumesValueForHostScan(arg[pos])) {
+                if (pos + 1 < arg.len) {
+                    i += 1;
+                } else {
+                    i += 2;
+                }
+                consumed_value = true;
+                break;
+            }
+        }
+        if (!consumed_value) i += 1;
+    }
+    return null;
+}
+
+fn sshOptionConsumesValueForHostScan(option: u8) bool {
+    return option == 'o' or
+        sshOptionRequiresValue(option) or
+        isUnsafeSshOptionWithValue(option);
+}
+
+fn exitUnsupportedPlatform(parsed_ssh_args: ParsedSshArgs, platform: ?Platform) !noreturn {
+    const action = unsupportedPlatformAction(parsed_ssh_args.action);
+    if (platform) |remote_platform| {
+        try io.stderrPrint(
+            "sessh: remote platform {s} {s} is unsupported; cannot {s}\n",
+            .{ remote_platform.os, remote_platform.arch, action },
+        );
+    } else {
+        try io.stderrPrint("sessh: remote platform is unsupported; cannot {s}\n", .{action});
+    }
+    return process_exit.request(1);
+}
+
+fn unsupportedPlatformAction(action: SshAction) []const u8 {
+    return switch (action) {
+        .new => "start a persistent sessh session",
+        .attach => "attach a sessh session",
+        .list => "list sessh sessions",
+        .kill => "kill a sessh session",
+        .kill_all => "kill all sessh sessions",
+    };
+}
+
+fn runPlainSshFallbackForUnsupportedArgs(allocator: std.mem.Allocator, args: []const []const u8, err: anyerror) !noreturn {
+    try io.stderrPrint(
+        "sessh: fallback to plain-ssh due to {s}; persistence disabled\n",
+        .{plainSshFallbackReason(err)},
+    );
+    try runPlainSshArgv(allocator, args[1..], "plain-ssh-fallback");
+}
+
+fn plainSshFallbackReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.RemoteCommandUnsupported => "non-interactive invocation",
+        error.UnsafeSshOption => "ssh option incompatible with sessh transport",
+        error.UnsupportedSshOption => "unsupported ssh option",
+        error.UnsupportedSesshOption => "unsupported post-host argument",
+        else => "unsupported invocation",
+    };
+}
+
+fn runPlainSshFallback(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, platform: ?Platform) !noreturn {
+    if (platform) |remote_platform| {
+        try io.stderrPrint(
+            "sessh: remote platform {s} {s} is unsupported; using plain-ssh-fallback without persistence\n",
+            .{ remote_platform.os, remote_platform.arch },
+        );
+    } else {
+        try io.writeAll(2, "sessh: remote platform is unsupported; using plain-ssh-fallback without persistence\n");
+    }
+
+    const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + 1);
+    defer allocator.free(ssh_argv);
+    @memcpy(ssh_argv[0..parsed_ssh_args.options.len], parsed_ssh_args.options);
+    ssh_argv[ssh_argv.len - 1] = parsed_ssh_args.host;
+
+    try runPlainSshArgv(allocator, ssh_argv, "plain-ssh-fallback");
+}
+
+fn runPlainSshArgv(allocator: std.mem.Allocator, ssh_args: []const []const u8, diagnostic_name: []const u8) !noreturn {
+    const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
+    defer allocator.free(ssh_argv);
+    ssh_argv[0] = "ssh";
+    @memcpy(ssh_argv[1..], ssh_args);
+
+    var child = std.process.Child.init(ssh_argv, allocator);
+    child.expand_arg0 = .expand;
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| return process_exit.request(code),
+        .Signal => |signal| {
+            try io.stderrPrint("sessh: {s} ended by signal {}\n", .{ diagnostic_name, signal });
+            return process_exit.request(255);
+        },
+        else => {
+            try io.stderrPrint("sessh: {s} ended unexpectedly: {t}\n", .{ diagnostic_name, term });
+            return process_exit.request(255);
+        },
+    }
+}
+
+fn exitAfterSshBootstrapFailure(
+    allocator: std.mem.Allocator,
+    parsed_ssh_args: ParsedSshArgs,
+    term: ?std.process.Child.Term,
+    cause: anyerror,
+) !noreturn {
+    if (term) |value| {
+        switch (value) {
+            .Exited => |code| {
+                if (code != 0) {
+                    try writeVisibleSshCommand(allocator, parsed_ssh_args);
+                    try io.stderrPrint(" failed (exitcode={})\n", .{code});
+                    return process_exit.request(code);
+                }
+                try io.stderrPrint("sessh: ssh bootstrap ended before response ({t})\n", .{cause});
+                return process_exit.request(1);
+            },
+            .Signal => |signal| {
+                try writeVisibleSshCommand(allocator, parsed_ssh_args);
+                try io.stderrPrint(" failed (signal {})\n", .{signal});
+                return process_exit.request(255);
+            },
+            else => {
+                try writeVisibleSshCommand(allocator, parsed_ssh_args);
+                try io.stderrPrint(" failed ({t})\n", .{value});
+                return process_exit.request(1);
+            },
+        }
+    }
+
+    try io.stderrPrint("sessh: ssh bootstrap failed before response: {t}\n", .{cause});
+    return process_exit.request(1);
+}
+
+fn writeVisibleSshCommand(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs) !void {
+    try io.writeAll(2, "sessh: `ssh");
+    for (parsed_ssh_args.options) |arg| {
+        try io.writeAll(2, " ");
+        try writeDiagnosticShellArg(allocator, arg);
+    }
+    try io.writeAll(2, " ");
+    try writeDiagnosticShellArg(allocator, parsed_ssh_args.host);
+    try io.writeAll(2, "`");
+}
+
+fn writeDiagnosticShellArg(allocator: std.mem.Allocator, arg: []const u8) !void {
+    if (isPlainShellArg(arg)) {
+        try io.writeAll(2, arg);
+        return;
+    }
+    const quoted = try shellQuote(allocator, arg);
+    defer allocator.free(quoted);
+    try io.writeAll(2, quoted);
+}
+
+fn isPlainShellArg(arg: []const u8) bool {
+    if (arg.len == 0) return false;
+    for (arg) |byte| {
+        switch (byte) {
+            'A'...'Z', 'a'...'z', '0'...'9', '_', '-', '.', '/', ':', '@', '%', '+', '=' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// ssh remote commands are evaluated by the remote account's login shell. Wrap
+/// the embedded script so that shell only execs POSIX sh. This gives the
+/// bootstrapper one shell contract to implement and test instead of inheriting
+/// every possible remote login shell's behavior.
+fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
+    return shCommand(allocator, bootstrapper_script);
+}
+
+fn directBrokerCommand(allocator: std.mem.Allocator) ![]u8 {
+    return shCommand(allocator, "exec sessh :internal-host-broker:\n");
+}
+
+fn shCommand(allocator: std.mem.Allocator, script: []const u8) ![]u8 {
+    const quoted_script = try shellQuote(allocator, script);
+    defer allocator.free(quoted_script);
+    return std.fmt.allocPrint(allocator, "exec /bin/sh -c {s}", .{quoted_script});
+}
+
+fn shellQuote(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    try out.append(allocator, '\'');
+    for (value) |byte| {
+        if (byte == '\'') {
+            try out.appendSlice(allocator, "'\\''");
+        } else {
+            try out.append(allocator, byte);
+        }
+    }
+    try out.append(allocator, '\'');
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseSshArgs(args: []const []const u8) !ParsedSshArgs {
+    if (args.len < 2) return error.MissingHost;
+
+    var i: usize = 1;
+    while (i < args.len) {
+        const arg = args[i];
+        if (arg.len == 0) return error.MissingHost;
+
+        if (std.mem.eql(u8, arg, "--")) {
+            i += 1;
+            if (i >= args.len) return error.MissingHost;
+            var parsed = ParsedSshArgs{ .options = args[1 .. i - 1], .host = args[i] };
+            i += 1;
+            try parseSesshOptionsAfterHost(args, &i, &parsed);
+            return parsed;
+        }
+
+        if (!std.mem.startsWith(u8, arg, "-") or std.mem.eql(u8, arg, "-")) {
+            var parsed = ParsedSshArgs{ .options = args[1..i], .host = arg };
+            i += 1;
+            try parseSesshOptionsAfterHost(args, &i, &parsed);
+            return parsed;
+        }
+
+        if (isSesshLongOption(arg)) return error.MissingHost;
+        try consumeSshOption(args, &i);
+    }
+
+    return error.MissingHost;
+}
+
+fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *ParsedSshArgs) !void {
+    while (index.* < args.len) {
+        const arg = args[index.*];
+        if (std.mem.eql(u8, arg, "--attach")) {
+            if (parsed.action != .new) return error.ConflictingSesshAction;
+            parsed.action = .attach;
+            index.* += 1;
+            if (index.* < args.len and !std.mem.startsWith(u8, args[index.*], "--")) {
+                parsed.attach_id = args[index.*];
+                index.* += 1;
+            }
+        } else if (std.mem.eql(u8, arg, "--leader")) {
+            index.* += 1;
+            if (index.* >= args.len) return error.MissingLeader;
+            parsed.leader = try client.parseLeader(args[index.*]);
+            parsed.leader_set = true;
+            try parsed.banner_args.append(arg);
+            try parsed.banner_args.append(args[index.*]);
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--scrollback-limit")) {
+            index.* += 1;
+            if (index.* >= args.len) return error.MissingScrollbackRowCount;
+            parsed.scrollback_row_count = try client.parseScrollbackRowCount(args[index.*]);
+            parsed.scrollback_row_count_set = true;
+            try parsed.banner_args.append(arg);
+            try parsed.banner_args.append(args[index.*]);
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--initial-scrollback")) {
+            index.* += 1;
+            if (index.* >= args.len) return error.MissingInitialScrollback;
+            parsed.initial_scrollback_row_count = try client.parseInitialScrollbackRowCount(args[index.*]);
+            parsed.initial_scrollback_row_count_set = true;
+            try parsed.banner_args.append(arg);
+            try parsed.banner_args.append(args[index.*]);
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--bootstrap")) {
+            parsed.bootstrap = true;
+            parsed.bootstrap_set = true;
+            try parsed.banner_args.append(arg);
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--no-bootstrap")) {
+            parsed.bootstrap = false;
+            parsed.bootstrap_set = true;
+            try parsed.banner_args.append(arg);
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--force-compat")) {
+            parsed.force_compat = true;
+            try parsed.banner_args.append(arg);
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--list")) {
+            if (parsed.action != .new) return error.ConflictingSesshAction;
+            parsed.action = .list;
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--kill")) {
+            if (parsed.action != .new) return error.ConflictingSesshAction;
+            index.* += 1;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingKillId;
+            parsed.action = .kill;
+            parsed.kill_id = args[index.*];
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--kill-all") or std.mem.eql(u8, arg, "--killall")) {
+            if (parsed.action != .new) return error.ConflictingSesshAction;
+            parsed.action = .kill_all;
+            index.* += 1;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnsupportedSesshOption;
+        } else {
+            return error.RemoteCommandUnsupported;
+        }
+    }
+}
+
+fn isSesshLongOption(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--attach") or
+        std.mem.eql(u8, arg, "--leader") or
+        std.mem.eql(u8, arg, "--scrollback-limit") or
+        std.mem.eql(u8, arg, "--initial-scrollback") or
+        std.mem.eql(u8, arg, "--bootstrap") or
+        std.mem.eql(u8, arg, "--no-bootstrap") or
+        std.mem.eql(u8, arg, "--force-compat") or
+        std.mem.eql(u8, arg, "--list") or
+        std.mem.eql(u8, arg, "--kill") or
+        std.mem.eql(u8, arg, "--kill-all") or
+        std.mem.eql(u8, arg, "--killall");
+}
+
+fn isRemoteManagementAction(action: SshAction) bool {
+    return switch (action) {
+        .list, .kill, .kill_all => true,
+        .new, .attach => false,
+    };
+}
+
+fn consumeSshOption(args: []const []const u8, index: *usize) !void {
+    const arg = args[index.*];
+    if (std.mem.startsWith(u8, arg, "--")) return error.UnsupportedSshOption;
+
+    var pos: usize = 1;
+    while (pos < arg.len) {
+        const option = arg[pos];
+        if (isUnsafeSshFlag(option) or isUnsafeSshOptionWithValue(option)) {
+            return error.UnsafeSshOption;
+        }
+
+        if (option == 'o') {
+            const value = try optionValue(args, index, pos);
+            try validateSshConfigOption(value);
+            return;
+        }
+
+        if (sshOptionRequiresValue(option)) {
+            _ = try optionValue(args, index, pos);
+            return;
+        }
+
+        if (!isSafeSshFlag(option)) return error.UnsupportedSshOption;
+        pos += 1;
+    }
+
+    index.* += 1;
+}
+
+fn optionValue(args: []const []const u8, index: *usize, option_pos: usize) ![]const u8 {
+    const arg = args[index.*];
+    if (option_pos + 1 < arg.len) {
+        index.* += 1;
+        return arg[option_pos + 1 ..];
+    }
+
+    if (index.* + 1 >= args.len) return error.MissingSshOptionValue;
+    const value = args[index.* + 1];
+    index.* += 2;
+    return value;
+}
+
+fn isSafeSshFlag(option: u8) bool {
+    return std.mem.indexOfScalar(u8, "46AaCgKkMqsTvXxYy", option) != null;
+}
+
+fn isUnsafeSshFlag(option: u8) bool {
+    return std.mem.indexOfScalar(u8, "fGNnstV", option) != null;
+}
+
+fn sshOptionRequiresValue(option: u8) bool {
+    return std.mem.indexOfScalar(u8, "BbcDEeFIiJLlmPpRSw", option) != null;
+}
+
+fn isUnsafeSshOptionWithValue(option: u8) bool {
+    return std.mem.indexOfScalar(u8, "OQW", option) != null;
+}
+
+fn validateSshConfigOption(raw_option: []const u8) !void {
+    const key = sshConfigKey(raw_option);
+    if (std.ascii.eqlIgnoreCase(key, "RemoteCommand")) return error.UnsafeSshOption;
+
+    if (std.ascii.eqlIgnoreCase(key, "RequestTTY")) {
+        if (!sshConfigValueIs(raw_option, key.len, "no")) return error.UnsafeSshOption;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(key, "SessionType")) {
+        if (!sshConfigValueIs(raw_option, key.len, "default")) return error.UnsafeSshOption;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(key, "StdinNull")) {
+        if (!sshConfigValueIs(raw_option, key.len, "no")) return error.UnsafeSshOption;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(key, "ForkAfterAuthentication")) {
+        if (!sshConfigValueIs(raw_option, key.len, "no")) return error.UnsafeSshOption;
+        return;
+    }
+}
+
+fn sshConfigKey(raw_option: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < raw_option.len) : (end += 1) {
+        switch (raw_option[end]) {
+            '=', ' ', '\t' => break,
+            else => {},
+        }
+    }
+    return raw_option[0..end];
+}
+
+fn sshConfigValueIs(raw_option: []const u8, key_len: usize, expected: []const u8) bool {
+    var value_start = key_len;
+    while (value_start < raw_option.len and
+        (raw_option[value_start] == ' ' or raw_option[value_start] == '\t'))
+    {
+        value_start += 1;
+    }
+    if (value_start < raw_option.len and raw_option[value_start] == '=') value_start += 1;
+    while (value_start < raw_option.len and
+        (raw_option[value_start] == ' ' or raw_option[value_start] == '\t'))
+    {
+        value_start += 1;
+    }
+    return std.ascii.eqlIgnoreCase(raw_option[value_start..], expected);
+}
+
+fn printSshArgError(err: anyerror) !void {
+    switch (err) {
+        error.MissingHost => try io.writeAll(2, "sessh: missing host\n"),
+        error.MissingKillId => try io.writeAll(2, "sessh: --kill requires an id\n"),
+        error.MissingLeader => try io.writeAll(2, "sessh: --leader requires a value\n"),
+        error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
+        error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),
+        error.MissingSshOptionValue => try io.writeAll(2, "sessh: ssh option is missing its value\n"),
+        error.ConflictingSesshAction => try io.writeAll(2, "sessh: conflicting sessh actions\n"),
+        error.DangerousLeader => try io.writeAll(2, "sessh: dangerous leader\n"),
+        error.InvalidLeader => try io.writeAll(2, "sessh: invalid leader\n"),
+        error.InvalidScrollbackRowCount => try io.writeAll(2, "sessh: invalid scrollback row count\n"),
+        error.InvalidInitialScrollback => try io.writeAll(2, "sessh: invalid initial scrollback\n"),
+        error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
+        error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands are not supported yet\n"),
+        error.UnsafeSshOption => try io.writeAll(2, "sessh: ssh option is not safe for sessh transport\n"),
+        error.UnsupportedSesshOption => try io.writeAll(2, "sessh: unsupported sessh option for ssh transport\n"),
+        error.UnsupportedSshOption => try io.writeAll(2, "sessh: unsupported ssh option for sessh transport\n"),
+        else => try io.stderrPrint("sessh: invalid ssh arguments: {t}\n", .{err}),
+    }
+}
+
+fn loadArtifactSet(allocator: std.mem.Allocator) !ArtifactSet {
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+
+    return loadPackagedArtifactSet(allocator, exe_path) catch |err| switch (err) {
+        error.NoPackagedArtifacts => loadDevelopmentArtifactSet(allocator, exe_path),
+        else => err,
+    };
+}
+
+fn loadPackagedArtifactSet(allocator: std.mem.Allocator, exe_path: []const u8) !ArtifactSet {
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.InvalidExePath;
+    if (try loadPackagedArtifactSetFromDir(allocator, exe_dir)) |artifact_set| {
+        return artifact_set;
+    }
+
+    const prefix_dir = std.fs.path.dirname(exe_dir) orelse return error.NoPackagedArtifacts;
+    const libexec_dir = try std.fs.path.join(allocator, &.{ prefix_dir, "libexec", "sessh" });
+    defer allocator.free(libexec_dir);
+    if (try loadPackagedArtifactSetFromDir(allocator, libexec_dir)) |artifact_set| {
+        return artifact_set;
+    }
+
+    return error.NoPackagedArtifacts;
+}
+
+fn loadPackagedArtifactSetFromDir(allocator: std.mem.Allocator, artifact_dir: []const u8) !?ArtifactSet {
+    var found_any = false;
+    for (packaged_artifact_targets) |target| {
+        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.filename });
+        defer allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        file.close();
+        found_any = true;
+        break;
+    }
+    if (!found_any) return null;
+
+    var entries = try allocator.alloc(ArtifactEntry, packaged_artifact_targets.len);
+    errdefer allocator.free(entries);
+    var initialized: usize = 0;
+    errdefer {
+        for (entries[0..initialized]) |*entry| entry.deinit(allocator);
+    }
+
+    for (packaged_artifact_targets, 0..) |target, i| {
+        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.filename });
+        errdefer allocator.free(path);
+
+        entries[i] = try loadArtifactEntryForPlatform(allocator, path, .{
+            .os = target.os,
+            .arch = target.arch,
+        });
+        allocator.free(path);
+        initialized += 1;
+    }
+
+    return .{
+        .allocator = allocator,
+        .artifact_set_id = try allocator.dupe(u8, config.version),
+        .entries = entries,
+    };
+}
+
+fn loadDevelopmentArtifactSet(allocator: std.mem.Allocator, exe_path: []const u8) !ArtifactSet {
+    const entry = try loadCurrentArtifactEntry(allocator, exe_path);
+    errdefer {
+        var mutable = entry;
+        mutable.deinit(allocator);
+    }
+
+    const entries = try allocator.alloc(ArtifactEntry, 1);
+    entries[0] = entry;
+    errdefer allocator.free(entries);
+
+    return .{
+        .allocator = allocator,
+        .artifact_set_id = try allocator.dupe(u8, config.version),
+        .entries = entries,
+    };
+}
+
+fn loadCurrentArtifactEntry(allocator: std.mem.Allocator, exe_path: []const u8) !ArtifactEntry {
+    return loadArtifactEntryForPlatform(allocator, exe_path, localPlatform());
+}
+
+fn loadArtifactEntryForPlatform(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    platform: Platform,
+) !ArtifactEntry {
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(allocator, max_artifact_bytes);
+    defer allocator.free(bytes);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+
+    return .{
+        .id = try std.fmt.allocPrint(
+            allocator,
+            "sessh-{s}-{s}-{s}",
+            .{ config.version, platform.os, platform.arch },
+        ),
+        .os = try allocator.dupe(u8, platform.os),
+        .arch = try allocator.dupe(u8, platform.arch),
+        .path = try allocator.dupe(u8, path),
+        .hash_hex = std.fmt.bytesToHex(digest, .lower),
+        .size = bytes.len,
+    };
+}
+
+fn sendUpload(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    artifact: *const ArtifactEntry,
+    reconnect_ui: ?*client.ReconnectUi,
+) !void {
+    const file = try std.fs.openFileAbsolute(artifact.path, .{});
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(allocator, max_artifact_bytes);
+    defer allocator.free(bytes);
+    if (artifact.size != bytes.len) return error.ArtifactSizeMismatch;
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const actual_hash = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual_hash, &artifact.hash_hex)) return error.ArtifactHashMismatch;
+
+    const encoded = try allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(bytes.len),
+    );
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+
+    try writeAllMaybeCancellable(fd, "UPLOAD ", reconnect_ui);
+    try writeAllMaybeCancellable(fd, artifact.id, reconnect_ui);
+    try writeAllMaybeCancellable(fd, " ", reconnect_ui);
+    try writeAllMaybeCancellable(fd, &artifact.hash_hex, reconnect_ui);
+    try writeAllMaybeCancellable(fd, " ", reconnect_ui);
+    try writeAllMaybeCancellable(fd, encoded, reconnect_ui);
+    try writeAllMaybeCancellable(fd, "\n", reconnect_ui);
+}
+
+fn parseMissingPlatform(line: []const u8) !Platform {
+    if (!std.mem.startsWith(u8, line, "MISSING ")) return error.InvalidMissingResponse;
+    var fields = std.mem.splitScalar(u8, line["MISSING ".len..], ' ');
+    const os = fields.next() orelse return error.InvalidMissingResponse;
+    const arch = fields.next() orelse return error.InvalidMissingResponse;
+    if (fields.next() != null or os.len == 0 or arch.len == 0) return error.InvalidMissingResponse;
+    return .{ .os = os, .arch = arch };
+}
+
+fn localPlatform() Platform {
+    const os = switch (builtin.os.tag) {
+        .linux => "linux",
+        .macos => "macos",
+        else => "unsupported",
+    };
+    const arch = switch (builtin.cpu.arch) {
+        .x86 => "x86",
+        .x86_64 => "x86_64",
+        .arm => "arm32",
+        .aarch64 => "aarch64",
+        .riscv64 => "riscv64",
+        else => "unsupported",
+    };
+    return .{ .os = os, .arch = arch };
+}
+
+fn platformsEqual(a: Platform, b: Platform) bool {
+    return std.mem.eql(u8, a.os, b.os) and std.mem.eql(u8, a.arch, b.arch);
+}
+
+fn artifactFilenameForPlatform(platform: Platform) ?[]const u8 {
+    for (packaged_artifact_targets) |target| {
+        if (platformsEqual(.{ .os = target.os, .arch = target.arch }, platform)) {
+            return target.filename;
+        }
+    }
+    return null;
+}
+
+fn closeChildStdin(child: *std.process.Child) void {
+    if (child.stdin) |*stdin| {
+        stdin.close();
+        child.stdin = null;
+    }
+}
+
+fn terminateChild(child: *std.process.Child) void {
+    closeChildStdin(child);
+    if (child.kill()) |_| return else |_| {}
+    _ = child.wait() catch {};
+}
+
+fn writeAllMaybeCancellable(fd: c.fd_t, bytes: []const u8, reconnect_ui: ?*client.ReconnectUi) !void {
+    if (reconnect_ui == null) {
+        try io.writeAll(fd, bytes);
+        return;
+    }
+
+    var written: usize = 0;
+    while (written < bytes.len) {
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, 50);
+        if (try reconnect_ui.?.pollAbort(0)) return error.ReconnectAborted;
+        if (ready == 0) continue;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
+        if ((pollfds[0].revents & posix.POLL.OUT) == 0) continue;
+
+        const chunk_len = @min(bytes.len - written, 4096);
+        const n = c.write(fd, bytes[written..].ptr, chunk_len);
+        if (n <= 0) return error.WriteFailed;
+        written += @intCast(n);
+    }
+}
+
+fn readBootstrapLine(allocator: std.mem.Allocator, fd: c.fd_t, reconnect_ui: ?*client.ReconnectUi) ![]u8 {
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(allocator);
+
+    while (line.items.len < 4096) {
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, if (reconnect_ui == null) -1 else 50);
+        if (reconnect_ui) |ui| {
+            if (try ui.pollAbort(0)) return error.ReconnectAborted;
+        }
+        if (ready == 0) continue;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfds[0].revents & posix.POLL.IN) == 0)
+        {
+            if (line.items.len == 0) return error.EndOfStream;
+            return try line.toOwnedSlice(allocator);
+        }
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
+        var byte: [1]u8 = undefined;
+        const n = c.read(fd, &byte, 1);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) {
+            if (line.items.len == 0) return error.EndOfStream;
+            return try line.toOwnedSlice(allocator);
+        }
+        if (byte[0] == '\n') return try line.toOwnedSlice(allocator);
+        try line.append(allocator, byte[0]);
+    }
+
+    return error.BootstrapLineTooLong;
+}
+
+test "readBootstrapLine returns the first line without the newline" {
+    var fds: [2]c.fd_t = undefined;
+    if (c.pipe(&fds) != 0) return error.PipeFailed;
+    defer _ = c.close(fds[0]);
+    defer _ = c.close(fds[1]);
+
+    try io.writeAll(fds[1], "MISSING linux x86_64\nextra\n");
+    const line = try readBootstrapLine(std.testing.allocator, fds[0], null);
+    defer std.testing.allocator.free(line);
+
+    try std.testing.expectEqualStrings("MISSING linux x86_64", line);
+}
+
+test "parseMissingPlatform parses canonical platform fields" {
+    const platform = try parseMissingPlatform("MISSING macos aarch64");
+
+    try std.testing.expectEqualStrings("macos", platform.os);
+    try std.testing.expectEqualStrings("aarch64", platform.arch);
+}
+
+test "artifactFilenameForPlatform maps canonical platform fields to packaged names" {
+    try std.testing.expectEqualStrings(
+        "sessh-linux-aarch64",
+        artifactFilenameForPlatform(.{ .os = "linux", .arch = "aarch64" }) orelse return error.MissingArtifactName,
+    );
+    try std.testing.expectEqualStrings(
+        "sessh-macos-x86_64",
+        artifactFilenameForPlatform(.{ .os = "macos", .arch = "x86_64" }) orelse return error.MissingArtifactName,
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), artifactFilenameForPlatform(.{
+        .os = "linux",
+        .arch = "sparc",
+    }));
+}
+
+test "shellQuote produces single-quoted shell words" {
+    const quoted = try shellQuote(std.testing.allocator, "alpha ' beta");
+    defer std.testing.allocator.free(quoted);
+
+    try std.testing.expectEqualStrings("'alpha '\\'' beta'", quoted);
+}
+
+test "parseSshArgs passes through ssh options before host" {
+    const args = [_][]const u8{
+        "sessh",
+        "-F",
+        "ssh_config",
+        "-p2222",
+        "-o",
+        "BatchMode=yes",
+        "-vvC",
+        "example.com",
+    };
+
+    const parsed = try parseSshArgs(&args);
+
+    try std.testing.expectEqualStrings("example.com", parsed.host);
+    try std.testing.expectEqual(@as(usize, 6), parsed.options.len);
+    try std.testing.expectEqualStrings("-F", parsed.options[0]);
+    try std.testing.expectEqualStrings("ssh_config", parsed.options[1]);
+    try std.testing.expectEqualStrings("-p2222", parsed.options[2]);
+    try std.testing.expectEqualStrings("-o", parsed.options[3]);
+    try std.testing.expectEqualStrings("BatchMode=yes", parsed.options[4]);
+    try std.testing.expectEqualStrings("-vvC", parsed.options[5]);
+}
+
+test "parseSshArgs rejects protocol-breaking ssh options" {
+    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(&.{
+        "sessh",
+        "-tt",
+        "example.com",
+    }));
+    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(&.{
+        "sessh",
+        "-n",
+        "example.com",
+    }));
+    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(&.{
+        "sessh",
+        "-W",
+        "host:22",
+        "example.com",
+    }));
+    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(&.{
+        "sessh",
+        "-o",
+        "RequestTTY=force",
+        "example.com",
+    }));
+}
+
+test "parseSshArgs permits explicit safe config overrides" {
+    const parsed = try parseSshArgs(&.{
+        "sessh",
+        "-oRequestTTY=no",
+        "-o",
+        "SessionType=default",
+        "example.com",
+    });
+
+    try std.testing.expectEqualStrings("example.com", parsed.host);
+    try std.testing.expectEqual(@as(usize, 3), parsed.options.len);
+}
+
+test "parseSshArgs accepts sessh attach options after host" {
+    const parsed = try parseSshArgs(&.{
+        "sessh",
+        "-F",
+        "ssh_config",
+        "example.com",
+        "--attach",
+        "s12",
+        "--leader",
+        "CTRL-B",
+        "--scrollback-limit",
+        "42",
+        "--initial-scrollback",
+        "0",
+        "--bootstrap",
+    });
+
+    try std.testing.expectEqualStrings("example.com", parsed.host);
+    try std.testing.expectEqual(@as(usize, 2), parsed.options.len);
+    try std.testing.expectEqual(SshAction.attach, parsed.action);
+    try std.testing.expectEqualStrings("s12", parsed.attach_id.?);
+    switch (parsed.leader) {
+        .ctrl => |byte| try std.testing.expectEqual(@as(u8, 'B'), byte),
+        .none => return error.ExpectedLeader,
+    }
+    try std.testing.expectEqual(@as(usize, 7), parsed.banner_args.len);
+    try std.testing.expectEqualStrings("--leader", parsed.banner_args.buf[0]);
+    try std.testing.expectEqualStrings("CTRL-B", parsed.banner_args.buf[1]);
+    try std.testing.expectEqualStrings("--scrollback-limit", parsed.banner_args.buf[2]);
+    try std.testing.expectEqualStrings("42", parsed.banner_args.buf[3]);
+    try std.testing.expectEqualStrings("--initial-scrollback", parsed.banner_args.buf[4]);
+    try std.testing.expectEqualStrings("0", parsed.banner_args.buf[5]);
+    try std.testing.expectEqualStrings("--bootstrap", parsed.banner_args.buf[6]);
+    try std.testing.expectEqual(@as(u32, 42), parsed.scrollback_row_count);
+    try std.testing.expectEqual(@as(?u32, 0), parsed.initial_scrollback_row_count);
+    try std.testing.expect(parsed.bootstrap);
+    try std.testing.expect(parsed.bootstrap_set);
+}
+
+test "parseSshArgs accepts no bootstrap shorthand after host" {
+    const parsed = try parseSshArgs(&.{
+        "sessh",
+        "example.com",
+        "--attach",
+        "s12",
+        "--no-bootstrap",
+    });
+
+    try std.testing.expectEqualStrings("example.com", parsed.host);
+    try std.testing.expectEqual(SshAction.attach, parsed.action);
+    try std.testing.expectEqualStrings("s12", parsed.attach_id.?);
+    try std.testing.expect(!parsed.bootstrap);
+    try std.testing.expect(parsed.bootstrap_set);
+    try std.testing.expectEqual(@as(usize, 1), parsed.banner_args.len);
+    try std.testing.expectEqualStrings("--no-bootstrap", parsed.banner_args.buf[0]);
+}
+
+test "parseSshArgs rejects old bootstrap boolean syntax" {
+    try std.testing.expectError(error.RemoteCommandUnsupported, parseSshArgs(&.{
+        "sessh",
+        "example.com",
+        "--bootstrap",
+        "false",
+    }));
+}
+
+test "parseSshArgs accepts attach without an id after host" {
+    const parsed = try parseSshArgs(&.{
+        "sessh",
+        "example.com",
+        "--attach",
+        "--scrollback-limit",
+        "100",
+    });
+
+    try std.testing.expectEqual(SshAction.attach, parsed.action);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed.attach_id);
+    try std.testing.expectEqual(@as(u32, 100), parsed.scrollback_row_count);
+}
+
+test "parseSshArgs accepts remote session commands after host" {
+    const list = try parseSshArgs(&.{ "sessh", "example.com", "--list" });
+    try std.testing.expectEqual(SshAction.list, list.action);
+
+    const kill = try parseSshArgs(&.{ "sessh", "example.com", "--kill", "s1" });
+    try std.testing.expectEqual(SshAction.kill, kill.action);
+    try std.testing.expectEqualStrings("s1", kill.kill_id.?);
+
+    const kill_all = try parseSshArgs(&.{ "sessh", "example.com", "--kill-all" });
+    try std.testing.expectEqual(SshAction.kill_all, kill_all.action);
+
+    const killall = try parseSshArgs(&.{ "sessh", "example.com", "--killall" });
+    try std.testing.expectEqual(SshAction.kill_all, killall.action);
+}
+
+test "parseSshArgs reports missing host for sessh actions before host" {
+    try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sessh", "--list" }));
+    try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sessh", "--kill", "s1" }));
+    try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sessh", "--kill-all" }));
+    try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sessh", "--killall" }));
+    try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sessh", "--attach", "s1" }));
+}
+
+test "reconnectDelayMs follows the documented backoff schedule" {
+    try std.testing.expectEqual(@as(u64, 5_000), reconnectDelayMs(0));
+    try std.testing.expectEqual(@as(u64, 10_000), reconnectDelayMs(1));
+    try std.testing.expectEqual(@as(u64, 20_000), reconnectDelayMs(2));
+    try std.testing.expectEqual(@as(u64, 60_000), reconnectDelayMs(3));
+    try std.testing.expectEqual(@as(u64, 120_000), reconnectDelayMs(4));
+    try std.testing.expectEqual(@as(u64, 240_000), reconnectDelayMs(5));
+    try std.testing.expectEqual(@as(u64, 600_000), reconnectDelayMs(6));
+    try std.testing.expectEqual(@as(u64, 600_000), reconnectDelayMs(7));
+}
+
+test "parseSshArgs rejects remote commands for now" {
+    try std.testing.expectError(error.RemoteCommandUnsupported, parseSshArgs(&.{
+        "sessh",
+        "example.com",
+        "uname",
+    }));
+}

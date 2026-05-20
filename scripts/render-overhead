@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+import collections
+import os
+import pty
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+TESTS = ROOT / "tests"
+sys.path.insert(0, str(TESTS))
+
+from harness_cleanup import cleanup_runtime
+from socket_harness import BIN, close_client, read_available, read_until, wait_child_draining_fd
+from test_env import isolated_env
+
+
+def spawn_pty_process(argv, env):
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ.update(env)
+        argv = [str(arg) for arg in argv]
+        os.execv(argv[0], argv)
+    return pid, fd
+
+
+def capture_seq100_output(argv, env):
+    pid, fd = spawn_pty_process(argv, env)
+    child_closed = False
+    try:
+        read_until(fd, b"PERF_READY$ ", timeout=5.0)
+        read_available(fd, timeout=0.2)
+        os.write(fd, b"seq 100\n")
+        output = read_until(fd, b"PERF_DONE$ ", timeout=10.0)
+        output += read_available(fd, timeout=0.5)
+        os.write(fd, b"exit\n")
+        status = wait_child_draining_fd(pid, fd)
+        if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+            raise RuntimeError(f"expected seq perf process to exit 0, got wait status {status}")
+        os.close(fd)
+        child_closed = True
+        return output
+    finally:
+        if not child_closed:
+            close_client(pid, fd)
+
+
+def write_perf_shell(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "stty -echo\n"
+        "printf 'PERF_READY$ '\n"
+        "while IFS= read -r line; do\n"
+        "  case \"$line\" in\n"
+        "    'seq 100')\n"
+        "      i=1\n"
+        "      while [ \"$i\" -le 100 ]; do\n"
+        "        printf '%s\\n' \"$i\"\n"
+        "        i=$((i + 1))\n"
+        "      done\n"
+        "      printf 'PERF_DONE$ '\n"
+        "      ;;\n"
+        "    exit) exit 0 ;;\n"
+        "  esac\n"
+        "done\n"
+    )
+    path.chmod(0o700)
+
+
+def capture_tmux_output(shell, env, tmp):
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return None
+    socket_path = Path(tmp) / "tmux.sock"
+    config_path = Path(tmp) / "tmux.conf"
+    config_path.write_text(
+        "set -g status off\n"
+        "set -g default-terminal xterm-256color\n"
+        "set -g history-limit 2000\n"
+    )
+    try:
+        return capture_seq100_output(
+            [
+                tmux,
+                "-S",
+                socket_path,
+                "-f",
+                config_path,
+                "new-session",
+                "-s",
+                f"sessh-render-overhead-{os.getpid()}",
+                shell,
+            ],
+            env,
+        )
+    finally:
+        subprocess.run([tmux, "-S", str(socket_path), "kill-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def capture_screen_output(shell, env, tmp):
+    screen = shutil.which("screen")
+    if screen is None:
+        return None
+    name = f"sessh-render-overhead-{os.getpid()}"
+    config_path = Path(tmp) / "screenrc"
+    config_path.write_text(
+        "startup_message off\n"
+        "vbell off\n"
+        "defscrollback 2000\n"
+        "term xterm-256color\n"
+    )
+    try:
+        return capture_seq100_output(
+            [
+                screen,
+                "-q",
+                "-c",
+                config_path,
+                "-S",
+                name,
+                shell,
+            ],
+            env,
+        )
+    finally:
+        subprocess.run([screen, "-q", "-S", name, "-X", "quit"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def escape_label(data, offset):
+    if offset + 1 >= len(data):
+        return "ESC <truncated>", "ESC <truncated>", offset + 1
+
+    introducer = data[offset + 1]
+    if introducer == ord("["):
+        end = offset + 2
+        while end < len(data) and not (0x40 <= data[end] <= 0x7E):
+            end += 1
+        if end >= len(data):
+            return "CSI <truncated>", "CSI <truncated>", len(data)
+        body = data[offset + 2 : end].decode("ascii", "replace")
+        final = chr(data[end])
+        return f"CSI {body}{final}", f"CSI {final}", end + 1
+
+    if introducer == ord("]"):
+        end = offset + 2
+        while end < len(data):
+            if data[end] == 0x07:
+                content = data[offset + 2 : end]
+                return osc_label(content), osc_label(content), end + 1
+            if data[end] == 0x1B and end + 1 < len(data) and data[end + 1] == ord("\\"):
+                content = data[offset + 2 : end]
+                return osc_label(content), osc_label(content), end + 2
+            end += 1
+        return "OSC <truncated>", "OSC <truncated>", len(data)
+
+    if introducer == ord("(") and offset + 2 < len(data):
+        return f"ESC ({chr(data[offset + 2])}", "ESC charset", offset + 3
+
+    return f"ESC {chr(introducer)}", f"ESC {chr(introducer)}", offset + 2
+
+
+def osc_label(content):
+    text = content.decode("ascii", "replace")
+    code = text.split(";", 1)[0]
+    return f"OSC {code}"
+
+
+def summarize(data):
+    c0_names = {
+        0x00: "NUL",
+        0x07: "BEL",
+        0x08: "BS",
+        0x09: "TAB",
+        0x0A: "LF",
+        0x0D: "CR",
+        0x7F: "DEL",
+    }
+    c0 = collections.Counter()
+    exact = collections.Counter()
+    groups = collections.Counter()
+    printable = 0
+
+    offset = 0
+    while offset < len(data):
+        byte = data[offset]
+        if byte == 0x1B:
+            exact_label, group_label, next_offset = escape_label(data, offset)
+            exact[exact_label] += 1
+            groups[group_label] += 1
+            offset = next_offset
+            continue
+        if byte < 0x20 or byte == 0x7F:
+            c0[c0_names.get(byte, f"C0 0x{byte:02x}")] += 1
+            offset += 1
+            continue
+        printable += 1
+        offset += 1
+
+    return {
+        "bytes": len(data),
+        "printable": printable,
+        "c0": c0,
+        "exact": exact,
+        "groups": groups,
+    }
+
+
+def print_summary(name, summary):
+    esc_count = sum(summary["exact"].values())
+    c0_count = sum(summary["c0"].values())
+    print(f"{name}:")
+    print(f"  bytes: {summary['bytes']}")
+    print(f"  printable bytes: {summary['printable']}")
+    print(f"  escape sequences: {esc_count}")
+    print(f"  C0 controls: {c0_count}")
+    if summary["c0"]:
+        print("  C0 breakdown:")
+        for label, count in summary["c0"].most_common():
+            print(f"    {count:5d} {label}")
+    if summary["groups"]:
+        print("  escape groups:")
+        for label, count in summary["groups"].most_common(12):
+            print(f"    {count:5d} {label}")
+    if summary["exact"]:
+        print("  top exact escapes:")
+        for label, count in summary["exact"].most_common(20):
+            print(f"    {count:5d} {label}")
+
+
+def main():
+    if not BIN.exists():
+        raise SystemExit(f"missing binary: {BIN}")
+
+    with tempfile.TemporaryDirectory(prefix="sessh-render-overhead-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        env["TERM"] = "xterm-256color"
+        shell = Path(tmp) / "perf-shell"
+        write_perf_shell(shell)
+        env["SHELL"] = str(shell)
+        cleanup_runtime(env)
+        try:
+            direct = capture_seq100_output([shell], env)
+            tmux = capture_tmux_output(shell, env, tmp)
+            screen = capture_screen_output(shell, env, tmp)
+            through_sessh = capture_seq100_output([BIN, ":local:"], env)
+        finally:
+            cleanup_runtime(env)
+
+    if not direct:
+        raise RuntimeError("direct seq output was empty")
+    if not through_sessh:
+        raise RuntimeError("sessh seq output was empty")
+
+    results = [
+        ("direct PTY", direct),
+        ("tmux", tmux),
+        ("screen", screen),
+        ("sessh :local:", through_sessh),
+    ]
+    summaries = {}
+    for name, data in results:
+        if data is None:
+            print(f"{name}: unavailable")
+            continue
+        summaries[name] = summarize(data)
+        print_summary(name, summaries[name])
+
+    direct_bytes = summaries["direct PTY"]["bytes"]
+    print("overhead vs direct PTY:")
+    for name in ("tmux", "screen", "sessh :local:"):
+        summary = summaries.get(name)
+        if summary is None:
+            continue
+        print(
+            f"  {name}: "
+            f"+{summary['bytes'] - direct_bytes} bytes, "
+            f"{summary['bytes'] / direct_bytes:.2f}x"
+        )
+
+
+if __name__ == "__main__":
+    main()

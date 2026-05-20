@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+import collections
+import socket
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+TESTS = ROOT / "tests"
+sys.path.insert(0, str(TESTS))
+
+from harness_cleanup import cleanup_runtime
+from socket_harness import (
+    pack_bytes,
+    pack_session_new,
+    parse_draw,
+    recv_frame,
+    run,
+    send_frame,
+    send_hello,
+    send_resize,
+    socket_path,
+    unpack_session_attached,
+)
+from test_env import isolated_env
+
+
+MESSAGE_NAMES = {
+    0x0001: "HELLO",
+    0x0002: "HELLO_OK",
+    0x0003: "ERROR",
+    0x0010: "COMMAND_REQUEST",
+    0x0011: "SESSION_NEW",
+    0x0012: "SESSION_ATTACH",
+    0x0015: "INPUT",
+    0x0016: "RESIZE",
+    0x0017: "REPAINT",
+    0x0020: "COMMAND_RESPONSE",
+    0x0021: "SESSION_ATTACHED",
+    0x0022: "SESSION_ENDED",
+    0x0027: "DRAW",
+}
+
+
+def message_name(message_type):
+    return MESSAGE_NAMES.get(message_type, f"0x{message_type:04x}")
+
+
+def write_perf_shell(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "stty -echo\n"
+        "printf 'PERF_READY$ '\n"
+        "while IFS= read -r line; do\n"
+        "  case \"$line\" in\n"
+        "    'seq 100')\n"
+        "      i=1\n"
+        "      while [ \"$i\" -le 100 ]; do\n"
+        "        printf '%s\\n' \"$i\"\n"
+        "        i=$((i + 1))\n"
+        "      done\n"
+        "      printf 'PERF_DONE$ '\n"
+        "      ;;\n"
+        "    exit) exit 0 ;;\n"
+        "  esac\n"
+        "done\n"
+    )
+    path.chmod(0o700)
+
+
+def frame_text(message_type, payload):
+    if message_type == 0x0027:
+        return parse_draw(payload)["bytes"].decode(errors="replace")
+    return ""
+
+
+def wait_for_text(conn, needle, max_frames=100):
+    for _ in range(max_frames):
+        message_type, payload = recv_frame(conn)
+        if needle in frame_text(message_type, payload):
+            return message_type, payload
+    raise RuntimeError(f"did not see {needle!r}")
+
+
+def collect_until_text(conn, needle, max_frames=200):
+    frames = []
+    for _ in range(max_frames):
+        message_type, payload = recv_frame(conn)
+        frames.append((message_type, payload))
+        if needle in frame_text(message_type, payload):
+            return frames
+    raise RuntimeError(f"did not see {needle!r}")
+
+
+def summarize_frames(frames):
+    by_message = collections.Counter()
+    payload_bytes = collections.Counter()
+    wire_bytes = collections.Counter()
+    draw_frames = 0
+    draw_bytes = 0
+    draw_scroll_count = 0
+
+    for message_type, payload in frames:
+        name = message_name(message_type)
+        by_message[name] += 1
+        payload_bytes[name] += len(payload)
+        wire_bytes[name] += len(payload) + 6
+
+        if message_type == 0x0027:
+            draw_frames += 1
+            parsed = parse_draw(payload)
+            draw_bytes += len(parsed["bytes"])
+            draw_scroll_count += parsed["scroll_count"]
+
+    return {
+        "frame_count": len(frames),
+        "by_message": by_message,
+        "payload_bytes": payload_bytes,
+        "wire_bytes": wire_bytes,
+        "draw_frames": draw_frames,
+        "draw_bytes": draw_bytes,
+        "draw_scroll_count": draw_scroll_count,
+    }
+
+
+def print_summary(summary):
+    total_payload = sum(summary["payload_bytes"].values())
+    total_wire = sum(summary["wire_bytes"].values())
+    print("protocol frames for `seq 100`:")
+    print(f"  frames: {summary['frame_count']}")
+    print(f"  payload bytes: {total_payload}")
+    print(f"  wire bytes including headers: {total_wire}")
+    print("  message breakdown:")
+    for name, count in summary["by_message"].most_common():
+        print(
+            f"    {count:5d} {name:<18} "
+            f"payload={summary['payload_bytes'][name]:6d} "
+            f"wire={summary['wire_bytes'][name]:6d}"
+        )
+    print("  DRAW:")
+    print(f"    frames: {summary['draw_frames']}")
+    print(f"    terminal bytes: {summary['draw_bytes']}")
+    print(f"    scroll_count: {summary['draw_scroll_count']}")
+
+
+def main():
+    with tempfile.TemporaryDirectory(prefix="sessh-protocol-overhead-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "perf-shell"
+        write_perf_shell(shell)
+        env["SHELL"] = str(shell)
+        cleanup_runtime(env)
+        try:
+            started = run([":local:", "--list"], env, check=True, timeout=5.0)
+            if "ID\tATTACHED\tPID" not in started.stdout:
+                raise RuntimeError(started.stdout)
+
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn, 24, 80)
+                send_frame(conn, 0x0011, pack_session_new(shell, scrollback=2000))
+
+                message_type, payload = recv_frame(conn)
+                if message_type != 0x0021:
+                    raise RuntimeError(f"expected SESSION_ATTACHED, got {message_name(message_type)}")
+                session_id = unpack_session_attached(payload)
+
+                wait_for_text(conn, "PERF_READY$ ")
+                _ = session_id
+                send_frame(conn, 0x0015, pack_bytes(b"seq 100\n"))
+                frames = collect_until_text(conn, "PERF_DONE$ ")
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+    print_summary(summarize_frames(frames))
+
+
+if __name__ == "__main__":
+    main()

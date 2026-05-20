@@ -6,4 +6,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-
+.zig-cache/
+zig-cache/
+zig-pkg/
+zig-out/

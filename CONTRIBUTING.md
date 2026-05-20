@@ -1,24 +1,19 @@
 # Contributing to sessh
 
-Thanks for taking the time to improve sessh.
+sessh is being rewritten around a single native binary, per-session agents, and
+a runtime protocol. Start with [README.md](README.md), then read
+[Architecture](docs/ARCHITECTURE.md) before changing implementation behavior.
 
 ## Development Setup
 
-Install `uv`, then run commands from the repository root.
+sessh currently requires Zig 0.15.2. On macOS, install it with:
 
 ```sh
-uv run --with-editable . sessh --help
+brew install zig@0.15
 ```
 
-The full verification suite uses Podman for integration tests that exercise a
-real SSH server and remote tmux session. For a faster local check that skips
-those tests:
-
-```sh
-scripts/check --fast
-```
-
-Before opening a pull request, run the full suite:
+Run commands from the repository root. Use the repository check script for the
+current implementation:
 
 ```sh
 scripts/check
@@ -26,17 +21,12 @@ scripts/check
 
 ## Testing
 
-Unit tests are standard `unittest` tests under `tests/`.
+Testing strategy is described in [Testing](docs/TESTING.md). Prefer
+process-level tests that invoke the `sessh` binary and exercise real protocol,
+socket, PTY, filesystem, and terminal behavior.
 
-```sh
-uv run --no-project --with-editable . python -m unittest discover -s tests
-```
-
-To run the Podman-backed SSH integration suite directly:
-
-```sh
-env SESSH_RUN_PODMAN_TESTS=1 uv run --no-project --with-editable . python -m unittest tests.integration.test_ssh_bootstrap_podman.PodmanSshBootstrapTests
-```
+Most behavior should be tested without ssh by using the `:local:` transport.
+Use Podman only for slower end-to-end coverage across a real ssh boundary.
 
 ## Releases
 
@@ -46,4 +36,5 @@ release process.
 ## Issues
 
 Use GitHub issues for reproducible bugs. Include the command you ran, the local
-and remote environments, the remote `tmux` version, and relevant terminal output.
+and remote environments, whether you used ssh or `:local:`, and relevant
+terminal output.

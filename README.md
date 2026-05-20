@@ -1,52 +1,23 @@
 # sessh
 
-`sessh` is `ssh` with persistent sessions: if your connection drops you can
-re-attach.
+`sessh` is `ssh` with seamless connection recovery.
 
-## Usage
+- no more losing work due to network disconnections
+- no need to install anything remotely: `sessh` will bootstrap
+- no extra ports: `sessh` communicates over `ssh`
+- scrollback and mouse behavior behave normally
+- same command-line interface as `ssh`
+- terminal state is restored automatically
+- `ssh` is 3 syllables; `sessh` is 1
 
-```sh
-sessh HOST
-sessh HOST --list
-sessh HOST --attach
-sessh HOST --attach ID
-sessh HOST COMMAND [ARG...]
-```
-
-Start a session with `sessh HOST`. List existing sessions with `--list`, or
-attach to one with `--attach`.
-
-Arguments after `HOST` run as a remote command, following ssh's usual
-shell-evaluated command model.
-
-## How It Works
-
-`sessh` runs a local Python CLI and a small POSIX `sh` bootstrap over ssh. The
-remote side creates or attaches to a tmux session on a `sessh`-owned socket,
-with tmux configured unobtrusively: native mouse behavior and no alt screen.
-
-Because the session lives in tmux on the remote host, shell state and scrollback
-survive local disconnects.
-
-## Requirements
-
-- No server install beyond `sshd`, but `tmux` must be installed on the remote
-  host.
-
-## SSH Compatibility
-
-Common ssh options before `HOST` are passed through unchanged:
+To get started:
 
 ```sh
-sessh -p 2222 -J jump.example.com work.example.com
+% brew install block/tap/sessh
+% sessh [ssh-options ...] destination
 ```
 
-For the full option list, run `sessh --help`.
+User-facing commands and configuration:
+[User Manual](docs/USER_MANUAL.md).
 
-## Release
-
-See [RELEASE.md](RELEASE.md).
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+Powered by libghostty-vt. Details in [Architecture](docs/ARCHITECTURE.md).
