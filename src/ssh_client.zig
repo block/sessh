@@ -115,6 +115,88 @@ const CompatModeReason = enum {
     forced,
 };
 
+const RuntimeConnection = struct {
+    child: std.process.Child,
+    stderr_pump: ?SshStderrPump = null,
+
+    fn suppressSshStderr(self: *RuntimeConnection) void {
+        if (self.stderr_pump) |*pump| pump.suppress();
+    }
+
+    fn closeStdin(self: *RuntimeConnection) void {
+        closeChildStdin(&self.child);
+    }
+
+    fn wait(self: *RuntimeConnection) !std.process.Child.Term {
+        const term = self.child.wait() catch |err| {
+            self.joinStderrPump();
+            return err;
+        };
+        self.joinStderrPump();
+        return term;
+    }
+
+    fn terminate(self: *RuntimeConnection) void {
+        self.closeStdin();
+        _ = self.child.kill() catch {
+            _ = self.child.wait() catch {};
+        };
+        self.joinStderrPump();
+    }
+
+    fn joinStderrPump(self: *RuntimeConnection) void {
+        if (self.stderr_pump) |*pump| {
+            pump.join();
+            self.stderr_pump = null;
+        }
+    }
+};
+
+const SshStderrPump = struct {
+    allocator: std.mem.Allocator,
+    state: *State,
+    thread: std.Thread,
+
+    const State = struct {
+        fd: c.fd_t,
+        forward: std.atomic.Value(bool),
+    };
+
+    fn start(allocator: std.mem.Allocator, file: std.fs.File, forward: bool) !SshStderrPump {
+        errdefer file.close();
+        const state = try allocator.create(State);
+        errdefer allocator.destroy(state);
+        state.* = .{
+            .fd = file.handle,
+            .forward = std.atomic.Value(bool).init(forward),
+        };
+
+        const thread = try std.Thread.spawn(.{}, stderrPumpMain, .{state});
+        return .{ .allocator = allocator, .state = state, .thread = thread };
+    }
+
+    fn suppress(self: *SshStderrPump) void {
+        self.state.forward.store(false, .release);
+    }
+
+    fn join(self: *SshStderrPump) void {
+        self.thread.join();
+        self.allocator.destroy(self.state);
+    }
+};
+
+fn stderrPumpMain(state: *SshStderrPump.State) void {
+    defer posix.close(state.fd);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = c.read(state.fd, &buf, buf.len);
+        if (n <= 0) return;
+        if (state.forward.load(.acquire)) {
+            io.writeAll(2, buf[0..@intCast(n)]) catch {};
+        }
+    }
+}
+
 /// Start the ssh transport by running the bootstrapper as the remote command.
 ///
 /// The bootstrapper eventually execs `sessh :internal-host-broker:`, at which
@@ -160,30 +242,30 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         );
         const exit_status = (switch (parsed_ssh_args.action) {
             .list => client.runCommandOnRuntime(
-                command_child.stdout.?.handle,
-                command_child.stdin.?.handle,
+                command_child.child.stdout.?.handle,
+                command_child.child.stdin.?.handle,
                 &.{"list"},
             ),
             .kill => client.runCommandOnRuntime(
-                command_child.stdout.?.handle,
-                command_child.stdin.?.handle,
+                command_child.child.stdout.?.handle,
+                command_child.child.stdin.?.handle,
                 &.{ "kill", parsed_ssh_args.kill_id.? },
             ),
             .kill_all => client.runCommandOnRuntime(
-                command_child.stdout.?.handle,
-                command_child.stdin.?.handle,
+                command_child.child.stdout.?.handle,
+                command_child.child.stdin.?.handle,
                 &.{"kill-all"},
             ),
             .new, .attach => unreachable,
         }) catch |err| {
-            closeChildStdin(&command_child);
+            command_child.closeStdin();
             _ = command_child.wait() catch {};
             if (err == error.VersionMismatch) try runRemoteCompat(allocator, parsed_ssh_args, .version_mismatch);
             if (process_exit.is(err)) return err;
             try io.stderrPrint("sessh: remote command failed: {t}\n", .{err});
             return process_exit.request(1);
         };
-        closeChildStdin(&command_child);
+        command_child.closeStdin();
         _ = command_child.wait() catch {};
         if (exit_status != 0) return process_exit.request(exit_status);
         return;
@@ -200,34 +282,35 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     var session = (switch (parsed_ssh_args.action) {
         .new => client.startNewSessionOnRuntime(
-            child.stdout.?.handle,
-            child.stdin.?.handle,
+            child.child.stdout.?.handle,
+            child.child.stdin.?.handle,
             parsed_ssh_args.scrollback_row_count,
         ),
         .attach => client.startAttachSessionOnRuntime(
-            child.stdout.?.handle,
-            child.stdin.?.handle,
+            child.child.stdout.?.handle,
+            child.child.stdin.?.handle,
             parsed_ssh_args.attach_id orelse "",
             parsed_ssh_args.initial_scrollback_row_count,
         ),
         .list, .kill, .kill_all => unreachable,
     }) catch |err| {
-        closeChildStdin(&child);
+        child.closeStdin();
         _ = child.wait() catch {};
         if (err == error.VersionMismatch) try runRemoteCompat(allocator, parsed_ssh_args, .version_mismatch);
         if (process_exit.is(err)) return err;
         try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
         return process_exit.request(1);
     };
+    child.suppressSshStderr();
 
     while (true) {
         const end = client.relayRuntimeSession(
-            child.stdout.?.handle,
-            child.stdin.?.handle,
+            child.child.stdout.?.handle,
+            child.child.stdin.?.handle,
             &session,
             parsed_ssh_args.leader,
         ) catch |err| {
-            closeChildStdin(&child);
+            child.closeStdin();
             _ = child.wait() catch {};
             if (process_exit.is(err)) return err;
             try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
@@ -236,20 +319,20 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         switch (end) {
             .detach => {
-                terminateChild(&child);
+                child.terminate();
                 client.writeDetachBannerForTarget(parsed_ssh_args.options, parsed_ssh_args.host, parsed_ssh_args.banner_args.slice(), session.idSlice());
                 return;
             },
             .session_ended => {
-                closeChildStdin(&child);
+                child.closeStdin();
                 _ = child.wait() catch {};
                 return;
             },
             .reconnect => {
-                terminateChild(&child);
+                child.terminate();
             },
             .transport_closed => {
-                closeChildStdin(&child);
+                child.closeStdin();
                 _ = child.wait() catch {};
             },
         }
@@ -282,11 +365,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             };
 
             client.reconnectSessionOnRuntime(
-                child.stdout.?.handle,
-                child.stdin.?.handle,
+                child.child.stdout.?.handle,
+                child.child.stdin.?.handle,
                 &session,
             ) catch |err| {
-                closeChildStdin(&child);
+                child.closeStdin();
                 _ = child.wait() catch {};
                 switch (err) {
                     error.ExitRequested => return err,
@@ -299,7 +382,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             };
 
             try reconnect_ui.clearBanner();
-            try reconnect_ui.flushBufferedInput(child.stdin.?.handle);
+            try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
             reconnect_ui.deinit();
             reconnect_ui_active = false;
             break;
@@ -545,7 +628,7 @@ fn startRuntimeConnection(
     remote_command: []const u8,
     batch_mode: bool,
     reconnect_ui: ?*client.ReconnectUi,
-) !std.process.Child {
+) !RuntimeConnection {
     const reconnect_options: usize = if (batch_mode) 1 else 0;
     const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + reconnect_options + 4);
     defer allocator.free(ssh_argv);
@@ -568,41 +651,51 @@ fn startRuntimeConnection(
     child.expand_arg0 = .expand;
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Inherit;
+    const pump_stderr = reconnect_ui == null;
+    child.stderr_behavior = if (pump_stderr) .Pipe else .Ignore;
     try child.spawn();
+    var connection = RuntimeConnection{ .child = child };
+    if (pump_stderr) {
+        const stderr_file = connection.child.stderr.?;
+        connection.child.stderr = null;
+        connection.stderr_pump = SshStderrPump.start(allocator, stderr_file, true) catch |err| {
+            connection.terminate();
+            return err;
+        };
+    }
 
-    const artifact_set = artifacts orelse return child;
+    const artifact_set = artifacts orelse return connection;
 
-    artifact_set.sendExec(child.stdin.?.handle, reconnect_ui) catch |err| {
-        terminateChild(&child);
+    artifact_set.sendExec(connection.child.stdin.?.handle, reconnect_ui) catch |err| {
+        connection.terminate();
         return err;
     };
 
-    var line = readBootstrapLine(allocator, child.stdout.?.handle, reconnect_ui) catch |err| {
-        closeChildStdin(&child);
+    var line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui) catch |err| {
+        connection.closeStdin();
         if (err == error.ReconnectAborted) {
-            terminateChild(&child);
+            connection.terminate();
             return err;
         }
         if (batch_mode) {
-            _ = child.wait() catch {};
+            _ = connection.wait() catch {};
             return err;
         }
-        const term = child.wait() catch null;
+        const term = connection.wait() catch null;
         try exitAfterSshBootstrapFailure(allocator, parsed_ssh_args, term, err);
     };
     defer allocator.free(line);
 
     if (std.mem.startsWith(u8, line, "MISSING ")) {
         const remote_platform = parseMissingPlatform(line) catch {
-            closeChildStdin(&child);
-            _ = child.wait() catch {};
+            connection.closeStdin();
+            _ = connection.wait() catch {};
             try io.stderrPrint("sessh: invalid bootstrap response: {s}\n", .{line});
             return process_exit.request(1);
         };
         const artifact = artifact_set.find(remote_platform) orelse {
-            closeChildStdin(&child);
-            _ = child.wait() catch {};
+            connection.closeStdin();
+            _ = connection.wait() catch {};
             if (artifactFilenameForPlatform(remote_platform) == null and canUsePlainSshFallback(parsed_ssh_args, batch_mode, reconnect_ui)) {
                 try runPlainSshFallback(allocator, parsed_ssh_args, remote_platform);
             }
@@ -616,39 +709,40 @@ fn startRuntimeConnection(
             return process_exit.request(1);
         };
 
-        sendUpload(allocator, child.stdin.?.handle, artifact, reconnect_ui) catch |err| {
-            closeChildStdin(&child);
+        sendUpload(allocator, connection.child.stdin.?.handle, artifact, reconnect_ui) catch |err| {
+            connection.closeStdin();
             if (err == error.ReconnectAborted) {
-                terminateChild(&child);
+                connection.terminate();
                 return err;
             }
-            _ = child.wait() catch {};
+            _ = connection.wait() catch {};
             return err;
         };
 
         allocator.free(line);
-        line = readBootstrapLine(allocator, child.stdout.?.handle, reconnect_ui) catch |err| {
-            closeChildStdin(&child);
+        line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui) catch |err| {
+            connection.closeStdin();
             if (err == error.ReconnectAborted) {
-                terminateChild(&child);
+                connection.terminate();
                 return err;
             }
             if (batch_mode) {
-                _ = child.wait() catch {};
+                _ = connection.wait() catch {};
                 return err;
             }
-            const term = child.wait() catch null;
+            const term = connection.wait() catch null;
             try exitAfterSshBootstrapFailure(allocator, parsed_ssh_args, term, err);
         };
     }
 
     if (std.mem.eql(u8, line, "OK")) {
-        return child;
+        connection.suppressSshStderr();
+        return connection;
     }
 
     if (std.mem.startsWith(u8, line, "ERR ")) {
-        closeChildStdin(&child);
-        _ = child.wait() catch {};
+        connection.closeStdin();
+        _ = connection.wait() catch {};
         if (isUnsupportedPlatformBootstrapError(line) and canUsePlainSshFallback(parsed_ssh_args, batch_mode, reconnect_ui)) {
             try runPlainSshFallback(allocator, parsed_ssh_args, null);
         }
@@ -659,8 +753,8 @@ fn startRuntimeConnection(
         return process_exit.request(1);
     }
 
-    closeChildStdin(&child);
-    _ = child.wait() catch {};
+    connection.closeStdin();
+    _ = connection.wait() catch {};
     try io.stderrPrint("sessh: unexpected bootstrap response: {s}\n", .{line});
     return process_exit.request(1);
 }

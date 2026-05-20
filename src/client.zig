@@ -1080,7 +1080,6 @@ fn relayTerminal(
     var last_size = terminal.currentWindowSize();
     var pending_cleanup = std.ArrayList(u8).empty;
     defer pending_cleanup.deinit(app_allocator.allocator());
-    defer if (pending_cleanup.items.len > 0) io_helpers.writeAll(1, pending_cleanup.items) catch {};
     _ = presentation_guard;
 
     while (true) {
@@ -1089,11 +1088,11 @@ fn relayTerminal(
 
         if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             const n = c.read(input_fd, &buf, buf.len);
-            if (n <= 0) return requestSessionDetach(read_fd, write_fd, session_id);
+            if (n <= 0) return finishRelay(requestSessionDetach(read_fd, write_fd, session_id), &pending_cleanup);
             const result = escape_filter.filter(buf[0..@intCast(n)], &filtered);
             if (result.bytes.len > 0) try sendInput(write_fd, result.bytes);
             if (result.end) |end| switch (end) {
-                .detach => return requestSessionDetach(read_fd, write_fd, session_id),
+                .detach => return finishRelay(requestSessionDetach(read_fd, write_fd, session_id), &pending_cleanup),
                 .repaint => sendRepaint(write_fd) catch return .transport_closed,
                 .reconnect => return .reconnect,
             };
@@ -1103,15 +1102,22 @@ fn relayTerminal(
             defer frame.deinit(app_allocator.allocator());
             switch (frame.message_type) {
                 .FRAME_TYPE_DRAW => try handleDrawFrame(frame.payload, &pending_cleanup, scrollback_cursor, cursor_row),
-                .FRAME_TYPE_SESSION_ENDED => return .session_ended,
+                .FRAME_TYPE_SESSION_ENDED => return finishRelay(.session_ended, &pending_cleanup),
                 .FRAME_TYPE_ERROR => {
                     try printErrorPayload(frame.payload);
-                    return .session_ended;
+                    return finishRelay(.session_ended, &pending_cleanup);
                 },
                 else => return error.UnexpectedFrame,
             }
         }
     }
+}
+
+fn finishRelay(end: RelayEnd, pending_cleanup: *const std.ArrayList(u8)) RelayEnd {
+    if ((end == .detach or end == .session_ended) and pending_cleanup.items.len > 0) {
+        io_helpers.writeAll(1, pending_cleanup.items) catch {};
+    }
+    return end;
 }
 
 fn requestSessionDetach(read_fd: c.fd_t, write_fd: c.fd_t, session_id: []const u8) RelayEnd {
