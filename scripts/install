@@ -1,0 +1,130 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat <<'EOF'
+usage: scripts/install
+
+Builds this checkout and installs it for local dogfooding:
+  ~/.local/opt/sessh-dev
+  ~/.local/bin/sessh -> ~/.local/opt/sessh-dev/bin/sessh
+EOF
+}
+
+find_zig() {
+  if [ -n "${ZIG:-}" ]; then
+    printf '%s\n' "$ZIG"
+  elif [ -x /opt/homebrew/opt/zig@0.15/bin/zig ]; then
+    printf '%s\n' /opt/homebrew/opt/zig@0.15/bin/zig
+  elif [ -x /usr/local/opt/zig@0.15/bin/zig ]; then
+    printf '%s\n' /usr/local/opt/zig@0.15/bin/zig
+  elif command -v zig >/dev/null 2>&1; then
+    command -v zig
+  else
+    echo "missing Zig 0.15.2" >&2
+    exit 1
+  fi
+}
+
+find_protoc() {
+  if [ -n "${SESSH_PROTOC:-}" ]; then
+    printf '%s\n' "$SESSH_PROTOC"
+  elif command -v protoc-33.0.0 >/dev/null 2>&1; then
+    command -v protoc-33.0.0
+  elif [ -x /opt/homebrew/opt/protobuf/bin/protoc ]; then
+    printf '%s\n' /opt/homebrew/opt/protobuf/bin/protoc
+  elif [ -x /usr/local/opt/protobuf/bin/protoc ]; then
+    printf '%s\n' /usr/local/opt/protobuf/bin/protoc
+  elif command -v protoc >/dev/null 2>&1 && protoc --version >/dev/null 2>&1; then
+    command -v protoc
+  else
+    cat >&2 <<'EOF'
+missing protobuf protoc.
+
+Install it with:
+  brew install protobuf
+
+If your PATH has a wrapper protoc, set SESSH_PROTOC to the real protobuf binary,
+for example:
+  SESSH_PROTOC=/opt/homebrew/opt/protobuf/bin/protoc scripts/install
+EOF
+    exit 1
+  fi
+}
+
+case "${1-}" in
+  "")
+    ;;
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 64
+    ;;
+esac
+
+if [ "$#" -ne 0 ]; then
+  usage >&2
+  exit 64
+fi
+
+if [ -z "${HOME:-}" ]; then
+  echo "scripts/install: HOME is not set" >&2
+  exit 1
+fi
+
+local_root=$HOME/.local
+bin_dir=$local_root/bin
+opt_dir=$local_root/opt
+prefix=$opt_dir/sessh-dev
+link=$bin_dir/sessh
+
+missing_dirs=
+if [ ! -d "$bin_dir" ]; then
+  missing_dirs=$bin_dir
+fi
+if [ ! -d "$opt_dir" ]; then
+  missing_dirs="${missing_dirs:+$missing_dirs }$opt_dir"
+fi
+if [ -n "$missing_dirs" ]; then
+  printf 'scripts/install: missing required install directories: %s\n' "$missing_dirs" >&2
+  printf 'Create them with:\n  mkdir -p %s\n' "$missing_dirs" >&2
+  exit 1
+fi
+
+if [ -e "$link" ] && [ ! -L "$link" ]; then
+  printf 'scripts/install: refusing to replace non-symlink %s\n' "$link" >&2
+  exit 1
+fi
+
+zig_bin=$(find_zig)
+zig_version=$("$zig_bin" version)
+if [ "$zig_version" != "0.15.2" ]; then
+  echo "expected Zig 0.15.2, got $zig_version from $zig_bin" >&2
+  exit 1
+fi
+
+protoc_bin=$(find_protoc)
+export SESSH_PROTOC=$protoc_bin
+
+"$zig_bin" build --prefix "$prefix"
+ln -sfn "$prefix/bin/sessh" "$link"
+
+printf 'installed %s\n' "$prefix"
+printf 'linked %s -> %s\n' "$link" "$prefix/bin/sessh"
+
+resolved=$(command -v sessh 2>/dev/null || true)
+if [ "$resolved" != "$link" ]; then
+  if [ -n "$resolved" ]; then
+    printf 'scripts/install: sessh resolves to the wrong executable: %s\n' "$resolved" >&2
+  else
+    printf 'scripts/install: sessh does not resolve on PATH\n' >&2
+  fi
+  printf 'Expected:\n  %s\n' "$link" >&2
+  printf 'Put %s before any other sessh on PATH:\n' "$bin_dir" >&2
+  printf '  export PATH="%s:$PATH"\n' "$bin_dir" >&2
+  printf 'If your shell caches command paths, run:\n  rehash\n' >&2
+  exit 1
+fi

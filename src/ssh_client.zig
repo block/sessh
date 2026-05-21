@@ -385,7 +385,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 client_log.flush(2);
             },
             .unresponsive => {
-                client_log.append("event=disconnect reason=unresponsive host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
+                client_log.debug("event=disconnect reason=unresponsive host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 race_existing_connection = true;
             },
             .transport_closed => {
@@ -422,7 +422,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                     child.terminate();
                     child = new_child;
                     try reconnect_ui.showConnectionResultBriefly(.reconnected);
-                    client_log.append("event=reconnect_success host={s} session={s} attempt=0", .{
+                    client_log.debug("event=reconnect_success host={s} session={s} attempt=0", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
                     });
@@ -442,7 +442,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                     return;
                 },
                 .failed => |err| {
-                    client_log.append("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
+                    client_log.warn("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
                         err,
