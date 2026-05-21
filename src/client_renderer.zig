@@ -163,14 +163,19 @@ pub const Renderer = struct {
 
     pub fn restorePresentation(self: Renderer) !void {
         if (!self.caps.supportsRendering()) return;
-        try self.setHyperlink(null);
-        try self.write("\x1b[0m");
+        try self.restoreBannerPresentation();
         try self.disableMouseTracking();
         try self.setPrivateMode(1, false);
         try self.write("\x1b[?1004l");
         try self.write("\x1b[?2004l");
         try self.write("\x1b[?25h");
         try self.setCursorStyle(.default);
+    }
+
+    pub fn restoreBannerPresentation(self: Renderer) !void {
+        if (!self.caps.supportsRendering()) return;
+        try self.setHyperlink(null);
+        try self.write("\x1b[0m");
     }
 
     pub fn clearScrollback(self: Renderer) !void {
@@ -733,6 +738,28 @@ test "restore presentation resets every modeled local terminal side effect" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?2004l") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?25h") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[0 q") != null);
+}
+
+test "restore banner presentation preserves input and event modes" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    try renderer.restoreBannerPresentation();
+
+    var buf: [512]u8 = undefined;
+    const len = try posix.read(fds[0], &buf);
+    const bytes = buf[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b]8;;\x1b\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1000l") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1002l") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1003l") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1006l") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1l") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1004l") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?2004l") == null);
 }
 
 test "presentation guard restores cleanup title" {

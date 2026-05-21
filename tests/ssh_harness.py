@@ -459,7 +459,7 @@ def version_mismatch_frame():
     payload = protobuf_string_field(1, b"VERSION_MISMATCH")
     payload += protobuf_string_field(2, b"existing remote sessh is incompatible with this client")
     payload += protobuf_string_field(3, b"Use the matching remote sessh binary")
-    return struct.pack(">IH", len(payload), 0x0003) + payload
+    return struct.pack(">IIQ", len(payload), 0x0003, 1) + payload
 
 
 def start_version_mismatch_agent(env, session_id="s1"):
@@ -483,10 +483,10 @@ def start_version_mismatch_agent(env, session_id="s1"):
             conn, _ = server.accept()
             with conn:
                 conn.settimeout(10.0)
-                header = conn.recv(6)
+                header = conn.recv(16)
                 observed["header"] = header
-                if len(header) == 6:
-                    payload_len, _ = struct.unpack(">IH", header)
+                if len(header) == 16:
+                    payload_len, _message_type, _seq = struct.unpack(">IIQ", header)
                     conn.recv(payload_len)
                 conn.sendall(version_mismatch_frame())
         except Exception as exc:
@@ -570,8 +570,9 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     if any(token in result.stdout or token in result.stderr for token in ("MISSING ", "UPLOAD ", "OK\n")):
         raise AssertionError(result)
 
-    installed = artifact_cache_path(env, local_artifact())
-    if installed.read_bytes() != local_artifact().read_bytes():
+    artifact = remote_path_artifact()
+    installed = artifact_cache_path(env, artifact)
+    if installed.read_bytes() != artifact.read_bytes():
         raise AssertionError("uploaded artifact was not installed")
     if not os.access(installed, os.X_OK):
         raise AssertionError("uploaded artifact is not executable")
@@ -621,7 +622,7 @@ def test_ssh_verbose_flags_are_passed_to_ssh(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["-vvv", "test-host"], env, timeout=30.0)
+    result = run_sessh_until_stdout(["-vvv", "test-host"], env, marker, timeout=30.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -744,8 +745,9 @@ def test_ssh_bootstrap_overrides_config_false_and_uploads(tmp):
     log_text = fake_log.read_text()
     if "direct_broker=1" in log_text:
         raise AssertionError(log_text)
-    installed = artifact_cache_path(env, local_artifact())
-    if installed.read_bytes() != local_artifact().read_bytes():
+    artifact = remote_path_artifact()
+    installed = artifact_cache_path(env, artifact)
+    if installed.read_bytes() != artifact.read_bytes():
         raise AssertionError("bootstrap flag did not upload artifact")
 
 
@@ -905,6 +907,79 @@ def test_ssh_leader_sever_reconnects(tmp):
         raise AssertionError(result.stderr)
     if "batch_mode=1" not in fake_log.read_text():
         raise AssertionError("reconnect did not force ssh BatchMode=yes")
+
+
+def test_ssh_no_echo_ping_prevents_false_unresponsive(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_PING_READY"
+    remote_shell.write_text(
+        f"""#!/bin/sh
+stty -echo
+printf '{marker}\\n'
+while IFS= read -r line; do
+  case "$line" in
+    slow-no-output)
+      sleep 3
+      printf 'REMOTE:old-recovered\\n'
+      stty echo
+      ;;
+    after-recovery)
+      printf 'REMOTE:after-recovery\\n'
+      exit 0
+      ;;
+    *)
+      printf 'REMOTE:%s\\n' "$line"
+      ;;
+  esac
+done
+"""
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    proc = subprocess.Popen(
+        [str(BIN), "test-host"],
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout = read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
+        proc.stdin.write(b"slow-no-output\n")
+        proc.stdin.flush()
+        stdout += read_until_pipe(proc.stdout, b"REMOTE:old-recovered", 10.0)
+        proc.stdin.write(b"after-recovery\n")
+        proc.stdin.flush()
+        stdout += read_until_pipe(proc.stdout, b"REMOTE:after-recovery", 10.0)
+        proc.stdin.close()
+        returncode = proc.wait(timeout=10.0)
+        stdout += proc.stdout.read()
+        stderr = proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+    result = subprocess.CompletedProcess(
+        [str(BIN), "test-host"],
+        returncode,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "sessh: connection unresponsive" in result.stdout:
+        raise AssertionError(result)
+    if "batch_mode=1" in fake_log.read_text():
+        raise AssertionError("false unresponsive detection started a parallel reconnect attempt")
 
 
 def test_ssh_reconnect_buffers_and_displays_ssh_stderr_with_timestamps(tmp):
@@ -1250,7 +1325,7 @@ def test_ssh_remote_session_commands_use_broker(tmp):
     if first.returncode != 0:
         raise AssertionError(first)
 
-    assert_session_compat_points_to_cached_artifact(env, local_artifact(), "s1", "remote session command")
+    assert_session_compat_points_to_cached_artifact(env, remote_path_artifact(), "s1", "remote session command")
 
     listed = run_sessh(["test-host", "--list"], env, timeout=30.0)
     if listed.returncode != 0:
@@ -1439,6 +1514,10 @@ def main():
         (
             "ssh leader sever reconnects",
             test_ssh_leader_sever_reconnects,
+        ),
+        (
+            "ssh no-echo ping prevents false unresponsive",
+            test_ssh_no_echo_ping_prevents_false_unresponsive,
         ),
         (
             "ssh reconnect buffers and displays ssh stderr with timestamps",

@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
 _PROTO_TMP = None
 _PROTO_MODULE = None
+_PROTO_HANDSHAKE_MODULE = None
+_FRAME_HEADER_LEN = 16
+_NEXT_FRAME_SEQ = 1
 
 
 class FdConn:
@@ -174,7 +177,7 @@ def wait_log_contains(path, needle, timeout=5.0):
 
 
 def sessh_pb():
-    global _PROTO_TMP, _PROTO_MODULE
+    global _PROTO_TMP, _PROTO_MODULE, _PROTO_HANDSHAKE_MODULE
     if _PROTO_MODULE is not None:
         return _PROTO_MODULE
     _PROTO_TMP = tempfile.TemporaryDirectory(prefix="sessh-proto-", dir="/tmp")
@@ -189,6 +192,7 @@ def sessh_pb():
             "-I",
             str(ROOT / "proto"),
             str(ROOT / "proto" / "sessh.proto"),
+            str(ROOT / "proto" / "sessh_handshake.proto"),
         ],
         cwd=ROOT,
         check=True,
@@ -201,7 +205,19 @@ def sessh_pb():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     _PROTO_MODULE = module
+
+    handshake_generated = output_dir / "sessh_handshake_pb2.py"
+    handshake_spec = importlib.util.spec_from_file_location("sessh_handshake_pb2", handshake_generated)
+    handshake_module = importlib.util.module_from_spec(handshake_spec)
+    handshake_spec.loader.exec_module(handshake_module)
+    _PROTO_HANDSHAKE_MODULE = handshake_module
     return module
+
+
+def sessh_hpb():
+    if _PROTO_HANDSHAKE_MODULE is None:
+        sessh_pb()
+    return _PROTO_HANDSHAKE_MODULE
 
 
 def pack_bytes(value):
@@ -252,6 +268,22 @@ def pack_repaint(include_scrollback):
     return sessh_pb().Repaint(include_scrollback=include_scrollback).SerializeToString()
 
 
+def pack_ping_request():
+    return sessh_pb().PingRequest().SerializeToString()
+
+
+def parse_ping_response(payload):
+    message = sessh_pb().PingResponse()
+    message.ParseFromString(payload)
+    return message.request_seq_number
+
+
+def parse_unrecognized_frame(payload):
+    message = sessh_hpb().UnrecognizedFrame()
+    message.ParseFromString(payload)
+    return message.seq, message.frame_type
+
+
 def unpack_session_attached(payload):
     message = sessh_pb().SessionAttached()
     message.ParseFromString(payload)
@@ -267,8 +299,8 @@ def parse_draw(payload):
         "epoch": message.scrollback_epoch,
         "scroll_count": message.scroll_count,
         "cursor_row": message.cursor_row,
-        "bytes": message.bytes,
-        "cleanup": message.cleanup_after if message.HasField("cleanup_after") else None,
+        "draw_bytes": message.draw_bytes,
+        "request_seq_number": message.request_seq_number if message.HasField("request_seq_number") else None,
     }
 
 
@@ -277,9 +309,11 @@ def recv_draw(conn, timeout=5.0):
     conn.settimeout(timeout)
     try:
         while True:
-            message_type, payload = recv_frame(conn)
+            message_type, seq, payload = recv_frame_full(conn)
             if message_type == 0x0027:
-                return parse_draw(payload)
+                draw = parse_draw(payload)
+                draw["frame_seq"] = seq
+                return draw
             if message_type == 0x0022:
                 raise AssertionError("session ended before DRAW arrived")
     finally:
@@ -292,7 +326,7 @@ def recv_draw_until(conn, needle, timeout=5.0):
     while time.monotonic() < end:
         draw = recv_draw(conn, timeout=max(0.1, end - time.monotonic()))
         draws.append(draw)
-        if needle in draw["bytes"]:
+        if needle in draw["draw_bytes"]:
             return draw, draws
     raise AssertionError(f"did not see {needle!r} in DRAW bytes: {draws!r}")
 
@@ -311,14 +345,31 @@ def recv_until_frame_type(conn, expected_type, timeout=5.0):
     raise AssertionError(f"did not receive frame type {expected_type:#06x}")
 
 
-def send_frame(conn, message_type, payload=b""):
-    conn.sendall(struct.pack(">IH", len(payload), message_type) + payload)
+def next_frame_seq():
+    global _NEXT_FRAME_SEQ
+    seq = _NEXT_FRAME_SEQ
+    _NEXT_FRAME_SEQ += 1
+    if _NEXT_FRAME_SEQ > 0xFFFFFFFFFFFFFFFF:
+        _NEXT_FRAME_SEQ = 1
+    return seq
+
+
+def send_frame(conn, message_type, payload=b"", seq=None):
+    if seq is None:
+        seq = next_frame_seq()
+    conn.sendall(struct.pack(">IIQ", len(payload), message_type, seq) + payload)
+    return seq
 
 
 def recv_frame(conn):
-    header = recv_exact(conn, 6)
-    payload_len, message_type = struct.unpack(">IH", header)
-    return message_type, recv_exact(conn, payload_len)
+    message_type, _seq, payload = recv_frame_full(conn)
+    return message_type, payload
+
+
+def recv_frame_full(conn):
+    header = recv_exact(conn, _FRAME_HEADER_LEN)
+    payload_len, message_type, seq = struct.unpack(">IIQ", header)
+    return message_type, seq, recv_exact(conn, payload_len)
 
 
 def recv_exact(conn, length):
@@ -435,20 +486,67 @@ def config_version():
     return version, major, minor
 
 
-def send_hello(conn):
+def send_hello(conn, minor_delta=0, expect_ok=True):
     version, major, minor = config_version()
     send_frame(
         conn,
         0x0001,
-        sessh_pb().Hello(
+        sessh_hpb().HelloRequest(
             protocol_major=major,
-            protocol_minor=minor,
+            protocol_minor=minor + minor_delta,
             version=version,
         ).SerializeToString(),
     )
-    message_type, _ = recv_frame(conn)
-    if message_type != 0x0002:
-        raise AssertionError(f"expected HELLO_OK, got {message_type:#06x}")
+    message_type, payload = recv_frame(conn)
+    if expect_ok:
+        if message_type != 0x0002:
+            raise AssertionError(f"expected HELLO_OK, got {message_type:#06x}")
+        ok = sessh_hpb().HelloOk()
+        ok.ParseFromString(payload)
+    else:
+        if message_type != 0x0003:
+            raise AssertionError(f"expected HELLO_ERROR, got {message_type:#06x}")
+        error = sessh_hpb().HelloError()
+        error.ParseFromString(payload)
+        return message_type, payload
+    message_type, payload = recv_frame(conn)
+    if message_type != 0x0001:
+        raise AssertionError(f"expected peer HELLO_REQUEST, got {message_type:#06x}")
+    peer = sessh_hpb().HelloRequest()
+    peer.ParseFromString(payload)
+    if peer.protocol_major != major or peer.protocol_minor != minor or peer.version != version:
+        raise AssertionError(f"unexpected peer HELLO_REQUEST: {peer!r}")
+    send_frame(conn, 0x0002, sessh_hpb().HelloOk().SerializeToString())
+    return message_type, payload
+
+
+def run_minor_version_compatibility_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-minor-compat-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        env["SHELL"] = "/bin/sh"
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+
+            newer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            newer.settimeout(5.0)
+            try:
+                newer.connect(str(socket_path(env)))
+                send_hello(newer, minor_delta=1)
+            finally:
+                newer.close()
+
+            _version, _major, minor = config_version()
+            if minor > 0:
+                older = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                older.settimeout(5.0)
+                try:
+                    older.connect(str(socket_path(env)))
+                    send_hello(older, minor_delta=-1, expect_ok=False)
+                finally:
+                    older.close()
+        finally:
+            cleanup_runtime(env)
 
 
 def run_live_draw_protocol_test(base_env):
@@ -485,7 +583,7 @@ def run_live_draw_protocol_test(base_env):
 
                 send_frame(conn, 0x0015, pack_bytes(b"go\n"))
                 _, draws = recv_draw_until(conn, b"PATCH_LINK")
-                output = b"".join(draw["bytes"] for draw in draws)
+                output = b"".join(draw["draw_bytes"] for draw in draws)
                 if b"PATCH_MARKER" not in output:
                     raise AssertionError(f"live DRAW did not include updated text: {output!r}")
                 for seq in (b"\x1b[1m", b"\x1b[31m", b"\x1b[44m"):
@@ -499,7 +597,127 @@ def run_live_draw_protocol_test(base_env):
             cleanup_runtime(env)
 
 
-def run_plain_scroll_uses_passthrough_protocol_test(base_env):
+def run_ping_protocol_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-ping-protocol-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "ping-shell"
+        shell.write_text("#!/bin/sh\nwhile :; do sleep 1; done\n")
+        shell.chmod(0o700)
+        env["SHELL"] = str(shell)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn)
+                send_frame(conn, 0x0011, pack_session_new(shell))
+
+                message_type, payload = recv_frame(conn)
+                if message_type != 0x0021:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type:#06x}")
+                _session_id = unpack_session_attached(payload)
+
+                ping_seq = send_frame(conn, 0x0018, pack_ping_request())
+                response = recv_until_frame_type(conn, 0x0028)
+                if parse_ping_response(response) != ping_seq:
+                    raise AssertionError(f"unexpected ping response: {response!r}")
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
+def run_draw_request_seq_protocol_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-draw-request-seq-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        env["SHELL"] = "/bin/sh"
+        shell = Path(tmp) / "draw-request-seq-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "stty -echo\n"
+            "printf 'ACK_READY$ '\n"
+            "while IFS= read -r line; do\n"
+            "  printf 'ACK:%s\\nACK_READY$ ' \"$line\"\n"
+            "done\n"
+        )
+        shell.chmod(0o700)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn)
+                send_frame(conn, 0x0011, pack_session_new(shell))
+
+                message_type, payload = recv_frame(conn)
+                if message_type != 0x0021:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type:#06x}")
+                _session_id = unpack_session_attached(payload)
+
+                recv_draw_until(conn, b"ACK_READY$ ")
+                input_seq = 0x35
+                send_frame(conn, 0x0015, pack_bytes(b"go\n"), seq=input_seq)
+                draw, _draws = recv_draw_until(conn, b"ACK:go")
+                if draw["request_seq_number"] != input_seq:
+                    raise AssertionError(f"DRAW did not report input seq {input_seq}: {draw!r}")
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
+def run_unrecognized_frame_protocol_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-unrecognized-frame-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "unrecognized-shell"
+        shell.write_text("#!/bin/sh\nwhile :; do sleep 1; done\n")
+        shell.chmod(0o700)
+        env["SHELL"] = str(shell)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn)
+                send_frame(conn, 0x0011, pack_session_new(shell))
+
+                message_type, payload = recv_frame(conn)
+                if message_type != 0x0021:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type:#06x}")
+                _session_id = unpack_session_attached(payload)
+
+                unknown_seq = 0x123456789ABCDEF0
+                send_frame(conn, 0x7FFF, b"", seq=unknown_seq)
+                response = recv_until_frame_type(conn, 0x0005)
+                reported_seq, reported_type = parse_unrecognized_frame(response)
+                if reported_seq != unknown_seq or reported_type != 0x7FFF:
+                    raise AssertionError(
+                        f"unexpected UNRECOGNIZED payload: seq={reported_seq:#x} type={reported_type:#x}"
+                    )
+
+                ping_seq = send_frame(conn, 0x0018, pack_ping_request())
+                ping_response = recv_until_frame_type(conn, 0x0028)
+                if parse_ping_response(ping_response) != ping_seq:
+                    raise AssertionError(f"connection did not continue after unknown frame: {ping_response!r}")
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
+def run_plain_scroll_protocol_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-plain-scroll-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         env["SHELL"] = "/bin/sh"
@@ -541,16 +759,16 @@ def run_plain_scroll_uses_passthrough_protocol_test(base_env):
                 scroll_draws = [draw for draw in draws if draw["scroll_count"] > 0]
                 if not scroll_draws:
                     raise AssertionError(f"expected scroll_count in DRAWs: {draws!r}")
-                for draw in scroll_draws:
-                    if b"\x1b" in draw["bytes"] or b"\x1b[2K" in draw["bytes"]:
-                        raise AssertionError(f"plain scroll should use raw passthrough bytes: {draw!r}")
+                output = b"".join(draw["draw_bytes"] for draw in draws)
+                if b"plain_40" not in output or b"SCROLL_DONE$ " not in output:
+                    raise AssertionError(f"plain scroll output missing expected text: {draws!r}")
             finally:
                 conn.close()
         finally:
             cleanup_runtime(env)
 
 
-def run_plain_screen_uses_passthrough_protocol_test(base_env):
+def run_plain_screen_protocol_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-plain-screen-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         env["SHELL"] = "/bin/sh"
@@ -589,13 +807,11 @@ def run_plain_screen_uses_passthrough_protocol_test(base_env):
                 recv_draw_until(conn, b"SCREEN_READY$ ")
                 send_frame(conn, 0x0015, pack_bytes(b"go\n"))
                 _, draws = recv_draw_until(conn, b"SCREEN_DONE$ ")
-                output = b"".join(draw["bytes"] for draw in draws)
+                output = b"".join(draw["draw_bytes"] for draw in draws)
                 if b"screen plain 05" not in output:
                     raise AssertionError(f"missing plain output: {draws!r}")
                 if any(draw["scroll_count"] != 0 for draw in draws):
                     raise AssertionError(f"screen-only output should not report scrollback: {draws!r}")
-                if b"\x1b" in output:
-                    raise AssertionError(f"screen-only plain output should use original bytes: {draws!r}")
             finally:
                 conn.close()
         finally:
@@ -638,10 +854,10 @@ def run_split_escape_tail_is_not_passthrough_test(base_env):
                 recv_draw_until(conn, b"SPLIT_READY$ ")
                 send_frame(conn, 0x0015, pack_bytes(b"go\n"))
                 _, draws = recv_draw_until(conn, b"SPLIT_DONE$ ")
-                if not any(b"SPLIT_TEXT" in draw["bytes"] for draw in draws):
+                if not any(b"SPLIT_TEXT" in draw["draw_bytes"] for draw in draws):
                     raise AssertionError(f"missing split output: {draws!r}")
                 for draw in draws:
-                    if draw["bytes"].startswith(b"0mSPLIT_TEXT"):
+                    if draw["draw_bytes"].startswith(b"0mSPLIT_TEXT"):
                         raise AssertionError(f"split escape tail was replayed as text: {draws!r}")
             finally:
                 conn.close()
@@ -682,7 +898,7 @@ def run_active_screen_protocol_test(base_env):
 
                 send_frame(conn, 0x0015, pack_bytes(b"go\n"))
                 draw, _ = recv_draw_until(conn, b"ALT_SCREEN")
-                if b"\x1b[?1049h" in draw["bytes"] or b"\x1b[?1049l" in draw["bytes"]:
+                if b"\x1b[?1049h" in draw["draw_bytes"] or b"\x1b[?1049l" in draw["draw_bytes"]:
                     raise AssertionError(f"DRAW should not enter outer alternate screen: {draw!r}")
             finally:
                 conn.close()
@@ -722,7 +938,7 @@ def run_terminal_modes_protocol_test(base_env):
 
                 send_frame(conn, 0x0015, pack_bytes(b"go\n"))
                 draw, draws = recv_draw_until(conn, b"MODES_READY")
-                output = b"".join(item["bytes"] for item in draws)
+                output = b"".join(item["draw_bytes"] for item in draws)
                 for seq in (b"\x1b[?1h", b"\x1b[?1000h", b"\x1b[?1006h", b"\x1b[?1004h", b"\x1b[?2004h"):
                     if seq not in output:
                         raise AssertionError(f"missing terminal mode sequence {seq!r}: {output!r}, last={draw!r}")
@@ -732,6 +948,15 @@ def run_terminal_modes_protocol_test(base_env):
                 for seq in (b"\x1b[?1000h", b"\x1b[?1006h"):
                     if output.index(seq) < ready_index:
                         raise AssertionError(f"mouse reporting was enabled before viewport redraw: {output!r}")
+                for enabled, disabled in (
+                    (b"\x1b[?1000h", b"\x1b[?1000l"),
+                    (b"\x1b[?1006h", b"\x1b[?1006l"),
+                    (b"\x1b[?1h", b"\x1b[?1l"),
+                    (b"\x1b[?1004h", b"\x1b[?1004l"),
+                    (b"\x1b[?2004h", b"\x1b[?2004l"),
+                ):
+                    if output.rfind(disabled) > output.rfind(enabled):
+                        raise AssertionError(f"terminal mode was disabled by DRAW cleanup: {output!r}")
             finally:
                 conn.close()
         finally:
@@ -773,7 +998,7 @@ def run_cursor_shape_protocol_test(base_env):
                 recv_draw_until(conn, b"\x1b]2;cursor-shape-ready\x1b\\")
                 send_frame(conn, 0x0015, pack_bytes(b"go\n"))
                 draw, draws = recv_draw_until(conn, b"\x1b[6 q")
-                if b"\x1b[6 q" not in b"".join(item["bytes"] for item in draws):
+                if b"\x1b[6 q" not in b"".join(item["draw_bytes"] for item in draws):
                     raise AssertionError(f"missing cursor shape DRAW: {draw!r}")
             finally:
                 conn.close()
@@ -945,12 +1170,12 @@ def run_default_colors_protocol_test(base_env):
 
                 send_frame(conn, 0x0015, pack_bytes(b"set\n"))
                 draw, _ = recv_draw_until(conn, b"COLOR_READY")
-                if b"\x1b]10;rgb:01/02/03\x1b\\" not in draw["bytes"] or b"\x1b]11;rgb:04/05/06\x1b\\" not in draw["bytes"]:
+                if b"\x1b]10;rgb:01/02/03\x1b\\" not in draw["draw_bytes"] or b"\x1b]11;rgb:04/05/06\x1b\\" not in draw["draw_bytes"]:
                     raise AssertionError(f"missing default-color set DRAW: {draw!r}")
 
                 send_frame(conn, 0x0015, pack_bytes(b"reset\n"))
                 draw, _ = recv_draw_until(conn, b"RESET_READY")
-                if b"\x1b]110\x1b\\" not in draw["bytes"] or b"\x1b]111\x1b\\" not in draw["bytes"]:
+                if b"\x1b]110\x1b\\" not in draw["draw_bytes"] or b"\x1b]111\x1b\\" not in draw["draw_bytes"]:
                     raise AssertionError(f"missing default-color reset DRAW: {draw!r}")
             finally:
                 conn.close()
@@ -1000,9 +1225,9 @@ def run_seeded_default_color_query_protocol_test(base_env):
                 _session_id = unpack_session_attached(payload)
 
                 draw, _ = recv_draw_until(conn, b"SEEDED_DEFAULT_QUERY_", timeout=5.0)
-                if b"SEEDED_DEFAULT_QUERY_BAD" in draw["bytes"]:
+                if b"SEEDED_DEFAULT_QUERY_BAD" in draw["draw_bytes"]:
                     raise AssertionError(f"seeded default color query failed: {draw!r}")
-                if b"SEEDED_DEFAULT_QUERY_OK" not in draw["bytes"]:
+                if b"SEEDED_DEFAULT_QUERY_OK" not in draw["draw_bytes"]:
                     raise AssertionError(f"missing seeded query result: {draw!r}")
             finally:
                 conn.close()
@@ -1067,9 +1292,9 @@ def run_complex_ui_query_protocol_test(base_env):
                 _session_id = unpack_session_attached(payload)
 
                 draw, _ = recv_draw_until(conn, b"COMPLEX_UI_QUERY_", timeout=5.0)
-                if b"COMPLEX_UI_QUERY_BAD" in draw["bytes"]:
+                if b"COMPLEX_UI_QUERY_BAD" in draw["draw_bytes"]:
                     raise AssertionError(f"complex UI query response failed: {draw!r}")
-                if b"COMPLEX_UI_QUERY_OK" not in draw["bytes"]:
+                if b"COMPLEX_UI_QUERY_OK" not in draw["draw_bytes"]:
                     raise AssertionError(f"missing complex UI query result: {draw!r}")
             finally:
                 conn.close()
@@ -1114,7 +1339,7 @@ def run_scrollback_attach_draw_protocol_test(base_env):
 
                 send_frame(conn, 0x0015, pack_bytes(b"go\n"))
                 _, draws = recv_draw_until(conn, b"AFTER$")
-                output = b"".join(draw["bytes"] for draw in draws)
+                output = b"".join(draw["draw_bytes"] for draw in draws)
                 scroll_count = sum(draw["scroll_count"] for draw in draws)
                 if scroll_count == 0 or b"history_01" not in output:
                     raise AssertionError(f"missing live scrollback DRAW: scroll_count={scroll_count}, output={output!r}")
@@ -1123,14 +1348,14 @@ def run_scrollback_attach_draw_protocol_test(base_env):
                 screen_only = recv_draw(conn)
                 if screen_only["scroll_count"] != 0:
                     raise AssertionError(f"screen-only repaint should not advance scrollback cursor: {screen_only!r}")
-                if b"history_01" in screen_only["bytes"] or b"\x1b[3J" in screen_only["bytes"]:
+                if b"history_01" in screen_only["draw_bytes"] or b"\x1b[3J" in screen_only["draw_bytes"]:
                     raise AssertionError(f"screen-only repaint included retained scrollback: {screen_only!r}")
-                if b"AFTER$" not in screen_only["bytes"]:
+                if b"AFTER$" not in screen_only["draw_bytes"]:
                     raise AssertionError(f"screen-only repaint did not redraw visible screen: {screen_only!r}")
 
                 send_frame(conn, 0x0017, pack_repaint(True))
                 full_repaint = recv_draw(conn)
-                if full_repaint["scroll_count"] == 0 or b"history_01" not in full_repaint["bytes"]:
+                if full_repaint["scroll_count"] == 0 or b"history_01" not in full_repaint["draw_bytes"]:
                     raise AssertionError(f"full repaint did not include retained scrollback: {full_repaint!r}")
             finally:
                 conn.close()
@@ -1148,7 +1373,7 @@ def run_scrollback_attach_draw_protocol_test(base_env):
                     raise AssertionError(f"expected SESSION_ATTACHED, got {message_type:#06x}")
 
                 draw = recv_draw(attach)
-                if draw["scroll_count"] == 0 or b"history_01" not in draw["bytes"]:
+                if draw["scroll_count"] == 0 or b"history_01" not in draw["draw_bytes"]:
                     raise AssertionError(f"missing retained scrollback rows in attach DRAW: {draw!r}")
             finally:
                 attach.close()
@@ -1194,7 +1419,7 @@ def run_scrollback_clear_protocol_test(base_env):
 
                 send_frame(conn, 0x0015, pack_bytes(b"go\n"))
                 _, draws = recv_draw_until(conn, b"AFTER_CLEAR$")
-                output = b"".join(draw["bytes"] for draw in draws)
+                output = b"".join(draw["draw_bytes"] for draw in draws)
                 if b"\x1b[3J" not in output:
                     raise AssertionError(f"missing retained scrollback clear DRAW: {output!r}")
             finally:
@@ -1215,7 +1440,7 @@ def run_scrollback_clear_protocol_test(base_env):
                 draw = recv_draw(attach)
                 if draw["scroll_count"] != 0:
                     raise AssertionError(f"cleared retained history returned in attach DRAW: {draw!r}")
-                if b"AFTER_CLEAR$" not in draw["bytes"]:
+                if b"AFTER_CLEAR$" not in draw["draw_bytes"]:
                     raise AssertionError(f"attach DRAW did not include current screen after clear: {draw!r}")
             finally:
                 attach.close()
@@ -1287,6 +1512,7 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
                 send_frame(conn, 0x0015, pack_bytes(b"go\n"))
                 _, before_draws = recv_draw_until(conn, b"BEFORE_DONE")
                 cursor = (before_draws[-1]["epoch"], sum(draw["scroll_count"] for draw in before_draws))
+                last_before_frame_seq = before_draws[-1]["frame_seq"]
             finally:
                 conn.close()
 
@@ -1295,7 +1521,12 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
             attach = attach_gap_session(env, session_id, reconnect_cursor=cursor)
             try:
                 _, reconnect_draws = recv_draw_until(attach, b"DURING_DONE$ ")
-                output = b"".join(draw["bytes"] for draw in reconnect_draws)
+                if reconnect_draws[0]["frame_seq"] <= last_before_frame_seq:
+                    raise AssertionError(
+                        "session-agent frame seq reset across reconnect: "
+                        f"before={last_before_frame_seq} reconnect={reconnect_draws[0]['frame_seq']}"
+                    )
+                output = b"".join(draw["draw_bytes"] for draw in reconnect_draws)
                 if b"sessh scrollback truncated" in output:
                     raise AssertionError(f"unexpected truncation marker without truncation: {output!r}")
                 for i in range(1, 5):
@@ -1328,7 +1559,7 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
             attach = attach_gap_session(env, session_id, reconnect_cursor=cursor)
             try:
                 _, reconnect_draws = recv_draw_until(attach, b"DURING_DONE$ ")
-                output = b"".join(draw["bytes"] for draw in reconnect_draws)
+                output = b"".join(draw["draw_bytes"] for draw in reconnect_draws)
                 # With a 3-row PTY and this output shape, the client saw three
                 # retained rows before disconnect and the retained snapshot now
                 # starts fifteen rows after that cursor.
@@ -1341,7 +1572,7 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
 
                 send_frame(attach, 0x0015, pack_bytes(b"after\n"))
                 _, post_draws = recv_draw_until(attach, b"POST:after")
-                post_output = b"".join(draw["bytes"] for draw in post_draws)
+                post_output = b"".join(draw["draw_bytes"] for draw in post_draws)
                 if b"POST:after" not in post_output:
                     raise AssertionError(f"post-reconnect input was not delivered: {post_output!r}")
             finally:
@@ -1350,7 +1581,7 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
             normal = attach_gap_session(env, session_id)
             try:
                 _, attach_draws = recv_draw_until(normal, b"POST:after")
-                output = b"".join(draw["bytes"] for draw in attach_draws)
+                output = b"".join(draw["draw_bytes"] for draw in attach_draws)
                 # The post-reconnect command adds more retained history; a
                 # normal attach should report the full omitted prefix.
                 if b"--- sessh scrollback truncated: 21 lines ---" not in output:
@@ -1977,9 +2208,13 @@ def main():
             run_session_agent_registry_test(env)
             run_host_broker_starts_session_agent_test(env)
             run_host_broker_registry_commands_test(env)
+            run_minor_version_compatibility_test(env)
             run_live_draw_protocol_test(env)
-            run_plain_scroll_uses_passthrough_protocol_test(env)
-            run_plain_screen_uses_passthrough_protocol_test(env)
+            run_ping_protocol_test(env)
+            run_draw_request_seq_protocol_test(env)
+            run_unrecognized_frame_protocol_test(env)
+            run_plain_scroll_protocol_test(env)
+            run_plain_screen_protocol_test(env)
             run_split_escape_tail_is_not_passthrough_test(env)
             run_active_screen_protocol_test(env)
             run_terminal_modes_protocol_test(env)

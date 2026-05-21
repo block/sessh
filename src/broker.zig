@@ -10,6 +10,7 @@ const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
 
 const pb = protocol.pb;
+const hpb = protocol.hpb;
 
 const AgentCommandResponse = struct {
     exit_status: u32,
@@ -26,17 +27,8 @@ const AgentCommandResponse = struct {
 pub fn run(allocator: std.mem.Allocator, exe: []const u8) !void {
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
 
-    var hello = try protocol.readFrameAlloc(allocator, 0);
-    defer hello.deinit(allocator);
-    if (hello.message_type != .FRAME_TYPE_HELLO) {
-        try sendError(1, "PROTOCOL_ERROR", "expected HELLO", "");
-        return;
-    }
-    if (!try helloIsCompatible(allocator, hello.payload)) {
-        try sendError(1, "VERSION_MISMATCH", "broker is incompatible with this client", "");
-        return;
-    }
-    try sendHelloOk(1);
+    const handshake_result = try acceptRuntimeHandshake(allocator, 0, 1);
+    if (handshake_result == .mismatch) return;
 
     var pending_resize: ?protocol.OwnedFrame = null;
     defer if (pending_resize) |*frame| frame.deinit(allocator);
@@ -45,57 +37,64 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8) !void {
         var frame = try protocol.readFrameAlloc(allocator, 0);
         errdefer frame.deinit(allocator);
         switch (frame.message_type) {
-            .FRAME_TYPE_RESIZE => {
-                if (pending_resize) |*old| old.deinit(allocator);
-                pending_resize = frame;
-            },
-            .FRAME_TYPE_COMMAND_REQUEST => {
-                defer frame.deinit(allocator);
-                try handleCommandRequest(allocator, hello.payload, frame.payload);
-                return;
-            },
-            .FRAME_TYPE_SESSION_ATTACH => {
-                defer frame.deinit(allocator);
-                const resize = pending_resize orelse {
-                    try sendError(1, "PROTOCOL_ERROR", "SESSION_ATTACH requires RESIZE first", "");
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_RESIZE => {
+                    if (pending_resize) |*old| old.deinit(allocator);
+                    pending_resize = frame;
+                },
+                .FRAME_TYPE_COMMAND_REQUEST => {
+                    defer frame.deinit(allocator);
+                    try handleCommandRequest(allocator, frame.payload);
                     return;
-                };
-                const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
-                    error.NoSessions => {
-                        try sendError(1, "SESSION_NOT_FOUND", "no sessions", "");
+                },
+                .FRAME_TYPE_SESSION_ATTACH => {
+                    defer frame.deinit(allocator);
+                    const resize = pending_resize orelse {
+                        try sendError(1, "PROTOCOL_ERROR", "SESSION_ATTACH requires RESIZE first", "");
                         return;
-                    },
-                    error.InvalidSessionId, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
-                        try sendError(1, "SESSION_NOT_FOUND", "session not found", "");
-                        return;
-                    },
-                    else => return err,
-                };
-                defer _ = c.close(agent_fd);
-                try attachAgentAndRelay(allocator, hello.payload, agent_fd, resize.payload, frame.payload);
-                return;
-            },
-            .FRAME_TYPE_SESSION_NEW => {
-                defer frame.deinit(allocator);
-                const resize = pending_resize orelse {
-                    try sendError(1, "PROTOCOL_ERROR", "SESSION_NEW requires RESIZE first", "");
+                    };
+                    const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
+                        error.NoSessions => {
+                            try sendError(1, "SESSION_NOT_FOUND", "no sessions", "");
+                            return;
+                        },
+                        error.InvalidSessionId, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
+                            try sendError(1, "SESSION_NOT_FOUND", "session not found", "");
+                            return;
+                        },
+                        else => return err,
+                    };
+                    defer _ = c.close(agent_fd);
+                    try attachAgentAndRelay(allocator, agent_fd, resize.payload, frame.payload);
                     return;
-                };
-                const agent_fd = try startSessionAgentAndConnect(allocator, exe);
-                defer _ = c.close(agent_fd);
-                try startAgentAndRelay(allocator, hello.payload, agent_fd, resize.payload, frame.payload);
-                return;
+                },
+                .FRAME_TYPE_SESSION_NEW => {
+                    defer frame.deinit(allocator);
+                    const resize = pending_resize orelse {
+                        try sendError(1, "PROTOCOL_ERROR", "SESSION_NEW requires RESIZE first", "");
+                        return;
+                    };
+                    const agent_fd = try startSessionAgentAndConnect(allocator, exe);
+                    defer _ = c.close(agent_fd);
+                    try startAgentAndRelay(allocator, agent_fd, resize.payload, frame.payload);
+                    return;
+                },
+                else => {
+                    defer frame.deinit(allocator);
+                    try sendError(1, "PROTOCOL_ERROR", "broker only supports SESSION_NEW in this mode", "");
+                    return;
+                },
             },
-            else => {
+            .unknown => |raw| {
                 defer frame.deinit(allocator);
-                try sendError(1, "PROTOCOL_ERROR", "broker only supports SESSION_NEW in this mode", "");
-                return;
+                try sendUnrecognizedFrame(1, frame.seq, raw);
+                continue;
             },
         }
     }
 }
 
-fn handleCommandRequest(allocator: std.mem.Allocator, hello_payload: []const u8, payload: []const u8) !void {
+fn handleCommandRequest(allocator: std.mem.Allocator, payload: []const u8) !void {
     var request = try protocol.decodePayload(pb.CommandRequest, allocator, payload);
     defer request.deinit(allocator);
     const argv = request.argv.items;
@@ -110,7 +109,7 @@ fn handleCommandRequest(allocator: std.mem.Allocator, hello_payload: []const u8,
             try sendCommandResponse(1, 64, "", "ERROR usage: list\n");
             return;
         }
-        try listAgents(allocator, hello_payload);
+        try listAgents(allocator);
         return;
     }
     if (std.mem.eql(u8, command, "kill")) {
@@ -118,7 +117,7 @@ fn handleCommandRequest(allocator: std.mem.Allocator, hello_payload: []const u8,
             try sendCommandResponse(1, 64, "", "ERROR usage: kill ID\n");
             return;
         }
-        try commandOneAgent(allocator, hello_payload, argv[1], &.{ "kill", argv[1] });
+        try commandOneAgent(allocator, argv[1], &.{ "kill", argv[1] });
         return;
     }
     if (std.mem.eql(u8, command, "kill-all")) {
@@ -126,14 +125,14 @@ fn handleCommandRequest(allocator: std.mem.Allocator, hello_payload: []const u8,
             try sendCommandResponse(1, 64, "", "ERROR usage: kill-all\n");
             return;
         }
-        try killAllAgents(allocator, hello_payload);
+        try killAllAgents(allocator);
         return;
     }
 
     try sendCommandResponse(1, 64, "", "ERROR unknown command\n");
 }
 
-fn listAgents(allocator: std.mem.Allocator, hello_payload: []const u8) !void {
+fn listAgents(allocator: std.mem.Allocator) !void {
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
     var stderr: std.ArrayList(u8) = .empty;
@@ -156,7 +155,7 @@ fn listAgents(allocator: std.mem.Allocator, hello_payload: []const u8) !void {
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
         var paths = try session_registry.pathsForSessionId(allocator, entry.name);
         defer paths.deinit(allocator);
-        var response = queryAgentCommand(allocator, hello_payload, paths, &.{"list"}) catch |err| switch (err) {
+        var response = queryAgentCommand(allocator, paths, &.{"list"}) catch |err| switch (err) {
             error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
                 session_registry.removeStaleHints(paths) catch {};
                 continue;
@@ -180,7 +179,6 @@ fn listAgents(allocator: std.mem.Allocator, hello_payload: []const u8) !void {
 
 fn commandOneAgent(
     allocator: std.mem.Allocator,
-    hello_payload: []const u8,
     session_id: []const u8,
     argv: []const []const u8,
 ) !void {
@@ -193,7 +191,7 @@ fn commandOneAgent(
     };
     defer paths.deinit(allocator);
 
-    var response = queryAgentCommand(allocator, hello_payload, paths, argv) catch |err| switch (err) {
+    var response = queryAgentCommand(allocator, paths, argv) catch |err| switch (err) {
         error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
             session_registry.removeStaleHints(paths) catch {};
             try sendCommandResponse(1, 1, "", "ERROR session not found\n");
@@ -209,7 +207,7 @@ fn commandOneAgent(
     try sendCommandResponse(1, response.exit_status, response.stdout, response.stderr);
 }
 
-fn killAllAgents(allocator: std.mem.Allocator, hello_payload: []const u8) !void {
+fn killAllAgents(allocator: std.mem.Allocator) !void {
     const sessions_dir = try session_registry.sessionsDir(allocator);
     defer allocator.free(sessions_dir);
     var dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
@@ -228,7 +226,7 @@ fn killAllAgents(allocator: std.mem.Allocator, hello_payload: []const u8) !void 
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
         var paths = try session_registry.pathsForSessionId(allocator, entry.name);
         defer paths.deinit(allocator);
-        var response = queryAgentCommand(allocator, hello_payload, paths, &.{"kill-all"}) catch |err| switch (err) {
+        var response = queryAgentCommand(allocator, paths, &.{"kill-all"}) catch |err| switch (err) {
             error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
                 session_registry.removeStaleHints(paths) catch {};
                 continue;
@@ -250,22 +248,21 @@ fn killAllAgents(allocator: std.mem.Allocator, hello_payload: []const u8) !void 
 
 fn queryAgentCommand(
     allocator: std.mem.Allocator,
-    hello_payload: []const u8,
     paths: session_registry.SessionPaths,
     argv: []const []const u8,
 ) !AgentCommandResponse {
     const fd = try socket_transport.connectSocket(paths.socket);
     defer _ = c.close(fd);
-    try agentHandshake(allocator, hello_payload, fd);
+    try initiateRuntimeHandshake(allocator, fd);
     try sendAgentCommandRequest(allocator, fd, argv);
 
     var frame = try protocol.readFrameAlloc(allocator, fd);
     defer frame.deinit(allocator);
-    if (frame.message_type == .FRAME_TYPE_ERROR) {
+    if (frame.knownMessageType() == .FRAME_TYPE_ERROR) {
         if (try errorIsVersionMismatch(allocator, frame.payload)) return error.VersionMismatch;
         return error.AgentError;
     }
-    if (frame.message_type != .FRAME_TYPE_COMMAND_RESPONSE) return error.UnexpectedFrame;
+    if (frame.knownMessageType() != .FRAME_TYPE_COMMAND_RESPONSE) return error.UnexpectedFrame;
     var message = try protocol.decodePayload(pb.CommandResponse, allocator, frame.payload);
     defer message.deinit(allocator);
     return .{
@@ -385,12 +382,11 @@ fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8) !c
 
 fn startAgentAndRelay(
     allocator: std.mem.Allocator,
-    hello_payload: []const u8,
     agent_fd: c.fd_t,
     resize_payload: []const u8,
     session_new_payload: []const u8,
 ) !void {
-    agentHandshake(allocator, hello_payload, agent_fd) catch |err| switch (err) {
+    initiateRuntimeHandshake(allocator, agent_fd) catch |err| switch (err) {
         error.VersionMismatch => {
             try sendError(1, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
             return;
@@ -404,12 +400,11 @@ fn startAgentAndRelay(
 
 fn attachAgentAndRelay(
     allocator: std.mem.Allocator,
-    hello_payload: []const u8,
     agent_fd: c.fd_t,
     resize_payload: []const u8,
     session_attach_payload: []const u8,
 ) !void {
-    agentHandshake(allocator, hello_payload, agent_fd) catch |err| switch (err) {
+    initiateRuntimeHandshake(allocator, agent_fd) catch |err| switch (err) {
         error.VersionMismatch => {
             try sendError(1, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
             return;
@@ -421,47 +416,146 @@ fn attachAgentAndRelay(
     try relay.relayFrames(0, 1, agent_fd);
 }
 
-fn agentHandshake(allocator: std.mem.Allocator, hello_payload: []const u8, agent_fd: c.fd_t) !void {
-    try protocol.sendFrame(agent_fd, .FRAME_TYPE_HELLO, hello_payload);
-    var agent_hello = try protocol.readFrameAlloc(allocator, agent_fd);
-    defer agent_hello.deinit(allocator);
-    if (agent_hello.message_type == .FRAME_TYPE_ERROR) {
-        if (try errorIsVersionMismatch(allocator, agent_hello.payload)) return error.VersionMismatch;
-        return error.AgentHandshakeFailed;
-    }
-    if (agent_hello.message_type != .FRAME_TYPE_HELLO_OK) return error.AgentHandshakeFailed;
-}
-
 fn errorIsVersionMismatch(allocator: std.mem.Allocator, payload: []const u8) !bool {
-    var message = try protocol.decodePayload(pb.Error, allocator, payload);
+    var message = try protocol.decodePayload(hpb.Error, allocator, payload);
     defer message.deinit(allocator);
     return std.mem.eql(u8, message.code, "VERSION_MISMATCH");
 }
 
-fn helloIsCompatible(allocator: std.mem.Allocator, payload: []const u8) !bool {
-    var hello = try protocol.decodePayload(pb.Hello, allocator, payload);
-    defer hello.deinit(allocator);
+const HandshakeResult = enum {
+    accepted,
+    mismatch,
+};
+
+fn acceptRuntimeHandshake(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !HandshakeResult {
+    var peer_hello = try readHelloRequest(allocator, read_fd, write_fd);
+    defer peer_hello.deinit(allocator);
+    if (!helloRequestIsCompatible(peer_hello)) {
+        try sendHelloError(write_fd, "VERSION_MISMATCH", "broker is incompatible with this client", "");
+        return .mismatch;
+    }
+    try sendHelloOk(write_fd);
+    try sendHelloRequest(write_fd);
+    var hello_error = try readHelloReply(allocator, read_fd, write_fd);
+    defer if (hello_error) |*err| err.deinit(allocator);
+    if (hello_error) |err| {
+        if (std.mem.eql(u8, err.code, "VERSION_MISMATCH")) return error.VersionMismatch;
+        return error.HandshakeFailed;
+    }
+    return .accepted;
+}
+
+fn initiateRuntimeHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    try sendHelloRequest(fd);
+    var hello_error = try readHelloReply(allocator, fd, fd);
+    defer if (hello_error) |*err| err.deinit(allocator);
+    if (hello_error) |err| {
+        if (std.mem.eql(u8, err.code, "VERSION_MISMATCH")) return error.VersionMismatch;
+        return error.AgentHandshakeFailed;
+    }
+    var peer_hello = try readHelloRequest(allocator, fd, fd);
+    defer peer_hello.deinit(allocator);
+    if (!helloRequestIsCompatible(peer_hello)) {
+        try sendHelloError(fd, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
+        return error.VersionMismatch;
+    }
+    try sendHelloOk(fd);
+}
+
+fn readHelloRequest(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !hpb.HelloRequest {
+    while (true) {
+        var frame = try protocol.readFrameAlloc(allocator, read_fd);
+        defer frame.deinit(allocator);
+        switch (frame.message_type) {
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_HELLO_REQUEST => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
+                .FRAME_TYPE_UNRECOGNIZED => continue,
+                else => {
+                    try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
+                    return error.UnexpectedFrame;
+                },
+            },
+            .unknown => |raw| {
+                try sendUnrecognizedFrame(write_fd, frame.seq, raw);
+                continue;
+            },
+        }
+    }
+}
+
+fn readHelloReply(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !?hpb.HelloError {
+    while (true) {
+        var frame = try protocol.readFrameAlloc(allocator, read_fd);
+        defer frame.deinit(allocator);
+        switch (frame.message_type) {
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_HELLO_OK => {
+                    var ok = try protocol.decodePayload(hpb.HelloOk, allocator, frame.payload);
+                    defer ok.deinit(allocator);
+                    return null;
+                },
+                .FRAME_TYPE_HELLO_ERROR => {
+                    const err = try protocol.decodePayload(hpb.HelloError, allocator, frame.payload);
+                    return err;
+                },
+                .FRAME_TYPE_UNRECOGNIZED => continue,
+                else => return error.UnexpectedFrame,
+            },
+            .unknown => |raw| {
+                try sendUnrecognizedFrame(write_fd, frame.seq, raw);
+                continue;
+            },
+        }
+    }
+}
+
+fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return hello.protocol_major == config.protocol_major and
-        hello.protocol_minor == config.protocol_minor and
+        hello.protocol_minor >= config.protocol_minor and
         std.mem.eql(u8, hello.version, config.version);
 }
 
-fn sendHelloOk(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Hello{
+fn sendHelloRequest(fd: c.fd_t) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloRequest{
         .protocol_major = config.protocol_major,
         .protocol_minor = config.protocol_minor,
         .version = config.version,
     });
     defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_REQUEST, payload);
+}
+
+fn sendHelloOk(fd: c.fd_t) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
+    defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_OK, payload);
 }
 
+fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloError{
+        .code = code,
+        .message = message,
+        .hint = hint,
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_ERROR, payload);
+}
+
 fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Error{
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
         .code = code,
         .message = message,
         .hint = hint,
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .FRAME_TYPE_ERROR, payload);
+}
+
+fn sendUnrecognizedFrame(fd: c.fd_t, seq: u64, frame_type: u32) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.UnrecognizedFrame{
+        .seq = seq,
+        .frame_type = frame_type,
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_UNRECOGNIZED, payload);
 }

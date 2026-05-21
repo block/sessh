@@ -25,14 +25,14 @@ const ArtifactSet = struct {
         self.* = undefined;
     }
 
-    fn sendExec(self: *const ArtifactSet, fd: c.fd_t, reconnect_ui: ?*client.ReconnectUi) !void {
-        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_ui);
-        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_ui);
+    fn sendExec(self: *const ArtifactSet, fd: c.fd_t, reconnect_ui: ?*client.ReconnectUi, poll_reconnect_input: bool) !void {
+        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_ui, poll_reconnect_input);
         for (self.entries) |entry| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_ui);
-            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_ui);
+            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
+            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_ui, poll_reconnect_input);
         }
-        try writeAllMaybeCancellable(fd, "\n", reconnect_ui);
+        try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
     }
 
     fn find(self: *const ArtifactSet, platform: Platform) ?*const ArtifactEntry {
@@ -155,6 +155,45 @@ const RuntimeConnection = struct {
     }
 };
 
+const ParallelReconnectResult = union(enum) {
+    connected: RuntimeConnection,
+    failed: anyerror,
+};
+
+const ParallelReconnectState = struct {
+    mutex: std.Thread.Mutex = .{},
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    parsed_ssh_args: ParsedSshArgs,
+    artifacts: ?*const ArtifactSet,
+    remote_command: []const u8,
+    reconnect_ui: *client.ReconnectUi,
+    session: client.RuntimeSession,
+    result: ?ParallelReconnectResult = null,
+
+    fn store(self: *ParallelReconnectState, result: ParallelReconnectResult) void {
+        self.mutex.lock();
+        self.result = result;
+        self.mutex.unlock();
+        self.done.store(true, .release);
+    }
+
+    fn take(self: *ParallelReconnectState) ?ParallelReconnectResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const result = self.result orelse return null;
+        self.result = null;
+        return result;
+    }
+};
+
+const ReconnectRaceOutcome = union(enum) {
+    recovered,
+    reconnected: RuntimeConnection,
+    session_ended,
+    failed: anyerror,
+    abort,
+};
+
 const SshStderrPump = struct {
     allocator: std.mem.Allocator,
     state: *State,
@@ -243,6 +282,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             remote_command,
             false,
             null,
+            false,
         );
         const exit_status = (switch (parsed_ssh_args.action) {
             .list => client.runCommandOnRuntime(
@@ -282,6 +322,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         remote_command,
         false,
         null,
+        false,
     );
 
     var session = (switch (parsed_ssh_args.action) {
@@ -313,6 +354,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             child.child.stdin.?.handle,
             &session,
             parsed_ssh_args.leader,
+            .{ .monitor_connection = true },
         ) catch |err| {
             child.closeStdin();
             _ = child.wait() catch {};
@@ -321,6 +363,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             return process_exit.request(1);
         };
 
+        var race_existing_connection = false;
         switch (end) {
             .detach => {
                 client_log.debug("event=detach host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
@@ -341,6 +384,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 child.terminate();
                 client_log.flush(2);
             },
+            .unresponsive => {
+                client_log.append("event=disconnect reason=unresponsive host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
+                race_existing_connection = true;
+            },
             .transport_closed => {
                 client_log.debug("event=disconnect reason=transport_closed host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.closeStdin();
@@ -352,6 +399,59 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         var reconnect_ui = try client.ReconnectUi.begin(session.origin_row, session.cursor_row);
         var reconnect_ui_active = true;
         defer if (reconnect_ui_active) reconnect_ui.deinit();
+
+        if (race_existing_connection) {
+            try reconnect_ui.showConnectionUnresponsive();
+            switch (try raceExistingConnectionWithReconnect(
+                parsed_ssh_args,
+                artifacts,
+                remote_command,
+                &child,
+                &session,
+                &reconnect_ui,
+            )) {
+                .recovered => {
+                    try reconnect_ui.showConnectionResultBriefly(.recovered);
+                    try reconnect_ui.clearBanner();
+                    try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
+                    reconnect_ui.deinit();
+                    reconnect_ui_active = false;
+                    continue;
+                },
+                .reconnected => |new_child| {
+                    child.terminate();
+                    child = new_child;
+                    try reconnect_ui.showConnectionResultBriefly(.reconnected);
+                    client_log.append("event=reconnect_success host={s} session={s} attempt=0", .{
+                        parsed_ssh_args.host,
+                        session.idSlice(),
+                    });
+                    try reconnect_ui.clearBanner();
+                    try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
+                    reconnect_ui.deinit();
+                    reconnect_ui_active = false;
+                    continue;
+                },
+                .session_ended => {
+                    child.closeStdin();
+                    _ = child.wait() catch {};
+                    return;
+                },
+                .abort => {
+                    child.terminate();
+                    return;
+                },
+                .failed => |err| {
+                    client_log.append("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
+                        parsed_ssh_args.host,
+                        session.idSlice(),
+                        err,
+                    });
+                    child.terminate();
+                },
+            }
+        }
+
         var reconnect_attempt: usize = 0;
         while (true) {
             const delay_ms = reconnectDelayMs(reconnect_attempt);
@@ -387,6 +487,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 remote_command,
                 true,
                 &reconnect_ui,
+                true,
             ) catch |err| switch (err) {
                 error.ExitRequested => return err,
                 error.ReconnectAborted => return,
@@ -709,6 +810,130 @@ fn sshVerbosity(ssh_options: []const []const u8) usize {
     return total;
 }
 
+fn raceExistingConnectionWithReconnect(
+    parsed_ssh_args: ParsedSshArgs,
+    artifacts: ?*const ArtifactSet,
+    remote_command: []const u8,
+    old_child: *RuntimeConnection,
+    session: *client.RuntimeSession,
+    reconnect_ui: *client.ReconnectUi,
+) !ReconnectRaceOutcome {
+    var state = ParallelReconnectState{
+        .parsed_ssh_args = parsed_ssh_args,
+        .artifacts = artifacts,
+        .remote_command = remote_command,
+        .reconnect_ui = reconnect_ui,
+        .session = session.*,
+    };
+    const thread_allocator = std.heap.smp_allocator;
+    var thread = try std.Thread.spawn(.{}, parallelReconnectMain, .{ &state, thread_allocator });
+    var joined = false;
+    defer if (!joined) {
+        reconnect_ui.cancel();
+        thread.join();
+        cleanupParallelReconnectResult(&state);
+    };
+
+    var old_available = true;
+    while (true) {
+        if (state.done.load(.acquire)) {
+            joined = true;
+            thread.join();
+            return parallelResultToRaceOutcome(state.take().?);
+        }
+
+        if (old_available) {
+            if (try client.pollRuntimeRecovery(old_child.child.stdout.?.handle, session, 50)) |recovery| {
+                switch (recovery) {
+                    .recovered => {
+                        reconnect_ui.cancel();
+                        joined = true;
+                        thread.join();
+                        cleanupParallelReconnectResult(&state);
+                        return .recovered;
+                    },
+                    .session_ended => {
+                        reconnect_ui.cancel();
+                        joined = true;
+                        thread.join();
+                        cleanupParallelReconnectResult(&state);
+                        return .session_ended;
+                    },
+                    .transport_closed => {
+                        old_child.closeStdin();
+                        _ = old_child.wait() catch {};
+                        old_available = false;
+                    },
+                }
+            }
+        } else {
+            if (try reconnect_ui.pollAbort(50)) {
+                reconnect_ui.cancel();
+                joined = true;
+                thread.join();
+                cleanupParallelReconnectResult(&state);
+                return .abort;
+            }
+        }
+
+        if (try reconnect_ui.pollAbort(0)) {
+            reconnect_ui.cancel();
+            joined = true;
+            thread.join();
+            cleanupParallelReconnectResult(&state);
+            return .abort;
+        }
+    }
+}
+
+fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allocator) void {
+    var connection = startRuntimeConnection(
+        allocator,
+        state.parsed_ssh_args,
+        state.artifacts,
+        state.remote_command,
+        true,
+        state.reconnect_ui,
+        false,
+    ) catch |err| {
+        state.store(.{ .failed = err });
+        return;
+    };
+
+    client.reconnectSessionOnRuntimeCancellable(
+        connection.child.stdout.?.handle,
+        connection.child.stdin.?.handle,
+        &state.session,
+        state.reconnect_ui.cancellationFlag(),
+    ) catch |err| {
+        if (err == error.ReconnectAborted) {
+            connection.terminate();
+        } else {
+            connection.closeStdin();
+            _ = connection.wait() catch {};
+        }
+        state.store(.{ .failed = err });
+        return;
+    };
+
+    state.store(.{ .connected = connection });
+}
+
+fn parallelResultToRaceOutcome(result: ParallelReconnectResult) ReconnectRaceOutcome {
+    return switch (result) {
+        .connected => |connection| .{ .reconnected = connection },
+        .failed => |err| .{ .failed = err },
+    };
+}
+
+fn cleanupParallelReconnectResult(state: *ParallelReconnectState) void {
+    var result = state.take() orelse return;
+    switch (result) {
+        .connected => |*connection| connection.terminate(),
+        .failed => {},
+    }
+}
+
 fn reconnectDelayMs(attempt: usize) u64 {
     const delays = [_]u64{
         5_000,
@@ -729,6 +954,7 @@ fn startRuntimeConnection(
     remote_command: []const u8,
     batch_mode: bool,
     reconnect_ui: ?*client.ReconnectUi,
+    poll_reconnect_input: bool,
 ) !RuntimeConnection {
     const reconnect_options: usize = if (batch_mode) 1 else 0;
     const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + reconnect_options + 4);
@@ -765,12 +991,12 @@ fn startRuntimeConnection(
 
     const artifact_set = artifacts orelse return connection;
 
-    artifact_set.sendExec(connection.child.stdin.?.handle, reconnect_ui) catch |err| {
+    artifact_set.sendExec(connection.child.stdin.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
         connection.terminate();
         return err;
     };
 
-    var line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui) catch |err| {
+    var line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
         connection.closeStdin();
         if (err == error.ReconnectAborted) {
             connection.terminate();
@@ -808,7 +1034,7 @@ fn startRuntimeConnection(
             return process_exit.request(1);
         };
 
-        sendUpload(allocator, connection.child.stdin.?.handle, artifact, reconnect_ui) catch |err| {
+        sendUpload(allocator, connection.child.stdin.?.handle, artifact, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
             if (err == error.ReconnectAborted) {
                 connection.terminate();
@@ -819,7 +1045,7 @@ fn startRuntimeConnection(
         };
 
         allocator.free(line);
-        line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui) catch |err| {
+        line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
             if (err == error.ReconnectAborted) {
                 connection.terminate();
@@ -1398,10 +1624,18 @@ fn loadArtifactSet(allocator: std.mem.Allocator) !ArtifactSet {
     const exe_path = try std.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
 
+    if (isDevelopmentExecutable(exe_path)) {
+        return loadDevelopmentArtifactSet(allocator, exe_path);
+    }
+
     return loadPackagedArtifactSet(allocator, exe_path) catch |err| switch (err) {
         error.NoPackagedArtifacts => loadDevelopmentArtifactSet(allocator, exe_path),
         else => err,
     };
+}
+
+fn isDevelopmentExecutable(exe_path: []const u8) bool {
+    return std.mem.eql(u8, std.fs.path.basename(exe_path), "sessh-dev");
 }
 
 fn loadPackagedArtifactSet(allocator: std.mem.Allocator, exe_path: []const u8) !ArtifactSet {
@@ -1517,6 +1751,7 @@ fn sendUpload(
     fd: c.fd_t,
     artifact: *const ArtifactEntry,
     reconnect_ui: ?*client.ReconnectUi,
+    poll_reconnect_input: bool,
 ) !void {
     const file = try std.fs.openFileAbsolute(artifact.path, .{});
     defer file.close();
@@ -1537,13 +1772,13 @@ fn sendUpload(
     defer allocator.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, bytes);
 
-    try writeAllMaybeCancellable(fd, "UPLOAD ", reconnect_ui);
-    try writeAllMaybeCancellable(fd, artifact.id, reconnect_ui);
-    try writeAllMaybeCancellable(fd, " ", reconnect_ui);
-    try writeAllMaybeCancellable(fd, &artifact.hash_hex, reconnect_ui);
-    try writeAllMaybeCancellable(fd, " ", reconnect_ui);
-    try writeAllMaybeCancellable(fd, encoded, reconnect_ui);
-    try writeAllMaybeCancellable(fd, "\n", reconnect_ui);
+    try writeAllMaybeCancellable(fd, "UPLOAD ", reconnect_ui, poll_reconnect_input);
+    try writeAllMaybeCancellable(fd, artifact.id, reconnect_ui, poll_reconnect_input);
+    try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
+    try writeAllMaybeCancellable(fd, &artifact.hash_hex, reconnect_ui, poll_reconnect_input);
+    try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
+    try writeAllMaybeCancellable(fd, encoded, reconnect_ui, poll_reconnect_input);
+    try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
 }
 
 fn parseMissingPlatform(line: []const u8) !Platform {
@@ -1598,7 +1833,12 @@ fn terminateChild(child: *std.process.Child) void {
     _ = child.wait() catch {};
 }
 
-fn writeAllMaybeCancellable(fd: c.fd_t, bytes: []const u8, reconnect_ui: ?*client.ReconnectUi) !void {
+fn writeAllMaybeCancellable(
+    fd: c.fd_t,
+    bytes: []const u8,
+    reconnect_ui: ?*client.ReconnectUi,
+    poll_reconnect_input: bool,
+) !void {
     if (reconnect_ui == null) {
         try io.writeAll(fd, bytes);
         return;
@@ -1612,7 +1852,7 @@ fn writeAllMaybeCancellable(fd: c.fd_t, bytes: []const u8, reconnect_ui: ?*clien
             .revents = 0,
         }};
         const ready = try posix.poll(&pollfds, 50);
-        if (try reconnect_ui.?.pollAbort(0)) return error.ReconnectAborted;
+        if (try reconnectShouldAbort(reconnect_ui.?, poll_reconnect_input)) return error.ReconnectAborted;
         if (ready == 0) continue;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
         if ((pollfds[0].revents & posix.POLL.OUT) == 0) continue;
@@ -1624,7 +1864,12 @@ fn writeAllMaybeCancellable(fd: c.fd_t, bytes: []const u8, reconnect_ui: ?*clien
     }
 }
 
-fn readBootstrapLine(allocator: std.mem.Allocator, fd: c.fd_t, reconnect_ui: ?*client.ReconnectUi) ![]u8 {
+fn readBootstrapLine(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    reconnect_ui: ?*client.ReconnectUi,
+    poll_reconnect_input: bool,
+) ![]u8 {
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
 
@@ -1636,7 +1881,7 @@ fn readBootstrapLine(allocator: std.mem.Allocator, fd: c.fd_t, reconnect_ui: ?*c
         }};
         const ready = try posix.poll(&pollfds, if (reconnect_ui == null) -1 else 50);
         if (reconnect_ui) |ui| {
-            if (try ui.pollAbort(0)) return error.ReconnectAborted;
+            if (try reconnectShouldAbort(ui, poll_reconnect_input)) return error.ReconnectAborted;
         }
         if (ready == 0) continue;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
@@ -1660,6 +1905,11 @@ fn readBootstrapLine(allocator: std.mem.Allocator, fd: c.fd_t, reconnect_ui: ?*c
     return error.BootstrapLineTooLong;
 }
 
+fn reconnectShouldAbort(reconnect_ui: *client.ReconnectUi, poll_reconnect_input: bool) !bool {
+    if (!poll_reconnect_input) return reconnect_ui.isCancelled();
+    return reconnect_ui.pollAbort(0);
+}
+
 test "readBootstrapLine returns the first line without the newline" {
     var fds: [2]c.fd_t = undefined;
     if (c.pipe(&fds) != 0) return error.PipeFailed;
@@ -1667,7 +1917,7 @@ test "readBootstrapLine returns the first line without the newline" {
     defer _ = c.close(fds[1]);
 
     try io.writeAll(fds[1], "MISSING linux x86_64\nextra\n");
-    const line = try readBootstrapLine(std.testing.allocator, fds[0], null);
+    const line = try readBootstrapLine(std.testing.allocator, fds[0], null, false);
     defer std.testing.allocator.free(line);
 
     try std.testing.expectEqualStrings("MISSING linux x86_64", line);
@@ -1879,6 +2129,13 @@ test "parseSshArgs reports missing host for sessh actions before host" {
     try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sessh", "--kill-all" }));
     try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sessh", "--killall" }));
     try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sessh", "--attach", "s1" }));
+}
+
+test "sessh-dev uses development artifact upload" {
+    try std.testing.expect(isDevelopmentExecutable("/tmp/sessh-dev"));
+    try std.testing.expect(isDevelopmentExecutable("/tmp/build/bin/sessh-dev"));
+    try std.testing.expect(!isDevelopmentExecutable("/tmp/build/bin/sessh"));
+    try std.testing.expect(!isDevelopmentExecutable("/tmp/libexec/sessh/sessh-macos-aarch64"));
 }
 
 test "reconnectDelayMs follows the documented backoff schedule" {

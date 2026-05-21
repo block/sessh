@@ -170,6 +170,7 @@ def main():
 
     session = f"sessh-ssh-reconnect-{os.getpid()}"
     detach_session = f"{session}-detach"
+    alt_detach_session = f"{session}-alt-detach"
     with tempfile.TemporaryDirectory(prefix="sessh-ssh-reconnect-tmux-", dir="/tmp") as tmp_text:
         tmp = Path(tmp_text)
         env = isolated_env(tmp)
@@ -181,6 +182,11 @@ def main():
             "#!/bin/sh\n"
             "printf 'REMOTE_TOP\\nREMOTE_PROMPT$ '\n"
             "while IFS= read -r line; do\n"
+            "  if [ \"$line\" = enter-alt ]; then\n"
+            "    printf 'PRIMARY_BEFORE_ALT\\n'\n"
+            "    printf '\\033[?1049hALT_SCREEN_READY\\n'\n"
+            "    while :; do sleep 1; done\n"
+            "  fi\n"
             "  if [ \"$line\" = spam ]; then\n"
             "    i=1\n"
             "    while :; do\n"
@@ -293,8 +299,24 @@ def main():
                 raise AssertionError(f"detach left a blank visible pane:\n{detached}")
             if "REMOTE_SPAM_" not in detached:
                 raise AssertionError(f"detach lost flowing output from scrollback:\n{detached}")
+
+            new_tmux_session(env, alt_detach_session, 80, 24)
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", alt_detach_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, alt_detach_session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, sessh_cmd, "Enter"])
+            wait_capture(env, alt_detach_session, "REMOTE_PROMPT$")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "enter-alt", "Enter"])
+            wait_capture(env, alt_detach_session, "ALT_SCREEN_READY")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "C-a", "d"])
+            time.sleep(0.5)
+            alt_after = capture_visible(env, alt_detach_session)
+            if "ALT_SCREEN_READY" in alt_after:
+                raise AssertionError(f"detach left alternate-screen contents visible:\n{alt_after}")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "printf 'OUTER_ALT_DETACHED\\n'", "Enter"])
+            wait_capture(env, alt_detach_session, "OUTER_ALT_DETACHED")
         finally:
-            for tmux_session in (session, detach_session, f"{detach_session}-idle"):
+            for tmux_session in (session, detach_session, f"{detach_session}-idle", alt_detach_session):
                 subprocess.run(
                     [*TMUX_ARGS, "kill-session", "-t", tmux_session],
                     cwd=ROOT,

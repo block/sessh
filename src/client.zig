@@ -13,6 +13,7 @@ const socket_transport = @import("socket_transport.zig");
 const terminal = @import("terminal.zig");
 
 const pb = protocol.pb;
+const hpb = protocol.hpb;
 const WindowSize = terminal.WindowSize;
 const Leader = terminal.Leader;
 
@@ -191,6 +192,7 @@ const ErrorPayload = struct {
 pub const RelayEnd = enum {
     detach,
     reconnect,
+    unresponsive,
     transport_closed,
     session_ended,
 };
@@ -199,6 +201,136 @@ pub const ReconnectDecision = enum {
     wait_elapsed,
     reconnect_now,
     abort,
+};
+
+pub const RuntimeRecovery = enum {
+    recovered,
+    transport_closed,
+    session_ended,
+};
+
+pub const ConnectionResult = enum {
+    recovered,
+    reconnected,
+};
+
+pub const RelayOptions = struct {
+    monitor_connection: bool = false,
+};
+
+const input_chunk_bytes = 1024;
+const ping_min_interval_ms: i64 = 1_000;
+const initial_responsiveness_timeout_ms: i64 = 2_000;
+const min_responsiveness_timeout_ms: i64 = 1_000;
+const max_responsiveness_timeout_ms: i64 = 15_000;
+
+const ConnectionMonitor = struct {
+    enabled: bool = false,
+    pending_ping_seq: ?u64 = null,
+    deferred_ping: bool = false,
+    ping_sent_ms: i64 = 0,
+    last_ping_sent_ms: ?i64 = null,
+    any_response_wait_started_ms: ?i64 = null,
+    smoothed_rtt_ms: ?i64 = null,
+    rtt_variance_ms: i64 = 0,
+
+    fn afterInput(self: *ConnectionMonitor, write_fd: c.fd_t) !void {
+        if (!self.enabled) return;
+        const now = std.time.milliTimestamp();
+        try self.afterInputAt(write_fd, now);
+    }
+
+    fn afterInputAt(self: *ConnectionMonitor, write_fd: c.fd_t, now: i64) !void {
+        if (!self.enabled) return;
+        if (self.any_response_wait_started_ms == null) {
+            self.any_response_wait_started_ms = now;
+        }
+        if (self.pending_ping_seq == null and self.canSendPing(now)) {
+            self.pending_ping_seq = try sendPingRequest(write_fd);
+            self.ping_sent_ms = now;
+            self.last_ping_sent_ms = now;
+            self.deferred_ping = false;
+        } else if (self.pending_ping_seq == null) {
+            self.deferred_ping = true;
+        }
+    }
+
+    fn canSendPing(self: *const ConnectionMonitor, now: i64) bool {
+        const last = self.last_ping_sent_ms orelse return true;
+        return now - last >= ping_min_interval_ms;
+    }
+
+    fn maybeSendDeferredPing(self: *ConnectionMonitor, write_fd: c.fd_t) !void {
+        if (!self.enabled) return;
+        try self.maybeSendDeferredPingAt(write_fd, std.time.milliTimestamp());
+    }
+
+    fn maybeSendDeferredPingAt(self: *ConnectionMonitor, write_fd: c.fd_t, now: i64) !void {
+        if (!self.deferred_ping or self.pending_ping_seq != null or !self.canSendPing(now)) return;
+        self.pending_ping_seq = try sendPingRequest(write_fd);
+        self.ping_sent_ms = now;
+        self.last_ping_sent_ms = now;
+        self.any_response_wait_started_ms = now;
+        self.deferred_ping = false;
+    }
+
+    fn noteInboundFrame(self: *ConnectionMonitor) void {
+        self.any_response_wait_started_ms = null;
+        self.deferred_ping = false;
+    }
+
+    fn handlePingResponse(self: *ConnectionMonitor, payload: []const u8) !void {
+        var response = try protocol.decodePayload(pb.PingResponse, app_allocator.allocator(), payload);
+        defer response.deinit(app_allocator.allocator());
+        const pending_seq = self.pending_ping_seq orelse return;
+        if (response.request_seq_number != pending_seq) return;
+        const rtt_ms = @max(std.time.milliTimestamp() - self.ping_sent_ms, 0);
+        self.pending_ping_seq = null;
+        self.updateRtt(rtt_ms);
+    }
+
+    fn updateRtt(self: *ConnectionMonitor, rtt_ms: i64) void {
+        if (self.smoothed_rtt_ms) |srtt| {
+            const delta = if (rtt_ms > srtt) rtt_ms - srtt else srtt - rtt_ms;
+            self.rtt_variance_ms = @max(@divTrunc(3 * self.rtt_variance_ms + delta, 4), 1);
+            self.smoothed_rtt_ms = @divTrunc(7 * srtt + rtt_ms, 8);
+        } else {
+            self.smoothed_rtt_ms = rtt_ms;
+            self.rtt_variance_ms = @max(@divTrunc(rtt_ms, 2), 1);
+        }
+    }
+
+    fn pollTimeoutMs(self: *const ConnectionMonitor) i32 {
+        if (!self.enabled) return 100;
+        if (self.deferred_ping and self.pending_ping_seq == null) {
+            const last = self.last_ping_sent_ms orelse return 0;
+            const until_ping = ping_min_interval_ms - (std.time.milliTimestamp() - last);
+            if (until_ping <= 0) return 0;
+            return @intCast(@min(@as(i64, 100), until_ping));
+        }
+        const started = self.any_response_wait_started_ms orelse return 100;
+        const elapsed = std.time.milliTimestamp() - started;
+        const remaining = self.responsivenessTimeoutMs() - elapsed;
+        if (remaining <= 0) return 0;
+        return @intCast(@min(@as(i64, 100), remaining));
+    }
+
+    fn isUnresponsive(self: *const ConnectionMonitor) bool {
+        if (!self.enabled) return false;
+        if (self.deferred_ping and self.pending_ping_seq == null) return false;
+        const started = self.any_response_wait_started_ms orelse return false;
+        return std.time.milliTimestamp() - started >= self.responsivenessTimeoutMs();
+    }
+
+    fn responsivenessTimeoutMs(self: *const ConnectionMonitor) i64 {
+        // TCP-style adaptive timeout: smoothed RTT plus variance, bounded so a
+        // single retransmit-scale delay does not immediately force reconnect.
+        const timeout = if (self.smoothed_rtt_ms) |srtt|
+            srtt + 4 * self.rtt_variance_ms
+        else
+            initial_responsiveness_timeout_ms;
+        return @min(max_responsiveness_timeout_ms, @max(min_responsiveness_timeout_ms, timeout));
+    }
 };
 
 pub const ScrollbackCursor = struct {
@@ -212,6 +344,7 @@ pub const RuntimeSession = struct {
     scrollback_cursor: ScrollbackCursor = .{},
     origin_row: ?u16 = null,
     cursor_row: u16 = 0,
+    relay_end_restore: std.ArrayList(u8) = .empty,
 
     pub fn idSlice(self: *const RuntimeSession) []const u8 {
         return self.id[0..self.id_len];
@@ -220,10 +353,6 @@ pub const RuntimeSession = struct {
 
 pub const ReconnectUi = struct {
     const reconnected_banner_ms = 500;
-    const reconnected_banner_message = std.fmt.comptimePrint(
-        "--- sessh: reconnected. Dismiss with SPACE (or wait {}ms) ---",
-        .{reconnected_banner_ms},
-    );
 
     mode_guard: terminal.TerminalModeGuard,
     escape_filter: terminal.EscapeFilter = .{ .at_line_start = false },
@@ -231,6 +360,7 @@ pub const ReconnectUi = struct {
     origin_row: ?u16 = null,
     banner_row: ?u16 = null,
     cursor_hidden: bool = false,
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn begin(origin_row: ?u16, cursor_row: u16) !ReconnectUi {
         const resolved_origin_row = reconnectOriginRow(origin_row, cursor_row);
@@ -278,11 +408,28 @@ pub const ReconnectUi = struct {
         }
     }
 
+    pub fn showConnectionUnresponsive(self: *ReconnectUi) !void {
+        try self.drawStaticBanner("--- sessh: connection unresponsive - attempting reconnect ---");
+    }
+
     pub fn pollAbort(self: *ReconnectUi, timeout_ms: i32) !bool {
+        if (self.isCancelled()) return true;
         return switch (try self.pollInput(timeout_ms)) {
             .abort => true,
             .reconnect_now, .wait_elapsed => false,
         };
+    }
+
+    pub fn cancel(self: *ReconnectUi) void {
+        self.cancelled.store(true, .release);
+    }
+
+    pub fn isCancelled(self: *ReconnectUi) bool {
+        return self.cancelled.load(.acquire);
+    }
+
+    pub fn cancellationFlag(self: *const ReconnectUi) *const std.atomic.Value(bool) {
+        return &self.cancelled;
     }
 
     fn pollInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
@@ -336,9 +483,16 @@ pub const ReconnectUi = struct {
     }
 
     pub fn showReconnectedBriefly(self: *ReconnectUi) !void {
-        if (c.isatty(1) == 0) return;
-        try self.drawStaticBanner(reconnected_banner_message);
-        try self.waitForReconnectedBannerDismiss(reconnected_banner_ms);
+        try self.showConnectionResultBriefly(.reconnected);
+    }
+
+    pub fn showConnectionResultBriefly(self: *ReconnectUi, result: ConnectionResult) !void {
+        const message = switch (result) {
+            .recovered => "--- sessh: connection recovered. SPACE to dismiss or wait 500ms ---",
+            .reconnected => "--- sessh: reconnected. SPACE to dismiss or wait 500ms ---",
+        };
+        try self.drawStaticBanner(message);
+        try self.waitForDismiss(reconnected_banner_ms);
     }
 
     fn drawBanner(self: *ReconnectUi, delay_ms: u64) !void {
@@ -380,20 +534,17 @@ pub const ReconnectUi = struct {
         try renderer.moveCursor(top_row, 0);
     }
 
-    fn waitForReconnectedBannerDismiss(self: *ReconnectUi, timeout_ms: u64) !void {
+    fn waitForDismiss(self: *ReconnectUi, timeout_ms: u64) !void {
         const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-        var dismiss_allowed = true;
-
         while (true) {
             const now = std.time.milliTimestamp();
             if (now >= deadline) return;
-
             const wait_ms: i32 = @intCast(@min(deadline - now, @as(i64, std.math.maxInt(i32))));
-            if (try self.pollReconnectedBannerDismiss(wait_ms, &dismiss_allowed)) return;
+            if (try self.pollDismissInput(wait_ms)) return;
         }
     }
 
-    fn pollReconnectedBannerDismiss(self: *ReconnectUi, timeout_ms: i32, dismiss_allowed: *bool) !bool {
+    fn pollDismissInput(self: *ReconnectUi, timeout_ms: i32) !bool {
         var pollfds = [_]posix.pollfd{.{
             .fd = 0,
             .events = posix.POLL.IN,
@@ -405,20 +556,18 @@ pub const ReconnectUi = struct {
         if ((pollfds[0].revents & posix.POLL.IN) == 0) return false;
 
         var input: [256]u8 = undefined;
+        var filtered: [512]u8 = undefined;
         const n = c.read(0, &input, input.len);
         if (n <= 0) return true;
 
-        var dismissed = false;
         for (input[0..@intCast(n)]) |byte| {
-            if (dismiss_allowed.* and byte == ' ') {
-                dismissed = true;
-                dismiss_allowed.* = false;
-                continue;
-            }
-            dismiss_allowed.* = false;
-            try self.buffered_input.append(app_allocator.allocator(), byte);
+            if (byte == ' ') return true;
+
+            const one = [_]u8{byte};
+            const result = self.escape_filter.filter(&one, &filtered);
+            try self.buffered_input.appendSlice(app_allocator.allocator(), result.bytes);
         }
-        return dismissed;
+        return false;
     }
 
     fn hideCursor(self: *ReconnectUi) !void {
@@ -456,8 +605,9 @@ const DrawPayload = struct {
     scrollback_epoch: u64,
     scroll_count: u64,
     cursor_row: u16,
-    bytes: []const u8,
-    cleanup_after: ?[]const u8,
+    draw_bytes: []const u8,
+    request_seq_number: ?u64,
+    relay_end_restore_bytes: ?[]const u8,
 };
 
 fn reconnectOriginRow(origin_row: ?u16, cursor_row: u16) ?u16 {
@@ -518,12 +668,62 @@ test "reconnect banner updates every second under one minute" {
     try std.testing.expectEqual(@as(u64, 60_000), nextBannerUpdateDelayMs(600_000));
 }
 
-test "reconnected banner documents space dismissal and timeout" {
-    var timeout_buf: [16]u8 = undefined;
-    const timeout_text = try std.fmt.bufPrint(&timeout_buf, "{}ms", .{ReconnectUi.reconnected_banner_ms});
+test "connection monitor defers rate-limited ping and starts responsiveness wait" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
 
-    try std.testing.expect(std.mem.indexOf(u8, ReconnectUi.reconnected_banner_message, "Dismiss with SPACE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ReconnectUi.reconnected_banner_message, timeout_text) != null);
+    var monitor = ConnectionMonitor{
+        .enabled = true,
+        .last_ping_sent_ms = 1_000,
+    };
+
+    try monitor.afterInputAt(fds[1], 1_100);
+    try std.testing.expectEqual(@as(?u64, null), monitor.pending_ping_seq);
+    try std.testing.expect(monitor.deferred_ping);
+    try std.testing.expectEqual(@as(?i64, 1_100), monitor.any_response_wait_started_ms);
+    try std.testing.expect(!monitor.isUnresponsive());
+
+    try monitor.maybeSendDeferredPingAt(fds[1], 2_000);
+    const pending = monitor.pending_ping_seq orelse return error.ExpectedPendingPing;
+    try std.testing.expect(!monitor.deferred_ping);
+    try std.testing.expectEqual(@as(?i64, 2_000), monitor.any_response_wait_started_ms);
+
+    var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pending, frame.seq);
+    try std.testing.expect(frame.knownMessageType() == .FRAME_TYPE_PING_REQUEST);
+}
+
+test "cancelled reconnect frame read returns without input" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.ReconnectAborted, readFrameAllocMaybeCancelled(fds[0], &cancelled));
+}
+
+test "recovery polling stores relay-end restore bytes from draw" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var session = RuntimeSession{};
+    defer session.relay_end_restore.deinit(app_allocator.allocator());
+
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Draw{
+        .scrollback_epoch = 1,
+        .scroll_count = 0,
+        .cursor_row = 0,
+        .draw_bytes = "",
+        .relay_end_restore_bytes = "restore-primary",
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fds[1], .FRAME_TYPE_DRAW, payload);
+
+    try std.testing.expectEqual(RuntimeRecovery.recovered, (try pollRuntimeRecovery(fds[0], &session, 0)).?);
+    try std.testing.expectEqualStrings("restore-primary", session.relay_end_restore.items);
 }
 
 /// Implements the public `sessh :local:` path. This is both the local testing
@@ -606,6 +806,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             child.stdin.?.handle,
             &session,
             options.leader,
+            .{},
         ) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
@@ -625,6 +826,9 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                 return;
             },
             .reconnect => {
+                terminateChild(&child);
+            },
+            .unresponsive => {
                 terminateChild(&child);
             },
             .transport_closed => {
@@ -671,7 +875,7 @@ fn sessionExistsViaBroker(allocator: std.mem.Allocator, exe: []const u8, session
 
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), child.stdout.?.handle) catch return false;
     defer frame.deinit(app_allocator.allocator());
-    if (frame.message_type != .FRAME_TYPE_COMMAND_RESPONSE) return false;
+    if (frame.knownMessageType() != .FRAME_TYPE_COMMAND_RESPONSE) return false;
     const response = parseCommandResponse(frame.payload) catch return false;
     defer freeCommandResponse(response);
 
@@ -849,12 +1053,30 @@ pub fn reconnectSessionOnRuntime(
     write_fd: c.fd_t,
     session: *RuntimeSession,
 ) !void {
-    try runtimeHandshake(read_fd, write_fd);
+    try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, null);
+}
+
+pub fn reconnectSessionOnRuntimeCancellable(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    session: *RuntimeSession,
+    cancelled: *const std.atomic.Value(bool),
+) !void {
+    try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, cancelled);
+}
+
+fn reconnectSessionOnRuntimeInner(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    session: *RuntimeSession,
+    cancelled: ?*const std.atomic.Value(bool),
+) !void {
+    try runtimeHandshakeInner(read_fd, write_fd, cancelled);
     try sendResize(write_fd, terminal.currentWindowSize());
     try sendSessionAttach(write_fd, session.idSlice(), null, session.scrollback_cursor);
 
     var id_buf: [64]u8 = undefined;
-    const attached_id = try readAttachedSessionId(read_fd, &id_buf);
+    const attached_id = try readAttachedSessionIdInner(read_fd, &id_buf, cancelled);
     if (!std.mem.eql(u8, attached_id, session.idSlice())) return error.UnexpectedSessionId;
 }
 
@@ -863,8 +1085,62 @@ pub fn relayRuntimeSession(
     write_fd: c.fd_t,
     session: *RuntimeSession,
     leader: Leader,
+    options: RelayOptions,
 ) !RelayEnd {
-    return relayInteractive(read_fd, write_fd, session.idSlice(), leader, &session.scrollback_cursor, &session.cursor_row);
+    return relayInteractive(
+        read_fd,
+        write_fd,
+        session.idSlice(),
+        leader,
+        &session.scrollback_cursor,
+        &session.cursor_row,
+        &session.relay_end_restore,
+        options,
+    );
+}
+
+pub fn pollRuntimeRecovery(
+    read_fd: c.fd_t,
+    session: *RuntimeSession,
+    timeout_ms: i32,
+) !?RuntimeRecovery {
+    var pollfds = [_]posix.pollfd{.{
+        .fd = read_fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try posix.poll(&pollfds, timeout_ms);
+    if (ready == 0) return null;
+    if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+        (pollfds[0].revents & posix.POLL.IN) == 0)
+    {
+        return .transport_closed;
+    }
+    if ((pollfds[0].revents & posix.POLL.IN) == 0) return null;
+
+    var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
+    defer frame.deinit(app_allocator.allocator());
+    switch (frame.message_type) {
+        .known => |message_type| switch (message_type) {
+            .FRAME_TYPE_DRAW => {
+                try handleDrawFrame(frame.payload, &session.relay_end_restore, &session.scrollback_cursor, &session.cursor_row);
+                return .recovered;
+            },
+            .FRAME_TYPE_PING_RESPONSE => return .recovered,
+            .FRAME_TYPE_SESSION_ENDED => {
+                _ = finishRelay(.session_ended, &session.relay_end_restore);
+                return .session_ended;
+            },
+            .FRAME_TYPE_ERROR => {
+                try printErrorPayload(frame.payload);
+                _ = finishRelay(.session_ended, &session.relay_end_restore);
+                return .session_ended;
+            },
+            .FRAME_TYPE_UNRECOGNIZED => return null,
+            else => return error.UnexpectedFrame,
+        },
+        .unknown => return null,
+    }
 }
 
 pub fn writeDetachBannerForTarget(ssh_options: []const []const u8, target: []const u8, sessh_options: []const []const u8, session_id: []const u8) void {
@@ -934,59 +1210,194 @@ fn querySessionOriginRow() ?u16 {
 }
 
 fn readAttachedSessionId(conn: c.fd_t, session_id_buf: []u8) ![]const u8 {
-    var frame = try protocol.readFrameAlloc(app_allocator.allocator(), conn);
-    defer frame.deinit(app_allocator.allocator());
-    if (frame.message_type == .FRAME_TYPE_ERROR) {
-        const parsed = try parseErrorPayload(frame.payload);
-        if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
-            freeErrorPayload(parsed);
-            return error.VersionMismatch;
-        }
-        try printParsedError(parsed);
-        return process_exit.request(1);
-    }
-    if (frame.message_type != .FRAME_TYPE_SESSION_ATTACHED) return error.UnexpectedFrame;
+    return readAttachedSessionIdInner(conn, session_id_buf, null);
+}
 
-    var attached = try protocol.decodePayload(pb.SessionAttached, app_allocator.allocator(), frame.payload);
-    defer attached.deinit(app_allocator.allocator());
-    const id = attached.session_id;
-    if (id.len == 0) return error.PayloadTooShort;
-    if (id.len > session_id_buf.len) return error.SessionIdTooLong;
-    @memcpy(session_id_buf[0..id.len], id);
-    return session_id_buf[0..id.len];
+fn readAttachedSessionIdInner(
+    conn: c.fd_t,
+    session_id_buf: []u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) ![]const u8 {
+    while (true) {
+        var frame = try readFrameAllocMaybeCancelled(conn, cancelled);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_ERROR => {
+                    const parsed = try parseErrorPayload(frame.payload);
+                    if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
+                        freeErrorPayload(parsed);
+                        return error.VersionMismatch;
+                    }
+                    try printParsedError(parsed);
+                    return process_exit.request(1);
+                },
+                .FRAME_TYPE_SESSION_ATTACHED => {
+                    var attached = try protocol.decodePayload(pb.SessionAttached, app_allocator.allocator(), frame.payload);
+                    defer attached.deinit(app_allocator.allocator());
+                    const id = attached.session_id;
+                    if (id.len == 0) return error.PayloadTooShort;
+                    if (id.len > session_id_buf.len) return error.SessionIdTooLong;
+                    @memcpy(session_id_buf[0..id.len], id);
+                    return session_id_buf[0..id.len];
+                },
+                .FRAME_TYPE_UNRECOGNIZED => continue,
+                else => return error.UnexpectedFrame,
+            },
+            .unknown => |raw| {
+                try sendUnrecognizedFrame(conn, frame.seq, raw);
+                continue;
+            },
+        }
+    }
+}
+
+fn readFrameAllocMaybeCancelled(
+    fd: c.fd_t,
+    cancelled: ?*const std.atomic.Value(bool),
+) !protocol.OwnedFrame {
+    const flag = cancelled orelse return protocol.readFrameAlloc(app_allocator.allocator(), fd);
+    while (true) {
+        if (flag.load(.acquire)) return error.ReconnectAborted;
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, 50);
+        if (flag.load(.acquire)) return error.ReconnectAborted;
+        if (ready == 0) continue;
+        if ((pollfds[0].revents & posix.POLL.IN) != 0) {
+            return protocol.readFrameAlloc(app_allocator.allocator(), fd);
+        }
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+            return error.EndOfStream;
+        }
+    }
 }
 
 pub fn runtimeHandshake(read_fd: c.fd_t, write_fd: c.fd_t) !void {
-    const hello_payload = try protocol.encodePayload(app_allocator.allocator(), pb.Hello{
+    try runtimeHandshakeInner(read_fd, write_fd, null);
+}
+
+fn runtimeHandshakeInner(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    cancelled: ?*const std.atomic.Value(bool),
+) !void {
+    try sendHelloRequest(write_fd);
+    var hello_error = try readHelloReply(read_fd, write_fd, cancelled);
+    defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
+    if (hello_error) |err| {
+        const parsed = errorPayloadFromHelloError(err);
+        if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) return error.VersionMismatch;
+        try printBorrowedError(parsed);
+        return process_exit.request(1);
+    }
+
+    var peer_hello = try readHelloRequest(read_fd, write_fd, cancelled);
+    defer peer_hello.deinit(app_allocator.allocator());
+    if (helloRequestIsCompatible(peer_hello)) {
+        try sendHelloOk(write_fd);
+    } else {
+        try sendHelloError(write_fd, "VERSION_MISMATCH", "existing remote sessh is incompatible with this client", "");
+        return error.VersionMismatch;
+    }
+}
+
+fn sendHelloRequest(fd: c.fd_t) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloRequest{
         .protocol_major = config.protocol_major,
         .protocol_minor = config.protocol_minor,
         .version = config.version,
     });
-    defer app_allocator.allocator().free(hello_payload);
-    try protocol.sendFrame(write_fd, .FRAME_TYPE_HELLO, hello_payload);
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_REQUEST, payload);
+}
 
-    var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
-    defer frame.deinit(app_allocator.allocator());
-    if (frame.message_type == .FRAME_TYPE_ERROR) {
-        const parsed = try parseErrorPayload(frame.payload);
-        if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
-            freeErrorPayload(parsed);
-            return error.VersionMismatch;
+fn sendHelloOk(fd: c.fd_t) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_OK, payload);
+}
+
+fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloError{
+        .code = code,
+        .message = message,
+        .hint = hint,
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_ERROR, payload);
+}
+
+fn readHelloReply(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    cancelled: ?*const std.atomic.Value(bool),
+) !?hpb.HelloError {
+    while (true) {
+        var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_HELLO_OK => {
+                    var ok = try protocol.decodePayload(hpb.HelloOk, app_allocator.allocator(), frame.payload);
+                    defer ok.deinit(app_allocator.allocator());
+                    return null;
+                },
+                .FRAME_TYPE_HELLO_ERROR => {
+                    const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
+                    return err;
+                },
+                .FRAME_TYPE_UNRECOGNIZED => continue,
+                else => return error.UnexpectedFrame,
+            },
+            .unknown => |raw| {
+                try sendUnrecognizedFrame(write_fd, frame.seq, raw);
+                continue;
+            },
         }
-        try printParsedError(parsed);
-        return process_exit.request(1);
     }
-    if (frame.message_type != .FRAME_TYPE_HELLO_OK) return error.UnexpectedFrame;
+}
 
-    var peer_hello = try protocol.decodePayload(pb.Hello, app_allocator.allocator(), frame.payload);
-    defer peer_hello.deinit(app_allocator.allocator());
-    if (peer_hello.protocol_major != config.protocol_major or
-        peer_hello.protocol_minor != config.protocol_minor or
-        !std.mem.eql(u8, peer_hello.version, config.version))
-    {
-        try io_helpers.writeAll(2, "ERROR existing remote sessh is incompatible with this client\n");
-        return process_exit.request(1);
+fn readHelloRequest(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    cancelled: ?*const std.atomic.Value(bool),
+) !hpb.HelloRequest {
+    while (true) {
+        var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_HELLO_REQUEST => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
+                .FRAME_TYPE_UNRECOGNIZED => continue,
+                else => {
+                    try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
+                    return error.UnexpectedFrame;
+                },
+            },
+            .unknown => |raw| {
+                try sendUnrecognizedFrame(write_fd, frame.seq, raw);
+                continue;
+            },
+        }
     }
+}
+
+fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
+    return hello.protocol_major == config.protocol_major and
+        hello.protocol_minor >= config.protocol_minor and
+        std.mem.eql(u8, hello.version, config.version);
+}
+
+fn errorPayloadFromHelloError(response_error: hpb.HelloError) ErrorPayload {
+    return .{
+        .code = response_error.code,
+        .message = response_error.message,
+        .hint = response_error.hint orelse "",
+    };
 }
 
 const CommandResponse = struct {
@@ -1022,23 +1433,36 @@ fn freeCommandResponse(response: CommandResponse) void {
 
 fn runCommandAndForward(read_fd: c.fd_t, write_fd: c.fd_t, argv: []const []const u8) !u8 {
     try sendCommandRequest(write_fd, argv);
-    var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
-    defer frame.deinit(app_allocator.allocator());
-    if (frame.message_type == .FRAME_TYPE_ERROR) {
-        const parsed = try parseErrorPayload(frame.payload);
-        if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
-            freeErrorPayload(parsed);
-            return error.VersionMismatch;
+    while (true) {
+        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_ERROR => {
+                    const parsed = try parseErrorPayload(frame.payload);
+                    if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
+                        freeErrorPayload(parsed);
+                        return error.VersionMismatch;
+                    }
+                    try printParsedError(parsed);
+                    return 1;
+                },
+                .FRAME_TYPE_COMMAND_RESPONSE => {
+                    const response = try parseCommandResponse(frame.payload);
+                    defer freeCommandResponse(response);
+                    if (response.stdout.len > 0) try io_helpers.writeAll(1, response.stdout);
+                    if (response.stderr.len > 0) try io_helpers.writeAll(2, response.stderr);
+                    return response.exit_status;
+                },
+                .FRAME_TYPE_UNRECOGNIZED => continue,
+                else => return error.UnexpectedFrame,
+            },
+            .unknown => |raw| {
+                try sendUnrecognizedFrame(write_fd, frame.seq, raw);
+                continue;
+            },
         }
-        try printParsedError(parsed);
-        return 1;
     }
-    if (frame.message_type != .FRAME_TYPE_COMMAND_RESPONSE) return error.UnexpectedFrame;
-    const response = try parseCommandResponse(frame.payload);
-    defer freeCommandResponse(response);
-    if (response.stdout.len > 0) try io_helpers.writeAll(1, response.stdout);
-    if (response.stderr.len > 0) try io_helpers.writeAll(2, response.stderr);
-    return response.exit_status;
 }
 
 fn sendSessionNew(conn: c.fd_t, scrollback_row_count: u32) !void {
@@ -1098,14 +1522,25 @@ fn sendSessionAttach(
 }
 
 fn readSessionEndedOrError(conn: c.fd_t) !bool {
-    var frame = try protocol.readFrameAlloc(app_allocator.allocator(), conn);
-    defer frame.deinit(app_allocator.allocator());
-    if (frame.message_type == .FRAME_TYPE_ERROR) {
-        try printErrorPayload(frame.payload);
-        return true;
+    while (true) {
+        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), conn);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_ERROR => {
+                    try printErrorPayload(frame.payload);
+                    return true;
+                },
+                .FRAME_TYPE_SESSION_ENDED => return false,
+                .FRAME_TYPE_UNRECOGNIZED => continue,
+                else => return error.UnexpectedFrame,
+            },
+            .unknown => |raw| {
+                try sendUnrecognizedFrame(conn, frame.seq, raw);
+                continue;
+            },
+        }
     }
-    if (frame.message_type != .FRAME_TYPE_SESSION_ENDED) return error.UnexpectedFrame;
-    return false;
 }
 
 fn printErrorPayload(payload: []const u8) !void {
@@ -1113,17 +1548,21 @@ fn printErrorPayload(payload: []const u8) !void {
 }
 
 fn parseErrorPayload(payload: []const u8) !ErrorPayload {
-    var message = try protocol.decodePayload(pb.Error, app_allocator.allocator(), payload);
-    defer message.deinit(app_allocator.allocator());
+    var decoded = try protocol.decodePayload(hpb.Error, app_allocator.allocator(), payload);
+    defer decoded.deinit(app_allocator.allocator());
     return .{
-        .code = try app_allocator.allocator().dupe(u8, message.code),
-        .message = try app_allocator.allocator().dupe(u8, message.message),
-        .hint = try app_allocator.allocator().dupe(u8, message.hint),
+        .code = try app_allocator.allocator().dupe(u8, decoded.code),
+        .message = try app_allocator.allocator().dupe(u8, decoded.message),
+        .hint = try app_allocator.allocator().dupe(u8, decoded.hint orelse ""),
     };
 }
 
 fn printParsedError(parsed: ErrorPayload) !void {
     defer freeErrorPayload(parsed);
+    try printBorrowedError(parsed);
+}
+
+fn printBorrowedError(parsed: ErrorPayload) !void {
     try io_helpers.writeAll(2, "ERROR ");
     try io_helpers.writeAll(2, parsed.message);
     try io_helpers.writeAll(2, "\n");
@@ -1157,6 +1596,8 @@ fn relayInteractive(
     leader: Leader,
     scrollback_cursor: *ScrollbackCursor,
     cursor_row: ?*u16,
+    relay_end_restore: *std.ArrayList(u8),
+    options: RelayOptions,
 ) !RelayEnd {
     var mode_guard = try terminal.TerminalModeGuard.enable(0);
     defer mode_guard.restore();
@@ -1168,7 +1609,18 @@ fn relayInteractive(
         client_renderer.PresentationGuard.init(1);
     defer presentation_guard.restore();
 
-    const end = try relayTerminal(0, read_fd, write_fd, session_id, leader, &presentation_guard, scrollback_cursor, cursor_row);
+    const end = try relayTerminal(
+        0,
+        read_fd,
+        write_fd,
+        session_id,
+        leader,
+        &presentation_guard,
+        scrollback_cursor,
+        cursor_row,
+        relay_end_restore,
+        options,
+    );
     if (end == .detach) writeDetachBoundary();
     return end;
 }
@@ -1182,6 +1634,8 @@ fn relayTerminal(
     presentation_guard: *client_renderer.PresentationGuard,
     scrollback_cursor: *ScrollbackCursor,
     cursor_row: ?*u16,
+    relay_end_restore: *std.ArrayList(u8),
+    options: RelayOptions,
 ) !RelayEnd {
     var pollfds = [_]posix.pollfd{
         .{ .fd = input_fd, .events = posix.POLL.IN, .revents = 0 },
@@ -1191,44 +1645,62 @@ fn relayTerminal(
     var filtered: [8192]u8 = undefined;
     var escape_filter = terminal.EscapeFilter{ .leader_byte = terminal.leaderByte(leader) };
     var last_size = terminal.currentWindowSize();
-    var pending_cleanup = std.ArrayList(u8).empty;
-    defer pending_cleanup.deinit(app_allocator.allocator());
+    var connection_monitor = ConnectionMonitor{ .enabled = options.monitor_connection };
     _ = presentation_guard;
 
     while (true) {
-        _ = try posix.poll(&pollfds, 100);
+        try connection_monitor.maybeSendDeferredPing(write_fd);
+        _ = try posix.poll(&pollfds, connection_monitor.pollTimeoutMs());
+        try connection_monitor.maybeSendDeferredPing(write_fd);
         maybeSendResize(write_fd, &last_size);
 
+        if (connection_monitor.isUnresponsive()) {
+            return .unresponsive;
+        }
+
+        if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+            var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
+            defer frame.deinit(app_allocator.allocator());
+            connection_monitor.noteInboundFrame();
+            switch (frame.message_type) {
+                .known => |message_type| switch (message_type) {
+                    .FRAME_TYPE_DRAW => {
+                        try handleDrawFrame(frame.payload, relay_end_restore, scrollback_cursor, cursor_row);
+                    },
+                    .FRAME_TYPE_PING_RESPONSE => try connection_monitor.handlePingResponse(frame.payload),
+                    .FRAME_TYPE_SESSION_ENDED => return finishRelay(.session_ended, relay_end_restore),
+                    .FRAME_TYPE_ERROR => {
+                        try printErrorPayload(frame.payload);
+                        return finishRelay(.session_ended, relay_end_restore);
+                    },
+                    .FRAME_TYPE_UNRECOGNIZED => {},
+                    else => return error.UnexpectedFrame,
+                },
+                .unknown => |raw| try sendUnrecognizedFrame(write_fd, frame.seq, raw),
+            }
+        }
         if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             const n = c.read(input_fd, &buf, buf.len);
-            if (n <= 0) return finishRelay(requestSessionDetach(read_fd, write_fd, session_id), &pending_cleanup);
+            if (n <= 0) return finishRelay(requestSessionDetach(read_fd, write_fd, session_id), relay_end_restore);
             const result = escape_filter.filter(buf[0..@intCast(n)], &filtered);
-            if (result.bytes.len > 0) try sendInput(write_fd, result.bytes);
+            if (result.bytes.len > 0) {
+                try sendInputChunks(write_fd, result.bytes);
+                try connection_monitor.afterInput(write_fd);
+            }
             if (result.end) |end| switch (end) {
-                .detach => return finishRelay(requestSessionDetach(read_fd, write_fd, session_id), &pending_cleanup),
+                .detach => return finishRelay(requestSessionDetach(read_fd, write_fd, session_id), relay_end_restore),
                 .repaint => sendRepaint(write_fd, true) catch return .transport_closed,
                 .reconnect => return .reconnect,
             };
         }
-        if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
-            defer frame.deinit(app_allocator.allocator());
-            switch (frame.message_type) {
-                .FRAME_TYPE_DRAW => try handleDrawFrame(frame.payload, &pending_cleanup, scrollback_cursor, cursor_row),
-                .FRAME_TYPE_SESSION_ENDED => return finishRelay(.session_ended, &pending_cleanup),
-                .FRAME_TYPE_ERROR => {
-                    try printErrorPayload(frame.payload);
-                    return finishRelay(.session_ended, &pending_cleanup);
-                },
-                else => return error.UnexpectedFrame,
-            }
-        }
     }
 }
 
-fn finishRelay(end: RelayEnd, pending_cleanup: *const std.ArrayList(u8)) RelayEnd {
-    if ((end == .detach or end == .session_ended) and pending_cleanup.items.len > 0) {
-        io_helpers.writeAll(1, pending_cleanup.items) catch {};
+fn finishRelay(end: RelayEnd, relay_end_restore: ?*const std.ArrayList(u8)) RelayEnd {
+    if (end == .detach or end == .session_ended) {
+        if (relay_end_restore) |restore| {
+            if (restore.items.len > 0) io_helpers.writeAll(1, restore.items) catch {};
+        }
     }
     return end;
 }
@@ -1247,16 +1719,18 @@ fn writeDetachBoundary() void {
 
 fn handleDrawFrame(
     payload: []const u8,
-    pending_cleanup: *std.ArrayList(u8),
+    relay_end_restore: ?*std.ArrayList(u8),
     scrollback_cursor: *ScrollbackCursor,
     cursor_row: ?*u16,
 ) !void {
     const draw = try parseDrawPayload(payload);
     defer freeDrawPayload(draw);
-    try io_helpers.writeAll(1, draw.bytes);
-    if (draw.cleanup_after) |cleanup| {
-        pending_cleanup.clearRetainingCapacity();
-        try pending_cleanup.appendSlice(app_allocator.allocator(), cleanup);
+    try io_helpers.writeAll(1, draw.draw_bytes);
+    if (relay_end_restore) |target| {
+        if (draw.relay_end_restore_bytes) |restore| {
+            target.clearRetainingCapacity();
+            try target.appendSlice(app_allocator.allocator(), restore);
+        }
     }
     if (scrollback_cursor.epoch != draw.scrollback_epoch) {
         scrollback_cursor.epoch = draw.scrollback_epoch;
@@ -1274,17 +1748,18 @@ fn parseDrawPayload(payload: []const u8) !DrawPayload {
         .scrollback_epoch = message.scrollback_epoch,
         .scroll_count = message.scroll_count,
         .cursor_row = @intCast(message.cursor_row),
-        .bytes = try app_allocator.allocator().dupe(u8, message.bytes),
-        .cleanup_after = if (message.cleanup_after) |cleanup|
-            try app_allocator.allocator().dupe(u8, cleanup)
+        .draw_bytes = try app_allocator.allocator().dupe(u8, message.draw_bytes),
+        .request_seq_number = message.request_seq_number,
+        .relay_end_restore_bytes = if (message.relay_end_restore_bytes) |restore|
+            try app_allocator.allocator().dupe(u8, restore)
         else
             null,
     };
 }
 
 fn freeDrawPayload(draw: DrawPayload) void {
-    app_allocator.allocator().free(draw.bytes);
-    if (draw.cleanup_after) |cleanup| app_allocator.allocator().free(cleanup);
+    app_allocator.allocator().free(draw.draw_bytes);
+    if (draw.relay_end_restore_bytes) |restore| app_allocator.allocator().free(restore);
 }
 
 fn maybeSendResize(socket_fd: c.fd_t, last_size: *WindowSize) void {
@@ -1313,4 +1788,28 @@ fn sendInput(socket_fd: c.fd_t, bytes: []const u8) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Input{ .data = bytes });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(socket_fd, .FRAME_TYPE_INPUT, payload);
+}
+
+fn sendPingRequest(socket_fd: c.fd_t) !u64 {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.PingRequest{});
+    defer app_allocator.allocator().free(payload);
+    return protocol.sendFrameWithAllocatedSeq(socket_fd, .FRAME_TYPE_PING_REQUEST, payload);
+}
+
+fn sendUnrecognizedFrame(socket_fd: c.fd_t, seq: u64, frame_type: u32) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.UnrecognizedFrame{
+        .seq = seq,
+        .frame_type = frame_type,
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(socket_fd, .FRAME_TYPE_UNRECOGNIZED, payload);
+}
+
+fn sendInputChunks(socket_fd: c.fd_t, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = @min(offset + input_chunk_bytes, bytes.len);
+        try sendInput(socket_fd, bytes[offset..end]);
+        offset = end;
+    }
 }

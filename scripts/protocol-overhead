@@ -26,19 +26,23 @@ from test_env import isolated_env
 
 
 MESSAGE_NAMES = {
-    0x0001: "HELLO",
+    0x0001: "HELLO_REQUEST",
     0x0002: "HELLO_OK",
-    0x0003: "ERROR",
+    0x0003: "HELLO_ERROR",
+    0x0004: "ERROR",
+    0x0005: "UNRECOGNIZED",
     0x0010: "COMMAND_REQUEST",
     0x0011: "SESSION_NEW",
     0x0012: "SESSION_ATTACH",
     0x0015: "INPUT",
     0x0016: "RESIZE",
     0x0017: "REPAINT",
+    0x0018: "PING_REQUEST",
     0x0020: "COMMAND_RESPONSE",
     0x0021: "SESSION_ATTACHED",
     0x0022: "SESSION_ENDED",
     0x0027: "DRAW",
+    0x0028: "PING_RESPONSE",
 }
 
 
@@ -70,7 +74,7 @@ def write_perf_shell(path):
 
 def frame_text(message_type, payload):
     if message_type == 0x0027:
-        return parse_draw(payload)["bytes"].decode(errors="replace")
+        return parse_draw(payload)["draw_bytes"].decode(errors="replace")
     return ""
 
 
@@ -104,12 +108,12 @@ def summarize_frames(frames):
         name = message_name(message_type)
         by_message[name] += 1
         payload_bytes[name] += len(payload)
-        wire_bytes[name] += len(payload) + 6
+        wire_bytes[name] += len(payload) + 16
 
         if message_type == 0x0027:
             draw_frames += 1
             parsed = parse_draw(payload)
-            draw_bytes += len(parsed["bytes"])
+            draw_bytes += len(parsed["draw_bytes"])
             draw_scroll_count += parsed["scroll_count"]
 
     return {

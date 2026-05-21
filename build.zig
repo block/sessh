@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     const gen_proto = b.step("gen-proto", "Generate Zig protobuf sources");
     const protoc_step = protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
         .destination_directory = b.path("src/proto"),
-        .source_files = &.{"proto/sessh.proto"},
+        .source_files = &.{ "proto/sessh.proto", "proto/sessh_handshake.proto" },
         .include_directories = &.{"proto"},
     });
     gen_proto.dependOn(&protoc_step.step);

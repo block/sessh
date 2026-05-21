@@ -1,8 +1,5 @@
-- Auto-detect lag
-  - allow empty input/draw to be used as ping/pong
-  - expect a draw from every batch of input (if the input doesn't result in a draw then we should emit an empty draw, possibly after some timeout)
-  - have a configurable ping/pong when there hasn't been any input after some time period
-  - show a banner when lag is detected (maybe allowing LEADER-S to force reconnection)
+- Connection responsiveness
+  - consider configurable idle ping/pong when there hasn't been any input after some time period
 - thorough auditing of the code
 
 - cursor query

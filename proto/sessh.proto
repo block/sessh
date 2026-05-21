@@ -2,17 +2,31 @@ syntax = "proto3";
 
 package sessh.protocol.v1;
 
-// Runtime frame type ids. These are the numeric values stored in the fixed
-// frame header described in docs/PROTOCOL.md.
+// Versioned remote protocol payloads.
+//
+// The stable handshake payloads live in sessh_handshake.proto. After both
+// sides accept the handshake, this file's messages are governed by
+// protocol_major/protocol_minor: a major protocol version bump permits
+// incompatible frame-format or message-schema changes, including reusing field
+// numbers with new names or semantics. Minor versions are for changes that are
+// intended to preserve forward and/or backward compatibility: if the peer
+// reports a higher minor version for the same major version, the peer is
+// responsible for remaining compatible with this side; if the peer reports a
+// lower minor version, this side decides whether it can proceed.
+//
+// Remote frame type ids. These are the numeric values stored in the fixed
+// frame header. Values are grouped by broad role rather than packed densely:
+// 0x0001-0x000f are reserved for stable connection setup/diagnostic frames
+// defined in sessh_handshake.proto, 0x0010-0x001f are client-to-remote request
+// frames, and 0x0020-0x002f are remote-to-client response/stream frames. Gaps
+// are reserved for related future frames, so the enum is intentionally
+// non-contiguous.
 enum FrameType {
   FRAME_TYPE_UNSPECIFIED = 0;
 
-  // Payload: Hello. Starts the runtime handshake.
-  FRAME_TYPE_HELLO = 0x0001;
-  // Payload: Hello. Accepts the runtime handshake.
-  FRAME_TYPE_HELLO_OK = 0x0002;
-  // Payload: Error.
-  FRAME_TYPE_ERROR = 0x0003;
+  reserved 1 to 15;
+
+  // Client-to-remote request frames.
 
   // Payload: CommandRequest.
   FRAME_TYPE_COMMAND_REQUEST = 0x0010;
@@ -26,6 +40,10 @@ enum FrameType {
   FRAME_TYPE_RESIZE = 0x0016;
   // Payload: Repaint.
   FRAME_TYPE_REPAINT = 0x0017;
+  // Payload: PingRequest.
+  FRAME_TYPE_PING_REQUEST = 0x0018;
+
+  // Remote-to-client response and stream frames.
 
   // Payload: CommandResponse.
   FRAME_TYPE_COMMAND_RESPONSE = 0x0020;
@@ -35,31 +53,8 @@ enum FrameType {
   FRAME_TYPE_SESSION_ENDED = 0x0022;
   // Payload: Draw.
   FRAME_TYPE_DRAW = 0x0027;
-}
-
-// Framed payload, bidirectional.
-//
-// The client sends this as HELLO to start the runtime handshake. The session agent
-// sends this as HELLO_OK when the handshake is accepted.
-message Hello {
-  // Runtime protocol major version. sessh currently requires an exact match.
-  uint32 protocol_major = 1;
-  // Runtime protocol minor version. sessh currently requires an exact match.
-  uint32 protocol_minor = 2;
-  // Binary version string for the sender.
-  string version = 3;
-}
-
-// Framed payload, session agent -> client.
-//
-// Reports protocol, versioning, session, or session agent errors.
-message Error {
-  // Stable machine-readable error code, such as VERSION_MISMATCH.
-  string code = 1;
-  // Human-readable error message.
-  string message = 2;
-  // Optional suggested user action. Empty means there is no hint.
-  string hint = 3;
+  // Payload: PingResponse.
+  FRAME_TYPE_PING_RESPONSE = 0x0028;
 }
 
 // Framed payload, client -> session agent.
@@ -156,6 +151,13 @@ message Repaint {
   bool include_scrollback = 1;
 }
 
+// Framed payload, client -> session agent.
+//
+// Requests a transport responsiveness acknowledgement. This measures the framed
+// path through ssh/broker/session-agent, not application output or UI rendering.
+message PingRequest {
+}
+
 // Framed payload, session agent -> client.
 //
 // Process-like response for a CommandRequest.
@@ -171,7 +173,7 @@ message CommandResponse {
 // Confirms the session selected for this connection.
 //
 // The session agent sends this after either SessionNew or SessionAttach succeeds. From
-// this point on, the runtime connection is bound to the returned session_id.
+// this point on, the remote connection is bound to the returned session_id.
 message SessionAttached {
   string session_id = 1;
 }
@@ -202,9 +204,25 @@ message Draw {
   // Modeled inner cursor row after this draw. The client uses this for
   // reconnect UI placement; it must not parse bytes or maintain a cell grid.
   uint32 cursor_row = 3;
-  // Terminal bytes to write to the outer terminal in protocol order.
-  bytes bytes = 4;
-  // Emergency cleanup bytes to install after bytes has been written. Absent
-  // leaves existing cleanup unchanged; present empty clears it.
-  optional bytes cleanup_after = 5;
+  // Self-contained terminal bytes to write to the outer terminal in protocol
+  // order. A Draw must apply and clean up any temporary terminal state it uses.
+  bytes draw_bytes = 4;
+  // Present on live output when this draw reflects input frames from this
+  // attachment up to and including this client frame seq number. This is
+  // payload-level request coverage; the frame header seq only identifies the
+  // Draw frame itself.
+  optional uint64 request_seq_number = 5;
+  // Terminal bytes the client keeps in memory and writes only when this relay
+  // ends by detach or session-end. Present empty clears a previous restore.
+  // This lets alternate-screen sessions restore the modeled primary screen on
+  // detach without applying that cleanup during reconnect.
+  optional bytes relay_end_restore_bytes = 6;
+}
+
+// Framed payload, session agent -> client.
+//
+// Acknowledges a PingRequest.
+message PingResponse {
+  // Frame seq number of the PingRequest being acknowledged.
+  uint64 request_seq_number = 1;
 }

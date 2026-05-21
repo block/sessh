@@ -19,6 +19,7 @@ const preferred_live_output_batch_bytes = 1024;
 const max_live_output_reads_per_batch = 64;
 
 const pb = protocol.pb;
+const hpb = protocol.hpb;
 
 extern "c" fn forkpty(amaster: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp: ?*c.winsize) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -85,6 +86,7 @@ const Attachment = struct {
     output_offset: usize = 0,
     input_pending: [128]u8 = [_]u8{0} ** 128,
     input_pending_len: usize = 0,
+    pending_draw_request_seq: ?u64 = null,
 
     fn queuedBytes(self: *const Attachment) usize {
         return self.output.items.len - self.output_offset;
@@ -108,8 +110,8 @@ const PollKind = union(enum) {
     attachment: usize,
 };
 
-const HelloStatus = enum {
-    compatible,
+const HandshakeResult = enum {
+    accepted,
     mismatch,
 };
 
@@ -217,6 +219,29 @@ const PresentationState = struct {
         {
             self.rendered_rows = @max(self.rendered_rows, @as(u16, @intCast(screen.rows.len)));
         }
+    }
+
+    fn applyRelayEndRestoreScreen(
+        self: *PresentationState,
+        renderer: client_renderer.Renderer,
+        session_rows: u16,
+        screen: *const vt.RenderedScreen,
+    ) !void {
+        try self.moveToRenderedTop(renderer);
+        try self.setActiveScreen(screen.active_screen);
+        try self.render(
+            renderer,
+            screen.rows,
+            screen.cursor_row,
+            screen.cursor_col,
+            screen.cursor_visible,
+            try cursorStyleFromVt(screen.cursor_style),
+            session_rows,
+        );
+        if (screen.title_dirty) try renderer.setTitle(screen.title);
+        try self.applyTerminalModes(renderer, vtModesToClient(screen.modes));
+        try self.applyDefaultColors(renderer, try vtDefaultColorsToClient(screen.default_colors));
+        self.full_height_rendering = false;
     }
 
     fn alignViewportTop(self: *PresentationState, renderer: client_renderer.Renderer, session_rows: u16) !void {
@@ -364,7 +389,6 @@ const PresentationState = struct {
     fn canApplyPlainPassthrough(
         self: *const PresentationState,
         screen: *const vt.RenderedScreen,
-        cleanup_screen: ?*const vt.RenderedScreen,
         align_viewport: bool,
         bytes: []const u8,
         parser_boundary_ok: bool,
@@ -372,7 +396,6 @@ const PresentationState = struct {
         if (!self.initialized) return false;
         if (self.full_height_rendering) return false;
         if (align_viewport) return false;
-        if (cleanup_screen != null) return false;
         if (screen.active_screen != 0) return false;
         if (screen.active_screen_changed) return false;
         if (screen.title_dirty or
@@ -887,98 +910,79 @@ fn acceptSessionAgentClient(session_agent: *SessionAgent, listen_fd: c.fd_t) voi
 }
 
 fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
-    var hello = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
-    defer hello.deinit(app_allocator.allocator());
-    if (hello.message_type != .FRAME_TYPE_HELLO) {
-        try sendError(session_agent, fd, "PROTOCOL_ERROR", "expected HELLO", "");
-        return false;
-    }
-    const hello_status = handleHello(hello.payload) catch {
-        try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid HELLO payload", "");
-        return false;
-    };
-    if (hello_status == .mismatch) {
-        try sendError(session_agent, fd, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
-        return false;
-    }
-    try sendHelloOk(fd);
+    const handshake_result = try acceptRemoteHandshake(session_agent, fd);
+    if (handshake_result == .mismatch) return false;
 
     var pending_size = PendingSize{};
     while (true) {
         var frame = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .FRAME_TYPE_RESIZE => {
-                pending_size = try readResizePayload(frame.payload);
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_RESIZE => {
+                    pending_size = try readResizePayload(frame.payload);
+                    continue;
+                },
+                .FRAME_TYPE_COMMAND_REQUEST => return try handleCommandRequest(session_agent, fd, frame.payload),
+                .FRAME_TYPE_SESSION_NEW => {
+                    if (!pending_size.present) {
+                        try sendError(session_agent, fd, "PROTOCOL_ERROR", "SESSION_NEW requires RESIZE first", "");
+                        return false;
+                    }
+                    var request = readSessionNewRequest(frame.payload) catch {
+                        try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid SESSION_NEW payload", "");
+                        return false;
+                    };
+                    defer request.deinit();
+                    const session_index = try createSession(
+                        session_agent,
+                        pending_size.rows,
+                        pending_size.cols,
+                        request.scrollback_row_count,
+                        request.environment,
+                        request.query_default_colors,
+                    );
+                    try attachSession(session_agent, session_index, fd, pending_size.rows, pending_size.cols, null, null);
+                    return true;
+                },
+                .FRAME_TYPE_SESSION_ATTACH => {
+                    if (!pending_size.present) {
+                        try sendError(session_agent, fd, "PROTOCOL_ERROR", "SESSION_ATTACH requires RESIZE first", "");
+                        return false;
+                    }
+                    var request = try readAttachRequest(frame.payload);
+                    defer request.deinit();
+                    const session_index = if (request.session_id) |id|
+                        findSessionIndex(session_agent, id)
+                    else
+                        findMostRecentDetachedSessionIndex(session_agent);
+                    const resolved_session_index = session_index orelse {
+                        try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
+                        return false;
+                    };
+                    updateSessionSize(&session_agent.sessions[resolved_session_index], pending_size.rows, pending_size.cols);
+                    try attachSession(
+                        session_agent,
+                        resolved_session_index,
+                        fd,
+                        pending_size.rows,
+                        pending_size.cols,
+                        request.initial_scrollback_row_count,
+                        request.reconnect_cursor,
+                    );
+                    return true;
+                },
+                else => {
+                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "unexpected first action", "");
+                    return false;
+                },
+            },
+            .unknown => |raw| {
+                try sendUnrecognizedFrame(fd, frame.seq, raw);
                 continue;
-            },
-            .FRAME_TYPE_COMMAND_REQUEST => return try handleCommandRequest(session_agent, fd, frame.payload),
-            .FRAME_TYPE_SESSION_NEW => {
-                if (!pending_size.present) {
-                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "SESSION_NEW requires RESIZE first", "");
-                    return false;
-                }
-                var request = readSessionNewRequest(frame.payload) catch {
-                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid SESSION_NEW payload", "");
-                    return false;
-                };
-                defer request.deinit();
-                const session_index = try createSession(
-                    session_agent,
-                    pending_size.rows,
-                    pending_size.cols,
-                    request.scrollback_row_count,
-                    request.environment,
-                    request.query_default_colors,
-                );
-                try attachSession(session_agent, session_index, fd, pending_size.rows, pending_size.cols, null, null);
-                return true;
-            },
-            .FRAME_TYPE_SESSION_ATTACH => {
-                if (!pending_size.present) {
-                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "SESSION_ATTACH requires RESIZE first", "");
-                    return false;
-                }
-                var request = try readAttachRequest(frame.payload);
-                defer request.deinit();
-                const session_index = if (request.session_id) |id|
-                    findSessionIndex(session_agent, id)
-                else
-                    findMostRecentDetachedSessionIndex(session_agent);
-                const resolved_session_index = session_index orelse {
-                    try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
-                    return false;
-                };
-                updateSessionSize(&session_agent.sessions[resolved_session_index], pending_size.rows, pending_size.cols);
-                try attachSession(
-                    session_agent,
-                    resolved_session_index,
-                    fd,
-                    pending_size.rows,
-                    pending_size.cols,
-                    request.initial_scrollback_row_count,
-                    request.reconnect_cursor,
-                );
-                return true;
-            },
-            else => {
-                try sendError(session_agent, fd, "PROTOCOL_ERROR", "unexpected first action", "");
-                return false;
             },
         }
     }
-}
-
-fn handleHello(payload: []const u8) !HelloStatus {
-    var hello = try protocol.decodePayload(pb.Hello, app_allocator.allocator(), payload);
-    defer hello.deinit(app_allocator.allocator());
-    if (hello.protocol_major != config.protocol_major or
-        hello.protocol_minor != config.protocol_minor or
-        !std.mem.eql(u8, hello.version, config.version))
-    {
-        return .mismatch;
-    }
-    return .compatible;
 }
 
 fn handleCommandRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !bool {
@@ -1086,19 +1090,113 @@ fn logSessionAgent(session_agent: *SessionAgent, comptime fmt: []const u8, args:
     }
 }
 
-fn sendHelloOk(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Hello{
+fn acceptRemoteHandshake(session_agent: *SessionAgent, fd: c.fd_t) !HandshakeResult {
+    var peer_hello = try readHelloRequest(fd);
+    defer peer_hello.deinit(app_allocator.allocator());
+    if (!helloRequestIsCompatible(peer_hello)) {
+        try sendHelloError(fd, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
+        return .mismatch;
+    }
+    try sendHelloOk(fd);
+    try sendHelloRequest(fd);
+    var hello_error = try readHelloReply(fd);
+    defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
+    if (hello_error) |err| {
+        logSessionAgent(session_agent, "event=handshake_rejected code={s} message={s}", .{
+            err.code,
+            err.message,
+        });
+        return .mismatch;
+    }
+    return .accepted;
+}
+
+fn readHelloRequest(fd: c.fd_t) !hpb.HelloRequest {
+    while (true) {
+        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_HELLO_REQUEST => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
+                .FRAME_TYPE_UNRECOGNIZED => continue,
+                else => {
+                    try sendHelloError(fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
+                    return error.UnexpectedFrame;
+                },
+            },
+            .unknown => |raw| {
+                try sendUnrecognizedFrame(fd, frame.seq, raw);
+                continue;
+            },
+        }
+    }
+}
+
+fn readHelloReply(fd: c.fd_t) !?hpb.HelloError {
+    while (true) {
+        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .known => |message_type| switch (message_type) {
+                .FRAME_TYPE_HELLO_OK => {
+                    var ok = try protocol.decodePayload(hpb.HelloOk, app_allocator.allocator(), frame.payload);
+                    defer ok.deinit(app_allocator.allocator());
+                    return null;
+                },
+                .FRAME_TYPE_HELLO_ERROR => {
+                    const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
+                    return err;
+                },
+                .FRAME_TYPE_UNRECOGNIZED => continue,
+                else => return error.UnexpectedFrame,
+            },
+            .unknown => |raw| {
+                try sendUnrecognizedFrame(fd, frame.seq, raw);
+                continue;
+            },
+        }
+    }
+}
+
+fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
+    return hello.protocol_major == config.protocol_major and
+        hello.protocol_minor >= config.protocol_minor and
+        std.mem.eql(u8, hello.version, config.version);
+}
+
+fn sendHelloRequest(fd: c.fd_t) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloRequest{
         .protocol_major = config.protocol_major,
         .protocol_minor = config.protocol_minor,
         .version = config.version,
     });
     defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_REQUEST, payload);
+}
+
+fn sendHelloOk(fd: c.fd_t) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
+    defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_OK, payload);
+}
+
+fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloError{
+        .code = code,
+        .message = message,
+        .hint = hint,
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_ERROR, payload);
 }
 
 fn sendError(session_agent: *SessionAgent, fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
     logSessionAgent(session_agent, "event=error code={s} message={s}", .{ code, message });
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Error{
+    try sendErrorFrame(fd, code, message, hint);
+}
+
+fn sendErrorFrame(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
         .code = code,
         .message = message,
         .hint = hint,
@@ -1107,15 +1205,33 @@ fn sendError(session_agent: *SessionAgent, fd: c.fd_t, code: []const u8, message
     try protocol.sendFrame(fd, .FRAME_TYPE_ERROR, payload);
 }
 
+fn sendUnrecognizedFrame(fd: c.fd_t, seq: u64, frame_type: u32) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.UnrecognizedFrame{
+        .seq = seq,
+        .frame_type = frame_type,
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_UNRECOGNIZED, payload);
+}
+
 fn queueAttachmentError(session_agent: *SessionAgent, attachment: *Attachment, code: []const u8, message: []const u8, hint: []const u8) !void {
     logSessionAgent(session_agent, "event=error code={s} message={s}", .{ code, message });
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Error{
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
         .code = code,
         .message = message,
         .hint = hint,
     });
     defer app_allocator.allocator().free(payload);
     try queueAttachmentFrame(attachment, .FRAME_TYPE_ERROR, payload);
+}
+
+fn queueAttachmentUnrecognized(attachment: *Attachment, seq: u64, frame_type: u32) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.UnrecognizedFrame{
+        .seq = seq,
+        .frame_type = frame_type,
+    });
+    defer app_allocator.allocator().free(payload);
+    try queueAttachmentFrame(attachment, .FRAME_TYPE_UNRECOGNIZED, payload);
 }
 
 fn sendCommandResponse(fd: c.fd_t, exit_status: u8, stdout: []const u8, stderr: []const u8) !void {
@@ -1239,18 +1355,42 @@ fn queueDrawFrame(
     attachment: *Attachment,
     session: *const Session,
     scroll_count: u64,
-    bytes: []const u8,
-    cleanup_after: ?[]const u8,
+    draw_bytes: []const u8,
+    request_seq_number: ?u64,
+    relay_end_restore_bytes: ?[]const u8,
 ) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Draw{
         .scrollback_epoch = session.scrollback_epoch,
         .scroll_count = scroll_count,
         .cursor_row = attachment.presentation.cursor_row,
-        .bytes = bytes,
-        .cleanup_after = cleanup_after,
+        .draw_bytes = draw_bytes,
+        .request_seq_number = request_seq_number,
+        .relay_end_restore_bytes = relay_end_restore_bytes,
     });
     defer app_allocator.allocator().free(payload);
     try queueAttachmentFrame(attachment, .FRAME_TYPE_DRAW, payload);
+}
+
+fn appendDrawCleanup(draw_bytes: *std.ArrayList(u8)) !void {
+    const renderer = client_renderer.Renderer.buffered(draw_bytes, .{ .kind = .xterm_compatible });
+    try renderer.restoreBannerPresentation();
+}
+
+fn appendRelayEndRestoreBytes(
+    attachment: *const Attachment,
+    session: *const Session,
+    screen: *const vt.RenderedScreen,
+    restore_screen: ?*const vt.RenderedScreen,
+    restore_bytes: *std.ArrayList(u8),
+) !?[]const u8 {
+    if (restore_screen) |primary| {
+        var restore_presentation = attachment.presentation;
+        const restore_renderer = client_renderer.Renderer.buffered(restore_bytes, .{ .kind = .xterm_compatible });
+        try restore_presentation.applyRelayEndRestoreScreen(restore_renderer, session.rows, primary);
+        return restore_bytes.items;
+    }
+    if (screen.active_screen == 0) return "";
+    return null;
 }
 
 fn queueScrollbackRowsDraw(attachment: *Attachment, session: *const Session, rows: []const vt.RenderedRow) !void {
@@ -1260,7 +1400,7 @@ fn queueScrollbackRowsDraw(attachment: *Attachment, session: *const Session, row
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    try queueDrawFrame(attachment, session, @intCast(rows.len), bytes.items, null);
+    try queueDrawFrame(attachment, session, @intCast(rows.len), bytes.items, null, null);
 }
 
 fn queueScrollbackRowsAndScreenDraw(
@@ -1268,8 +1408,9 @@ fn queueScrollbackRowsAndScreenDraw(
     session: *const Session,
     rows: []const vt.RenderedRow,
     screen: *const vt.RenderedScreen,
-    cleanup_screen: ?*const vt.RenderedScreen,
+    restore_screen: ?*const vt.RenderedScreen,
     align_viewport: bool,
+    request_seq_number: ?u64,
 ) !void {
     if (rows.len == 0) return;
     if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
@@ -1277,13 +1418,12 @@ fn queueScrollbackRowsAndScreenDraw(
     const passthrough = session.pending_plain_output.items;
     if (try attachment.presentation.canApplyPlainPassthrough(
         screen,
-        cleanup_screen,
         align_viewport,
         passthrough,
         session.pendingPlainOutputCanReplay(),
     )) {
         try attachment.presentation.assumePlainPassthroughScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, @intCast(rows.len), passthrough, null);
+        try queueDrawFrame(attachment, session, @intCast(rows.len), passthrough, request_seq_number, null);
         return;
     }
 
@@ -1295,20 +1435,11 @@ fn queueScrollbackRowsAndScreenDraw(
     try attachment.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
     if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
     updateMouseOriginAfterDraw(attachment, screen);
-
-    var cleanup_bytes = std.ArrayList(u8).empty;
-    defer cleanup_bytes.deinit(app_allocator.allocator());
-    const cleanup: ?[]const u8 = if (cleanup_screen) |primary| cleanup: {
-        var cleanup_presentation = attachment.presentation;
-        const cleanup_renderer = client_renderer.Renderer.buffered(&cleanup_bytes, .{ .kind = .xterm_compatible });
-        try cleanup_presentation.applyScreen(cleanup_renderer, session.rows, primary, true, false);
-        break :cleanup cleanup_bytes.items;
-    } else if (screen.active_screen == 0)
-        ""
-    else
-        null;
-
-    try queueDrawFrame(attachment, session, @intCast(rows.len), bytes.items, cleanup);
+    try appendDrawCleanup(&bytes);
+    var restore_bytes = std.ArrayList(u8).empty;
+    defer restore_bytes.deinit(app_allocator.allocator());
+    const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
+    try queueDrawFrame(attachment, session, @intCast(rows.len), bytes.items, request_seq_number, restore);
 }
 
 fn queueScrollbackTruncatedDraw(attachment: *Attachment, session: *const Session, truncated_rows: u64) !void {
@@ -1317,7 +1448,7 @@ fn queueScrollbackTruncatedDraw(attachment: *Attachment, session: *const Session
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
-    try queueDrawFrame(attachment, session, truncated_rows, bytes.items, null);
+    try queueDrawFrame(attachment, session, truncated_rows, bytes.items, null, null);
 }
 
 fn appendScrollbackTruncatedMarker(bytes: *std.ArrayList(u8), renderer: client_renderer.Renderer, truncated_rows: u64) !void {
@@ -1355,21 +1486,21 @@ fn queueScreenDraw(
     attachment: *Attachment,
     session: *const Session,
     screen: *const vt.RenderedScreen,
-    cleanup_screen: ?*const vt.RenderedScreen,
+    restore_screen: ?*const vt.RenderedScreen,
     force_redraw: bool,
     align_viewport: bool,
-) !void {
+    request_seq_number: ?u64,
+) !bool {
     const passthrough = session.pending_plain_output.items;
     if (try attachment.presentation.canApplyPlainPassthrough(
         screen,
-        cleanup_screen,
         align_viewport,
         passthrough,
         session.pendingPlainOutputCanReplay(),
     )) {
         try attachment.presentation.assumePlainPassthroughScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, 0, passthrough, null);
-        return;
+        try queueDrawFrame(attachment, session, 0, passthrough, request_seq_number, null);
+        return true;
     }
 
     var bytes = std.ArrayList(u8).empty;
@@ -1380,19 +1511,14 @@ fn queueScreenDraw(
     if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
     updateMouseOriginAfterDraw(attachment, screen);
     if (bytes.items.len > 0) {
-        var cleanup_bytes = std.ArrayList(u8).empty;
-        defer cleanup_bytes.deinit(app_allocator.allocator());
-        const cleanup: ?[]const u8 = if (cleanup_screen) |primary| cleanup: {
-            var cleanup_presentation = attachment.presentation;
-            const cleanup_renderer = client_renderer.Renderer.buffered(&cleanup_bytes, .{ .kind = .xterm_compatible });
-            try cleanup_presentation.applyScreen(cleanup_renderer, session.rows, primary, true, false);
-            break :cleanup cleanup_bytes.items;
-        } else if (screen.active_screen == 0)
-            ""
-        else
-            null;
-        try queueDrawFrame(attachment, session, 0, bytes.items, cleanup);
+        try appendDrawCleanup(&bytes);
+        var restore_bytes = std.ArrayList(u8).empty;
+        defer restore_bytes.deinit(app_allocator.allocator());
+        const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
+        try queueDrawFrame(attachment, session, 0, bytes.items, request_seq_number, restore);
+        return true;
     }
+    return false;
 }
 
 fn advanceScrollbackEpoch(session: *Session) void {
@@ -1400,12 +1526,12 @@ fn advanceScrollbackEpoch(session: *Session) void {
     if (session.scrollback_epoch == 0) session.scrollback_epoch = 1;
 }
 
-fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session) !void {
+fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session, request_seq_number: ?u64) !void {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try renderer.clearScrollback();
-    try queueDrawFrame(attachment, session, 0, bytes.items, null);
+    try queueDrawFrame(attachment, session, 0, bytes.items, request_seq_number, null);
 }
 
 fn queueRepaintDraw(
@@ -1428,7 +1554,8 @@ fn queueRepaintDraw(
     try attachment.presentation.applyScreen(renderer, session.rows, screen, true, screenWantsMouseReporting(screen));
     attachment.origin = .{ .row = 0, .col = 0 };
     updateMouseOriginAfterDraw(attachment, screen);
-    try queueDrawFrame(attachment, session, truncated_rows + @as(u64, @intCast(rows.len)), bytes.items, null);
+    try appendDrawCleanup(&bytes);
+    try queueDrawFrame(attachment, session, truncated_rows + @as(u64, @intCast(rows.len)), bytes.items, null, null);
 }
 
 fn sendSessionSnapshot(
@@ -1448,7 +1575,7 @@ fn sendSessionSnapshot(
         if (reconnect_cursor) |cursor| {
             if (cursor.epoch != session.scrollback_epoch) {
                 advanceScrollbackEpoch(session);
-                try queueRetainedScrollbackClearDraw(attachment, session);
+                try queueRetainedScrollbackClearDraw(attachment, session, null);
                 truncated_rows_to_report = scrollback.truncated_rows;
             } else if (cursor.seen_rows < scrollback.truncated_rows) {
                 truncated_rows_to_report = scrollback.truncated_rows - cursor.seen_rows;
@@ -1474,13 +1601,14 @@ fn sendSessionSnapshot(
         if (screen.active_screen == 1) {
             primary_screen = try model.renderedPrimaryScreen(app_allocator.allocator());
         }
-        try queueScreenDraw(
+        _ = try queueScreenDraw(
             attachment,
             session,
             &screen,
             if (primary_screen) |*primary| primary else null,
             true,
             false,
+            null,
         );
         model.markScrollbackReported();
         model.markRendered(screen.rows.len);
@@ -1852,20 +1980,31 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
     defer frame.deinit(app_allocator.allocator());
 
     switch (frame.message_type) {
-        .FRAME_TYPE_INPUT => handleInputFrame(session_agent, attachment_index, frame.payload),
-        .FRAME_TYPE_RESIZE => handleResizeFrame(session_agent, attachment_index, frame.payload),
-        .FRAME_TYPE_REPAINT => handleRepaintFrame(session_agent, attachment_index, frame.payload),
-        else => {
-            queueAttachmentError(session_agent, attachment, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
+        .known => |message_type| switch (message_type) {
+            .FRAME_TYPE_INPUT => handleInputFrame(session_agent, attachment_index, frame.seq, frame.payload),
+            .FRAME_TYPE_RESIZE => handleResizeFrame(session_agent, attachment_index, frame.payload),
+            .FRAME_TYPE_REPAINT => handleRepaintFrame(session_agent, attachment_index, frame.payload),
+            .FRAME_TYPE_PING_REQUEST => handlePingRequestFrame(session_agent, attachment_index, frame.seq, frame.payload),
+            .FRAME_TYPE_UNRECOGNIZED => {},
+            else => {
+                queueAttachmentError(session_agent, attachment, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
+                    detachAttachment(session_agent, attachment_index);
+                    return;
+                };
+                closeAttachmentAfterFlush(session_agent, attachment_index);
+            },
+        },
+        .unknown => |raw| {
+            queueAttachmentUnrecognized(attachment, frame.seq, raw) catch {
                 detachAttachment(session_agent, attachment_index);
                 return;
             };
-            closeAttachmentAfterFlush(session_agent, attachment_index);
+            flushAttachmentOutput(session_agent, attachment_index);
         },
     }
 }
 
-fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
+fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, request_seq_number: u64, payload: []const u8) void {
     const attachment = &session_agent.attachments[attachment_index];
     const session = &session_agent.sessions[attachment.session_index];
     var input = protocol.decodePayload(pb.Input, app_allocator.allocator(), payload) catch {
@@ -1889,7 +2028,29 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, paylo
 
     io.writeAll(session.pty_fd, translated.items) catch {
         detachAttachment(session_agent, attachment_index);
+        return;
     };
+    attachment.pending_draw_request_seq = request_seq_number;
+}
+
+fn handlePingRequestFrame(session_agent: *SessionAgent, attachment_index: usize, request_seq_number: u64, payload: []const u8) void {
+    const attachment = &session_agent.attachments[attachment_index];
+    var request = protocol.decodePayload(pb.PingRequest, app_allocator.allocator(), payload) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    defer request.deinit(app_allocator.allocator());
+
+    const response_payload = protocol.encodePayload(app_allocator.allocator(), pb.PingResponse{ .request_seq_number = request_seq_number }) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    defer app_allocator.allocator().free(response_payload);
+    queueAttachmentFrame(attachment, .FRAME_TYPE_PING_RESPONSE, response_payload) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    flushAttachmentOutput(session_agent, attachment_index);
 }
 
 const SgrMouseReport = struct {
@@ -2105,7 +2266,7 @@ fn handleRepaintFrame(session_agent: *SessionAgent, attachment_index: usize, pay
         };
         model.markScrollbackReported();
     } else {
-        queueScreenDraw(attachment, session, &screen, null, true, false) catch {
+        _ = queueScreenDraw(attachment, session, &screen, null, true, false, null) catch {
             detachAttachment(session_agent, attachment_index);
             return;
         };
@@ -2164,11 +2325,21 @@ fn broadcastSessionPatch(session_agent: *SessionAgent, session_index: usize) voi
     for (&session_agent.attachments, 0..) |*attachment, i| {
         if (!attachment.active or attachment.session_index != session_index) continue;
         if (attachment.close_after_flush) continue;
+        const request_seq_number = attachment.pending_draw_request_seq;
+        var request_seq_queued = false;
+        const clear_is_only_draw = screen.retained_scrollback_clear_dirty and
+            scrollback.rows.len == 0 and
+            !should_send_screen_draw;
         if (screen.retained_scrollback_clear_dirty) {
-            queueRetainedScrollbackClearDraw(attachment, session) catch {
+            queueRetainedScrollbackClearDraw(
+                attachment,
+                session,
+                if (clear_is_only_draw) request_seq_number else null,
+            ) catch {
                 detachAttachment(session_agent, i);
                 continue;
             };
+            request_seq_queued = clear_is_only_draw and request_seq_number != null;
         }
         if (scrollback.rows.len > 0) {
             queueScrollbackRowsAndScreenDraw(
@@ -2178,23 +2349,27 @@ fn broadcastSessionPatch(session_agent: *SessionAgent, session_index: usize) voi
                 &screen,
                 if (primary_screen) |*primary| primary else null,
                 materialize_screen_after_scrollback,
+                request_seq_number,
             ) catch {
                 detachAttachment(session_agent, i);
                 continue;
             };
+            request_seq_queued = request_seq_number != null;
         } else if (should_send_screen_draw) {
-            queueScreenDraw(
+            request_seq_queued = queueScreenDraw(
                 attachment,
                 session,
                 &screen,
                 if (primary_screen) |*primary| primary else null,
                 materialize_screen_after_scrollback,
                 materialize_screen_after_scrollback,
+                request_seq_number,
             ) catch {
                 detachAttachment(session_agent, i);
                 continue;
             };
         }
+        if (request_seq_queued) attachment.pending_draw_request_seq = null;
         flushAttachmentOutput(session_agent, i);
         if (attachment.active) delivered = true;
     }

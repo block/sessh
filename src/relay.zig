@@ -3,6 +3,7 @@ const c = std.c;
 const posix = std.posix;
 
 const io = @import("io.zig");
+const protocol = @import("protocol.zig");
 
 pub fn relayFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, agent_fd: c.fd_t) !void {
     var pollfds = [_]posix.pollfd{
@@ -23,17 +24,14 @@ pub fn relayFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, agent_fd: c.fd_t) !void 
 }
 
 fn copyOneFrame(read_fd: c.fd_t, write_fd: c.fd_t) !bool {
-    var header: [6]u8 = undefined;
+    var header: [protocol.frame_header_len]u8 = undefined;
     io.readExact(read_fd, &header) catch |err| switch (err) {
         error.EndOfStream => return false,
         else => return err,
     };
     try io.writeAll(write_fd, &header);
 
-    var remaining: usize = (@as(u32, header[0]) << 24) |
-        (@as(u32, header[1]) << 16) |
-        (@as(u32, header[2]) << 8) |
-        @as(u32, header[3]);
+    var remaining = protocol.payloadLenFromHeader(&header);
     var buf: [16 * 1024]u8 = undefined;
     while (remaining > 0) {
         const chunk_len = @min(remaining, buf.len);
