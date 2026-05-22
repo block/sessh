@@ -12,6 +12,8 @@ const terminal = @import("terminal.zig");
 
 const bootstrapper_script = @embedFile("bootstrapper.sh");
 const max_artifact_bytes = 64 * 1024 * 1024;
+const max_artifact_manifest_bytes = 16 * 1024;
+const artifact_manifest_filename = "artifacts.manifest";
 const default_ipqos_option_prefix = "-oIPQoS=";
 const ssh_config_query_max_output_bytes = 256 * 1024;
 
@@ -63,7 +65,6 @@ const ArtifactEntry = struct {
     arch: []u8,
     path: []u8,
     hash_hex: [64]u8,
-    size: u64,
 
     fn deinit(self: *ArtifactEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -1783,6 +1784,10 @@ fn loadPackagedArtifactSet(allocator: std.mem.Allocator, exe_path: []const u8) !
 }
 
 fn loadPackagedArtifactSetFromDir(allocator: std.mem.Allocator, artifact_dir: []const u8) !?ArtifactSet {
+    if (try loadPackagedArtifactManifest(allocator, artifact_dir)) |artifact_set| {
+        return artifact_set;
+    }
+
     var found_any = false;
     for (packaged_artifact_targets) |target| {
         const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.filename });
@@ -1821,6 +1826,99 @@ fn loadPackagedArtifactSetFromDir(allocator: std.mem.Allocator, artifact_dir: []
         .allocator = allocator,
         .artifact_set_id = try allocator.dupe(u8, config.version),
         .entries = entries,
+    };
+}
+
+fn loadPackagedArtifactManifest(allocator: std.mem.Allocator, artifact_dir: []const u8) !?ArtifactSet {
+    const manifest_path = try std.fs.path.join(allocator, &.{ artifact_dir, artifact_manifest_filename });
+    defer allocator.free(manifest_path);
+
+    const file = std.fs.openFileAbsolute(manifest_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(allocator, max_artifact_manifest_bytes);
+    defer allocator.free(bytes);
+
+    return try parsePackagedArtifactManifest(allocator, artifact_dir, bytes);
+}
+
+fn parsePackagedArtifactManifest(
+    allocator: std.mem.Allocator,
+    artifact_dir: []const u8,
+    bytes: []const u8,
+) !ArtifactSet {
+    var entries = try allocator.alloc(ArtifactEntry, packaged_artifact_targets.len);
+    errdefer allocator.free(entries);
+    var seen = [_]bool{false} ** packaged_artifact_targets.len;
+    errdefer {
+        for (seen, 0..) |entry_seen, i| {
+            if (entry_seen) entries[i].deinit(allocator);
+        }
+    }
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (line.len == 0) continue;
+
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        const filename = fields.next() orelse return error.InvalidArtifactManifest;
+        const hash_hex = fields.next() orelse return error.InvalidArtifactManifest;
+        if (fields.next() != null) return error.InvalidArtifactManifest;
+
+        const target_index = packagedArtifactTargetIndex(filename) orelse return error.InvalidArtifactManifest;
+        if (seen[target_index]) return error.InvalidArtifactManifest;
+        const target = packaged_artifact_targets[target_index];
+        if (!isLowerSha256Hex(hash_hex)) return error.InvalidArtifactManifest;
+
+        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.filename });
+        entries[target_index] = try artifactEntryFromManifest(allocator, path, target, hash_hex);
+        seen[target_index] = true;
+    }
+
+    for (seen) |entry_seen| {
+        if (!entry_seen) return error.InvalidArtifactManifest;
+    }
+
+    return .{
+        .allocator = allocator,
+        .artifact_set_id = try allocator.dupe(u8, config.version),
+        .entries = entries,
+    };
+}
+
+fn artifactEntryFromManifest(
+    allocator: std.mem.Allocator,
+    path: []u8,
+    target: PackagedArtifactTarget,
+    hash_text: []const u8,
+) !ArtifactEntry {
+    errdefer allocator.free(path);
+
+    const id = try std.fmt.allocPrint(
+        allocator,
+        "sessh-{s}-{s}-{s}",
+        .{ config.version, target.os, target.arch },
+    );
+    errdefer allocator.free(id);
+
+    const os = try allocator.dupe(u8, target.os);
+    errdefer allocator.free(os);
+    const arch = try allocator.dupe(u8, target.arch);
+    errdefer allocator.free(arch);
+
+    var hash_hex: [64]u8 = undefined;
+    @memcpy(hash_hex[0..], hash_text);
+
+    return .{
+        .id = id,
+        .os = os,
+        .arch = arch,
+        .path = path,
+        .hash_hex = hash_hex,
     };
 }
 
@@ -1870,7 +1968,6 @@ fn loadArtifactEntryForPlatform(
         .arch = try allocator.dupe(u8, platform.arch),
         .path = try allocator.dupe(u8, path),
         .hash_hex = std.fmt.bytesToHex(digest, .lower),
-        .size = bytes.len,
     };
 }
 
@@ -1886,7 +1983,6 @@ fn sendUpload(
 
     const bytes = try file.readToEndAlloc(allocator, max_artifact_bytes);
     defer allocator.free(bytes);
-    if (artifact.size != bytes.len) return error.ArtifactSizeMismatch;
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -1946,6 +2042,22 @@ fn artifactFilenameForPlatform(platform: Platform) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn packagedArtifactTargetIndex(filename: []const u8) ?usize {
+    for (packaged_artifact_targets, 0..) |target, i| {
+        if (std.mem.eql(u8, target.filename, filename)) return i;
+    }
+    return null;
+}
+
+fn isLowerSha256Hex(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| switch (byte) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
 }
 
 fn closeChildStdin(child: *std.process.Child) void {
@@ -2071,6 +2183,35 @@ test "artifactFilenameForPlatform maps canonical platform fields to packaged nam
         .os = "linux",
         .arch = "sparc",
     }));
+}
+
+test "packaged artifact manifest supplies hashes without hashing artifact contents" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const zero_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    var manifest: std.ArrayList(u8) = .empty;
+    defer manifest.deinit(std.testing.allocator);
+    for (packaged_artifact_targets) |target| {
+        try tmp.dir.writeFile(.{ .sub_path = target.filename, .data = "x" });
+        try manifest.writer(std.testing.allocator).print(
+            "{s} {s}\n",
+            .{ target.filename, zero_hash },
+        );
+    }
+    try tmp.dir.writeFile(.{ .sub_path = artifact_manifest_filename, .data = manifest.items });
+
+    const artifact_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(artifact_dir);
+    var artifact_set = (try loadPackagedArtifactSetFromDir(std.testing.allocator, artifact_dir)) orelse {
+        return error.MissingArtifactSet;
+    };
+    defer artifact_set.deinit();
+
+    const entry = artifact_set.find(.{ .os = "linux", .arch = "x86_64" }) orelse {
+        return error.MissingArtifactEntry;
+    };
+    try std.testing.expectEqualStrings(zero_hash, entry.hash_hex[0..]);
 }
 
 test "shellQuote produces single-quoted shell words" {

@@ -145,9 +145,6 @@ canonical_platform() {
   printf '%s %s\n' "$os" "$arch"
 }
 
-probe_sha256 || err MISSING_TOOL sha256
-probe_base64 || err MISSING_TOOL base64
-
 IFS= read -r exec_line || err INVALID_EXEC missing_exec
 set -- $exec_line
 [ "$#" -ge 3 ] || err INVALID_EXEC expected_exec_set_and_hashes
@@ -176,11 +173,8 @@ cache_dir=$cache_root/$artifact_set_id
 for hash in $hashes; do
   candidate=$cache_dir/$hash
   if [ -f "$candidate" ] && [ -x "$candidate" ]; then
-      actual=$(sha256_file "$candidate") || actual=
-    if [ "$actual" = "$hash" ]; then
-      printf 'OK\n'
-      exec "$candidate" :internal-host-broker: $broker_args
-    fi
+    printf 'OK\n'
+    exec "$candidate" :internal-host-broker: $broker_args
   fi
 done
 
@@ -197,11 +191,13 @@ payload=$4
 
 is_safe_artifact_id "$artifact_id" || err INVALID_UPLOAD invalid_artifact_id
 is_sha256 "$upload_hash" || err INVALID_UPLOAD invalid_sha256
+probe_base64 || err MISSING_TOOL base64
 mkdir -p "$cache_dir" || err INSTALL_FAILED mkdir
 
 tmp=$cache_dir/.$upload_hash.tmp.$$
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
 decode_base64_to_file "$payload" "$tmp" || err INVALID_UPLOAD base64_decode_failed
+probe_sha256 || err MISSING_TOOL sha256
 actual=$(sha256_file "$tmp") || err INSTALL_FAILED sha256_failed
 [ "$actual" = "$upload_hash" ] || err CHECKSUM_MISMATCH expected_$upload_hash
 chmod 700 "$tmp" || err INSTALL_FAILED chmod

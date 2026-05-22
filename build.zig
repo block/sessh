@@ -130,6 +130,18 @@ fn addArtifactsStep(b: *std.Build, protoc_step: *std.Build.Step) *std.Build.Step
         },
     };
 
+    const manifest_mod = b.createModule(.{
+        .root_source_file = b.path("src/artifact_manifest.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const manifest_tool = b.addExecutable(.{
+        .name = "sessh-artifact-manifest",
+        .root_module = manifest_mod,
+    });
+    const manifest_run = b.addRunArtifact(manifest_tool);
+    const manifest_file = manifest_run.addOutputFileArg("artifacts.manifest");
+
     for (artifact_targets) |artifact_target| {
         const artifact = artifactExecutable(
             b,
@@ -142,7 +154,13 @@ fn addArtifactsStep(b: *std.Build, protoc_step: *std.Build.Step) *std.Build.Step
             .dest_sub_path = b.fmt("libexec/sessh/{s}", .{artifact_target.filename}),
         });
         artifacts_step.dependOn(&install.step);
+
+        manifest_run.addArg(artifact_target.filename);
+        manifest_run.addFileArg(artifact.getEmittedBin());
     }
+
+    const manifest_install = b.addInstallFile(manifest_file, "libexec/sessh/artifacts.manifest");
+    artifacts_step.dependOn(&manifest_install.step);
 
     return artifacts_step;
 }

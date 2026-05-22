@@ -23,7 +23,7 @@ def run_bootstrapper(input_text, env, extra_env=None):
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        ["sh", str(BOOTSTRAPPER)],
+        ["/bin/sh", str(BOOTSTRAPPER)],
         cwd=ROOT,
         env=env,
         input=input_text,
@@ -64,8 +64,11 @@ def assert_ok(process):
         raise AssertionError(process)
 
 
-def test_cache_hit_execs_without_platform_roundtrip(tmp):
+def test_cache_hit_execs_without_platform_or_tool_probe(tmp):
     env = isolated_env(tmp)
+    fake_bin = tmp / "fake-bin"
+    fake_bin.mkdir()
+    env["PATH"] = str(fake_bin)
     artifact = b"#!/bin/sh\nprintf 'CACHED %s\\n' \"$*\"\n"
     artifact_hash = sha256(artifact)
     write_executable(artifact_path(env, artifact_hash), artifact)
@@ -117,7 +120,7 @@ def test_invalid_artifact_set_is_rejected(tmp):
         raise AssertionError(result.stdout)
 
 
-def test_cache_mismatch_does_not_exec(tmp):
+def test_cache_hit_trusts_hash_named_executable(tmp):
     env = isolated_env(tmp)
     expected = b"#!/bin/sh\nprintf 'EXPECTED\\n'\n"
     wrong = b"#!/bin/sh\nprintf 'WRONG\\n'\n"
@@ -126,11 +129,29 @@ def test_cache_mismatch_does_not_exec(tmp):
 
     result = run_bootstrapper(f"EXEC test-set {expected_hash}\n", env)
 
+    assert_ok(result)
+    if result.stdout != "OK\nWRONG\n":
+        raise AssertionError(result.stdout)
+
+
+def test_cache_miss_reports_platform_before_tool_probe(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-bin"
+    write_fake_uname(fake_bin / "uname")
+    env["PATH"] = str(fake_bin)
+
+    result = run_bootstrapper(
+        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000\n",
+        env,
+        extra_env={
+            "SESSH_FAKE_UNAME_S": "Linux",
+            "SESSH_FAKE_UNAME_M": "x86_64",
+        },
+    )
+
     if result.returncode == 0:
         raise AssertionError(result)
-    if "WRONG" in result.stdout:
-        raise AssertionError(result.stdout)
-    if not result.stdout.startswith("MISSING "):
+    if result.stdout != "MISSING linux x86_64\nERR MISSING_UPLOAD expected_upload\n":
         raise AssertionError(result.stdout)
 
 
@@ -191,10 +212,11 @@ def run_test(name, fn):
 
 def main():
     tests = (
-        ("cache hit execs without platform roundtrip", test_cache_hit_execs_without_platform_roundtrip),
+        ("cache hit execs without platform or tool probe", test_cache_hit_execs_without_platform_or_tool_probe),
         ("upload installs and execs", test_upload_installs_and_execs),
         ("invalid artifact set is rejected", test_invalid_artifact_set_is_rejected),
-        ("cache mismatch does not exec", test_cache_mismatch_does_not_exec),
+        ("cache hit trusts hash-named executable", test_cache_hit_trusts_hash_named_executable),
+        ("cache miss reports platform before tool probe", test_cache_miss_reports_platform_before_tool_probe),
         ("platform strings are canonicalized", test_platform_strings_are_canonicalized),
         ("unsupported platform is structured error", test_unsupported_platform_is_structured_error),
     )
