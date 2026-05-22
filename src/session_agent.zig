@@ -24,6 +24,15 @@ const hpb = protocol.hpb;
 extern "c" fn forkpty(amaster: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp: ?*c.winsize) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
+var shutdown_signal_write_fd: c.fd_t = -1;
+
+fn handleShutdownSignal(_: c_int) callconv(.c) void {
+    const fd = shutdown_signal_write_fd;
+    if (fd < 0) return;
+    var byte = [_]u8{1};
+    _ = c.write(fd, &byte, byte.len);
+}
+
 const Session = struct {
     id: [64]u8 = [_]u8{0} ** 64,
     id_len: usize = 0,
@@ -36,7 +45,6 @@ const Session = struct {
     scrollback_epoch: u64 = 1,
     last_scrollback_clear_epoch: u64 = 1,
     end_reason: u8 = 0,
-    kill_waiter_fd: c.fd_t = -1,
     attached: bool = false,
     alive: bool = false,
     pending_plain_output: std.ArrayList(u8) = .empty,
@@ -98,6 +106,7 @@ const SessionAgent = struct {
     attachments: [max_attachments]Attachment = [_]Attachment{Attachment{}} ** max_attachments,
     next_id: usize = 1,
     running: bool = true,
+    shutting_down: bool = false,
     log_file: ?std.fs.File = null,
     fixed_session_id: ?[]const u8 = null,
     session_paths: ?session_registry.SessionPaths = null,
@@ -106,6 +115,7 @@ const SessionAgent = struct {
 
 const PollKind = union(enum) {
     listen,
+    shutdown_signal,
     session: usize,
     attachment: usize,
 };
@@ -741,26 +751,6 @@ fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
     };
 }
 
-const CommandOutput = struct {
-    buf: []u8,
-    len: usize = 0,
-
-    fn written(self: *const CommandOutput) []const u8 {
-        return self.buf[0..self.len];
-    }
-
-    fn append(self: *CommandOutput, bytes: []const u8) !void {
-        if (self.len + bytes.len > self.buf.len) return error.PayloadTooLarge;
-        @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
-        self.len += bytes.len;
-    }
-
-    fn print(self: *CommandOutput, comptime fmt: []const u8, args: anytype) !void {
-        const formatted = try std.fmt.bufPrint(self.buf[self.len..], fmt, args);
-        self.len += formatted.len;
-    }
-};
-
 /// Run one long-lived agent for exactly one session directory.
 ///
 /// This is the process shape used by the session-agent architecture. It still
@@ -770,6 +760,13 @@ pub fn runSessionAgent(session_dir: []const u8) !void {
     socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
 
     const paths = try session_registry.pathsForSessionDir(app_allocator.allocator(), session_dir);
+    const shutdown_pipe = try posix.pipe();
+    defer {
+        posix.close(shutdown_pipe[0]);
+        posix.close(shutdown_pipe[1]);
+    }
+    installShutdownSignalHandler(shutdown_pipe[1]);
+    defer uninstallShutdownSignalHandler();
 
     const fixed_session_id = std.fs.path.basename(paths.dir);
     var session_agent = SessionAgent{
@@ -791,10 +788,30 @@ pub fn runSessionAgent(session_dir: []const u8) !void {
     defer closeSessionAgent(&session_agent);
 
     while (session_agent.running) {
-        try sessionAgentPollOnce(&session_agent, listen_fd);
+        try sessionAgentPollOnce(&session_agent, listen_fd, shutdown_pipe[0]);
         reapSessions(&session_agent);
         stopSessionAgentIfComplete(&session_agent);
     }
+}
+
+fn installShutdownSignalHandler(write_fd: c.fd_t) void {
+    shutdown_signal_write_fd = write_fd;
+    const action = posix.Sigaction{
+        .handler = .{ .handler = handleShutdownSignal },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.TERM, &action, null);
+}
+
+fn uninstallShutdownSignalHandler() void {
+    const action = posix.Sigaction{
+        .handler = .{ .handler = null },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.TERM, &action, null);
+    shutdown_signal_write_fd = -1;
 }
 
 fn writeAgentCompatBinary(paths: session_registry.SessionPaths) !void {
@@ -879,14 +896,20 @@ fn chmodPath(path: []const u8, mode: c.mode_t) !void {
     }
 }
 
-fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: c.fd_t) !void {
-    var pollfds: [1 + max_sessions + max_attachments]posix.pollfd = undefined;
-    var kinds: [1 + max_sessions + max_attachments]PollKind = undefined;
+fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: c.fd_t, shutdown_signal_fd: c.fd_t) !void {
+    var pollfds: [2 + max_sessions + max_attachments]posix.pollfd = undefined;
+    var kinds: [2 + max_sessions + max_attachments]PollKind = undefined;
     var count: usize = 0;
 
-    pollfds[count] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
-    kinds[count] = .listen;
+    pollfds[count] = .{ .fd = shutdown_signal_fd, .events = posix.POLL.IN, .revents = 0 };
+    kinds[count] = .shutdown_signal;
     count += 1;
+
+    if (!session_agent.shutting_down) {
+        pollfds[count] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
+        kinds[count] = .listen;
+        count += 1;
+    }
 
     for (&session_agent.sessions, 0..) |*session, i| {
         if (!session.alive) continue;
@@ -910,10 +933,17 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: c.fd_t) !void {
         if (pollfd.revents == 0) continue;
         switch (kind) {
             .listen => acceptSessionAgentClient(session_agent, listen_fd),
+            .shutdown_signal => handleShutdownSignalEvent(session_agent, shutdown_signal_fd),
             .session => |session_index| drainSessionOutput(session_agent, session_index),
             .attachment => |attachment_index| handleAttachmentEvents(session_agent, attachment_index, pollfd.revents),
         }
     }
+}
+
+fn handleShutdownSignalEvent(session_agent: *SessionAgent, shutdown_signal_fd: c.fd_t) void {
+    var buf: [32]u8 = undefined;
+    _ = c.read(shutdown_signal_fd, &buf, buf.len);
+    requestGracefulShutdown(session_agent);
 }
 
 fn handleAttachmentEvents(session_agent: *SessionAgent, attachment_index: usize, revents: i16) void {
@@ -953,7 +983,6 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
         switch (frame.message_type) {
             .known => |message_type| switch (message_type) {
                 .FRAME_TYPE_RESIZE => continue,
-                .FRAME_TYPE_BROKER_COMMAND_REQUEST => return try handleCommandRequest(session_agent, fd, frame.payload),
                 .FRAME_TYPE_SESSION_NEW => {
                     var request = readSessionNewRequest(frame.payload) catch {
                         try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid SESSION_NEW payload", "");
@@ -995,81 +1024,13 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
     }
 }
 
-fn handleCommandRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !bool {
-    var request = try protocol.decodeBrokerCommandRequest(app_allocator.allocator(), payload);
-    defer request.deinit(app_allocator.allocator());
-    if (request.argv.len > 8) {
-        try sendCommandResponse(fd, 64, "", "ERROR too many command arguments\n");
-        return false;
-    }
-    const argv = request.argv;
-    const argc = argv.len;
-    if (argc == 0) {
-        try sendCommandResponse(fd, 64, "", "ERROR missing command\n");
-        return false;
-    }
-
-    const command = argv[0];
-    if (std.mem.eql(u8, command, "list")) {
-        if (argc != 1) {
-            try sendCommandResponse(fd, 64, "", "ERROR usage: list\n");
-            return false;
-        }
-        try sendListCommandResponse(fd, session_agent);
-        return false;
-    }
-    if (std.mem.eql(u8, command, "kill")) {
-        if (argc != 2) {
-            try sendCommandResponse(fd, 64, "", "ERROR usage: kill ID\n");
-            return false;
-        }
-        return try handleKillCommand(session_agent, fd, argv[1]);
-    }
-    if (std.mem.eql(u8, command, "kill-all")) {
-        if (argc != 1) {
-            try sendCommandResponse(fd, 64, "", "ERROR usage: kill-all\n");
-            return false;
-        }
-        try handleKillAllCommand(session_agent, fd);
-        return false;
-    }
-
-    try sendCommandResponse(fd, 64, "", "ERROR unknown command\n");
-    return false;
-}
-
-fn handleKillCommand(session_agent: *SessionAgent, fd: c.fd_t, id: []const u8) !bool {
-    const session_index = findSessionIndex(session_agent, id) orelse {
-        logSessionAgent(session_agent, "event=error code=SESSION_NOT_FOUND message=session not found", .{});
-        try sendCommandResponse(fd, 1, "", "ERROR session not found\n");
-        return false;
-    };
-    const session = &session_agent.sessions[session_index];
-    if (session.kill_waiter_fd >= 0) {
-        try sendCommandResponse(fd, 1, "", "ERROR session kill already in progress\n");
-        return false;
-    }
-    if (!signalSession(session, 0)) {
-        try sendCommandResponse(fd, 1, "", "ERROR failed to signal session process\n");
-        return false;
-    }
-    session.end_reason = 1;
-    logSessionAgent(session_agent, "event=session_kill_requested id={s} signal=0", .{session.idSlice()});
-    session.kill_waiter_fd = fd;
-    return true;
-}
-
-fn handleKillAllCommand(session_agent: *SessionAgent, fd: c.fd_t) !void {
-    logSessionAgent(session_agent, "event=session_agent_stop_requested", .{});
-    for (&session_agent.sessions) |*session| {
-        if (!session.alive) continue;
-        posix.kill(session.pid, c.SIG.TERM) catch {};
-    }
+fn requestGracefulShutdown(session_agent: *SessionAgent) void {
+    if (session_agent.shutting_down) return;
+    session_agent.shutting_down = true;
+    logSessionAgent(session_agent, "event=session_agent_shutdown_requested", .{});
     for (0..session_agent.sessions.len) |i| {
-        if (session_agent.sessions[i].alive) endSession(session_agent, i, 2, .{});
+        if (session_agent.sessions[i].alive) endSession(session_agent, i, 1, .{ .ended_at_unix_ms = nowUnixMs() });
     }
-    try sendCommandResponse(fd, 0, "KILLING_ALL\n", "");
-    session_agent.running = false;
 }
 
 fn openSessionAgentLog(session_agent: *SessionAgent, socket_path: []const u8) !void {
@@ -1244,12 +1205,6 @@ fn queueAttachmentUnrecognized(attachment: *Attachment, seq: u64, frame_type: u3
     try queueAttachmentFrame(attachment, .FRAME_TYPE_UNRECOGNIZED, payload);
 }
 
-fn sendCommandResponse(fd: c.fd_t, exit_status: u8, stdout: []const u8, stderr: []const u8) !void {
-    const payload = try protocol.encodeBrokerCommandResponse(app_allocator.allocator(), exit_status, stdout, stderr);
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_BROKER_COMMAND_RESPONSE, payload);
-}
-
 fn queueAttachmentFrame(attachment: *Attachment, message_type: protocol.MessageType, payload: []const u8) !void {
     const header = try protocol.frameHeader(message_type, payload.len);
     const frame_len = header.len + payload.len;
@@ -1307,21 +1262,6 @@ fn flushAttachmentOutput(session_agent: *SessionAgent, attachment_index: usize) 
             detachAttachment(session_agent, attachment_index);
         }
     }
-}
-
-fn sendListCommandResponse(fd: c.fd_t, session_agent: *SessionAgent) !void {
-    var stdout_buf: [16 * 1024]u8 = undefined;
-    var stdout = CommandOutput{ .buf = &stdout_buf };
-    try stdout.append("ID\tATTACHED\tPID\n");
-    for (&session_agent.sessions, 0..) |*session, session_index| {
-        if (!session.alive) continue;
-        try stdout.print("{s}\t{s}\t{}\n", .{
-            session.idSlice(),
-            if (attachedCount(session_agent, session_index) > 0) "yes" else "no",
-            session.pid,
-        });
-    }
-    try sendCommandResponse(fd, 0, stdout.written(), "");
 }
 
 fn attachedCount(session_agent: *SessionAgent, session_index: usize) u32 {
@@ -2626,14 +2566,6 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
         });
     }
     sendSessionEndedToAttachments(session_agent, session_index, reason, exit_info);
-    if (session.kill_waiter_fd >= 0) {
-        var stdout_buf: [128]u8 = undefined;
-        var stdout = CommandOutput{ .buf = &stdout_buf };
-        stdout.print("ENDED {s}\n", .{session.idSlice()}) catch {};
-        sendCommandResponse(session.kill_waiter_fd, 0, stdout.written(), "") catch {};
-        _ = c.close(session.kill_waiter_fd);
-        session.kill_waiter_fd = -1;
-    }
     if (session.pty_fd >= 0) _ = c.close(session.pty_fd);
     if (session.terminal_model) |model| {
         model.destroy();
@@ -2659,6 +2591,13 @@ fn clearDetachedHint(session_agent: *SessionAgent) void {
 }
 
 fn stopSessionAgentIfComplete(session_agent: *SessionAgent) void {
+    if (session_agent.shutting_down) {
+        for (&session_agent.attachments) |*attachment| {
+            if (attachment.active) return;
+        }
+        session_agent.running = false;
+        return;
+    }
     if (session_agent.fixed_session_id == null or !session_agent.started_session) return;
     for (&session_agent.sessions) |*session| {
         if (session.alive) return;

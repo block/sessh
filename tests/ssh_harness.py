@@ -1481,7 +1481,7 @@ def test_ssh_remote_session_commands_use_broker(tmp):
     listed = run_sessh(["test-host", "--list"], env, timeout=30.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
-    if "ID\tATTACHED\tPID" not in listed.stdout or "s1\tno\t" not in listed.stdout:
+    if "ID\tATTACHED\tAGENT_PID" not in listed.stdout or "s1\tno\t" not in listed.stdout:
         raise AssertionError(listed)
 
     killed = run_sessh(["test-host", "--kill", "s1"], env, timeout=30.0)

@@ -121,11 +121,11 @@ pub fn isValidSessionId(id: []const u8) bool {
     return true;
 }
 
-pub fn writeMeta(paths: SessionPaths, pid: c.pid_t, version: []const u8) !void {
+pub fn writeMeta(paths: SessionPaths, agent_pid: c.pid_t, version: []const u8) !void {
     const file = try std.fs.cwd().createFile(paths.meta, .{ .truncate = true, .mode = 0o600 });
     defer file.close();
     var buf: [256]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buf, "pid={}\nversion={s}\n", .{ pid, version });
+    const text = try std.fmt.bufPrint(&buf, "agent_pid={}\nversion={s}\n", .{ agent_pid, version });
     try file.writeAll(text);
 }
 
@@ -254,7 +254,7 @@ test "registry writes meta and tracks detached marker" {
     try writeMeta(allocation.paths, 12345, "0.4.0-dev");
     const meta = try std.fs.cwd().readFileAlloc(allocator, allocation.paths.meta, 1024);
     defer allocator.free(meta);
-    try std.testing.expectEqualStrings("pid=12345\nversion=0.4.0-dev\n", meta);
+    try std.testing.expectEqualStrings("agent_pid=12345\nversion=0.4.0-dev\n", meta);
 
     try markDetached(allocation.paths);
     _ = try std.fs.cwd().statFile(allocation.paths.detached);

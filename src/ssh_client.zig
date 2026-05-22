@@ -27,12 +27,24 @@ const ArtifactSet = struct {
         self.* = undefined;
     }
 
-    fn sendExec(self: *const ArtifactSet, fd: c.fd_t, reconnect_ui: ?*client.ReconnectUi, poll_reconnect_input: bool) !void {
+    fn sendExec(
+        self: *const ArtifactSet,
+        fd: c.fd_t,
+        broker_args: []const []const u8,
+        reconnect_ui: ?*client.ReconnectUi,
+        poll_reconnect_input: bool,
+    ) !void {
         try writeAllMaybeCancellable(fd, "EXEC ", reconnect_ui, poll_reconnect_input);
         try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_ui, poll_reconnect_input);
         for (self.entries) |entry| {
             try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
             try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_ui, poll_reconnect_input);
+        }
+        try writeAllMaybeCancellable(fd, " --", reconnect_ui, poll_reconnect_input);
+        for (broker_args) |arg| {
+            if (!isPlainShellArg(arg)) return error.UnsafeBrokerArgument;
+            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
+            try writeAllMaybeCancellable(fd, arg, reconnect_ui, poll_reconnect_input);
         }
         try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
     }
@@ -169,6 +181,7 @@ const ParallelReconnectState = struct {
     parsed_ssh_args: ParsedSshArgs,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
+    broker_args: []const []const u8,
     reconnect_ui: *client.ReconnectUi,
     session: client.RuntimeSession,
     result: ?ParallelReconnectResult = null,
@@ -276,46 +289,34 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const remote_command = if (parsed_ssh_args.bootstrap)
         try bootstrapCommand(allocator)
     else
-        try directBrokerCommand(allocator);
+        try directBrokerCommand(allocator, &.{});
     defer allocator.free(remote_command);
+    var broker_arg_buf: [2][]const u8 = undefined;
+    const broker_args = brokerArgsForAction(parsed_ssh_args, &broker_arg_buf);
 
     if (isRemoteManagementAction(parsed_ssh_args.action)) {
+        const command_remote_command = if (parsed_ssh_args.bootstrap)
+            remote_command
+        else
+            try directBrokerCommand(allocator, broker_args);
+        defer if (!parsed_ssh_args.bootstrap) allocator.free(command_remote_command);
         var command_child = try startRuntimeConnection(
             allocator,
             parsed_ssh_args,
             artifacts,
-            remote_command,
+            command_remote_command,
+            broker_args,
             false,
             null,
             false,
         );
-        const exit_status = (switch (parsed_ssh_args.action) {
-            .list => client.runCommandOnRuntime(
-                command_child.child.stdout.?.handle,
-                command_child.child.stdin.?.handle,
-                &.{"list"},
-            ),
-            .kill => client.runCommandOnRuntime(
-                command_child.child.stdout.?.handle,
-                command_child.child.stdin.?.handle,
-                &.{ "kill", parsed_ssh_args.kill_id.? },
-            ),
-            .kill_all => client.runCommandOnRuntime(
-                command_child.child.stdout.?.handle,
-                command_child.child.stdin.?.handle,
-                &.{"kill-all"},
-            ),
-            .new, .attach => unreachable,
-        }) catch |err| {
+        const exit_status = runRemoteBrokerCommandAndForward(&command_child) catch |err| {
             command_child.closeStdin();
             _ = command_child.wait() catch {};
-            if (err == error.VersionMismatch) try runRemoteCompat(allocator, parsed_ssh_args, .version_mismatch);
             if (process_exit.is(err)) return err;
             try io.stderrPrint("sessh: remote command failed: {t}\n", .{err});
             return process_exit.request(1);
         };
-        command_child.closeStdin();
-        _ = command_child.wait() catch {};
         if (exit_status != 0) return process_exit.request(exit_status);
         return;
     }
@@ -325,6 +326,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         parsed_ssh_args,
         artifacts,
         remote_command,
+        &.{},
         false,
         null,
         false,
@@ -490,6 +492,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 parsed_ssh_args,
                 artifacts,
                 remote_command,
+                &.{},
                 true,
                 &reconnect_ui,
                 true,
@@ -597,6 +600,41 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
             return process_exit.request(255);
         },
     }
+}
+
+fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[2][]const u8) []const []const u8 {
+    return switch (parsed_ssh_args.action) {
+        .new, .attach => buf[0..0],
+        .list => blk: {
+            buf[0] = "--list";
+            break :blk buf[0..1];
+        },
+        .kill => blk: {
+            buf[0] = "--kill";
+            buf[1] = parsed_ssh_args.kill_id.?;
+            break :blk buf[0..2];
+        },
+        .kill_all => blk: {
+            buf[0] = "--kill-all";
+            break :blk buf[0..1];
+        },
+    };
+}
+
+fn runRemoteBrokerCommandAndForward(connection: *RuntimeConnection) !u8 {
+    connection.closeStdin();
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = c.read(connection.child.stdout.?.handle, &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try io.writeAll(1, buf[0..@intCast(n)]);
+    }
+    const term = try connection.wait();
+    return switch (term) {
+        .Exited => |code| @intCast(@min(code, std.math.maxInt(u8))),
+        else => 1,
+    };
 }
 
 fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs) ![]u8 {
@@ -875,6 +913,7 @@ fn raceExistingConnectionWithReconnect(
         .parsed_ssh_args = parsed_ssh_args,
         .artifacts = artifacts,
         .remote_command = remote_command,
+        .broker_args = &.{},
         .reconnect_ui = reconnect_ui,
         .session = session.*,
     };
@@ -945,6 +984,7 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
         state.parsed_ssh_args,
         state.artifacts,
         state.remote_command,
+        state.broker_args,
         true,
         state.reconnect_ui,
         false,
@@ -1023,6 +1063,7 @@ fn startRuntimeConnection(
     parsed_ssh_args: ParsedSshArgs,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
+    broker_args: []const []const u8,
     batch_mode: bool,
     reconnect_ui: ?*client.ReconnectUi,
     poll_reconnect_input: bool,
@@ -1064,7 +1105,7 @@ fn startRuntimeConnection(
 
     const artifact_set = artifacts orelse return connection;
 
-    artifact_set.sendExec(connection.child.stdin.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
+    artifact_set.sendExec(connection.child.stdin.?.handle, broker_args, reconnect_ui, poll_reconnect_input) catch |err| {
         connection.terminate();
         return err;
     };
@@ -1134,7 +1175,7 @@ fn startRuntimeConnection(
     }
 
     if (std.mem.eql(u8, line, "OK")) {
-        connection.suppressSshStderr();
+        if (broker_args.len == 0) connection.suppressSshStderr();
         return connection;
     }
 
@@ -1403,8 +1444,18 @@ fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
     return shCommand(allocator, bootstrapper_script);
 }
 
-fn directBrokerCommand(allocator: std.mem.Allocator) ![]u8 {
-    return shCommand(allocator, "exec sessh :internal-host-broker:\n");
+fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []const u8) ![]u8 {
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    try script.appendSlice(allocator, "exec sessh :internal-host-broker:");
+    for (broker_args) |arg| {
+        const quoted = try shellQuote(allocator, arg);
+        defer allocator.free(quoted);
+        try script.append(allocator, ' ');
+        try script.appendSlice(allocator, quoted);
+    }
+    try script.append(allocator, '\n');
+    return shCommand(allocator, script.items);
 }
 
 fn shCommand(allocator: std.mem.Allocator, script: []const u8) ![]u8 {

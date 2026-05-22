@@ -257,27 +257,6 @@ def pack_session_new(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF):
     return message.SerializeToString()
 
 
-def pack_command(*argv):
-    payload = bytearray([len(argv)])
-    for arg in argv:
-        data = str(arg).encode()
-        payload += struct.pack(">I", len(data))
-        payload += data
-    return bytes(payload)
-
-
-def unpack_command_response(payload):
-    if len(payload) < 9:
-        raise AssertionError(f"short command response: {payload!r}")
-    exit_status = payload[0]
-    stdout_len, stderr_len = struct.unpack(">II", payload[1:9])
-    if len(payload) != 9 + stdout_len + stderr_len:
-        raise AssertionError(f"invalid command response length: {payload!r}")
-    stdout = payload[9:9 + stdout_len]
-    stderr = payload[9 + stdout_len:]
-    return exit_status, stdout, stderr
-
-
 def pack_session_attach(session_id, initial_scrollback=None, reconnect_cursor=None):
     global _NEXT_REPAINT_ID
     pb = sessh_pb()
@@ -1762,7 +1741,7 @@ def run_slow_attachment_does_not_block_commands_test(base_env):
                 listed = run([":local:", "--compat-version", sessh_version(), "--list"], env, check=True, timeout=2.0)
             except subprocess.TimeoutExpired as exc:
                 raise AssertionError("management command path blocked behind a slow attachment") from exc
-            if "ID\tATTACHED\tPID" not in listed.stdout:
+            if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:
                 raise AssertionError(listed.stdout)
         finally:
             if conn is not None:
@@ -1835,7 +1814,7 @@ def run_session_agent_registry_test(base_env):
             wait_file(meta_file)
             wait_file(compat_file)
             meta = meta_file.read_text()
-            if f"pid={proc.pid}\n" not in meta or f"version={sessh_version()}\n" not in meta:
+            if f"agent_pid={proc.pid}\n" not in meta or f"version={sessh_version()}\n" not in meta:
                 raise AssertionError(meta)
             if not os.path.islink(compat_file):
                 raise AssertionError("session compat path is not a symlink")
@@ -1994,32 +1973,9 @@ def run_host_broker_registry_commands_test(base_env):
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        proc = subprocess.Popen(
-            [str(BIN), ":internal-host-broker:"],
-            cwd=ROOT,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        conn = FdConn(proc.stdout.fileno(), proc.stdin.fileno())
-        try:
-            send_hello(conn)
-            send_frame(conn, 0x0010, pack_command("list"))
-            message_type, payload = recv_frame(conn)
-            if message_type != 0x0020:
-                raise AssertionError(f"expected COMMAND_RESPONSE, got {message_type:#06x}")
-            status, stdout, stderr = unpack_command_response(payload)
-            if status != 0 or stderr:
-                raise AssertionError((status, stdout, stderr))
-            if b"s1\tno\t" not in stdout:
-                raise AssertionError(stdout)
-            proc.stdin.close()
-            proc.wait(timeout=5.0)
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=2.0)
+        listed = run([":internal-host-broker:", "--list"], env, check=True, timeout=5.0)
+        if "s1\tno\t" not in listed.stdout:
+            raise AssertionError(listed.stdout)
 
         proc = subprocess.Popen(
             [str(BIN), ":internal-host-broker:"],
@@ -2051,30 +2007,9 @@ def run_host_broker_registry_commands_test(base_env):
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        proc = subprocess.Popen(
-            [str(BIN), ":internal-host-broker:"],
-            cwd=ROOT,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        conn = FdConn(proc.stdout.fileno(), proc.stdin.fileno())
-        try:
-            send_hello(conn)
-            send_frame(conn, 0x0010, pack_command("kill", "s1"))
-            message_type, payload = recv_frame(conn)
-            if message_type != 0x0020:
-                raise AssertionError(f"expected COMMAND_RESPONSE, got {message_type:#06x}")
-            status, stdout, stderr = unpack_command_response(payload)
-            if status != 1 or b"session not found" not in stderr:
-                raise AssertionError((status, stdout, stderr))
-            proc.stdin.close()
-            proc.wait(timeout=5.0)
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=2.0)
+        missing = run([":internal-host-broker:", "--kill", "s1"], env, timeout=5.0)
+        if missing.returncode != 1 or "session not found" not in missing.stderr:
+            raise AssertionError(missing)
 
         proc = subprocess.Popen(
             [str(BIN), ":internal-host-broker:"],
@@ -2102,33 +2037,12 @@ def run_host_broker_registry_commands_test(base_env):
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        proc = subprocess.Popen(
-            [str(BIN), ":internal-host-broker:"],
-            cwd=ROOT,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        conn = FdConn(proc.stdout.fileno(), proc.stdin.fileno())
-        try:
-            send_hello(conn)
-            send_frame(conn, 0x0010, pack_command("kill", "s2"))
-            message_type, payload = recv_frame(conn)
-            if message_type != 0x0020:
-                raise AssertionError(f"expected COMMAND_RESPONSE, got {message_type:#06x}")
-            status, stdout, stderr = unpack_command_response(payload)
-            if status != 0 or b"ENDED s2" not in stdout or stderr:
-                raise AssertionError((status, stdout, stderr))
-            proc.stdin.close()
-            proc.wait(timeout=5.0)
-            s2_dir = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s2"
-            wait_missing(s2_dir / "s")
-            wait_missing(s2_dir / "compat")
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=2.0)
+        killed = run([":internal-host-broker:", "--kill", "s2"], env, check=True, timeout=5.0)
+        if "ENDED s2" not in killed.stdout or killed.stderr:
+            raise AssertionError(killed)
+        s2_dir = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s2"
+        wait_missing(s2_dir / "s")
+        wait_missing(s2_dir / "compat")
 
         for expected_id in ("s3", "s4"):
             proc = subprocess.Popen(
@@ -2157,34 +2071,13 @@ def run_host_broker_registry_commands_test(base_env):
                     proc.terminate()
                     proc.wait(timeout=2.0)
 
-        proc = subprocess.Popen(
-            [str(BIN), ":internal-host-broker:"],
-            cwd=ROOT,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        conn = FdConn(proc.stdout.fileno(), proc.stdin.fileno())
-        try:
-            send_hello(conn)
-            send_frame(conn, 0x0010, pack_command("kill-all"))
-            message_type, payload = recv_frame(conn)
-            if message_type != 0x0020:
-                raise AssertionError(f"expected COMMAND_RESPONSE, got {message_type:#06x}")
-            status, stdout, stderr = unpack_command_response(payload)
-            if status != 0 or b"KILLING_ALL" not in stdout or stderr:
-                raise AssertionError((status, stdout, stderr))
-            proc.stdin.close()
-            proc.wait(timeout=5.0)
-            for expected_id in ("s3", "s4"):
-                session_dir = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / expected_id
-                wait_missing(session_dir / "s")
-                wait_missing(session_dir / "compat")
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=2.0)
+        stopped = run([":internal-host-broker:", "--kill-all"], env, check=True, timeout=5.0)
+        if "KILLING_ALL" not in stopped.stdout or stopped.stderr:
+            raise AssertionError(stopped)
+        for expected_id in ("s3", "s4"):
+            session_dir = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / expected_id
+            wait_missing(session_dir / "s")
+            wait_missing(session_dir / "compat")
 
 
 def spawn_client(env, extra_args=None):
@@ -2357,7 +2250,7 @@ def main():
             run_env_config_client_test(tmp)
 
             listed = run([":local:", "--list"], env, check=True, timeout=5.0)
-            if "ID\tATTACHED\tPID" not in listed.stdout:
+            if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:
                 raise AssertionError(listed.stdout)
 
             pid, fd = spawn_client(env)
@@ -2375,7 +2268,7 @@ def main():
                 close_client(pid, fd)
 
             listed = run([":local:", "--list"], env, check=True, timeout=5.0)
-            if "ID\tATTACHED\tPID" not in listed.stdout:
+            if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:
                 raise AssertionError(listed.stdout)
             if "s1\tno\t" not in listed.stdout:
                 raise AssertionError(listed.stdout)
@@ -2504,7 +2397,7 @@ def main():
                 "event=session_create id=s6",
                 "event=attach id=s6",
                 "event=detach id=s6",
-                "event=session_kill_requested id=s6",
+                "event=session_agent_shutdown_requested",
                 "event=session_end id=s6",
                 "event=session_agent_stop",
             ):

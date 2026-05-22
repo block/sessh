@@ -17,7 +17,6 @@ pub const MessageType = enum(u32) {
     FRAME_TYPE_ERROR = frameTypeEnumValue(StableMessageType.FRAME_TYPE_ERROR),
     FRAME_TYPE_UNRECOGNIZED = frameTypeEnumValue(StableMessageType.FRAME_TYPE_UNRECOGNIZED),
 
-    FRAME_TYPE_BROKER_COMMAND_REQUEST = 0x0010,
     FRAME_TYPE_SESSION_NEW = frameTypeEnumValue(RemoteMessageType.FRAME_TYPE_SESSION_NEW),
     FRAME_TYPE_SESSION_ATTACH = frameTypeEnumValue(RemoteMessageType.FRAME_TYPE_SESSION_ATTACH),
     FRAME_TYPE_INPUT = frameTypeEnumValue(RemoteMessageType.FRAME_TYPE_INPUT),
@@ -25,7 +24,6 @@ pub const MessageType = enum(u32) {
     FRAME_TYPE_REPAINT = frameTypeEnumValue(RemoteMessageType.FRAME_TYPE_REPAINT),
     FRAME_TYPE_PING_REQUEST = frameTypeEnumValue(RemoteMessageType.FRAME_TYPE_PING_REQUEST),
 
-    FRAME_TYPE_BROKER_COMMAND_RESPONSE = 0x0020,
     FRAME_TYPE_SESSION_ATTACHED = frameTypeEnumValue(RemoteMessageType.FRAME_TYPE_SESSION_ATTACHED),
     FRAME_TYPE_SESSION_ENDED = frameTypeEnumValue(RemoteMessageType.FRAME_TYPE_SESSION_ENDED),
     FRAME_TYPE_DRAW = frameTypeEnumValue(RemoteMessageType.FRAME_TYPE_DRAW),
@@ -136,91 +134,6 @@ pub fn encodePayload(allocator: std.mem.Allocator, message: anytype) ![]u8 {
 pub fn decodePayload(comptime T: type, allocator: std.mem.Allocator, payload: []const u8) !T {
     var reader: std.Io.Reader = .fixed(payload);
     return T.decode(&reader, allocator);
-}
-
-pub const BrokerCommandRequest = struct {
-    argv: []const []const u8,
-
-    pub fn deinit(self: *BrokerCommandRequest, allocator: std.mem.Allocator) void {
-        allocator.free(self.argv);
-        self.* = undefined;
-    }
-};
-
-pub const BrokerCommandResponse = struct {
-    exit_status: u8,
-    stdout: []u8,
-    stderr: []u8,
-
-    pub fn deinit(self: *BrokerCommandResponse, allocator: std.mem.Allocator) void {
-        allocator.free(self.stderr);
-        allocator.free(self.stdout);
-        self.* = undefined;
-    }
-};
-
-pub fn encodeBrokerCommandRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    if (argv.len > std.math.maxInt(u8)) return error.TooManyCommandArguments;
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer writer.deinit();
-    try writer.writer.writeByte(@intCast(argv.len));
-    for (argv) |arg| {
-        if (arg.len > std.math.maxInt(u32)) return error.CommandArgumentTooLong;
-        var len_bytes: [4]u8 = undefined;
-        writeU32(&len_bytes, @intCast(arg.len));
-        try writer.writer.writeAll(&len_bytes);
-        try writer.writer.writeAll(arg);
-    }
-    return writer.toOwnedSlice();
-}
-
-pub fn decodeBrokerCommandRequest(allocator: std.mem.Allocator, payload: []const u8) !BrokerCommandRequest {
-    if (payload.len < 1) return error.PayloadTooShort;
-    const argc = payload[0];
-    var offset: usize = 1;
-    const argv = try allocator.alloc([]const u8, argc);
-    errdefer allocator.free(argv);
-    for (argv) |*arg| {
-        if (payload.len - offset < 4) return error.PayloadTooShort;
-        const len = readU32(payload[offset..][0..4]);
-        offset += 4;
-        if (payload.len - offset < len) return error.PayloadTooShort;
-        arg.* = payload[offset .. offset + len];
-        offset += len;
-    }
-    if (offset != payload.len) return error.TrailingPayloadBytes;
-    return .{ .argv = argv };
-}
-
-pub fn encodeBrokerCommandResponse(
-    allocator: std.mem.Allocator,
-    exit_status: u8,
-    stdout: []const u8,
-    stderr: []const u8,
-) ![]u8 {
-    if (stdout.len > std.math.maxInt(u32) or stderr.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
-    var payload = try allocator.alloc(u8, 9 + stdout.len + stderr.len);
-    errdefer allocator.free(payload);
-    payload[0] = exit_status;
-    writeU32(payload[1..5], @intCast(stdout.len));
-    writeU32(payload[5..9], @intCast(stderr.len));
-    @memcpy(payload[9 .. 9 + stdout.len], stdout);
-    @memcpy(payload[9 + stdout.len ..], stderr);
-    return payload;
-}
-
-pub fn decodeBrokerCommandResponse(allocator: std.mem.Allocator, payload: []const u8) !BrokerCommandResponse {
-    if (payload.len < 9) return error.PayloadTooShort;
-    const stdout_len = readU32(payload[1..5]);
-    const stderr_len = readU32(payload[5..9]);
-    if (payload.len - 9 != @as(usize, stdout_len) + @as(usize, stderr_len)) return error.InvalidPayloadLength;
-    const stdout_start = 9;
-    const stderr_start = stdout_start + @as(usize, stdout_len);
-    return .{
-        .exit_status = payload[0],
-        .stdout = try allocator.dupe(u8, payload[stdout_start..stderr_start]),
-        .stderr = try allocator.dupe(u8, payload[stderr_start..]),
-    };
 }
 
 pub fn readFrame(fd: c.fd_t, payload_buf: []u8) !Frame {

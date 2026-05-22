@@ -52,11 +52,7 @@ fn runMain() !void {
     }
 
     if (std.mem.eql(u8, args[1], ":internal-host-broker:")) {
-        if (args.len != 2) {
-            try io.writeAll(2, "sessh: :internal-host-broker: does not take arguments\n");
-            return process_exit.request(64);
-        }
-        return broker.run(allocator, args[0]);
+        return broker.run(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":local:")) {

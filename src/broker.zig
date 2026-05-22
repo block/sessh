@@ -1,9 +1,11 @@
 const std = @import("std");
 const app_allocator = @import("app_allocator.zig");
 const c = std.c;
+const posix = std.posix;
 
 const config = @import("config.zig");
 const io = @import("io.zig");
+const process_exit = @import("process_exit.zig");
 const protocol = @import("protocol.zig");
 const relay = @import("relay.zig");
 const session_registry = @import("session_registry.zig");
@@ -12,10 +14,13 @@ const socket_transport = @import("socket_transport.zig");
 const pb = protocol.pb;
 const hpb = protocol.hpb;
 
-const AgentCommandResponse = protocol.BrokerCommandResponse;
+const command_timeout_ms: i64 = 2_000;
+const command_poll_ms: u64 = 20;
 
-pub fn run(allocator: std.mem.Allocator, exe: []const u8) !void {
+pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
+
+    if (args.len > 0) return runCommandArgs(allocator, args);
 
     const handshake_result = try acceptRuntimeHandshake(allocator, 0, 1);
     if (handshake_result == .mismatch) return;
@@ -28,11 +33,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8) !void {
                 .FRAME_TYPE_RESIZE => {
                     frame.deinit(allocator);
                     continue;
-                },
-                .FRAME_TYPE_BROKER_COMMAND_REQUEST => {
-                    defer frame.deinit(allocator);
-                    try handleCommandRequest(allocator, frame.payload);
-                    return;
                 },
                 .FRAME_TYPE_SESSION_ATTACH => {
                     defer frame.deinit(allocator);
@@ -60,7 +60,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8) !void {
                 },
                 else => {
                     defer frame.deinit(allocator);
-                    try sendError(1, "PROTOCOL_ERROR", "broker only supports SESSION_NEW in this mode", "");
+                    try sendError(1, "PROTOCOL_ERROR", "broker only supports SESSION_NEW or SESSION_ATTACH in this mode", "");
                     return;
                 },
             },
@@ -73,57 +73,41 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8) !void {
     }
 }
 
-fn handleCommandRequest(allocator: std.mem.Allocator, payload: []const u8) !void {
-    var request = try protocol.decodeBrokerCommandRequest(allocator, payload);
-    defer request.deinit(allocator);
-    const argv = request.argv;
-    if (argv.len == 0) {
-        try sendCommandResponse(1, 64, "", "ERROR missing command\n");
-        return;
+fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const command = args[0];
+    if (std.mem.eql(u8, command, "--list")) {
+        if (args.len != 1) return finishCommand(64, "", "ERROR usage: --list\n");
+        const exit_status = try listAgents(allocator);
+        return process_exit.request(exit_status);
     }
-
-    const command = argv[0];
-    if (std.mem.eql(u8, command, "list")) {
-        if (argv.len != 1) {
-            try sendCommandResponse(1, 64, "", "ERROR usage: list\n");
-            return;
-        }
-        try listAgents(allocator);
-        return;
+    if (std.mem.eql(u8, command, "--kill")) {
+        if (args.len != 2) return finishCommand(64, "", "ERROR usage: --kill ID\n");
+        return killOneAgent(allocator, args[1]);
     }
-    if (std.mem.eql(u8, command, "kill")) {
-        if (argv.len != 2) {
-            try sendCommandResponse(1, 64, "", "ERROR usage: kill ID\n");
-            return;
-        }
-        try commandOneAgent(allocator, argv[1], &.{ "kill", argv[1] });
-        return;
+    if (std.mem.eql(u8, command, "--kill-all") or std.mem.eql(u8, command, "--killall")) {
+        if (args.len != 1) return finishCommand(64, "", "ERROR usage: --kill-all\n");
+        return killAllAgents(allocator);
     }
-    if (std.mem.eql(u8, command, "kill-all")) {
-        if (argv.len != 1) {
-            try sendCommandResponse(1, 64, "", "ERROR usage: kill-all\n");
-            return;
-        }
-        try killAllAgents(allocator);
-        return;
-    }
-
-    try sendCommandResponse(1, 64, "", "ERROR unknown command\n");
+    return finishCommand(64, "", "ERROR unknown broker command\n");
 }
 
-fn listAgents(allocator: std.mem.Allocator) !void {
+fn finishCommand(exit_status: u8, stdout: []const u8, stderr: []const u8) !void {
+    if (stdout.len > 0) try io.writeAll(1, stdout);
+    if (stderr.len > 0) try io.writeAll(2, stderr);
+    return process_exit.request(exit_status);
+}
+
+fn listAgents(allocator: std.mem.Allocator) !u8 {
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
-    var stderr: std.ArrayList(u8) = .empty;
-    defer stderr.deinit(allocator);
-    try stdout.appendSlice(allocator, "ID\tATTACHED\tPID\n");
+    try stdout.appendSlice(allocator, "ID\tATTACHED\tAGENT_PID\n");
 
     const sessions_dir = try session_registry.sessionsDir(allocator);
     defer allocator.free(sessions_dir);
     var dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
-            try sendCommandResponse(1, 0, stdout.items, "");
-            return;
+            try io.writeAll(1, stdout.items);
+            return 0;
         },
         else => return err,
     };
@@ -134,138 +118,228 @@ fn listAgents(allocator: std.mem.Allocator) !void {
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
         var paths = try session_registry.pathsForSessionId(allocator, entry.name);
         defer paths.deinit(allocator);
-        var response = queryAgentCommand(allocator, paths, &.{"list"}) catch |err| switch (err) {
-            error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
-                session_registry.removeStaleHints(paths) catch {};
-                continue;
-            },
-            error.VersionMismatch => {
-                try sendError(1, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
-                return;
-            },
-            else => return err,
+        var meta = readSessionMeta(allocator, paths) catch {
+            session_registry.removeStaleHints(paths) catch {};
+            continue;
         };
-        defer response.deinit(allocator);
-        if (response.exit_status == 0) {
-            try appendListRows(allocator, &stdout, response.stdout);
-        } else if (response.stderr.len > 0) {
-            try stderr.appendSlice(allocator, response.stderr);
+        defer meta.deinit(allocator);
+        if (!processExists(meta.agent_pid)) {
+            session_registry.removeStaleHints(paths) catch {};
+            continue;
         }
+        try stdout.writer(allocator).print("{s}\t{s}\t{}\n", .{
+            entry.name,
+            if (fileExists(paths.detached)) "no" else "yes",
+            meta.agent_pid,
+        });
     }
 
-    try sendCommandResponse(1, if (stderr.items.len == 0) 0 else 1, stdout.items, stderr.items);
+    try io.writeAll(1, stdout.items);
+    return 0;
 }
 
-fn commandOneAgent(
-    allocator: std.mem.Allocator,
-    session_id: []const u8,
-    argv: []const []const u8,
-) !void {
+fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
     var paths = session_registry.pathsForSessionId(allocator, session_id) catch |err| switch (err) {
         error.InvalidSessionId => {
-            try sendCommandResponse(1, 1, "", "ERROR session not found\n");
-            return;
+            return finishCommand(1, "", "ERROR session not found\n");
         },
         else => return err,
     };
     defer paths.deinit(allocator);
 
-    var response = queryAgentCommand(allocator, paths, argv) catch |err| switch (err) {
-        error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
-            session_registry.removeStaleHints(paths) catch {};
-            try sendCommandResponse(1, 1, "", "ERROR session not found\n");
-            return;
-        },
-        error.VersionMismatch => {
-            try sendError(1, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
-            return;
-        },
-        else => return err,
+    var meta = readSessionMeta(allocator, paths) catch {
+        session_registry.removeStaleHints(paths) catch {};
+        return finishCommand(1, "", "ERROR session not found\n");
     };
-    defer response.deinit(allocator);
-    try sendCommandResponse(1, response.exit_status, response.stdout, response.stderr);
+    defer meta.deinit(allocator);
+    if (!processExists(meta.agent_pid)) {
+        session_registry.removeStaleHints(paths) catch {};
+        return finishCommand(1, "", "ERROR session not found\n");
+    }
+    if (!std.mem.eql(u8, meta.version, config.version)) {
+        const exit_status = try runCompatCommand(allocator, paths, &.{ "--kill", session_id });
+        return process_exit.request(exit_status);
+    }
+    if (!terminateAgent(meta.agent_pid)) {
+        return finishCommand(1, "", "ERROR failed to kill session agent\n");
+    }
+    var stdout_buf: [128]u8 = undefined;
+    const stdout = try std.fmt.bufPrint(&stdout_buf, "ENDED {s}\n", .{session_id});
+    return finishCommand(0, stdout, "");
 }
+
+const KillTarget = struct {
+    id: []u8,
+    agent_pid: c.pid_t,
+};
 
 fn killAllAgents(allocator: std.mem.Allocator) !void {
     const sessions_dir = try session_registry.sessionsDir(allocator);
     defer allocator.free(sessions_dir);
     var dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => {
-            try sendCommandResponse(1, 0, "KILLING_ALL\n", "");
-            return;
-        },
+        error.FileNotFound => return finishCommand(0, "KILLING_ALL\n", ""),
         else => return err,
     };
     defer dir.close();
 
-    var stderr: std.ArrayList(u8) = .empty;
-    defer stderr.deinit(allocator);
+    var targets: std.ArrayList(KillTarget) = .empty;
+    defer {
+        for (targets.items) |target| allocator.free(target.id);
+        targets.deinit(allocator);
+    }
+
+    var exit_status: u8 = 0;
     var iterator = dir.iterate();
     while (try iterator.next()) |entry| {
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
         var paths = try session_registry.pathsForSessionId(allocator, entry.name);
         defer paths.deinit(allocator);
-        var response = queryAgentCommand(allocator, paths, &.{"kill-all"}) catch |err| switch (err) {
-            error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
-                session_registry.removeStaleHints(paths) catch {};
-                continue;
-            },
-            error.VersionMismatch => {
-                try sendError(1, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
-                return;
-            },
-            else => return err,
+        var meta = readSessionMeta(allocator, paths) catch {
+            session_registry.removeStaleHints(paths) catch {};
+            continue;
         };
-        defer response.deinit(allocator);
-        if (response.exit_status != 0 and response.stderr.len > 0) {
-            try stderr.appendSlice(allocator, response.stderr);
+        defer meta.deinit(allocator);
+        if (!processExists(meta.agent_pid)) {
+            session_registry.removeStaleHints(paths) catch {};
+            continue;
+        }
+        if (!std.mem.eql(u8, meta.version, config.version)) {
+            const compat_status = try runCompatCommand(allocator, paths, &.{ "--kill", entry.name });
+            if (compat_status != 0) exit_status = compat_status;
+            continue;
+        }
+        try targets.append(allocator, .{
+            .id = try allocator.dupe(u8, entry.name),
+            .agent_pid = meta.agent_pid,
+        });
+    }
+
+    for (targets.items) |target| {
+        if (!signalProcess(target.agent_pid, c.SIG.TERM) and processExists(target.agent_pid)) {
+            try io.writeAll(2, "ERROR failed to signal session agent\n");
+            exit_status = 1;
         }
     }
-
-    try sendCommandResponse(1, if (stderr.items.len == 0) 0 else 1, "KILLING_ALL\n", stderr.items);
-}
-
-fn queryAgentCommand(
-    allocator: std.mem.Allocator,
-    paths: session_registry.SessionPaths,
-    argv: []const []const u8,
-) !AgentCommandResponse {
-    const fd = try socket_transport.connectSocket(paths.socket);
-    defer _ = c.close(fd);
-    try initiateRuntimeHandshake(allocator, fd);
-    try sendAgentCommandRequest(allocator, fd, argv);
-
-    var frame = try protocol.readFrameAlloc(allocator, fd);
-    defer frame.deinit(allocator);
-    if (frame.knownMessageType() == .FRAME_TYPE_ERROR) {
-        if (try errorIsVersionMismatch(allocator, frame.payload)) return error.VersionMismatch;
-        return error.AgentError;
+    waitForAgents(targets.items, command_timeout_ms);
+    for (targets.items) |target| {
+        if (!processExists(target.agent_pid)) continue;
+        _ = signalProcess(target.agent_pid, c.SIG.KILL);
+        exit_status = 1;
     }
-    if (frame.knownMessageType() != .FRAME_TYPE_BROKER_COMMAND_RESPONSE) return error.UnexpectedFrame;
-    return protocol.decodeBrokerCommandResponse(allocator, frame.payload);
+    waitForAgents(targets.items, 500);
+    try io.writeAll(1, "KILLING_ALL\n");
+    return process_exit.request(exit_status);
 }
 
-fn sendAgentCommandRequest(allocator: std.mem.Allocator, fd: c.fd_t, argv: []const []const u8) !void {
-    const payload = try protocol.encodeBrokerCommandRequest(allocator, argv);
-    defer allocator.free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_BROKER_COMMAND_REQUEST, payload);
-}
+const SessionMeta = struct {
+    bytes: []u8,
+    agent_pid: c.pid_t,
+    version: []const u8,
 
-fn appendListRows(allocator: std.mem.Allocator, stdout: *std.ArrayList(u8), agent_stdout: []const u8) !void {
-    var lines = std.mem.splitScalar(u8, agent_stdout, '\n');
-    _ = lines.next();
+    fn deinit(self: *SessionMeta, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+fn readSessionMeta(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !SessionMeta {
+    const file = try std.fs.openFileAbsolute(paths.meta, .{});
+    defer file.close();
+    const bytes = try file.readToEndAlloc(allocator, 4096);
+    errdefer allocator.free(bytes);
+
+    var agent_pid: ?c.pid_t = null;
+    var version: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        try stdout.appendSlice(allocator, line);
-        try stdout.append(allocator, '\n');
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = line[0..eq];
+        const value = line[eq + 1 ..];
+        if (std.mem.eql(u8, key, "agent_pid") or std.mem.eql(u8, key, "pid")) {
+            agent_pid = try parsePid(value);
+        } else if (std.mem.eql(u8, key, "version")) {
+            version = value;
+        }
+    }
+    return .{
+        .bytes = bytes,
+        .agent_pid = agent_pid orelse return error.InvalidSessionMeta,
+        .version = version orelse return error.InvalidSessionMeta,
+    };
+}
+
+fn parsePid(value: []const u8) !c.pid_t {
+    const parsed = try std.fmt.parseInt(i64, value, 10);
+    if (parsed <= 0 or parsed > std.math.maxInt(c.pid_t)) return error.InvalidSessionMeta;
+    return @intCast(parsed);
+}
+
+fn processExists(pid: c.pid_t) bool {
+    posix.kill(pid, 0) catch return false;
+    return true;
+}
+
+fn fileExists(path: []const u8) bool {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
+fn signalProcess(pid: c.pid_t, signal: u8) bool {
+    posix.kill(pid, signal) catch return false;
+    return true;
+}
+
+fn terminateAgent(pid: c.pid_t) bool {
+    if (!signalProcess(pid, c.SIG.TERM) and processExists(pid)) return false;
+    if (waitForAgentExit(pid, command_timeout_ms)) return true;
+    _ = signalProcess(pid, c.SIG.KILL);
+    return waitForAgentExit(pid, 500);
+}
+
+fn waitForAgents(targets: []const KillTarget, timeout_ms: i64) void {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (true) {
+        var any_alive = false;
+        for (targets) |target| {
+            if (processExists(target.agent_pid)) {
+                any_alive = true;
+                break;
+            }
+        }
+        if (!any_alive or std.time.milliTimestamp() >= deadline) return;
+        std.Thread.sleep(command_poll_ms * std.time.ns_per_ms);
     }
 }
 
-fn sendCommandResponse(fd: c.fd_t, exit_status: u32, stdout: []const u8, stderr: []const u8) !void {
-    if (exit_status > std.math.maxInt(u8)) return error.IntOutOfRange;
-    const payload = try protocol.encodeBrokerCommandResponse(app_allocator.allocator(), @intCast(exit_status), stdout, stderr);
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_BROKER_COMMAND_RESPONSE, payload);
+fn waitForAgentExit(pid: c.pid_t, timeout_ms: i64) bool {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (processExists(pid)) {
+        if (std.time.milliTimestamp() >= deadline) return false;
+        std.Thread.sleep(command_poll_ms * std.time.ns_per_ms);
+    }
+    return true;
+}
+
+fn runCompatCommand(allocator: std.mem.Allocator, paths: session_registry.SessionPaths, args: []const []const u8) !u8 {
+    const argv = try allocator.alloc([]const u8, 4 + args.len);
+    defer allocator.free(argv);
+    argv[0] = paths.compat;
+    argv[1] = ":local:";
+    argv[2] = "--compat-version";
+    argv[3] = config.version;
+    @memcpy(argv[4..], args);
+
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+    const term = try child.wait();
+    return switch (term) {
+        .Exited => |code| @intCast(@min(code, std.math.maxInt(u8))),
+        else => 1,
+    };
 }
 
 fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.fd_t {

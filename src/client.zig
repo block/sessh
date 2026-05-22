@@ -828,38 +828,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, options: LocalOptions) !void {
     switch (options.action) {
         .list => {
-            var child = try startLocalBroker(allocator, args[0]);
-            var child_done = false;
-            defer if (!child_done) terminateChild(&child);
-            try runtimeHandshake(child.stdout.?.handle, child.stdin.?.handle);
-            const exit_status = try runCommandAndForward(child.stdout.?.handle, child.stdin.?.handle, &.{"list"});
-            closeChildStdin(&child);
-            _ = child.wait() catch {};
-            child_done = true;
+            const exit_status = try runLocalBrokerCommand(allocator, args[0], &.{"--list"});
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
         .kill => {
-            var child = try startLocalBroker(allocator, args[0]);
-            var child_done = false;
-            defer if (!child_done) terminateChild(&child);
-            try runtimeHandshake(child.stdout.?.handle, child.stdin.?.handle);
-            const exit_status = try runCommandAndForward(child.stdout.?.handle, child.stdin.?.handle, &.{ "kill", options.kill_id.? });
-            closeChildStdin(&child);
-            _ = child.wait() catch {};
-            child_done = true;
+            const exit_status = try runLocalBrokerCommand(allocator, args[0], &.{ "--kill", options.kill_id.? });
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
         .kill_all => {
-            var child = try startLocalBroker(allocator, args[0]);
-            var child_done = false;
-            defer if (!child_done) terminateChild(&child);
-            try runtimeHandshake(child.stdout.?.handle, child.stdin.?.handle);
-            const exit_status = try runCommandAndForward(child.stdout.?.handle, child.stdin.?.handle, &.{"kill-all"});
-            closeChildStdin(&child);
-            _ = child.wait() catch {};
-            child_done = true;
+            const exit_status = try runLocalBrokerCommand(allocator, args[0], &.{"--kill-all"});
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
@@ -948,6 +927,25 @@ fn startLocalBroker(allocator: std.mem.Allocator, exe: []const u8) !std.process.
     return child;
 }
 
+fn runLocalBrokerCommand(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8) !u8 {
+    const argv = try allocator.alloc([]const u8, 2 + broker_args.len);
+    defer allocator.free(argv);
+    argv[0] = exe;
+    argv[1] = ":internal-host-broker:";
+    @memcpy(argv[2..], broker_args);
+
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+    const term = try child.wait();
+    return switch (term) {
+        .Exited => |code| @intCast(@min(code, std.math.maxInt(u8))),
+        else => 1,
+    };
+}
+
 fn sessionExistsViaBroker(allocator: std.mem.Allocator, exe: []const u8, session_id: []const u8) bool {
     return brokerListMatches(allocator, exe, session_id);
 }
@@ -957,25 +955,20 @@ fn anySessionExistsViaBroker(allocator: std.mem.Allocator, exe: []const u8) bool
 }
 
 fn brokerListMatches(allocator: std.mem.Allocator, exe: []const u8, session_id: ?[]const u8) bool {
-    var child = startLocalBroker(allocator, exe) catch return false;
-    var child_done = false;
-    defer if (!child_done) terminateChild(&child);
-
-    runtimeHandshake(child.stdout.?.handle, child.stdin.?.handle) catch return false;
-    sendBrokerCommandRequest(child.stdin.?.handle, &.{"list"}) catch return false;
-
-    var frame = protocol.readFrameAlloc(app_allocator.allocator(), child.stdout.?.handle) catch return false;
-    defer frame.deinit(app_allocator.allocator());
-    if (frame.knownMessageType() != .FRAME_TYPE_BROKER_COMMAND_RESPONSE) return false;
-    var response = protocol.decodeBrokerCommandResponse(app_allocator.allocator(), frame.payload) catch return false;
-    defer response.deinit(app_allocator.allocator());
-
-    closeChildStdin(&child);
-    _ = child.wait() catch {};
-    child_done = true;
-    if (response.exit_status != 0) return false;
-    if (session_id) |id| return listContainsSession(response.stdout, id);
-    return listHasAnySession(response.stdout);
+    const argv = [_][]const u8{ exe, ":internal-host-broker:", "--list" };
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &argv,
+        .max_output_bytes = 1024 * 1024,
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+    if (session_id) |id| return listContainsSession(result.stdout, id);
+    return listHasAnySession(result.stdout);
 }
 
 fn closeChildStdin(child: *std.process.Child) void {
@@ -1105,11 +1098,6 @@ test "parseLeader accepts case-insensitive spelling" {
     }
 
     try std.testing.expectEqual(Leader.none, try parseLeader("none"));
-}
-
-pub fn runCommandOnRuntime(read_fd: c.fd_t, write_fd: c.fd_t, argv: []const []const u8) !u8 {
-    try runtimeHandshake(read_fd, write_fd);
-    return runCommandAndForward(read_fd, write_fd, argv);
 }
 
 pub fn startNewSessionOnRuntime(
@@ -1498,46 +1486,6 @@ fn errorPayloadFromHelloError(response_error: hpb.HelloError) ErrorPayload {
         .message = response_error.message,
         .hint = response_error.hint orelse "",
     };
-}
-
-fn sendBrokerCommandRequest(conn: c.fd_t, argv: []const []const u8) !void {
-    const payload = try protocol.encodeBrokerCommandRequest(app_allocator.allocator(), argv);
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(conn, .FRAME_TYPE_BROKER_COMMAND_REQUEST, payload);
-}
-
-fn runCommandAndForward(read_fd: c.fd_t, write_fd: c.fd_t, argv: []const []const u8) !u8 {
-    try sendBrokerCommandRequest(write_fd, argv);
-    while (true) {
-        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
-        defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_ERROR => {
-                    const parsed = try parseErrorPayload(frame.payload);
-                    if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
-                        freeErrorPayload(parsed);
-                        return error.VersionMismatch;
-                    }
-                    try printParsedError(parsed);
-                    return 1;
-                },
-                .FRAME_TYPE_BROKER_COMMAND_RESPONSE => {
-                    var response = try protocol.decodeBrokerCommandResponse(app_allocator.allocator(), frame.payload);
-                    defer response.deinit(app_allocator.allocator());
-                    if (response.stdout.len > 0) try io_helpers.writeAll(1, response.stdout);
-                    if (response.stderr.len > 0) try io_helpers.writeAll(2, response.stderr);
-                    return response.exit_status;
-                },
-                .FRAME_TYPE_UNRECOGNIZED => continue,
-                else => return error.UnexpectedFrame,
-            },
-            .unknown => |raw| {
-                try sendUnrecognizedFrame(write_fd, frame.seq, raw);
-                continue;
-            },
-        }
-    }
 }
 
 fn sendSessionNew(

@@ -406,7 +406,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         )
         if listed.returncode != 0:
             raise AssertionError(listed)
-        if "ID\tATTACHED\tPID" not in listed.stdout or "\tno\t" not in listed.stdout:
+        if "ID\tATTACHED\tAGENT_PID" not in listed.stdout or "\tno\t" not in listed.stdout:
             raise AssertionError(listed)
         session_id = first_session_id(listed.stdout)
         compat_path = f"/tmp/sessh-0/s/{session_id}/compat"
