@@ -12,17 +12,7 @@ const socket_transport = @import("socket_transport.zig");
 const pb = protocol.pb;
 const hpb = protocol.hpb;
 
-const AgentCommandResponse = struct {
-    exit_status: u32,
-    stdout: []u8,
-    stderr: []u8,
-
-    fn deinit(self: *AgentCommandResponse, allocator: std.mem.Allocator) void {
-        allocator.free(self.stderr);
-        allocator.free(self.stdout);
-        self.* = undefined;
-    }
-};
+const AgentCommandResponse = protocol.BrokerCommandResponse;
 
 pub fn run(allocator: std.mem.Allocator, exe: []const u8) !void {
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
@@ -30,29 +20,22 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8) !void {
     const handshake_result = try acceptRuntimeHandshake(allocator, 0, 1);
     if (handshake_result == .mismatch) return;
 
-    var pending_resize: ?protocol.OwnedFrame = null;
-    defer if (pending_resize) |*frame| frame.deinit(allocator);
-
     while (true) {
         var frame = try protocol.readFrameAlloc(allocator, 0);
         errdefer frame.deinit(allocator);
         switch (frame.message_type) {
             .known => |message_type| switch (message_type) {
                 .FRAME_TYPE_RESIZE => {
-                    if (pending_resize) |*old| old.deinit(allocator);
-                    pending_resize = frame;
+                    frame.deinit(allocator);
+                    continue;
                 },
-                .FRAME_TYPE_COMMAND_REQUEST => {
+                .FRAME_TYPE_BROKER_COMMAND_REQUEST => {
                     defer frame.deinit(allocator);
                     try handleCommandRequest(allocator, frame.payload);
                     return;
                 },
                 .FRAME_TYPE_SESSION_ATTACH => {
                     defer frame.deinit(allocator);
-                    const resize = pending_resize orelse {
-                        try sendError(1, "PROTOCOL_ERROR", "SESSION_ATTACH requires RESIZE first", "");
-                        return;
-                    };
                     const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
                         error.NoSessions => {
                             try sendError(1, "SESSION_NOT_FOUND", "no sessions", "");
@@ -65,18 +48,14 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8) !void {
                         else => return err,
                     };
                     defer _ = c.close(agent_fd);
-                    try attachAgentAndRelay(allocator, agent_fd, resize.payload, frame.payload);
+                    try attachAgentAndRelay(allocator, agent_fd, frame.payload);
                     return;
                 },
                 .FRAME_TYPE_SESSION_NEW => {
                     defer frame.deinit(allocator);
-                    const resize = pending_resize orelse {
-                        try sendError(1, "PROTOCOL_ERROR", "SESSION_NEW requires RESIZE first", "");
-                        return;
-                    };
                     const agent_fd = try startSessionAgentAndConnect(allocator, exe);
                     defer _ = c.close(agent_fd);
-                    try startAgentAndRelay(allocator, agent_fd, resize.payload, frame.payload);
+                    try startAgentAndRelay(allocator, agent_fd, frame.payload);
                     return;
                 },
                 else => {
@@ -95,9 +74,9 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8) !void {
 }
 
 fn handleCommandRequest(allocator: std.mem.Allocator, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.CommandRequest, allocator, payload);
+    var request = try protocol.decodeBrokerCommandRequest(allocator, payload);
     defer request.deinit(allocator);
-    const argv = request.argv.items;
+    const argv = request.argv;
     if (argv.len == 0) {
         try sendCommandResponse(1, 64, "", "ERROR missing command\n");
         return;
@@ -262,23 +241,14 @@ fn queryAgentCommand(
         if (try errorIsVersionMismatch(allocator, frame.payload)) return error.VersionMismatch;
         return error.AgentError;
     }
-    if (frame.knownMessageType() != .FRAME_TYPE_COMMAND_RESPONSE) return error.UnexpectedFrame;
-    var message = try protocol.decodePayload(pb.CommandResponse, allocator, frame.payload);
-    defer message.deinit(allocator);
-    return .{
-        .exit_status = message.exit_status,
-        .stdout = try allocator.dupe(u8, message.stdout),
-        .stderr = try allocator.dupe(u8, message.stderr),
-    };
+    if (frame.knownMessageType() != .FRAME_TYPE_BROKER_COMMAND_RESPONSE) return error.UnexpectedFrame;
+    return protocol.decodeBrokerCommandResponse(allocator, frame.payload);
 }
 
 fn sendAgentCommandRequest(allocator: std.mem.Allocator, fd: c.fd_t, argv: []const []const u8) !void {
-    var message = pb.CommandRequest{};
-    defer message.argv.deinit(allocator);
-    for (argv) |arg| try message.argv.append(allocator, arg);
-    const payload = try protocol.encodePayload(allocator, message);
+    const payload = try protocol.encodeBrokerCommandRequest(allocator, argv);
     defer allocator.free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_COMMAND_REQUEST, payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_BROKER_COMMAND_REQUEST, payload);
 }
 
 fn appendListRows(allocator: std.mem.Allocator, stdout: *std.ArrayList(u8), agent_stdout: []const u8) !void {
@@ -292,27 +262,21 @@ fn appendListRows(allocator: std.mem.Allocator, stdout: *std.ArrayList(u8), agen
 }
 
 fn sendCommandResponse(fd: c.fd_t, exit_status: u32, stdout: []const u8, stderr: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.CommandResponse{
-        .exit_status = exit_status,
-        .stdout = stdout,
-        .stderr = stderr,
-    });
+    if (exit_status > std.math.maxInt(u8)) return error.IntOutOfRange;
+    const payload = try protocol.encodeBrokerCommandResponse(app_allocator.allocator(), @intCast(exit_status), stdout, stderr);
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_COMMAND_RESPONSE, payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_BROKER_COMMAND_RESPONSE, payload);
 }
 
 fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.fd_t {
     var request = try protocol.decodePayload(pb.SessionAttach, allocator, payload);
     defer request.deinit(allocator);
-    var paths = if (request.session_id) |id|
-        try session_registry.pathsForSessionId(allocator, id)
-    else
-        (try mostRecentDetachedAgent(allocator)) orelse return error.NoSessions;
+    var paths = (try mostRecentAgent(allocator)) orelse return error.NoSessions;
     defer paths.deinit(allocator);
     return socket_transport.connectSocket(paths.socket);
 }
 
-fn mostRecentDetachedAgent(allocator: std.mem.Allocator) !?session_registry.SessionPaths {
+fn mostRecentAgent(allocator: std.mem.Allocator) !?session_registry.SessionPaths {
     const sessions_dir = try session_registry.sessionsDir(allocator);
     defer allocator.free(sessions_dir);
     var dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
@@ -322,23 +286,27 @@ fn mostRecentDetachedAgent(allocator: std.mem.Allocator) !?session_registry.Sess
     defer dir.close();
 
     var selected: ?session_registry.SessionPaths = null;
-    var selected_mtime: i128 = 0;
+    var selected_number: usize = 0;
     var iterator = dir.iterate();
     while (try iterator.next()) |entry| {
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
         var paths = try session_registry.pathsForSessionId(allocator, entry.name);
         errdefer paths.deinit(allocator);
-        const stat = statAbsolute(paths.detached) catch |err| switch (err) {
+        _ = statAbsolute(paths.socket) catch |err| switch (err) {
             error.FileNotFound => {
                 paths.deinit(allocator);
                 continue;
             },
             else => return err,
         };
-        if (selected == null or stat.mtime > selected_mtime) {
+        const number = std.fmt.parseInt(usize, entry.name[1..], 10) catch {
+            paths.deinit(allocator);
+            continue;
+        };
+        if (selected == null or number > selected_number) {
             if (selected) |*old| old.deinit(allocator);
             selected = paths;
-            selected_mtime = stat.mtime;
+            selected_number = number;
         } else {
             paths.deinit(allocator);
         }
@@ -347,9 +315,7 @@ fn mostRecentDetachedAgent(allocator: std.mem.Allocator) !?session_registry.Sess
 }
 
 fn statAbsolute(path: []const u8) !std.fs.File.Stat {
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    return file.stat();
+    return std.fs.cwd().statFile(path);
 }
 
 fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
@@ -383,7 +349,6 @@ fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8) !c
 fn startAgentAndRelay(
     allocator: std.mem.Allocator,
     agent_fd: c.fd_t,
-    resize_payload: []const u8,
     session_new_payload: []const u8,
 ) !void {
     initiateRuntimeHandshake(allocator, agent_fd) catch |err| switch (err) {
@@ -393,7 +358,6 @@ fn startAgentAndRelay(
         },
         else => return err,
     };
-    try protocol.sendFrame(agent_fd, .FRAME_TYPE_RESIZE, resize_payload);
     try protocol.sendFrame(agent_fd, .FRAME_TYPE_SESSION_NEW, session_new_payload);
     try relay.relayFrames(0, 1, agent_fd);
 }
@@ -401,7 +365,6 @@ fn startAgentAndRelay(
 fn attachAgentAndRelay(
     allocator: std.mem.Allocator,
     agent_fd: c.fd_t,
-    resize_payload: []const u8,
     session_attach_payload: []const u8,
 ) !void {
     initiateRuntimeHandshake(allocator, agent_fd) catch |err| switch (err) {
@@ -411,7 +374,6 @@ fn attachAgentAndRelay(
         },
         else => return err,
     };
-    try protocol.sendFrame(agent_fd, .FRAME_TYPE_RESIZE, resize_payload);
     try protocol.sendFrame(agent_fd, .FRAME_TYPE_SESSION_ATTACH, session_attach_payload);
     try relay.relayFrames(0, 1, agent_fd);
 }

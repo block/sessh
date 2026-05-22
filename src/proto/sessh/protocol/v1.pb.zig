@@ -26,88 +26,33 @@ const fd = protobuf.fd;
 /// non-contiguous.
 pub const FrameType = enum(i32) {
     FRAME_TYPE_UNSPECIFIED = 0,
-    FRAME_TYPE_COMMAND_REQUEST = 16,
     FRAME_TYPE_SESSION_NEW = 17,
     FRAME_TYPE_SESSION_ATTACH = 18,
     FRAME_TYPE_INPUT = 21,
     FRAME_TYPE_RESIZE = 22,
     FRAME_TYPE_REPAINT = 23,
     FRAME_TYPE_PING_REQUEST = 24,
-    FRAME_TYPE_COMMAND_RESPONSE = 32,
     FRAME_TYPE_SESSION_ATTACHED = 33,
     FRAME_TYPE_SESSION_ENDED = 34,
     FRAME_TYPE_DRAW = 39,
     FRAME_TYPE_PING_RESPONSE = 40,
+    FRAME_TYPE_REPAINT_RESPONSE = 41,
     _,
 };
 
-/// Framed payload, client -> session agent.
-///
-/// Runs a management command that does not attach to a session.
-pub const CommandRequest = struct {
-    argv: std.ArrayListUnmanaged([]const u8) = .empty,
+pub const SessionEndReason = enum(i32) {
+    SESSION_END_REASON_UNSPECIFIED = 0,
+    SESSION_END_REASON_PROCESS_EXITED = 1,
+    SESSION_END_REASON_KILLED_BY_REQUEST = 2,
+    SESSION_END_REASON_AGENT_SHUTDOWN = 3,
+    _,
+};
 
-    pub const _desc_table = .{
-        .argv = fd(1, .{ .repeated = .{ .scalar = .string } }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
+pub const ExitStatusKind = enum(i32) {
+    EXIT_STATUS_KIND_UNSPECIFIED = 0,
+    EXIT_STATUS_KIND_EXITED = 1,
+    EXIT_STATUS_KIND_SIGNALLED = 2,
+    _,
 };
 
 /// Embedded in SessionNew.
@@ -254,90 +199,19 @@ pub const DefaultColors = struct {
 
 /// Framed payload, client -> session agent.
 ///
-/// Creates a new interactive PTY session.
-///
-/// The client must send Resize before SessionNew. A successful SessionNew is
-/// followed by SessionAttached for the new session, then Draw messages.
+/// Creates a new interactive PTY session. A successful SessionNew is followed
+/// by SessionAttached for the new session, then Draw messages.
 pub const SessionNew = struct {
+    resize: ?Resize = null,
     scrollback_row_limit: u32 = 0,
     environment: std.ArrayListUnmanaged(EnvironmentEntry) = .empty,
     query_default_colors: ?DefaultColors = null,
 
     pub const _desc_table = .{
-        .scrollback_row_limit = fd(1, .{ .scalar = .uint32 }),
-        .environment = fd(2, .{ .repeated = .submessage }),
-        .query_default_colors = fd(3, .submessage),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Embedded in SessionAttach.
-///
-/// Client reconnect cursor into session-agent-retained scrollback.
-pub const ScrollbackCursor = struct {
-    scrollback_epoch: u64 = 0,
-    seen_scrollback_rows: u64 = 0,
-
-    pub const _desc_table = .{
-        .scrollback_epoch = fd(1, .{ .scalar = .uint64 }),
-        .seen_scrollback_rows = fd(2, .{ .scalar = .uint64 }),
+        .resize = fd(1, .submessage),
+        .scrollback_row_limit = fd(2, .{ .scalar = .uint32 }),
+        .environment = fd(3, .{ .repeated = .submessage }),
+        .query_default_colors = fd(4, .submessage),
     };
 
     /// Encodes the message to the writer
@@ -401,19 +275,13 @@ pub const ScrollbackCursor = struct {
 
 /// Framed payload, client -> session agent.
 ///
-/// Attaches to an existing session.
-///
-/// The client must send Resize before SessionAttach. A successful SessionAttach
-/// is followed by SessionAttached for the selected session, then Draw messages.
+/// Attaches to an existing session. A successful SessionAttach is followed by
+/// SessionAttached for the selected session, then Draw/RepaintResponse messages.
 pub const SessionAttach = struct {
-    session_id: ?[]const u8 = null,
-    initial_scrollback_row_count: ?u32 = null,
-    reconnect_cursor: ?ScrollbackCursor = null,
+    resize: ?Resize = null,
 
     pub const _desc_table = .{
-        .session_id = fd(1, .{ .scalar = .string }),
-        .initial_scrollback_row_count = fd(2, .{ .scalar = .uint32 }),
-        .reconnect_cursor = fd(3, .submessage),
+        .resize = fd(1, .submessage),
     };
 
     /// Encodes the message to the writer
@@ -550,10 +418,14 @@ pub const Input = struct {
 pub const Resize = struct {
     terminal_rows: u32 = 0,
     terminal_cols: u32 = 0,
+    repaint_request: ?RepaintRequest = null,
+    viewport_offset: ?i32 = null,
 
     pub const _desc_table = .{
         .terminal_rows = fd(1, .{ .scalar = .uint32 }),
         .terminal_cols = fd(2, .{ .scalar = .uint32 }),
+        .repaint_request = fd(3, .submessage),
+        .viewport_offset = fd(4, .{ .scalar = .sint32 }),
     };
 
     /// Encodes the message to the writer
@@ -618,11 +490,15 @@ pub const Resize = struct {
 /// Framed payload, client -> session agent.
 ///
 /// Requests that the session agent redraw terminal state for this attachment.
-pub const Repaint = struct {
-    include_scrollback: bool = false,
+pub const RepaintRequest = struct {
+    id: u64 = 0,
+    scrollback_cursor: ?[]const u8 = null,
+    initial_scrollback_rows: ?u32 = null,
 
     pub const _desc_table = .{
-        .include_scrollback = fd(1, .{ .scalar = .bool }),
+        .id = fd(1, .{ .scalar = .uint64 }),
+        .scrollback_cursor = fd(2, .{ .scalar = .bytes }),
+        .initial_scrollback_rows = fd(3, .{ .scalar = .uint32 }),
     };
 
     /// Encodes the message to the writer
@@ -752,17 +628,9 @@ pub const PingRequest = struct {
 
 /// Framed payload, session agent -> client.
 ///
-/// Process-like response for a CommandRequest.
-pub const CommandResponse = struct {
-    exit_status: u32 = 0,
-    stdout: []const u8 = &.{},
-    stderr: []const u8 = &.{},
-
-    pub const _desc_table = .{
-        .exit_status = fd(1, .{ .scalar = .uint32 }),
-        .stdout = fd(2, .{ .scalar = .bytes }),
-        .stderr = fd(3, .{ .scalar = .bytes }),
-    };
+/// Confirms the session selected for this connection.
+pub const SessionAttached = struct {
+    pub const _desc_table = .{};
 
     /// Encodes the message to the writer
     /// The allocator is used to generate submessages internally.
@@ -823,17 +691,13 @@ pub const CommandResponse = struct {
     }
 };
 
-/// Framed payload, session agent -> client.
-///
-/// Confirms the session selected for this connection.
-///
-/// The session agent sends this after either SessionNew or SessionAttach succeeds. From
-/// this point on, the remote connection is bound to the returned session_id.
-pub const SessionAttached = struct {
-    session_id: []const u8 = &.{},
+pub const ExitStatus = struct {
+    kind: ExitStatusKind = @enumFromInt(0),
+    status: i32 = 0,
 
     pub const _desc_table = .{
-        .session_id = fd(1, .{ .scalar = .string }),
+        .kind = fd(1, .@"enum"),
+        .status = fd(2, .{ .scalar = .sint32 }),
     };
 
     /// Encodes the message to the writer
@@ -899,16 +763,14 @@ pub const SessionAttached = struct {
 ///
 /// Tells an attached client that the session has ended.
 pub const SessionEnded = struct {
-    reason: u32 = 0,
-    exit_kind: u32 = 0,
-    status: i32 = 0,
-    ended_at_unix_ms: u64 = 0,
+    reason: SessionEndReason = @enumFromInt(0),
+    exit_status: ?ExitStatus = null,
+    ended_at_unix_ms: ?u64 = null,
 
     pub const _desc_table = .{
-        .reason = fd(1, .{ .scalar = .uint32 }),
-        .exit_kind = fd(2, .{ .scalar = .uint32 }),
-        .status = fd(3, .{ .scalar = .sint32 }),
-        .ended_at_unix_ms = fd(4, .{ .scalar = .uint64 }),
+        .reason = fd(1, .@"enum"),
+        .exit_status = fd(2, .submessage),
+        .ended_at_unix_ms = fd(3, .{ .scalar = .uint64 }),
     };
 
     /// Encodes the message to the writer
@@ -974,20 +836,88 @@ pub const SessionEnded = struct {
 ///
 /// Session-agent-generated terminal bytes for the attached session.
 pub const Draw = struct {
-    scrollback_epoch: u64 = 0,
-    scroll_count: u64 = 0,
-    cursor_row: u32 = 0,
+    scrollback_cursor: []const u8 = &.{},
+    viewport_offset: ?i32 = null,
     draw_bytes: []const u8 = &.{},
-    request_seq_number: ?u64 = null,
     relay_end_restore_bytes: ?[]const u8 = null,
 
     pub const _desc_table = .{
-        .scrollback_epoch = fd(1, .{ .scalar = .uint64 }),
-        .scroll_count = fd(2, .{ .scalar = .uint64 }),
-        .cursor_row = fd(3, .{ .scalar = .uint32 }),
-        .draw_bytes = fd(4, .{ .scalar = .bytes }),
-        .request_seq_number = fd(5, .{ .scalar = .uint64 }),
-        .relay_end_restore_bytes = fd(6, .{ .scalar = .bytes }),
+        .scrollback_cursor = fd(1, .{ .scalar = .bytes }),
+        .viewport_offset = fd(2, .{ .scalar = .sint32 }),
+        .draw_bytes = fd(3, .{ .scalar = .bytes }),
+        .relay_end_restore_bytes = fd(4, .{ .scalar = .bytes }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, session agent -> client.
+///
+/// Response for a RepaintRequest. The embedded Draw is applied exactly like a
+/// framed Draw.
+pub const RepaintResponse = struct {
+    id: u64 = 0,
+    draw: ?Draw = null,
+
+    pub const _desc_table = .{
+        .id = fd(1, .{ .scalar = .uint64 }),
+        .draw = fd(2, .submessage),
     };
 
     /// Encodes the message to the writer

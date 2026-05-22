@@ -284,7 +284,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "C-a", "d"])
             time.sleep(0.5)
             idle_after = capture(env, idle_detach_session)
-            if "sessh: detached" not in idle_after or "sessh test-host --leader CTRL-A --scrollback-limit 321 --attach " not in idle_after:
+            if "sessh: detached" not in idle_after or "sessh test-host --leader CTRL-A --scrollback-limit 321 --attach" not in idle_after:
                 raise AssertionError(f"detach did not print a reattach banner:\n{idle_after}")
             if f"REMOTE_PROMPT$ {PROMPT}" in idle_after or f"REMOTE_PROMPT${PROMPT}" in idle_after:
                 raise AssertionError(f"detach drew the outer prompt at the inner cursor:\n{idle_after}")

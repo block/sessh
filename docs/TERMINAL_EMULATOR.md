@@ -60,6 +60,14 @@ for content to come in normally, aligning the viewports naturally without any
 side-effects. Once the viewports are aligned they stay aligned until the
 session is detached.
 
+## Window resize
+
+When the window size changes, it can reflow the content within the synthetic
+scrollback, modifying our viewport alignment. I don't think it's possible to
+rediscover the new viewport alignment with confidence - the size change may
+happen in the middle of our rendering. We do the safe thing: scroll the entire
+outer terminal screen into scrollback (which aligns our viewports) and repaint.
+
 ## Alternate screen handling
 
 We don't use the outer-terminal's alternate screen, even when the

@@ -28,8 +28,9 @@ enum FrameType {
 
   // Client-to-remote request frames.
 
-  // Payload: CommandRequest.
-  FRAME_TYPE_COMMAND_REQUEST = 0x0010;
+  reserved 0x0010, 0x0020;
+  reserved "FRAME_TYPE_COMMAND_REQUEST", "FRAME_TYPE_COMMAND_RESPONSE";
+
   // Payload: SessionNew.
   FRAME_TYPE_SESSION_NEW = 0x0011;
   // Payload: SessionAttach.
@@ -38,15 +39,13 @@ enum FrameType {
   FRAME_TYPE_INPUT = 0x0015;
   // Payload: Resize.
   FRAME_TYPE_RESIZE = 0x0016;
-  // Payload: Repaint.
+  // Payload: RepaintRequest.
   FRAME_TYPE_REPAINT = 0x0017;
   // Payload: PingRequest.
   FRAME_TYPE_PING_REQUEST = 0x0018;
 
   // Remote-to-client response and stream frames.
 
-  // Payload: CommandResponse.
-  FRAME_TYPE_COMMAND_RESPONSE = 0x0020;
   // Payload: SessionAttached.
   FRAME_TYPE_SESSION_ATTACHED = 0x0021;
   // Payload: SessionEnded.
@@ -55,14 +54,8 @@ enum FrameType {
   FRAME_TYPE_DRAW = 0x0027;
   // Payload: PingResponse.
   FRAME_TYPE_PING_RESPONSE = 0x0028;
-}
-
-// Framed payload, client -> session agent.
-//
-// Runs a management command that does not attach to a session.
-message CommandRequest {
-  // Supported commands are ["list"], ["kill", ID], and ["kill-all"].
-  repeated string argv = 1;
+  // Payload: RepaintResponse.
+  FRAME_TYPE_REPAINT_RESPONSE = 0x0029;
 }
 
 // Embedded in SessionNew.
@@ -85,42 +78,25 @@ message DefaultColors {
 
 // Framed payload, client -> session agent.
 //
-// Creates a new interactive PTY session.
-//
-// The client must send Resize before SessionNew. A successful SessionNew is
-// followed by SessionAttached for the new session, then Draw messages.
+// Creates a new interactive PTY session. A successful SessionNew is followed
+// by SessionAttached for the new session, then Draw messages.
 message SessionNew {
+  // Initial terminal size for this attachment.
+  Resize resize = 1;
   // Maximum session-agent-retained scrollback rows for this session.
-  uint32 scrollback_row_limit = 1;
+  uint32 scrollback_row_limit = 2;
   // Session environment entries. Currently SHELL is the only used key.
-  repeated EnvironmentEntry environment = 2;
+  repeated EnvironmentEntry environment = 3;
   // Colors the session agent may use to answer early OSC 10/11 queries.
-  DefaultColors query_default_colors = 3;
-}
-
-// Embedded in SessionAttach.
-//
-// Client reconnect cursor into session-agent-retained scrollback.
-message ScrollbackCursor {
-  // Retained-scrollback generation known by the client.
-  uint64 scrollback_epoch = 1;
-  // Number of rows from that generation already materialized locally.
-  uint64 seen_scrollback_rows = 2;
+  DefaultColors query_default_colors = 4;
 }
 
 // Framed payload, client -> session agent.
 //
-// Attaches to an existing session.
-//
-// The client must send Resize before SessionAttach. A successful SessionAttach
-// is followed by SessionAttached for the selected session, then Draw messages.
+// Attaches to an existing session. A successful SessionAttach is followed by
+// SessionAttached for the selected session, then Draw/RepaintResponse messages.
 message SessionAttach {
-  // If absent, attach to the most recently detached attachable session.
-  optional string session_id = 1;
-  // Initial retained scrollback row count. Absent means all retained rows.
-  optional uint32 initial_scrollback_row_count = 2;
-  // Present only for automatic reconnect.
-  optional ScrollbackCursor reconnect_cursor = 3;
+  Resize resize = 1;
 }
 
 // Framed payload, client -> session agent.
@@ -139,16 +115,35 @@ message Resize {
   uint32 terminal_rows = 1;
   // Columns visible in the local terminal. The session agent bounds this to u16.
   uint32 terminal_cols = 2;
+  // Present for resize frames after attach and for embedded SessionAttach
+  // resizes. The session agent applies the new size, then answers this request
+  // with a RepaintResponse.
+  optional RepaintRequest repaint_request = 3;
+  // Rows between the outer terminal viewport top and the sessh viewport top.
+  // Omitted means the viewports are aligned. -1 means the client no longer
+  // knows the offset, typically after SIGWINCH resized an unaligned viewport;
+  // the session agent must align the viewports in its repaint response.
+  optional sint32 viewport_offset = 4;
 }
 
 // Framed payload, client -> session agent.
 //
 // Requests that the session agent redraw terminal state for this attachment.
-message Repaint {
-  // True means clear local retained scrollback and redraw session-agent-retained
-  // scrollback before the visible screen. False means redraw only the visible
-  // screen in place.
-  bool include_scrollback = 1;
+message RepaintRequest {
+  // Client-local repaint id copied into RepaintResponse. While this repaint is
+  // outstanding, the client ignores framed Draw messages and resumes applying
+  // draws only after receiving the matching RepaintResponse. If multiple
+  // RepaintRequests are in flight, the session agent may ignore all but the
+  // last one.
+  uint64 id = 1;
+  // Opaque scrollback cursor. Absent means assume the client has current
+  // scrollback and send none. Present empty bytes means send all retained
+  // scrollback available; present non-empty bytes must come from a previous
+  // Draw.scrollback_cursor.
+  optional bytes scrollback_cursor = 2;
+  // Optional cap for retained scrollback rows included with an initial attach
+  // repaint. Absent means all available retained scrollback.
+  optional uint32 initial_scrollback_rows = 3;
 }
 
 // Framed payload, client -> session agent.
@@ -160,63 +155,68 @@ message PingRequest {
 
 // Framed payload, session agent -> client.
 //
-// Process-like response for a CommandRequest.
-message CommandResponse {
-  // Exit status for the management command. The client bounds this to u8.
-  uint32 exit_status = 1;
-  bytes stdout = 2;
-  bytes stderr = 3;
+// Confirms the session selected for this connection.
+message SessionAttached {
 }
 
-// Framed payload, session agent -> client.
-//
-// Confirms the session selected for this connection.
-//
-// The session agent sends this after either SessionNew or SessionAttach succeeds. From
-// this point on, the remote connection is bound to the returned session_id.
-message SessionAttached {
-  string session_id = 1;
+enum SessionEndReason {
+  SESSION_END_REASON_UNSPECIFIED = 0;
+  SESSION_END_REASON_PROCESS_EXITED = 1;
+  SESSION_END_REASON_KILLED_BY_REQUEST = 2;
+  SESSION_END_REASON_AGENT_SHUTDOWN = 3;
+}
+
+enum ExitStatusKind {
+  EXIT_STATUS_KIND_UNSPECIFIED = 0;
+  EXIT_STATUS_KIND_EXITED = 1;
+  EXIT_STATUS_KIND_SIGNALLED = 2;
+}
+
+message ExitStatus {
+  ExitStatusKind kind = 1;
+  // Process exit status when kind is EXITED, or signal number when kind is
+  // SIGNALLED.
+  sint32 status = 2;
 }
 
 // Framed payload, session agent -> client.
 //
 // Tells an attached client that the session has ended.
 message SessionEnded {
-  // 0: process exited itself; 1: killed by client command; 2: session agent shutdown.
-  uint32 reason = 1;
-  // 0: no status; 1: exited with status; 2: terminated by signal.
-  uint32 exit_kind = 2;
-  // Exit status or signal number, ignored when exit_kind is 0.
-  sint32 status = 3;
-  // End timestamp in Unix milliseconds, or 0 when not applicable.
-  uint64 ended_at_unix_ms = 4;
+  SessionEndReason reason = 1;
+  // Absent means the session agent did not observe a wait status, for example
+  // because it is shutting down and synthesized the end notification.
+  optional ExitStatus exit_status = 2;
+  optional uint64 ended_at_unix_ms = 3;
 }
 
 // Framed payload, session agent -> client.
 //
 // Session-agent-generated terminal bytes for the attached session.
 message Draw {
-  // Retained-scrollback generation after this draw.
-  uint64 scrollback_epoch = 1;
-  // Session-agent-retained scrollback rows newly materialized or represented by this
-  // draw. This is a reconnect cursor, not a physical terminal-scroll count.
-  uint64 scroll_count = 2;
-  // Modeled inner cursor row after this draw. The client uses this for
-  // reconnect UI placement; it must not parse bytes or maintain a cell grid.
-  uint32 cursor_row = 3;
+  // Opaque cursor representing the client scrollback state after applying this
+  // draw. Clients must store and pass this back without interpreting it.
+  bytes scrollback_cursor = 1;
+  // Rows between the outer terminal viewport top and the sessh viewport top
+  // after applying this draw. Omitted means the viewports are aligned.
+  optional sint32 viewport_offset = 2;
   // Self-contained terminal bytes to write to the outer terminal in protocol
   // order. A Draw must apply and clean up any temporary terminal state it uses.
-  bytes draw_bytes = 4;
-  // Present on live output when this draw reflects input frames from this
-  // attachment up to and including this client frame seq number. This is
-  // payload-level request coverage; the frame header seq only identifies the
-  // Draw frame itself.
-  optional uint64 request_seq_number = 5;
+  bytes draw_bytes = 3;
   // Terminal bytes the client keeps in memory and writes only when this relay
   // ends by detach or session-end. Present empty clears a previous restore.
   // This lets alternate-screen sessions restore the modeled primary screen on
   // detach without applying that cleanup during reconnect.
-  optional bytes relay_end_restore_bytes = 6;
+  optional bytes relay_end_restore_bytes = 4;
+}
+
+// Framed payload, session agent -> client.
+//
+// Response for a RepaintRequest. The embedded Draw is applied exactly like a
+// framed Draw.
+message RepaintResponse {
+  uint64 id = 1;
+  Draw draw = 2;
 }
 
 // Framed payload, session agent -> client.

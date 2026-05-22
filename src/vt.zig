@@ -135,6 +135,7 @@ pub const RenderedScreen = struct {
 pub const ScrollbackSnapshot = struct {
     rows: []RenderedRow,
     truncated_rows: u64,
+    absolute_count: u64,
 
     pub fn deinit(self: *ScrollbackSnapshot, allocator: std.mem.Allocator) void {
         for (self.rows) |*row| row.deinit(allocator);
@@ -625,6 +626,7 @@ pub const SessionTerminal = struct {
         return .{
             .rows = rows,
             .truncated_rows = skip + skipped_synthetic_rows,
+            .absolute_count = history_rows + @as(u64, @intCast(self.synthetic_history_rows.items.len)),
         };
     }
 
@@ -644,6 +646,7 @@ pub const SessionTerminal = struct {
                     history_rows - self.scrollback_row_limit
                 else
                     0,
+                .absolute_count = history_rows + @as(u64, @intCast(self.synthetic_history_rows.items.len)),
             };
         }
 
@@ -676,6 +679,7 @@ pub const SessionTerminal = struct {
         return .{
             .rows = rows,
             .truncated_rows = first_retained,
+            .absolute_count = history_rows + @as(u64, @intCast(self.synthetic_history_rows.items.len)),
         };
     }
 
@@ -690,6 +694,12 @@ pub const SessionTerminal = struct {
         const history_rows = self.historyRowCount();
         if (history_rows <= self.scrollback_row_limit) return 0;
         return history_rows - self.scrollback_row_limit;
+    }
+
+    pub fn scrollbackCursor(self: *SessionTerminal) !u64 {
+        self.consumeSyntheticHistoryForRealScrollback();
+        try self.discardSyntheticRedrawRows();
+        return self.historyRowCount() + @as(u64, @intCast(self.synthetic_history_rows.items.len));
     }
 
     pub fn plainSnapshot(self: *SessionTerminal, allocator: std.mem.Allocator) !PlainSnapshot {
@@ -1750,6 +1760,28 @@ test "scrollback snapshot exposes retained history rows" {
         if (std.mem.eql(u8, text.items, "history_01")) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "scrollback snapshot reports absolute count past retained row limit" {
+    const terminal = try SessionTerminal.create(std.testing.allocator, 3, 20, 5);
+    defer terminal.destroy();
+
+    var i: usize = 1;
+    while (i <= 16) : (i += 1) {
+        var line_buf: [16]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "abs_{d:0>2}\r\n", .{i});
+        try terminal.feed(line);
+    }
+
+    var scrollback = try terminal.scrollbackSnapshot(std.testing.allocator);
+    defer scrollback.deinit(std.testing.allocator);
+
+    try std.testing.expect(scrollback.rows.len <= 5);
+    try std.testing.expect(scrollback.absolute_count > scrollback.rows.len);
+    try std.testing.expectEqual(
+        scrollback.absolute_count - @as(u64, @intCast(scrollback.rows.len)),
+        scrollback.truncated_rows,
+    );
 }
 
 test "clear screen followed by output commits overflow rows to scrollback" {

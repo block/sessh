@@ -34,6 +34,7 @@ const Session = struct {
     cols: u16 = 80,
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     scrollback_epoch: u64 = 1,
+    last_scrollback_clear_epoch: u64 = 1,
     end_reason: u8 = 0,
     kill_waiter_fd: c.fd_t = -1,
     attached: bool = false,
@@ -86,7 +87,6 @@ const Attachment = struct {
     output_offset: usize = 0,
     input_pending: [128]u8 = [_]u8{0} ** 128,
     input_pending_len: usize = 0,
-    pending_draw_request_seq: ?u64 = null,
 
     fn queuedBytes(self: *const Attachment) usize {
         return self.output.items.len - self.output_offset;
@@ -143,6 +143,7 @@ const PresentationState = struct {
     default_colors: client_renderer.DefaultColors = .{},
     default_colors_initialized: bool = false,
     full_height_rendering: bool = false,
+    viewport_offset: i32 = 0,
 
     fn reset(self: *PresentationState) void {
         self.* = .{};
@@ -213,6 +214,7 @@ const PresentationState = struct {
         if (!mouse_requested) {
             self.full_height_rendering = false;
         }
+        self.updateViewportOffset(session_rows);
 
         if (self.initialized and self.rendered_rows < session_rows and
             (screen.active_screen == 1 or min_rendered_rows > 0))
@@ -256,6 +258,7 @@ const PresentationState = struct {
         self.rendered_rows = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.viewport_offset = 0;
     }
 
     fn render(
@@ -293,6 +296,7 @@ const PresentationState = struct {
         if (rows.len == 0) return;
         if (!self.initialized or self.rendered_rows == 0) {
             try renderTranscriptRows(renderer, rows);
+            self.updateViewportOffsetForRenderedRows(session_rows, @intCast(@min(rows.len, std.math.maxInt(u16))));
             return;
         }
 
@@ -313,6 +317,7 @@ const PresentationState = struct {
             self.cursor_row = self.rendered_rows - 1;
             self.cursor_col = 0;
         }
+        self.viewport_offset = 0;
     }
 
     fn renderInitial(
@@ -395,6 +400,7 @@ const PresentationState = struct {
     ) !bool {
         if (!self.initialized) return false;
         if (self.full_height_rendering) return false;
+        if (self.viewportOffsetUnknown()) return false;
         if (align_viewport) return false;
         if (screen.active_screen != 0) return false;
         if (screen.active_screen_changed) return false;
@@ -440,6 +446,31 @@ const PresentationState = struct {
         if (screen.modes.mouse_tracking == 0 or !screen.modes.mouse_sgr) {
             self.full_height_rendering = false;
         }
+        self.updateViewportOffset(session_rows);
+    }
+
+    fn setViewportOffset(self: *PresentationState, viewport_offset: ?i32) void {
+        self.viewport_offset = viewport_offset orelse 0;
+    }
+
+    fn protocolViewportOffset(self: *const PresentationState) ?i32 {
+        return if (self.viewport_offset == 0) null else self.viewport_offset;
+    }
+
+    fn viewportOffsetUnknown(self: *const PresentationState) bool {
+        return self.viewport_offset < 0;
+    }
+
+    fn updateViewportOffset(self: *PresentationState, session_rows: u16) void {
+        self.updateViewportOffsetForRenderedRows(session_rows, self.rendered_rows);
+    }
+
+    fn updateViewportOffsetForRenderedRows(self: *PresentationState, session_rows: u16, rendered_rows: u16) void {
+        if (self.viewport_offset <= 0 or session_rows == 0) return;
+        self.viewport_offset = if (rendered_rows >= session_rows)
+            0
+        else
+            @min(self.viewport_offset, @as(i32, @intCast(session_rows - rendered_rows)));
     }
 
     fn moveToRenderedTop(self: *const PresentationState, renderer: client_renderer.Renderer) !void {
@@ -481,34 +512,17 @@ const PresentationState = struct {
     }
 };
 
-const PendingSize = struct {
-    rows: u16 = 24,
-    cols: u16 = 80,
-    present: bool = false,
-};
-
-const ScrollbackCursor = struct {
-    epoch: u64,
-    seen_rows: u64,
-};
-
 const TerminalOrigin = struct {
     row: u16,
     col: u16,
 };
 
 const AttachRequest = struct {
-    session_id: ?[]const u8,
-    initial_scrollback_row_count: ?u32,
-    reconnect_cursor: ?ScrollbackCursor,
-
-    fn deinit(self: *AttachRequest) void {
-        if (self.session_id) |session_id| app_allocator.allocator().free(session_id);
-        self.* = undefined;
-    }
+    resize: ResizePayload,
 };
 
 const SessionNewRequest = struct {
+    resize: ResizePayload,
     scrollback_row_count: u32,
     environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
@@ -517,6 +531,26 @@ const SessionNewRequest = struct {
         self.environment.deinit();
         self.* = undefined;
     }
+};
+
+const RepaintRequest = struct {
+    id: u64,
+    scrollback_cursor: ?ScrollbackCursor,
+    initial_scrollback_rows: ?u32 = null,
+};
+
+const ScrollbackCursor = struct {
+    epoch: u64,
+    per_epoch_cursor: u64,
+};
+
+const encoded_scrollback_cursor_len = 16;
+
+const ResizePayload = struct {
+    rows: u16,
+    cols: u16,
+    viewport_offset: ?i32,
+    repaint_request: ?RepaintRequest,
 };
 
 fn renderTranscriptRows(renderer: client_renderer.Renderer, rows: []const vt.RenderedRow) !void {
@@ -913,22 +947,14 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
     const handshake_result = try acceptRemoteHandshake(session_agent, fd);
     if (handshake_result == .mismatch) return false;
 
-    var pending_size = PendingSize{};
     while (true) {
         var frame = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_RESIZE => {
-                    pending_size = try readResizePayload(frame.payload);
-                    continue;
-                },
-                .FRAME_TYPE_COMMAND_REQUEST => return try handleCommandRequest(session_agent, fd, frame.payload),
+                .FRAME_TYPE_RESIZE => continue,
+                .FRAME_TYPE_BROKER_COMMAND_REQUEST => return try handleCommandRequest(session_agent, fd, frame.payload),
                 .FRAME_TYPE_SESSION_NEW => {
-                    if (!pending_size.present) {
-                        try sendError(session_agent, fd, "PROTOCOL_ERROR", "SESSION_NEW requires RESIZE first", "");
-                        return false;
-                    }
                     var request = readSessionNewRequest(frame.payload) catch {
                         try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid SESSION_NEW payload", "");
                         return false;
@@ -936,40 +962,24 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     defer request.deinit();
                     const session_index = try createSession(
                         session_agent,
-                        pending_size.rows,
-                        pending_size.cols,
+                        request.resize.rows,
+                        request.resize.cols,
                         request.scrollback_row_count,
                         request.environment,
                         request.query_default_colors,
                     );
-                    try attachSession(session_agent, session_index, fd, pending_size.rows, pending_size.cols, null, null);
+                    try attachSession(session_agent, session_index, fd, request.resize);
                     return true;
                 },
                 .FRAME_TYPE_SESSION_ATTACH => {
-                    if (!pending_size.present) {
-                        try sendError(session_agent, fd, "PROTOCOL_ERROR", "SESSION_ATTACH requires RESIZE first", "");
-                        return false;
-                    }
-                    var request = try readAttachRequest(frame.payload);
-                    defer request.deinit();
-                    const session_index = if (request.session_id) |id|
-                        findSessionIndex(session_agent, id)
-                    else
-                        findMostRecentDetachedSessionIndex(session_agent);
+                    const request = try readAttachRequest(frame.payload);
+                    const session_index = findMostRecentSessionIndex(session_agent);
                     const resolved_session_index = session_index orelse {
                         try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
                         return false;
                     };
-                    updateSessionSize(&session_agent.sessions[resolved_session_index], pending_size.rows, pending_size.cols);
-                    try attachSession(
-                        session_agent,
-                        resolved_session_index,
-                        fd,
-                        pending_size.rows,
-                        pending_size.cols,
-                        request.initial_scrollback_row_count,
-                        request.reconnect_cursor,
-                    );
+                    updateSessionSize(&session_agent.sessions[resolved_session_index], request.resize.rows, request.resize.cols);
+                    try attachSession(session_agent, resolved_session_index, fd, request.resize);
                     return true;
                 },
                 else => {
@@ -986,13 +996,13 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
 }
 
 fn handleCommandRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !bool {
-    var request = try protocol.decodePayload(pb.CommandRequest, app_allocator.allocator(), payload);
+    var request = try protocol.decodeBrokerCommandRequest(app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
-    if (request.argv.items.len > 8) {
+    if (request.argv.len > 8) {
         try sendCommandResponse(fd, 64, "", "ERROR too many command arguments\n");
         return false;
     }
-    const argv = request.argv.items;
+    const argv = request.argv;
     const argc = argv.len;
     if (argc == 0) {
         try sendCommandResponse(fd, 64, "", "ERROR missing command\n");
@@ -1235,13 +1245,9 @@ fn queueAttachmentUnrecognized(attachment: *Attachment, seq: u64, frame_type: u3
 }
 
 fn sendCommandResponse(fd: c.fd_t, exit_status: u8, stdout: []const u8, stderr: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.CommandResponse{
-        .exit_status = exit_status,
-        .stdout = stdout,
-        .stderr = stderr,
-    });
+    const payload = try protocol.encodeBrokerCommandResponse(app_allocator.allocator(), exit_status, stdout, stderr);
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_COMMAND_RESPONSE, payload);
+    try protocol.sendFrame(fd, .FRAME_TYPE_BROKER_COMMAND_RESPONSE, payload);
 }
 
 fn queueAttachmentFrame(attachment: *Attachment, message_type: protocol.MessageType, payload: []const u8) !void {
@@ -1326,20 +1332,26 @@ fn attachedCount(session_agent: *SessionAgent, session_index: usize) u32 {
     return count;
 }
 
-fn sendSessionAttached(attachment: *Attachment, session: *const Session) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionAttached{
-        .session_id = session.idSlice(),
-    });
+fn sendSessionAttached(attachment: *Attachment) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionAttached{});
     defer app_allocator.allocator().free(payload);
     try queueAttachmentFrame(attachment, .FRAME_TYPE_SESSION_ATTACHED, payload);
 }
 
 fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !void {
+    const exit_status: ?pb.ExitStatus = switch (exit_info.kind) {
+        1 => .{ .kind = .EXIT_STATUS_KIND_EXITED, .status = exit_info.status },
+        2 => .{ .kind = .EXIT_STATUS_KIND_SIGNALLED, .status = exit_info.status },
+        else => null,
+    };
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionEnded{
-        .reason = reason,
-        .exit_kind = exit_info.kind,
-        .status = exit_info.status,
-        .ended_at_unix_ms = exit_info.ended_at_unix_ms,
+        .reason = switch (reason) {
+            1 => .SESSION_END_REASON_KILLED_BY_REQUEST,
+            2 => .SESSION_END_REASON_AGENT_SHUTDOWN,
+            else => .SESSION_END_REASON_PROCESS_EXITED,
+        },
+        .exit_status = exit_status,
+        .ended_at_unix_ms = if (exit_info.ended_at_unix_ms == 0) null else exit_info.ended_at_unix_ms,
     });
     defer app_allocator.allocator().free(payload);
     try queueAttachmentFrame(attachment, .FRAME_TYPE_SESSION_ENDED, payload);
@@ -1351,20 +1363,55 @@ fn readDefaultColorValue(color: u32) !u32 {
     return error.InvalidDefaultColor;
 }
 
+fn encodeScrollbackCursor(out: *[encoded_scrollback_cursor_len]u8, epoch: u64, per_epoch_cursor: u64) void {
+    writeU64BigEndian(out[0..8], epoch);
+    writeU64BigEndian(out[8..16], per_epoch_cursor);
+}
+
+fn decodeScrollbackCursor(bytes: []const u8) !ScrollbackCursor {
+    if (bytes.len == 0) return .{ .epoch = 0, .per_epoch_cursor = 0 };
+    if (bytes.len != encoded_scrollback_cursor_len) return error.InvalidScrollbackCursor;
+    return .{
+        .epoch = readU64BigEndian(bytes[0..8]),
+        .per_epoch_cursor = readU64BigEndian(bytes[8..16]),
+    };
+}
+
+fn writeU64BigEndian(bytes: []u8, value: u64) void {
+    bytes[0] = @intCast((value >> 56) & 0xff);
+    bytes[1] = @intCast((value >> 48) & 0xff);
+    bytes[2] = @intCast((value >> 40) & 0xff);
+    bytes[3] = @intCast((value >> 32) & 0xff);
+    bytes[4] = @intCast((value >> 24) & 0xff);
+    bytes[5] = @intCast((value >> 16) & 0xff);
+    bytes[6] = @intCast((value >> 8) & 0xff);
+    bytes[7] = @intCast(value & 0xff);
+}
+
+fn readU64BigEndian(bytes: []const u8) u64 {
+    return (@as(u64, bytes[0]) << 56) |
+        (@as(u64, bytes[1]) << 48) |
+        (@as(u64, bytes[2]) << 40) |
+        (@as(u64, bytes[3]) << 32) |
+        (@as(u64, bytes[4]) << 24) |
+        (@as(u64, bytes[5]) << 16) |
+        (@as(u64, bytes[6]) << 8) |
+        @as(u64, bytes[7]);
+}
+
 fn queueDrawFrame(
     attachment: *Attachment,
     session: *const Session,
-    scroll_count: u64,
+    scrollback_cursor: u64,
     draw_bytes: []const u8,
-    request_seq_number: ?u64,
     relay_end_restore_bytes: ?[]const u8,
 ) !void {
+    var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
+    encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Draw{
-        .scrollback_epoch = session.scrollback_epoch,
-        .scroll_count = scroll_count,
-        .cursor_row = attachment.presentation.cursor_row,
+        .scrollback_cursor = encoded_cursor[0..],
+        .viewport_offset = attachment.presentation.protocolViewportOffset(),
         .draw_bytes = draw_bytes,
-        .request_seq_number = request_seq_number,
         .relay_end_restore_bytes = relay_end_restore_bytes,
     });
     defer app_allocator.allocator().free(payload);
@@ -1393,14 +1440,19 @@ fn appendRelayEndRestoreBytes(
     return null;
 }
 
-fn queueScrollbackRowsDraw(attachment: *Attachment, session: *const Session, rows: []const vt.RenderedRow) !void {
+fn queueScrollbackRowsDraw(
+    attachment: *Attachment,
+    session: *const Session,
+    rows: []const vt.RenderedRow,
+    scrollback_cursor: u64,
+) !void {
     if (rows.len == 0) return;
     if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    try queueDrawFrame(attachment, session, @intCast(rows.len), bytes.items, null, null);
+    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null);
 }
 
 fn queueScrollbackRowsAndScreenDraw(
@@ -1410,7 +1462,7 @@ fn queueScrollbackRowsAndScreenDraw(
     screen: *const vt.RenderedScreen,
     restore_screen: ?*const vt.RenderedScreen,
     align_viewport: bool,
-    request_seq_number: ?u64,
+    scrollback_cursor: u64,
 ) !void {
     if (rows.len == 0) return;
     if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
@@ -1423,7 +1475,7 @@ fn queueScrollbackRowsAndScreenDraw(
         session.pendingPlainOutputCanReplay(),
     )) {
         try attachment.presentation.assumePlainPassthroughScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, @intCast(rows.len), passthrough, request_seq_number, null);
+        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, null);
         return;
     }
 
@@ -1439,16 +1491,21 @@ fn queueScrollbackRowsAndScreenDraw(
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
     const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-    try queueDrawFrame(attachment, session, @intCast(rows.len), bytes.items, request_seq_number, restore);
+    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, restore);
 }
 
-fn queueScrollbackTruncatedDraw(attachment: *Attachment, session: *const Session, truncated_rows: u64) !void {
+fn queueScrollbackTruncatedDraw(
+    attachment: *Attachment,
+    session: *const Session,
+    truncated_rows: u64,
+    scrollback_cursor: u64,
+) !void {
     if (truncated_rows == 0) return;
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
-    try queueDrawFrame(attachment, session, truncated_rows, bytes.items, null, null);
+    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null);
 }
 
 fn appendScrollbackTruncatedMarker(bytes: *std.ArrayList(u8), renderer: client_renderer.Renderer, truncated_rows: u64) !void {
@@ -1479,6 +1536,7 @@ fn screenWantsMouseReporting(screen: *const vt.RenderedScreen) bool {
 
 fn shouldAlignViewportForDraw(attachment: *const Attachment, screen: *const vt.RenderedScreen, requested: bool) bool {
     return requested or
+        attachment.presentation.viewportOffsetUnknown() or
         (screenWantsMouseReporting(screen) and !attachment.presentation.full_height_rendering);
 }
 
@@ -1489,7 +1547,7 @@ fn queueScreenDraw(
     restore_screen: ?*const vt.RenderedScreen,
     force_redraw: bool,
     align_viewport: bool,
-    request_seq_number: ?u64,
+    scrollback_cursor: u64,
 ) !bool {
     const passthrough = session.pending_plain_output.items;
     if (try attachment.presentation.canApplyPlainPassthrough(
@@ -1499,7 +1557,7 @@ fn queueScreenDraw(
         session.pendingPlainOutputCanReplay(),
     )) {
         try attachment.presentation.assumePlainPassthroughScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, 0, passthrough, request_seq_number, null);
+        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, null);
         return true;
     }
 
@@ -1515,7 +1573,7 @@ fn queueScreenDraw(
         var restore_bytes = std.ArrayList(u8).empty;
         defer restore_bytes.deinit(app_allocator.allocator());
         const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-        try queueDrawFrame(attachment, session, 0, bytes.items, request_seq_number, restore);
+        try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, restore);
         return true;
     }
     return false;
@@ -1526,76 +1584,164 @@ fn advanceScrollbackEpoch(session: *Session) void {
     if (session.scrollback_epoch == 0) session.scrollback_epoch = 1;
 }
 
-fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session, request_seq_number: ?u64) !void {
+fn advanceScrollbackEpochForClear(session: *Session) void {
+    advanceScrollbackEpoch(session);
+    session.last_scrollback_clear_epoch = session.scrollback_epoch;
+}
+
+fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session) !void {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try renderer.clearScrollback();
-    try queueDrawFrame(attachment, session, 0, bytes.items, request_seq_number, null);
+    try queueDrawFrame(attachment, session, 0, bytes.items, null);
 }
 
-fn queueRepaintDraw(
+fn queueRepaintResponseFrame(
+    attachment: *Attachment,
+    session: *const Session,
+    request_id: u64,
+    scrollback_cursor: u64,
+    draw_bytes: []const u8,
+    relay_end_restore_bytes: ?[]const u8,
+) !void {
+    var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
+    encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.RepaintResponse{
+        .id = request_id,
+        .draw = .{
+            .scrollback_cursor = encoded_cursor[0..],
+            .viewport_offset = attachment.presentation.protocolViewportOffset(),
+            .draw_bytes = draw_bytes,
+            .relay_end_restore_bytes = relay_end_restore_bytes,
+        },
+    });
+    defer app_allocator.allocator().free(payload);
+    try queueAttachmentFrame(attachment, .FRAME_TYPE_REPAINT_RESPONSE, payload);
+}
+
+fn queueRepaintResponseDraw(
     attachment: *Attachment,
     session: *Session,
+    request_id: u64,
+    clear_for_replace: bool,
     truncated_rows: u64,
     rows: []const vt.RenderedRow,
     screen: *const vt.RenderedScreen,
+    restore_screen: ?*const vt.RenderedScreen,
+    scrollback_cursor: u64,
 ) !void {
-    advanceScrollbackEpoch(session);
     if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
-    attachment.presentation.reset();
 
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try renderer.clearForReplace();
+    if (clear_for_replace) {
+        try renderer.clearForReplace();
+        attachment.presentation.reset();
+    }
     if (truncated_rows > 0) try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
-    try renderTranscriptRows(renderer, rows);
-    try attachment.presentation.applyScreen(renderer, session.rows, screen, true, screenWantsMouseReporting(screen));
-    attachment.origin = .{ .row = 0, .col = 0 };
+    try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
+    const effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, false);
+    try attachment.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
+    if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
     updateMouseOriginAfterDraw(attachment, screen);
     try appendDrawCleanup(&bytes);
-    try queueDrawFrame(attachment, session, truncated_rows + @as(u64, @intCast(rows.len)), bytes.items, null, null);
+    var restore_bytes = std.ArrayList(u8).empty;
+    defer restore_bytes.deinit(app_allocator.allocator());
+    const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
+    try queueRepaintResponseFrame(attachment, session, request_id, scrollback_cursor, bytes.items, restore);
 }
 
-fn sendSessionSnapshot(
+fn queueRepaintSnapshot(
     attachment: *Attachment,
     session: *Session,
-    initial_scrollback_row_count: ?u32,
-    reconnect_cursor: ?ScrollbackCursor,
-) !void {
+    request: RepaintRequest,
+    clear_for_replace: bool,
+) !usize {
+    const model = session.terminal_model orelse return 0;
+    var screen = try model.renderedScreen(app_allocator.allocator());
+    defer screen.deinit(app_allocator.allocator());
+
+    var primary_screen: ?vt.RenderedScreen = null;
+    defer if (primary_screen) |*primary| primary.deinit(app_allocator.allocator());
+    if (screen.active_screen == 1) {
+        primary_screen = try model.renderedPrimaryScreen(app_allocator.allocator());
+    }
+
+    if (request.scrollback_cursor) |requested_cursor| {
+        var scrollback = try model.scrollbackSnapshot(app_allocator.allocator());
+        defer scrollback.deinit(app_allocator.allocator());
+
+        const effective_cursor = if (requested_cursor.epoch == session.scrollback_epoch)
+            requested_cursor.per_epoch_cursor
+        else
+            0;
+        var rows_to_draw = scrollback.rows;
+        var truncated_rows_to_report: u64 = 0;
+        if (request.initial_scrollback_rows == null and effective_cursor < scrollback.truncated_rows) {
+            truncated_rows_to_report = scrollback.truncated_rows - effective_cursor;
+        } else {
+            const skip = effective_cursor -| scrollback.truncated_rows;
+            if (skip >= @as(u64, @intCast(rows_to_draw.len))) {
+                rows_to_draw = rows_to_draw[rows_to_draw.len..];
+            } else {
+                rows_to_draw = rows_to_draw[@intCast(skip)..];
+            }
+        }
+        if (request.initial_scrollback_rows) |initial_rows| {
+            const initial_rows_usize: usize = @intCast(initial_rows);
+            if (rows_to_draw.len > initial_rows_usize) {
+                rows_to_draw = rows_to_draw[rows_to_draw.len - initial_rows_usize ..];
+            }
+            truncated_rows_to_report = 0;
+        }
+
+        const clear_scrollback_for_stale_clear =
+            requested_cursor.epoch != 0 and requested_cursor.epoch < session.last_scrollback_clear_epoch;
+        try queueRepaintResponseDraw(
+            attachment,
+            session,
+            request.id,
+            clear_for_replace or clear_scrollback_for_stale_clear,
+            truncated_rows_to_report,
+            rows_to_draw,
+            &screen,
+            if (primary_screen) |*primary| primary else null,
+            scrollback.absolute_count,
+        );
+    } else {
+        const scrollback_cursor = try model.scrollbackCursor();
+        try queueRepaintResponseDraw(
+            attachment,
+            session,
+            request.id,
+            clear_for_replace,
+            0,
+            &.{},
+            &screen,
+            if (primary_screen) |*primary| primary else null,
+            scrollback_cursor,
+        );
+    }
+
+    return screen.rows.len;
+}
+
+fn sendSessionSnapshot(attachment: *Attachment, session: *Session) !void {
     if (session.terminal_model) |model| {
         var scrollback = try model.scrollbackSnapshot(app_allocator.allocator());
         defer scrollback.deinit(app_allocator.allocator());
         var screen = try model.renderedScreen(app_allocator.allocator());
         defer screen.deinit(app_allocator.allocator());
 
-        var rows_to_draw = scrollback.rows;
-        var truncated_rows_to_report: u64 = 0;
-        if (reconnect_cursor) |cursor| {
-            if (cursor.epoch != session.scrollback_epoch) {
-                advanceScrollbackEpoch(session);
-                try queueRetainedScrollbackClearDraw(attachment, session, null);
-                truncated_rows_to_report = scrollback.truncated_rows;
-            } else if (cursor.seen_rows < scrollback.truncated_rows) {
-                truncated_rows_to_report = scrollback.truncated_rows - cursor.seen_rows;
-            } else {
-                const skip = cursor.seen_rows - scrollback.truncated_rows;
-                if (skip >= rows_to_draw.len) {
-                    rows_to_draw = rows_to_draw[rows_to_draw.len..];
-                } else {
-                    rows_to_draw = rows_to_draw[@intCast(skip)..];
-                }
-            }
-        } else {
-            const limit = initial_scrollback_row_count orelse std.math.maxInt(u32);
-            const limit_usize: usize = @intCast(limit);
-            if (rows_to_draw.len > limit_usize) rows_to_draw = rows_to_draw[rows_to_draw.len - limit_usize ..];
-            if (initial_scrollback_row_count == null) truncated_rows_to_report = scrollback.truncated_rows;
-        }
+        const rows_to_draw = scrollback.rows;
+        const truncated_rows_to_report = scrollback.truncated_rows;
 
-        if (truncated_rows_to_report > 0) try queueScrollbackTruncatedDraw(attachment, session, truncated_rows_to_report);
-        if (rows_to_draw.len > 0) try queueScrollbackRowsDraw(attachment, session, rows_to_draw);
+        if (truncated_rows_to_report > 0) {
+            try queueScrollbackTruncatedDraw(attachment, session, truncated_rows_to_report, truncated_rows_to_report);
+        }
+        if (rows_to_draw.len > 0) try queueScrollbackRowsDraw(attachment, session, rows_to_draw, scrollback.absolute_count);
         var primary_screen: ?vt.RenderedScreen = null;
         defer if (primary_screen) |*primary| primary.deinit(app_allocator.allocator());
         if (screen.active_screen == 1) {
@@ -1608,7 +1754,7 @@ fn sendSessionSnapshot(
             if (primary_screen) |*primary| primary else null,
             true,
             false,
-            null,
+            scrollback.absolute_count,
         );
         model.markScrollbackReported();
         model.markRendered(screen.rows.len);
@@ -1616,10 +1762,21 @@ fn sendSessionSnapshot(
     }
 }
 
+fn sendSessionRepaintSnapshot(attachment: *Attachment, session: *Session, request: RepaintRequest) !void {
+    const model = session.terminal_model orelse return;
+    const screen_rows = try queueRepaintSnapshot(attachment, session, request, false);
+    model.markScrollbackReported();
+    model.markRendered(screen_rows);
+}
+
 fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
+    const resized = session.rows != rows or session.cols != cols;
     session.rows = rows;
     session.cols = cols;
-    if (session.terminal_model) |model| model.resize(rows, cols) catch {};
+    if (session.terminal_model) |model| {
+        model.resize(rows, cols) catch {};
+        if (resized) advanceScrollbackEpoch(session);
+    }
     _ = terminal.setPtySize(session.pty_fd, rows, cols);
 }
 
@@ -1647,6 +1804,7 @@ fn signalPidOrGroup(pid: c.pid_t, signal: u8) bool {
 fn readSessionNewRequest(payload: []const u8) !SessionNewRequest {
     var message = try protocol.decodePayload(pb.SessionNew, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
+    const resize = message.resize orelse return error.MissingResize;
     var environment = SessionEnvironment{};
     errdefer environment.deinit();
     var query_default_colors = vt.DefaultColors{};
@@ -1659,6 +1817,7 @@ fn readSessionNewRequest(payload: []const u8) !SessionNewRequest {
     }
 
     return .{
+        .resize = try resizePayloadFromMessage(resize),
         .scrollback_row_count = message.scrollback_row_limit,
         .environment = environment,
         .query_default_colors = query_default_colors,
@@ -1679,43 +1838,54 @@ fn readDefaultColors(colors: pb.DefaultColors) !vt.DefaultColors {
     };
 }
 
-fn readResizePayload(payload: []const u8) !PendingSize {
+fn readResizePayload(payload: []const u8) !ResizePayload {
     var message = try protocol.decodePayload(pb.Resize, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
+    return try resizePayloadFromMessage(message);
+}
+
+fn resizePayloadFromMessage(message: pb.Resize) !ResizePayload {
     if (message.terminal_rows > std.math.maxInt(u16) or
         message.terminal_cols > std.math.maxInt(u16))
     {
         return error.IntOutOfRange;
     }
+    if (message.viewport_offset) |offset| {
+        if (offset < -1) return error.InvalidViewportOffset;
+        if (offset > std.math.maxInt(u16)) return error.IntOutOfRange;
+    }
     return .{
         .rows = @intCast(message.terminal_rows),
         .cols = @intCast(message.terminal_cols),
-        .present = true,
+        .viewport_offset = message.viewport_offset,
+        .repaint_request = if (message.repaint_request) |repaint| try repaintRequestFromMessage(repaint) else null,
     };
 }
 
 fn readAttachRequest(payload: []const u8) !AttachRequest {
     var message = try protocol.decodePayload(pb.SessionAttach, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
+    const resize = message.resize orelse return error.MissingResize;
     return .{
-        .session_id = if (message.session_id) |session_id|
-            try app_allocator.allocator().dupe(u8, session_id)
+        .resize = try resizePayloadFromMessage(resize),
+    };
+}
+
+fn readRepaintRequest(payload: []const u8) !RepaintRequest {
+    var message = try protocol.decodePayload(pb.RepaintRequest, app_allocator.allocator(), payload);
+    defer message.deinit(app_allocator.allocator());
+    return repaintRequestFromMessage(message);
+}
+
+fn repaintRequestFromMessage(message: pb.RepaintRequest) !RepaintRequest {
+    return .{
+        .id = message.id,
+        .scrollback_cursor = if (message.scrollback_cursor) |cursor|
+            try decodeScrollbackCursor(cursor)
         else
             null,
-        .initial_scrollback_row_count = message.initial_scrollback_row_count,
-        .reconnect_cursor = if (message.reconnect_cursor) |cursor| readScrollbackCursor(cursor) else null,
+        .initial_scrollback_rows = message.initial_scrollback_rows,
     };
-}
-
-fn readScrollbackCursor(cursor: pb.ScrollbackCursor) ScrollbackCursor {
-    return .{
-        .epoch = cursor.scrollback_epoch,
-        .seen_rows = cursor.seen_scrollback_rows,
-    };
-}
-
-fn readRepaintRequest(payload: []const u8) !pb.Repaint {
-    return protocol.decodePayload(pb.Repaint, app_allocator.allocator(), payload);
 }
 
 fn createSession(
@@ -1840,10 +2010,7 @@ fn attachSession(
     session_agent: *SessionAgent,
     session_index: usize,
     client_fd: c.fd_t,
-    rows: u16,
-    cols: u16,
-    initial_scrollback_row_count: ?u32,
-    reconnect_cursor: ?ScrollbackCursor,
+    resize: ResizePayload,
 ) !void {
     const session = &session_agent.sessions[session_index];
 
@@ -1852,21 +2019,26 @@ fn attachSession(
         attachment.* = .{
             .fd = client_fd,
             .session_index = session_index,
-            .rows = rows,
-            .cols = cols,
+            .rows = resize.rows,
+            .cols = resize.cols,
             .active = true,
         };
+        attachment.presentation.setViewportOffset(resize.viewport_offset);
         errdefer {
             attachment.output.deinit(app_allocator.allocator());
             attachment.* = Attachment{};
         }
-        try sendSessionAttached(attachment, session);
-        try sendSessionSnapshot(attachment, session, initial_scrollback_row_count, reconnect_cursor);
+        try sendSessionAttached(attachment);
+        if (resize.repaint_request) |request| {
+            try sendSessionRepaintSnapshot(attachment, session, request);
+        } else {
+            try sendSessionSnapshot(attachment, session);
+        }
         refreshAttachedFlag(session_agent, session_index);
         logSessionAgent(session_agent, "event=attach id={s} rows={} cols={} attachments={}", .{
             session.idSlice(),
-            rows,
-            cols,
+            resize.rows,
+            resize.cols,
             attachedCount(session_agent, session_index),
         });
         flushAttachmentOutput(session_agent, attachment_index);
@@ -1981,7 +2153,7 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
 
     switch (frame.message_type) {
         .known => |message_type| switch (message_type) {
-            .FRAME_TYPE_INPUT => handleInputFrame(session_agent, attachment_index, frame.seq, frame.payload),
+            .FRAME_TYPE_INPUT => handleInputFrame(session_agent, attachment_index, frame.payload),
             .FRAME_TYPE_RESIZE => handleResizeFrame(session_agent, attachment_index, frame.payload),
             .FRAME_TYPE_REPAINT => handleRepaintFrame(session_agent, attachment_index, frame.payload),
             .FRAME_TYPE_PING_REQUEST => handlePingRequestFrame(session_agent, attachment_index, frame.seq, frame.payload),
@@ -2004,7 +2176,7 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
     }
 }
 
-fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, request_seq_number: u64, payload: []const u8) void {
+fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
     const attachment = &session_agent.attachments[attachment_index];
     const session = &session_agent.sessions[attachment.session_index];
     var input = protocol.decodePayload(pb.Input, app_allocator.allocator(), payload) catch {
@@ -2030,7 +2202,6 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, reque
         detachAttachment(session_agent, attachment_index);
         return;
     };
-    attachment.pending_draw_request_seq = request_seq_number;
 }
 
 fn handlePingRequestFrame(session_agent: *SessionAgent, attachment_index: usize, request_seq_number: u64, payload: []const u8) void {
@@ -2229,50 +2400,40 @@ test "SGR mouse input is translated from outer to inner coordinates" {
 fn handleResizeFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
     const attachment = &session_agent.attachments[attachment_index];
     const session = &session_agent.sessions[attachment.session_index];
-    const size = readResizePayload(payload) catch {
+    const resize = readResizePayload(payload) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };
-    attachment.rows = size.rows;
-    attachment.cols = size.cols;
-    updateSessionSize(session, size.rows, size.cols);
+    attachment.rows = resize.rows;
+    attachment.cols = resize.cols;
+    attachment.presentation.setViewportOffset(resize.viewport_offset);
+    updateSessionSize(session, resize.rows, resize.cols);
+    if (resize.repaint_request) |request| {
+        handleRepaintRequest(session_agent, attachment_index, request);
+    }
 }
 
 fn handleRepaintFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
+    const request = readRepaintRequest(payload) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    handleRepaintRequest(session_agent, attachment_index, request);
+}
+
+fn handleRepaintRequest(session_agent: *SessionAgent, attachment_index: usize, request: RepaintRequest) void {
     const attachment = &session_agent.attachments[attachment_index];
     const session = &session_agent.sessions[attachment.session_index];
-    var request = readRepaintRequest(payload) catch {
-        detachAttachment(session_agent, attachment_index);
-        return;
-    };
-    defer request.deinit(app_allocator.allocator());
 
     const model = session.terminal_model orelse return;
-    var screen = model.renderedScreen(app_allocator.allocator()) catch {
+    const clear_for_replace = request.scrollback_cursor != null and
+        request.scrollback_cursor.?.per_epoch_cursor == 0 and
+        request.initial_scrollback_rows == null;
+    const screen_rows = queueRepaintSnapshot(attachment, session, request, clear_for_replace) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };
-    defer screen.deinit(app_allocator.allocator());
-
-    if (request.include_scrollback) {
-        var scrollback = model.scrollbackSnapshot(app_allocator.allocator()) catch {
-            detachAttachment(session_agent, attachment_index);
-            return;
-        };
-        defer scrollback.deinit(app_allocator.allocator());
-        queueRepaintDraw(attachment, session, scrollback.truncated_rows, scrollback.rows, &screen) catch {
-            detachAttachment(session_agent, attachment_index);
-            return;
-        };
-        model.markScrollbackReported();
-    } else {
-        _ = queueScreenDraw(attachment, session, &screen, null, true, false, null) catch {
-            detachAttachment(session_agent, attachment_index);
-            return;
-        };
-    }
-
-    model.markRendered(screen.rows.len);
+    model.markRendered(screen_rows);
     flushAttachmentOutput(session_agent, attachment_index);
 }
 
@@ -2320,26 +2481,16 @@ fn broadcastSessionPatch(session_agent: *SessionAgent, session_index: usize) voi
             return;
         };
     }
-    if (screen.retained_scrollback_clear_dirty) advanceScrollbackEpoch(session);
+    if (screen.retained_scrollback_clear_dirty) advanceScrollbackEpochForClear(session);
     var delivered = false;
     for (&session_agent.attachments, 0..) |*attachment, i| {
         if (!attachment.active or attachment.session_index != session_index) continue;
         if (attachment.close_after_flush) continue;
-        const request_seq_number = attachment.pending_draw_request_seq;
-        var request_seq_queued = false;
-        const clear_is_only_draw = screen.retained_scrollback_clear_dirty and
-            scrollback.rows.len == 0 and
-            !should_send_screen_draw;
         if (screen.retained_scrollback_clear_dirty) {
-            queueRetainedScrollbackClearDraw(
-                attachment,
-                session,
-                if (clear_is_only_draw) request_seq_number else null,
-            ) catch {
+            queueRetainedScrollbackClearDraw(attachment, session) catch {
                 detachAttachment(session_agent, i);
                 continue;
             };
-            request_seq_queued = clear_is_only_draw and request_seq_number != null;
         }
         if (scrollback.rows.len > 0) {
             queueScrollbackRowsAndScreenDraw(
@@ -2349,27 +2500,25 @@ fn broadcastSessionPatch(session_agent: *SessionAgent, session_index: usize) voi
                 &screen,
                 if (primary_screen) |*primary| primary else null,
                 materialize_screen_after_scrollback,
-                request_seq_number,
+                scrollback.absolute_count,
             ) catch {
                 detachAttachment(session_agent, i);
                 continue;
             };
-            request_seq_queued = request_seq_number != null;
         } else if (should_send_screen_draw) {
-            request_seq_queued = queueScreenDraw(
+            _ = queueScreenDraw(
                 attachment,
                 session,
                 &screen,
                 if (primary_screen) |*primary| primary else null,
                 materialize_screen_after_scrollback,
                 materialize_screen_after_scrollback,
-                request_seq_number,
+                scrollback.absolute_count,
             ) catch {
                 detachAttachment(session_agent, i);
                 continue;
             };
         }
-        if (request_seq_queued) attachment.pending_draw_request_seq = null;
         flushAttachmentOutput(session_agent, i);
         if (attachment.active) delivered = true;
     }
@@ -2532,11 +2681,11 @@ fn findSessionIndex(session_agent: *SessionAgent, id: []const u8) ?usize {
     return null;
 }
 
-fn findMostRecentDetachedSessionIndex(session_agent: *SessionAgent) ?usize {
+fn findMostRecentSessionIndex(session_agent: *SessionAgent) ?usize {
     var selected: ?usize = null;
     var selected_number: usize = 0;
     for (&session_agent.sessions, 0..) |*session, i| {
-        if (!session.alive or attachedCount(session_agent, i) != 0) continue;
+        if (!session.alive) continue;
         const id = session.idSlice();
         if (id.len < 2 or id[0] != 's') continue;
         const number = std.fmt.parseInt(usize, id[1..], 10) catch continue;

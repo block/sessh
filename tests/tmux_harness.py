@@ -947,7 +947,7 @@ def main():
                 raise AssertionError(f"detach left tmux on the remote alternate screen:\n{alt_screen_capture}")
             if alt_screen_command not in alt_screen_capture or "ALT_READY$ go" not in alt_screen_capture:
                 raise AssertionError(f"detach did not restore the primary screen:\n{alt_screen_capture}")
-            if "sessh: detached" not in alt_screen_capture or "sessh :local: --attach " not in alt_screen_capture:
+            if "sessh: detached" not in alt_screen_capture or "sessh :local: --attach" not in alt_screen_capture:
                 raise AssertionError(f"detach did not print a reattach banner:\n{alt_screen_capture}")
 
             run(

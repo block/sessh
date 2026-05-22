@@ -401,7 +401,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             },
         }
 
-        var reconnect_ui = try client.ReconnectUi.begin(session.origin_row, session.cursor_row);
+        var reconnect_ui = try client.ReconnectUi.begin(session.viewport_offset);
         var reconnect_ui_active = true;
         defer if (reconnect_ui_active) reconnect_ui.deinit();
 
