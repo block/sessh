@@ -50,6 +50,17 @@ pub fn decodePayload(comptime T: type, allocator: std.mem.Allocator, payload: []
     return T.decode(&reader, allocator);
 }
 
+pub fn helloRequestIsCompatible(
+    hello: hpb.HelloRequest,
+    local_major: u32,
+    local_minor: u32,
+    local_version: []const u8,
+) bool {
+    return hello.protocol_major == local_major and
+        hello.protocol_minor >= local_minor and
+        std.mem.eql(u8, hello.version, local_version);
+}
+
 pub fn readFrameAlloc(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedFrame {
     const envelope = try readEnvelopeAlloc(allocator, fd);
     defer allocator.free(envelope);
@@ -255,4 +266,41 @@ test "frame envelope round trip" {
     var decoded = try decodePayload(pb.PingRequest, std.testing.allocator, frame.payload);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 42), decoded.ping_request_seq);
+}
+
+test "hello compatibility accepts higher minor only for same major and version" {
+    try std.testing.expect(helloRequestIsCompatible(.{
+        .protocol_major = 2,
+        .protocol_minor = 4,
+        .version = "0.5.0-dev",
+    }, 2, 3, "0.5.0-dev"));
+    try std.testing.expect(!helloRequestIsCompatible(.{
+        .protocol_major = 2,
+        .protocol_minor = 2,
+        .version = "0.5.0-dev",
+    }, 2, 3, "0.5.0-dev"));
+    try std.testing.expect(!helloRequestIsCompatible(.{
+        .protocol_major = 3,
+        .protocol_minor = 4,
+        .version = "0.5.0-dev",
+    }, 2, 3, "0.5.0-dev"));
+    try std.testing.expect(!helloRequestIsCompatible(.{
+        .protocol_major = 2,
+        .protocol_minor = 4,
+        .version = "0.6.0-dev",
+    }, 2, 3, "0.5.0-dev"));
+}
+
+test "session ended exit status is optional" {
+    const payload = try encodePayload(std.testing.allocator, pb.SessionEnded{
+        .reason = .SESSION_END_REASON_KILLED_BY_REQUEST,
+        .ended_at_unix_ms = 42,
+    });
+    defer std.testing.allocator.free(payload);
+
+    var decoded = try decodePayload(pb.SessionEnded, std.testing.allocator, payload);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pb.SessionEndReason.SESSION_END_REASON_KILLED_BY_REQUEST, decoded.reason);
+    try std.testing.expectEqual(@as(?pb.ExitStatus, null), decoded.exit_status);
+    try std.testing.expectEqual(@as(?u64, 42), decoded.ended_at_unix_ms);
 }

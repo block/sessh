@@ -353,6 +353,12 @@ def parse_ping_response(payload):
     return message.ping_request_seq
 
 
+def parse_session_ended(payload):
+    message = sessh_pb().SessionEnded()
+    message.ParseFromString(payload)
+    return message
+
+
 def assert_session_attached(payload):
     message = sessh_pb().SessionAttached()
     message.ParseFromString(payload)
@@ -531,6 +537,70 @@ def start_session_agent(env, session_id="s1"):
     return proc
 
 
+def write_session_meta(env, session_id, agent_pid, version=None):
+    path = session_dir(env, session_id)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (path / "meta").write_text(f"agent_pid={agent_pid}\nversion={version or sessh_version()}\n")
+    return path
+
+
+def write_compat_script(path, log_path, exit_status=0):
+    path.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >>{str(log_path)!r}\n"
+        f"exit {exit_status}\n"
+    )
+    path.chmod(0o700)
+
+
+def process_exists(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def wait_process_missing(pid, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_exists(pid):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"process {pid} still exists")
+
+
+def start_sigterm_ignoring_process(tmp, name):
+    pid_file = Path(tmp) / f"{name}.pid"
+    term_marker = Path(tmp) / f"{name}.term"
+    ready_marker = Path(tmp) / f"{name}.ready"
+    script = Path(tmp) / f"{name}.py"
+    script.write_text(
+        "import os, pathlib, signal, sys, time\n"
+        "pid = os.fork()\n"
+        "if pid:\n"
+        "    pathlib.Path(sys.argv[1]).write_text(str(pid))\n"
+        "    sys.exit(0)\n"
+        "os.setsid()\n"
+        "def on_term(signum, frame):\n"
+        "    pathlib.Path(sys.argv[2]).write_text('term')\n"
+        "signal.signal(signal.SIGTERM, on_term)\n"
+        "pathlib.Path(sys.argv[3]).write_text('ready')\n"
+        "while True:\n"
+        "    time.sleep(1)\n"
+    )
+    subprocess.run(
+        [sys.executable, str(script), str(pid_file), str(term_marker), str(ready_marker)],
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+    wait_file(ready_marker)
+    return int(pid_file.read_text()), term_marker
+
+
 def session_agent_pids(env):
     needle = f":internal-session-agent: --session-dir {Path(env['XDG_RUNTIME_DIR']) / 'sessh' / 's'}"
     result = subprocess.run(
@@ -596,14 +666,17 @@ def config_version():
     return version, major, minor
 
 
-def send_hello(conn, minor_delta=0, expect_ok=True):
+def send_hello(conn, major_delta=0, minor_delta=0, expect_ok=True):
     version, major, minor = config_version()
+    peer_minor = minor + minor_delta
+    if peer_minor < 0:
+        raise AssertionError(f"invalid negative protocol minor: {peer_minor}")
     send_frame(
         conn,
         HELLO_REQUEST,
         sessh_hpb().HelloRequest(
-            protocol_major=major,
-            protocol_minor=minor + minor_delta,
+            protocol_major=major + major_delta,
+            protocol_minor=peer_minor,
             version=version,
         ).SerializeToString(),
     )
@@ -618,6 +691,8 @@ def send_hello(conn, minor_delta=0, expect_ok=True):
             raise AssertionError(f"expected HELLO_ERROR, got {message_type}")
         error = sessh_hpb().HelloError()
         error.ParseFromString(payload)
+        if error.code != "VERSION_MISMATCH":
+            raise AssertionError(f"expected VERSION_MISMATCH, got {error!r}")
         return message_type, payload
     message_type, payload = recv_frame(conn)
     if message_type != HELLO_REQUEST:
@@ -630,13 +705,35 @@ def send_hello(conn, minor_delta=0, expect_ok=True):
     return message_type, payload
 
 
+def broker_hello(env, **kwargs):
+    proc = subprocess.Popen(
+        [str(BIN), ":internal-host-broker:"],
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    conn = FdConn(proc.stdout.fileno(), proc.stdin.fileno())
+    try:
+        return send_hello(conn, **kwargs)
+    finally:
+        if kwargs.get("expect_ok", True):
+            proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+
 def run_minor_version_compatibility_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-minor-compat-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         env["SHELL"] = "/bin/sh"
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            proc = start_session_agent(env)
 
             newer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             newer.settimeout(5.0)
@@ -646,16 +743,20 @@ def run_minor_version_compatibility_test(base_env):
             finally:
                 newer.close()
 
-            _version, _major, minor = config_version()
-            if minor > 0:
-                older = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                older.settimeout(5.0)
-                try:
-                    older.connect(str(socket_path(env)))
-                    send_hello(older, minor_delta=-1, expect_ok=False)
-                finally:
-                    older.close()
+            wrong_major = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            wrong_major.settimeout(5.0)
+            try:
+                wrong_major.connect(str(socket_path(env)))
+                send_hello(wrong_major, major_delta=1, expect_ok=False)
+            finally:
+                wrong_major.close()
+
+            broker_hello(env, minor_delta=1)
+            broker_hello(env, major_delta=1, expect_ok=False)
         finally:
+            if "proc" in locals() and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2.0)
             cleanup_runtime(env)
 
 
@@ -740,6 +841,97 @@ def run_ping_protocol_test(base_env):
                 conn.close()
         finally:
             cleanup_runtime(env)
+
+
+def run_session_ended_payload_protocol_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-session-ended-exit-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "exit-status-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "printf 'EXIT_READY\\n'\n"
+            "while IFS= read -r line; do\n"
+            "  [ \"$line\" = exit ] && exit 7\n"
+            "done\n"
+        )
+        shell.chmod(0o700)
+        env["SHELL"] = str(shell)
+        cleanup_runtime(env)
+        conn = None
+        proc = None
+        try:
+            proc = start_session_agent(env)
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            conn.connect(str(socket_path(env)))
+            send_hello(conn)
+            send_resize(conn)
+            send_frame(conn, SESSION_NEW, pack_session_new(shell))
+            message_kind, payload = recv_frame(conn)
+            if message_kind != SESSION_ATTACHED:
+                raise AssertionError(f"expected SESSION_ATTACHED, got {message_kind}")
+            assert_session_attached(payload)
+            recv_draw_until(conn, b"EXIT_READY")
+            send_frame(conn, INPUT, pack_bytes(b"exit\n"))
+
+            ended = parse_session_ended(recv_until_message(conn, SESSION_ENDED))
+            pb = sessh_pb()
+            if ended.reason != pb.SESSION_END_REASON_PROCESS_EXITED:
+                raise AssertionError(f"unexpected process-exit reason: {ended!r}")
+            if not ended.HasField("exit_status"):
+                raise AssertionError(f"missing process exit status: {ended!r}")
+            if ended.exit_status.kind != pb.EXIT_STATUS_KIND_EXITED or ended.exit_status.status != 7:
+                raise AssertionError(f"unexpected process exit status: {ended!r}")
+            if not ended.HasField("ended_at_unix_ms"):
+                raise AssertionError(f"missing end timestamp: {ended!r}")
+        finally:
+            if conn is not None:
+                conn.close()
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            cleanup_runtime(env)
+
+    with tempfile.TemporaryDirectory(prefix="sessh-session-ended-kill-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "kill-status-shell"
+        shell.write_text("#!/bin/sh\nprintf 'KILL_READY\\n'\nwhile :; do sleep 1; done\n")
+        shell.chmod(0o700)
+        env["SHELL"] = str(shell)
+        cleanup_runtime(env)
+        conn = None
+        proc = None
+        try:
+            proc = start_session_agent(env)
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            conn.connect(str(socket_path(env)))
+            send_hello(conn)
+            send_resize(conn)
+            send_frame(conn, SESSION_NEW, pack_session_new(shell))
+            message_kind, payload = recv_frame(conn)
+            if message_kind != SESSION_ATTACHED:
+                raise AssertionError(f"expected SESSION_ATTACHED, got {message_kind}")
+            assert_session_attached(payload)
+            recv_draw_until(conn, b"KILL_READY")
+
+            os.kill(proc.pid, signal.SIGTERM)
+            ended = parse_session_ended(recv_until_message(conn, SESSION_ENDED))
+            pb = sessh_pb()
+            if ended.reason != pb.SESSION_END_REASON_KILLED_BY_REQUEST:
+                raise AssertionError(f"unexpected killed reason: {ended!r}")
+            if ended.HasField("exit_status"):
+                raise AssertionError(f"killed-by-request should not report a wait status: {ended!r}")
+            if not ended.HasField("ended_at_unix_ms"):
+                raise AssertionError(f"missing killed timestamp: {ended!r}")
+        finally:
+            if conn is not None:
+                conn.close()
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            cleanup_runtime(env)
+
 
 def run_plain_scroll_protocol_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-plain-scroll-", dir="/tmp") as tmp:
@@ -1385,6 +1577,15 @@ def run_scrollback_attach_draw_protocol_test(base_env):
                     raise AssertionError(f"unexpected full repaint seq: {response_id}")
                 if full_repaint["scrollback_cursor"] == 0 or b"history_01" not in full_repaint["draw_bytes"]:
                     raise AssertionError(f"full repaint did not include retained scrollback: {full_repaint!r}")
+
+                send_frame(conn, REPAINT_REQUEST, pack_repaint(3))
+                send_frame(conn, REPAINT_REQUEST, pack_repaint(4, 0))
+                first_response_id, _first_draw = recv_repaint_response(conn)
+                second_response_id, second_draw = recv_repaint_response(conn)
+                if (first_response_id, second_response_id) != (3, 4):
+                    raise AssertionError(f"repaint responses arrived out of order: {(first_response_id, second_response_id)}")
+                if second_draw["scrollback_cursor"] == 0 or b"history_01" not in second_draw["draw_bytes"]:
+                    raise AssertionError(f"latest repaint did not include requested retained scrollback: {second_draw!r}")
             finally:
                 conn.close()
 
@@ -2078,6 +2279,78 @@ def run_host_broker_registry_commands_test(base_env):
             wait_missing(session_dir / "compat")
 
 
+def run_broker_kill_edge_cases_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-broker-sigkill-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        cleanup_runtime(env)
+        agent_pid, term_marker = start_sigterm_ignoring_process(tmp, "ignore-term-agent")
+        try:
+            write_session_meta(env, "s1", agent_pid)
+            killed = run([":internal-host-broker:", "--kill", "s1"], env, timeout=6.0)
+            if killed.returncode != 0 or "ENDED s1" not in killed.stdout:
+                raise AssertionError(killed)
+            wait_file(term_marker)
+            wait_process_missing(agent_pid)
+        finally:
+            if process_exists(agent_pid):
+                os.kill(agent_pid, signal.SIGKILL)
+                wait_process_missing(agent_pid)
+            cleanup_runtime(env)
+
+    with tempfile.TemporaryDirectory(prefix="sessh-broker-compat-kill-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        cleanup_runtime(env)
+        sleeper = subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            session_path = write_session_meta(env, "s1", sleeper.pid, version="0.0.0-compat-test")
+            compat_log = Path(tmp) / "compat.log"
+            write_compat_script(session_path / "compat", compat_log)
+
+            killed = run([":internal-host-broker:", "--kill", "s1"], env, check=True, timeout=5.0)
+            if killed.stdout or killed.stderr:
+                raise AssertionError(killed)
+            expected = f":local: --compat-version {sessh_version()} --kill s1"
+            if expected not in compat_log.read_text().splitlines():
+                raise AssertionError(compat_log.read_text())
+            if sleeper.poll() is not None:
+                raise AssertionError("broker killed a mismatched-version agent instead of delegating to compat")
+        finally:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=2.0)
+            cleanup_runtime(env)
+
+    with tempfile.TemporaryDirectory(prefix="sessh-broker-compat-kill-all-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        cleanup_runtime(env)
+        sleepers = [
+            subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(2)
+        ]
+        try:
+            compat_log = Path(tmp) / "compat-all.log"
+            for session_id, proc in zip(("s1", "s2"), sleepers):
+                session_path = write_session_meta(env, session_id, proc.pid, version="0.0.0-compat-test")
+                write_compat_script(session_path / "compat", compat_log)
+
+            stopped = run([":internal-host-broker:", "--kill-all"], env, check=True, timeout=5.0)
+            if stopped.stdout != "KILLING_ALL\n" or stopped.stderr:
+                raise AssertionError(stopped)
+            lines = compat_log.read_text().splitlines()
+            for session_id in ("s1", "s2"):
+                expected = f":local: --compat-version {sessh_version()} --kill {session_id}"
+                if expected not in lines:
+                    raise AssertionError(lines)
+            if any(proc.poll() is not None for proc in sleepers):
+                raise AssertionError("broker killed a mismatched-version agent during kill-all")
+        finally:
+            for proc in sleepers:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=2.0)
+            cleanup_runtime(env)
+
+
 def spawn_client(env, extra_args=None):
     extra_args = extra_args or []
     pid, fd = pty.fork()
@@ -2224,9 +2497,11 @@ def main():
             run_session_agent_registry_test(env)
             run_host_broker_starts_session_agent_test(env)
             run_host_broker_registry_commands_test(env)
+            run_broker_kill_edge_cases_test(env)
             run_minor_version_compatibility_test(env)
             run_live_draw_protocol_test(env)
             run_ping_protocol_test(env)
+            run_session_ended_payload_protocol_test(env)
             run_plain_scroll_protocol_test(env)
             run_plain_screen_protocol_test(env)
             run_split_escape_tail_is_not_passthrough_test(env)
