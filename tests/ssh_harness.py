@@ -292,7 +292,16 @@ def run_sessh_until_stdout(args, env, needle, timeout=10.0):
     )
 
 
-def run_sessh_reconnect_probe(args, env, ready, after, during=None, timeout=30.0):
+def run_sessh_reconnect_probe(
+    args,
+    env,
+    ready,
+    after,
+    during=None,
+    timeout=30.0,
+    expect_countdown=False,
+    expect_reconnecting=False,
+):
     proc = subprocess.Popen(
         [str(BIN), *args],
         cwd=ROOT,
@@ -305,11 +314,15 @@ def run_sessh_reconnect_probe(args, env, ready, after, during=None, timeout=30.0
     proc.stdin.write(b"\x02s")
     proc.stdin.flush()
     stdout += read_until_pipe(proc.stdout, b"sessh: disconnected. Retry in 5sec", timeout)
+    if expect_countdown:
+        stdout += read_until_pipe(proc.stdout, b"sessh: disconnected. Retry in 4sec", timeout)
     if during is not None:
         proc.stdin.write(during.encode("utf-8") + b"\n")
         proc.stdin.flush()
     proc.stdin.write(b" ")
     proc.stdin.flush()
+    if expect_reconnecting:
+        stdout += read_until_pipe(proc.stdout, b"sessh: reconnecting... CTRL-C aborts", timeout)
     stdout += read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
     if during is not None:
         during_needle = f"REMOTE:{during}".encode("utf-8")
@@ -1048,12 +1061,18 @@ def test_ssh_leader_sever_reconnects(tmp):
         marker,
         "after-reconnect",
         during="during-reconnect",
+        expect_countdown=True,
+        expect_reconnecting=True,
         timeout=30.0,
     )
 
     if result.returncode != 0:
         raise AssertionError(result)
     if "sessh: disconnected. Retry in 5sec" not in result.stdout:
+        raise AssertionError(result)
+    if "sessh: disconnected. Retry in 4sec" not in result.stdout:
+        raise AssertionError(result)
+    if "sessh: reconnecting... CTRL-C aborts" not in result.stdout:
         raise AssertionError(result)
     if "REMOTE:after-reconnect" not in result.stdout:
         raise AssertionError(result)

@@ -253,8 +253,9 @@ def main():
 
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "C-a", "s"])
             wait_capture(env, session, "sessh: disconnected. Retry in 5sec")
+            wait_capture(env, session, "sessh: disconnected. Retry in 4sec", timeout=2.0)
             banner = capture_visible(env, session).splitlines()
-            if remote_top_index + 1 >= len(banner) or "sessh: disconnected. Retry in 5sec" not in banner[remote_top_index + 1]:
+            if remote_top_index + 1 >= len(banner) or "sessh: disconnected. Retry in 4sec" not in banner[remote_top_index + 1]:
                 raise AssertionError(
                     "reconnect banner was not drawn one row below the sessh screen top\n"
                     f"before:\n{before}\n"
@@ -262,10 +263,16 @@ def main():
                 )
 
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "Space"])
+            wait_capture(env, session, "sessh: reconnecting... CTRL-C aborts", timeout=2.0)
             success_banner = "sessh: reconnected"
             wait_capture(env, session, success_banner, timeout=10.0)
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "Space"])
             wait_visible_absent(env, session, success_banner, timeout=2.0)
+            after_repaint = capture_visible(env, session)
+            if "sessh: disconnected. Retry" in after_repaint:
+                raise AssertionError(f"reconnect banner was still visible after repaint:\n{after_repaint}")
+            if after_repaint.count("REMOTE_TOP") != 1:
+                raise AssertionError(f"reconnect did not repaint the session screen before input:\n{after_repaint}")
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "after-reconnect", "Enter"])
             final = wait_capture(env, session, "REMOTE:after-reconnect")
             if "sessh: disconnected. Retry" in final:
