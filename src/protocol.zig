@@ -7,51 +7,30 @@ pub const pb = @import("proto/sessh/protocol/v1.pb.zig");
 pub const hpb = @import("proto/sessh/handshake/v1.pb.zig");
 
 pub const MessageType = enum {
-    FRAME_TYPE_HELLO_REQUEST,
-    FRAME_TYPE_HELLO_OK,
-    FRAME_TYPE_HELLO_ERROR,
-    FRAME_TYPE_ERROR,
+    hello_request,
+    hello_ok,
+    hello_error,
+    error_message,
 
-    FRAME_TYPE_SESSION_NEW,
-    FRAME_TYPE_SESSION_ATTACH,
-    FRAME_TYPE_INPUT,
-    FRAME_TYPE_RESIZE,
-    FRAME_TYPE_REPAINT,
-    FRAME_TYPE_PING_REQUEST,
+    session_new,
+    session_attach,
+    input,
+    resize,
+    repaint_request,
+    ping_request,
 
-    FRAME_TYPE_SESSION_ATTACHED,
-    FRAME_TYPE_SESSION_ENDED,
-    FRAME_TYPE_DRAW,
-    FRAME_TYPE_PING_RESPONSE,
-    FRAME_TYPE_REPAINT_RESPONSE,
+    session_attached,
+    session_ended,
+    draw,
+    ping_response,
+    repaint_response,
 };
 
 pub const frame_header_len = 4;
 
-pub const FrameType = union(enum) {
-    known: MessageType,
-};
-
-pub const Frame = struct {
-    message_type: FrameType,
-    payload: []const u8,
-
-    pub fn knownMessageType(self: Frame) ?MessageType {
-        return switch (self.message_type) {
-            .known => |message_type| message_type,
-        };
-    }
-};
-
 pub const OwnedFrame = struct {
-    message_type: FrameType,
+    message_type: MessageType,
     payload: []u8,
-
-    pub fn knownMessageType(self: OwnedFrame) ?MessageType {
-        return switch (self.message_type) {
-            .known => |message_type| message_type,
-        };
-    }
 
     pub fn deinit(self: *OwnedFrame, allocator: std.mem.Allocator) void {
         allocator.free(self.payload);
@@ -114,18 +93,18 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
         defer frame.deinit(allocator);
         const payload = frame.payload orelse return error.UnknownFrame;
         return switch (payload) {
-            .@"error" => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_ERROR, message),
-            .session_new => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_SESSION_NEW, message),
-            .session_attach => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_SESSION_ATTACH, message),
-            .input => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_INPUT, message),
-            .resize => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_RESIZE, message),
-            .repaint_request => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_REPAINT, message),
-            .ping_request => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_PING_REQUEST, message),
-            .session_attached => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_SESSION_ATTACHED, message),
-            .session_ended => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_SESSION_ENDED, message),
-            .draw => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_DRAW, message),
-            .ping_response => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_PING_RESPONSE, message),
-            .repaint_response => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_REPAINT_RESPONSE, message),
+            .@"error" => |message| ownedFrameFromMessage(allocator, .error_message, message),
+            .session_new => |message| ownedFrameFromMessage(allocator, .session_new, message),
+            .session_attach => |message| ownedFrameFromMessage(allocator, .session_attach, message),
+            .input => |message| ownedFrameFromMessage(allocator, .input, message),
+            .resize => |message| ownedFrameFromMessage(allocator, .resize, message),
+            .repaint_request => |message| ownedFrameFromMessage(allocator, .repaint_request, message),
+            .ping_request => |message| ownedFrameFromMessage(allocator, .ping_request, message),
+            .session_attached => |message| ownedFrameFromMessage(allocator, .session_attached, message),
+            .session_ended => |message| ownedFrameFromMessage(allocator, .session_ended, message),
+            .draw => |message| ownedFrameFromMessage(allocator, .draw, message),
+            .ping_response => |message| ownedFrameFromMessage(allocator, .ping_response, message),
+            .repaint_response => |message| ownedFrameFromMessage(allocator, .repaint_response, message),
         };
     }
 
@@ -133,9 +112,9 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
     defer hello_frame.deinit(allocator);
     if (hello_frame.payload) |payload| {
         return switch (payload) {
-            .hello_request => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_HELLO_REQUEST, message),
-            .hello_ok => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_HELLO_OK, message),
-            .hello_error => |message| ownedFrameFromMessage(allocator, .FRAME_TYPE_HELLO_ERROR, message),
+            .hello_request => |message| ownedFrameFromMessage(allocator, .hello_request, message),
+            .hello_ok => |message| ownedFrameFromMessage(allocator, .hello_ok, message),
+            .hello_error => |message| ownedFrameFromMessage(allocator, .hello_error, message),
         };
     }
     return error.UnknownFrame;
@@ -147,84 +126,84 @@ fn isHelloFrameEnvelope(envelope: []const u8) bool {
 
 fn ownedFrameFromMessage(allocator: std.mem.Allocator, message_type: MessageType, message: anytype) !OwnedFrame {
     return .{
-        .message_type = .{ .known = message_type },
+        .message_type = message_type,
         .payload = try encodePayload(allocator, message),
     };
 }
 
 fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType, payload: []const u8) ![]u8 {
     return switch (message_type) {
-        .FRAME_TYPE_HELLO_REQUEST => blk: {
+        .hello_request => blk: {
             var message = try decodePayload(hpb.HelloRequest, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, hpb.HelloFrame{ .payload = .{ .hello_request = message } });
         },
-        .FRAME_TYPE_HELLO_OK => blk: {
+        .hello_ok => blk: {
             var message = try decodePayload(hpb.HelloOk, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, hpb.HelloFrame{ .payload = .{ .hello_ok = message } });
         },
-        .FRAME_TYPE_HELLO_ERROR => blk: {
+        .hello_error => blk: {
             var message = try decodePayload(hpb.HelloError, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, hpb.HelloFrame{ .payload = .{ .hello_error = message } });
         },
-        .FRAME_TYPE_ERROR => blk: {
+        .error_message => blk: {
             var message = try decodePayload(hpb.Error, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .@"error" = message } });
         },
-        .FRAME_TYPE_SESSION_NEW => blk: {
+        .session_new => blk: {
             var message = try decodePayload(pb.SessionNew, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_new = message } });
         },
-        .FRAME_TYPE_SESSION_ATTACH => blk: {
+        .session_attach => blk: {
             var message = try decodePayload(pb.SessionAttach, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_attach = message } });
         },
-        .FRAME_TYPE_INPUT => blk: {
+        .input => blk: {
             var message = try decodePayload(pb.Input, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .input = message } });
         },
-        .FRAME_TYPE_RESIZE => blk: {
+        .resize => blk: {
             var message = try decodePayload(pb.Resize, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .resize = message } });
         },
-        .FRAME_TYPE_REPAINT => blk: {
+        .repaint_request => blk: {
             var message = try decodePayload(pb.RepaintRequest, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .repaint_request = message } });
         },
-        .FRAME_TYPE_PING_REQUEST => blk: {
+        .ping_request => blk: {
             var message = try decodePayload(pb.PingRequest, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .ping_request = message } });
         },
-        .FRAME_TYPE_SESSION_ATTACHED => blk: {
+        .session_attached => blk: {
             var message = try decodePayload(pb.SessionAttached, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_attached = message } });
         },
-        .FRAME_TYPE_SESSION_ENDED => blk: {
+        .session_ended => blk: {
             var message = try decodePayload(pb.SessionEnded, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_ended = message } });
         },
-        .FRAME_TYPE_DRAW => blk: {
+        .draw => blk: {
             var message = try decodePayload(pb.Draw, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .draw = message } });
         },
-        .FRAME_TYPE_PING_RESPONSE => blk: {
+        .ping_response => blk: {
             var message = try decodePayload(pb.PingResponse, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .ping_response = message } });
         },
-        .FRAME_TYPE_REPAINT_RESPONSE => blk: {
+        .repaint_response => blk: {
             var message = try decodePayload(pb.RepaintResponse, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .repaint_response = message } });
@@ -265,13 +244,13 @@ test "generated protobuf payload round trip" {
 test "frame envelope round trip" {
     const payload = try encodePayload(std.testing.allocator, pb.PingRequest{ .ping_request_seq = 42 });
     defer std.testing.allocator.free(payload);
-    const frame_bytes = try encodeFrame(std.testing.allocator, .FRAME_TYPE_PING_REQUEST, payload);
+    const frame_bytes = try encodeFrame(std.testing.allocator, .ping_request, payload);
     defer std.testing.allocator.free(frame_bytes);
 
     const envelope = frame_bytes[frame_header_len..];
     var frame = try decodeEnvelopeAlloc(std.testing.allocator, envelope);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expect(frame.knownMessageType() == .FRAME_TYPE_PING_REQUEST);
+    try std.testing.expectEqual(MessageType.ping_request, frame.message_type);
 
     var decoded = try decodePayload(pb.PingRequest, std.testing.allocator, frame.payload);
     defer decoded.deinit(std.testing.allocator);

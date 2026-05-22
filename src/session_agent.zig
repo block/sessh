@@ -981,40 +981,38 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
         var frame = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_RESIZE => continue,
-                .FRAME_TYPE_SESSION_NEW => {
-                    var request = readSessionNewRequest(frame.payload) catch {
-                        try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid SESSION_NEW payload", "");
-                        return false;
-                    };
-                    defer request.deinit();
-                    const session_index = try createSession(
-                        session_agent,
-                        request.resize.rows,
-                        request.resize.cols,
-                        request.scrollback_row_count,
-                        request.environment,
-                        request.query_default_colors,
-                    );
-                    try attachSession(session_agent, session_index, fd, request.resize);
-                    return true;
-                },
-                .FRAME_TYPE_SESSION_ATTACH => {
-                    const request = try readAttachRequest(frame.payload);
-                    const session_index = findMostRecentSessionIndex(session_agent);
-                    const resolved_session_index = session_index orelse {
-                        try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
-                        return false;
-                    };
-                    updateSessionSize(&session_agent.sessions[resolved_session_index], request.resize.rows, request.resize.cols);
-                    try attachSession(session_agent, resolved_session_index, fd, request.resize);
-                    return true;
-                },
-                else => {
-                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "unexpected first action", "");
+            .resize => continue,
+            .session_new => {
+                var request = readSessionNewRequest(frame.payload) catch {
+                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid SESSION_NEW payload", "");
                     return false;
-                },
+                };
+                defer request.deinit();
+                const session_index = try createSession(
+                    session_agent,
+                    request.resize.rows,
+                    request.resize.cols,
+                    request.scrollback_row_count,
+                    request.environment,
+                    request.query_default_colors,
+                );
+                try attachSession(session_agent, session_index, fd, request.resize);
+                return true;
+            },
+            .session_attach => {
+                const request = try readAttachRequest(frame.payload);
+                const session_index = findMostRecentSessionIndex(session_agent);
+                const resolved_session_index = session_index orelse {
+                    try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
+                    return false;
+                };
+                updateSessionSize(&session_agent.sessions[resolved_session_index], request.resize.rows, request.resize.cols);
+                try attachSession(session_agent, resolved_session_index, fd, request.resize);
+                return true;
+            },
+            else => {
+                try sendError(session_agent, fd, "PROTOCOL_ERROR", "unexpected first action", "");
+                return false;
             },
         }
     }
@@ -1083,12 +1081,10 @@ fn readHelloRequest(fd: c.fd_t) !hpb.HelloRequest {
         var frame = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_HELLO_REQUEST => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
-                else => {
-                    try sendHelloError(fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
-                    return error.UnexpectedFrame;
-                },
+            .hello_request => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
+            else => {
+                try sendHelloError(fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
+                return error.UnexpectedFrame;
             },
         }
     }
@@ -1099,18 +1095,16 @@ fn readHelloReply(fd: c.fd_t) !?hpb.HelloError {
         var frame = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_HELLO_OK => {
-                    var ok = try protocol.decodePayload(hpb.HelloOk, app_allocator.allocator(), frame.payload);
-                    defer ok.deinit(app_allocator.allocator());
-                    return null;
-                },
-                .FRAME_TYPE_HELLO_ERROR => {
-                    const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
-                    return err;
-                },
-                else => return error.UnexpectedFrame,
+            .hello_ok => {
+                var ok = try protocol.decodePayload(hpb.HelloOk, app_allocator.allocator(), frame.payload);
+                defer ok.deinit(app_allocator.allocator());
+                return null;
             },
+            .hello_error => {
+                const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
+                return err;
+            },
+            else => return error.UnexpectedFrame,
         }
     }
 }
@@ -1128,13 +1122,13 @@ fn sendHelloRequest(fd: c.fd_t) !void {
         .version = config.version,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_REQUEST, payload);
+    try protocol.sendFrame(fd, .hello_request, payload);
 }
 
 fn sendHelloOk(fd: c.fd_t) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_OK, payload);
+    try protocol.sendFrame(fd, .hello_ok, payload);
 }
 
 fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
@@ -1144,7 +1138,7 @@ fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
         .hint = hint,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_ERROR, payload);
+    try protocol.sendFrame(fd, .hello_error, payload);
 }
 
 fn sendError(session_agent: *SessionAgent, fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
@@ -1159,7 +1153,7 @@ fn sendErrorFrame(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
         .hint = hint,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_ERROR, payload);
+    try protocol.sendFrame(fd, .error_message, payload);
 }
 
 fn queueAttachmentError(session_agent: *SessionAgent, attachment: *Attachment, code: []const u8, message: []const u8, hint: []const u8) !void {
@@ -1170,7 +1164,7 @@ fn queueAttachmentError(session_agent: *SessionAgent, attachment: *Attachment, c
         .hint = hint,
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .FRAME_TYPE_ERROR, payload);
+    try queueAttachmentFrame(attachment, .error_message, payload);
 }
 
 fn queueAttachmentFrame(attachment: *Attachment, message_type: protocol.MessageType, payload: []const u8) !void {
@@ -1243,7 +1237,7 @@ fn attachedCount(session_agent: *SessionAgent, session_index: usize) u32 {
 fn sendSessionAttached(attachment: *Attachment) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionAttached{});
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .FRAME_TYPE_SESSION_ATTACHED, payload);
+    try queueAttachmentFrame(attachment, .session_attached, payload);
 }
 
 fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !void {
@@ -1262,7 +1256,7 @@ fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !v
         .ended_at_unix_ms = if (exit_info.ended_at_unix_ms == 0) null else exit_info.ended_at_unix_ms,
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .FRAME_TYPE_SESSION_ENDED, payload);
+    try queueAttachmentFrame(attachment, .session_ended, payload);
 }
 
 fn readDefaultColorValue(color: u32) !u32 {
@@ -1323,7 +1317,7 @@ fn queueDrawFrame(
         .relay_end_restore_bytes = relay_end_restore_bytes,
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .FRAME_TYPE_DRAW, payload);
+    try queueAttachmentFrame(attachment, .draw, payload);
 }
 
 fn appendDrawCleanup(draw_bytes: *std.ArrayList(u8)) !void {
@@ -1525,7 +1519,7 @@ fn queueRepaintResponseFrame(
         },
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .FRAME_TYPE_REPAINT_RESPONSE, payload);
+    try queueAttachmentFrame(attachment, .repaint_response, payload);
 }
 
 fn queueRepaintResponseDraw(
@@ -1686,27 +1680,6 @@ fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
         if (resized) advanceScrollbackEpoch(session);
     }
     _ = terminal.setPtySize(session.pty_fd, rows, cols);
-}
-
-fn signalSession(session: *const Session, signal_number: u8) bool {
-    if (signal_number == 0) {
-        var sent = false;
-        sent = signalPidOrGroup(session.pid, c.SIG.HUP) or sent;
-        sent = signalPidOrGroup(session.pid, c.SIG.TERM) or sent;
-        return sent;
-    }
-    return signalPidOrGroup(session.pid, signal_number);
-}
-
-fn signalPidOrGroup(pid: c.pid_t, signal: u8) bool {
-    var sent = false;
-    if (posix.kill(-pid, signal)) {
-        sent = true;
-    } else |_| {}
-    if (posix.kill(pid, signal)) {
-        sent = true;
-    } else |_| {}
-    return sent;
 }
 
 fn readSessionNewRequest(payload: []const u8) !SessionNewRequest {
@@ -2060,18 +2033,16 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
     defer frame.deinit(app_allocator.allocator());
 
     switch (frame.message_type) {
-        .known => |message_type| switch (message_type) {
-            .FRAME_TYPE_INPUT => handleInputFrame(session_agent, attachment_index, frame.payload),
-            .FRAME_TYPE_RESIZE => handleResizeFrame(session_agent, attachment_index, frame.payload),
-            .FRAME_TYPE_REPAINT => handleRepaintFrame(session_agent, attachment_index, frame.payload),
-            .FRAME_TYPE_PING_REQUEST => handlePingRequestFrame(session_agent, attachment_index, frame.payload),
-            else => {
-                queueAttachmentError(session_agent, attachment, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
-                    detachAttachment(session_agent, attachment_index);
-                    return;
-                };
-                closeAttachmentAfterFlush(session_agent, attachment_index);
-            },
+        .input => handleInputFrame(session_agent, attachment_index, frame.payload),
+        .resize => handleResizeFrame(session_agent, attachment_index, frame.payload),
+        .repaint_request => handleRepaintFrame(session_agent, attachment_index, frame.payload),
+        .ping_request => handlePingRequestFrame(session_agent, attachment_index, frame.payload),
+        else => {
+            queueAttachmentError(session_agent, attachment, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
+                detachAttachment(session_agent, attachment_index);
+                return;
+            };
+            closeAttachmentAfterFlush(session_agent, attachment_index);
         },
     }
 }
@@ -2119,7 +2090,7 @@ fn handlePingRequestFrame(session_agent: *SessionAgent, attachment_index: usize,
         return;
     };
     defer app_allocator.allocator().free(response_payload);
-    queueAttachmentFrame(attachment, .FRAME_TYPE_PING_RESPONSE, response_payload) catch {
+    queueAttachmentFrame(attachment, .ping_response, response_payload) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };

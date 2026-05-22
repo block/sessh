@@ -720,7 +720,7 @@ test "connection monitor defers rate-limited ping and starts responsiveness wait
 
     var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expect(frame.knownMessageType() == .FRAME_TYPE_PING_REQUEST);
+    try std.testing.expectEqual(protocol.MessageType.ping_request, frame.message_type);
     var request = try protocol.decodePayload(pb.PingRequest, std.testing.allocator, frame.payload);
     defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(pending, request.ping_request_seq);
@@ -750,7 +750,7 @@ test "recovery polling stores relay-end restore bytes from draw" {
         .relay_end_restore_bytes = "restore-primary",
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fds[1], .FRAME_TYPE_DRAW, payload);
+    try protocol.sendFrame(fds[1], .draw, payload);
 
     try std.testing.expectEqual(RuntimeRecovery.recovered, (try pollRuntimeRecovery(fds[0], &session, 0)).?);
     try std.testing.expectEqualStrings("restore-primary", session.relay_end_restore.items);
@@ -770,7 +770,7 @@ test "recovery polling ignores draw while repaint is outstanding" {
         .draw_bytes = "",
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fds[1], .FRAME_TYPE_DRAW, payload);
+    try protocol.sendFrame(fds[1], .draw, payload);
 
     try std.testing.expectEqual(@as(?RuntimeRecovery, null), try pollRuntimeRecovery(fds[0], &session, 0));
     try std.testing.expectEqual(@as(usize, 0), session.scrollback_cursor.len);
@@ -1201,34 +1201,32 @@ pub fn pollRuntimeRecovery(
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        .known => |message_type| switch (message_type) {
-            .FRAME_TYPE_DRAW => {
-                if (session.pending_repaint.active()) return null;
-                try handleDrawFrame(frame.payload, &session.relay_end_restore, &session.scrollback_cursor, &session.viewport_offset);
-                return .recovered;
-            },
-            .FRAME_TYPE_REPAINT_RESPONSE => {
-                const applied = try handleRepaintResponseFrame(
-                    frame.payload,
-                    &session.relay_end_restore,
-                    &session.scrollback_cursor,
-                    &session.viewport_offset,
-                    &session.pending_repaint,
-                );
-                return if (applied) .recovered else null;
-            },
-            .FRAME_TYPE_PING_RESPONSE => return .recovered,
-            .FRAME_TYPE_SESSION_ENDED => {
-                _ = finishRelay(.session_ended, &session.relay_end_restore);
-                return .session_ended;
-            },
-            .FRAME_TYPE_ERROR => {
-                try printErrorPayload(frame.payload);
-                _ = finishRelay(.session_ended, &session.relay_end_restore);
-                return .session_ended;
-            },
-            else => return error.UnexpectedFrame,
+        .draw => {
+            if (session.pending_repaint.active()) return null;
+            try handleDrawFrame(frame.payload, &session.relay_end_restore, &session.scrollback_cursor, &session.viewport_offset);
+            return .recovered;
         },
+        .repaint_response => {
+            const applied = try handleRepaintResponseFrame(
+                frame.payload,
+                &session.relay_end_restore,
+                &session.scrollback_cursor,
+                &session.viewport_offset,
+                &session.pending_repaint,
+            );
+            return if (applied) .recovered else null;
+        },
+        .ping_response => return .recovered,
+        .session_ended => {
+            _ = finishRelay(.session_ended, &session.relay_end_restore);
+            return .session_ended;
+        },
+        .error_message => {
+            try printErrorPayload(frame.payload);
+            _ = finishRelay(.session_ended, &session.relay_end_restore);
+            return .session_ended;
+        },
+        else => return error.UnexpectedFrame,
     }
 }
 
@@ -1315,23 +1313,21 @@ fn readSessionAttachedInner(
         var frame = try readFrameAllocMaybeCancelled(conn, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_ERROR => {
-                    const parsed = try parseErrorPayload(frame.payload);
-                    if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
-                        freeErrorPayload(parsed);
-                        return error.VersionMismatch;
-                    }
-                    try printParsedError(parsed);
-                    return process_exit.request(1);
-                },
-                .FRAME_TYPE_SESSION_ATTACHED => {
-                    var attached = try protocol.decodePayload(pb.SessionAttached, app_allocator.allocator(), frame.payload);
-                    defer attached.deinit(app_allocator.allocator());
-                    return;
-                },
-                else => return error.UnexpectedFrame,
+            .error_message => {
+                const parsed = try parseErrorPayload(frame.payload);
+                if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
+                    freeErrorPayload(parsed);
+                    return error.VersionMismatch;
+                }
+                try printParsedError(parsed);
+                return process_exit.request(1);
             },
+            .session_attached => {
+                var attached = try protocol.decodePayload(pb.SessionAttached, app_allocator.allocator(), frame.payload);
+                defer attached.deinit(app_allocator.allocator());
+                return;
+            },
+            else => return error.UnexpectedFrame,
         }
     }
 }
@@ -1396,13 +1392,13 @@ fn sendHelloRequest(fd: c.fd_t) !void {
         .version = config.version,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_REQUEST, payload);
+    try protocol.sendFrame(fd, .hello_request, payload);
 }
 
 fn sendHelloOk(fd: c.fd_t) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_OK, payload);
+    try protocol.sendFrame(fd, .hello_ok, payload);
 }
 
 fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
@@ -1412,7 +1408,7 @@ fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
         .hint = hint,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_ERROR, payload);
+    try protocol.sendFrame(fd, .hello_error, payload);
 }
 
 fn readHelloReply(
@@ -1423,18 +1419,16 @@ fn readHelloReply(
         var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_HELLO_OK => {
-                    var ok = try protocol.decodePayload(hpb.HelloOk, app_allocator.allocator(), frame.payload);
-                    defer ok.deinit(app_allocator.allocator());
-                    return null;
-                },
-                .FRAME_TYPE_HELLO_ERROR => {
-                    const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
-                    return err;
-                },
-                else => return error.UnexpectedFrame,
+            .hello_ok => {
+                var ok = try protocol.decodePayload(hpb.HelloOk, app_allocator.allocator(), frame.payload);
+                defer ok.deinit(app_allocator.allocator());
+                return null;
             },
+            .hello_error => {
+                const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
+                return err;
+            },
+            else => return error.UnexpectedFrame,
         }
     }
 }
@@ -1448,12 +1442,10 @@ fn readHelloRequest(
         var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_HELLO_REQUEST => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
-                else => {
-                    try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
-                    return error.UnexpectedFrame;
-                },
+            .hello_request => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
+            else => {
+                try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
+                return error.UnexpectedFrame;
             },
         }
     }
@@ -1495,7 +1487,7 @@ fn sendSessionNew(
     };
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(conn, .FRAME_TYPE_SESSION_NEW, payload);
+    try protocol.sendFrame(conn, .session_new, payload);
 }
 
 const ProtocolDefaultColors = struct {
@@ -1547,7 +1539,7 @@ fn sendSessionAttach(
     };
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(conn, .FRAME_TYPE_SESSION_ATTACH, payload);
+    try protocol.sendFrame(conn, .session_attach, payload);
     return repaint_request_seq;
 }
 
@@ -1556,14 +1548,12 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
         var frame = try protocol.readFrameAlloc(app_allocator.allocator(), conn);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_ERROR => {
-                    try printErrorPayload(frame.payload);
-                    return true;
-                },
-                .FRAME_TYPE_SESSION_ENDED => return false,
-                else => return error.UnexpectedFrame,
+            .error_message => {
+                try printErrorPayload(frame.payload);
+                return true;
             },
+            .session_ended => return false,
+            else => return error.UnexpectedFrame,
         }
     }
 }
@@ -1697,29 +1687,27 @@ fn relayTerminal(
             defer frame.deinit(app_allocator.allocator());
             connection_monitor.noteInboundFrame();
             switch (frame.message_type) {
-                .known => |message_type| switch (message_type) {
-                    .FRAME_TYPE_DRAW => {
-                        if (!pending_repaint.active()) {
-                            try handleDrawFrame(frame.payload, relay_end_restore, scrollback_cursor, viewport_offset);
-                        }
-                    },
-                    .FRAME_TYPE_REPAINT_RESPONSE => {
-                        _ = try handleRepaintResponseFrame(
-                            frame.payload,
-                            relay_end_restore,
-                            scrollback_cursor,
-                            viewport_offset,
-                            pending_repaint,
-                        );
-                    },
-                    .FRAME_TYPE_PING_RESPONSE => try connection_monitor.handlePingResponse(frame.payload),
-                    .FRAME_TYPE_SESSION_ENDED => return finishRelay(.session_ended, relay_end_restore),
-                    .FRAME_TYPE_ERROR => {
-                        try printErrorPayload(frame.payload);
-                        return finishRelay(.session_ended, relay_end_restore);
-                    },
-                    else => return error.UnexpectedFrame,
+                .draw => {
+                    if (!pending_repaint.active()) {
+                        try handleDrawFrame(frame.payload, relay_end_restore, scrollback_cursor, viewport_offset);
+                    }
                 },
+                .repaint_response => {
+                    _ = try handleRepaintResponseFrame(
+                        frame.payload,
+                        relay_end_restore,
+                        scrollback_cursor,
+                        viewport_offset,
+                        pending_repaint,
+                    );
+                },
+                .ping_response => try connection_monitor.handlePingResponse(frame.payload),
+                .session_ended => return finishRelay(.session_ended, relay_end_restore),
+                .error_message => {
+                    try printErrorPayload(frame.payload);
+                    return finishRelay(.session_ended, relay_end_restore);
+                },
+                else => return error.UnexpectedFrame,
             }
         }
         if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
@@ -1857,7 +1845,7 @@ fn sendResize(socket_fd: c.fd_t, size: WindowSize) !void {
         .terminal_cols = size.cols,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .FRAME_TYPE_RESIZE, payload);
+    try protocol.sendFrame(socket_fd, .resize, payload);
 }
 
 fn sendResizeWithRepaint(
@@ -1878,7 +1866,7 @@ fn sendResizeWithRepaint(
         },
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .FRAME_TYPE_RESIZE, payload);
+    try protocol.sendFrame(socket_fd, .resize, payload);
 }
 
 fn sendRepaint(socket_fd: c.fd_t, scrollback_cursor: []const u8, pending_repaint: *PendingRepaint) !void {
@@ -1887,7 +1875,7 @@ fn sendRepaint(socket_fd: c.fd_t, scrollback_cursor: []const u8, pending_repaint
         .scrollback_cursor = scrollback_cursor,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .FRAME_TYPE_REPAINT, payload);
+    try protocol.sendFrame(socket_fd, .repaint_request, payload);
 }
 
 fn allocateRepaintRequestSeq() u64 {
@@ -1900,7 +1888,7 @@ fn allocateRepaintRequestSeq() u64 {
 fn sendInput(socket_fd: c.fd_t, bytes: []const u8) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Input{ .data = bytes });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .FRAME_TYPE_INPUT, payload);
+    try protocol.sendFrame(socket_fd, .input, payload);
 }
 
 fn sendPingRequest(socket_fd: c.fd_t) !u64 {
@@ -1909,7 +1897,7 @@ fn sendPingRequest(socket_fd: c.fd_t) !u64 {
         .ping_request_seq = ping_request_seq,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .FRAME_TYPE_PING_REQUEST, payload);
+    try protocol.sendFrame(socket_fd, .ping_request, payload);
     return ping_request_seq;
 }
 

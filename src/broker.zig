@@ -29,40 +29,38 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
         var frame = try protocol.readFrameAlloc(allocator, 0);
         errdefer frame.deinit(allocator);
         switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_RESIZE => {
-                    frame.deinit(allocator);
-                    continue;
-                },
-                .FRAME_TYPE_SESSION_ATTACH => {
-                    defer frame.deinit(allocator);
-                    const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
-                        error.NoSessions => {
-                            try sendError(1, "SESSION_NOT_FOUND", "no sessions", "");
-                            return;
-                        },
-                        error.InvalidSessionId, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
-                            try sendError(1, "SESSION_NOT_FOUND", "session not found", "");
-                            return;
-                        },
-                        else => return err,
-                    };
-                    defer _ = c.close(agent_fd);
-                    try attachAgentAndRelay(allocator, agent_fd, frame.payload);
-                    return;
-                },
-                .FRAME_TYPE_SESSION_NEW => {
-                    defer frame.deinit(allocator);
-                    const agent_fd = try startSessionAgentAndConnect(allocator, exe);
-                    defer _ = c.close(agent_fd);
-                    try startAgentAndRelay(allocator, agent_fd, frame.payload);
-                    return;
-                },
-                else => {
-                    defer frame.deinit(allocator);
-                    try sendError(1, "PROTOCOL_ERROR", "broker only supports SESSION_NEW or SESSION_ATTACH in this mode", "");
-                    return;
-                },
+            .resize => {
+                frame.deinit(allocator);
+                continue;
+            },
+            .session_attach => {
+                defer frame.deinit(allocator);
+                const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
+                    error.NoSessions => {
+                        try sendError(1, "SESSION_NOT_FOUND", "no sessions", "");
+                        return;
+                    },
+                    error.InvalidSessionId, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
+                        try sendError(1, "SESSION_NOT_FOUND", "session not found", "");
+                        return;
+                    },
+                    else => return err,
+                };
+                defer _ = c.close(agent_fd);
+                try attachAgentAndRelay(allocator, agent_fd, frame.payload);
+                return;
+            },
+            .session_new => {
+                defer frame.deinit(allocator);
+                const agent_fd = try startSessionAgentAndConnect(allocator, exe);
+                defer _ = c.close(agent_fd);
+                try startAgentAndRelay(allocator, agent_fd, frame.payload);
+                return;
+            },
+            else => {
+                defer frame.deinit(allocator);
+                try sendError(1, "PROTOCOL_ERROR", "broker only supports SESSION_NEW or SESSION_ATTACH in this mode", "");
+                return;
             },
         }
     }
@@ -250,7 +248,7 @@ fn readSessionMeta(allocator: std.mem.Allocator, paths: session_registry.Session
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         const key = line[0..eq];
         const value = line[eq + 1 ..];
-        if (std.mem.eql(u8, key, "agent_pid") or std.mem.eql(u8, key, "pid")) {
+        if (std.mem.eql(u8, key, "agent_pid")) {
             agent_pid = try parsePid(value);
         } else if (std.mem.eql(u8, key, "version")) {
             version = value;
@@ -427,7 +425,7 @@ fn startAgentAndRelay(
         },
         else => return err,
     };
-    try protocol.sendFrame(agent_fd, .FRAME_TYPE_SESSION_NEW, session_new_payload);
+    try protocol.sendFrame(agent_fd, .session_new, session_new_payload);
     try relay.relayFrames(0, 1, agent_fd);
 }
 
@@ -443,7 +441,7 @@ fn attachAgentAndRelay(
         },
         else => return err,
     };
-    try protocol.sendFrame(agent_fd, .FRAME_TYPE_SESSION_ATTACH, session_attach_payload);
+    try protocol.sendFrame(agent_fd, .session_attach, session_attach_payload);
     try relay.relayFrames(0, 1, agent_fd);
 }
 
@@ -498,12 +496,10 @@ fn readHelloRequest(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.f
         var frame = try protocol.readFrameAlloc(allocator, read_fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_HELLO_REQUEST => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
-                else => {
-                    try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
-                    return error.UnexpectedFrame;
-                },
+            .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
+            else => {
+                try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
+                return error.UnexpectedFrame;
             },
         }
     }
@@ -514,18 +510,16 @@ fn readHelloReply(allocator: std.mem.Allocator, read_fd: c.fd_t) !?hpb.HelloErro
         var frame = try protocol.readFrameAlloc(allocator, read_fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
-            .known => |message_type| switch (message_type) {
-                .FRAME_TYPE_HELLO_OK => {
-                    var ok = try protocol.decodePayload(hpb.HelloOk, allocator, frame.payload);
-                    defer ok.deinit(allocator);
-                    return null;
-                },
-                .FRAME_TYPE_HELLO_ERROR => {
-                    const err = try protocol.decodePayload(hpb.HelloError, allocator, frame.payload);
-                    return err;
-                },
-                else => return error.UnexpectedFrame,
+            .hello_ok => {
+                var ok = try protocol.decodePayload(hpb.HelloOk, allocator, frame.payload);
+                defer ok.deinit(allocator);
+                return null;
             },
+            .hello_error => {
+                const err = try protocol.decodePayload(hpb.HelloError, allocator, frame.payload);
+                return err;
+            },
+            else => return error.UnexpectedFrame,
         }
     }
 }
@@ -543,13 +537,13 @@ fn sendHelloRequest(fd: c.fd_t) !void {
         .version = config.version,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_REQUEST, payload);
+    try protocol.sendFrame(fd, .hello_request, payload);
 }
 
 fn sendHelloOk(fd: c.fd_t) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_OK, payload);
+    try protocol.sendFrame(fd, .hello_ok, payload);
 }
 
 fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
@@ -559,7 +553,7 @@ fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
         .hint = hint,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_HELLO_ERROR, payload);
+    try protocol.sendFrame(fd, .hello_error, payload);
 }
 
 fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
@@ -569,5 +563,5 @@ fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8
         .hint = hint,
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_ERROR, payload);
+    try protocol.sendFrame(fd, .error_message, payload);
 }
