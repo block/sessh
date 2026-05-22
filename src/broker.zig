@@ -64,11 +64,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                     return;
                 },
             },
-            .unknown => |raw| {
-                defer frame.deinit(allocator);
-                try sendUnrecognizedFrame(1, frame.seq, raw);
-                continue;
-            },
         }
     }
 }
@@ -472,7 +467,7 @@ fn acceptRuntimeHandshake(allocator: std.mem.Allocator, read_fd: c.fd_t, write_f
     }
     try sendHelloOk(write_fd);
     try sendHelloRequest(write_fd);
-    var hello_error = try readHelloReply(allocator, read_fd, write_fd);
+    var hello_error = try readHelloReply(allocator, read_fd);
     defer if (hello_error) |*err| err.deinit(allocator);
     if (hello_error) |err| {
         if (std.mem.eql(u8, err.code, "VERSION_MISMATCH")) return error.VersionMismatch;
@@ -483,7 +478,7 @@ fn acceptRuntimeHandshake(allocator: std.mem.Allocator, read_fd: c.fd_t, write_f
 
 fn initiateRuntimeHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     try sendHelloRequest(fd);
-    var hello_error = try readHelloReply(allocator, fd, fd);
+    var hello_error = try readHelloReply(allocator, fd);
     defer if (hello_error) |*err| err.deinit(allocator);
     if (hello_error) |err| {
         if (std.mem.eql(u8, err.code, "VERSION_MISMATCH")) return error.VersionMismatch;
@@ -505,21 +500,16 @@ fn readHelloRequest(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.f
         switch (frame.message_type) {
             .known => |message_type| switch (message_type) {
                 .FRAME_TYPE_HELLO_REQUEST => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
-                .FRAME_TYPE_UNRECOGNIZED => continue,
                 else => {
                     try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
                     return error.UnexpectedFrame;
                 },
             },
-            .unknown => |raw| {
-                try sendUnrecognizedFrame(write_fd, frame.seq, raw);
-                continue;
-            },
         }
     }
 }
 
-fn readHelloReply(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !?hpb.HelloError {
+fn readHelloReply(allocator: std.mem.Allocator, read_fd: c.fd_t) !?hpb.HelloError {
     while (true) {
         var frame = try protocol.readFrameAlloc(allocator, read_fd);
         defer frame.deinit(allocator);
@@ -534,12 +524,7 @@ fn readHelloReply(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_
                     const err = try protocol.decodePayload(hpb.HelloError, allocator, frame.payload);
                     return err;
                 },
-                .FRAME_TYPE_UNRECOGNIZED => continue,
                 else => return error.UnexpectedFrame,
-            },
-            .unknown => |raw| {
-                try sendUnrecognizedFrame(write_fd, frame.seq, raw);
-                continue;
             },
         }
     }
@@ -585,13 +570,4 @@ fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .FRAME_TYPE_ERROR, payload);
-}
-
-fn sendUnrecognizedFrame(fd: c.fd_t, seq: u64, frame_type: u32) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.UnrecognizedFrame{
-        .seq = seq,
-        .frame_type = frame_type,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_UNRECOGNIZED, payload);
 }

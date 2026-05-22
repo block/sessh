@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package sessh.protocol.v1;
 
+import "sessh_handshake.proto";
+
 // Versioned remote protocol payloads.
 //
 // The stable handshake payloads live in sessh_handshake.proto. After both
@@ -14,48 +16,23 @@ package sessh.protocol.v1;
 // responsible for remaining compatible with this side; if the peer reports a
 // lower minor version, this side decides whether it can proceed.
 //
-// Remote frame type ids. These are the numeric values stored in the fixed
-// frame header. Values are grouped by broad role rather than packed densely:
-// 0x0001-0x000f are reserved for stable connection setup/diagnostic frames
-// defined in sessh_handshake.proto, 0x0010-0x001f are client-to-remote request
-// frames, and 0x0020-0x002f are remote-to-client response/stream frames. Gaps
-// are reserved for related future frames, so the enum is intentionally
-// non-contiguous.
-enum FrameType {
-  FRAME_TYPE_UNSPECIFIED = 0;
+message Frame {
+  reserved 1 to 9;
 
-  reserved 1 to 15;
-
-  // Client-to-remote request frames.
-
-  reserved 0x0010, 0x0020;
-  reserved "FRAME_TYPE_COMMAND_REQUEST", "FRAME_TYPE_COMMAND_RESPONSE";
-
-  // Payload: SessionNew.
-  FRAME_TYPE_SESSION_NEW = 0x0011;
-  // Payload: SessionAttach.
-  FRAME_TYPE_SESSION_ATTACH = 0x0012;
-  // Payload: Input.
-  FRAME_TYPE_INPUT = 0x0015;
-  // Payload: Resize.
-  FRAME_TYPE_RESIZE = 0x0016;
-  // Payload: RepaintRequest.
-  FRAME_TYPE_REPAINT = 0x0017;
-  // Payload: PingRequest.
-  FRAME_TYPE_PING_REQUEST = 0x0018;
-
-  // Remote-to-client response and stream frames.
-
-  // Payload: SessionAttached.
-  FRAME_TYPE_SESSION_ATTACHED = 0x0021;
-  // Payload: SessionEnded.
-  FRAME_TYPE_SESSION_ENDED = 0x0022;
-  // Payload: Draw.
-  FRAME_TYPE_DRAW = 0x0027;
-  // Payload: PingResponse.
-  FRAME_TYPE_PING_RESPONSE = 0x0028;
-  // Payload: RepaintResponse.
-  FRAME_TYPE_REPAINT_RESPONSE = 0x0029;
+  oneof payload {
+    sessh.handshake.v1.Error error = 10;
+    SessionNew session_new = 11;
+    SessionAttach session_attach = 12;
+    Input input = 13;
+    Resize resize = 14;
+    RepaintRequest repaint_request = 15;
+    PingRequest ping_request = 16;
+    SessionAttached session_attached = 17;
+    SessionEnded session_ended = 18;
+    Draw draw = 19;
+    PingResponse ping_response = 20;
+    RepaintResponse repaint_response = 21;
+  }
 }
 
 // Embedded in SessionNew.

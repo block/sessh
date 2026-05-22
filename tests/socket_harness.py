@@ -22,12 +22,33 @@ BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
 _PROTO_TMP = None
 _PROTO_MODULE = None
 _PROTO_HANDSHAKE_MODULE = None
-_FRAME_HEADER_LEN = 16
-_NEXT_FRAME_SEQ = 1
+_FRAME_HEADER_LEN = 4
 _LAST_RESIZE = (24, 80)
 _NEXT_REPAINT_REQUEST_SEQ = 1
 _NEXT_PING_REQUEST_SEQ = 1
 _SCROLLBACK_CURSOR_LEN = 16
+
+_HELLO_FRAME_FIELDS = {
+    0x0001: "hello_request",
+    0x0002: "hello_ok",
+    0x0003: "hello_error",
+}
+_HELLO_MESSAGE_TYPES = {value: key for key, value in _HELLO_FRAME_FIELDS.items()}
+_FRAME_FIELDS = {
+    0x0004: "error",
+    0x0011: "session_new",
+    0x0012: "session_attach",
+    0x0015: "input",
+    0x0016: "resize",
+    0x0017: "repaint_request",
+    0x0018: "ping_request",
+    0x0021: "session_attached",
+    0x0022: "session_ended",
+    0x0027: "draw",
+    0x0028: "ping_response",
+    0x0029: "repaint_response",
+}
+_MESSAGE_TYPES = {value: key for key, value in _FRAME_FIELDS.items()}
 
 
 def encode_scrollback_cursor(epoch, cursor):
@@ -220,17 +241,19 @@ def sessh_pb():
         stderr=subprocess.PIPE,
         text=True,
     )
-    generated = output_dir / "sessh_pb2.py"
-    spec = importlib.util.spec_from_file_location("sessh_pb2", generated)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    _PROTO_MODULE = module
-
     handshake_generated = output_dir / "sessh_handshake_pb2.py"
     handshake_spec = importlib.util.spec_from_file_location("sessh_handshake_pb2", handshake_generated)
     handshake_module = importlib.util.module_from_spec(handshake_spec)
+    sys.modules["sessh_handshake_pb2"] = handshake_module
     handshake_spec.loader.exec_module(handshake_module)
     _PROTO_HANDSHAKE_MODULE = handshake_module
+
+    generated = output_dir / "sessh_pb2.py"
+    spec = importlib.util.spec_from_file_location("sessh_pb2", generated)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["sessh_pb2"] = module
+    spec.loader.exec_module(module)
+    _PROTO_MODULE = module
     return module
 
 
@@ -316,12 +339,6 @@ def parse_ping_response(payload):
     return message.ping_request_seq
 
 
-def parse_unrecognized_frame(payload):
-    message = sessh_hpb().UnrecognizedFrame()
-    message.ParseFromString(payload)
-    return message.seq, message.frame_type
-
-
 def unpack_session_attached(payload):
     message = sessh_pb().SessionAttached()
     message.ParseFromString(payload)
@@ -356,14 +373,12 @@ def recv_draw(conn, timeout=5.0):
     conn.settimeout(timeout)
     try:
         while True:
-            message_type, seq, payload = recv_frame_full(conn)
+            message_type, _seq, payload = recv_frame_full(conn)
             if message_type == 0x0027:
                 draw = parse_draw(payload)
-                draw["frame_seq"] = seq
                 return draw
             if message_type == 0x0029:
                 response_id, draw = parse_repaint_response(payload)
-                draw["frame_seq"] = seq
                 draw["repaint_request_seq"] = response_id
                 return draw
             if message_type == 0x0022:
@@ -377,10 +392,9 @@ def recv_repaint_response(conn, timeout=5.0):
     conn.settimeout(timeout)
     try:
         while True:
-            message_type, seq, payload = recv_frame_full(conn)
+            message_type, _seq, payload = recv_frame_full(conn)
             if message_type == 0x0029:
                 response_id, draw = parse_repaint_response(payload)
-                draw["frame_seq"] = seq
                 return response_id, draw
             if message_type == 0x0022:
                 raise AssertionError("session ended before REPAINT_RESPONSE arrived")
@@ -413,20 +427,31 @@ def recv_until_frame_type(conn, expected_type, timeout=5.0):
     raise AssertionError(f"did not receive frame type {expected_type:#06x}")
 
 
-def next_frame_seq():
-    global _NEXT_FRAME_SEQ
-    seq = _NEXT_FRAME_SEQ
-    _NEXT_FRAME_SEQ += 1
-    if _NEXT_FRAME_SEQ > 0xFFFFFFFFFFFFFFFF:
-        _NEXT_FRAME_SEQ = 1
-    return seq
-
-
 def send_frame(conn, message_type, payload=b"", seq=None):
-    if seq is None:
-        seq = next_frame_seq()
-    conn.sendall(struct.pack(">IIQ", len(payload), message_type, seq) + payload)
-    return seq
+    if seq is not None:
+        raise AssertionError("frame sequence numbers are not part of the wire protocol")
+    body = encode_frame_body(message_type, payload)
+    conn.sendall(struct.pack(">I", len(body)) + body)
+    return 0
+
+
+def encode_frame_body(message_type, payload):
+    if message_type in _HELLO_FRAME_FIELDS:
+        frame = sessh_hpb().HelloFrame()
+        set_submessage(frame, _HELLO_FRAME_FIELDS[message_type], payload)
+        return frame.SerializeToString()
+    if message_type in _FRAME_FIELDS:
+        frame = sessh_pb().Frame()
+        set_submessage(frame, _FRAME_FIELDS[message_type], payload)
+        return frame.SerializeToString()
+    raise AssertionError(f"unknown test frame type: {message_type:#06x}")
+
+
+def set_submessage(frame, field_name, payload):
+    field = frame.DESCRIPTOR.fields_by_name[field_name]
+    submessage = field.message_type._concrete_class()
+    submessage.ParseFromString(payload)
+    getattr(frame, field_name).CopyFrom(submessage)
 
 
 def recv_frame(conn):
@@ -436,8 +461,20 @@ def recv_frame(conn):
 
 def recv_frame_full(conn):
     header = recv_exact(conn, _FRAME_HEADER_LEN)
-    payload_len, message_type, seq = struct.unpack(">IIQ", header)
-    return message_type, seq, recv_exact(conn, payload_len)
+    (payload_len,) = struct.unpack(">I", header)
+    body = recv_exact(conn, payload_len)
+    hello_frame = sessh_hpb().HelloFrame()
+    hello_frame.ParseFromString(body)
+    hello_field = hello_frame.WhichOneof("payload")
+    if hello_field is not None:
+        return _HELLO_MESSAGE_TYPES[hello_field], 0, getattr(hello_frame, hello_field).SerializeToString()
+
+    frame = sessh_pb().Frame()
+    frame.ParseFromString(body)
+    field = frame.WhichOneof("payload")
+    if field is None:
+        raise AssertionError(f"missing frame payload: {body!r}")
+    return _MESSAGE_TYPES[field], 0, getattr(frame, field).SerializeToString()
 
 
 def recv_exact(conn, length):
@@ -698,50 +735,6 @@ def run_ping_protocol_test(base_env):
                 conn.close()
         finally:
             cleanup_runtime(env)
-
-def run_unrecognized_frame_protocol_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-unrecognized-frame-", dir="/tmp") as tmp:
-        env = isolated_env(tmp)
-        shell = Path(tmp) / "unrecognized-shell"
-        shell.write_text("#!/bin/sh\nwhile :; do sleep 1; done\n")
-        shell.chmod(0o700)
-        env["SHELL"] = str(shell)
-        cleanup_runtime(env)
-        try:
-            start_session_agent(env)
-
-            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            conn.settimeout(5.0)
-            try:
-                conn.connect(str(socket_path(env)))
-                send_hello(conn)
-                send_resize(conn)
-                send_frame(conn, 0x0011, pack_session_new(shell))
-
-                message_type, payload = recv_frame(conn)
-                if message_type != 0x0021:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type:#06x}")
-                _session_id = unpack_session_attached(payload)
-
-                unknown_seq = 0x123456789ABCDEF0
-                send_frame(conn, 0x7FFF, b"", seq=unknown_seq)
-                response = recv_until_frame_type(conn, 0x0005)
-                reported_seq, reported_type = parse_unrecognized_frame(response)
-                if reported_seq != unknown_seq or reported_type != 0x7FFF:
-                    raise AssertionError(
-                        f"unexpected UNRECOGNIZED payload: seq={reported_seq:#x} type={reported_type:#x}"
-                    )
-
-                ping_request_seq, ping_payload = pack_ping_request()
-                send_frame(conn, 0x0018, ping_payload)
-                ping_response = recv_until_frame_type(conn, 0x0028)
-                if parse_ping_response(ping_response) != ping_request_seq:
-                    raise AssertionError(f"connection did not continue after unknown frame: {ping_response!r}")
-            finally:
-                conn.close()
-        finally:
-            cleanup_runtime(env)
-
 
 def run_plain_scroll_protocol_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-plain-scroll-", dir="/tmp") as tmp:
@@ -1542,7 +1535,6 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
                 send_frame(conn, 0x0015, pack_bytes(b"go\n"))
                 _, before_draws = recv_draw_until(conn, b"BEFORE_DONE")
                 cursor = (before_draws[-1]["epoch"], before_draws[-1]["scrollback_cursor"])
-                last_before_frame_seq = before_draws[-1]["frame_seq"]
             finally:
                 conn.close()
 
@@ -1551,11 +1543,6 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
             attach = attach_gap_session(env, session_id, reconnect_cursor=cursor)
             try:
                 _, reconnect_draws = recv_draw_until(attach, b"DURING_DONE$ ")
-                if reconnect_draws[0]["frame_seq"] <= last_before_frame_seq:
-                    raise AssertionError(
-                        "session-agent frame seq reset across reconnect: "
-                        f"before={last_before_frame_seq} reconnect={reconnect_draws[0]['frame_seq']}"
-                    )
                 output = b"".join(draw["draw_bytes"] for draw in reconnect_draws)
                 if b"sessh scrollback truncated" in output:
                     raise AssertionError(f"unexpected truncation marker without truncation: {output!r}")
@@ -2235,7 +2222,6 @@ def main():
             run_minor_version_compatibility_test(env)
             run_live_draw_protocol_test(env)
             run_ping_protocol_test(env)
-            run_unrecognized_frame_protocol_test(env)
             run_plain_scroll_protocol_test(env)
             run_plain_screen_protocol_test(env)
             run_split_escape_tail_is_not_passthrough_test(env)

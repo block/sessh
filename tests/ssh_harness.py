@@ -507,7 +507,8 @@ def version_mismatch_frame():
     payload = protobuf_string_field(1, b"VERSION_MISMATCH")
     payload += protobuf_string_field(2, b"existing remote sessh is incompatible with this client")
     payload += protobuf_string_field(3, b"Use the matching remote sessh binary")
-    return struct.pack(">IIQ", len(payload), 0x0003, 1) + payload
+    hello_frame = protobuf_bytes_field(3, payload)
+    return struct.pack(">I", len(hello_frame)) + hello_frame
 
 
 def start_version_mismatch_agent(env, session_id="s1"):
@@ -531,10 +532,10 @@ def start_version_mismatch_agent(env, session_id="s1"):
             conn, _ = server.accept()
             with conn:
                 conn.settimeout(10.0)
-                header = conn.recv(16)
+                header = conn.recv(4)
                 observed["header"] = header
-                if len(header) == 16:
-                    payload_len, _message_type, _seq = struct.unpack(">IIQ", header)
+                if len(header) == 4:
+                    (payload_len,) = struct.unpack(">I", header)
                     conn.recv(payload_len)
                 conn.sendall(version_mismatch_frame())
         except Exception as exc:
@@ -546,6 +547,10 @@ def start_version_mismatch_agent(env, session_id="s1"):
 
 
 def protobuf_string_field(field_number, value):
+    return protobuf_bytes_field(field_number, value)
+
+
+def protobuf_bytes_field(field_number, value):
     key = (field_number << 3) | 2
     return protobuf_varint(key) + protobuf_varint(len(value)) + value
 

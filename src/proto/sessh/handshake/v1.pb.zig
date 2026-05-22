@@ -5,14 +5,86 @@ const std = @import("std");
 const protobuf = @import("protobuf");
 const fd = protobuf.fd;
 
-pub const FrameType = enum(i32) {
-    FRAME_TYPE_UNSPECIFIED = 0,
-    FRAME_TYPE_HELLO_REQUEST = 1,
-    FRAME_TYPE_HELLO_OK = 2,
-    FRAME_TYPE_HELLO_ERROR = 3,
-    FRAME_TYPE_ERROR = 4,
-    FRAME_TYPE_UNRECOGNIZED = 5,
-    _,
+pub const HelloFrame = struct {
+    payload: ?payload_union = null,
+
+    pub const _payload_case = enum {
+        hello_request,
+        hello_ok,
+        hello_error,
+    };
+    pub const payload_union = union(_payload_case) {
+        hello_request: HelloRequest,
+        hello_ok: HelloOk,
+        hello_error: HelloError,
+        pub const _desc_table = .{
+            .hello_request = fd(1, .submessage),
+            .hello_ok = fd(2, .submessage),
+            .hello_error = fd(3, .submessage),
+        };
+    };
+
+    pub const _desc_table = .{
+        .payload = fd(null, .{ .oneof = payload_union }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
 };
 
 pub const HelloRequest = struct {
@@ -219,8 +291,8 @@ pub const HelloError = struct {
 
 /// Stable generic error payload.
 ///
-/// Used by FRAME_TYPE_ERROR after the handshake. Existing fields and meanings
-/// must remain stable.
+/// Used by the post-handshake Frame after the handshake. Existing fields and
+/// meanings must remain stable.
 pub const Error = struct {
     code: []const u8 = &.{},
     message: []const u8 = &.{},
@@ -230,78 +302,6 @@ pub const Error = struct {
         .code = fd(1, .{ .scalar = .string }),
         .message = fd(2, .{ .scalar = .string }),
         .hint = fd(3, .{ .scalar = .string }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Stable connection-level diagnostic frame.
-///
-/// Reports that a frame type was not understood. The seq identifies the frame
-/// being reported when available.
-pub const UnrecognizedFrame = struct {
-    seq: u64 = 0,
-    frame_type: u32 = 0,
-
-    pub const _desc_table = .{
-        .seq = fd(1, .{ .scalar = .uint64 }),
-        .frame_type = fd(2, .{ .scalar = .uint32 }),
     };
 
     /// Encodes the message to the writer

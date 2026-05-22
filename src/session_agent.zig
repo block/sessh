@@ -1016,10 +1016,6 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     return false;
                 },
             },
-            .unknown => |raw| {
-                try sendUnrecognizedFrame(fd, frame.seq, raw);
-                continue;
-            },
         }
     }
 }
@@ -1089,15 +1085,10 @@ fn readHelloRequest(fd: c.fd_t) !hpb.HelloRequest {
         switch (frame.message_type) {
             .known => |message_type| switch (message_type) {
                 .FRAME_TYPE_HELLO_REQUEST => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
-                .FRAME_TYPE_UNRECOGNIZED => continue,
                 else => {
                     try sendHelloError(fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
                     return error.UnexpectedFrame;
                 },
-            },
-            .unknown => |raw| {
-                try sendUnrecognizedFrame(fd, frame.seq, raw);
-                continue;
             },
         }
     }
@@ -1118,12 +1109,7 @@ fn readHelloReply(fd: c.fd_t) !?hpb.HelloError {
                     const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
                     return err;
                 },
-                .FRAME_TYPE_UNRECOGNIZED => continue,
                 else => return error.UnexpectedFrame,
-            },
-            .unknown => |raw| {
-                try sendUnrecognizedFrame(fd, frame.seq, raw);
-                continue;
             },
         }
     }
@@ -1176,15 +1162,6 @@ fn sendErrorFrame(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
     try protocol.sendFrame(fd, .FRAME_TYPE_ERROR, payload);
 }
 
-fn sendUnrecognizedFrame(fd: c.fd_t, seq: u64, frame_type: u32) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.UnrecognizedFrame{
-        .seq = seq,
-        .frame_type = frame_type,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .FRAME_TYPE_UNRECOGNIZED, payload);
-}
-
 fn queueAttachmentError(session_agent: *SessionAgent, attachment: *Attachment, code: []const u8, message: []const u8, hint: []const u8) !void {
     logSessionAgent(session_agent, "event=error code={s} message={s}", .{ code, message });
     const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
@@ -1196,18 +1173,10 @@ fn queueAttachmentError(session_agent: *SessionAgent, attachment: *Attachment, c
     try queueAttachmentFrame(attachment, .FRAME_TYPE_ERROR, payload);
 }
 
-fn queueAttachmentUnrecognized(attachment: *Attachment, seq: u64, frame_type: u32) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.UnrecognizedFrame{
-        .seq = seq,
-        .frame_type = frame_type,
-    });
-    defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .FRAME_TYPE_UNRECOGNIZED, payload);
-}
-
 fn queueAttachmentFrame(attachment: *Attachment, message_type: protocol.MessageType, payload: []const u8) !void {
-    const header = try protocol.frameHeader(message_type, payload.len);
-    const frame_len = header.len + payload.len;
+    const frame = try protocol.encodeFrame(app_allocator.allocator(), message_type, payload);
+    defer app_allocator.allocator().free(frame);
+    const frame_len = frame.len;
     if (frame_len > max_attachment_output_queue_bytes or
         attachment.queuedBytes() > max_attachment_output_queue_bytes - frame_len)
     {
@@ -1215,8 +1184,7 @@ fn queueAttachmentFrame(attachment: *Attachment, message_type: protocol.MessageT
     }
 
     compactAttachmentOutput(attachment);
-    try attachment.output.appendSlice(app_allocator.allocator(), &header);
-    try attachment.output.appendSlice(app_allocator.allocator(), payload);
+    try attachment.output.appendSlice(app_allocator.allocator(), frame);
 }
 
 fn compactAttachmentOutput(attachment: *Attachment) void {
@@ -2097,7 +2065,6 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
             .FRAME_TYPE_RESIZE => handleResizeFrame(session_agent, attachment_index, frame.payload),
             .FRAME_TYPE_REPAINT => handleRepaintFrame(session_agent, attachment_index, frame.payload),
             .FRAME_TYPE_PING_REQUEST => handlePingRequestFrame(session_agent, attachment_index, frame.payload),
-            .FRAME_TYPE_UNRECOGNIZED => {},
             else => {
                 queueAttachmentError(session_agent, attachment, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
                     detachAttachment(session_agent, attachment_index);
@@ -2105,13 +2072,6 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
                 };
                 closeAttachmentAfterFlush(session_agent, attachment_index);
             },
-        },
-        .unknown => |raw| {
-            queueAttachmentUnrecognized(attachment, frame.seq, raw) catch {
-                detachAttachment(session_agent, attachment_index);
-                return;
-            };
-            flushAttachmentOutput(session_agent, attachment_index);
         },
     }
 }

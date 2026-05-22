@@ -4,27 +4,23 @@ package sessh.handshake.v1;
 
 // Stable sessh remote handshake payloads.
 //
-// These messages are carried by the fixed frame header using the FrameType
-// values defined below. They are deliberately kept outside the versioned remote
-// protocol schema: a peer must be able to parse these messages before it knows
-// whether it understands the remote protocol version.
+// These messages are carried by the length-prefixed HelloFrame below. They are
+// deliberately kept outside the versioned remote protocol schema: a peer must
+// be able to parse these messages before it knows whether it understands the
+// remote protocol version.
 //
 // Compatibility rule: evolve these messages append-only. Existing field
 // numbers, enum values, and meanings must remain stable.
 
-enum FrameType {
-  FRAME_TYPE_UNSPECIFIED = 0;
+message HelloFrame {
+  oneof payload {
+    HelloRequest hello_request = 1;
+    HelloOk hello_ok = 2;
+    HelloError hello_error = 3;
+  }
 
-  // Payload: HelloRequest.
-  FRAME_TYPE_HELLO_REQUEST = 0x0001;
-  // Payload: HelloOk.
-  FRAME_TYPE_HELLO_OK = 0x0002;
-  // Payload: HelloError.
-  FRAME_TYPE_HELLO_ERROR = 0x0003;
-  // Payload: Error.
-  FRAME_TYPE_ERROR = 0x0004;
-  // Payload: UnrecognizedFrame.
-  FRAME_TYPE_UNRECOGNIZED = 0x0005;
+  // Field numbers 10+ belong to the post-handshake Frame schema.
+  reserved 10 to max;
 }
 
 message HelloRequest {
@@ -44,19 +40,10 @@ message HelloError {
 
 // Stable generic error payload.
 //
-// Used by FRAME_TYPE_ERROR after the handshake. Existing fields and meanings
-// must remain stable.
+// Used by the post-handshake Frame after the handshake. Existing fields and
+// meanings must remain stable.
 message Error {
   string code = 1;
   string message = 2;
   optional string hint = 3;
-}
-
-// Stable connection-level diagnostic frame.
-//
-// Reports that a frame type was not understood. The seq identifies the frame
-// being reported when available.
-message UnrecognizedFrame {
-  uint64 seq = 1;
-  uint32 frame_type = 2;
 }

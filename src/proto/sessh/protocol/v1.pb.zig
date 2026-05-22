@@ -4,41 +4,8 @@ const std = @import("std");
 
 const protobuf = @import("protobuf");
 const fd = protobuf.fd;
-
-/// Versioned remote protocol payloads.
-///
-/// The stable handshake payloads live in sessh_handshake.proto. After both
-/// sides accept the handshake, this file's messages are governed by
-/// protocol_major/protocol_minor: a major protocol version bump permits
-/// incompatible frame-format or message-schema changes, including reusing field
-/// numbers with new names or semantics. Minor versions are for changes that are
-/// intended to preserve forward and/or backward compatibility: if the peer
-/// reports a higher minor version for the same major version, the peer is
-/// responsible for remaining compatible with this side; if the peer reports a
-/// lower minor version, this side decides whether it can proceed.
-///
-/// Remote frame type ids. These are the numeric values stored in the fixed
-/// frame header. Values are grouped by broad role rather than packed densely:
-/// 0x0001-0x000f are reserved for stable connection setup/diagnostic frames
-/// defined in sessh_handshake.proto, 0x0010-0x001f are client-to-remote request
-/// frames, and 0x0020-0x002f are remote-to-client response/stream frames. Gaps
-/// are reserved for related future frames, so the enum is intentionally
-/// non-contiguous.
-pub const FrameType = enum(i32) {
-    FRAME_TYPE_UNSPECIFIED = 0,
-    FRAME_TYPE_SESSION_NEW = 17,
-    FRAME_TYPE_SESSION_ATTACH = 18,
-    FRAME_TYPE_INPUT = 21,
-    FRAME_TYPE_RESIZE = 22,
-    FRAME_TYPE_REPAINT = 23,
-    FRAME_TYPE_PING_REQUEST = 24,
-    FRAME_TYPE_SESSION_ATTACHED = 33,
-    FRAME_TYPE_SESSION_ENDED = 34,
-    FRAME_TYPE_DRAW = 39,
-    FRAME_TYPE_PING_RESPONSE = 40,
-    FRAME_TYPE_REPAINT_RESPONSE = 41,
-    _,
-};
+/// import package sessh.handshake.v1
+const sessh_handshake_v1 = @import("../handshake/v1.pb.zig");
 
 pub const SessionEndReason = enum(i32) {
     SESSION_END_REASON_UNSPECIFIED = 0,
@@ -53,6 +20,126 @@ pub const ExitStatusKind = enum(i32) {
     EXIT_STATUS_KIND_EXITED = 1,
     EXIT_STATUS_KIND_SIGNALLED = 2,
     _,
+};
+
+/// Versioned remote protocol payloads.
+///
+/// The stable handshake payloads live in sessh_handshake.proto. After both
+/// sides accept the handshake, this file's messages are governed by
+/// protocol_major/protocol_minor: a major protocol version bump permits
+/// incompatible frame-format or message-schema changes, including reusing field
+/// numbers with new names or semantics. Minor versions are for changes that are
+/// intended to preserve forward and/or backward compatibility: if the peer
+/// reports a higher minor version for the same major version, the peer is
+/// responsible for remaining compatible with this side; if the peer reports a
+/// lower minor version, this side decides whether it can proceed.
+pub const Frame = struct {
+    payload: ?payload_union = null,
+
+    pub const _payload_case = enum {
+        @"error",
+        session_new,
+        session_attach,
+        input,
+        resize,
+        repaint_request,
+        ping_request,
+        session_attached,
+        session_ended,
+        draw,
+        ping_response,
+        repaint_response,
+    };
+    pub const payload_union = union(_payload_case) {
+        @"error": sessh_handshake_v1.Error,
+        session_new: SessionNew,
+        session_attach: SessionAttach,
+        input: Input,
+        resize: Resize,
+        repaint_request: RepaintRequest,
+        ping_request: PingRequest,
+        session_attached: SessionAttached,
+        session_ended: SessionEnded,
+        draw: Draw,
+        ping_response: PingResponse,
+        repaint_response: RepaintResponse,
+        pub const _desc_table = .{
+            .@"error" = fd(10, .submessage),
+            .session_new = fd(11, .submessage),
+            .session_attach = fd(12, .submessage),
+            .input = fd(13, .submessage),
+            .resize = fd(14, .submessage),
+            .repaint_request = fd(15, .submessage),
+            .ping_request = fd(16, .submessage),
+            .session_attached = fd(17, .submessage),
+            .session_ended = fd(18, .submessage),
+            .draw = fd(19, .submessage),
+            .ping_response = fd(20, .submessage),
+            .repaint_response = fd(21, .submessage),
+        };
+    };
+
+    pub const _desc_table = .{
+        .payload = fd(null, .{ .oneof = payload_union }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
 };
 
 /// Embedded in SessionNew.

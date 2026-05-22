@@ -246,7 +246,10 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, sessh_cmd, "Enter"])
             wait_capture(env, session, "REMOTE_PROMPT$")
             before = capture_visible(env, session)
-            remote_top_index = before.splitlines().index("REMOTE_TOP")
+            before_lines = before.splitlines()
+            if "REMOTE_TOP" not in before_lines:
+                raise AssertionError(f"REMOTE_TOP not found in pane:\n{before}")
+            remote_top_index = before_lines.index("REMOTE_TOP")
 
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "C-a", "s"])
             wait_capture(env, session, "sessh: disconnected. Retry in 5sec")

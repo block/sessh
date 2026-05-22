@@ -1227,10 +1227,8 @@ pub fn pollRuntimeRecovery(
                 _ = finishRelay(.session_ended, &session.relay_end_restore);
                 return .session_ended;
             },
-            .FRAME_TYPE_UNRECOGNIZED => return null,
             else => return error.UnexpectedFrame,
         },
-        .unknown => return null,
     }
 }
 
@@ -1332,12 +1330,7 @@ fn readSessionAttachedInner(
                     defer attached.deinit(app_allocator.allocator());
                     return;
                 },
-                .FRAME_TYPE_UNRECOGNIZED => continue,
                 else => return error.UnexpectedFrame,
-            },
-            .unknown => |raw| {
-                try sendUnrecognizedFrame(conn, frame.seq, raw);
-                continue;
             },
         }
     }
@@ -1377,7 +1370,7 @@ fn runtimeHandshakeInner(
     cancelled: ?*const std.atomic.Value(bool),
 ) !void {
     try sendHelloRequest(write_fd);
-    var hello_error = try readHelloReply(read_fd, write_fd, cancelled);
+    var hello_error = try readHelloReply(read_fd, cancelled);
     defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
     if (hello_error) |err| {
         const parsed = errorPayloadFromHelloError(err);
@@ -1424,7 +1417,6 @@ fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
 
 fn readHelloReply(
     read_fd: c.fd_t,
-    write_fd: c.fd_t,
     cancelled: ?*const std.atomic.Value(bool),
 ) !?hpb.HelloError {
     while (true) {
@@ -1441,12 +1433,7 @@ fn readHelloReply(
                     const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
                     return err;
                 },
-                .FRAME_TYPE_UNRECOGNIZED => continue,
                 else => return error.UnexpectedFrame,
-            },
-            .unknown => |raw| {
-                try sendUnrecognizedFrame(write_fd, frame.seq, raw);
-                continue;
             },
         }
     }
@@ -1463,15 +1450,10 @@ fn readHelloRequest(
         switch (frame.message_type) {
             .known => |message_type| switch (message_type) {
                 .FRAME_TYPE_HELLO_REQUEST => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
-                .FRAME_TYPE_UNRECOGNIZED => continue,
                 else => {
                     try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
                     return error.UnexpectedFrame;
                 },
-            },
-            .unknown => |raw| {
-                try sendUnrecognizedFrame(write_fd, frame.seq, raw);
-                continue;
             },
         }
     }
@@ -1580,12 +1562,7 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
                     return true;
                 },
                 .FRAME_TYPE_SESSION_ENDED => return false,
-                .FRAME_TYPE_UNRECOGNIZED => continue,
                 else => return error.UnexpectedFrame,
-            },
-            .unknown => |raw| {
-                try sendUnrecognizedFrame(conn, frame.seq, raw);
-                continue;
             },
         }
     }
@@ -1741,10 +1718,8 @@ fn relayTerminal(
                         try printErrorPayload(frame.payload);
                         return finishRelay(.session_ended, relay_end_restore);
                     },
-                    .FRAME_TYPE_UNRECOGNIZED => {},
                     else => return error.UnexpectedFrame,
                 },
-                .unknown => |raw| try sendUnrecognizedFrame(write_fd, frame.seq, raw),
             }
         }
         if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
@@ -1943,15 +1918,6 @@ fn allocatePingRequestSeq() u64 {
     next_ping_request_seq +%= 1;
     if (next_ping_request_seq == 0) next_ping_request_seq = 1;
     return seq;
-}
-
-fn sendUnrecognizedFrame(socket_fd: c.fd_t, seq: u64, frame_type: u32) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.UnrecognizedFrame{
-        .seq = seq,
-        .frame_type = frame_type,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .FRAME_TYPE_UNRECOGNIZED, payload);
 }
 
 fn sendInputChunks(socket_fd: c.fd_t, bytes: []const u8) !void {
