@@ -491,12 +491,12 @@ pub const Resize = struct {
 ///
 /// Requests that the session agent redraw terminal state for this attachment.
 pub const RepaintRequest = struct {
-    id: u64 = 0,
+    repaint_request_seq: u64 = 0,
     scrollback_cursor: ?[]const u8 = null,
     initial_scrollback_rows: ?u32 = null,
 
     pub const _desc_table = .{
-        .id = fd(1, .{ .scalar = .uint64 }),
+        .repaint_request_seq = fd(1, .{ .scalar = .uint64 }),
         .scrollback_cursor = fd(2, .{ .scalar = .bytes }),
         .initial_scrollback_rows = fd(3, .{ .scalar = .uint32 }),
     };
@@ -565,7 +565,11 @@ pub const RepaintRequest = struct {
 /// Requests a transport responsiveness acknowledgement. This measures the framed
 /// path through ssh/broker/session-agent, not application output or UI rendering.
 pub const PingRequest = struct {
-    pub const _desc_table = .{};
+    ping_request_seq: u64 = 0,
+
+    pub const _desc_table = .{
+        .ping_request_seq = fd(1, .{ .scalar = .uint64 }),
+    };
 
     /// Encodes the message to the writer
     /// The allocator is used to generate submessages internally.
@@ -912,11 +916,11 @@ pub const Draw = struct {
 /// Response for a RepaintRequest. The embedded Draw is applied exactly like a
 /// framed Draw.
 pub const RepaintResponse = struct {
-    id: u64 = 0,
+    repaint_request_seq: u64 = 0,
     draw: ?Draw = null,
 
     pub const _desc_table = .{
-        .id = fd(1, .{ .scalar = .uint64 }),
+        .repaint_request_seq = fd(1, .{ .scalar = .uint64 }),
         .draw = fd(2, .submessage),
     };
 
@@ -983,10 +987,10 @@ pub const RepaintResponse = struct {
 ///
 /// Acknowledges a PingRequest.
 pub const PingResponse = struct {
-    request_seq_number: u64 = 0,
+    ping_request_seq: u64 = 0,
 
     pub const _desc_table = .{
-        .request_seq_number = fd(1, .{ .scalar = .uint64 }),
+        .ping_request_seq = fd(1, .{ .scalar = .uint64 }),
     };
 
     /// Encodes the message to the writer

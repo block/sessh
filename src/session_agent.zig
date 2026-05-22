@@ -544,7 +544,7 @@ const SessionNewRequest = struct {
 };
 
 const RepaintRequest = struct {
-    id: u64,
+    repaint_request_seq: u64,
     scrollback_cursor: ?ScrollbackCursor,
     initial_scrollback_rows: ?u32 = null,
 };
@@ -1540,7 +1540,7 @@ fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session) 
 fn queueRepaintResponseFrame(
     attachment: *Attachment,
     session: *const Session,
-    request_id: u64,
+    repaint_request_seq: u64,
     scrollback_cursor: u64,
     draw_bytes: []const u8,
     relay_end_restore_bytes: ?[]const u8,
@@ -1548,7 +1548,7 @@ fn queueRepaintResponseFrame(
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
     encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.RepaintResponse{
-        .id = request_id,
+        .repaint_request_seq = repaint_request_seq,
         .draw = .{
             .scrollback_cursor = encoded_cursor[0..],
             .viewport_offset = attachment.presentation.protocolViewportOffset(),
@@ -1563,7 +1563,7 @@ fn queueRepaintResponseFrame(
 fn queueRepaintResponseDraw(
     attachment: *Attachment,
     session: *Session,
-    request_id: u64,
+    repaint_request_seq: u64,
     clear_for_replace: bool,
     truncated_rows: u64,
     rows: []const vt.RenderedRow,
@@ -1590,7 +1590,7 @@ fn queueRepaintResponseDraw(
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
     const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-    try queueRepaintResponseFrame(attachment, session, request_id, scrollback_cursor, bytes.items, restore);
+    try queueRepaintResponseFrame(attachment, session, repaint_request_seq, scrollback_cursor, bytes.items, restore);
 }
 
 fn queueRepaintSnapshot(
@@ -1642,7 +1642,7 @@ fn queueRepaintSnapshot(
         try queueRepaintResponseDraw(
             attachment,
             session,
-            request.id,
+            request.repaint_request_seq,
             clear_for_replace or clear_scrollback_for_stale_clear,
             truncated_rows_to_report,
             rows_to_draw,
@@ -1655,7 +1655,7 @@ fn queueRepaintSnapshot(
         try queueRepaintResponseDraw(
             attachment,
             session,
-            request.id,
+            request.repaint_request_seq,
             clear_for_replace,
             0,
             &.{},
@@ -1819,7 +1819,7 @@ fn readRepaintRequest(payload: []const u8) !RepaintRequest {
 
 fn repaintRequestFromMessage(message: pb.RepaintRequest) !RepaintRequest {
     return .{
-        .id = message.id,
+        .repaint_request_seq = message.repaint_request_seq,
         .scrollback_cursor = if (message.scrollback_cursor) |cursor|
             try decodeScrollbackCursor(cursor)
         else
@@ -2096,7 +2096,7 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
             .FRAME_TYPE_INPUT => handleInputFrame(session_agent, attachment_index, frame.payload),
             .FRAME_TYPE_RESIZE => handleResizeFrame(session_agent, attachment_index, frame.payload),
             .FRAME_TYPE_REPAINT => handleRepaintFrame(session_agent, attachment_index, frame.payload),
-            .FRAME_TYPE_PING_REQUEST => handlePingRequestFrame(session_agent, attachment_index, frame.seq, frame.payload),
+            .FRAME_TYPE_PING_REQUEST => handlePingRequestFrame(session_agent, attachment_index, frame.payload),
             .FRAME_TYPE_UNRECOGNIZED => {},
             else => {
                 queueAttachmentError(session_agent, attachment, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
@@ -2144,7 +2144,7 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, paylo
     };
 }
 
-fn handlePingRequestFrame(session_agent: *SessionAgent, attachment_index: usize, request_seq_number: u64, payload: []const u8) void {
+fn handlePingRequestFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
     const attachment = &session_agent.attachments[attachment_index];
     var request = protocol.decodePayload(pb.PingRequest, app_allocator.allocator(), payload) catch {
         detachAttachment(session_agent, attachment_index);
@@ -2152,7 +2152,9 @@ fn handlePingRequestFrame(session_agent: *SessionAgent, attachment_index: usize,
     };
     defer request.deinit(app_allocator.allocator());
 
-    const response_payload = protocol.encodePayload(app_allocator.allocator(), pb.PingResponse{ .request_seq_number = request_seq_number }) catch {
+    const response_payload = protocol.encodePayload(app_allocator.allocator(), pb.PingResponse{
+        .ping_request_seq = request.ping_request_seq,
+    }) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };

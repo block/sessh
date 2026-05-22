@@ -25,7 +25,8 @@ _PROTO_HANDSHAKE_MODULE = None
 _FRAME_HEADER_LEN = 16
 _NEXT_FRAME_SEQ = 1
 _LAST_RESIZE = (24, 80)
-_NEXT_REPAINT_ID = 1
+_NEXT_REPAINT_REQUEST_SEQ = 1
+_NEXT_PING_REQUEST_SEQ = 1
 _SCROLLBACK_CURSOR_LEN = 16
 
 
@@ -258,15 +259,15 @@ def pack_session_new(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF):
 
 
 def pack_session_attach(session_id, initial_scrollback=None, reconnect_cursor=None):
-    global _NEXT_REPAINT_ID
+    global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
     message = pb.SessionAttach()
     rows, cols = _LAST_RESIZE
     message.resize.terminal_rows = rows
     message.resize.terminal_cols = cols
     repaint = message.resize.repaint_request
-    repaint.id = _NEXT_REPAINT_ID
-    _NEXT_REPAINT_ID += 1
+    repaint.repaint_request_seq = _NEXT_REPAINT_REQUEST_SEQ
+    _NEXT_REPAINT_REQUEST_SEQ += 1
     if reconnect_cursor is not None:
         epoch, cursor = reconnect_cursor
         repaint.scrollback_cursor = encode_scrollback_cursor(epoch, cursor)
@@ -286,30 +287,33 @@ def send_resize(conn, rows=24, cols=80, repaint=None, viewport_offset=None):
         message.viewport_offset = viewport_offset
     if repaint is not None:
         if len(repaint) == 2:
-            repaint_id, scrollback_cursor = repaint
+            repaint_request_seq, scrollback_cursor = repaint
             scrollback_epoch = 0
         else:
-            repaint_id, scrollback_epoch, scrollback_cursor = repaint
-        message.repaint_request.id = repaint_id
+            repaint_request_seq, scrollback_epoch, scrollback_cursor = repaint
+        message.repaint_request.repaint_request_seq = repaint_request_seq
         message.repaint_request.scrollback_cursor = encode_request_scrollback_cursor(scrollback_epoch, scrollback_cursor)
     send_frame(conn, 0x0016, message.SerializeToString())
 
 
-def pack_repaint(repaint_id, scrollback_cursor=None, scrollback_epoch=0):
-    message = sessh_pb().RepaintRequest(id=repaint_id)
+def pack_repaint(repaint_request_seq, scrollback_cursor=None, scrollback_epoch=0):
+    message = sessh_pb().RepaintRequest(repaint_request_seq=repaint_request_seq)
     if scrollback_cursor is not None:
         message.scrollback_cursor = encode_request_scrollback_cursor(scrollback_epoch, scrollback_cursor)
     return message.SerializeToString()
 
 
 def pack_ping_request():
-    return sessh_pb().PingRequest().SerializeToString()
+    global _NEXT_PING_REQUEST_SEQ
+    ping_request_seq = _NEXT_PING_REQUEST_SEQ
+    _NEXT_PING_REQUEST_SEQ += 1
+    return ping_request_seq, sessh_pb().PingRequest(ping_request_seq=ping_request_seq).SerializeToString()
 
 
 def parse_ping_response(payload):
     message = sessh_pb().PingResponse()
     message.ParseFromString(payload)
-    return message.request_seq_number
+    return message.ping_request_seq
 
 
 def parse_unrecognized_frame(payload):
@@ -344,7 +348,7 @@ def parse_repaint_response(payload):
     message.ParseFromString(payload)
     if not message.HasField("draw"):
         raise AssertionError(f"missing repaint response draw: {payload!r}")
-    return message.id, parse_draw(message.draw.SerializeToString())
+    return message.repaint_request_seq, parse_draw(message.draw.SerializeToString())
 
 
 def recv_draw(conn, timeout=5.0):
@@ -360,7 +364,7 @@ def recv_draw(conn, timeout=5.0):
             if message_type == 0x0029:
                 response_id, draw = parse_repaint_response(payload)
                 draw["frame_seq"] = seq
-                draw["repaint_id"] = response_id
+                draw["repaint_request_seq"] = response_id
                 return draw
             if message_type == 0x0022:
                 raise AssertionError("session ended before DRAW arrived")
@@ -685,9 +689,10 @@ def run_ping_protocol_test(base_env):
                     raise AssertionError(f"expected SESSION_ATTACHED, got {message_type:#06x}")
                 _session_id = unpack_session_attached(payload)
 
-                ping_seq = send_frame(conn, 0x0018, pack_ping_request())
+                ping_request_seq, ping_payload = pack_ping_request()
+                send_frame(conn, 0x0018, ping_payload)
                 response = recv_until_frame_type(conn, 0x0028)
-                if parse_ping_response(response) != ping_seq:
+                if parse_ping_response(response) != ping_request_seq:
                     raise AssertionError(f"unexpected ping response: {response!r}")
             finally:
                 conn.close()
@@ -727,9 +732,10 @@ def run_unrecognized_frame_protocol_test(base_env):
                         f"unexpected UNRECOGNIZED payload: seq={reported_seq:#x} type={reported_type:#x}"
                     )
 
-                ping_seq = send_frame(conn, 0x0018, pack_ping_request())
+                ping_request_seq, ping_payload = pack_ping_request()
+                send_frame(conn, 0x0018, ping_payload)
                 ping_response = recv_until_frame_type(conn, 0x0028)
-                if parse_ping_response(ping_response) != ping_seq:
+                if parse_ping_response(ping_response) != ping_request_seq:
                     raise AssertionError(f"connection did not continue after unknown frame: {ping_response!r}")
             finally:
                 conn.close()
@@ -1367,7 +1373,7 @@ def run_scrollback_attach_draw_protocol_test(base_env):
                 send_frame(conn, 0x0017, pack_repaint(1))
                 response_id, screen_only = recv_repaint_response(conn)
                 if response_id != 1:
-                    raise AssertionError(f"unexpected screen-only repaint id: {response_id}")
+                    raise AssertionError(f"unexpected screen-only repaint seq: {response_id}")
                 if screen_only["scrollback_cursor"] != scrollback_cursor:
                     raise AssertionError(f"screen-only repaint should not advance scrollback cursor: {screen_only!r}")
                 if b"history_01" in screen_only["draw_bytes"] or b"\x1b[3J" in screen_only["draw_bytes"]:
@@ -1378,7 +1384,7 @@ def run_scrollback_attach_draw_protocol_test(base_env):
                 send_frame(conn, 0x0017, pack_repaint(2, 0))
                 response_id, full_repaint = recv_repaint_response(conn)
                 if response_id != 2:
-                    raise AssertionError(f"unexpected full repaint id: {response_id}")
+                    raise AssertionError(f"unexpected full repaint seq: {response_id}")
                 if full_repaint["scrollback_cursor"] == 0 or b"history_01" not in full_repaint["draw_bytes"]:
                     raise AssertionError(f"full repaint did not include retained scrollback: {full_repaint!r}")
             finally:
@@ -1659,7 +1665,7 @@ def run_resize_epoch_does_not_clear_reconnect_scrollback_test(base_env):
                 send_resize(conn, 3, 20, repaint=(1, cursor[0], cursor[1]), viewport_offset=-1)
                 response_id, resize_repaint = recv_repaint_response(conn)
                 if response_id != 1:
-                    raise AssertionError(f"unexpected resize repaint id: {response_id}")
+                    raise AssertionError(f"unexpected resize repaint seq: {response_id}")
                 if resize_repaint["viewport_offset"] != 0:
                     raise AssertionError(f"resize repaint did not realign unknown viewport: {resize_repaint!r}")
                 if resize_repaint["epoch"] == cursor[0]:

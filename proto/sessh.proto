@@ -130,12 +130,12 @@ message Resize {
 //
 // Requests that the session agent redraw terminal state for this attachment.
 message RepaintRequest {
-  // Client-local repaint id copied into RepaintResponse. While this repaint is
-  // outstanding, the client ignores framed Draw messages and resumes applying
-  // draws only after receiving the matching RepaintResponse. If multiple
-  // RepaintRequests are in flight, the session agent may ignore all but the
-  // last one.
-  uint64 id = 1;
+  // Client-local repaint request sequence copied into RepaintResponse. While
+  // this repaint is outstanding, the client ignores framed Draw messages and
+  // resumes applying draws only after receiving the matching RepaintResponse.
+  // If multiple RepaintRequests are in flight, the session agent may ignore all
+  // but the last one.
+  uint64 repaint_request_seq = 1;
   // Opaque scrollback cursor. Absent means assume the client has current
   // scrollback and send none. Present empty bytes means send all retained
   // scrollback available; present non-empty bytes must come from a previous
@@ -151,6 +151,7 @@ message RepaintRequest {
 // Requests a transport responsiveness acknowledgement. This measures the framed
 // path through ssh/broker/session-agent, not application output or UI rendering.
 message PingRequest {
+  uint64 ping_request_seq = 1;
 }
 
 // Framed payload, session agent -> client.
@@ -215,7 +216,7 @@ message Draw {
 // Response for a RepaintRequest. The embedded Draw is applied exactly like a
 // framed Draw.
 message RepaintResponse {
-  uint64 id = 1;
+  uint64 repaint_request_seq = 1;
   Draw draw = 2;
 }
 
@@ -223,6 +224,5 @@ message RepaintResponse {
 //
 // Acknowledges a PingRequest.
 message PingResponse {
-  // Frame seq number of the PingRequest being acknowledged.
-  uint64 request_seq_number = 1;
+  uint64 ping_request_seq = 1;
 }

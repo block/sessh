@@ -17,7 +17,8 @@ const hpb = protocol.hpb;
 const WindowSize = terminal.WindowSize;
 const Leader = terminal.Leader;
 
-var next_repaint_id: u64 = 1;
+var next_repaint_request_seq: u64 = 1;
+var next_ping_request_seq: u64 = 1;
 
 const LocalAction = enum {
     new,
@@ -228,7 +229,7 @@ const max_responsiveness_timeout_ms: i64 = 15_000;
 
 const ConnectionMonitor = struct {
     enabled: bool = false,
-    pending_ping_seq: ?u64 = null,
+    pending_ping_request_seq: ?u64 = null,
     deferred_ping: bool = false,
     ping_sent_ms: i64 = 0,
     last_ping_sent_ms: ?i64 = null,
@@ -247,12 +248,12 @@ const ConnectionMonitor = struct {
         if (self.any_response_wait_started_ms == null) {
             self.any_response_wait_started_ms = now;
         }
-        if (self.pending_ping_seq == null and self.canSendPing(now)) {
-            self.pending_ping_seq = try sendPingRequest(write_fd);
+        if (self.pending_ping_request_seq == null and self.canSendPing(now)) {
+            self.pending_ping_request_seq = try sendPingRequest(write_fd);
             self.ping_sent_ms = now;
             self.last_ping_sent_ms = now;
             self.deferred_ping = false;
-        } else if (self.pending_ping_seq == null) {
+        } else if (self.pending_ping_request_seq == null) {
             self.deferred_ping = true;
         }
     }
@@ -268,8 +269,8 @@ const ConnectionMonitor = struct {
     }
 
     fn maybeSendDeferredPingAt(self: *ConnectionMonitor, write_fd: c.fd_t, now: i64) !void {
-        if (!self.deferred_ping or self.pending_ping_seq != null or !self.canSendPing(now)) return;
-        self.pending_ping_seq = try sendPingRequest(write_fd);
+        if (!self.deferred_ping or self.pending_ping_request_seq != null or !self.canSendPing(now)) return;
+        self.pending_ping_request_seq = try sendPingRequest(write_fd);
         self.ping_sent_ms = now;
         self.last_ping_sent_ms = now;
         self.any_response_wait_started_ms = now;
@@ -284,10 +285,10 @@ const ConnectionMonitor = struct {
     fn handlePingResponse(self: *ConnectionMonitor, payload: []const u8) !void {
         var response = try protocol.decodePayload(pb.PingResponse, app_allocator.allocator(), payload);
         defer response.deinit(app_allocator.allocator());
-        const pending_seq = self.pending_ping_seq orelse return;
-        if (response.request_seq_number != pending_seq) return;
+        const pending_seq = self.pending_ping_request_seq orelse return;
+        if (response.ping_request_seq != pending_seq) return;
         const rtt_ms = @max(std.time.milliTimestamp() - self.ping_sent_ms, 0);
-        self.pending_ping_seq = null;
+        self.pending_ping_request_seq = null;
         self.updateRtt(rtt_ms);
     }
 
@@ -304,7 +305,7 @@ const ConnectionMonitor = struct {
 
     fn pollTimeoutMs(self: *const ConnectionMonitor) i32 {
         if (!self.enabled) return 100;
-        if (self.deferred_ping and self.pending_ping_seq == null) {
+        if (self.deferred_ping and self.pending_ping_request_seq == null) {
             const last = self.last_ping_sent_ms orelse return 0;
             const until_ping = ping_min_interval_ms - (std.time.milliTimestamp() - last);
             if (until_ping <= 0) return 0;
@@ -319,7 +320,7 @@ const ConnectionMonitor = struct {
 
     fn isUnresponsive(self: *const ConnectionMonitor) bool {
         if (!self.enabled) return false;
-        if (self.deferred_ping and self.pending_ping_seq == null) return false;
+        if (self.deferred_ping and self.pending_ping_request_seq == null) return false;
         const started = self.any_response_wait_started_ms orelse return false;
         return std.time.milliTimestamp() - started >= self.responsivenessTimeoutMs();
     }
@@ -353,23 +354,23 @@ pub const ScrollbackCursor = struct {
 };
 
 const PendingRepaint = struct {
-    id: u64 = 0,
+    repaint_request_seq: u64 = 0,
 
     fn active(self: PendingRepaint) bool {
-        return self.id != 0;
+        return self.repaint_request_seq != 0;
     }
 
     fn start(self: *PendingRepaint) u64 {
-        self.id = allocateRepaintId();
-        return self.id;
+        self.repaint_request_seq = allocateRepaintRequestSeq();
+        return self.repaint_request_seq;
     }
 
-    fn matches(self: PendingRepaint, id: u64) bool {
-        return self.id == id;
+    fn matches(self: PendingRepaint, repaint_request_seq: u64) bool {
+        return self.repaint_request_seq == repaint_request_seq;
     }
 
     fn clear(self: *PendingRepaint) void {
-        self.id = 0;
+        self.repaint_request_seq = 0;
     }
 };
 
@@ -377,7 +378,7 @@ const PendingRepaint = struct {
 pub const RuntimeSession = struct {
     scrollback_cursor: ScrollbackCursor = .{},
     viewport_offset: i32 = 0,
-    /// Latest outstanding RepaintRequest id. Older RepaintResponses are stale.
+    /// Latest outstanding RepaintRequest sequence. Older responses are stale.
     pending_repaint: PendingRepaint = .{},
     relay_end_restore: std.ArrayList(u8) = .empty,
 
@@ -707,20 +708,22 @@ test "connection monitor defers rate-limited ping and starts responsiveness wait
     };
 
     try monitor.afterInputAt(fds[1], 1_100);
-    try std.testing.expectEqual(@as(?u64, null), monitor.pending_ping_seq);
+    try std.testing.expectEqual(@as(?u64, null), monitor.pending_ping_request_seq);
     try std.testing.expect(monitor.deferred_ping);
     try std.testing.expectEqual(@as(?i64, 1_100), monitor.any_response_wait_started_ms);
     try std.testing.expect(!monitor.isUnresponsive());
 
     try monitor.maybeSendDeferredPingAt(fds[1], 2_000);
-    const pending = monitor.pending_ping_seq orelse return error.ExpectedPendingPing;
+    const pending = monitor.pending_ping_request_seq orelse return error.ExpectedPendingPing;
     try std.testing.expect(!monitor.deferred_ping);
     try std.testing.expectEqual(@as(?i64, 2_000), monitor.any_response_wait_started_ms);
 
     var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(pending, frame.seq);
     try std.testing.expect(frame.knownMessageType() == .FRAME_TYPE_PING_REQUEST);
+    var request = try protocol.decodePayload(pb.PingRequest, std.testing.allocator, frame.payload);
+    defer request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pending, request.ping_request_seq);
 }
 
 test "cancelled reconnect frame read returns without input" {
@@ -758,7 +761,7 @@ test "recovery polling ignores draw while repaint is outstanding" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var session = RuntimeSession{ .pending_repaint = .{ .id = 7 } };
+    var session = RuntimeSession{ .pending_repaint = .{ .repaint_request_seq = 7 } };
     defer session.relay_end_restore.deinit(app_allocator.allocator());
 
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Draw{
@@ -777,7 +780,7 @@ test "recovery polling ignores draw while repaint is outstanding" {
 
 test "repaint response applies only latest outstanding request" {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.RepaintResponse{
-        .id = 7,
+        .repaint_request_seq = 7,
         .draw = .{
             .scrollback_cursor = "cursor-v7",
             .viewport_offset = 4,
@@ -796,12 +799,12 @@ test "repaint response applies only latest outstanding request" {
     try std.testing.expectEqual(@as(usize, 0), cursor.len);
     try std.testing.expectEqual(@as(i32, 0), viewport_offset);
 
-    var older_pending = PendingRepaint{ .id = 8 };
+    var older_pending = PendingRepaint{ .repaint_request_seq = 8 };
     try std.testing.expect(!try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &older_pending));
-    try std.testing.expectEqual(@as(u64, 8), older_pending.id);
+    try std.testing.expectEqual(@as(u64, 8), older_pending.repaint_request_seq);
     try std.testing.expectEqual(@as(usize, 0), cursor.len);
 
-    var matching_pending = PendingRepaint{ .id = 7 };
+    var matching_pending = PendingRepaint{ .repaint_request_seq = 7 };
     try std.testing.expect(try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &matching_pending));
     try std.testing.expect(!matching_pending.active());
     try std.testing.expectEqualStrings("cursor-v7", cursor.slice());
@@ -1122,10 +1125,10 @@ pub fn startAttachSessionOnRuntime(
     _ = attach_id;
     const viewport_offset = queryInitialViewportOffset();
     try runtimeHandshake(read_fd, write_fd);
-    const repaint_id = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null);
+    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null);
     var session = try readRuntimeSession(read_fd);
     session.viewport_offset = viewport_offset orelse 0;
-    session.pending_repaint.id = repaint_id;
+    session.pending_repaint.repaint_request_seq = repaint_request_seq;
     return session;
 }
 
@@ -1153,7 +1156,7 @@ fn reconnectSessionOnRuntimeInner(
     cancelled: ?*const std.atomic.Value(bool),
 ) !void {
     try runtimeHandshakeInner(read_fd, write_fd, cancelled);
-    session.pending_repaint.id = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor);
+    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor);
     try readSessionAttachedInner(read_fd, cancelled);
 }
 
@@ -1541,17 +1544,17 @@ fn sendSessionAttach(
     initial_scrollback_row_count: ?u32,
     reconnect_cursor: ?*const ScrollbackCursor,
 ) !u64 {
-    const repaint_id = allocateRepaintId();
+    const repaint_request_seq = allocateRepaintRequestSeq();
     const message = pb.SessionAttach{
         .resize = .{
             .terminal_rows = size.rows,
             .terminal_cols = size.cols,
             .viewport_offset = viewport_offset,
             .repaint_request = if (reconnect_cursor) |cursor| .{
-                .id = repaint_id,
+                .repaint_request_seq = repaint_request_seq,
                 .scrollback_cursor = cursor.slice(),
             } else .{
-                .id = repaint_id,
+                .repaint_request_seq = repaint_request_seq,
                 .scrollback_cursor = if (initial_scrollback_row_count != null and initial_scrollback_row_count.? == 0)
                     null
                 else
@@ -1563,7 +1566,7 @@ fn sendSessionAttach(
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(conn, .FRAME_TYPE_SESSION_ATTACH, payload);
-    return repaint_id;
+    return repaint_request_seq;
 }
 
 fn readSessionEndedOrError(conn: c.fd_t) !bool {
@@ -1801,7 +1804,7 @@ fn handleRepaintResponseFrame(
 ) !bool {
     var response = try protocol.decodePayload(pb.RepaintResponse, app_allocator.allocator(), payload);
     defer response.deinit(app_allocator.allocator());
-    if (!pending_repaint.active() or !pending_repaint.matches(response.id)) return false;
+    if (!pending_repaint.active() or !pending_repaint.matches(response.repaint_request_seq)) return false;
     const response_draw = response.draw orelse return error.MissingDraw;
     const draw = try drawPayloadFromMessage(response_draw);
     defer freeDrawPayload(draw);
@@ -1889,13 +1892,13 @@ fn sendResizeWithRepaint(
     viewport_offset: i32,
     pending_repaint: *PendingRepaint,
 ) !void {
-    const repaint_id = pending_repaint.start();
+    const repaint_request_seq = pending_repaint.start();
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Resize{
         .terminal_rows = size.rows,
         .terminal_cols = size.cols,
         .viewport_offset = nonZeroViewportOffset(viewport_offset),
         .repaint_request = .{
-            .id = repaint_id,
+            .repaint_request_seq = repaint_request_seq,
             .scrollback_cursor = scrollback_cursor.slice(),
         },
     });
@@ -1905,18 +1908,18 @@ fn sendResizeWithRepaint(
 
 fn sendRepaint(socket_fd: c.fd_t, scrollback_cursor: []const u8, pending_repaint: *PendingRepaint) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.RepaintRequest{
-        .id = pending_repaint.start(),
+        .repaint_request_seq = pending_repaint.start(),
         .scrollback_cursor = scrollback_cursor,
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(socket_fd, .FRAME_TYPE_REPAINT, payload);
 }
 
-fn allocateRepaintId() u64 {
-    const id = next_repaint_id;
-    next_repaint_id +%= 1;
-    if (next_repaint_id == 0) next_repaint_id = 1;
-    return id;
+fn allocateRepaintRequestSeq() u64 {
+    const seq = next_repaint_request_seq;
+    next_repaint_request_seq +%= 1;
+    if (next_repaint_request_seq == 0) next_repaint_request_seq = 1;
+    return seq;
 }
 
 fn sendInput(socket_fd: c.fd_t, bytes: []const u8) !void {
@@ -1926,9 +1929,20 @@ fn sendInput(socket_fd: c.fd_t, bytes: []const u8) !void {
 }
 
 fn sendPingRequest(socket_fd: c.fd_t) !u64 {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.PingRequest{});
+    const ping_request_seq = allocatePingRequestSeq();
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.PingRequest{
+        .ping_request_seq = ping_request_seq,
+    });
     defer app_allocator.allocator().free(payload);
-    return protocol.sendFrameWithAllocatedSeq(socket_fd, .FRAME_TYPE_PING_REQUEST, payload);
+    try protocol.sendFrame(socket_fd, .FRAME_TYPE_PING_REQUEST, payload);
+    return ping_request_seq;
+}
+
+fn allocatePingRequestSeq() u64 {
+    const seq = next_ping_request_seq;
+    next_ping_request_seq +%= 1;
+    if (next_ping_request_seq == 0) next_ping_request_seq = 1;
+    return seq;
 }
 
 fn sendUnrecognizedFrame(socket_fd: c.fd_t, seq: u64, frame_type: u32) !void {
