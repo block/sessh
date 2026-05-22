@@ -1,57 +1,80 @@
-We keep our client simple. Like normal `ssh` PTY handling, we:
+# Framing
+
+Each wire frame is a 4-byte big-endian length followed by a protobuf envelope.
+The handshake uses `HelloFrame`, whose `oneof` carries only `HelloRequest`,
+`HelloOk`, or `Error`. Once both sides have accepted the handshake, all
+subsequent frames use the versioned `Frame` envelope from `sessh.proto`.
+
+The `HelloFrame`/`Frame` separation is designed to allow us maximum protocol
+flexibility in the future. We could migrate off of protobuf for everything past
+`HelloOk` while still emitting clean `Error` responses for incompatible
+versions.
+
+# Client capabilities
+
+Like normal `ssh` PTY handling, we:
 1. forward input from the outer terminal to the remote
 2. forward output from the remote to the outer terminal
 3. Catch signals (e.g. SIGINT for ctrl-c, SIGWINCH for window size change) and
    transmit them to the remote
 
-Our client has three additional capabilities:
+Our client has 4 additional capabilities:
 1. It tracks sufficient state so that it can seamlessly reconnect
+2. It avoids executing stale rendering operations while resizing
 2. It can render banners independently of the remote
 3. It can cleanup TTY state independently of the remote
+
+We are able to implement these 4 additional capabilities with minimal client
+logic, which hopefully means it's easier to preserve compatibility across
+versions.
 
 ## Seamless reconnect
 
 The protocol is designed so that session agents don't retain state of
 disconnected clients. Instead, a reconnecting client sends state to its session
-agent, which combines that with its own state and then computes missing
-scrollback and generates accurate repaint instructions for the client.
+agent, which combines that with its own terminal state and then computes
+missing scrollback and generates accurate repaint instructions for the client.
 
 In the event of a network disconnection, the session agent will continue
 terminal emulation. The virtual screen may update and/or generate additional
-lines of scrollback. When the client reconnects, it sends a RepaintRequest that
-may include an opaque scrollback cursor previously returned by Draw. The client
-does not interpret the cursor. To the session agent, the cursor identifies enough
-state to decide:
+lines of scrollback. When the client reconnects, it sends a Resize message with
+an embedded RepaintRequest message containing enough information for the
+session agent to decide:
 1. Are the client's scrollback contents stale? (i.e. are they from before
    scrollback was cleared?)
 2. Which retained scrollback rows, if any, should be sent to the client?
 
-If the client's scrollback contents are stale, then the remote will include an
-instruction to clear the client's scrollback, along with instructions to render
-all of the new scrollback. Otherwise the remote will compute how many rows of
-scrollback the client is missing and include instructions to render them.
+RepaintResponse includes an embedded Draw message with instructions to add
+missing scrollback rows, possibly clearing older scrollback if stale. These
+instructions also clear and re-render the screen, and restore state (e.g.
+cursor position/visibility/style, terminal modes such as mouse reporting or
+bracketed paste, etc).
 
-If the RepaintRequest omits the cursor, the session agent assumes the client has
-current scrollback and sends only the screen repaint. If the request includes an
-empty cursor, the session agent sends all retained scrollback available, subject
-to any requested row cap.
+## Smart resize
 
-Additionally the RepaintResponse includes instructions for redrawing the
-screen and restoring any state (e.g. cursor position/visibility/style, terminal
-modes such as mouse reporting or bracketed paste, etc).
+When the terminal window is resized our client receives a SIGWINCH which we
+handle by sending a Resize message to the remote, the same message that gets
+embedded within SessionAttach. Resizing is treated as a logical reconnection.
 
-Resize carries the client's current viewport offset when known. Omitted means
-the viewports are aligned; `-1` means the client lost track of the offset after
-a resize. The session agent answers an unknown offset by aligning the viewport
-in the repaint response.
+The Resize contains a RepaintRequest and we drop any Draw packets until the
+matching RepaintResponse is received. It doesn't make sense to try to apply
+rendering operations that were generated for a different sized window.
+
+Resize carries the client's current viewport offset when known. The session
+agent answers an unknown offset by aligning the viewport in the repaint
+response.
 
 ## Client-side banner rendering
 
 We allow for the possibility of the client to render banners independently of
 the remote, but the client doesn't have the ability to remove the banners by
 itself. It can redraw a different banner, but the only way it can remove a
-banner is by asking the remote to repaint. This capability allows the client to
-notify the user when the connection has become stale.
+banner is by asking the remote to repaint. After requesting repaint, the client
+ignores subsequent Draw packets up until the matching RepaintResponse so that
+the banner doesn't end up in the outer terminal's scrollback.
+
+The client uses banners to notify the user when the connection has died or
+become unresponsive.
 
 ## Client-side state cleanup
 
