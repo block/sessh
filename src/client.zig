@@ -352,10 +352,38 @@ pub const ScrollbackCursor = struct {
     }
 };
 
+const PendingRepaint = struct {
+    id: u64 = 0,
+
+    fn active(self: PendingRepaint) bool {
+        return self.id != 0;
+    }
+
+    fn start(self: *PendingRepaint) u64 {
+        self.id = allocateRepaintId();
+        return self.id;
+    }
+
+    fn matches(self: PendingRepaint, id: u64) bool {
+        return self.id == id;
+    }
+
+    fn clear(self: *PendingRepaint) void {
+        self.id = 0;
+    }
+};
+
+/// Client-side state carried across runtime transports for one attached session.
 pub const RuntimeSession = struct {
     scrollback_cursor: ScrollbackCursor = .{},
     viewport_offset: i32 = 0,
+    /// Latest outstanding RepaintRequest id. Older RepaintResponses are stale.
+    pending_repaint: PendingRepaint = .{},
     relay_end_restore: std.ArrayList(u8) = .empty,
+
+    pub fn adoptReconnectState(self: *RuntimeSession, reconnected: *const RuntimeSession) void {
+        self.pending_repaint = reconnected.pending_repaint;
+    }
 
     pub fn idSlice(self: *const RuntimeSession) []const u8 {
         _ = self;
@@ -618,25 +646,6 @@ const DrawPayload = struct {
     relay_end_restore_bytes: ?[]const u8,
 };
 
-const PendingRepaint = struct {
-    id: u64 = 0,
-
-    fn active(self: PendingRepaint) bool {
-        return self.id != 0;
-    }
-
-    fn start(self: *PendingRepaint) u64 {
-        self.id = allocateRepaintId();
-        return self.id;
-    }
-
-    fn complete(self: *PendingRepaint, id: u64) bool {
-        if (self.id != id) return false;
-        self.id = 0;
-        return true;
-    }
-};
-
 test "parseEnvConfig accepts sessh env keys" {
     const parsed = try parseEnvConfig(
         \\leader=CTRL-B
@@ -742,6 +751,62 @@ test "recovery polling stores relay-end restore bytes from draw" {
 
     try std.testing.expectEqual(RuntimeRecovery.recovered, (try pollRuntimeRecovery(fds[0], &session, 0)).?);
     try std.testing.expectEqualStrings("restore-primary", session.relay_end_restore.items);
+}
+
+test "recovery polling ignores draw while repaint is outstanding" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var session = RuntimeSession{ .pending_repaint = .{ .id = 7 } };
+    defer session.relay_end_restore.deinit(app_allocator.allocator());
+
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Draw{
+        .scrollback_cursor = "stale-cursor",
+        .viewport_offset = 3,
+        .draw_bytes = "",
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fds[1], .FRAME_TYPE_DRAW, payload);
+
+    try std.testing.expectEqual(@as(?RuntimeRecovery, null), try pollRuntimeRecovery(fds[0], &session, 0));
+    try std.testing.expectEqual(@as(usize, 0), session.scrollback_cursor.len);
+    try std.testing.expectEqual(@as(i32, 0), session.viewport_offset);
+    try std.testing.expect(session.pending_repaint.active());
+}
+
+test "repaint response applies only latest outstanding request" {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.RepaintResponse{
+        .id = 7,
+        .draw = .{
+            .scrollback_cursor = "cursor-v7",
+            .viewport_offset = 4,
+            .draw_bytes = "",
+            .relay_end_restore_bytes = "restore-v7",
+        },
+    });
+    defer app_allocator.allocator().free(payload);
+
+    var restore = std.ArrayList(u8).empty;
+    defer restore.deinit(app_allocator.allocator());
+    var cursor = ScrollbackCursor{};
+    var viewport_offset: i32 = 0;
+    var no_pending = PendingRepaint{};
+    try std.testing.expect(!try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &no_pending));
+    try std.testing.expectEqual(@as(usize, 0), cursor.len);
+    try std.testing.expectEqual(@as(i32, 0), viewport_offset);
+
+    var older_pending = PendingRepaint{ .id = 8 };
+    try std.testing.expect(!try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &older_pending));
+    try std.testing.expectEqual(@as(u64, 8), older_pending.id);
+    try std.testing.expectEqual(@as(usize, 0), cursor.len);
+
+    var matching_pending = PendingRepaint{ .id = 7 };
+    try std.testing.expect(try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &matching_pending));
+    try std.testing.expect(!matching_pending.active());
+    try std.testing.expectEqualStrings("cursor-v7", cursor.slice());
+    try std.testing.expectEqual(@as(i32, 4), viewport_offset);
+    try std.testing.expectEqualStrings("restore-v7", restore.items);
 }
 
 /// Implements the public `sessh :local:` path. This is both the local testing
@@ -1069,9 +1134,10 @@ pub fn startAttachSessionOnRuntime(
     _ = attach_id;
     const viewport_offset = queryInitialViewportOffset();
     try runtimeHandshake(read_fd, write_fd);
-    try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null);
+    const repaint_id = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null);
     var session = try readRuntimeSession(read_fd);
     session.viewport_offset = viewport_offset orelse 0;
+    session.pending_repaint.id = repaint_id;
     return session;
 }
 
@@ -1099,7 +1165,7 @@ fn reconnectSessionOnRuntimeInner(
     cancelled: ?*const std.atomic.Value(bool),
 ) !void {
     try runtimeHandshakeInner(read_fd, write_fd, cancelled);
-    try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor);
+    session.pending_repaint.id = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor);
     try readSessionAttachedInner(read_fd, cancelled);
 }
 
@@ -1116,6 +1182,7 @@ pub fn relayRuntimeSession(
         leader,
         &session.scrollback_cursor,
         &session.viewport_offset,
+        &session.pending_repaint,
         &session.relay_end_restore,
         options,
     );
@@ -1145,19 +1212,19 @@ pub fn pollRuntimeRecovery(
     switch (frame.message_type) {
         .known => |message_type| switch (message_type) {
             .FRAME_TYPE_DRAW => {
+                if (session.pending_repaint.active()) return null;
                 try handleDrawFrame(frame.payload, &session.relay_end_restore, &session.scrollback_cursor, &session.viewport_offset);
                 return .recovered;
             },
             .FRAME_TYPE_REPAINT_RESPONSE => {
-                var pending_repaint = PendingRepaint{};
-                _ = try handleRepaintResponseFrame(
+                const applied = try handleRepaintResponseFrame(
                     frame.payload,
                     &session.relay_end_restore,
                     &session.scrollback_cursor,
                     &session.viewport_offset,
-                    &pending_repaint,
+                    &session.pending_repaint,
                 );
-                return .recovered;
+                return if (applied) .recovered else null;
             },
             .FRAME_TYPE_PING_RESPONSE => return .recovered,
             .FRAME_TYPE_SESSION_ENDED => {
@@ -1525,7 +1592,7 @@ fn sendSessionAttach(
     viewport_offset: ?i32,
     initial_scrollback_row_count: ?u32,
     reconnect_cursor: ?*const ScrollbackCursor,
-) !void {
+) !u64 {
     const repaint_id = allocateRepaintId();
     const message = pb.SessionAttach{
         .resize = .{
@@ -1548,6 +1615,7 @@ fn sendSessionAttach(
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(conn, .FRAME_TYPE_SESSION_ATTACH, payload);
+    return repaint_id;
 }
 
 fn readSessionEndedOrError(conn: c.fd_t) !bool {
@@ -1633,6 +1701,7 @@ fn relayInteractive(
     leader: Leader,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
+    pending_repaint: *PendingRepaint,
     relay_end_restore: *std.ArrayList(u8),
     options: RelayOptions,
 ) !RelayEnd {
@@ -1654,6 +1723,7 @@ fn relayInteractive(
         &presentation_guard,
         scrollback_cursor,
         viewport_offset,
+        pending_repaint,
         relay_end_restore,
         options,
     );
@@ -1669,6 +1739,7 @@ fn relayTerminal(
     presentation_guard: *client_renderer.PresentationGuard,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
+    pending_repaint: *PendingRepaint,
     relay_end_restore: *std.ArrayList(u8),
     options: RelayOptions,
 ) !RelayEnd {
@@ -1681,14 +1752,13 @@ fn relayTerminal(
     var escape_filter = terminal.EscapeFilter{ .leader_byte = terminal.leaderByte(leader) };
     var last_size = terminal.currentWindowSize();
     var connection_monitor = ConnectionMonitor{ .enabled = options.monitor_connection };
-    var pending_repaint = PendingRepaint{};
     _ = presentation_guard;
 
     while (true) {
         try connection_monitor.maybeSendDeferredPing(write_fd);
         _ = try posix.poll(&pollfds, connection_monitor.pollTimeoutMs());
         try connection_monitor.maybeSendDeferredPing(write_fd);
-        maybeSendResize(write_fd, &last_size, scrollback_cursor, viewport_offset, &pending_repaint);
+        maybeSendResize(write_fd, &last_size, scrollback_cursor, viewport_offset, pending_repaint);
 
         if (connection_monitor.isUnresponsive()) {
             return .unresponsive;
@@ -1711,7 +1781,7 @@ fn relayTerminal(
                             relay_end_restore,
                             scrollback_cursor,
                             viewport_offset,
-                            &pending_repaint,
+                            pending_repaint,
                         );
                     },
                     .FRAME_TYPE_PING_RESPONSE => try connection_monitor.handlePingResponse(frame.payload),
@@ -1736,7 +1806,7 @@ fn relayTerminal(
             }
             if (result.end) |end| switch (end) {
                 .detach => return finishRelay(requestSessionDetach(read_fd, write_fd), relay_end_restore),
-                .repaint => sendRepaint(write_fd, "", &pending_repaint) catch return .transport_closed,
+                .repaint => sendRepaint(write_fd, "", pending_repaint) catch return .transport_closed,
                 .reconnect => return .reconnect,
             };
         }
@@ -1783,11 +1853,12 @@ fn handleRepaintResponseFrame(
 ) !bool {
     var response = try protocol.decodePayload(pb.RepaintResponse, app_allocator.allocator(), payload);
     defer response.deinit(app_allocator.allocator());
-    if (pending_repaint.active() and !pending_repaint.complete(response.id)) return false;
+    if (!pending_repaint.active() or !pending_repaint.matches(response.id)) return false;
     const response_draw = response.draw orelse return error.MissingDraw;
     const draw = try drawPayloadFromMessage(response_draw);
     defer freeDrawPayload(draw);
     try handleDrawPayload(draw, relay_end_restore, scrollback_cursor, viewport_offset);
+    pending_repaint.clear();
     return true;
 }
 
@@ -1850,7 +1921,7 @@ fn maybeSendResize(
     const resize_viewport_offset: i32 = if (viewport_offset.* == 0) 0 else -1;
     viewport_offset.* = resize_viewport_offset;
     sendResizeWithRepaint(socket_fd, size, scrollback_cursor, resize_viewport_offset, pending_repaint) catch {
-        pending_repaint.id = 0;
+        pending_repaint.clear();
     };
 }
 

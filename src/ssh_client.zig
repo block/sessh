@@ -892,7 +892,7 @@ fn raceExistingConnectionWithReconnect(
         if (state.done.load(.acquire)) {
             joined = true;
             thread.join();
-            return parallelResultToRaceOutcome(state.take().?);
+            return parallelResultToRaceOutcome(state.take().?, &state.session, session);
         }
 
         if (old_available) {
@@ -972,9 +972,16 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
     state.store(.{ .connected = connection });
 }
 
-fn parallelResultToRaceOutcome(result: ParallelReconnectResult) ReconnectRaceOutcome {
+fn parallelResultToRaceOutcome(
+    result: ParallelReconnectResult,
+    reconnected_session: *const client.RuntimeSession,
+    session: *client.RuntimeSession,
+) ReconnectRaceOutcome {
     return switch (result) {
-        .connected => |connection| .{ .reconnected = connection },
+        .connected => |connection| connected: {
+            session.adoptReconnectState(reconnected_session);
+            break :connected .{ .reconnected = connection };
+        },
         .failed => |err| .{ .failed = err },
     };
 }
