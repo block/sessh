@@ -12,6 +12,8 @@ const terminal = @import("terminal.zig");
 
 const bootstrapper_script = @embedFile("bootstrapper.sh");
 const max_artifact_bytes = 64 * 1024 * 1024;
+const default_ipqos_option_prefix = "-oIPQoS=";
+const ssh_config_query_max_output_bytes = 256 * 1024;
 
 const ArtifactSet = struct {
     allocator: std.mem.Allocator,
@@ -111,6 +113,7 @@ const ParsedSshArgs = struct {
     bootstrap: bool = true,
     bootstrap_set: bool = false,
     force_compat: bool = false,
+    default_ipqos_option: ?[]const u8 = null,
 };
 
 const CompatModeReason = enum {
@@ -259,6 +262,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return process_exit.request(64);
     };
     client_log.setLevel(parsed_ssh_args.client_log_level);
+    parsed_ssh_args.default_ipqos_option = try resolveDefaultIpQosOption(allocator, parsed_ssh_args.options, parsed_ssh_args.host);
+    defer if (parsed_ssh_args.default_ipqos_option) |option| allocator.free(option);
 
     if (parsed_ssh_args.force_compat) {
         try runRemoteCompat(allocator, parsed_ssh_args, .forced);
@@ -557,7 +562,8 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
 
     const batch_mode = reason == .version_mismatch;
     const extra_options: usize = if (batch_mode) 1 else 0;
-    const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + extra_options + 4);
+    const default_options = defaultSshOptionsLen(parsed_ssh_args);
+    const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + extra_options + default_options + 4);
     defer allocator.free(ssh_argv);
     ssh_argv[0] = "ssh";
     var arg_index: usize = 1;
@@ -565,6 +571,7 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
         ssh_argv[arg_index] = "-oBatchMode=yes";
         arg_index += 1;
     }
+    appendDefaultSshOptions(ssh_argv, &arg_index, parsed_ssh_args.default_ipqos_option);
     @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.options.len], parsed_ssh_args.options);
     arg_index += parsed_ssh_args.options.len;
     ssh_argv[arg_index] = "-T";
@@ -810,6 +817,52 @@ fn sshVerbosity(ssh_options: []const []const u8) usize {
     return total;
 }
 
+fn resolveDefaultIpQosOption(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) !?[]u8 {
+    const value = queryInteractiveIpQos(allocator, ssh_options, host) catch |err| {
+        client_log.debug("event=ipqos_query_failed host={s} error={t}", .{ host, err });
+        return null;
+    };
+    defer allocator.free(value);
+    const option: ?[]u8 = try std.fmt.allocPrint(allocator, "{s}{s}", .{ default_ipqos_option_prefix, value });
+    return option;
+}
+
+fn queryInteractiveIpQos(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) ![]u8 {
+    const argv = try allocator.alloc([]const u8, ssh_options.len + 3);
+    defer allocator.free(argv);
+    argv[0] = "ssh";
+    @memcpy(argv[1 .. 1 + ssh_options.len], ssh_options);
+    argv[1 + ssh_options.len] = "-G";
+    argv[2 + ssh_options.len] = host;
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .max_output_bytes = ssh_config_query_max_output_bytes,
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return error.SshConfigQueryFailed,
+        else => return error.SshConfigQueryFailed,
+    }
+    return parseInteractiveIpQos(allocator, result.stdout);
+}
+
+fn parseInteractiveIpQos(allocator: std.mem.Allocator, output: []const u8) ![]u8 {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        const key = fields.next() orelse continue;
+        if (!std.ascii.eqlIgnoreCase(key, "ipqos")) continue;
+        const interactive = fields.next() orelse return error.MissingIpQos;
+        return allocator.dupe(u8, interactive);
+    }
+    return error.MissingIpQos;
+}
+
 fn raceExistingConnectionWithReconnect(
     parsed_ssh_args: ParsedSshArgs,
     artifacts: ?*const ArtifactSet,
@@ -947,6 +1000,17 @@ fn reconnectDelayMs(attempt: usize) u64 {
     return if (attempt < delays.len) delays[attempt] else delays[delays.len - 1];
 }
 
+fn defaultSshOptionsLen(parsed_ssh_args: ParsedSshArgs) usize {
+    return if (parsed_ssh_args.default_ipqos_option == null) 0 else 1;
+}
+
+fn appendDefaultSshOptions(ssh_argv: [][]const u8, arg_index: *usize, default_ipqos_option: ?[]const u8) void {
+    if (default_ipqos_option) |option| {
+        ssh_argv[arg_index.*] = option;
+        arg_index.* += 1;
+    }
+}
+
 fn startRuntimeConnection(
     allocator: std.mem.Allocator,
     parsed_ssh_args: ParsedSshArgs,
@@ -957,7 +1021,8 @@ fn startRuntimeConnection(
     poll_reconnect_input: bool,
 ) !RuntimeConnection {
     const reconnect_options: usize = if (batch_mode) 1 else 0;
-    const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + reconnect_options + 4);
+    const default_options = defaultSshOptionsLen(parsed_ssh_args);
+    const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + reconnect_options + default_options + 4);
     defer allocator.free(ssh_argv);
     ssh_argv[0] = "ssh";
     var arg_index: usize = 1;
@@ -968,6 +1033,7 @@ fn startRuntimeConnection(
         ssh_argv[arg_index] = "-oBatchMode=yes";
         arg_index += 1;
     }
+    appendDefaultSshOptions(ssh_argv, &arg_index, parsed_ssh_args.default_ipqos_option);
     @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.options.len], parsed_ssh_args.options);
     arg_index += parsed_ssh_args.options.len;
     ssh_argv[arg_index] = "-T";
@@ -2020,6 +2086,35 @@ test "parseSshArgs permits explicit safe config overrides" {
 
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqual(@as(usize, 3), parsed.options.len);
+}
+
+test "default ssh options append resolved interactive IPQoS value" {
+    var parsed = ParsedSshArgs{
+        .options = &.{},
+        .host = "example.com",
+        .default_ipqos_option = "-oIPQoS=af21",
+    };
+    try std.testing.expectEqual(@as(usize, 1), defaultSshOptionsLen(parsed));
+
+    var argv: [4][]const u8 = undefined;
+    var index: usize = 0;
+    appendDefaultSshOptions(&argv, &index, parsed.default_ipqos_option);
+    try std.testing.expectEqual(@as(usize, 1), index);
+    try std.testing.expectEqualStrings("-oIPQoS=af21", argv[0]);
+
+    parsed.default_ipqos_option = null;
+    try std.testing.expectEqual(@as(usize, 0), defaultSshOptionsLen(parsed));
+}
+
+test "parseInteractiveIpQos returns first configured value" {
+    const value = try parseInteractiveIpQos(std.testing.allocator,
+        \\hostname example.com
+        \\ipqos ef cs0
+        \\user tomm
+        \\
+    );
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("ef", value);
 }
 
 test "parseSshArgs accepts sessh attach options after host" {

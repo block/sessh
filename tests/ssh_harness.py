@@ -24,11 +24,28 @@ FAKE_SSH = """#!/bin/sh
 set -eu
 
 saw_t=0
+config_query=0
 host=
 config=
 batch_mode=0
 verbose=
 plain_option=
+ipqos_option=
+
+record_o_option() {
+  case "$1" in
+    [Ii][Pp][Qq][Oo][Ss]=*)
+      if [ -z "$ipqos_option" ]; then
+        ipqos_option=${1#*=}
+      fi
+      ;;
+    [Ii][Pp][Qq][Oo][Ss]\\ *)
+      if [ -z "$ipqos_option" ]; then
+        ipqos_option=${1#* }
+      fi
+      ;;
+  esac
+}
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -41,12 +58,19 @@ while [ "$#" -gt 0 ]; do
       if [ "$1" = "BatchMode=yes" ]; then
         batch_mode=1
       fi
+      record_o_option "$1"
       shift
       ;;
     -o*)
-      if [ "${1#-o}" = "BatchMode=yes" ]; then
+      option_value=${1#-o}
+      if [ "$option_value" = "BatchMode=yes" ]; then
         batch_mode=1
       fi
+      record_o_option "$option_value"
+      shift
+      ;;
+    -G)
+      config_query=1
       shift
       ;;
     -T)
@@ -93,6 +117,27 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$config_query" -eq 1 ]; then
+  if [ -z "$host" ]; then
+    printf 'fake ssh: missing host for -G\\n' >&2
+    exit 97
+  fi
+  if [ -n "${SESSH_FAKE_SSH_G_FAIL:-}" ]; then
+    exit "$SESSH_FAKE_SSH_G_FAIL"
+  fi
+  if [ -n "$ipqos_option" ]; then
+    printf 'hostname %s\\n' "$host"
+    case "$ipqos_option" in
+      *\\ *) printf 'ipqos %s\\n' "$ipqos_option" ;;
+      *) printf 'ipqos %s %s\\n' "$ipqos_option" "$ipqos_option" ;;
+    esac
+  else
+    printf 'hostname %s\\n' "$host"
+    printf 'ipqos %s\\n' "${SESSH_FAKE_SSH_G_IPQOS:-af21 cs1}"
+  fi
+  exit 0
+fi
+
 if [ "$saw_t" -ne 1 ]; then
   if [ -n "${SESSH_FAKE_SSH_ALLOW_PLAIN:-}" ]; then
     printf 'invoked=1\\n' >>"$SESSH_FAKE_SSH_LOG"
@@ -129,6 +174,9 @@ if [ "$batch_mode" -eq 1 ]; then
 fi
 if [ -n "$verbose" ]; then
   printf 'verbose=%s\\n' "$verbose" >>"$SESSH_FAKE_SSH_LOG"
+fi
+if [ -n "${SESSH_FAKE_SSH_LOG_IPQOS:-}" ] && [ -n "$ipqos_option" ]; then
+  printf 'ipqos=%s\\n' "$ipqos_option" >>"$SESSH_FAKE_SSH_LOG"
 fi
 export SESSH_TEST_HOST=$host
 if [ "$batch_mode" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_DELAY_ON_BATCH:-}" ]; then
@@ -579,6 +627,109 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     session_meta = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s1" / "meta"
     if not session_meta.exists():
         raise AssertionError("uploaded broker did not create a session agent")
+
+
+def test_ssh_transport_pins_ipqos_to_interactive_config_value(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_IPQOS_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_LOG_IPQOS"] = "1"
+    env["SESSH_FAKE_SSH_G_IPQOS"] = "af31 cs1"
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["test-host"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "ipqos=af31" not in log_text or "ipqos=cs1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_transport_respects_explicit_user_ipqos(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_USER_IPQOS_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_LOG_IPQOS"] = "1"
+    env["SESSH_FAKE_SSH_G_IPQOS"] = "af31 cs1"
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["-oIPQoS=none", "test-host"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "ipqos=none" not in log_text or "ipqos=ef" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_transport_pins_explicit_two_value_ipqos_to_interactive_value(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_USER_TWO_VALUE_IPQOS_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_LOG_IPQOS"] = "1"
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["-oIPQoS=ef cs0", "test-host"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "ipqos=ef\n" not in log_text or "ipqos=cs0" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_transport_preserves_config_when_ipqos_query_fails(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_IPQOS_QUERY_FAILED_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_LOG_IPQOS"] = "1"
+    env["SESSH_FAKE_SSH_G_FAIL"] = "97"
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["test-host"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "ipqos=" in log_text:
+        raise AssertionError(log_text)
 
 
 def test_ssh_session_uses_remote_shell_not_local_client_shell(tmp):
@@ -1466,6 +1617,22 @@ def main():
         (
             "ssh transport uploads artifact and reaches broker",
             test_ssh_transport_uploads_artifact_and_reaches_broker,
+        ),
+        (
+            "ssh transport pins ipqos to interactive config value",
+            test_ssh_transport_pins_ipqos_to_interactive_config_value,
+        ),
+        (
+            "ssh transport respects explicit user ipqos",
+            test_ssh_transport_respects_explicit_user_ipqos,
+        ),
+        (
+            "ssh transport pins explicit two-value ipqos to interactive value",
+            test_ssh_transport_pins_explicit_two_value_ipqos_to_interactive_value,
+        ),
+        (
+            "ssh transport preserves config when ipqos query fails",
+            test_ssh_transport_preserves_config_when_ipqos_query_fails,
         ),
         (
             "ssh session uses remote shell, not local client shell",

@@ -28,3 +28,5 @@ The path when sessh connects to a remote for the first time (simplified):
 
 The same `sessh` binary supports all three modalities: client,
 host-broker, and session-agent.
+
+Networking behavior is documented in [NETWORKING](NETWORKING.md).

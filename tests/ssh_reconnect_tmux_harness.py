@@ -23,6 +23,7 @@ FAKE_SSH = """#!/bin/sh
 set -eu
 
 saw_t=0
+config_query=0
 batch_mode=0
 host=
 
@@ -36,6 +37,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     -o*)
       [ "${1#-o}" = "BatchMode=yes" ] && batch_mode=1
+      shift
+      ;;
+    -G)
+      config_query=1
       shift
       ;;
     -T)
@@ -53,6 +58,13 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$config_query" -eq 1 ]; then
+  [ -n "$host" ] || exit 97
+  printf 'hostname %s\\n' "$host"
+  printf 'ipqos %s\\n' "${SESSH_FAKE_SSH_G_IPQOS:-af21 cs1}"
+  exit 0
+fi
 
 [ "$saw_t" -eq 1 ] || exit 97
 [ -n "$host" ] || exit 97
