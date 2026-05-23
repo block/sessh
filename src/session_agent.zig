@@ -239,7 +239,6 @@ const PresentationState = struct {
         session_rows: u16,
         screen: *const vt.RenderedScreen,
     ) !void {
-        try self.moveToRenderedTop(renderer);
         try self.setActiveScreen(screen.active_screen);
         try self.render(
             renderer,
@@ -377,9 +376,6 @@ const PresentationState = struct {
         if (self.active_screen == active_screen) return;
 
         self.active_screen = active_screen;
-        self.rendered_rows = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
     }
 
     fn applyTerminalModes(self: *PresentationState, renderer: client_renderer.Renderer, modes: client_renderer.TerminalModes) !void {
@@ -702,6 +698,124 @@ test "full-height redraw pads blank rows without indexing past VT rows" {
     };
     try presentation.applyScreen(renderer, 3, &screen, true, false);
     try std.testing.expectEqual(@as(u16, 3), presentation.rendered_rows);
+}
+
+test "active-screen change redraw starts at previous rendered top" {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(app_allocator.allocator());
+    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+
+    var alt_screen = try testRenderedScreen(
+        std.testing.allocator,
+        1,
+        3,
+        &.{ "ALT0", "ALT1", "ALT2", "ALT3" },
+    );
+    defer alt_screen.deinit(std.testing.allocator);
+
+    var presentation = PresentationState{};
+    try presentation.applyScreen(renderer, 4, &alt_screen, true, false);
+    try std.testing.expectEqual(@as(u16, 3), presentation.cursor_row);
+
+    bytes.clearRetainingCapacity();
+
+    var primary_screen = try testRenderedScreen(
+        std.testing.allocator,
+        0,
+        0,
+        &.{"PRIMARY"},
+    );
+    defer primary_screen.deinit(std.testing.allocator);
+
+    try presentation.applyScreen(renderer, 4, &primary_screen, true, false);
+    try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[3A\r"));
+    try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
+}
+
+test "relay-end restore moves to rendered top only once" {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(app_allocator.allocator());
+    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+
+    var alt_screen = try testRenderedScreen(
+        std.testing.allocator,
+        1,
+        3,
+        &.{ "ALT0", "ALT1", "ALT2", "ALT3" },
+    );
+    defer alt_screen.deinit(std.testing.allocator);
+
+    var presentation = PresentationState{};
+    try presentation.applyScreen(renderer, 4, &alt_screen, true, false);
+
+    bytes.clearRetainingCapacity();
+
+    var primary_screen = try testRenderedScreen(
+        std.testing.allocator,
+        0,
+        0,
+        &.{"PRIMARY"},
+    );
+    defer primary_screen.deinit(std.testing.allocator);
+
+    try presentation.applyRelayEndRestoreScreen(renderer, 4, &primary_screen);
+    try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[3A\r"));
+    try std.testing.expect(!std.mem.startsWith(u8, bytes.items, "\x1b[3A\r\x1b[3A\r"));
+    try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
+}
+
+fn testRenderedScreen(
+    allocator: std.mem.Allocator,
+    active_screen: u8,
+    cursor_row: u16,
+    labels: []const []const u8,
+) !vt.RenderedScreen {
+    const rows = try allocator.alloc(vt.RenderedRow, labels.len);
+    var rows_filled: usize = 0;
+    errdefer {
+        for (rows[0..rows_filled]) |*row| row.deinit(allocator);
+        allocator.free(rows);
+    }
+
+    for (labels, 0..) |label, index| {
+        rows[index] = try testRenderedRow(allocator, label);
+        rows_filled += 1;
+    }
+
+    return .{
+        .rows = rows,
+        .cols = 80,
+        .active_screen = active_screen,
+        .title = "",
+        .title_dirty = false,
+        .default_colors = .{},
+        .default_colors_dirty = false,
+        .retained_scrollback_clear_dirty = false,
+        .cursor_row = cursor_row,
+        .cursor_col = 0,
+        .cursor_visible = true,
+        .cursor_style = 0,
+        .modes = .{},
+        .dirty_state = .full,
+        .active_screen_changed = true,
+        .display_clear = null,
+    };
+}
+
+fn testRenderedRow(allocator: std.mem.Allocator, label: []const u8) !vt.RenderedRow {
+    const cells = try allocator.alloc(vt.RenderedCell, 1);
+    errdefer allocator.free(cells);
+    cells[0] = .{
+        .text = try allocator.dupe(u8, label),
+        .display_width = @intCast(label.len),
+        .attrs = .{},
+    };
+    return .{
+        .cells = cells,
+        .width_cols = 80,
+        .flags = 0,
+        .dirty = true,
+    };
 }
 
 fn vtAttrsToClient(attrs: vt.CellAttrs) !client_renderer.CellAttrs {

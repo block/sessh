@@ -391,6 +391,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
         return process_exit.request(1);
     };
+    defer session.deinit();
     child.suppressSshStderr();
 
     while (true) {

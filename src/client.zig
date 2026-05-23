@@ -401,6 +401,11 @@ pub const RuntimeSession = struct {
         self.pending_repaint = reconnected.pending_repaint;
     }
 
+    pub fn deinit(self: *RuntimeSession) void {
+        self.relay_end_restore.deinit(app_allocator.allocator());
+        self.relay_end_restore = .empty;
+    }
+
     pub fn idSlice(self: *const RuntimeSession) []const u8 {
         if (self.primary_alias_len > 0) return self.primary_alias[0..self.primary_alias_len];
         return self.guidSlice();
@@ -1016,6 +1021,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         try io_helpers.stderrPrint("sessh: local runtime attach failed: {t}\n", .{err});
         return process_exit.request(1);
     };
+    defer session.deinit();
 
     while (true) {
         const end = relayRuntimeSession(
