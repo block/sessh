@@ -79,6 +79,7 @@ fn usage(code: u8) !void {
         \\  --scrollback-limit N
         \\  --initial-scrollback N
         \\  --log-level quiet|error|warn|info|debug|verbose
+        \\  --capture-tty-transcript PATH.tar.gz
         \\  --bootstrap | --no-bootstrap
         \\  --force-compat
         \\
@@ -110,5 +111,6 @@ test {
     _ = @import("session_registry.zig");
     _ = @import("ssh_client.zig");
     _ = @import("terminal.zig");
+    _ = @import("tty_transcript.zig");
     _ = @import("vt.zig");
 }

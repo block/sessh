@@ -177,6 +177,7 @@ pub fn queryDefaultColors(input_fd: c.fd_t, output_fd: c.fd_t) !DefaultColorQuer
         if (len == bytes.len) break;
         const n = c.read(input_fd, bytes[len..].ptr, bytes.len - len);
         if (n <= 0) break;
+        io.noteRead(input_fd, bytes[len..][0..@intCast(n)]);
         len += @intCast(n);
         parseDefaultColorResponses(bytes[0..len], &result);
     }
@@ -209,6 +210,7 @@ pub fn queryCursorPosition(input_fd: c.fd_t, output_fd: c.fd_t) !?CursorPosition
         if (len == bytes.len) break;
         const n = c.read(input_fd, bytes[len..].ptr, bytes.len - len);
         if (n <= 0) break;
+        io.noteRead(input_fd, bytes[len..][0..@intCast(n)]);
         len += @intCast(n);
         if (parseCursorPositionResponse(bytes[0..len])) |position| return position;
     }

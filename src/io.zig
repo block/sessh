@@ -2,6 +2,24 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+pub const WriteHook = *const fn (fd: c.fd_t, bytes: []const u8) void;
+pub const ReadHook = *const fn (fd: c.fd_t, bytes: []const u8) void;
+
+var write_hook: ?WriteHook = null;
+var read_hook: ?ReadHook = null;
+
+pub fn setWriteHook(hook: ?WriteHook) void {
+    write_hook = hook;
+}
+
+pub fn setReadHook(hook: ?ReadHook) void {
+    read_hook = hook;
+}
+
+pub fn noteRead(fd: c.fd_t, bytes: []const u8) void {
+    if (read_hook) |hook| hook(fd, bytes);
+}
+
 pub fn readExact(fd: c.fd_t, buf: []u8) !void {
     var offset: usize = 0;
     while (offset < buf.len) {
@@ -10,6 +28,7 @@ pub fn readExact(fd: c.fd_t, buf: []u8) !void {
         if (n == 0) return error.EndOfStream;
         offset += @intCast(n);
     }
+    noteRead(fd, buf);
 }
 
 pub fn writeAll(fd: c.fd_t, bytes: []const u8) !void {
@@ -20,6 +39,7 @@ pub fn writeAll(fd: c.fd_t, bytes: []const u8) !void {
         if (n == 0) return error.WriteFailed;
         offset += @intCast(n);
     }
+    if (write_hook) |hook| hook(fd, bytes);
 }
 
 pub const WriteSomeResult = union(enum) {

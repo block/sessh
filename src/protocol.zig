@@ -24,6 +24,7 @@ pub const MessageType = enum {
     draw,
     ping_response,
     repaint_response,
+    tty_transcript_chunk,
 };
 
 pub const frame_header_len = 4;
@@ -116,6 +117,7 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .draw => |message| ownedFrameFromMessage(allocator, .draw, message),
             .ping_response => |message| ownedFrameFromMessage(allocator, .ping_response, message),
             .repaint_response => |message| ownedFrameFromMessage(allocator, .repaint_response, message),
+            .tty_transcript_chunk => |message| ownedFrameFromMessage(allocator, .tty_transcript_chunk, message),
         };
     }
 
@@ -218,6 +220,11 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.RepaintResponse, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .repaint_response = message } });
+        },
+        .tty_transcript_chunk => blk: {
+            var message = try decodePayload(pb.TtyTranscriptChunk, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_transcript_chunk = message } });
         },
     };
 }

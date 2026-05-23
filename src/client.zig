@@ -12,6 +12,7 @@ const process_exit = @import("process_exit.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
 const terminal = @import("terminal.zig");
+const tty_transcript = @import("tty_transcript.zig");
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
@@ -46,6 +47,7 @@ const LocalOptions = struct {
     client_log_level: client_log.Level = .warn,
     client_log_level_set: bool = false,
     compat_version: ?[]const u8 = null,
+    capture_tty_transcript: ?[]const u8 = null,
 };
 
 pub const DetachBannerArgs = struct {
@@ -420,6 +422,7 @@ pub const RuntimeSession = struct {
         @memcpy(self.guid[0..guid.len], guid);
         self.guid_len = guid.len;
         self.primary_alias_len = 0;
+        tty_transcript.setSessionGuid(guid);
 
         const alias = (try session_registry.primaryAliasForGuid(app_allocator.allocator(), guid)) orelse return;
         defer app_allocator.allocator().free(alias);
@@ -524,6 +527,7 @@ pub const ReconnectUi = struct {
         var filtered: [512]u8 = undefined;
         const n = c.read(0, &input, input.len);
         if (n <= 0) return .abort;
+        io_helpers.noteRead(0, input[0..@intCast(n)]);
 
         for (input[0..@intCast(n)]) |byte| {
             if (byte == 0x03) return .abort;
@@ -635,6 +639,7 @@ pub const ReconnectUi = struct {
         var filtered: [512]u8 = undefined;
         const n = c.read(0, &input, input.len);
         if (n <= 0) return true;
+        io_helpers.noteRead(0, input[0..@intCast(n)]);
 
         for (input[0..@intCast(n)]) |byte| {
             if (byte == ' ') return true;
@@ -954,6 +959,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, options: LocalOptions) !void {
+    if (options.capture_tty_transcript != null and options.action != .new and options.action != .attach) {
+        try io_helpers.writeAll(2, "sessh: --capture-tty-transcript is only supported for new and attach sessions\n");
+        return process_exit.request(64);
+    }
+
     var broker_arg_buf: [2][]const u8 = undefined;
     const state_broker_args = brokerStateArgs(options, &broker_arg_buf);
     switch (options.action) {
@@ -980,6 +990,19 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         },
         .new, .attach => {},
     }
+
+    var transcript_recorder: ?tty_transcript.Recorder = null;
+    if (options.capture_tty_transcript) |path| {
+        transcript_recorder = try tty_transcript.Recorder.init(allocator, path);
+        if (transcript_recorder) |*recorder| {
+            try recorder.warnEnabled();
+            tty_transcript.activate(recorder);
+        }
+    }
+    defer if (transcript_recorder) |*recorder| {
+        tty_transcript.deactivate();
+        recorder.deinit();
+    };
 
     var generated_guid: ?[]u8 = null;
     defer if (generated_guid) |guid| allocator.free(guid);
@@ -1040,12 +1063,14 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         switch (end) {
             .detach => {
                 terminateChild(&child);
+                try tty_transcript.finishActiveOrReport();
                 writeDetachBannerForTarget(&.{}, ":local:", options.banner_args.slice(), session.idSlice());
                 return;
             },
             .session_ended => {
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
+                try tty_transcript.finishActiveOrReport();
                 return;
             },
             .reconnect => {
@@ -1245,6 +1270,11 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             if (i >= args.len) return error.MissingCompatVersion;
             options.compat_version = args[i];
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingTtyTranscriptPath;
+            options.capture_tty_transcript = args[i];
+            i += 1;
         } else {
             return error.UnknownArgument;
         }
@@ -1395,6 +1425,7 @@ fn finishReconnectRepaintInner(
                 );
             },
             .ping_response => {},
+            .tty_transcript_chunk => try handleTtyTranscriptChunkFrame(frame.payload),
             .session_ended => return error.SessionEnded,
             .error_message => {
                 try printErrorPayload(frame.payload);
@@ -1462,6 +1493,10 @@ pub fn pollRuntimeRecovery(
             return if (applied) .recovered else null;
         },
         .ping_response => return .recovered,
+        .tty_transcript_chunk => {
+            try handleTtyTranscriptChunkFrame(frame.payload);
+            return .recovered;
+        },
         .session_ended => {
             _ = finishRelay(.session_ended, &session.relay_end_restore);
             return .session_ended;
@@ -1764,6 +1799,7 @@ fn sendSessionNew(
         },
         .scrollback_row_limit = scrollback_row_count,
         .session_guid = session_guid,
+        .capture_tty_transcript = tty_transcript.enabled(),
     };
     defer message.environment.deinit(app_allocator.allocator());
     const default_colors = queryDefaultColorsForSession();
@@ -1824,6 +1860,7 @@ fn sendSessionAttach(
             },
         },
         .session_guid = session_guid,
+        .capture_tty_transcript = tty_transcript.enabled(),
     };
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);
@@ -1991,6 +2028,10 @@ fn relayTerminal(
                     );
                 },
                 .ping_response => try connection_monitor.handlePingResponse(frame.payload),
+                .tty_transcript_chunk => {
+                    connection_monitor.noteInboundFrame();
+                    try handleTtyTranscriptChunkFrame(frame.payload);
+                },
                 .session_ended => {
                     connection_monitor.noteInboundFrame();
                     return finishRelay(.session_ended, relay_end_restore);
@@ -2006,6 +2047,7 @@ fn relayTerminal(
         if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             const n = c.read(input_fd, &buf, buf.len);
             if (n <= 0) return finishRelay(requestSessionDetach(read_fd, write_fd), relay_end_restore);
+            io_helpers.noteRead(input_fd, buf[0..@intCast(n)]);
             const result = escape_filter.filter(buf[0..@intCast(n)], &filtered);
             if (result.bytes.len > 0) {
                 try sendInputChunks(write_fd, result.bytes);
@@ -2067,6 +2109,17 @@ fn handleRepaintResponseFrame(
     try handleDrawPayload(draw, relay_end_restore, scrollback_cursor, viewport_offset);
     pending_repaint.clear();
     return true;
+}
+
+fn handleTtyTranscriptChunkFrame(payload: []const u8) !void {
+    var chunk = try protocol.decodePayload(pb.TtyTranscriptChunk, app_allocator.allocator(), payload);
+    defer chunk.deinit(app_allocator.allocator());
+    switch (chunk.stream) {
+        .TTY_TRANSCRIPT_STREAM_INNER_IN => tty_transcript.recordInnerIn(chunk.data),
+        .TTY_TRANSCRIPT_STREAM_INNER_OUT => tty_transcript.recordInnerOut(chunk.data),
+        .TTY_TRANSCRIPT_STREAM_UNSPECIFIED => {},
+        _ => {},
+    }
 }
 
 fn handleDrawPayload(

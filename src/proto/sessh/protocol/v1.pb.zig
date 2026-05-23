@@ -22,6 +22,13 @@ pub const ExitStatusKind = enum(i32) {
     _,
 };
 
+pub const TtyTranscriptStream = enum(i32) {
+    TTY_TRANSCRIPT_STREAM_UNSPECIFIED = 0,
+    TTY_TRANSCRIPT_STREAM_INNER_IN = 1,
+    TTY_TRANSCRIPT_STREAM_INNER_OUT = 2,
+    _,
+};
+
 /// Versioned remote protocol payloads.
 ///
 /// The stable handshake payloads live in sessh_handshake.proto. After both
@@ -49,6 +56,7 @@ pub const Frame = struct {
         draw,
         ping_response,
         repaint_response,
+        tty_transcript_chunk,
     };
     pub const payload_union = union(_payload_case) {
         @"error": sessh_handshake_v1.Error,
@@ -63,6 +71,7 @@ pub const Frame = struct {
         draw: Draw,
         ping_response: PingResponse,
         repaint_response: RepaintResponse,
+        tty_transcript_chunk: TtyTranscriptChunk,
         pub const _desc_table = .{
             .@"error" = fd(10, .submessage),
             .session_new = fd(11, .submessage),
@@ -76,6 +85,7 @@ pub const Frame = struct {
             .draw = fd(19, .submessage),
             .ping_response = fd(20, .submessage),
             .repaint_response = fd(21, .submessage),
+            .tty_transcript_chunk = fd(22, .submessage),
         };
     };
 
@@ -294,6 +304,7 @@ pub const SessionNew = struct {
     environment: std.ArrayListUnmanaged(EnvironmentEntry) = .empty,
     query_default_colors: ?DefaultColors = null,
     session_guid: []const u8 = &.{},
+    capture_tty_transcript: bool = false,
 
     pub const _desc_table = .{
         .resize = fd(1, .submessage),
@@ -301,6 +312,7 @@ pub const SessionNew = struct {
         .environment = fd(3, .{ .repeated = .submessage }),
         .query_default_colors = fd(4, .submessage),
         .session_guid = fd(5, .{ .scalar = .string }),
+        .capture_tty_transcript = fd(6, .{ .scalar = .bool }),
     };
 
     /// Encodes the message to the writer
@@ -369,10 +381,12 @@ pub const SessionNew = struct {
 pub const SessionAttach = struct {
     resize: ?Resize = null,
     session_guid: []const u8 = &.{},
+    capture_tty_transcript: bool = false,
 
     pub const _desc_table = .{
         .resize = fd(1, .submessage),
         .session_guid = fd(2, .{ .scalar = .string }),
+        .capture_tty_transcript = fd(3, .{ .scalar = .bool }),
     };
 
     /// Encodes the message to the writer
@@ -1086,6 +1100,77 @@ pub const PingResponse = struct {
 
     pub const _desc_table = .{
         .ping_request_seq = fd(1, .{ .scalar = .uint64 }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, session agent -> client.
+///
+/// Raw inner PTY bytes captured for a client-requested tty transcript.
+pub const TtyTranscriptChunk = struct {
+    stream: TtyTranscriptStream = @enumFromInt(0),
+    data: []const u8 = &.{},
+
+    pub const _desc_table = .{
+        .stream = fd(1, .@"enum"),
+        .data = fd(2, .{ .scalar = .bytes }),
     };
 
     /// Encodes the message to the writer

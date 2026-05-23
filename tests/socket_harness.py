@@ -8,6 +8,8 @@ import socket
 import struct
 import subprocess
 import sys
+import json
+import tarfile
 import tempfile
 import time
 import importlib.util
@@ -2495,6 +2497,65 @@ def run_env_config_client_test(tmp_root):
         cleanup_runtime(env)
 
 
+def run_tty_transcript_capture_test(tmp_root):
+    env = isolated_env(Path(tmp_root) / "tty-transcript")
+    env["SHELL"] = "/bin/sh"
+    cleanup_runtime(env)
+
+    archive = Path(tmp_root) / "tty-transcript.tar.gz"
+    try:
+        pid, fd = spawn_client(env, ["--capture-tty-transcript", str(archive)])
+        try:
+            startup = read_until(fd, b"$ ")
+            if b"WARNING: tty transcript capture is enabled" not in startup:
+                raise AssertionError(f"missing transcript warning: {startup!r}")
+            os.write(fd, b"printf 'transcript_inner_marker\\n'\n")
+            read_until_count(fd, b"transcript_inner_marker", 2)
+            os.write(fd, b"~.")
+            read_until(fd, b"sessh: detached")
+        finally:
+            close_client(pid, fd)
+
+        wait_file(archive)
+        with tarfile.open(archive, "r:gz") as tar:
+            names = set(tar.getnames())
+            expected = {
+                "manifest.json",
+                "outer.in.bin",
+                "outer.out.bin",
+                "inner.in.bin",
+                "inner.out.bin",
+            }
+            if names != expected:
+                raise AssertionError(f"unexpected transcript archive contents: {names}")
+
+            manifest = json.loads(tar.extractfile("manifest.json").read().decode())
+            if manifest["format_version"] != 1:
+                raise AssertionError(manifest)
+            if manifest["streams"]["inner.in.bin"]["bytes"] <= 0:
+                raise AssertionError(manifest)
+
+            outer_in = tar.extractfile("outer.in.bin").read()
+            outer_out = tar.extractfile("outer.out.bin").read()
+            inner_in = tar.extractfile("inner.in.bin").read()
+            inner_out = tar.extractfile("inner.out.bin").read()
+
+        if b"printf 'transcript_inner_marker\\n'\n" not in outer_in:
+            raise AssertionError(outer_in)
+        if b"transcript_inner_marker" not in outer_out:
+            raise AssertionError(outer_out)
+        if b"printf 'transcript_inner_marker\\n'\n" not in inner_in:
+            raise AssertionError(inner_in)
+        if b"transcript_inner_marker" not in inner_out:
+            raise AssertionError(inner_out)
+
+        killed = run([":local:", "--kill", "s1"], env, check=True, timeout=5.0)
+        if "ENDED s1" not in killed.stdout:
+            raise AssertionError(killed.stdout)
+    finally:
+        cleanup_runtime(env)
+
+
 def main():
     if not BIN.exists():
         raise SystemExit(f"missing binary: {BIN}")
@@ -2572,6 +2633,7 @@ def main():
             run_resize_epoch_does_not_clear_reconnect_scrollback_test(env)
             run_slow_attachment_does_not_block_commands_test(env)
             run_env_config_client_test(tmp)
+            run_tty_transcript_capture_test(tmp)
 
             listed = run([":local:", "--list"], env, check=True, timeout=5.0)
             if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:

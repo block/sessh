@@ -95,6 +95,7 @@ const Attachment = struct {
     output_offset: usize = 0,
     input_pending: [128]u8 = [_]u8{0} ** 128,
     input_pending_len: usize = 0,
+    capture_tty_transcript: bool = false,
 
     fn queuedBytes(self: *const Attachment) usize {
         return self.output.items.len - self.output_offset;
@@ -526,6 +527,7 @@ const TerminalOrigin = struct {
 const AttachRequest = struct {
     resize: ResizePayload,
     session_guid: []u8,
+    capture_tty_transcript: bool,
 
     fn deinit(self: *AttachRequest) void {
         app_allocator.allocator().free(self.session_guid);
@@ -539,6 +541,7 @@ const SessionNewRequest = struct {
     environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
     session_guid: []u8,
+    capture_tty_transcript: bool,
 
     fn deinit(self: *SessionNewRequest) void {
         app_allocator.allocator().free(self.session_guid);
@@ -1119,7 +1122,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.query_default_colors,
                     request.session_guid,
                 );
-                try attachSession(session_agent, session_index, fd, request.resize);
+                try attachSession(session_agent, session_index, fd, request.resize, request.capture_tty_transcript);
                 return true;
             },
             .session_attach => {
@@ -1134,7 +1137,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     return false;
                 };
                 updateSessionSize(&session_agent.sessions[resolved_session_index], request.resize.rows, request.resize.cols);
-                try attachSession(session_agent, resolved_session_index, fd, request.resize);
+                try attachSession(session_agent, resolved_session_index, fd, request.resize, request.capture_tty_transcript);
                 return true;
             },
             else => {
@@ -1384,6 +1387,36 @@ fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !v
     });
     defer app_allocator.allocator().free(payload);
     try queueAttachmentFrame(attachment, .session_ended, payload);
+}
+
+fn queueTtyTranscriptChunk(
+    attachment: *Attachment,
+    stream: pb.TtyTranscriptStream,
+    bytes: []const u8,
+) !void {
+    if (!attachment.capture_tty_transcript or bytes.len == 0) return;
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TtyTranscriptChunk{
+        .stream = stream,
+        .data = bytes,
+    });
+    defer app_allocator.allocator().free(payload);
+    try queueAttachmentFrame(attachment, .tty_transcript_chunk, payload);
+}
+
+fn queueTtyTranscriptChunkForSession(
+    session_agent: *SessionAgent,
+    session_index: usize,
+    stream: pb.TtyTranscriptStream,
+    bytes: []const u8,
+) void {
+    if (bytes.len == 0) return;
+    for (&session_agent.attachments, 0..) |*attachment, i| {
+        if (!attachment.active or attachment.session_index != session_index) continue;
+        if (attachment.close_after_flush or !attachment.capture_tty_transcript) continue;
+        queueTtyTranscriptChunk(attachment, stream, bytes) catch {
+            detachAttachment(session_agent, i);
+        };
+    }
 }
 
 fn readDefaultColorValue(color: u32) !u32 {
@@ -1831,6 +1864,7 @@ fn readSessionNewRequest(payload: []const u8) !SessionNewRequest {
         .environment = environment,
         .query_default_colors = query_default_colors,
         .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
+        .capture_tty_transcript = message.capture_tty_transcript,
     };
 }
 
@@ -1880,6 +1914,7 @@ fn readAttachRequest(payload: []const u8) !AttachRequest {
     return .{
         .resize = try resizePayloadFromMessage(resize),
         .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
+        .capture_tty_transcript = message.capture_tty_transcript,
     };
 }
 
@@ -2020,6 +2055,7 @@ fn attachSession(
     session_index: usize,
     client_fd: c.fd_t,
     resize: ResizePayload,
+    capture_tty_transcript: bool,
 ) !void {
     const session = &session_agent.sessions[session_index];
 
@@ -2031,6 +2067,7 @@ fn attachSession(
             .rows = resize.rows,
             .cols = resize.cols,
             .active = true,
+            .capture_tty_transcript = capture_tty_transcript,
         };
         attachment.presentation.setViewportOffset(resize.viewport_offset);
         errdefer {
@@ -2136,6 +2173,7 @@ fn drainSessionOutputBeforeEnd(session_agent: *SessionAgent, session_index: usiz
 
 fn feedSessionOutputBytes(session_agent: *SessionAgent, session_index: usize, bytes: []const u8) !void {
     const session = &session_agent.sessions[session_index];
+    queueTtyTranscriptChunkForSession(session_agent, session_index, .TTY_TRANSCRIPT_STREAM_INNER_OUT, bytes);
     if (session.terminal_model) |model| {
         const starts_at_boundary = model.isPlainTextParserBoundary();
         try model.feed(bytes);
@@ -2196,6 +2234,12 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, paylo
         return;
     };
     if (translated.items.len == 0) return;
+
+    queueTtyTranscriptChunk(attachment, .TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    flushAttachmentOutput(session_agent, attachment_index);
 
     io.writeAll(session.pty_fd, translated.items) catch {
         detachAttachment(session_agent, attachment_index);

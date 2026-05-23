@@ -11,6 +11,7 @@ const process_exit = @import("process_exit.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
 const terminal = @import("terminal.zig");
+const tty_transcript = @import("tty_transcript.zig");
 
 const bootstrapper_script = @embedFile("bootstrapper.sh");
 const max_artifact_bytes = 64 * 1024 * 1024;
@@ -131,6 +132,7 @@ const ParsedSshArgs = struct {
     bootstrap_set: bool = false,
     force_compat: bool = false,
     default_ipqos_option: ?[]const u8 = null,
+    capture_tty_transcript: ?[]const u8 = null,
 };
 
 const CompatModeReason = enum {
@@ -283,6 +285,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return process_exit.request(64);
     };
     client_log.setLevel(parsed_ssh_args.client_log_level);
+    if (parsed_ssh_args.capture_tty_transcript != null and isRemoteManagementAction(parsed_ssh_args.action)) {
+        try io.writeAll(2, "sessh: --capture-tty-transcript is only supported for new and attach sessions\n");
+        return process_exit.request(64);
+    }
+    if (parsed_ssh_args.capture_tty_transcript != null and parsed_ssh_args.force_compat) {
+        try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with --force-compat\n");
+        return process_exit.request(64);
+    }
     if (parsed_ssh_args.state_dir) |dir| socket_transport.setRuntimeRootOverride(dir);
     const resolved_ref_storage = try resolveLocalRefs(allocator, &parsed_ssh_args);
     defer if (resolved_ref_storage) |ref| allocator.free(ref);
@@ -331,6 +341,19 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         if (exit_status != 0) return process_exit.request(exit_status);
         return;
     }
+
+    var transcript_recorder: ?tty_transcript.Recorder = null;
+    if (parsed_ssh_args.capture_tty_transcript) |path| {
+        transcript_recorder = try tty_transcript.Recorder.init(allocator, path);
+        if (transcript_recorder) |*recorder| {
+            try recorder.warnEnabled();
+            tty_transcript.activate(recorder);
+        }
+    }
+    defer if (transcript_recorder) |*recorder| {
+        tty_transcript.deactivate();
+        recorder.deinit();
+    };
 
     var new_guid: ?[]u8 = null;
     defer if (new_guid) |guid| allocator.free(guid);
@@ -386,7 +409,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }) catch |err| {
         child.closeStdin();
         _ = child.wait() catch {};
-        if (err == error.VersionMismatch) try runRemoteCompat(allocator, parsed_ssh_args, .version_mismatch);
+        if (err == error.VersionMismatch) {
+            if (parsed_ssh_args.capture_tty_transcript != null) {
+                try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with compat-fallback\n");
+                return process_exit.request(1);
+            }
+            try runRemoteCompat(allocator, parsed_ssh_args, .version_mismatch);
+        }
         if (process_exit.is(err)) return err;
         try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
         return process_exit.request(1);
@@ -415,6 +444,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 client_log.debug("event=detach host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.terminate();
                 client_log.flush(2);
+                try tty_transcript.finishActiveOrReport();
                 client.writeDetachBannerForSessionRef(parsed_ssh_args.banner_args.slice(), session.idSlice());
                 return;
             },
@@ -423,6 +453,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 child.closeStdin();
                 _ = child.wait() catch {};
                 client_log.flush(2);
+                try tty_transcript.finishActiveOrReport();
                 return;
             },
             .reconnect => {
@@ -485,10 +516,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 .session_ended => {
                     child.closeStdin();
                     _ = child.wait() catch {};
+                    try tty_transcript.finishActiveOrReport();
                     return;
                 },
                 .abort => {
                     child.terminate();
+                    try tty_transcript.finishActiveOrReport();
                     return;
                 },
                 .failed => |err| {
@@ -519,6 +552,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                         reconnect_attempt,
                     });
                     client_log.flush(2);
+                    try tty_transcript.finishActiveOrReport();
                     return;
                 },
                 .reconnect_now, .wait_elapsed => {
@@ -541,7 +575,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 true,
             ) catch |err| switch (err) {
                 error.ExitRequested => return err,
-                error.ReconnectAborted => return,
+                error.ReconnectAborted => {
+                    try tty_transcript.finishActiveOrReport();
+                    return;
+                },
                 error.OutOfMemory => return err,
                 else => {
                     client_log.warn("event=reconnect_failed stage=transport host={s} session={s} attempt={} error={t}", .{
@@ -1588,6 +1625,11 @@ fn parseRouteAttachArgs(
             try parsed.banner_args.append(arg);
             try parsed.banner_args.append(args[i]);
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingTtyTranscriptPath;
+            parsed.capture_tty_transcript = args[i];
+            i += 1;
         } else {
             return null;
         }
@@ -1725,6 +1767,11 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             parsed.force_compat = true;
             try parsed.banner_args.append(arg);
             index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
+            index.* += 1;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingTtyTranscriptPath;
+            parsed.capture_tty_transcript = args[index.*];
+            index.* += 1;
         } else if (std.mem.eql(u8, arg, "--list")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.action = .list;
@@ -1759,6 +1806,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
         std.mem.eql(u8, arg, "--force-compat") or
+        std.mem.eql(u8, arg, "--capture-tty-transcript") or
         std.mem.eql(u8, arg, "--list") or
         std.mem.eql(u8, arg, "--kill") or
         std.mem.eql(u8, arg, "--kill-all") or
@@ -1890,6 +1938,7 @@ fn printSshArgError(err: anyerror) !void {
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),
         error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
+        error.MissingTtyTranscriptPath => try io.writeAll(2, "sessh: --capture-tty-transcript requires a path\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: ssh option is missing its value\n"),
         error.ConflictingSesshAction => try io.writeAll(2, "sessh: conflicting sessh actions\n"),
         error.DangerousLeader => try io.writeAll(2, "sessh: dangerous leader\n"),

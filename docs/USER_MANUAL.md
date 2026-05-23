@@ -88,6 +88,13 @@ The options in the config file can be overridden on the command-line:
 - `--state-dir DIR`: choose the local runtime state directory. The default is
   `/tmp/sessh-<uid>`.
 
+## Diagnostics
+
+- `--capture-tty-transcript PATH.tar.gz`: capture raw outer terminal and inner
+  PTY byte streams for debugging. This can record secrets and private terminal
+  contents. The transcript is buffered in memory and flushed to the specified
+  path upon clean exit.
+
 ## Sessions
 
 Running `sessh HOST` starts the user's interactive login shell under a remote

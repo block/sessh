@@ -32,6 +32,7 @@ message Frame {
     Draw draw = 19;
     PingResponse ping_response = 20;
     RepaintResponse repaint_response = 21;
+    TtyTranscriptChunk tty_transcript_chunk = 22;
   }
 }
 
@@ -68,6 +69,9 @@ message SessionNew {
   DefaultColors query_default_colors = 4;
   // Canonical session GUID in normal hyphenated UUID form.
   string session_guid = 5;
+  // When true, the session agent sends raw inner PTY transcript chunks for
+  // this attachment. The client still owns archive creation and storage.
+  bool capture_tty_transcript = 6;
 }
 
 // Framed payload, client -> session agent.
@@ -79,6 +83,9 @@ message SessionAttach {
   // Canonical session GUID in normal hyphenated UUID form. Empty means attach
   // the most recent session known to the selected broker.
   string session_guid = 2;
+  // When true, the session agent sends raw inner PTY transcript chunks for
+  // this attachment. The client still owns archive creation and storage.
+  bool capture_tty_transcript = 3;
 }
 
 // Framed payload, client -> session agent.
@@ -209,4 +216,18 @@ message RepaintResponse {
 // Acknowledges a PingRequest.
 message PingResponse {
   uint64 ping_request_seq = 1;
+}
+
+enum TtyTranscriptStream {
+  TTY_TRANSCRIPT_STREAM_UNSPECIFIED = 0;
+  TTY_TRANSCRIPT_STREAM_INNER_IN = 1;
+  TTY_TRANSCRIPT_STREAM_INNER_OUT = 2;
+}
+
+// Framed payload, session agent -> client.
+//
+// Raw inner PTY bytes captured for a client-requested tty transcript.
+message TtyTranscriptChunk {
+  TtyTranscriptStream stream = 1;
+  bytes data = 2;
 }
