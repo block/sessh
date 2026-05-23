@@ -188,6 +188,12 @@ pub const Renderer = struct {
         try self.clearScrollback();
     }
 
+    pub fn clearVisible(self: Renderer) !void {
+        if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
+        try self.write("\x1b[2J");
+        try self.moveCursor(0, 0);
+    }
+
     pub fn enterAlternateScreen(self: Renderer) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
         try self.write("\x1b[?1049h");
@@ -433,12 +439,6 @@ pub const Renderer = struct {
             }
         }
         if (len > 0) try self.write(buf[0..len]);
-    }
-
-    fn clearVisible(self: Renderer) !void {
-        if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
-        try self.write("\x1b[2J");
-        try self.moveCursor(0, 0);
     }
 
     fn applyAttrs(self: Renderer, attrs: CellAttrs) !void {

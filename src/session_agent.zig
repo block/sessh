@@ -271,6 +271,16 @@ const PresentationState = struct {
         self.viewport_offset = 0;
     }
 
+    fn clearOuterVisibleForScreen(self: *PresentationState, renderer: client_renderer.Renderer, screen: *const vt.RenderedScreen) !void {
+        try renderer.clearVisible();
+        self.initialized = false;
+        self.rendered_rows = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.full_height_rendering = screenWantsMouseReporting(screen);
+        self.viewport_offset = 0;
+    }
+
     fn render(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
@@ -290,7 +300,7 @@ const PresentationState = struct {
         try renderer.setCursorVisible(cursor_visible);
         try renderer.setCursorStyle(cursor_style);
         self.initialized = true;
-        self.rendered_rows = @max(@as(u16, @intCast(rows.len)), min_rendered_rows);
+        self.rendered_rows = targetRenderedRows(rows.len, cursor_row, min_rendered_rows);
         self.cursor_row = cursor_row;
         self.cursor_col = cursor_col;
         self.cursor_visible = cursor_visible;
@@ -339,7 +349,7 @@ const PresentationState = struct {
         min_rendered_rows: u16,
     ) !void {
         _ = self;
-        const rendered_rows = @max(@as(u16, @intCast(rows.len)), min_rendered_rows);
+        const rendered_rows = targetRenderedRows(rows.len, cursor_row, min_rendered_rows);
         var row_index: u16 = 0;
         while (row_index < rendered_rows) : (row_index += 1) {
             if (row_index > 0) try renderer.newline();
@@ -359,7 +369,7 @@ const PresentationState = struct {
     ) !void {
         try self.moveToRenderedTop(renderer);
 
-        const new_rows = @max(@as(u16, @intCast(rows.len)), min_rendered_rows);
+        const new_rows = targetRenderedRows(rows.len, cursor_row, min_rendered_rows);
         const redraw_rows = @max(self.rendered_rows, new_rows);
         var row_index: u16 = 0;
         while (row_index < redraw_rows) : (row_index += 1) {
@@ -638,6 +648,13 @@ fn moveToSnapshotCursor(renderer: client_renderer.Renderer, rendered_rows: u16, 
     if (cursor_row > last_row) try renderer.cursorDown(cursor_row - last_row);
     try renderer.carriageReturn();
     try renderer.cursorRight(cursor_col);
+}
+
+fn targetRenderedRows(rows_len: usize, cursor_row: u16, min_rendered_rows: u16) u16 {
+    return @max(
+        @max(@as(u16, @intCast(rows_len)), min_rendered_rows),
+        cursor_row +| 1,
+    );
 }
 
 fn vtModesToClient(modes: vt.TerminalModes) client_renderer.TerminalModes {
@@ -1544,7 +1561,11 @@ fn queueScrollbackRowsAndScreenDraw(
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    const effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, align_viewport);
+    var effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, align_viewport);
+    if (shouldClearOuterVisibleForDisplayClear(screen)) {
+        try attachment.presentation.clearOuterVisibleForScreen(renderer, screen);
+        effective_align_viewport = false;
+    }
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
     try attachment.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
     if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
@@ -1602,6 +1623,11 @@ fn shouldAlignViewportForDraw(attachment: *const Attachment, screen: *const vt.R
         (screenWantsMouseReporting(screen) and !attachment.presentation.full_height_rendering);
 }
 
+fn shouldClearOuterVisibleForDisplayClear(screen: *const vt.RenderedScreen) bool {
+    const clear = screen.display_clear orelse return false;
+    return clear.mode == .complete;
+}
+
 fn queueScreenDraw(
     attachment: *Attachment,
     session: *const Session,
@@ -1626,7 +1652,11 @@ fn queueScreenDraw(
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    const effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, align_viewport);
+    var effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, align_viewport);
+    if (shouldClearOuterVisibleForDisplayClear(screen)) {
+        try attachment.presentation.clearOuterVisibleForScreen(renderer, screen);
+        effective_align_viewport = false;
+    }
     try attachment.presentation.applyScreen(renderer, session.rows, screen, force_redraw, effective_align_viewport);
     if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
     updateMouseOriginAfterDraw(attachment, screen);
@@ -1702,9 +1732,13 @@ fn queueRepaintResponseDraw(
         try renderer.clearForReplace();
         attachment.presentation.reset();
     }
+    var effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, false);
+    if (!clear_for_replace and shouldClearOuterVisibleForDisplayClear(screen)) {
+        try attachment.presentation.clearOuterVisibleForScreen(renderer, screen);
+        effective_align_viewport = false;
+    }
     if (truncated_rows > 0) try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    const effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, false);
     try attachment.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
     if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
     updateMouseOriginAfterDraw(attachment, screen);

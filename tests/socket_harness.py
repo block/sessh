@@ -1363,6 +1363,48 @@ def run_display_clear_not_forwarded_test(base_env):
             cleanup_runtime(env)
 
 
+def run_complete_display_clear_protocol_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-complete-display-clear-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        env["SHELL"] = "/bin/sh"
+        shell = Path(tmp) / "complete-display-clear-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "printf 'READY$ '\n"
+            "while IFS= read -r line; do\n"
+            "  printf '\\033[2J\\033[HAFTER_FULL_CLEAR$ '\n"
+            "done\n"
+        )
+        shell.chmod(0o700)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn)
+                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+
+                message_type, payload = recv_frame(conn)
+                if message_type != SESSION_ATTACHED:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                assert_session_attached(payload)
+                recv_draw_until(conn, b"READY$ ")
+
+                send_frame(conn, INPUT, pack_bytes(b"go\n"))
+                draw, _ = recv_draw_until(conn, b"AFTER_FULL_CLEAR$")
+                output = draw["draw_bytes"]
+                if not output.startswith(b"\x1b[2J\x1b[1;1H"):
+                    raise AssertionError(f"complete display clear did not clear physical screen first: {output!r}")
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
 def run_title_protocol_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-title-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
@@ -2623,6 +2665,7 @@ def main():
             run_cursor_shape_protocol_test(env)
             run_state_only_client_render_test(env)
             run_display_clear_not_forwarded_test(env)
+            run_complete_display_clear_protocol_test(env)
             run_title_protocol_test(env)
             run_default_colors_protocol_test(env)
             run_seeded_default_color_query_protocol_test(env)
