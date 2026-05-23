@@ -11,8 +11,10 @@ pub const SessionPaths = struct {
     meta: []u8,
     detached: []u8,
     compat: []u8,
+    route: []u8,
 
     pub fn deinit(self: *SessionPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.route);
         allocator.free(self.compat);
         allocator.free(self.detached);
         allocator.free(self.meta);
@@ -40,33 +42,46 @@ pub fn allocateSessionDir(allocator: std.mem.Allocator) !Allocation {
 }
 
 pub fn allocateSessionDirInRoot(allocator: std.mem.Allocator, root: []const u8) !Allocation {
+    const id = try generateGuid(allocator);
+    errdefer allocator.free(id);
+    var allocation = try allocateSessionDirForGuidInRoot(allocator, root, id);
+    allocator.free(allocation.id);
+    allocation.id = id;
+    return allocation;
+}
+
+pub fn allocateSessionDirForGuid(allocator: std.mem.Allocator, guid: []const u8) !Allocation {
+    const root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(root);
+    return allocateSessionDirForGuidInRoot(allocator, root, guid);
+}
+
+pub fn allocateSessionDirForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !Allocation {
     try ensureRegistryRoot(allocator, root);
 
     const sessions_dir = try sessionsDirInRoot(allocator, root);
     defer allocator.free(sessions_dir);
     try mkdirIgnoreExists(allocator, sessions_dir);
 
-    var next_id: u64 = 1;
-    while (true) : (next_id += 1) {
-        const id = try std.fmt.allocPrint(allocator, "s{}", .{next_id});
-        errdefer allocator.free(id);
+    const canonical = try canonicalGuid(allocator, guid);
+    errdefer allocator.free(canonical);
+    const compact = try compactGuid(allocator, canonical);
+    defer allocator.free(compact);
 
-        const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, id });
-        errdefer allocator.free(dir);
-        switch (try mkdirSessionDir(allocator, dir)) {
-            .created => {
-                var paths = try pathsForSessionDir(allocator, dir);
-                errdefer paths.deinit(allocator);
-                allocator.free(dir);
-                return .{ .id = id, .paths = paths };
-            },
-            .exists => {
-                allocator.free(dir);
-                allocator.free(id);
-                continue;
-            },
-        }
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, compact });
+    defer allocator.free(dir);
+    switch (try mkdirSessionDir(allocator, dir)) {
+        .created => {},
+        .exists => {
+            var existing_paths = try pathsForSessionDir(allocator, dir);
+            errdefer existing_paths.deinit(allocator);
+            if (liveHintsExist(existing_paths)) return error.SessionExists;
+            return .{ .id = canonical, .paths = existing_paths };
+        },
     }
+    var paths = try pathsForSessionDir(allocator, dir);
+    errdefer paths.deinit(allocator);
+    return .{ .id = canonical, .paths = paths };
 }
 
 pub fn sessionsDir(allocator: std.mem.Allocator) ![]u8 {
@@ -76,14 +91,16 @@ pub fn sessionsDir(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn sessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/s", .{root});
+    return std.fmt.allocPrint(allocator, "{s}/g", .{root});
 }
 
 pub fn pathsForSessionId(allocator: std.mem.Allocator, id: []const u8) !SessionPaths {
     if (!isValidSessionId(id)) return error.InvalidSessionId;
     const sessions_dir = try sessionsDir(allocator);
     defer allocator.free(sessions_dir);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, id });
+    const compact = try compactGuid(allocator, id);
+    defer allocator.free(compact);
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, compact });
     defer allocator.free(dir);
     return pathsForSessionDir(allocator, dir);
 }
@@ -104,21 +121,89 @@ pub fn pathsForSessionDir(allocator: std.mem.Allocator, dir: []const u8) !Sessio
     const compat = try std.fmt.allocPrint(allocator, "{s}/compat", .{dir});
     errdefer allocator.free(compat);
 
+    const route = try std.fmt.allocPrint(allocator, "{s}/route", .{dir});
+    errdefer allocator.free(route);
+
     return .{
         .dir = dir_copy,
         .socket = socket,
         .meta = meta,
         .detached = detached,
         .compat = compat,
+        .route = route,
     };
 }
 
 pub fn isValidSessionId(id: []const u8) bool {
-    if (id.len < 2 or id[0] != 's') return false;
-    for (id[1..]) |byte| {
-        if (byte < '0' or byte > '9') return false;
+    return isValidGuid(id) or isValidCompactGuid(id);
+}
+
+pub fn isValidGuid(guid: []const u8) bool {
+    if (guid.len != 36) return false;
+    for (guid, 0..) |byte, i| {
+        switch (i) {
+            8, 13, 18, 23 => if (byte != '-') return false,
+            else => if (!std.ascii.isHex(byte)) return false,
+        }
     }
     return true;
+}
+
+pub fn isValidCompactGuid(guid: []const u8) bool {
+    if (guid.len != 32) return false;
+    for (guid) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
+}
+
+pub fn canonicalGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (isValidGuid(guid)) {
+        const out = try allocator.alloc(u8, 36);
+        for (guid, 0..) |byte, i| out[i] = std.ascii.toLower(byte);
+        return out;
+    }
+    if (isValidCompactGuid(guid)) {
+        const out = try allocator.alloc(u8, 36);
+        var src: usize = 0;
+        for (out, 0..) |*byte, i| {
+            switch (i) {
+                8, 13, 18, 23 => byte.* = '-',
+                else => {
+                    byte.* = std.ascii.toLower(guid[src]);
+                    src += 1;
+                },
+            }
+        }
+        return out;
+    }
+    return error.InvalidSessionId;
+}
+
+pub fn compactGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (isValidCompactGuid(guid)) {
+        const out = try allocator.alloc(u8, 32);
+        for (guid, 0..) |byte, i| out[i] = std.ascii.toLower(byte);
+        return out;
+    }
+    if (!isValidGuid(guid)) return error.InvalidSessionId;
+    var out = try allocator.alloc(u8, 32);
+    var dst: usize = 0;
+    for (guid) |byte| {
+        if (byte == '-') continue;
+        out[dst] = std.ascii.toLower(byte);
+        dst += 1;
+    }
+    return out;
+}
+
+pub fn generateGuid(allocator: std.mem.Allocator) ![]u8 {
+    var bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const compact = std.fmt.bytesToHex(bytes, .lower);
+    return canonicalGuid(allocator, &compact);
 }
 
 pub fn writeMeta(paths: SessionPaths, agent_pid: c.pid_t, version: []const u8) !void {
@@ -127,6 +212,262 @@ pub fn writeMeta(paths: SessionPaths, agent_pid: c.pid_t, version: []const u8) !
     var buf: [256]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "agent_pid={}\nversion={s}\n", .{ agent_pid, version });
     try file.writeAll(text);
+}
+
+pub const Route = struct {
+    bytes: []u8,
+    guid: []const u8,
+    primary_alias: []const u8,
+    host: []const u8,
+    ssh_options: []const []const u8,
+
+    pub fn deinit(self: *Route, allocator: std.mem.Allocator) void {
+        allocator.free(self.ssh_options);
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+pub fn writeSshRoute(
+    allocator: std.mem.Allocator,
+    paths: SessionPaths,
+    guid: []const u8,
+    primary_alias: []const u8,
+    host: []const u8,
+    ssh_options: []const []const u8,
+) !void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    const writer = text.writer(allocator);
+    try writer.print("guid={s}\n", .{guid});
+    try writer.print("primary_alias={s}\n", .{primary_alias});
+    try writer.print("host=", .{});
+    try appendHex(&text, allocator, host);
+    try writer.print("\n", .{});
+    for (ssh_options) |arg| {
+        try writer.print("ssh_option=", .{});
+        try appendHex(&text, allocator, arg);
+        try writer.print("\n", .{});
+    }
+
+    const file = try std.fs.cwd().createFile(paths.route, .{ .truncate = true, .mode = 0o600 });
+    defer file.close();
+    try file.writeAll(text.items);
+}
+
+pub fn readRouteForRef(allocator: std.mem.Allocator, ref: []const u8) !Route {
+    var paths = try pathsForRef(allocator, ref);
+    defer paths.deinit(allocator);
+    return readRoute(allocator, paths.route);
+}
+
+pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024);
+    errdefer allocator.free(bytes);
+
+    var guid: ?[]const u8 = null;
+    var primary_alias: ?[]const u8 = null;
+    var host: ?[]const u8 = null;
+    var option_count: usize = 0;
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = line[0..eq];
+        const value = line[eq + 1 ..];
+        if (std.mem.eql(u8, key, "guid")) {
+            if (!isValidGuid(value)) return error.InvalidRoute;
+            guid = value;
+        } else if (std.mem.eql(u8, key, "primary_alias")) {
+            if (!isValidAlias(value)) return error.InvalidRoute;
+            primary_alias = value;
+        } else if (std.mem.eql(u8, key, "host")) {
+            host = value;
+        } else if (std.mem.eql(u8, key, "ssh_option")) {
+            option_count += 1;
+        }
+    }
+
+    var options = try allocator.alloc([]const u8, option_count);
+    errdefer allocator.free(options);
+    var option_index: usize = 0;
+    lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = line[0..eq];
+        const value = line[eq + 1 ..];
+        if (std.mem.eql(u8, key, "ssh_option")) {
+            options[option_index] = try decodeHexInPlace(value);
+            option_index += 1;
+        }
+    }
+
+    return .{
+        .bytes = bytes,
+        .guid = guid orelse return error.InvalidRoute,
+        .primary_alias = primary_alias orelse return error.InvalidRoute,
+        .host = try decodeHexInPlace(host orelse return error.InvalidRoute),
+        .ssh_options = options,
+    };
+}
+
+pub fn createAlias(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !void {
+    const root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(root);
+    return createAliasInRoot(allocator, root, alias, guid);
+}
+
+pub fn createAliasInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8, guid: []const u8) !void {
+    if (!isValidAlias(alias)) return error.InvalidAlias;
+    const aliases_dir = try aliasesDirInRoot(allocator, root);
+    defer allocator.free(aliases_dir);
+    try ensureRegistryRoot(allocator, root);
+    try mkdirIgnoreExists(allocator, aliases_dir);
+
+    const compact = try compactGuid(allocator, guid);
+    defer allocator.free(compact);
+    const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, alias });
+    defer allocator.free(link_path);
+    const target = try std.fmt.allocPrint(allocator, "../g/{s}", .{compact});
+    defer allocator.free(target);
+    const link_path_z = try allocator.dupeZ(u8, link_path);
+    defer allocator.free(link_path_z);
+    const target_z = try allocator.dupeZ(u8, target);
+    defer allocator.free(target_z);
+    switch (posix.errno(c.symlink(target_z.ptr, link_path_z.ptr))) {
+        .SUCCESS => return,
+        .EXIST => return error.AliasExists,
+        else => return error.SymlinkFailed,
+    }
+}
+
+pub fn createGeneratedAlias(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    const root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(root);
+    return createGeneratedAliasInRoot(allocator, root, guid);
+}
+
+pub fn createGeneratedAliasInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
+    var n: u64 = 1;
+    while (true) : (n += 1) {
+        const alias = try std.fmt.allocPrint(allocator, "s{}", .{n});
+        errdefer allocator.free(alias);
+        createAliasInRoot(allocator, root, alias, guid) catch |err| switch (err) {
+            error.AliasExists => {
+                allocator.free(alias);
+                continue;
+            },
+            else => return err,
+        };
+        return alias;
+    }
+}
+
+pub fn pathsForRef(allocator: std.mem.Allocator, ref: []const u8) !SessionPaths {
+    if (isValidSessionId(ref)) return pathsForSessionId(allocator, ref);
+    if (!isValidAlias(ref)) return error.InvalidSessionId;
+    const guid = try resolveRefToGuid(allocator, ref);
+    defer allocator.free(guid);
+    return pathsForSessionId(allocator, guid);
+}
+
+pub fn resolveRefToGuid(allocator: std.mem.Allocator, ref: []const u8) ![]u8 {
+    if (isValidSessionId(ref)) return canonicalGuid(allocator, ref);
+    if (!isValidAlias(ref)) return error.InvalidSessionId;
+    const root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(root);
+    const aliases_dir = try aliasesDirInRoot(allocator, root);
+    defer allocator.free(aliases_dir);
+    const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, ref });
+    defer allocator.free(link_path);
+    const target = try readLinkAlloc(allocator, link_path, 4096);
+    defer allocator.free(target);
+    const compact = std.fs.path.basename(target);
+    return canonicalGuid(allocator, compact);
+}
+
+pub fn aliasesDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/alias", .{root});
+}
+
+pub fn primaryAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) !?[]u8 {
+    const root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(root);
+    const aliases_dir = try aliasesDirInRoot(allocator, root);
+    defer allocator.free(aliases_dir);
+    var dir = std.fs.openDirAbsolute(aliases_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer dir.close();
+
+    const compact = try compactGuid(allocator, guid);
+    defer allocator.free(compact);
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (!isValidAlias(entry.name)) continue;
+        const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, entry.name });
+        defer allocator.free(link_path);
+        const target = readLinkAlloc(allocator, link_path, 4096) catch continue;
+        defer allocator.free(target);
+        if (std.mem.eql(u8, std.fs.path.basename(target), compact)) {
+            return try allocator.dupe(u8, entry.name);
+        }
+    }
+    return null;
+}
+
+pub fn isValidAlias(alias: []const u8) bool {
+    if (alias.len == 0 or alias.len > 128) return false;
+    if (std.mem.eql(u8, alias, ".") or std.mem.eql(u8, alias, "..")) return false;
+    if (alias[0] == '-') return false;
+    if (isValidGuid(alias) or isValidCompactGuid(alias)) return false;
+    for (alias) |byte| {
+        switch (byte) {
+            'A'...'Z', 'a'...'z', '0'...'9', '_', '-', '.' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn appendHex(out: *std.ArrayList(u8), allocator: std.mem.Allocator, bytes: []const u8) !void {
+    const alphabet = "0123456789abcdef";
+    try out.ensureUnusedCapacity(allocator, bytes.len * 2);
+    for (bytes) |byte| {
+        out.appendAssumeCapacity(alphabet[byte >> 4]);
+        out.appendAssumeCapacity(alphabet[byte & 0x0f]);
+    }
+}
+
+fn decodeHexInPlace(value: []const u8) ![]const u8 {
+    if (value.len % 2 != 0) return error.InvalidRoute;
+    const mutable: []u8 = @constCast(value);
+    var dst: usize = 0;
+    var src: usize = 0;
+    while (src < value.len) : (src += 2) {
+        const hi = std.fmt.charToDigit(value[src], 16) catch return error.InvalidRoute;
+        const lo = std.fmt.charToDigit(value[src + 1], 16) catch return error.InvalidRoute;
+        mutable[dst] = @intCast((hi << 4) | lo);
+        dst += 1;
+    }
+    return mutable[0..dst];
+}
+
+fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8, max_len: usize) ![]u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const buf = try allocator.alloc(u8, max_len);
+    defer allocator.free(buf);
+    const n = c.readlink(path_z.ptr, buf.ptr, buf.len);
+    if (n < 0) {
+        return switch (posix.errno(n)) {
+            .NOENT, .NOTDIR => error.FileNotFound,
+            else => error.ReadLinkFailed,
+        };
+    }
+    return allocator.dupe(u8, buf[0..@intCast(n)]);
 }
 
 pub fn markDetached(paths: SessionPaths) !void {
@@ -181,6 +522,18 @@ fn mkdirSessionDir(allocator: std.mem.Allocator, path: []const u8) !MkdirSession
     };
 }
 
+fn liveHintsExist(paths: SessionPaths) bool {
+    if (std.fs.cwd().statFile(paths.socket)) |_| return true else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return true,
+    }
+    _ = std.fs.cwd().statFile(paths.meta) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return true,
+    };
+    return true;
+}
+
 fn unlinkIfExists(path: []const u8) !void {
     const path_z = try app_allocator.allocator().dupeZ(u8, path);
     defer app_allocator.allocator().free(path_z);
@@ -190,7 +543,7 @@ fn unlinkIfExists(path: []const u8) !void {
     }
 }
 
-test "allocates session directories without reusing tombstones" {
+test "allocates GUID session directories without reusing tombstones" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(
         allocator,
@@ -204,16 +557,15 @@ test "allocates session directories without reusing tombstones" {
 
     var first = try allocateSessionDirInRoot(allocator, root);
     defer first.deinit(allocator);
-    try std.testing.expectEqualStrings("s1", first.id);
+    try std.testing.expect(isValidGuid(first.id));
 
     var second = try allocateSessionDirInRoot(allocator, root);
     defer second.deinit(allocator);
-    try std.testing.expectEqualStrings("s2", second.id);
+    try std.testing.expect(isValidGuid(second.id));
+    try std.testing.expect(!std.mem.eql(u8, first.id, second.id));
 
-    // Leaving s1/s2 in place reserves those ids, even after the agent exits.
-    var third = try allocateSessionDirInRoot(allocator, root);
-    defer third.deinit(allocator);
-    try std.testing.expectEqualStrings("s3", third.id);
+    try writeMeta(first.paths, 12345, "0.5.0-dev");
+    try std.testing.expectError(error.SessionExists, allocateSessionDirForGuidInRoot(allocator, root, first.id));
 }
 
 test "session paths use short socket components and registry side files" {
@@ -222,24 +574,31 @@ test "session paths use short socket components and registry side files" {
     std.fs.cwd().deleteTree(root) catch {};
     defer std.fs.cwd().deleteTree(root) catch {};
 
-    var allocation = try allocateSessionDirInRoot(allocator, root);
+    const guid = "550e8400-e29b-41d4-a716-446655440000";
+    var allocation = try allocateSessionDirForGuidInRoot(allocator, root, guid);
     defer allocation.deinit(allocator);
 
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/s/s1", allocation.paths.dir);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/s/s1/s", allocation.paths.socket);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/s/s1/meta", allocation.paths.meta);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/s/s1/detached", allocation.paths.detached);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/s/s1/compat", allocation.paths.compat);
+    try std.testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", allocation.id);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000", allocation.paths.dir);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/s", allocation.paths.socket);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/meta", allocation.paths.meta);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/detached", allocation.paths.detached);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/compat", allocation.paths.compat);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/route", allocation.paths.route);
 }
 
-test "validates session ids" {
-    try std.testing.expect(isValidSessionId("s1"));
-    try std.testing.expect(isValidSessionId("s12345"));
+test "validates session ids and aliases" {
+    try std.testing.expect(isValidSessionId("550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(isValidSessionId("550e8400e29b41d4a716446655440000"));
     try std.testing.expect(!isValidSessionId(""));
-    try std.testing.expect(!isValidSessionId("1"));
-    try std.testing.expect(!isValidSessionId("s"));
-    try std.testing.expect(!isValidSessionId("s1/compat"));
-    try std.testing.expect(!isValidSessionId("sx"));
+    try std.testing.expect(!isValidSessionId("s1"));
+    try std.testing.expect(!isValidSessionId("550e8400-e29b-41d4-a716-44665544000z"));
+    try std.testing.expect(isValidAlias("s1"));
+    try std.testing.expect(isValidAlias("my-awesome-session"));
+    try std.testing.expect(!isValidAlias("550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(!isValidAlias("550e8400e29b41d4a716446655440000"));
+    try std.testing.expect(!isValidAlias("-bad"));
+    try std.testing.expect(!isValidAlias("bad/name"));
 }
 
 test "registry writes meta and tracks detached marker" {

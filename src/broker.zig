@@ -18,9 +18,10 @@ const command_timeout_ms: i64 = 2_000;
 const command_poll_ms: u64 = 20;
 
 pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+    const command_args = try applyBrokerOptions(args);
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
 
-    if (args.len > 0) return runCommandArgs(allocator, args);
+    if (command_args.len > 0) return runCommandArgs(allocator, command_args);
 
     const handshake_result = try acceptRuntimeHandshake(allocator, 0, 1);
     if (handshake_result == .mismatch) return;
@@ -52,7 +53,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
             },
             .session_new => {
                 defer frame.deinit(allocator);
-                const agent_fd = try startSessionAgentAndConnect(allocator, exe);
+                const agent_fd = try startSessionAgentAndConnect(allocator, exe, frame.payload);
                 defer _ = c.close(agent_fd);
                 try startAgentAndRelay(allocator, agent_fd, frame.payload);
                 return;
@@ -64,6 +65,22 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
             },
         }
     }
+}
+
+fn applyBrokerOptions(args: []const []const u8) ![]const []const u8 {
+    var i: usize = 0;
+    while (i < args.len) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--state-dir")) {
+            i += 1;
+            if (i >= args.len) return error.MissingStateDir;
+            socket_transport.setRuntimeRootOverride(args[i]);
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    return args[i..];
 }
 
 fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -120,8 +137,15 @@ fn listAgents(allocator: std.mem.Allocator) !u8 {
             session_registry.removeStaleHints(paths) catch {};
             continue;
         }
+        const guid = session_registry.canonicalGuid(allocator, entry.name) catch {
+            session_registry.removeStaleHints(paths) catch {};
+            continue;
+        };
+        defer allocator.free(guid);
+        const display_id = (try session_registry.primaryAliasForGuid(allocator, guid)) orelse try allocator.dupe(u8, guid);
+        defer allocator.free(display_id);
         try stdout.writer(allocator).print("{s}\t{s}\t{}\n", .{
-            entry.name,
+            display_id,
             if (fileExists(paths.detached)) "no" else "yes",
             meta.agent_pid,
         });
@@ -132,8 +156,8 @@ fn listAgents(allocator: std.mem.Allocator) !u8 {
 }
 
 fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
-    var paths = session_registry.pathsForSessionId(allocator, session_id) catch |err| switch (err) {
-        error.InvalidSessionId => {
+    var paths = session_registry.pathsForRef(allocator, session_id) catch |err| switch (err) {
+        error.InvalidSessionId, error.FileNotFound => {
             return finishCommand(1, "", "ERROR session not found\n");
         },
         else => return err,
@@ -338,7 +362,10 @@ fn runCompatCommand(allocator: std.mem.Allocator, paths: session_registry.Sessio
 fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.fd_t {
     var request = try protocol.decodePayload(pb.SessionAttach, allocator, payload);
     defer request.deinit(allocator);
-    var paths = (try mostRecentAgent(allocator)) orelse return error.NoSessions;
+    var paths = if (request.session_guid.len > 0)
+        try session_registry.pathsForSessionId(allocator, request.session_guid)
+    else
+        (try mostRecentAgent(allocator)) orelse return error.NoSessions;
     defer paths.deinit(allocator);
     return socket_transport.connectSocket(paths.socket);
 }
@@ -353,7 +380,7 @@ fn mostRecentAgent(allocator: std.mem.Allocator) !?session_registry.SessionPaths
     defer dir.close();
 
     var selected: ?session_registry.SessionPaths = null;
-    var selected_number: usize = 0;
+    var selected_mtime: i128 = std.math.minInt(i128);
     var iterator = dir.iterate();
     while (try iterator.next()) |entry| {
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
@@ -366,14 +393,14 @@ fn mostRecentAgent(allocator: std.mem.Allocator) !?session_registry.SessionPaths
             },
             else => return err,
         };
-        const number = std.fmt.parseInt(usize, entry.name[1..], 10) catch {
+        const stat = statAbsolute(paths.meta) catch {
             paths.deinit(allocator);
             continue;
         };
-        if (selected == null or number > selected_number) {
+        if (selected == null or stat.mtime > selected_mtime) {
             if (selected) |*old| old.deinit(allocator);
             selected = paths;
-            selected_number = number;
+            selected_mtime = stat.mtime;
         } else {
             paths.deinit(allocator);
         }
@@ -385,8 +412,13 @@ fn statAbsolute(path: []const u8) !std.fs.File.Stat {
     return std.fs.cwd().statFile(path);
 }
 
-fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
-    var allocation = try session_registry.allocateSessionDir(allocator);
+fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_new_payload: []const u8) !c.fd_t {
+    var request = try protocol.decodePayload(pb.SessionNew, allocator, session_new_payload);
+    defer request.deinit(allocator);
+    var allocation = if (request.session_guid.len > 0)
+        try session_registry.allocateSessionDirForGuid(allocator, request.session_guid)
+    else
+        try session_registry.allocateSessionDir(allocator);
     defer allocation.deinit(allocator);
 
     const argv = [_][]const u8{

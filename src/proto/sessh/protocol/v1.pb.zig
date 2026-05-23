@@ -293,12 +293,14 @@ pub const SessionNew = struct {
     scrollback_row_limit: u32 = 0,
     environment: std.ArrayListUnmanaged(EnvironmentEntry) = .empty,
     query_default_colors: ?DefaultColors = null,
+    session_guid: []const u8 = &.{},
 
     pub const _desc_table = .{
         .resize = fd(1, .submessage),
         .scrollback_row_limit = fd(2, .{ .scalar = .uint32 }),
         .environment = fd(3, .{ .repeated = .submessage }),
         .query_default_colors = fd(4, .submessage),
+        .session_guid = fd(5, .{ .scalar = .string }),
     };
 
     /// Encodes the message to the writer
@@ -366,9 +368,11 @@ pub const SessionNew = struct {
 /// SessionAttached for the selected session, then Draw/RepaintResponse messages.
 pub const SessionAttach = struct {
     resize: ?Resize = null,
+    session_guid: []const u8 = &.{},
 
     pub const _desc_table = .{
         .resize = fd(1, .submessage),
+        .session_guid = fd(2, .{ .scalar = .string }),
     };
 
     /// Encodes the message to the writer
@@ -721,7 +725,11 @@ pub const PingRequest = struct {
 ///
 /// Confirms the session selected for this connection.
 pub const SessionAttached = struct {
-    pub const _desc_table = .{};
+    session_guid: []const u8 = &.{},
+
+    pub const _desc_table = .{
+        .session_guid = fd(1, .{ .scalar = .string }),
+    };
 
     /// Encodes the message to the writer
     /// The allocator is used to generate submessages internally.

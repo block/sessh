@@ -66,6 +66,8 @@ message SessionNew {
   repeated EnvironmentEntry environment = 3;
   // Colors the session agent may use to answer early OSC 10/11 queries.
   DefaultColors query_default_colors = 4;
+  // Canonical session GUID in normal hyphenated UUID form.
+  string session_guid = 5;
 }
 
 // Framed payload, client -> session agent.
@@ -74,6 +76,9 @@ message SessionNew {
 // SessionAttached for the selected session, then Draw/RepaintResponse messages.
 message SessionAttach {
   Resize resize = 1;
+  // Canonical session GUID in normal hyphenated UUID form. Empty means attach
+  // the most recent session known to the selected broker.
+  string session_guid = 2;
 }
 
 // Framed payload, client -> session agent.
@@ -135,6 +140,8 @@ message PingRequest {
 //
 // Confirms the session selected for this connection.
 message SessionAttached {
+  // Canonical session GUID in normal hyphenated UUID form.
+  string session_guid = 1;
 }
 
 enum SessionEndReason {

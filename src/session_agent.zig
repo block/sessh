@@ -529,6 +529,12 @@ const TerminalOrigin = struct {
 
 const AttachRequest = struct {
     resize: ResizePayload,
+    session_guid: []u8,
+
+    fn deinit(self: *AttachRequest) void {
+        app_allocator.allocator().free(self.session_guid);
+        self.* = undefined;
+    }
 };
 
 const SessionNewRequest = struct {
@@ -536,8 +542,10 @@ const SessionNewRequest = struct {
     scrollback_row_count: u32,
     environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
+    session_guid: []u8,
 
     fn deinit(self: *SessionNewRequest) void {
+        app_allocator.allocator().free(self.session_guid);
         self.environment.deinit();
         self.* = undefined;
     }
@@ -995,13 +1003,18 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.scrollback_row_count,
                     request.environment,
                     request.query_default_colors,
+                    request.session_guid,
                 );
                 try attachSession(session_agent, session_index, fd, request.resize);
                 return true;
             },
             .session_attach => {
-                const request = try readAttachRequest(frame.payload);
-                const session_index = findMostRecentSessionIndex(session_agent);
+                var request = try readAttachRequest(frame.payload);
+                defer request.deinit();
+                const session_index = if (request.session_guid.len > 0)
+                    findSessionIndex(session_agent, request.session_guid)
+                else
+                    findMostRecentSessionIndex(session_agent);
                 const resolved_session_index = session_index orelse {
                     try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
                     return false;
@@ -1232,8 +1245,10 @@ fn attachedCount(session_agent: *SessionAgent, session_index: usize) u32 {
     return count;
 }
 
-fn sendSessionAttached(attachment: *Attachment) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionAttached{});
+fn sendSessionAttachedForSession(attachment: *Attachment, session: *const Session) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionAttached{
+        .session_guid = session.idSlice(),
+    });
     defer app_allocator.allocator().free(payload);
     try queueAttachmentFrame(attachment, .session_attached, payload);
 }
@@ -1684,6 +1699,7 @@ fn readSessionNewRequest(payload: []const u8) !SessionNewRequest {
     var message = try protocol.decodePayload(pb.SessionNew, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     const resize = message.resize orelse return error.MissingResize;
+    if (!session_registry.isValidGuid(message.session_guid)) return error.InvalidSessionGuid;
     var environment = SessionEnvironment{};
     errdefer environment.deinit();
     var query_default_colors = vt.DefaultColors{};
@@ -1700,6 +1716,7 @@ fn readSessionNewRequest(payload: []const u8) !SessionNewRequest {
         .scrollback_row_count = message.scrollback_row_limit,
         .environment = environment,
         .query_default_colors = query_default_colors,
+        .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
     };
 }
 
@@ -1745,8 +1762,10 @@ fn readAttachRequest(payload: []const u8) !AttachRequest {
     var message = try protocol.decodePayload(pb.SessionAttach, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     const resize = message.resize orelse return error.MissingResize;
+    if (message.session_guid.len > 0 and !session_registry.isValidGuid(message.session_guid)) return error.InvalidSessionGuid;
     return .{
         .resize = try resizePayloadFromMessage(resize),
+        .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
     };
 }
 
@@ -1774,6 +1793,7 @@ fn createSession(
     scrollback_row_count: u32,
     session_environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
+    session_guid: []const u8,
 ) !usize {
     if (session_agent.fixed_session_id != null and session_agent.started_session) return error.TooManySessions;
 
@@ -1789,13 +1809,9 @@ fn createSession(
         );
         errdefer terminal_model.destroy();
 
-        var id_buf: [64]u8 = undefined;
-        const id = if (session_agent.fixed_session_id) |fixed_session_id|
-            try std.fmt.bufPrint(&id_buf, "{s}", .{fixed_session_id})
-        else
-            try std.fmt.bufPrint(&id_buf, "s{}", .{session_agent.next_id});
-        const session_id_z = try app_allocator.allocator().dupeZ(u8, id);
-        defer app_allocator.allocator().free(session_id_z);
+        if (!session_registry.isValidGuid(session_guid)) return error.InvalidSessionGuid;
+        const session_guid_z = try app_allocator.allocator().dupeZ(u8, session_guid);
+        defer app_allocator.allocator().free(session_guid_z);
 
         const shell_path = session_environment.shell orelse defaultShellPath();
         const shell_z = try app_allocator.allocator().dupeZ(u8, shell_path);
@@ -1811,7 +1827,7 @@ fn createSession(
             terminal.setSigpipe(posix.SIG.DFL);
             _ = setenv("TERM", "xterm-256color", 1);
             _ = setenv("SHELL", shell_z.ptr, 1);
-            _ = setenv("SESSH_ID", session_id_z.ptr, 1);
+            _ = setenv("SESSH_GUID", session_guid_z.ptr, 1);
             const dash_i: [*:0]const u8 = "-i";
             var child_argv = [_:null]?[*:0]const u8{ shell_argv0.ptr, dash_i };
             _ = c.execve(shell_z.ptr, &child_argv, @ptrCast(c.environ));
@@ -1827,8 +1843,8 @@ fn createSession(
             .scrollback_row_count = scrollback_row_count,
             .alive = true,
         };
-        @memcpy(session.id[0..id.len], id);
-        session.id_len = id.len;
+        @memcpy(session.id[0..session_guid.len], session_guid);
+        session.id_len = session_guid.len;
         session_agent.started_session = true;
         if (session_agent.fixed_session_id == null) session_agent.next_id += 1;
         logSessionAgent(session_agent, "event=session_create id={s} pid={} rows={} cols={} scrollback_rows={} shell={s}", .{
@@ -1907,7 +1923,7 @@ fn attachSession(
             attachment.output.deinit(app_allocator.allocator());
             attachment.* = Attachment{};
         }
-        try sendSessionAttached(attachment);
+        try sendSessionAttachedForSession(attachment, session);
         if (resize.repaint_request) |request| {
             try sendSessionRepaintSnapshot(attachment, session, request);
         } else {
@@ -2552,19 +2568,11 @@ fn findSessionIndex(session_agent: *SessionAgent, id: []const u8) ?usize {
 }
 
 fn findMostRecentSessionIndex(session_agent: *SessionAgent) ?usize {
-    var selected: ?usize = null;
-    var selected_number: usize = 0;
     for (&session_agent.sessions, 0..) |*session, i| {
         if (!session.alive) continue;
-        const id = session.idSlice();
-        if (id.len < 2 or id[0] != 's') continue;
-        const number = std.fmt.parseInt(usize, id[1..], 10) catch continue;
-        if (selected == null or number > selected_number) {
-            selected = i;
-            selected_number = number;
-        }
+        return i;
     }
-    return selected;
+    return null;
 }
 
 fn reapSessions(session_agent: *SessionAgent) void {
@@ -2579,13 +2587,23 @@ fn reapSessions(session_agent: *SessionAgent) void {
 }
 
 fn endSessionFromPtyClose(session_agent: *SessionAgent, session_index: usize) void {
-    var status: c_int = 0;
-    const result = c.waitpid(session_agent.sessions[session_index].pid, &status, 1);
-    if (result == session_agent.sessions[session_index].pid) {
-        endSession(session_agent, session_index, session_agent.sessions[session_index].end_reason, exitInfoFromWaitStatus(status));
+    if (waitForSessionExitInfo(session_agent.sessions[session_index].pid)) |exit_info| {
+        endSession(session_agent, session_index, session_agent.sessions[session_index].end_reason, exit_info);
         return;
     }
     endSession(session_agent, session_index, session_agent.sessions[session_index].end_reason, .{ .ended_at_unix_ms = nowUnixMs() });
+}
+
+fn waitForSessionExitInfo(pid: c.pid_t) ?ExitInfo {
+    var attempts: usize = 0;
+    while (attempts < 20) : (attempts += 1) {
+        var status: c_int = 0;
+        const result = c.waitpid(pid, &status, 1);
+        if (result == pid) return exitInfoFromWaitStatus(status);
+        if (result < 0) return null;
+        io.sleepMillis(5);
+    }
+    return null;
 }
 
 fn exitInfoFromWaitStatus(status: c_int) ExitInfo {

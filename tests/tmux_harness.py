@@ -313,7 +313,7 @@ def main():
             "  printf 'CLEAR_SCROLL_%02d\\n' \"$i\"\n"
             "  i=$((i + 1))\n"
             "done\n"
-            "printf 'CLEAR_SCROLL_DONE:%s\\n' \"${SESSH_ID:-missing}\"\n"
+            "printf 'CLEAR_SCROLL_DONE:%s\\n' \"${SESSH_GUID:-missing}\"\n"
         )
         clear_scroll_shell.chmod(clear_scroll_shell.stat().st_mode | stat.S_IXUSR)
         reset_scroll_shell.write_text(
@@ -322,7 +322,7 @@ def main():
             "printf '\\033[?1049h\\033[2J\\033[HALT_SCREEN\\033[?1049l'\n"
             "printf '\\033[?1049h\\033[3;3H\\033[?1049l'\n"
             "printf '\\033c'\n"
-            "printf 'RIS_REPORT\\nRIS_DONE:%s\\n' \"${SESSH_ID:-missing}\"\n"
+            "printf 'RIS_REPORT\\nRIS_DONE:%s\\n' \"${SESSH_GUID:-missing}\"\n"
         )
         reset_scroll_shell.chmod(reset_scroll_shell.stat().st_mode | stat.S_IXUSR)
         redraw_prompt_shell.write_text(

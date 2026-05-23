@@ -196,6 +196,10 @@ def first_session_id(list_stdout):
     raise AssertionError(f"no sessions in list output: {list_stdout!r}")
 
 
+def compact_session_id(session_id):
+    return session_id.replace("-", "")
+
+
 def generate_key(tmp):
     key = tmp / "ssh_key"
     run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], timeout=10.0)
@@ -409,7 +413,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         if "ID\tATTACHED\tAGENT_PID" not in listed.stdout or "\tno\t" not in listed.stdout:
             raise AssertionError(listed)
         session_id = first_session_id(listed.stdout)
-        compat_path = f"/tmp/sessh-0/s/{session_id}/compat"
+        compat_path = f"/tmp/sessh-0/g/{compact_session_id(session_id)}/compat"
         compat = run(
             [
                 "podman",

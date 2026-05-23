@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import hashlib
 import os
+import re
 import select
 import shlex
 import socket
@@ -18,6 +19,8 @@ from test_env import isolated_env
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
+GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+COMPACT_GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
 FAKE_SSH = """#!/bin/sh
@@ -481,8 +484,50 @@ def sessh_version():
     raise AssertionError("could not find sessh version")
 
 
+def aliases_dir(env):
+    state_dir = env.get("SESSH_STATE_DIR")
+    if state_dir:
+        return Path(state_dir) / "alias"
+    return Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "alias"
+
+
+def compact_guid(guid):
+    if COMPACT_GUID_RE.match(guid):
+        return guid.lower()
+    if not GUID_RE.match(guid):
+        raise AssertionError(f"invalid guid: {guid}")
+    return guid.replace("-", "").lower()
+
+
+def guid_for_alias(alias):
+    match = re.fullmatch(r"s([0-9]+)", alias)
+    if match:
+        return f"00000000-0000-4000-8000-{int(match.group(1)):012x}"
+    digest = hashlib.sha256(alias.encode("utf-8")).hexdigest()
+    return f"{digest[0:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+
+
+def ensure_alias(env, alias, guid=None):
+    guid = guid or guid_for_alias(alias)
+    alias_path = aliases_dir(env) / alias
+    alias_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if alias_path.exists() or alias_path.is_symlink():
+        return
+    alias_path.symlink_to(Path("../g") / compact_guid(guid))
+
+
+def session_path(env, session_id="s1"):
+    if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
+        return sessions_dir(env) / compact_guid(session_id)
+    alias_path = aliases_dir(env) / session_id
+    if alias_path.is_symlink():
+        return (alias_path.parent / os.readlink(alias_path)).resolve(strict=False)
+    ensure_alias(env, session_id)
+    return (alias_path.parent / os.readlink(alias_path)).resolve(strict=False)
+
+
 def session_compat_path(env, session_id="s1"):
-    return sessions_dir(env) / session_id / "compat"
+    return session_path(env, session_id) / "compat"
 
 
 def assert_session_compat_points_to_cached_artifact(env, artifact, session_id, context):
@@ -525,8 +570,9 @@ def version_mismatch_frame():
 
 
 def start_version_mismatch_agent(env, session_id="s1"):
-    session = sessions_dir(env) / session_id
+    session = session_path(env, session_id)
     session.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (session / "meta").write_text(f"agent_pid={os.getpid()}\nversion=0.0.0-compat-test\n")
     (session / "detached").write_text("")
     sock_path = session / "s"
     try:
@@ -642,7 +688,7 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError("uploaded artifact was not installed")
     if not os.access(installed, os.X_OK):
         raise AssertionError("uploaded artifact is not executable")
-    session_meta = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s1" / "meta"
+    session_meta = session_path(env, "s1") / "meta"
     if not session_meta.exists():
         raise AssertionError("uploaded broker did not create a session agent")
 
@@ -1037,6 +1083,35 @@ def test_ssh_attach_without_id_reattaches_latest_session(tmp):
         raise AssertionError(attached)
     if "remote commands are not supported yet" in attached.stderr:
         raise AssertionError(attached.stderr)
+
+
+def test_ssh_no_host_attach_uses_local_route(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_ROUTE_ATTACH_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf 'ID=%s GUID=%s {marker}\\n' \"${{SESSH_ID-unset}}\" \"$SESSH_GUID\"\nwhile :; do sleep 1; done\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    first = run_sessh_until_stdout(["test-host", "--alias", "route-alias"], env, marker)
+    if first.returncode != 0:
+        raise AssertionError(first)
+    if "ID=unset GUID=" not in first.stdout:
+        raise AssertionError(first)
+
+    attached = run_sessh_until_stdout(["--attach", "route-alias"], env, marker)
+    if attached.returncode != 0:
+        raise AssertionError(attached)
+    if marker not in attached.stdout:
+        raise AssertionError(attached)
+    log_text = fake_log.read_text()
+    if log_text.splitlines().count("invoked=1") < 2:
+        raise AssertionError(log_text)
 
 
 def test_ssh_leader_sever_reconnects(tmp):
@@ -1471,7 +1546,7 @@ def test_ssh_unsupported_remote_platform_does_not_plain_ssh_fallback_for_attach(
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
     env["SESSH_FAKE_SSH_REMOTE_PATH"] = str(remote_bin)
 
-    result = run_sessh(["test-host", "--attach", "s1"], env, timeout=30.0)
+    result = run_sessh(["test-host", "--attach", guid_for_alias("s1")], env, timeout=30.0)
 
     if result.returncode == 0:
         raise AssertionError(result)
@@ -1511,7 +1586,7 @@ def test_ssh_remote_session_commands_use_broker(tmp):
     killed = run_sessh(["test-host", "--kill", "s1"], env, timeout=30.0)
     if killed.returncode != 0:
         raise AssertionError(killed)
-    if "ENDED s1" not in killed.stdout:
+    if not killed.stdout.startswith("ENDED "):
         raise AssertionError(killed)
 
     listed = run_sessh(["test-host", "--list"], env, timeout=30.0)
@@ -1618,7 +1693,7 @@ def test_ssh_force_compat_uses_compat_path(tmp):
         raise AssertionError(log_text)
     expected_args = (
         f"compat_args=:local: --compat-version {sessh_version()} "
-        "--attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
+        f"--attach {guid_for_alias('s1')} --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
     )
     if expected_args not in log_text:
         raise AssertionError(log_text)
@@ -1701,6 +1776,10 @@ def main():
         (
             "ssh attach without id reattaches latest session",
             test_ssh_attach_without_id_reattaches_latest_session,
+        ),
+        (
+            "ssh no-host attach uses local route",
+            test_ssh_no_host_attach_uses_local_route,
         ),
         (
             "ssh leader sever reconnects",

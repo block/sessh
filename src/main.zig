@@ -66,12 +66,15 @@ fn usage(code: u8) !void {
     const text =
         \\usage:
         \\  sessh [ssh-options] HOST [sessh-options]
+        \\  sessh --attach ID
         \\
         \\sessh-specific options:
         \\  --attach [ID]
         \\  --list
         \\  --kill ID
         \\  --kill-all | --killall
+        \\  --alias NAME
+        \\  --state-dir DIR
         \\  --leader CTRL-KEY|None
         \\  --scrollback-limit N
         \\  --initial-scrollback N

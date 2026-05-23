@@ -7,17 +7,22 @@ const posix = std.posix;
 extern "c" fn socket(domain: c_int, socket_type: c_int, protocol: c_int) c_int;
 
 var runtime_root_symlink_published = false;
+var runtime_root_override: ?[]const u8 = null;
+
+pub fn setRuntimeRootOverride(path: []const u8) void {
+    runtime_root_override = path;
+    runtime_root_symlink_published = false;
+}
 
 /// Runtime root for live sockets and session registry state.
 /// Cache paths intentionally use a different root.
 pub fn runtimeRoot(allocator: std.mem.Allocator) ![]u8 {
-    return runtimeRootFor(allocator, envVar("XDG_RUNTIME_DIR"), c.getuid());
+    if (runtime_root_override) |root| return allocator.dupe(u8, root);
+    if (envVar("SESSH_STATE_DIR")) |root| return allocator.dupe(u8, root);
+    return runtimeRootFor(allocator, c.getuid());
 }
 
-fn runtimeRootFor(allocator: std.mem.Allocator, xdg_runtime_dir: ?[]const u8, uid: c.uid_t) ![]u8 {
-    if (xdg_runtime_dir) |runtime| {
-        return std.fmt.allocPrint(allocator, "{s}/sessh", .{runtime});
-    }
+fn runtimeRootFor(allocator: std.mem.Allocator, uid: c.uid_t) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/sessh-{}", .{uid});
 }
 
@@ -213,13 +218,9 @@ fn envVar(name: [*:0]const u8) ?[]const u8 {
     return value;
 }
 
-test "runtime root uses XDG_RUNTIME_DIR or fixed tmp fallback" {
+test "runtime root uses fixed tmp fallback" {
     const allocator = std.testing.allocator;
-    const xdg_root = try runtimeRootFor(allocator, "/isolated/runtime", 501);
-    defer allocator.free(xdg_root);
-    try std.testing.expectEqualStrings("/isolated/runtime/sessh", xdg_root);
-
-    const fallback_root = try runtimeRootFor(allocator, null, 501);
+    const fallback_root = try runtimeRootFor(allocator, 501);
     defer allocator.free(fallback_root);
     try std.testing.expectEqualStrings("/tmp/sessh-501", fallback_root);
 }

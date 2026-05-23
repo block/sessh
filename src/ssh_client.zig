@@ -8,6 +8,8 @@ const client_log = @import("client_log.zig");
 const config = @import("config.zig");
 const io = @import("io.zig");
 const process_exit = @import("process_exit.zig");
+const session_registry = @import("session_registry.zig");
+const socket_transport = @import("socket_transport.zig");
 const terminal = @import("terminal.zig");
 
 const bootstrapper_script = @embedFile("bootstrapper.sh");
@@ -114,6 +116,8 @@ const ParsedSshArgs = struct {
     action: SshAction = .new,
     attach_id: ?[]const u8 = null,
     kill_id: ?[]const u8 = null,
+    alias: ?[]const u8 = null,
+    state_dir: ?[]const u8 = null,
     leader: terminal.Leader = .none,
     leader_set: bool = false,
     banner_args: client.DetachBannerArgs = .{},
@@ -264,7 +268,10 @@ fn stderrPumpMain(state: *SshStderrPump.State) void {
 /// `sessh-<os>-<arch>`. If that layout is unavailable, upload the current
 /// binary for same-platform development tests.
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    var parsed_ssh_args = parseSshArgs(args) catch |err| {
+    var route_storage: ?session_registry.Route = null;
+    defer if (route_storage) |*route| route.deinit(allocator);
+
+    var parsed_ssh_args = (try parseRouteAttachArgs(allocator, args, &route_storage)) orelse parseSshArgs(args) catch |err| {
         if (shouldUsePlainSshFallbackForArgError(args, err)) {
             try runPlainSshFallbackForUnsupportedArgs(allocator, args, err);
         }
@@ -276,6 +283,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return process_exit.request(64);
     };
     client_log.setLevel(parsed_ssh_args.client_log_level);
+    if (parsed_ssh_args.state_dir) |dir| socket_transport.setRuntimeRootOverride(dir);
+    const resolved_ref_storage = try resolveLocalRefs(allocator, &parsed_ssh_args);
+    defer if (resolved_ref_storage) |ref| allocator.free(ref);
     parsed_ssh_args.default_ipqos_option = try resolveDefaultIpQosOption(allocator, parsed_ssh_args.options, parsed_ssh_args.host);
     defer if (parsed_ssh_args.default_ipqos_option) |option| allocator.free(option);
 
@@ -287,13 +297,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
     const artifacts = if (artifacts_storage) |*value| value else null;
 
+    var broker_arg_buf: [4][]const u8 = undefined;
+    const broker_args = brokerArgsForAction(parsed_ssh_args, &broker_arg_buf);
     const remote_command = if (parsed_ssh_args.bootstrap)
         try bootstrapCommand(allocator)
     else
-        try directBrokerCommand(allocator, &.{});
+        try directBrokerCommand(allocator, broker_args);
     defer allocator.free(remote_command);
-    var broker_arg_buf: [2][]const u8 = undefined;
-    const broker_args = brokerArgsForAction(parsed_ssh_args, &broker_arg_buf);
 
     if (isRemoteManagementAction(parsed_ssh_args.action)) {
         const command_remote_command = if (parsed_ssh_args.bootstrap)
@@ -322,12 +332,38 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     }
 
+    var new_guid: ?[]u8 = null;
+    defer if (new_guid) |guid| allocator.free(guid);
+    var new_alias: ?[]u8 = null;
+    defer if (new_alias) |alias| allocator.free(alias);
+    var route_allocation: ?session_registry.Allocation = null;
+    defer if (route_allocation) |*allocation| allocation.deinit(allocator);
+
+    if (parsed_ssh_args.action == .new) {
+        new_guid = try session_registry.generateGuid(allocator);
+        route_allocation = try session_registry.allocateSessionDirForGuid(allocator, new_guid.?);
+        if (parsed_ssh_args.alias) |alias| {
+            try session_registry.createAlias(allocator, alias, new_guid.?);
+            new_alias = try allocator.dupe(u8, alias);
+        } else {
+            new_alias = try session_registry.createGeneratedAlias(allocator, new_guid.?);
+        }
+        try session_registry.writeSshRoute(
+            allocator,
+            route_allocation.?.paths,
+            new_guid.?,
+            new_alias.?,
+            parsed_ssh_args.host,
+            parsed_ssh_args.options,
+        );
+    }
+
     var child = try startRuntimeConnection(
         allocator,
         parsed_ssh_args,
         artifacts,
         remote_command,
-        &.{},
+        broker_args,
         false,
         null,
         false,
@@ -338,6 +374,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
             parsed_ssh_args.scrollback_row_count,
+            new_guid.?,
         ),
         .attach => client.startAttachSessionOnRuntime(
             child.child.stdout.?.handle,
@@ -377,7 +414,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 client_log.debug("event=detach host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.terminate();
                 client_log.flush(2);
-                client.writeDetachBannerForTarget(parsed_ssh_args.options, parsed_ssh_args.host, parsed_ssh_args.banner_args.slice(), session.idSlice());
+                client.writeDetachBannerForSessionRef(parsed_ssh_args.banner_args.slice(), session.idSlice());
                 return;
             },
             .session_ended => {
@@ -414,6 +451,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 parsed_ssh_args,
                 artifacts,
                 remote_command,
+                broker_args,
                 &child,
                 &session,
                 &reconnect_ui,
@@ -496,7 +534,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 parsed_ssh_args,
                 artifacts,
                 remote_command,
-                &.{},
+                broker_args,
                 true,
                 &reconnect_ui,
                 true,
@@ -607,23 +645,32 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
     }
 }
 
-fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[2][]const u8) []const []const u8 {
-    return switch (parsed_ssh_args.action) {
-        .new, .attach => buf[0..0],
-        .list => blk: {
-            buf[0] = "--list";
-            break :blk buf[0..1];
+fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[4][]const u8) []const []const u8 {
+    var len: usize = 0;
+    if (parsed_ssh_args.state_dir) |dir| {
+        buf[len] = "--state-dir";
+        len += 1;
+        buf[len] = dir;
+        len += 1;
+    }
+    switch (parsed_ssh_args.action) {
+        .new, .attach => {},
+        .list => {
+            buf[len] = "--list";
+            len += 1;
         },
-        .kill => blk: {
-            buf[0] = "--kill";
-            buf[1] = parsed_ssh_args.kill_id.?;
-            break :blk buf[0..2];
+        .kill => {
+            buf[len] = "--kill";
+            len += 1;
+            buf[len] = parsed_ssh_args.kill_id.?;
+            len += 1;
         },
-        .kill_all => blk: {
-            buf[0] = "--kill-all";
-            break :blk buf[0..1];
+        .kill_all => {
+            buf[len] = "--kill-all";
+            len += 1;
         },
-    };
+    }
+    return buf[0..len];
 }
 
 fn runRemoteBrokerCommandAndForward(connection: *RuntimeConnection) !u8 {
@@ -653,18 +700,22 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
     const session_id = compatSessionId(parsed_ssh_args) orelse "";
     const session_id_quoted = try shellQuote(allocator, session_id);
     defer allocator.free(session_id_quoted);
+    const runtime_root = try shellQuote(allocator, parsed_ssh_args.state_dir orelse "");
+    defer allocator.free(runtime_root);
 
     return std.fmt.allocPrint(allocator,
         \\set -u
         \\compat_action={s}
         \\compat_session_id={s}
-        \\if [ -n "${{XDG_RUNTIME_DIR:-}}" ]; then
-        \\  runtime_root=$XDG_RUNTIME_DIR/sessh
-        \\else
-        \\  runtime_root=/tmp/sessh-$(id -u)
+        \\runtime_root={s}
+        \\if [ -z "$runtime_root" ]; then
+        \\  runtime_root=${{SESSH_STATE_DIR:-/tmp/sessh-$(id -u)}}
         \\fi
+        \\compact_session_id() {{
+        \\  printf '%s' "$1" | tr -d '-'
+        \\}}
         \\find_latest_session_id() {{
-        \\  detached=$(ls -t "$runtime_root"/s/s*/detached 2>/dev/null | sed -n '1p')
+        \\  detached=$(ls -t "$runtime_root"/g/*/detached 2>/dev/null | sed -n '1p')
         \\  if [ -z "$detached" ]; then
         \\    printf 'sessh: no detached session is available for compat-mode\n' >&2
         \\    exit 1
@@ -677,15 +728,15 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    printf 'sessh: session compat binary is unavailable\n' >&2
         \\    exit 1
         \\  fi
-        \\  exec "$compat" :local: --compat-version {s}{s}
+        \\  SESSH_STATE_DIR=$runtime_root exec "$compat" :local: --compat-version {s}{s}
         \\}}
         \\run_each_compat() {{
         \\  found=0
         \\  status=0
-        \\  for compat in "$runtime_root"/s/s*/compat; do
+        \\  for compat in "$runtime_root"/g/*/compat; do
         \\    [ -e "$compat" ] || continue
         \\    found=1
-        \\    "$compat" :local: --compat-version {s}{s}
+        \\    SESSH_STATE_DIR=$runtime_root "$compat" :local: --compat-version {s}{s}
         \\    code=$?
         \\    if [ "$code" -ne 0 ]; then
         \\      status=$code
@@ -702,10 +753,12 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    if [ -z "$compat_session_id" ]; then
         \\      compat_session_id=$(find_latest_session_id)
         \\    fi
-        \\    exec_one_compat "$runtime_root/s/$compat_session_id/compat"
+        \\    compat_session_id=$(compact_session_id "$compat_session_id")
+        \\    exec_one_compat "$runtime_root/g/$compat_session_id/compat"
         \\    ;;
         \\  kill)
-        \\    exec_one_compat "$runtime_root/s/$compat_session_id/compat"
+        \\    compat_session_id=$(compact_session_id "$compat_session_id")
+        \\    exec_one_compat "$runtime_root/g/$compat_session_id/compat"
         \\    ;;
         \\  list|kill-all)
         \\    run_each_compat
@@ -719,6 +772,7 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
     , .{
         action_quoted,
         session_id_quoted,
+        runtime_root,
         compat_version,
         local_args,
         compat_version,
@@ -910,6 +964,7 @@ fn raceExistingConnectionWithReconnect(
     parsed_ssh_args: ParsedSshArgs,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
+    broker_args: []const []const u8,
     old_child: *RuntimeConnection,
     session: *client.RuntimeSession,
     reconnect_ui: *client.ReconnectUi,
@@ -918,7 +973,7 @@ fn raceExistingConnectionWithReconnect(
         .parsed_ssh_args = parsed_ssh_args,
         .artifacts = artifacts,
         .remote_command = remote_command,
-        .broker_args = &.{},
+        .broker_args = broker_args,
         .reconnect_ui = reconnect_ui,
         .session = session.*,
     };
@@ -1485,6 +1540,89 @@ fn shellQuote(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+fn parseRouteAttachArgs(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    route_storage: *?session_registry.Route,
+) !?ParsedSshArgs {
+    if (args.len < 2) return null;
+    var parsed = ParsedSshArgs{ .options = &.{}, .host = "", .action = .attach };
+    var attach_ref: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--attach")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingAttachId;
+            attach_ref = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--state-dir")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingStateDir;
+            parsed.state_dir = args[i];
+            try parsed.banner_args.append(arg);
+            try parsed.banner_args.append(args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--initial-scrollback")) {
+            i += 1;
+            if (i >= args.len) return error.MissingInitialScrollback;
+            parsed.initial_scrollback_row_count = try client.parseInitialScrollbackRowCount(args[i]);
+            parsed.initial_scrollback_row_count_set = true;
+            try parsed.banner_args.append(arg);
+            try parsed.banner_args.append(args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--leader")) {
+            i += 1;
+            if (i >= args.len) return error.MissingLeader;
+            parsed.leader = try client.parseLeader(args[i]);
+            parsed.leader_set = true;
+            try parsed.banner_args.append(arg);
+            try parsed.banner_args.append(args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--log-level")) {
+            i += 1;
+            if (i >= args.len) return error.MissingClientLogLevel;
+            parsed.client_log_level = try client_log.parseLevel(args[i]);
+            parsed.client_log_level_set = true;
+            try parsed.banner_args.append(arg);
+            try parsed.banner_args.append(args[i]);
+            i += 1;
+        } else {
+            return null;
+        }
+    }
+    const ref = attach_ref orelse return null;
+    if (parsed.state_dir) |dir| socket_transport.setRuntimeRootOverride(dir);
+    route_storage.* = try session_registry.readRouteForRef(allocator, ref);
+    const route = &route_storage.*.?;
+    parsed.options = route.ssh_options;
+    parsed.host = route.host;
+    parsed.attach_id = route.guid;
+    return parsed;
+}
+
+fn resolveLocalRefs(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !?[]u8 {
+    switch (parsed.action) {
+        .attach => {
+            const ref = parsed.attach_id orelse return null;
+            if (ref.len == 0) return null;
+            const guid = try session_registry.resolveRefToGuid(allocator, ref);
+            parsed.attach_id = guid;
+            return guid;
+        },
+        .kill => {
+            const ref = parsed.kill_id orelse return null;
+            const guid = session_registry.resolveRefToGuid(allocator, ref) catch |err| switch (err) {
+                error.FileNotFound => return null,
+                else => return err,
+            };
+            parsed.kill_id = guid;
+            return guid;
+        },
+        .new, .list, .kill_all => return null,
+    }
+}
+
 fn parseSshArgs(args: []const []const u8) !ParsedSshArgs {
     if (args.len < 2) return error.MissingHost;
 
@@ -1559,6 +1697,19 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             try parsed.banner_args.append(arg);
             try parsed.banner_args.append(args[index.*]);
             index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--alias")) {
+            index.* += 1;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingAlias;
+            if (!session_registry.isValidAlias(args[index.*])) return error.InvalidAlias;
+            parsed.alias = args[index.*];
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--state-dir")) {
+            index.* += 1;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingStateDir;
+            parsed.state_dir = args[index.*];
+            try parsed.banner_args.append(arg);
+            try parsed.banner_args.append(args[index.*]);
+            index.* += 1;
         } else if (std.mem.eql(u8, arg, "--bootstrap")) {
             parsed.bootstrap = true;
             parsed.bootstrap_set = true;
@@ -1602,6 +1753,8 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
+        std.mem.eql(u8, arg, "--alias") or
+        std.mem.eql(u8, arg, "--state-dir") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
         std.mem.eql(u8, arg, "--force-compat") or
@@ -1728,7 +1881,10 @@ fn sshConfigValueIs(raw_option: []const u8, key_len: usize, expected: []const u8
 fn printSshArgError(err: anyerror) !void {
     switch (err) {
         error.MissingHost => try io.writeAll(2, "sessh: missing host\n"),
+        error.MissingAttachId => try io.writeAll(2, "sessh: --attach requires an id when no host is provided\n"),
         error.MissingKillId => try io.writeAll(2, "sessh: --kill requires an id\n"),
+        error.MissingAlias => try io.writeAll(2, "sessh: --alias requires a value\n"),
+        error.MissingStateDir => try io.writeAll(2, "sessh: --state-dir requires a value\n"),
         error.MissingLeader => try io.writeAll(2, "sessh: --leader requires a value\n"),
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),
@@ -1740,6 +1896,7 @@ fn printSshArgError(err: anyerror) !void {
         error.InvalidScrollbackRowCount => try io.writeAll(2, "sessh: invalid scrollback row count\n"),
         error.InvalidInitialScrollback => try io.writeAll(2, "sessh: invalid initial scrollback\n"),
         error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
+        error.InvalidAlias => try io.writeAll(2, "sessh: invalid alias\n"),
         error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
         error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands are not supported yet\n"),
         error.UnsafeSshOption => try io.writeAll(2, "sessh: ssh option is not safe for sessh transport\n"),

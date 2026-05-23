@@ -36,8 +36,8 @@ sessh [ssh-options] HOST [sessh-options]
 
 ## Action-type parameters
 
-- `--attach [ID]`: attach to an existing session. Without an id, attach to the
-  most recent attachable session
+- `--attach [ID]`: attach to an existing session. `ID` may be a local alias or
+  a session GUID. Without an id, attach to the most recent attachable session.
 - `--list`: list attachable sessions.
 - `--kill ID`: terminate the specified session.
 - `--kill-all`: terminate all sessions on the host.
@@ -84,6 +84,9 @@ The options in the config file can be overridden on the command-line:
 - `--initial-scrollback`
 - `--log-level`
 - `--bootstrap` or `--no-bootstrap`
+- `--alias NAME`: choose the local alias for a new session.
+- `--state-dir DIR`: choose the local runtime state directory. The default is
+  `/tmp/sessh-<uid>`.
 
 ## Sessions
 
@@ -91,9 +94,9 @@ Running `sessh HOST` starts the user's interactive login shell under a remote
 PTY. The session agent models that PTY's screen, terminal state, and retained
 scrollback so the session can be reattached after a disconnect.
 
-Each sessh PTY has `$SESSH_ID` set to its session id. This lets shells,
-prompts, and scripts tell whether they are running inside `sessh` and which
-session they are in.
+Each sessh session has a stable GUID, stored in the environment variable
+`$SESSH_GUID`. This lets shells, prompts, and scripts tell whether they are
+running inside `sessh` and which session they are in.
 
 ## Reconnects
 

@@ -27,6 +27,8 @@ _LAST_RESIZE = (24, 80)
 _NEXT_REPAINT_REQUEST_SEQ = 1
 _NEXT_PING_REQUEST_SEQ = 1
 _SCROLLBACK_CURSOR_LEN = 16
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_COMPACT_GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
 HELLO_REQUEST = "hello_request"
 HELLO_OK = "hello_ok"
@@ -281,9 +283,10 @@ def pack_bytes(value):
     return sessh_pb().Input(data=value).SerializeToString()
 
 
-def pack_session_new(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF):
+def pack_session_new(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1"):
     pb = sessh_pb()
     message = pb.SessionNew(scrollback_row_limit=scrollback)
+    message.session_guid = guid_for_ref(session_id)
     rows, cols = _LAST_RESIZE
     message.resize.terminal_rows = rows
     message.resize.terminal_cols = cols
@@ -499,10 +502,53 @@ def recv_exact(conn, length):
 
 
 def sessions_dir(env):
+    state_dir = env.get("SESSH_STATE_DIR")
+    if state_dir:
+        return Path(state_dir) / "g"
     runtime_dir = env.get("XDG_RUNTIME_DIR")
     if not runtime_dir:
-        raise AssertionError("socket harness requires XDG_RUNTIME_DIR")
-    return Path(runtime_dir) / "sessh" / "s"
+        raise AssertionError("socket harness requires SESSH_STATE_DIR or XDG_RUNTIME_DIR")
+    return Path(runtime_dir) / "sessh" / "g"
+
+
+def aliases_dir(env):
+    state_dir = env.get("SESSH_STATE_DIR")
+    if state_dir:
+        return Path(state_dir) / "alias"
+    return Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "alias"
+
+
+def is_guid_ref(value):
+    return bool(_GUID_RE.match(value) or _COMPACT_GUID_RE.match(value))
+
+
+def compact_guid(guid):
+    if _COMPACT_GUID_RE.match(guid):
+        return guid.lower()
+    if not _GUID_RE.match(guid):
+        raise AssertionError(f"invalid guid: {guid}")
+    return guid.replace("-", "").lower()
+
+
+def guid_for_ref(ref):
+    if _GUID_RE.match(ref):
+        return ref.lower()
+    if _COMPACT_GUID_RE.match(ref):
+        compact = ref.lower()
+        return f"{compact[0:8]}-{compact[8:12]}-{compact[12:16]}-{compact[16:20]}-{compact[20:32]}"
+    match = re.fullmatch(r"s([0-9]+)", ref)
+    if not match:
+        raise AssertionError(f"test alias cannot be mapped to a deterministic guid: {ref}")
+    return f"00000000-0000-4000-8000-{int(match.group(1)):012x}"
+
+
+def ensure_alias(env, alias, guid=None):
+    guid = guid or guid_for_ref(alias)
+    alias_path = aliases_dir(env) / alias
+    alias_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if alias_path.exists() or alias_path.is_symlink():
+        return
+    alias_path.symlink_to(Path("../g") / compact_guid(guid))
 
 
 def assert_runtime_dir_symlink(env, expected_runtime_root):
@@ -515,7 +561,13 @@ def assert_runtime_dir_symlink(env, expected_runtime_root):
 
 
 def session_dir(env, session_id="s1"):
-    return sessions_dir(env) / session_id
+    if is_guid_ref(session_id):
+        return sessions_dir(env) / compact_guid(session_id)
+    ensure_alias(env, session_id)
+    alias_path = aliases_dir(env) / session_id
+    if alias_path.is_symlink():
+        return (alias_path.parent / os.readlink(alias_path)).resolve(strict=False)
+    return sessions_dir(env) / compact_guid(guid_for_ref(session_id))
 
 
 def socket_path(env, session_id="s1"):
@@ -602,7 +654,7 @@ def start_sigterm_ignoring_process(tmp, name):
 
 
 def session_agent_pids(env):
-    needle = f":internal-session-agent: --session-dir {Path(env['XDG_RUNTIME_DIR']) / 'sessh' / 's'}"
+    needle = f":internal-session-agent: --session-dir {sessions_dir(env)}"
     result = subprocess.run(
         ["ps", "-axo", "pid=,command="],
         cwd=ROOT,
@@ -1991,15 +2043,15 @@ def run_session_agent_registry_test(base_env):
         )
         shell.chmod(0o700)
 
-        session_dir = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s42"
-        session_dir.mkdir(mode=0o700, parents=True)
-        socket_file = session_dir / "s"
-        meta_file = session_dir / "meta"
-        detached_file = session_dir / "detached"
-        compat_file = session_dir / "compat"
+        session_path = session_dir(env, "s42")
+        session_path.mkdir(mode=0o700, parents=True)
+        socket_file = session_path / "s"
+        meta_file = session_path / "meta"
+        detached_file = session_path / "detached"
+        compat_file = session_path / "compat"
 
         proc = subprocess.Popen(
-            [str(BIN), ":internal-session-agent:", "--session-dir", str(session_dir)],
+            [str(BIN), ":internal-session-agent:", "--session-dir", str(session_path)],
             cwd=ROOT,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -2023,7 +2075,7 @@ def run_session_agent_registry_test(base_env):
             conn.connect(str(socket_file))
             send_hello(conn)
             send_resize(conn, rows=4, cols=40)
-            send_frame(conn, SESSION_NEW, pack_session_new(shell))
+            send_frame(conn, SESSION_NEW, pack_session_new(shell, session_id="s42"))
             message_type, payload = recv_frame(conn)
             if message_type != SESSION_ATTACHED:
                 raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
@@ -2055,7 +2107,7 @@ def run_session_agent_registry_test(base_env):
             wait_missing(socket_file)
             wait_missing(compat_file)
             wait_missing(detached_file)
-            if not session_dir.exists():
+            if not session_path.exists():
                 raise AssertionError("session tombstone was removed")
         finally:
             if conn is not None:
@@ -2104,12 +2156,12 @@ def run_host_broker_starts_session_agent_test(base_env):
             assert_session_attached(payload)
             recv_draw_until(conn, b"BROKER_READY")
 
-            session_dir = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s1"
-            if not (session_dir / "s").exists():
+            session_path = session_dir(env, "s1")
+            if not (session_path / "s").exists():
                 raise AssertionError("host broker did not create a session-agent socket")
-            if not os.path.islink(session_dir / "compat"):
+            if not os.path.islink(session_path / "compat"):
                 raise AssertionError("host broker session agent did not write compat symlink")
-            assert_runtime_dir_symlink(env, Path(env["XDG_RUNTIME_DIR"]) / "sessh")
+            assert_runtime_dir_symlink(env, Path(env["SESSH_STATE_DIR"]))
 
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
             recv_until_message(conn, SESSION_ENDED)
@@ -2117,9 +2169,9 @@ def run_host_broker_starts_session_agent_test(base_env):
             proc.wait(timeout=5.0)
             if proc.returncode != 0:
                 raise AssertionError(proc.stderr.read().decode("utf-8", "replace"))
-            wait_missing(session_dir / "s")
-            wait_missing(session_dir / "compat")
-            if not session_dir.exists():
+            wait_missing(session_path / "s")
+            wait_missing(session_path / "compat")
+            if not session_path.exists():
                 raise AssertionError("host broker removed session tombstone")
         finally:
             if proc.poll() is None:
@@ -2144,7 +2196,7 @@ def run_host_broker_registry_commands_test(base_env):
             "done\n"
         )
         shell.chmod(0o700)
-        session_dir = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s1"
+        session_path = session_dir(env, "s1")
 
         proc = subprocess.Popen(
             [str(BIN), ":internal-host-broker:"],
@@ -2166,7 +2218,7 @@ def run_host_broker_registry_commands_test(base_env):
             recv_draw_until(conn, b"BROKER_COMMAND_READY")
             proc.stdin.close()
             proc.wait(timeout=5.0)
-            wait_file(session_dir / "detached")
+            wait_file(session_path / "detached")
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -2193,14 +2245,14 @@ def run_host_broker_registry_commands_test(base_env):
             if message_type != SESSION_ATTACHED:
                 raise AssertionError((message_type, payload))
             assert_session_attached(payload)
-            if (session_dir / "detached").exists():
+            if (session_path / "detached").exists():
                 raise AssertionError("broker attach did not remove detached marker")
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
             recv_until_message(conn, SESSION_ENDED)
             proc.stdin.close()
             proc.wait(timeout=5.0)
-            wait_missing(session_dir / "s")
-            wait_missing(session_dir / "compat")
+            wait_missing(session_path / "s")
+            wait_missing(session_path / "compat")
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -2222,7 +2274,7 @@ def run_host_broker_registry_commands_test(base_env):
         try:
             send_hello(conn)
             send_resize(conn, rows=4, cols=40)
-            send_frame(conn, SESSION_NEW, pack_session_new(shell))
+            send_frame(conn, SESSION_NEW, pack_session_new(shell, session_id="s2"))
             message_type, payload = recv_frame(conn)
             if message_type != SESSION_ATTACHED:
                 raise AssertionError((message_type, payload))
@@ -2230,7 +2282,7 @@ def run_host_broker_registry_commands_test(base_env):
             recv_draw_until(conn, b"BROKER_COMMAND_READY")
             proc.stdin.close()
             proc.wait(timeout=5.0)
-            wait_file(Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s2" / "detached")
+            wait_file(session_dir(env, "s2") / "detached")
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -2239,7 +2291,7 @@ def run_host_broker_registry_commands_test(base_env):
         killed = run([":internal-host-broker:", "--kill", "s2"], env, check=True, timeout=5.0)
         if "ENDED s2" not in killed.stdout or killed.stderr:
             raise AssertionError(killed)
-        s2_dir = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s2"
+        s2_dir = session_dir(env, "s2")
         wait_missing(s2_dir / "s")
         wait_missing(s2_dir / "compat")
 
@@ -2256,7 +2308,7 @@ def run_host_broker_registry_commands_test(base_env):
             try:
                 send_hello(conn)
                 send_resize(conn, rows=4, cols=40)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                send_frame(conn, SESSION_NEW, pack_session_new(shell, session_id=expected_id))
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
                     raise AssertionError((expected_id, message_type, payload))
@@ -2264,7 +2316,7 @@ def run_host_broker_registry_commands_test(base_env):
                 recv_draw_until(conn, b"BROKER_COMMAND_READY")
                 proc.stdin.close()
                 proc.wait(timeout=5.0)
-                wait_file(Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / expected_id / "detached")
+                wait_file(session_dir(env, expected_id) / "detached")
             finally:
                 if proc.poll() is None:
                     proc.terminate()
@@ -2274,9 +2326,9 @@ def run_host_broker_registry_commands_test(base_env):
         if "KILLING_ALL" not in stopped.stdout or stopped.stderr:
             raise AssertionError(stopped)
         for expected_id in ("s3", "s4"):
-            session_dir = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / expected_id
-            wait_missing(session_dir / "s")
-            wait_missing(session_dir / "compat")
+            path = session_dir(env, expected_id)
+            wait_missing(path / "s")
+            wait_missing(path / "compat")
 
 
 def run_broker_kill_edge_cases_test(base_env):
@@ -2338,7 +2390,7 @@ def run_broker_kill_edge_cases_test(base_env):
                 raise AssertionError(stopped)
             lines = compat_log.read_text().splitlines()
             for session_id in ("s1", "s2"):
-                expected = f":local: --compat-version {sessh_version()} --kill {session_id}"
+                expected = f":local: --compat-version {sessh_version()} --kill {compact_guid(guid_for_ref(session_id))}"
                 if expected not in lines:
                     raise AssertionError(lines)
             if any(proc.poll() is not None for proc in sleepers):
@@ -2410,7 +2462,7 @@ def run_env_config_client_test(tmp_root):
         finally:
             close_client(pid, fd)
 
-        wait_log_contains(Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s1" / "agent.log", "scrollback_rows=80")
+        wait_log_contains(session_dir(env, "s1") / "agent.log", "scrollback_rows=80")
 
         pid, fd = spawn_client(env, ["--attach"])
         try:
@@ -2530,8 +2582,10 @@ def main():
                 read_until(fd, b"$ ")
                 os.write(fd, b"echo TERM=$TERM\n")
                 read_until(fd, b"TERM=xterm-256color")
-                os.write(fd, b"echo SESSH_ID=$SESSH_ID\n")
-                read_until(fd, b"SESSH_ID=s1")
+                os.write(fd, b"echo SESSH_ID=${SESSH_ID-unset}\n")
+                read_until(fd, b"SESSH_ID=unset")
+                os.write(fd, b"echo SESSH_GUID=$SESSH_GUID\n")
+                read_until(fd, b"SESSH_GUID=")
                 os.write(fd, b"echo sessh_before_reconnect\n")
                 read_until_count(fd, b"sessh_before_reconnect", 2)
                 os.write(fd, b"~.")
@@ -2662,15 +2716,15 @@ def main():
             if "ENDED s6" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
-            log_path = Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "s" / "s6" / "agent.log"
+            log_path = session_dir(env, "s6") / "agent.log"
             log_text = wait_log_contains(log_path, "event=session_agent_stop")
             for needle in (
-                "event=session_agent_start id=s6",
-                "event=session_create id=s6",
-                "event=attach id=s6",
-                "event=detach id=s6",
+                "event=session_agent_start",
+                "event=session_create",
+                "event=attach",
+                "event=detach",
                 "event=session_agent_shutdown_requested",
-                "event=session_end id=s6",
+                "event=session_end",
                 "event=session_agent_stop",
             ):
                 if needle not in log_text:

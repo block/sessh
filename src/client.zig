@@ -9,6 +9,7 @@ const client_renderer = @import("client_renderer.zig");
 const io_helpers = @import("io.zig");
 const protocol = @import("protocol.zig");
 const process_exit = @import("process_exit.zig");
+const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
 const terminal = @import("terminal.zig");
 
@@ -33,6 +34,8 @@ const LocalOptions = struct {
     action_set: bool = false,
     attach_id: ?[]const u8 = null,
     kill_id: ?[]const u8 = null,
+    alias: ?[]const u8 = null,
+    state_dir: ?[]const u8 = null,
     leader: Leader = .none,
     leader_set: bool = false,
     banner_args: DetachBannerArgs = .{},
@@ -384,6 +387,10 @@ const PendingRepaint = struct {
 
 /// Client-side state carried across runtime transports for one attached session.
 pub const RuntimeSession = struct {
+    guid: [36]u8 = [_]u8{0} ** 36,
+    guid_len: usize = 0,
+    primary_alias: [128]u8 = [_]u8{0} ** 128,
+    primary_alias_len: usize = 0,
     scrollback_cursor: ScrollbackCursor = .{},
     viewport_offset: i32 = 0,
     /// Latest outstanding RepaintRequest sequence. Older responses are stale.
@@ -395,8 +402,25 @@ pub const RuntimeSession = struct {
     }
 
     pub fn idSlice(self: *const RuntimeSession) []const u8 {
-        _ = self;
-        return "";
+        if (self.primary_alias_len > 0) return self.primary_alias[0..self.primary_alias_len];
+        return self.guidSlice();
+    }
+
+    pub fn guidSlice(self: *const RuntimeSession) []const u8 {
+        return self.guid[0..self.guid_len];
+    }
+
+    pub fn setIdentity(self: *RuntimeSession, guid: []const u8) !void {
+        if (guid.len > self.guid.len) return error.SessionGuidTooLarge;
+        @memcpy(self.guid[0..guid.len], guid);
+        self.guid_len = guid.len;
+        self.primary_alias_len = 0;
+
+        const alias = (try session_registry.primaryAliasForGuid(app_allocator.allocator(), guid)) orelse return;
+        defer app_allocator.allocator().free(alias);
+        if (alias.len > self.primary_alias.len) return error.SessionAliasTooLarge;
+        @memcpy(self.primary_alias[0..alias.len], alias);
+        self.primary_alias_len = alias.len;
     }
 };
 
@@ -919,37 +943,70 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return process_exit.request(64);
     };
     client_log.setLevel(options.client_log_level);
+    if (options.state_dir) |dir| socket_transport.setRuntimeRootOverride(dir);
 
     return runBrokerClient(allocator, args, options);
 }
 
 fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, options: LocalOptions) !void {
+    var broker_arg_buf: [2][]const u8 = undefined;
+    const state_broker_args = brokerStateArgs(options, &broker_arg_buf);
     switch (options.action) {
         .list => {
-            const exit_status = try runLocalBrokerCommand(allocator, args[0], &.{"--list"});
+            var command_args_buf: [3][]const u8 = undefined;
+            const command_args = appendBrokerCommand(state_broker_args, "--list", null, &command_args_buf);
+            const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
         .kill => {
-            const exit_status = try runLocalBrokerCommand(allocator, args[0], &.{ "--kill", options.kill_id.? });
+            var command_args_buf: [4][]const u8 = undefined;
+            const command_args = appendBrokerCommand(state_broker_args, "--kill", options.kill_id.?, &command_args_buf);
+            const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
         .kill_all => {
-            const exit_status = try runLocalBrokerCommand(allocator, args[0], &.{"--kill-all"});
+            var command_args_buf: [3][]const u8 = undefined;
+            const command_args = appendBrokerCommand(state_broker_args, "--kill-all", null, &command_args_buf);
+            const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
         .new, .attach => {},
     }
 
-    var child = try startLocalBroker(allocator, args[0]);
+    var generated_guid: ?[]u8 = null;
+    defer if (generated_guid) |guid| allocator.free(guid);
+    var generated_alias: ?[]u8 = null;
+    defer if (generated_alias) |alias| allocator.free(alias);
+    var attach_guid: ?[]u8 = null;
+    defer if (attach_guid) |guid| allocator.free(guid);
+
+    if (options.action == .new) {
+        generated_guid = try session_registry.generateGuid(allocator);
+        if (options.alias) |alias| {
+            try session_registry.createAlias(allocator, alias, generated_guid.?);
+            generated_alias = try allocator.dupe(u8, alias);
+        } else {
+            generated_alias = try session_registry.createGeneratedAlias(allocator, generated_guid.?);
+        }
+    } else if (options.attach_id) |ref| {
+        attach_guid = try session_registry.resolveRefToGuid(allocator, ref);
+    }
+
+    var child = try startLocalBroker(allocator, args[0], state_broker_args);
     var session = (switch (options.action) {
-        .new => startNewSessionOnRuntime(child.stdout.?.handle, child.stdin.?.handle, options.scrollback_row_count),
+        .new => startNewSessionOnRuntime(
+            child.stdout.?.handle,
+            child.stdin.?.handle,
+            options.scrollback_row_count,
+            generated_guid.?,
+        ),
         .attach => startAttachSessionOnRuntime(
             child.stdout.?.handle,
             child.stdin.?.handle,
-            options.attach_id orelse "",
+            attach_guid orelse "",
             options.initial_scrollback_row_count,
         ),
         .list, .kill, .kill_all => unreachable,
@@ -977,7 +1034,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         switch (end) {
             .detach => {
                 terminateChild(&child);
-                writeDetachBannerForTarget(&.{}, ":local:", options.banner_args.slice(), "");
+                writeDetachBannerForTarget(&.{}, ":local:", options.banner_args.slice(), session.idSlice());
                 return;
             },
             .session_ended => {
@@ -1002,7 +1059,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         }
 
         try io_helpers.writeAll(2, "\r\nsessh: reconnecting; type <enter>~. to abort\r\n");
-        child = startLocalBroker(allocator, args[0]) catch |err| {
+        child = startLocalBroker(allocator, args[0], state_broker_args) catch |err| {
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -1015,9 +1072,37 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     }
 }
 
-fn startLocalBroker(allocator: std.mem.Allocator, exe: []const u8) !std.process.Child {
-    const argv = [_][]const u8{ exe, ":internal-host-broker:" };
-    var child = std.process.Child.init(&argv, allocator);
+fn brokerStateArgs(options: LocalOptions, buf: *[2][]const u8) []const []const u8 {
+    if (options.state_dir) |dir| {
+        buf[0] = "--state-dir";
+        buf[1] = dir;
+        return buf[0..2];
+    }
+    return buf[0..0];
+}
+
+fn appendBrokerCommand(
+    state_args: []const []const u8,
+    command: []const u8,
+    value: ?[]const u8,
+    buf: [][]const u8,
+) []const []const u8 {
+    @memcpy(buf[0..state_args.len], state_args);
+    buf[state_args.len] = command;
+    if (value) |arg| {
+        buf[state_args.len + 1] = arg;
+        return buf[0 .. state_args.len + 2];
+    }
+    return buf[0 .. state_args.len + 1];
+}
+
+fn startLocalBroker(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8) !std.process.Child {
+    const argv = try allocator.alloc([]const u8, 2 + broker_args.len);
+    defer allocator.free(argv);
+    argv[0] = exe;
+    argv[1] = ":internal-host-broker:";
+    @memcpy(argv[2..], broker_args);
+    var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Inherit;
@@ -1105,6 +1190,17 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingKillId;
             options.kill_id = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--alias")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingAlias;
+            if (!session_registry.isValidAlias(args[i])) return error.InvalidAlias;
+            options.alias = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--state-dir")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingStateDir;
+            options.state_dir = args[i];
             i += 1;
         } else if (std.mem.eql(u8, arg, "--leader")) {
             i += 1;
@@ -1202,10 +1298,11 @@ pub fn startNewSessionOnRuntime(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     scrollback_row_count: u32,
+    session_guid: []const u8,
 ) !RuntimeSession {
     const viewport_offset = queryInitialViewportOffset();
     try runtimeHandshake(read_fd, write_fd);
-    try sendSessionNew(write_fd, terminal.currentWindowSize(), scrollback_row_count, viewport_offset);
+    try sendSessionNew(write_fd, terminal.currentWindowSize(), scrollback_row_count, viewport_offset, session_guid);
     var session = try readRuntimeSession(read_fd);
     session.viewport_offset = viewport_offset orelse 0;
     return session;
@@ -1214,13 +1311,12 @@ pub fn startNewSessionOnRuntime(
 pub fn startAttachSessionOnRuntime(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
-    attach_id: []const u8,
+    session_guid: []const u8,
     initial_scrollback_row_count: ?u32,
 ) !RuntimeSession {
-    _ = attach_id;
     const viewport_offset = queryInitialViewportOffset();
     try runtimeHandshake(read_fd, write_fd);
-    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null);
+    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_guid);
     var session = try readRuntimeSession(read_fd);
     session.viewport_offset = viewport_offset orelse 0;
     session.pending_repaint.repaint_request_seq = repaint_request_seq;
@@ -1252,7 +1348,7 @@ fn reconnectSessionOnRuntimeInner(
     wait_for_repaint: bool,
 ) !void {
     try runtimeHandshakeInner(read_fd, write_fd, cancelled);
-    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor);
+    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice());
     try readSessionAttachedInner(read_fd, cancelled);
     if (wait_for_repaint) try finishReconnectRepaintInner(read_fd, session, cancelled);
 }
@@ -1378,6 +1474,26 @@ pub fn writeDetachBannerForTarget(ssh_options: []const []const u8, target: []con
     writeDetachBannerForTargetInner(ssh_options, target, sessh_options, session_id) catch {};
 }
 
+pub fn writeDetachBannerForSessionRef(sessh_options: []const []const u8, session_ref: []const u8) void {
+    if (c.isatty(1) == 0) return;
+    writeDetachBannerForSessionRefInner(sessh_options, session_ref) catch {};
+}
+
+fn writeDetachBannerForSessionRefInner(sessh_options: []const []const u8, session_ref: []const u8) !void {
+    try io_helpers.writeAll(1, "--- sessh: detached. To re-attach: `");
+    try writeShellArg(1, "sessh");
+    for (sessh_options) |arg| {
+        try io_helpers.writeAll(1, " ");
+        try writeShellArg(1, arg);
+    }
+    try io_helpers.writeAll(1, " --attach");
+    if (session_ref.len > 0) {
+        try io_helpers.writeAll(1, " ");
+        try writeShellArg(1, session_ref);
+    }
+    try io_helpers.writeAll(1, "` ---\r\n");
+}
+
 fn writeDetachBannerForTargetInner(ssh_options: []const []const u8, target: []const u8, sessh_options: []const []const u8, session_id: []const u8) !void {
     try io_helpers.writeAll(1, "--- sessh: detached. To re-attach: `");
     try writeShellArg(1, "sessh");
@@ -1431,8 +1547,29 @@ fn isPlainShellArg(arg: []const u8) bool {
 }
 
 fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
-    try readSessionAttached(read_fd);
-    return .{};
+    while (true) {
+        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .error_message => {
+                const parsed = try parseErrorPayload(frame.payload);
+                if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
+                    freeErrorPayload(parsed);
+                    return error.VersionMismatch;
+                }
+                try printParsedError(parsed);
+                return process_exit.request(1);
+            },
+            .session_attached => {
+                var attached = try protocol.decodePayload(pb.SessionAttached, app_allocator.allocator(), frame.payload);
+                defer attached.deinit(app_allocator.allocator());
+                var session = RuntimeSession{};
+                try session.setIdentity(attached.session_guid);
+                return session;
+            },
+            else => return error.UnexpectedFrame,
+        }
+    }
 }
 
 fn queryInitialViewportOffset() ?i32 {
@@ -1611,6 +1748,7 @@ fn sendSessionNew(
     size: WindowSize,
     scrollback_row_count: u32,
     viewport_offset: ?i32,
+    session_guid: []const u8,
 ) !void {
     var message = pb.SessionNew{
         .resize = .{
@@ -1619,6 +1757,7 @@ fn sendSessionNew(
             .viewport_offset = viewport_offset,
         },
         .scrollback_row_limit = scrollback_row_count,
+        .session_guid = session_guid,
     };
     defer message.environment.deinit(app_allocator.allocator());
     const default_colors = queryDefaultColorsForSession();
@@ -1658,6 +1797,7 @@ fn sendSessionAttach(
     viewport_offset: ?i32,
     initial_scrollback_row_count: ?u32,
     reconnect_cursor: ?*const ScrollbackCursor,
+    session_guid: []const u8,
 ) !u64 {
     const repaint_request_seq = allocateRepaintRequestSeq();
     const message = pb.SessionAttach{
@@ -1677,6 +1817,7 @@ fn sendSessionAttach(
                 .initial_scrollback_rows = initial_scrollback_row_count,
             },
         },
+        .session_guid = session_guid,
     };
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);

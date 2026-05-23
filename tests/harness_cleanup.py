@@ -11,10 +11,13 @@ BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
 
 
 def sessions_dir(env):
+    state_dir = env.get("SESSH_STATE_DIR")
+    if state_dir:
+        return Path(state_dir) / "g"
     runtime_dir = env.get("XDG_RUNTIME_DIR")
     if not runtime_dir:
-        raise AssertionError("test cleanup requires XDG_RUNTIME_DIR")
-    return Path(runtime_dir) / "sessh" / "s"
+        raise AssertionError("test cleanup requires SESSH_STATE_DIR or XDG_RUNTIME_DIR")
+    return Path(runtime_dir) / "sessh" / "g"
 
 
 def cleanup_runtime(env, timeout=5.0):
