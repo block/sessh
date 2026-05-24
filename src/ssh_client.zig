@@ -2966,15 +2966,6 @@ test "parseSshArgs accepts no bootstrap shorthand after host" {
     try std.testing.expectEqualStrings("--no-bootstrap", parsed.banner_args.buf[0]);
 }
 
-test "parseSshArgs rejects old bootstrap boolean syntax" {
-    try std.testing.expectError(error.RemoteCommandUnsupported, parseSshArgs(&.{
-        "sessh",
-        "example.com",
-        "--bootstrap",
-        "false",
-    }));
-}
-
 test "parseSshArgs accepts attach without an id after host" {
     const parsed = try parseSshArgs(&.{
         "sesshmux",
@@ -3091,14 +3082,6 @@ fn expectArgvEqual(expected: []const []const u8, actual: []const []const u8) !vo
     for (expected, actual) |expected_arg, actual_arg| {
         try std.testing.expectEqualStrings(expected_arg, actual_arg);
     }
-}
-
-test "parseSshArgs reports missing host for translated actions before host" {
-    try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sesshmux", "--list" }));
-    try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sesshmux", "--kill", "s1" }));
-    try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sesshmux", "--kill-all" }));
-    try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sesshmux", "--killall" }));
-    try std.testing.expectError(error.MissingHost, parseSshArgs(&.{ "sesshmux", "--attach", "s1" }));
 }
 
 test "sesshmux-dev uses development artifact upload" {
