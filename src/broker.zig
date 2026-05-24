@@ -442,7 +442,7 @@ fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, se
     defer request.deinit(allocator);
     if (request.session_alias.len > 0) {
         if (!session_registry.isValidAlias(request.session_alias)) return error.InvalidAlias;
-        if (!try aliasAvailableForGuid(allocator, request.session_alias, request.session_guid)) return error.AliasExists;
+        if (!try session_registry.aliasAvailableForGuid(allocator, request.session_alias, request.session_guid)) return error.AliasExists;
     }
     var allocation = if (request.session_guid.len > 0)
         try session_registry.allocateSessionDirForGuid(allocator, request.session_guid)
@@ -472,17 +472,6 @@ fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, se
         io.sleepMillis(20);
     }
     return error.SessionAgentDidNotStart;
-}
-
-fn aliasAvailableForGuid(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !bool {
-    const existing = session_registry.resolveRefToGuid(allocator, alias) catch |err| switch (err) {
-        error.FileNotFound => return true,
-        else => return err,
-    };
-    defer allocator.free(existing);
-    const canonical = try session_registry.canonicalGuid(allocator, guid);
-    defer allocator.free(canonical);
-    return std.mem.eql(u8, existing, canonical);
 }
 
 fn createSessionAndRelay(

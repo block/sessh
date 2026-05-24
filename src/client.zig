@@ -1714,11 +1714,13 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     var local_alias_created = false;
 
     if (options.action == .new) {
-        generated_guid = try session_registry.generateGuid(allocator);
         if (options.alias) |alias| {
+            generated_guid = try session_registry.generateGuid(allocator);
             generated_alias = try allocator.dupe(u8, alias);
         } else {
-            generated_alias = try session_registry.defaultAliasForGuid(allocator, generated_guid.?);
+            const identity = try session_registry.generateGuidWithDefaultAlias(allocator);
+            generated_guid = identity.guid;
+            generated_alias = identity.alias;
         }
     }
 
@@ -1933,7 +1935,7 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
         } else if (std.mem.eql(u8, arg, "--alias")) {
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingAlias;
-            if (!session_registry.isValidAlias(args[i])) return error.InvalidAlias;
+            if (!session_registry.isValidCustomAlias(args[i])) return error.InvalidAlias;
             options.alias = args[i];
             i += 1;
         } else if (std.mem.eql(u8, arg, "--runtime-dir")) {

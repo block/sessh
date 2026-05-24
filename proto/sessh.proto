@@ -84,7 +84,7 @@ message SessionCreate {
   // s-550e8400-e29b-41d4-a716-446655440000.
   string session_guid = 5;
   // Alias to register for this session in the session agent's namespace. Empty
-  // asks the receiver to generate a remote alias.
+  // asks the receiver to generate an alias.
   string session_alias = 6;
   // Optional argv to exec inside the PTY. Empty starts the user's interactive
   // login shell.

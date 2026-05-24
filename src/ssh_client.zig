@@ -2130,7 +2130,7 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
         } else if (std.mem.eql(u8, arg, "--alias")) {
             index.* += 1;
             if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingAlias;
-            if (!session_registry.isValidAlias(args[index.*])) return error.InvalidAlias;
+            if (!session_registry.isValidCustomAlias(args[index.*])) return error.InvalidAlias;
             parsed.alias = args[index.*];
             index.* += 1;
         } else if (std.mem.eql(u8, arg, "--runtime-dir")) {
@@ -3030,6 +3030,21 @@ test "parseSshArgs accepts persistent command argv after delimiter" {
     try std.testing.expectEqual(@as(usize, 2), parsed.command_argv.len);
     try std.testing.expectEqualStrings("top", parsed.command_argv[0]);
     try std.testing.expectEqualStrings("-H", parsed.command_argv[1]);
+}
+
+test "parseSshArgs rejects custom aliases with reserved typed prefix shape" {
+    try std.testing.expectError(error.InvalidAlias, parseSshArgs(&.{
+        "sessh",
+        "example.com",
+        "--alias",
+        "s-deadbeef",
+    }));
+    try std.testing.expectError(error.InvalidAlias, parseSshArgs(&.{
+        "sessh",
+        "example.com",
+        "--alias",
+        "x-anything",
+    }));
 }
 
 test "translateMuxArgs maps new command to ssh-shaped invocation" {

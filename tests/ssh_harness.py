@@ -1151,7 +1151,7 @@ def test_ssh_remote_default_alias_is_remote_generated(tmp):
         raise AssertionError(listed)
     rows = [line.split("\t") for line in listed.stdout.splitlines()[1:] if line]
     aliases = [row[0] for row in rows if len(row) >= 1]
-    remote_aliases = [alias for alias in aliases if re.fullmatch(r"r[0-9a-f]{8}", alias)]
+    remote_aliases = [alias for alias in aliases if re.fullmatch(r"s-[0-9a-f]{4,32}", alias)]
     if len(remote_aliases) != 1:
         raise AssertionError(listed.stdout)
 

@@ -11,6 +11,7 @@ pub const session_guid_prefix = "s-";
 pub const client_guid_prefix = "c-";
 pub const session_guid_len = session_guid_prefix.len + guid_body_len;
 pub const client_guid_len = client_guid_prefix.len + guid_body_len;
+pub const default_alias_hex_len = 4;
 
 pub const SessionPaths = struct {
     dir: []u8,
@@ -38,6 +39,17 @@ pub const Allocation = struct {
     pub fn deinit(self: *Allocation, allocator: std.mem.Allocator) void {
         self.paths.deinit(allocator);
         allocator.free(self.id);
+        self.* = undefined;
+    }
+};
+
+pub const GeneratedIdentity = struct {
+    guid: []u8,
+    alias: []u8,
+
+    pub fn deinit(self: *GeneratedIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.alias);
+        allocator.free(self.guid);
         self.* = undefined;
     }
 };
@@ -286,6 +298,63 @@ pub fn generateClientGuid(allocator: std.mem.Allocator) ![]u8 {
     return out;
 }
 
+pub fn generateGuidWithDefaultAlias(allocator: std.mem.Allocator) !GeneratedIdentity {
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    return generateGuidWithDefaultAliasInRoot(allocator, root);
+}
+
+pub fn generateGuidWithDefaultAliasInRoot(allocator: std.mem.Allocator, root: []const u8) !GeneratedIdentity {
+    const guid = try generateGuid(allocator);
+    errdefer allocator.free(guid);
+    const alias = try availableDefaultAliasForGuidInRoot(allocator, root, guid);
+    return .{ .guid = guid, .alias = alias };
+}
+
+pub fn createDefaultAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    return createDefaultAliasForGuidInRoot(allocator, root, guid);
+}
+
+pub fn createDefaultAliasForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
+    var hex_len: usize = default_alias_hex_len;
+    while (hex_len <= compact_guid_len) : (hex_len += 1) {
+        const alias = try defaultAliasForGuidLen(allocator, guid, hex_len);
+        errdefer allocator.free(alias);
+        ensureAliasForGuidInRoot(allocator, root, alias, guid) catch |err| switch (err) {
+            error.AliasExists => {
+                allocator.free(alias);
+                continue;
+            },
+            else => return err,
+        };
+        return alias;
+    }
+    return error.DefaultAliasExhausted;
+}
+
+fn availableDefaultAliasForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
+    var hex_len: usize = default_alias_hex_len;
+    while (hex_len <= compact_guid_len) : (hex_len += 1) {
+        const alias = try defaultAliasForGuidLen(allocator, guid, hex_len);
+        errdefer allocator.free(alias);
+        if (try aliasAvailableForGuidInRoot(allocator, root, alias, guid)) return alias;
+        allocator.free(alias);
+    }
+    return error.DefaultAliasExhausted;
+}
+
+fn generateGuidWithDefaultAliasFromCandidatesInRoot(allocator: std.mem.Allocator, root: []const u8, candidates: []const []const u8) !GeneratedIdentity {
+    for (candidates) |candidate| {
+        const guid = try canonicalGuid(allocator, candidate);
+        errdefer allocator.free(guid);
+        const alias = try availableDefaultAliasForGuidInRoot(allocator, root, guid);
+        return .{ .guid = guid, .alias = alias };
+    }
+    return error.DefaultAliasExhausted;
+}
+
 pub fn writeMeta(paths: SessionPaths, agent_pid: c.pid_t, version: []const u8) !void {
     const file = try std.fs.cwd().createFile(paths.meta, .{ .truncate = true, .mode = 0o600 });
     defer file.close();
@@ -474,6 +543,23 @@ pub fn ensureAliasForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, 
     };
 }
 
+pub fn aliasAvailableForGuid(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !bool {
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    return aliasAvailableForGuidInRoot(allocator, root, alias, guid);
+}
+
+pub fn aliasAvailableForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8, guid: []const u8) !bool {
+    const existing = resolveRefToGuidInRoot(allocator, root, alias) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return err,
+    };
+    defer allocator.free(existing);
+    const canonical = try canonicalGuid(allocator, guid);
+    defer allocator.free(canonical);
+    return std.mem.eql(u8, existing, canonical);
+}
+
 pub fn removeAlias(allocator: std.mem.Allocator, alias: []const u8) !void {
     const root = try socket_transport.stateRoot(allocator);
     defer allocator.free(root);
@@ -490,9 +576,16 @@ pub fn removeAliasInRoot(allocator: std.mem.Allocator, root: []const u8, alias: 
 }
 
 pub fn defaultAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    return defaultAliasForGuidLen(allocator, guid, default_alias_hex_len);
+}
+
+fn defaultAliasForGuidLen(allocator: std.mem.Allocator, guid: []const u8, hex_len: usize) ![]u8 {
+    if (hex_len < default_alias_hex_len or hex_len > compact_guid_len) return error.InvalidAliasLength;
     const canonical = try canonicalGuid(allocator, guid);
     defer allocator.free(canonical);
-    return allocator.dupe(u8, canonical[session_guid_prefix.len .. session_guid_prefix.len + 8]);
+    const compact = try compactGuid(allocator, canonical);
+    defer allocator.free(compact);
+    return std.fmt.allocPrint(allocator, "s-{s}", .{compact[0..hex_len]});
 }
 
 pub fn createGeneratedRemoteAlias(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
@@ -502,21 +595,39 @@ pub fn createGeneratedRemoteAlias(allocator: std.mem.Allocator, guid: []const u8
 }
 
 pub fn createGeneratedRemoteAliasInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
-    while (true) {
-        var bytes: [4]u8 = undefined;
+    var alias_hex_len: usize = 8;
+    while (alias_hex_len <= compact_guid_len) : (alias_hex_len += 1) {
+        var bytes: [16]u8 = undefined;
         std.crypto.random.bytes(&bytes);
         const hex = std.fmt.bytesToHex(bytes, .lower);
-        const alias = try std.fmt.allocPrint(allocator, "r{s}", .{&hex});
+        const alias = try std.fmt.allocPrint(allocator, "a-{s}", .{hex[0..alias_hex_len]});
         errdefer allocator.free(alias);
-        createAliasInRoot(allocator, root, alias, guid) catch |err| switch (err) {
-            error.AliasExists => {
-                allocator.free(alias);
-                continue;
-            },
-            else => return err,
-        };
-        return alias;
+        if (try createAliasCandidateInRoot(allocator, root, alias, guid)) return alias;
+        allocator.free(alias);
     }
+    return error.GeneratedAliasExhausted;
+}
+
+fn createGeneratedAliasFromHexCandidatesInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8, candidates: []const []const u8) ![]u8 {
+    var alias_hex_len: usize = 8;
+    for (candidates) |candidate| {
+        if (candidate.len < alias_hex_len) return error.InvalidAliasLength;
+        const alias = try std.fmt.allocPrint(allocator, "a-{s}", .{candidate[0..alias_hex_len]});
+        errdefer allocator.free(alias);
+        if (try createAliasCandidateInRoot(allocator, root, alias, guid)) return alias;
+        allocator.free(alias);
+        alias_hex_len += 1;
+        if (alias_hex_len > compact_guid_len) break;
+    }
+    return error.GeneratedAliasExhausted;
+}
+
+fn createAliasCandidateInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8, guid: []const u8) !bool {
+    createAliasInRoot(allocator, root, alias, guid) catch |err| switch (err) {
+        error.AliasExists => return false,
+        else => return err,
+    };
+    return true;
 }
 
 pub fn pathsForRef(allocator: std.mem.Allocator, ref: []const u8) !SessionPaths {
@@ -586,11 +697,31 @@ pub fn isValidAlias(alias: []const u8) bool {
         isValidGuid(alias) or
         isValidCompactGuid(alias) or
         isReservedGuidLikeAlias(alias)) return false;
+    if (alias.len >= 2 and alias[1] == '-' and !isValidGeneratedAlias(alias)) return false;
     for (alias) |byte| {
         switch (byte) {
             'A'...'Z', 'a'...'z', '0'...'9', '_', '-', '.' => {},
             else => return false,
         }
+    }
+    return true;
+}
+
+pub fn isValidCustomAlias(alias: []const u8) bool {
+    if (!isValidAlias(alias)) return false;
+    return alias.len < 2 or alias[1] != '-';
+}
+
+fn isValidGeneratedAlias(alias: []const u8) bool {
+    if (std.mem.startsWith(u8, alias, "s-")) {
+        if (alias.len < 2 + default_alias_hex_len or alias.len > 2 + compact_guid_len) return false;
+    } else if (std.mem.startsWith(u8, alias, "a-")) {
+        if (alias.len < 10 or alias.len > 2 + compact_guid_len) return false;
+    } else {
+        return false;
+    }
+    for (alias[2..]) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
     }
     return true;
 }
@@ -772,6 +903,19 @@ test "validates session ids and aliases" {
     try std.testing.expect(!isValidSessionId("550e8400-e29b-41d4-a716-44665544000z"));
     try std.testing.expect(isValidAlias("s1"));
     try std.testing.expect(isValidAlias("my-awesome-session"));
+    try std.testing.expect(isValidAlias("s-550e"));
+    try std.testing.expect(isValidAlias("s-550e8"));
+    try std.testing.expect(isValidAlias("s-550e8400"));
+    try std.testing.expect(isValidAlias("a-550e8400"));
+    try std.testing.expect(isValidAlias("a-550e8400a"));
+    try std.testing.expect(!isValidAlias("s-not-hex"));
+    try std.testing.expect(!isValidAlias("a-not-hex"));
+    try std.testing.expect(!isValidAlias("x-anything"));
+    try std.testing.expect(isValidCustomAlias("s1"));
+    try std.testing.expect(isValidCustomAlias("my-awesome-session"));
+    try std.testing.expect(!isValidCustomAlias("s-550e"));
+    try std.testing.expect(!isValidCustomAlias("a-550e8400"));
+    try std.testing.expect(!isValidCustomAlias("x-anything"));
     try std.testing.expect(!isValidAlias("s-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(!isValidAlias("c-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(!isValidAlias("x-550e8400-e29b-41d4-a716-446655440000"));
@@ -780,6 +924,70 @@ test "validates session ids and aliases" {
     try std.testing.expect(!isValidAlias("550e8400e29b41d4a716446655440000"));
     try std.testing.expect(!isValidAlias("-bad"));
     try std.testing.expect(!isValidAlias("bad/name"));
+
+    const default_alias = try defaultAliasForGuid(std.testing.allocator, "s-550e8400-e29b-41d4-a716-446655440000");
+    defer std.testing.allocator.free(default_alias);
+    try std.testing.expectEqualStrings("s-550e", default_alias);
+    try std.testing.expect(isValidAlias(default_alias));
+    try std.testing.expect(!isValidCustomAlias(default_alias));
+}
+
+test "default alias availability detects short alias collisions" {
+    const allocator = std.testing.allocator;
+    const root = "zig-cache/session-registry-default-alias-test";
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+
+    const first_guid = "s-550e0000-e29b-41d4-a716-446655440000";
+    const second_guid = "s-550e1111-e29b-41d4-a716-446655440000";
+    const alias = try defaultAliasForGuid(allocator, first_guid);
+    defer allocator.free(alias);
+    try std.testing.expectEqualStrings("s-550e", alias);
+    try createAliasInRoot(allocator, root, alias, first_guid);
+
+    try std.testing.expect(try aliasAvailableForGuidInRoot(allocator, root, alias, first_guid));
+    try std.testing.expect(!try aliasAvailableForGuidInRoot(allocator, root, alias, second_guid));
+}
+
+test "guid default alias generation retries colliding short prefixes" {
+    const allocator = std.testing.allocator;
+    const root = "zig-cache/session-registry-default-alias-retry-test";
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+
+    const existing_guid = "s-550e0000-e29b-41d4-a716-446655440000";
+    try createAliasInRoot(allocator, root, "s-550e", existing_guid);
+    try createAliasInRoot(allocator, root, "s-550e1", existing_guid);
+
+    var identity = try generateGuidWithDefaultAliasFromCandidatesInRoot(allocator, root, &.{
+        "s-550e1111-e29b-41d4-a716-446655440000",
+    });
+    defer identity.deinit(allocator);
+
+    try std.testing.expectEqualStrings("s-550e1111-e29b-41d4-a716-446655440000", identity.guid);
+    try std.testing.expectEqualStrings("s-550e11", identity.alias);
+}
+
+test "random generated aliases retry collisions" {
+    const allocator = std.testing.allocator;
+    const root = "zig-cache/session-registry-generated-alias-retry-test";
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+
+    const existing_guid = "s-11110000-e29b-41d4-a716-446655440000";
+    const new_guid = "s-22220000-e29b-41d4-a716-446655440000";
+    try createAliasInRoot(allocator, root, "a-deadbeef", existing_guid);
+
+    const alias = try createGeneratedAliasFromHexCandidatesInRoot(allocator, root, new_guid, &.{
+        "deadbeef000000000000000000000000",
+        "feed1234500000000000000000000000",
+    });
+    defer allocator.free(alias);
+
+    try std.testing.expectEqualStrings("a-feed12345", alias);
+    const resolved = try resolveRefToGuidInRoot(allocator, root, alias);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(new_guid, resolved);
 }
 
 test "registry writes meta and tracks detached marker" {

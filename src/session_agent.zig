@@ -1964,7 +1964,7 @@ fn registerSessionAlias(session_guid: []const u8, requested_alias: []const u8) !
         try session_registry.ensureAliasForGuid(app_allocator.allocator(), requested_alias, session_guid);
         return try app_allocator.allocator().dupe(u8, requested_alias);
     }
-    return session_registry.createGeneratedRemoteAlias(app_allocator.allocator(), session_guid);
+    return session_registry.createDefaultAliasForGuid(app_allocator.allocator(), session_guid);
 }
 
 fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.EnvironmentEntry) !void {
