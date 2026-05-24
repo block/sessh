@@ -524,20 +524,18 @@ def recv_exact(conn, length):
 
 
 def sessions_dir(env):
-    state_dir = env.get("SESSH_STATE_DIR")
-    if state_dir:
-        return Path(state_dir) / "g"
-    runtime_dir = env.get("XDG_RUNTIME_DIR")
+    runtime_dir = env.get("SESSH_RUNTIME_DIR")
     if not runtime_dir:
-        raise AssertionError("socket harness requires SESSH_STATE_DIR or XDG_RUNTIME_DIR")
-    return Path(runtime_dir) / "sessh" / "g"
+        raise AssertionError("socket harness requires SESSH_RUNTIME_DIR")
+    return Path(runtime_dir) / "g"
 
 
 def aliases_dir(env):
-    state_dir = env.get("SESSH_STATE_DIR")
-    if state_dir:
-        return Path(state_dir) / "alias"
-    return Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "alias"
+    return state_root(env) / "alias"
+
+
+def state_root(env):
+    return Path(env["XDG_STATE_HOME"]) / "sessh"
 
 
 def is_guid_ref(value):
@@ -588,7 +586,7 @@ def session_dir(env, session_id="s1"):
     ensure_alias(env, session_id)
     alias_path = aliases_dir(env) / session_id
     if alias_path.is_symlink():
-        return (alias_path.parent / os.readlink(alias_path)).resolve(strict=False)
+        return sessions_dir(env) / Path(os.readlink(alias_path)).name
     return sessions_dir(env) / compact_guid(guid_for_ref(session_id))
 
 
@@ -2310,7 +2308,7 @@ def run_host_broker_starts_session_agent_test(base_env):
                 raise AssertionError("host broker did not create a session-agent socket")
             if not os.path.islink(session_path / "compat"):
                 raise AssertionError("host broker session agent did not write compat symlink")
-            assert_runtime_dir_symlink(env, Path(env["SESSH_STATE_DIR"]))
+            assert_runtime_dir_symlink(env, Path(env["SESSH_RUNTIME_DIR"]))
 
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
             recv_until_message(conn, SESSION_ENDED)

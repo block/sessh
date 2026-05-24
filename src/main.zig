@@ -76,7 +76,7 @@ fn usage(code: u8) !void {
         \\
         \\sessh-specific options:
         \\  --alias NAME
-        \\  --state-dir DIR
+        \\  --runtime-dir DIR
         \\  --leader CTRL-KEY|None
         \\  --scrollback-limit N
         \\  --initial-scrollback N

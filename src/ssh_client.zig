@@ -119,7 +119,7 @@ const ParsedSshArgs = struct {
     kill_id: ?[]const u8 = null,
     command_argv: []const []const u8 = &.{},
     alias: ?[]const u8 = null,
-    state_dir: ?[]const u8 = null,
+    runtime_dir: ?[]const u8 = null,
     leader: terminal.Leader = .none,
     leader_set: bool = false,
     banner_args: client.DetachBannerArgs = .{},
@@ -575,7 +575,7 @@ fn sesshLongOptionRequiresValue(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--alias") or
-        std.mem.eql(u8, arg, "--state-dir") or
+        std.mem.eql(u8, arg, "--runtime-dir") or
         std.mem.eql(u8, arg, "--capture-tty-transcript") or
         std.mem.eql(u8, arg, "--kill");
 }
@@ -586,7 +586,7 @@ fn sesshLongOptionMissingValueError(arg: []const u8) anyerror {
     if (std.mem.eql(u8, arg, "--initial-scrollback")) return error.MissingInitialScrollback;
     if (std.mem.eql(u8, arg, "--log-level")) return error.MissingClientLogLevel;
     if (std.mem.eql(u8, arg, "--alias")) return error.MissingAlias;
-    if (std.mem.eql(u8, arg, "--state-dir")) return error.MissingStateDir;
+    if (std.mem.eql(u8, arg, "--runtime-dir")) return error.MissingRuntimeDir;
     if (std.mem.eql(u8, arg, "--capture-tty-transcript")) return error.MissingTtyTranscriptPath;
     if (std.mem.eql(u8, arg, "--kill")) return error.MissingKillId;
     return error.UnsupportedMuxOption;
@@ -623,7 +623,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with --force-compat\n");
         return process_exit.request(64);
     }
-    if (parsed_ssh_args.state_dir) |dir| socket_transport.setRuntimeRootOverride(dir);
     const resolved_ref_storage = try resolveLocalRefs(allocator, &parsed_ssh_args);
     defer if (resolved_ref_storage) |ref| allocator.free(ref);
     const route_attach_ref = if (route_storage) |route| route.primary_alias else null;
@@ -1021,8 +1020,8 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
 
 fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[4][]const u8) []const []const u8 {
     var len: usize = 0;
-    if (parsed_ssh_args.state_dir) |dir| {
-        buf[len] = "--state-dir";
+    if (parsed_ssh_args.runtime_dir) |dir| {
+        buf[len] = "--runtime-dir";
         len += 1;
         buf[len] = dir;
         len += 1;
@@ -1074,7 +1073,7 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
     const session_id = compatSessionId(parsed_ssh_args) orelse "";
     const session_id_quoted = try shellQuote(allocator, session_id);
     defer allocator.free(session_id_quoted);
-    const runtime_root = try shellQuote(allocator, parsed_ssh_args.state_dir orelse "");
+    const runtime_root = try shellQuote(allocator, parsed_ssh_args.runtime_dir orelse "");
     defer allocator.free(runtime_root);
 
     return std.fmt.allocPrint(allocator,
@@ -1083,7 +1082,13 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\compat_session_id={s}
         \\runtime_root={s}
         \\if [ -z "$runtime_root" ]; then
-        \\  runtime_root=${{SESSH_STATE_DIR:-/tmp/sessh-$(id -u)}}
+        \\  runtime_root=${{SESSH_RUNTIME_DIR:-/tmp/sessh-$(id -u)}}
+        \\fi
+        \\state_root=
+        \\if [ -n "${{XDG_STATE_HOME:-}}" ]; then
+        \\  state_root=$XDG_STATE_HOME/sessh
+        \\elif [ -n "${{HOME:-}}" ]; then
+        \\  state_root=$HOME/.local/state/sessh
         \\fi
         \\compact_session_id() {{
         \\  printf '%s' "$1" | tr -d '-'
@@ -1100,6 +1105,14 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\  case "$ref" in
         \\    ""|/*|*/*|.|..) printf '%s\n' "$compact"; return ;;
         \\  esac
+        \\  if [ -n "$state_root" ]; then
+        \\    alias_path=$state_root/alias/$ref
+        \\    if [ -L "$alias_path" ]; then
+        \\      target=$(readlink "$alias_path") || exit 1
+        \\      basename "$target"
+        \\      return
+        \\    fi
+        \\  fi
         \\  alias_path=$runtime_root/alias/$ref
         \\  if [ -L "$alias_path" ]; then
         \\    target=$(readlink "$alias_path") || exit 1
@@ -1122,7 +1135,7 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    printf 'sessh: session compat binary is unavailable\n' >&2
         \\    exit 1
         \\  fi
-        \\  SESSH_STATE_DIR=$runtime_root exec "$compat" :local: --compat-version {s}{s}
+        \\  SESSH_RUNTIME_DIR=$runtime_root exec "$compat" :local: --compat-version {s}{s}
         \\}}
         \\run_each_compat() {{
         \\  found=0
@@ -1130,7 +1143,7 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\  for compat in "$runtime_root"/g/*/compat; do
         \\    [ -e "$compat" ] || continue
         \\    found=1
-        \\    SESSH_STATE_DIR=$runtime_root "$compat" :local: --compat-version {s}{s}
+        \\    SESSH_RUNTIME_DIR=$runtime_root "$compat" :local: --compat-version {s}{s}
         \\    code=$?
         \\    if [ "$code" -ne 0 ]; then
         \\      status=$code
@@ -1952,10 +1965,10 @@ fn parseRouteAttachArgs(
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingAttachId;
             attach_ref = args[i];
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--state-dir")) {
+        } else if (std.mem.eql(u8, arg, "--runtime-dir")) {
             i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingStateDir;
-            parsed.state_dir = args[i];
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingRuntimeDir;
+            parsed.runtime_dir = args[i];
             try parsed.banner_args.append(arg);
             try parsed.banner_args.append(args[i]);
             i += 1;
@@ -1993,7 +2006,6 @@ fn parseRouteAttachArgs(
         }
     }
     const ref = attach_ref orelse return null;
-    if (parsed.state_dir) |dir| socket_transport.setRuntimeRootOverride(dir);
     route_storage.* = try session_registry.readRouteForRef(allocator, ref);
     const route = &route_storage.*.?;
     parsed.options = route.ssh_options;
@@ -2106,10 +2118,10 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             if (!session_registry.isValidAlias(args[index.*])) return error.InvalidAlias;
             parsed.alias = args[index.*];
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--state-dir")) {
+        } else if (std.mem.eql(u8, arg, "--runtime-dir")) {
             index.* += 1;
-            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingStateDir;
-            parsed.state_dir = args[index.*];
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingRuntimeDir;
+            parsed.runtime_dir = args[index.*];
             try parsed.banner_args.append(arg);
             try parsed.banner_args.append(args[index.*]);
             index.* += 1;
@@ -2168,7 +2180,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--alias") or
-        std.mem.eql(u8, arg, "--state-dir") or
+        std.mem.eql(u8, arg, "--runtime-dir") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
         std.mem.eql(u8, arg, "--force-compat") or
@@ -2298,7 +2310,7 @@ fn printSshArgError(err: anyerror) !void {
         error.MissingAttachId => try io.writeAll(2, "sesshmux: attach requires an id when no host is provided\n"),
         error.MissingKillId => try io.writeAll(2, "sesshmux: kill requires an id\n"),
         error.MissingAlias => try io.writeAll(2, "sessh: --alias requires a value\n"),
-        error.MissingStateDir => try io.writeAll(2, "sessh: --state-dir requires a value\n"),
+        error.MissingRuntimeDir => try io.writeAll(2, "sessh: --runtime-dir requires a value\n"),
         error.MissingLeader => try io.writeAll(2, "sessh: --leader requires a value\n"),
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),

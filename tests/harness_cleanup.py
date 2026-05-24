@@ -1,4 +1,5 @@
 import os
+import shutil
 import shlex
 import signal
 import subprocess
@@ -11,18 +12,27 @@ BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
 
 
 def sessions_dir(env):
-    state_dir = env.get("SESSH_STATE_DIR")
-    if state_dir:
-        return Path(state_dir) / "g"
-    runtime_dir = env.get("XDG_RUNTIME_DIR")
+    runtime_dir = env.get("SESSH_RUNTIME_DIR")
     if not runtime_dir:
-        raise AssertionError("test cleanup requires SESSH_STATE_DIR or XDG_RUNTIME_DIR")
-    return Path(runtime_dir) / "sessh" / "g"
+        raise AssertionError("test cleanup requires SESSH_RUNTIME_DIR")
+    return Path(runtime_dir) / "g"
+
+
+def state_root(env):
+    state_home = env.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home) / "sessh"
+    home = env.get("HOME")
+    if home:
+        return Path(home) / ".local" / "state" / "sessh"
+    raise AssertionError("test cleanup requires XDG_STATE_HOME or HOME")
 
 
 def cleanup_runtime(env, timeout=5.0):
     kill_all(env, timeout=timeout)
     kill_build_sessh_processes(timeout=timeout)
+    shutil.rmtree(Path(env["SESSH_RUNTIME_DIR"]), ignore_errors=True)
+    shutil.rmtree(state_root(env), ignore_errors=True)
 
 
 def kill_all(env, timeout=5.0):

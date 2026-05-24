@@ -22,6 +22,7 @@ TMUX = shutil.which("tmux")
 XDG_ENV_KEYS = (
     "HOME",
     "XDG_RUNTIME_DIR",
+    "SESSH_RUNTIME_DIR",
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",

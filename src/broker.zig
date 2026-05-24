@@ -85,9 +85,9 @@ fn applyBrokerOptions(args: []const []const u8) ![]const []const u8 {
     var i: usize = 0;
     while (i < args.len) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--state-dir")) {
+        if (std.mem.eql(u8, arg, "--runtime-dir")) {
             i += 1;
-            if (i >= args.len) return error.MissingStateDir;
+            if (i >= args.len) return error.MissingRuntimeDir;
             socket_transport.setRuntimeRootOverride(args[i]);
             i += 1;
             continue;

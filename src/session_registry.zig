@@ -36,30 +36,47 @@ pub const Allocation = struct {
 };
 
 pub fn allocateSessionDir(allocator: std.mem.Allocator) !Allocation {
-    const root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(root);
-    return allocateSessionDirInRoot(allocator, root);
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    const state_root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(state_root);
+    return allocateSessionDirInRoots(allocator, runtime_root, state_root);
 }
 
 pub fn allocateSessionDirInRoot(allocator: std.mem.Allocator, root: []const u8) !Allocation {
     const id = try generateGuid(allocator);
     errdefer allocator.free(id);
-    var allocation = try allocateSessionDirForGuidInRoot(allocator, root, id);
+    var allocation = try allocateSessionDirForGuidInRoots(allocator, root, root, id);
+    allocator.free(allocation.id);
+    allocation.id = id;
+    return allocation;
+}
+
+fn allocateSessionDirInRoots(allocator: std.mem.Allocator, runtime_root: []const u8, state_root: []const u8) !Allocation {
+    const id = try generateGuid(allocator);
+    errdefer allocator.free(id);
+    var allocation = try allocateSessionDirForGuidInRoots(allocator, runtime_root, state_root, id);
     allocator.free(allocation.id);
     allocation.id = id;
     return allocation;
 }
 
 pub fn allocateSessionDirForGuid(allocator: std.mem.Allocator, guid: []const u8) !Allocation {
-    const root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(root);
-    return allocateSessionDirForGuidInRoot(allocator, root, guid);
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    const state_root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(state_root);
+    return allocateSessionDirForGuidInRoots(allocator, runtime_root, state_root, guid);
 }
 
 pub fn allocateSessionDirForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !Allocation {
-    try ensureRegistryRoot(allocator, root);
+    return allocateSessionDirForGuidInRoots(allocator, root, root, guid);
+}
 
-    const sessions_dir = try sessionsDirInRoot(allocator, root);
+fn allocateSessionDirForGuidInRoots(allocator: std.mem.Allocator, runtime_root: []const u8, state_root: []const u8, guid: []const u8) !Allocation {
+    try ensureRegistryRoot(allocator, runtime_root);
+
+    const sessions_dir = try sessionsDirInRoot(allocator, runtime_root);
     defer allocator.free(sessions_dir);
     try mkdirIgnoreExists(allocator, sessions_dir);
 
@@ -73,13 +90,13 @@ pub fn allocateSessionDirForGuidInRoot(allocator: std.mem.Allocator, root: []con
     switch (try mkdirSessionDir(allocator, dir)) {
         .created => {},
         .exists => {
-            var existing_paths = try pathsForSessionDir(allocator, dir);
+            var existing_paths = try pathsForSessionDirInStateRoot(allocator, dir, state_root);
             errdefer existing_paths.deinit(allocator);
             if (liveHintsExist(existing_paths)) return error.SessionExists;
             return .{ .id = canonical, .paths = existing_paths };
         },
     }
-    var paths = try pathsForSessionDir(allocator, dir);
+    var paths = try pathsForSessionDirInStateRoot(allocator, dir, state_root);
     errdefer paths.deinit(allocator);
     return .{ .id = canonical, .paths = paths };
 }
@@ -98,14 +115,22 @@ pub fn pathsForSessionId(allocator: std.mem.Allocator, id: []const u8) !SessionP
     if (!isValidSessionId(id)) return error.InvalidSessionId;
     const sessions_dir = try sessionsDir(allocator);
     defer allocator.free(sessions_dir);
+    const state_root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(state_root);
     const compact = try compactGuid(allocator, id);
     defer allocator.free(compact);
     const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, compact });
     defer allocator.free(dir);
-    return pathsForSessionDir(allocator, dir);
+    return pathsForSessionDirInStateRoot(allocator, dir, state_root);
 }
 
 pub fn pathsForSessionDir(allocator: std.mem.Allocator, dir: []const u8) !SessionPaths {
+    const state_root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(state_root);
+    return pathsForSessionDirInStateRoot(allocator, dir, state_root);
+}
+
+fn pathsForSessionDirInStateRoot(allocator: std.mem.Allocator, dir: []const u8, state_root: []const u8) !SessionPaths {
     const dir_copy = try allocator.dupe(u8, dir);
     errdefer allocator.free(dir_copy);
 
@@ -121,7 +146,8 @@ pub fn pathsForSessionDir(allocator: std.mem.Allocator, dir: []const u8) !Sessio
     const compat = try std.fmt.allocPrint(allocator, "{s}/compat", .{dir});
     errdefer allocator.free(compat);
 
-    const route = try std.fmt.allocPrint(allocator, "{s}/route", .{dir});
+    const compact = std.fs.path.basename(dir);
+    const route = try std.fmt.allocPrint(allocator, "{s}/g/{s}/route", .{ state_root, compact });
     errdefer allocator.free(route);
 
     return .{
@@ -230,7 +256,6 @@ pub const Route = struct {
 
 pub fn writeSshRoute(
     allocator: std.mem.Allocator,
-    paths: SessionPaths,
     guid: []const u8,
     primary_alias: []const u8,
     host: []const u8,
@@ -250,7 +275,11 @@ pub fn writeSshRoute(
         try writer.print("\n", .{});
     }
 
-    const file = try std.fs.cwd().createFile(paths.route, .{ .truncate = true, .mode = 0o600 });
+    const route_path = try routePathForGuid(allocator, guid);
+    defer allocator.free(route_path);
+    try ensureRouteDirForGuid(allocator, guid);
+
+    const file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
     defer file.close();
     try file.writeAll(text.items);
 }
@@ -259,6 +288,34 @@ pub fn readRouteForRef(allocator: std.mem.Allocator, ref: []const u8) !Route {
     var paths = try pathsForRef(allocator, ref);
     defer paths.deinit(allocator);
     return readRoute(allocator, paths.route);
+}
+
+fn routePathForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    const state_root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(state_root);
+    const compact = try compactGuid(allocator, guid);
+    defer allocator.free(compact);
+    return routePathForCompactInStateRoot(allocator, state_root, compact);
+}
+
+fn routePathForCompactInStateRoot(allocator: std.mem.Allocator, state_root: []const u8, compact: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/g/{s}/route", .{ state_root, compact });
+}
+
+fn ensureRouteDirForGuid(allocator: std.mem.Allocator, guid: []const u8) !void {
+    const state_root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(state_root);
+    try ensureRegistryRoot(allocator, state_root);
+
+    const state_sessions_dir = try sessionsDirInRoot(allocator, state_root);
+    defer allocator.free(state_sessions_dir);
+    try mkdirIgnoreExists(allocator, state_sessions_dir);
+
+    const compact = try compactGuid(allocator, guid);
+    defer allocator.free(compact);
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ state_sessions_dir, compact });
+    defer allocator.free(dir);
+    try mkdirIgnoreExists(allocator, dir);
 }
 
 pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
@@ -312,7 +369,7 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
 }
 
 pub fn createAlias(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !void {
-    const root = try socket_transport.runtimeRoot(allocator);
+    const root = try socket_transport.stateRoot(allocator);
     defer allocator.free(root);
     return createAliasInRoot(allocator, root, alias, guid);
 }
@@ -342,7 +399,7 @@ pub fn createAliasInRoot(allocator: std.mem.Allocator, root: []const u8, alias: 
 }
 
 pub fn ensureAliasForGuid(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !void {
-    const root = try socket_transport.runtimeRoot(allocator);
+    const root = try socket_transport.stateRoot(allocator);
     defer allocator.free(root);
     return ensureAliasForGuidInRoot(allocator, root, alias, guid);
 }
@@ -361,7 +418,7 @@ pub fn ensureAliasForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, 
 }
 
 pub fn removeAlias(allocator: std.mem.Allocator, alias: []const u8) !void {
-    const root = try socket_transport.runtimeRoot(allocator);
+    const root = try socket_transport.stateRoot(allocator);
     defer allocator.free(root);
     return removeAliasInRoot(allocator, root, alias);
 }
@@ -382,7 +439,7 @@ pub fn defaultAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8
 }
 
 pub fn createGeneratedRemoteAlias(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    const root = try socket_transport.runtimeRoot(allocator);
+    const root = try socket_transport.stateRoot(allocator);
     defer allocator.free(root);
     return createGeneratedRemoteAliasInRoot(allocator, root, guid);
 }
@@ -414,7 +471,7 @@ pub fn pathsForRef(allocator: std.mem.Allocator, ref: []const u8) !SessionPaths 
 }
 
 pub fn resolveRefToGuid(allocator: std.mem.Allocator, ref: []const u8) ![]u8 {
-    const root = try socket_transport.runtimeRoot(allocator);
+    const root = try socket_transport.stateRoot(allocator);
     defer allocator.free(root);
     return resolveRefToGuidInRoot(allocator, root, ref);
 }
@@ -437,7 +494,7 @@ pub fn aliasesDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
 }
 
 pub fn primaryAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) !?[]u8 {
-    const root = try socket_transport.runtimeRoot(allocator);
+    const root = try socket_transport.stateRoot(allocator);
     defer allocator.free(root);
     const aliases_dir = try aliasesDirInRoot(allocator, root);
     defer allocator.free(aliases_dir);

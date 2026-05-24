@@ -501,10 +501,15 @@ def sessh_version():
 
 
 def aliases_dir(env):
-    state_dir = env.get("SESSH_STATE_DIR")
-    if state_dir:
-        return Path(state_dir) / "alias"
-    return Path(env["XDG_RUNTIME_DIR"]) / "sessh" / "alias"
+    return state_root(env) / "alias"
+
+
+def state_root(env):
+    return Path(env["XDG_STATE_HOME"]) / "sessh"
+
+
+def state_sessions_dir(env):
+    return state_root(env) / "g"
 
 
 def compact_guid(guid):
@@ -534,7 +539,7 @@ def ensure_alias(env, alias, guid=None):
 
 def write_ssh_route(env, alias, guid, host, ssh_options=()):
     ensure_alias(env, alias, guid)
-    session = sessions_dir(env) / compact_guid(guid)
+    session = state_sessions_dir(env) / compact_guid(guid)
     session.mkdir(mode=0o700, parents=True, exist_ok=True)
     lines = [
         f"guid={guid}",
@@ -551,9 +556,9 @@ def session_path(env, session_id="s1"):
         return sessions_dir(env) / compact_guid(session_id)
     alias_path = aliases_dir(env) / session_id
     if alias_path.is_symlink():
-        return (alias_path.parent / os.readlink(alias_path)).resolve(strict=False)
+        return sessions_dir(env) / Path(os.readlink(alias_path)).name
     ensure_alias(env, session_id)
-    return (alias_path.parent / os.readlink(alias_path)).resolve(strict=False)
+    return sessions_dir(env) / Path(os.readlink(alias_path)).name
 
 
 def session_compat_path(env, session_id="s1"):

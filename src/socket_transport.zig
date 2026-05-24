@@ -14,16 +14,33 @@ pub fn setRuntimeRootOverride(path: []const u8) void {
     runtime_root_symlink_published = false;
 }
 
-/// Runtime root for live sockets and session registry state.
-/// Cache paths intentionally use a different root.
+/// Runtime root for live sockets and agent-owned files. Keep this path short:
+/// Unix-domain socket paths have tight platform limits.
 pub fn runtimeRoot(allocator: std.mem.Allocator) ![]u8 {
     if (runtime_root_override) |root| return allocator.dupe(u8, root);
-    if (envVar("SESSH_STATE_DIR")) |root| return allocator.dupe(u8, root);
+    if (envVar("SESSH_RUNTIME_DIR")) |root| return allocator.dupe(u8, root);
     return runtimeRootFor(allocator, c.getuid());
 }
 
 fn runtimeRootFor(allocator: std.mem.Allocator, uid: c.uid_t) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/sessh-{}", .{uid});
+}
+
+/// Persistent client-side registry for aliases and remote routes.
+pub fn stateRoot(allocator: std.mem.Allocator) ![]u8 {
+    if (c.getenv("XDG_STATE_HOME")) |state_z| {
+        const state = std.mem.span(state_z);
+        if (state.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}/sessh", .{state});
+        }
+    }
+    if (c.getenv("HOME")) |home_z| {
+        const home = std.mem.span(home_z);
+        if (home.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}/.local/state/sessh", .{home});
+        }
+    }
+    return error.MissingStateHome;
 }
 
 pub fn cacheRoot(allocator: std.mem.Allocator) ![]u8 {

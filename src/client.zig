@@ -36,7 +36,7 @@ const LocalOptions = struct {
     attach_id: ?[]const u8 = null,
     kill_id: ?[]const u8 = null,
     alias: ?[]const u8 = null,
-    state_dir: ?[]const u8 = null,
+    runtime_dir: ?[]const u8 = null,
     leader: Leader = .none,
     leader_set: bool = false,
     banner_args: DetachBannerArgs = .{},
@@ -1634,7 +1634,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return process_exit.request(64);
     };
     client_log.setLevel(options.client_log_level);
-    if (options.state_dir) |dir| socket_transport.setRuntimeRootOverride(dir);
+    if (options.runtime_dir) |dir| socket_transport.setRuntimeRootOverride(dir);
 
     return runBrokerClient(allocator, args, options);
 }
@@ -1646,25 +1646,25 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     }
 
     var broker_arg_buf: [2][]const u8 = undefined;
-    const state_broker_args = brokerStateArgs(options, &broker_arg_buf);
+    const runtime_broker_args = brokerRuntimeArgs(options, &broker_arg_buf);
     switch (options.action) {
         .list => {
             var command_args_buf: [3][]const u8 = undefined;
-            const command_args = appendBrokerCommand(state_broker_args, "--list", null, &command_args_buf);
+            const command_args = appendBrokerCommand(runtime_broker_args, "--list", null, &command_args_buf);
             const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
         .kill => {
             var command_args_buf: [4][]const u8 = undefined;
-            const command_args = appendBrokerCommand(state_broker_args, "--kill", options.kill_id.?, &command_args_buf);
+            const command_args = appendBrokerCommand(runtime_broker_args, "--kill", options.kill_id.?, &command_args_buf);
             const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
         .kill_all => {
             var command_args_buf: [3][]const u8 = undefined;
-            const command_args = appendBrokerCommand(state_broker_args, "--kill-all", null, &command_args_buf);
+            const command_args = appendBrokerCommand(runtime_broker_args, "--kill-all", null, &command_args_buf);
             const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
@@ -1700,7 +1700,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         }
     }
 
-    var child = try startLocalBroker(allocator, args[0], state_broker_args);
+    var child = try startLocalBroker(allocator, args[0], runtime_broker_args);
     var session = (switch (options.action) {
         .new => startNewSessionOnRuntime(
             child.stdout.?.handle,
@@ -1766,7 +1766,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             .transport_closed => {
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
-                if (!anySessionExistsViaBroker(allocator, args[0])) {
+                if (!anySessionExistsViaBroker(allocator, args[0], runtime_broker_args)) {
                     try io_helpers.writeAll(2, "\r\nsessh: session agent crashed\r\n");
                     return process_exit.request(1);
                 }
@@ -1774,7 +1774,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         }
 
         try io_helpers.writeAll(2, "\r\nsessh: reconnecting; type <enter>~. to abort\r\n");
-        child = startLocalBroker(allocator, args[0], state_broker_args) catch |err| {
+        child = startLocalBroker(allocator, args[0], runtime_broker_args) catch |err| {
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -1788,9 +1788,9 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     }
 }
 
-fn brokerStateArgs(options: LocalOptions, buf: *[2][]const u8) []const []const u8 {
-    if (options.state_dir) |dir| {
-        buf[0] = "--state-dir";
+fn brokerRuntimeArgs(options: LocalOptions, buf: *[2][]const u8) []const []const u8 {
+    if (options.runtime_dir) |dir| {
+        buf[0] = "--runtime-dir";
         buf[1] = dir;
         return buf[0..2];
     }
@@ -1798,18 +1798,18 @@ fn brokerStateArgs(options: LocalOptions, buf: *[2][]const u8) []const []const u
 }
 
 fn appendBrokerCommand(
-    state_args: []const []const u8,
+    runtime_args: []const []const u8,
     command: []const u8,
     value: ?[]const u8,
     buf: [][]const u8,
 ) []const []const u8 {
-    @memcpy(buf[0..state_args.len], state_args);
-    buf[state_args.len] = command;
+    @memcpy(buf[0..runtime_args.len], runtime_args);
+    buf[runtime_args.len] = command;
     if (value) |arg| {
-        buf[state_args.len + 1] = arg;
-        return buf[0 .. state_args.len + 2];
+        buf[runtime_args.len + 1] = arg;
+        return buf[0 .. runtime_args.len + 2];
     }
-    return buf[0 .. state_args.len + 1];
+    return buf[0 .. runtime_args.len + 1];
 }
 
 fn startLocalBroker(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8) !std.process.Child {
@@ -1845,19 +1845,20 @@ fn runLocalBrokerCommand(allocator: std.mem.Allocator, exe: []const u8, broker_a
     };
 }
 
-fn sessionExistsViaBroker(allocator: std.mem.Allocator, exe: []const u8, session_id: []const u8) bool {
-    return brokerListMatches(allocator, exe, session_id);
+fn anySessionExistsViaBroker(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8) bool {
+    return brokerListMatches(allocator, exe, broker_args, null);
 }
 
-fn anySessionExistsViaBroker(allocator: std.mem.Allocator, exe: []const u8) bool {
-    return brokerListMatches(allocator, exe, null);
-}
-
-fn brokerListMatches(allocator: std.mem.Allocator, exe: []const u8, session_id: ?[]const u8) bool {
-    const argv = [_][]const u8{ exe, ":internal-host-broker:", "--list" };
+fn brokerListMatches(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8, session_id: ?[]const u8) bool {
+    const argv = allocator.alloc([]const u8, 3 + broker_args.len) catch return false;
+    defer allocator.free(argv);
+    argv[0] = exe;
+    argv[1] = ":internal-host-broker:";
+    @memcpy(argv[2 .. 2 + broker_args.len], broker_args);
+    argv[2 + broker_args.len] = "--list";
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &argv,
+        .argv = argv,
         .max_output_bytes = 1024 * 1024,
     }) catch return false;
     defer allocator.free(result.stdout);
@@ -1913,10 +1914,10 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             if (!session_registry.isValidAlias(args[i])) return error.InvalidAlias;
             options.alias = args[i];
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--state-dir")) {
+        } else if (std.mem.eql(u8, arg, "--runtime-dir")) {
             i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingStateDir;
-            options.state_dir = args[i];
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingRuntimeDir;
+            options.runtime_dir = args[i];
             i += 1;
         } else if (std.mem.eql(u8, arg, "--leader")) {
             i += 1;
@@ -2061,26 +2062,8 @@ pub fn ensureLocalRouteForRemoteSession(
     const alias = try localAliasForRemoteSession(allocator, session, requested_ref);
     defer allocator.free(alias);
     try session_registry.ensureAliasForGuid(allocator, alias, session.guidSlice());
-    var allocation = session_registry.allocateSessionDirForGuid(allocator, session.guidSlice()) catch |err| switch (err) {
-        error.SessionExists => {
-            var paths = try session_registry.pathsForSessionId(allocator, session.guidSlice());
-            defer paths.deinit(allocator);
-            try session_registry.writeSshRoute(
-                allocator,
-                paths,
-                session.guidSlice(),
-                alias,
-                host,
-                ssh_options,
-            );
-            return;
-        },
-        else => return err,
-    };
-    defer allocation.deinit(allocator);
     try session_registry.writeSshRoute(
         allocator,
-        allocation.paths,
         session.guidSlice(),
         alias,
         host,
