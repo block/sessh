@@ -1171,8 +1171,12 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     session_registry.removeAlias(app_allocator.allocator(), alias) catch {};
                     return err;
                 };
-                if (session_agent.session_paths) |paths| session_registry.markDetached(paths) catch {};
-                try sendSessionCreatedForSession(fd, &session_agent.sessions[session_index], alias);
+                const session = &session_agent.sessions[session_index];
+                if (session_agent.session_paths) |paths| {
+                    try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), alias, paths.dir);
+                    session_registry.markDetached(paths) catch {};
+                }
+                try sendSessionCreatedForSession(session_agent, fd, session, alias);
                 continue;
             },
             .session_attach => {
@@ -1412,24 +1416,30 @@ fn attachedCount(session_agent: *SessionAgent, session_index: usize) u32 {
     return count;
 }
 
-fn sendSessionAttachedForSession(attachment: *Attachment, session: *const Session) !void {
+fn sendSessionAttachedForSession(session_agent: *const SessionAgent, attachment: *Attachment, session: *const Session) !void {
     const maybe_alias = try session_registry.primaryAliasForGuid(app_allocator.allocator(), session.idSlice());
     defer if (maybe_alias) |alias| app_allocator.allocator().free(alias);
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionAttached{
         .session_guid = session.idSlice(),
         .session_alias = maybe_alias orelse "",
+        .session_dir = sessionDirSlice(session_agent),
     });
     defer app_allocator.allocator().free(payload);
     try queueAttachmentFrame(attachment, .session_attached, payload);
 }
 
-fn sendSessionCreatedForSession(fd: c.fd_t, session: *const Session, alias: []const u8) !void {
+fn sendSessionCreatedForSession(session_agent: *const SessionAgent, fd: c.fd_t, session: *const Session, alias: []const u8) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionCreated{
         .session_guid = session.idSlice(),
         .session_alias = alias,
+        .session_dir = sessionDirSlice(session_agent),
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .session_created, payload);
+}
+
+fn sessionDirSlice(session_agent: *const SessionAgent) []const u8 {
+    return if (session_agent.session_paths) |paths| paths.dir else "";
 }
 
 fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !void {
@@ -2236,7 +2246,7 @@ fn attachSession(
             attachment.output.deinit(app_allocator.allocator());
             attachment.* = Attachment{};
         }
-        try sendSessionAttachedForSession(attachment, session);
+        try sendSessionAttachedForSession(session_agent, attachment, session);
         if (resize.repaint_request) |request| {
             try sendSessionRepaintSnapshot(attachment, session, request);
         } else {

@@ -367,6 +367,7 @@ pub const Route = struct {
     bytes: []u8,
     guid: []const u8,
     primary_alias: []const u8,
+    session_dir: []const u8,
     host: []const u8,
     ssh_options: []const []const u8,
 
@@ -381,9 +382,31 @@ pub fn writeSshRoute(
     allocator: std.mem.Allocator,
     guid: []const u8,
     primary_alias: []const u8,
+    session_dir: []const u8,
     host: []const u8,
     ssh_options: []const []const u8,
 ) !void {
+    return writeRoute(allocator, guid, primary_alias, session_dir, host, ssh_options);
+}
+
+pub fn writeLocalRoute(
+    allocator: std.mem.Allocator,
+    guid: []const u8,
+    primary_alias: []const u8,
+    session_dir: []const u8,
+) !void {
+    return writeRoute(allocator, guid, primary_alias, session_dir, "", &.{});
+}
+
+fn writeRoute(
+    allocator: std.mem.Allocator,
+    guid: []const u8,
+    primary_alias: []const u8,
+    session_dir: []const u8,
+    host: []const u8,
+    ssh_options: []const []const u8,
+) !void {
+    if (!isAbsolutePath(session_dir)) return error.InvalidSessionDir;
     const canonical = try canonicalGuid(allocator, guid);
     defer allocator.free(canonical);
 
@@ -392,6 +415,9 @@ pub fn writeSshRoute(
     const writer = text.writer(allocator);
     try writer.print("guid={s}\n", .{canonical});
     try writer.print("primary_alias={s}\n", .{primary_alias});
+    try writer.print("session_dir=", .{});
+    try appendHex(&text, allocator, session_dir);
+    try writer.print("\n", .{});
     try writer.print("host=", .{});
     try appendHex(&text, allocator, host);
     try writer.print("\n", .{});
@@ -450,6 +476,7 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
 
     var guid: ?[]const u8 = null;
     var primary_alias: ?[]const u8 = null;
+    var session_dir: ?[]const u8 = null;
     var host: ?[]const u8 = null;
     var option_count: usize = 0;
 
@@ -464,6 +491,8 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
         } else if (std.mem.eql(u8, key, "primary_alias")) {
             if (!isValidAlias(value)) return error.InvalidRoute;
             primary_alias = value;
+        } else if (std.mem.eql(u8, key, "session_dir")) {
+            session_dir = value;
         } else if (std.mem.eql(u8, key, "host")) {
             host = value;
         } else if (std.mem.eql(u8, key, "ssh_option")) {
@@ -485,11 +514,16 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
         }
     }
 
+    const decoded_session_dir = if (session_dir) |value| try decodeHexInPlace(value) else "";
+    if (decoded_session_dir.len > 0 and !isAbsolutePath(decoded_session_dir)) return error.InvalidRoute;
+    const decoded_host = if (host) |value| try decodeHexInPlace(value) else "";
+
     return .{
         .bytes = bytes,
         .guid = guid orelse return error.InvalidRoute,
         .primary_alias = primary_alias orelse return error.InvalidRoute,
-        .host = try decodeHexInPlace(host orelse return error.InvalidRoute),
+        .session_dir = decoded_session_dir,
+        .host = decoded_host,
         .ssh_options = options,
     };
 }
@@ -709,7 +743,9 @@ pub fn isValidAlias(alias: []const u8) bool {
 
 pub fn isValidCustomAlias(alias: []const u8) bool {
     if (!isValidAlias(alias)) return false;
-    return alias.len < 2 or alias[1] != '-';
+    if (alias[0] == '-') return false;
+    if (alias.len >= 2 and alias[1] == '-') return false;
+    return true;
 }
 
 fn isValidGeneratedAlias(alias: []const u8) bool {
@@ -754,6 +790,10 @@ fn decodeHexInPlace(value: []const u8) ![]const u8 {
         dst += 1;
     }
     return mutable[0..dst];
+}
+
+fn isAbsolutePath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "/");
 }
 
 fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8, max_len: usize) ![]u8 {
@@ -913,6 +953,7 @@ test "validates session ids and aliases" {
     try std.testing.expect(!isValidAlias("x-anything"));
     try std.testing.expect(isValidCustomAlias("s1"));
     try std.testing.expect(isValidCustomAlias("my-awesome-session"));
+    try std.testing.expect(!isValidCustomAlias("-bad"));
     try std.testing.expect(!isValidCustomAlias("s-550e"));
     try std.testing.expect(!isValidCustomAlias("a-550e8400"));
     try std.testing.expect(!isValidCustomAlias("x-anything"));
@@ -988,6 +1029,47 @@ test "random generated aliases retry collisions" {
     const resolved = try resolveRefToGuidInRoot(allocator, root, alias);
     defer allocator.free(resolved);
     try std.testing.expectEqualStrings(new_guid, resolved);
+}
+
+test "route files persist absolute session directories" {
+    const allocator = std.testing.allocator;
+    const root = try std.fmt.allocPrint(allocator, "/tmp/sessh-route-test-{}", .{c.getpid()});
+    defer allocator.free(root);
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+    try std.fs.cwd().makePath(root);
+
+    const route_path = try std.fmt.allocPrint(allocator, "{s}/route", .{root});
+    defer allocator.free(route_path);
+    const session_dir = "/tmp/sessh-runtime-test/g/550e8400e29b41d4a716446655440000";
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    const writer = text.writer(allocator);
+    try writer.writeAll("guid=s-550e8400-e29b-41d4-a716-446655440000\n");
+    try writer.writeAll("primary_alias=s-550e\n");
+    try writer.writeAll("session_dir=");
+    try appendHex(&text, allocator, session_dir);
+    try writer.writeAll("\n");
+    try writer.writeAll("host=");
+    try appendHex(&text, allocator, "work.example");
+    try writer.writeAll("\n");
+    try writer.writeAll("ssh_option=");
+    try appendHex(&text, allocator, "-F");
+    try writer.writeAll("\n");
+
+    const file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
+    try file.writeAll(text.items);
+    file.close();
+
+    var route = try readRoute(allocator, route_path);
+    defer route.deinit(allocator);
+    try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", route.guid);
+    try std.testing.expectEqualStrings("s-550e", route.primary_alias);
+    try std.testing.expectEqualStrings(session_dir, route.session_dir);
+    try std.testing.expectEqualStrings("work.example", route.host);
+    try std.testing.expectEqual(@as(usize, 1), route.ssh_options.len);
+    try std.testing.expectEqualStrings("-F", route.ssh_options[0]);
 }
 
 test "registry writes meta and tracks detached marker" {

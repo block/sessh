@@ -376,7 +376,10 @@ fn runCompatCommand(allocator: std.mem.Allocator, paths: session_registry.Sessio
 fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.fd_t {
     var request = try protocol.decodePayload(pb.SessionAttach, allocator, payload);
     defer request.deinit(allocator);
-    var paths = if (request.session_ref.len > 0)
+    var paths = if (request.session_dir.len > 0) blk: {
+        if (!std.mem.startsWith(u8, request.session_dir, "/")) return error.InvalidSessionDir;
+        break :blk try session_registry.pathsForSessionDir(allocator, request.session_dir);
+    } else if (request.session_ref.len > 0)
         try pathsForAttachRef(allocator, request.session_ref)
     else
         (try mostRecentAgent(allocator)) orelse return error.NoSessions;
@@ -385,10 +388,30 @@ fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.f
 }
 
 fn pathsForAttachRef(allocator: std.mem.Allocator, ref: []const u8) !session_registry.SessionPaths {
-    if (session_registry.isValidSessionId(ref)) return session_registry.pathsForSessionId(allocator, ref);
-    if (!session_registry.isValidAlias(ref)) return error.InvalidSessionId;
+    if (!session_registry.isValidSessionId(ref) and !session_registry.isValidAlias(ref)) return error.InvalidSessionId;
     const guid = try session_registry.resolveRefToGuid(allocator, ref);
     defer allocator.free(guid);
+
+    var route = session_registry.readRouteForRef(allocator, ref) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (route) |*value| {
+        defer value.deinit(allocator);
+        if (value.session_dir.len > 0) {
+            var routed_paths = try session_registry.pathsForSessionDir(allocator, value.session_dir);
+            errdefer routed_paths.deinit(allocator);
+            if (fileExists(routed_paths.meta) or value.host.len == 0) return routed_paths;
+            return error.SessionRefNotLocal;
+        }
+        if (value.host.len > 0) {
+            var current_paths = try session_registry.pathsForSessionId(allocator, guid);
+            errdefer current_paths.deinit(allocator);
+            if (!fileExists(current_paths.meta)) return error.SessionRefNotLocal;
+            return current_paths;
+        }
+    }
+
     var paths = try session_registry.pathsForSessionId(allocator, guid);
     errdefer paths.deinit(allocator);
     if (fileExists(paths.route) and !fileExists(paths.meta)) return error.SessionRefNotLocal;

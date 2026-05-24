@@ -106,6 +106,10 @@ message SessionAttach {
   // Canonical client GUID in c-prefixed hyphenated UUID form. This identifies
   // the attaching client, not the durable session.
   string client_guid = 4;
+  // Absolute path to the selected session GUID directory. This is used for
+  // route-based reconnects when the broker's current runtime directory no
+  // longer matches where the session was created.
+  string session_dir = 5;
 }
 
 // Framed payload, client -> session agent.
@@ -171,6 +175,8 @@ message SessionCreated {
   string session_guid = 1;
   // Alias registered for this session in the creating namespace.
   string session_alias = 2;
+  // Absolute path to this session's GUID directory
+  string session_dir = 3;
 }
 
 // Framed payload, session agent -> client.
@@ -181,6 +187,8 @@ message SessionAttached {
   string session_guid = 1;
   // Primary alias for this session in the attaching namespace, if known.
   string session_alias = 2;
+  // Absolute path to this session's GUID directory
+  string session_dir = 3;
 }
 
 enum SessionEndReason {

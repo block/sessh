@@ -100,7 +100,7 @@ The options in the config file can be overridden on the command-line:
   `$XDG_RUNTIME_DIR/sessh` when that path is short enough for session sockets,
   otherwise `/tmp/sessh-<uid>`.
 
-Persistent client aliases and remote routes are stored under XDG state:
+Persistent client aliases and attach routes are stored under XDG state:
 `$XDG_STATE_HOME/sessh`, or `~/.local/state/sessh` if `XDG_STATE_HOME` is unset.
 
 ## Diagnostics

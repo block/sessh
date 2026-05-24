@@ -116,6 +116,7 @@ const ParsedSshArgs = struct {
     host: []const u8,
     action: SshAction = .new,
     attach_id: ?[]const u8 = null,
+    attach_session_dir: []const u8 = "",
     kill_id: ?[]const u8 = null,
     command_argv: []const []const u8 = &.{},
     alias: ?[]const u8 = null,
@@ -603,13 +604,16 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var route_storage: ?session_registry.Route = null;
     defer if (route_storage) |*route| route.deinit(allocator);
 
-    var parsed_ssh_args = (try parseRouteAttachArgs(allocator, args, &route_storage)) orelse parseSshArgs(args) catch |err| {
+    var parsed_ssh_args = if (try parseRouteAttachArgs(allocator, args, &route_storage)) |parsed| parsed else parseSshArgs(args) catch |err| {
         if (shouldUsePlainSshFallbackForArgError(args, err)) {
             try runPlainSshFallbackForUnsupportedArgs(allocator, args, err);
         }
         try printSshArgError(err);
         return process_exit.request(64);
     };
+    if (parsed_ssh_args.action == .attach and parsed_ssh_args.host.len == 0) {
+        return runLocalRouteAttach(allocator, args);
+    }
     applyFileConfigToSsh(allocator, &parsed_ssh_args) catch |err| {
         try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
         return process_exit.request(64);
@@ -625,7 +629,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
     const resolved_ref_storage = try resolveLocalRefs(allocator, &parsed_ssh_args);
     defer if (resolved_ref_storage) |ref| allocator.free(ref);
-    const route_attach_ref = if (route_storage) |route| route.primary_alias else null;
     parsed_ssh_args.default_ipqos_option = try resolveDefaultIpQosOption(allocator, parsed_ssh_args.options, parsed_ssh_args.host);
     defer if (parsed_ssh_args.default_ipqos_option) |option| allocator.free(option);
 
@@ -726,6 +729,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
             parsed_ssh_args.attach_id orelse "",
+            parsed_ssh_args.attach_session_dir,
             parsed_ssh_args.initial_scrollback_row_count,
         ),
         .list, .kill, .kill_all => unreachable,
@@ -749,7 +753,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer session.deinit();
     child.suppressSshStderr();
-    if (parsed_ssh_args.action == .new or route_attach_ref == null) {
+    if (parsed_ssh_args.action == .new or parsed_ssh_args.action == .attach) {
         try client.ensureLocalRouteForRemoteSession(
             allocator,
             &session,
@@ -2026,7 +2030,17 @@ fn parseRouteAttachArgs(
     parsed.options = route.ssh_options;
     parsed.host = route.host;
     parsed.attach_id = route.guid;
+    parsed.attach_session_dir = route.session_dir;
     return parsed;
+}
+
+fn runLocalRouteAttach(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const local_args = try allocator.alloc([]const u8, args.len + 1);
+    defer allocator.free(local_args);
+    local_args[0] = args[0];
+    local_args[1] = ":local:";
+    @memcpy(local_args[2..], args[1..]);
+    return client.run(allocator, local_args);
 }
 
 fn resolveLocalRefs(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !?[]u8 {

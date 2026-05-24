@@ -406,6 +406,8 @@ pub const RuntimeSession = struct {
     client_guid_len: usize = 0,
     primary_alias: [128]u8 = [_]u8{0} ** 128,
     primary_alias_len: usize = 0,
+    session_dir: [4096]u8 = [_]u8{0} ** 4096,
+    session_dir_len: usize = 0,
     scrollback_cursor: ScrollbackCursor = .{},
     viewport_offset: i32 = 0,
     /// Latest outstanding RepaintRequest sequence. Older responses are stale.
@@ -434,6 +436,10 @@ pub const RuntimeSession = struct {
         return self.client_guid[0..self.client_guid_len];
     }
 
+    pub fn sessionDirSlice(self: *const RuntimeSession) []const u8 {
+        return self.session_dir[0..self.session_dir_len];
+    }
+
     pub fn ensureClientGuid(self: *RuntimeSession) ![]const u8 {
         if (self.client_guid_len == 0) {
             const generated = try session_registry.generateClientGuid(app_allocator.allocator());
@@ -448,6 +454,17 @@ pub const RuntimeSession = struct {
         if (client_guid.len > self.client_guid.len) return error.ClientGuidTooLarge;
         @memcpy(self.client_guid[0..client_guid.len], client_guid);
         self.client_guid_len = client_guid.len;
+    }
+
+    pub fn setSessionDir(self: *RuntimeSession, session_dir: []const u8) !void {
+        if (session_dir.len == 0) {
+            self.session_dir_len = 0;
+            return;
+        }
+        if (!std.mem.startsWith(u8, session_dir, "/")) return error.InvalidSessionDir;
+        if (session_dir.len > self.session_dir.len) return error.SessionDirTooLarge;
+        @memcpy(self.session_dir[0..session_dir.len], session_dir);
+        self.session_dir_len = session_dir.len;
     }
 
     pub fn setIdentity(self: *RuntimeSession, guid: []const u8) !void {
@@ -1738,6 +1755,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             child.stdout.?.handle,
             child.stdin.?.handle,
             options.attach_id orelse "",
+            "",
             options.initial_scrollback_row_count,
         ),
         .list, .kill, .kill_all => unreachable,
@@ -1750,6 +1768,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     defer session.deinit();
     if (options.action == .new) {
         try session_registry.ensureAliasForGuid(allocator, session.idSlice(), session.guidSlice());
+        try session_registry.writeLocalRoute(allocator, session.guidSlice(), session.idSlice(), session.sessionDirSlice());
         local_alias_created = true;
     }
 
@@ -2055,7 +2074,7 @@ pub fn startNewSessionOnRuntime(
     defer created.deinit(app_allocator.allocator());
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
     defer app_allocator.allocator().free(client_guid);
-    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid, client_guid);
+    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid, client_guid, "");
     var session = try readRuntimeSession(read_fd);
     try session.setClientGuid(client_guid);
     session.viewport_offset = viewport_offset orelse 0;
@@ -2067,13 +2086,14 @@ pub fn startAttachSessionOnRuntime(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     session_ref: []const u8,
+    session_dir: []const u8,
     initial_scrollback_row_count: ?u32,
 ) !RuntimeSession {
     const viewport_offset = queryInitialViewportOffset();
     try runtimeHandshake(read_fd, write_fd);
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
     defer app_allocator.allocator().free(client_guid);
-    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, client_guid);
+    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, client_guid, session_dir);
     var session = try readRuntimeSession(read_fd);
     try session.setClientGuid(client_guid);
     session.viewport_offset = viewport_offset orelse 0;
@@ -2096,6 +2116,7 @@ pub fn ensureLocalRouteForRemoteSession(
         allocator,
         session.guidSlice(),
         alias,
+        session.sessionDirSlice(),
         host,
         ssh_options,
     );
@@ -2143,7 +2164,7 @@ fn reconnectSessionOnRuntimeInner(
 ) !void {
     try runtimeHandshakeInner(read_fd, write_fd, cancelled);
     const client_guid = try session.ensureClientGuid();
-    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice(), client_guid);
+    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice(), client_guid, session.sessionDirSlice());
     try readSessionAttachedInner(read_fd, cancelled);
     if (wait_for_repaint) try finishReconnectRepaintInner(read_fd, session, cancelled);
 }
@@ -2345,6 +2366,7 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                 defer attached.deinit(app_allocator.allocator());
                 var session = RuntimeSession{};
                 try session.setIdentityWithAlias(attached.session_guid, attached.session_alias);
+                try session.setSessionDir(attached.session_dir);
                 return session;
             },
             else => return error.UnexpectedFrame,
@@ -2622,6 +2644,7 @@ fn sendSessionAttach(
     reconnect_cursor: ?*const ScrollbackCursor,
     session_ref: []const u8,
     client_guid: []const u8,
+    session_dir: []const u8,
 ) !u64 {
     const repaint_request_seq = allocateRepaintRequestSeq();
     const message = pb.SessionAttach{
@@ -2644,6 +2667,7 @@ fn sendSessionAttach(
         .session_ref = session_ref,
         .capture_tty_transcript = tty_transcript.enabled(),
         .client_guid = client_guid,
+        .session_dir = session_dir,
     };
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);

@@ -541,9 +541,11 @@ def write_ssh_route(env, alias, guid, host, ssh_options=()):
     ensure_alias(env, alias, guid)
     session = state_sessions_dir(env) / compact_guid(guid)
     session.mkdir(mode=0o700, parents=True, exist_ok=True)
+    remote_session_dir = Path(env["SESSH_RUNTIME_DIR"]) / "g" / compact_guid(guid)
     lines = [
         f"guid={guid}",
         f"primary_alias={alias}",
+        f"session_dir={str(remote_session_dir).encode('utf-8').hex()}",
         f"host={host.encode('utf-8').hex()}",
     ]
     lines.extend(f"ssh_option={option.encode('utf-8').hex()}" for option in ssh_options)
@@ -1119,7 +1121,9 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
     if "ID=unset GUID=" not in first.stdout:
         raise AssertionError(first)
 
-    attached = run_sessh_until_stdout(["attach", "route-alias"], env, marker)
+    changed_runtime_env = dict(env)
+    changed_runtime_env["SESSH_RUNTIME_DIR"] = str(tmp / "changed-runtime")
+    attached = run_sessh_until_stdout(["attach", "route-alias"], changed_runtime_env, marker)
     if attached.returncode != 0:
         raise AssertionError(attached)
     if marker not in attached.stdout:

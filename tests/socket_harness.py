@@ -2562,13 +2562,17 @@ def run_broker_kill_edge_cases_test(base_env):
             cleanup_runtime(env)
 
 
-def spawn_client(env, extra_args=None):
-    extra_args = extra_args or []
+def spawn_bin(env, args):
     pid, fd = pty.fork()
     if pid == 0:
         os.environ.update(env)
-        os.execv(str(BIN), [str(BIN), ":local:", *extra_args])
+        os.execv(str(BIN), [str(BIN), *args])
     return pid, fd
+
+
+def spawn_client(env, extra_args=None):
+    extra_args = extra_args or []
+    return spawn_bin(env, [":local:", *extra_args])
 
 
 def close_client(pid, fd):
@@ -2863,6 +2867,17 @@ def main():
             current_sessions = sessions(listed.stdout)
             if current_sessions.get("s3", {}).get("attached") != "no":
                 raise AssertionError(listed.stdout)
+
+            changed_runtime_env = dict(env)
+            changed_runtime_env["SESSH_RUNTIME_DIR"] = str(Path(tmp) / "changed-runtime")
+            pid, fd = spawn_bin(changed_runtime_env, ["attach", "s3"])
+            try:
+                read_until(fd, b"$ ")
+                os.write(fd, b"echo sessh_runtime_route_attach\n")
+                read_until_count(fd, b"sessh_runtime_route_attach", 2)
+                os.write(fd, b"~.")
+            finally:
+                close_client(pid, fd)
 
             killed = run([":local:", "--kill", "s3"], env, check=True, timeout=5.0)
             if "ENDED s3" not in killed.stdout:
