@@ -545,15 +545,19 @@ const AttachRequest = struct {
     }
 };
 
-const SessionNewRequest = struct {
-    resize: ResizePayload,
+const TerminalSizePayload = struct {
+    rows: u16,
+    cols: u16,
+};
+
+const SessionCreateRequest = struct {
+    terminal_size: TerminalSizePayload,
     scrollback_row_count: u32,
     environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
     session_guid: []u8,
-    capture_tty_transcript: bool,
 
-    fn deinit(self: *SessionNewRequest) void {
+    fn deinit(self: *SessionCreateRequest) void {
         app_allocator.allocator().free(self.session_guid);
         self.environment.deinit();
         self.* = undefined;
@@ -1120,27 +1124,31 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
     if (handshake_result == .mismatch) return false;
 
     while (true) {
-        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
+        var frame = protocol.readFrameAlloc(app_allocator.allocator(), fd) catch |err| switch (err) {
+            error.EndOfStream => return false,
+            else => return err,
+        };
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .resize => continue,
-            .session_new => {
-                var request = readSessionNewRequest(frame.payload) catch {
-                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid SESSION_NEW payload", "");
+            .session_create => {
+                var request = readSessionCreateRequest(frame.payload) catch {
+                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid SESSION_CREATE payload", "");
                     return false;
                 };
                 defer request.deinit();
                 const session_index = try createSession(
                     session_agent,
-                    request.resize.rows,
-                    request.resize.cols,
+                    request.terminal_size.rows,
+                    request.terminal_size.cols,
                     request.scrollback_row_count,
                     request.environment,
                     request.query_default_colors,
                     request.session_guid,
                 );
-                try attachSession(session_agent, session_index, fd, request.resize, request.capture_tty_transcript);
-                return true;
+                if (session_agent.session_paths) |paths| session_registry.markDetached(paths) catch {};
+                try sendSessionCreatedForSession(fd, &session_agent.sessions[session_index]);
+                continue;
             },
             .session_attach => {
                 var request = try readAttachRequest(frame.payload);
@@ -1385,6 +1393,14 @@ fn sendSessionAttachedForSession(attachment: *Attachment, session: *const Sessio
     });
     defer app_allocator.allocator().free(payload);
     try queueAttachmentFrame(attachment, .session_attached, payload);
+}
+
+fn sendSessionCreatedForSession(fd: c.fd_t, session: *const Session) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionCreated{
+        .session_guid = session.idSlice(),
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .session_created, payload);
 }
 
 fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !void {
@@ -1876,10 +1892,10 @@ fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
     _ = terminal.setPtySize(session.pty_fd, rows, cols);
 }
 
-fn readSessionNewRequest(payload: []const u8) !SessionNewRequest {
-    var message = try protocol.decodePayload(pb.SessionNew, app_allocator.allocator(), payload);
+fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
+    var message = try protocol.decodePayload(pb.SessionCreate, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
-    const resize = message.resize orelse return error.MissingResize;
+    const terminal_size = message.terminal_size orelse return error.MissingTerminalSize;
     if (!session_registry.isValidGuid(message.session_guid)) return error.InvalidSessionGuid;
     var environment = SessionEnvironment{};
     errdefer environment.deinit();
@@ -1893,12 +1909,11 @@ fn readSessionNewRequest(payload: []const u8) !SessionNewRequest {
     }
 
     return .{
-        .resize = try resizePayloadFromMessage(resize),
+        .terminal_size = try terminalSizePayloadFromMessage(terminal_size),
         .scrollback_row_count = message.scrollback_row_limit,
         .environment = environment,
         .query_default_colors = query_default_colors,
         .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
-        .capture_tty_transcript = message.capture_tty_transcript,
     };
 }
 
@@ -1920,6 +1935,18 @@ fn readResizePayload(payload: []const u8) !ResizePayload {
     var message = try protocol.decodePayload(pb.Resize, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     return try resizePayloadFromMessage(message);
+}
+
+fn terminalSizePayloadFromMessage(message: pb.TerminalSize) !TerminalSizePayload {
+    if (message.terminal_rows > std.math.maxInt(u16) or
+        message.terminal_cols > std.math.maxInt(u16))
+    {
+        return error.IntOutOfRange;
+    }
+    return .{
+        .rows = @intCast(message.terminal_rows),
+        .cols = @intCast(message.terminal_cols),
+    };
 }
 
 fn resizePayloadFromMessage(message: pb.Resize) !ResizePayload {

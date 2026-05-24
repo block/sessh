@@ -36,12 +36,13 @@ HELLO_REQUEST = "hello_request"
 HELLO_OK = "hello_ok"
 HELLO_ERROR = "hello_error"
 ERROR = "error"
-SESSION_NEW = "session_new"
+SESSION_CREATE = "session_create"
 SESSION_ATTACH = "session_attach"
 INPUT = "input"
 RESIZE = "resize"
 REPAINT_REQUEST = "repaint_request"
 PING_REQUEST = "ping_request"
+SESSION_CREATED = "session_created"
 SESSION_ATTACHED = "session_attached"
 SESSION_ENDED = "session_ended"
 DRAW = "draw"
@@ -55,12 +56,13 @@ _HELLO_FRAME_FIELDS = {
 }
 _FRAME_FIELDS = {
     ERROR: ERROR,
-    SESSION_NEW: SESSION_NEW,
+    SESSION_CREATE: SESSION_CREATE,
     SESSION_ATTACH: SESSION_ATTACH,
     INPUT: INPUT,
     RESIZE: RESIZE,
     REPAINT_REQUEST: REPAINT_REQUEST,
     PING_REQUEST: PING_REQUEST,
+    SESSION_CREATED: SESSION_CREATED,
     SESSION_ATTACHED: SESSION_ATTACHED,
     SESSION_ENDED: SESSION_ENDED,
     DRAW: DRAW,
@@ -285,13 +287,13 @@ def pack_bytes(value):
     return sessh_pb().Input(data=value).SerializeToString()
 
 
-def pack_session_new(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1"):
+def pack_session_create(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1"):
     pb = sessh_pb()
-    message = pb.SessionNew(scrollback_row_limit=scrollback)
+    message = pb.SessionCreate(scrollback_row_limit=scrollback)
     message.session_guid = guid_for_ref(session_id)
     rows, cols = _LAST_RESIZE
-    message.resize.terminal_rows = rows
-    message.resize.terminal_cols = cols
+    message.terminal_size.terminal_rows = rows
+    message.terminal_size.terminal_cols = cols
     entry = message.environment.add()
     entry.name = "SHELL"
     entry.value = str(shell)
@@ -367,6 +369,17 @@ def parse_session_ended(payload):
 def assert_session_attached(payload):
     message = sessh_pb().SessionAttached()
     message.ParseFromString(payload)
+
+
+def assert_session_created(payload):
+    message = sessh_pb().SessionCreated()
+    message.ParseFromString(payload)
+
+
+def create_and_attach_session(conn, shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", initial_scrollback=None):
+    send_frame(conn, SESSION_CREATE, pack_session_create(shell, scrollback=scrollback, fg=fg, bg=bg, session_id=session_id))
+    assert_session_created(recv_until_message(conn, SESSION_CREATED))
+    send_frame(conn, SESSION_ATTACH, pack_session_attach(initial_scrollback=initial_scrollback))
 
 
 def parse_draw(payload):
@@ -695,7 +708,7 @@ def run_login_shell_profile_test(_base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(Path("/bin/sh")))
+                create_and_attach_session(conn, Path("/bin/sh"))
                 message_type, _payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
                     raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
@@ -839,7 +852,7 @@ def run_live_draw_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -862,6 +875,52 @@ def run_live_draw_protocol_test(base_env):
             cleanup_runtime(env)
 
 
+def run_session_create_without_attach_protocol_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-create-detached-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "detached-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "printf 'DETACHED_READY\\n'\n"
+            "while IFS= read -r line; do\n"
+            "  [ \"$line\" = exit ] && exit 0\n"
+            "done\n"
+        )
+        shell.chmod(0o700)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+
+            create = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            create.settimeout(5.0)
+            try:
+                create.connect(str(socket_path(env)))
+                send_hello(create)
+                send_resize(create)
+                send_frame(create, SESSION_CREATE, pack_session_create(shell))
+                assert_session_created(recv_until_message(create, SESSION_CREATED))
+            finally:
+                create.close()
+
+            attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            attach.settimeout(5.0)
+            try:
+                attach.connect(str(socket_path(env)))
+                send_hello(attach)
+                send_frame(attach, SESSION_ATTACH, pack_session_attach())
+                message_type, payload = recv_frame(attach)
+                if message_type != SESSION_ATTACHED:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                assert_session_attached(payload)
+                recv_draw_until(attach, b"DETACHED_READY")
+                send_frame(attach, INPUT, pack_bytes(b"exit\n"))
+                recv_until_message(attach, SESSION_ENDED)
+            finally:
+                attach.close()
+        finally:
+            cleanup_runtime(env)
+
+
 def run_ping_protocol_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-ping-protocol-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
@@ -879,7 +938,7 @@ def run_ping_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -920,7 +979,7 @@ def run_session_ended_payload_protocol_test(base_env):
             conn.connect(str(socket_path(env)))
             send_hello(conn)
             send_resize(conn)
-            send_frame(conn, SESSION_NEW, pack_session_new(shell))
+            create_and_attach_session(conn, shell)
             message_kind, payload = recv_frame(conn)
             if message_kind != SESSION_ATTACHED:
                 raise AssertionError(f"expected SESSION_ATTACHED, got {message_kind}")
@@ -962,7 +1021,7 @@ def run_session_ended_payload_protocol_test(base_env):
             conn.connect(str(socket_path(env)))
             send_hello(conn)
             send_resize(conn)
-            send_frame(conn, SESSION_NEW, pack_session_new(shell))
+            create_and_attach_session(conn, shell)
             message_kind, payload = recv_frame(conn)
             if message_kind != SESSION_ATTACHED:
                 raise AssertionError(f"expected SESSION_ATTACHED, got {message_kind}")
@@ -1016,7 +1075,7 @@ def run_plain_scroll_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, rows=10, cols=80)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1067,7 +1126,7 @@ def run_plain_screen_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, rows=24, cols=80)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1114,7 +1173,7 @@ def run_split_escape_tail_is_not_passthrough_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, rows=24, cols=80)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1159,7 +1218,7 @@ def run_active_screen_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1199,7 +1258,7 @@ def run_terminal_modes_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1258,7 +1317,7 @@ def run_cursor_shape_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1386,7 +1445,7 @@ def run_complete_display_clear_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1428,7 +1487,7 @@ def run_title_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1473,7 +1532,7 @@ def run_default_colors_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1529,7 +1588,7 @@ def run_seeded_default_color_query_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell, fg=0x010A0B0C, bg=0x010D0E0F))
+                create_and_attach_session(conn, shell, fg=0x010A0B0C, bg=0x010D0E0F)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1596,7 +1655,7 @@ def run_complex_ui_query_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell))
+                create_and_attach_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1642,7 +1701,7 @@ def run_scrollback_attach_draw_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, 3, 40)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell, scrollback=20))
+                create_and_attach_session(conn, shell, scrollback=20)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1735,7 +1794,7 @@ def run_scrollback_clear_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, 3, 40)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell, scrollback=20))
+                create_and_attach_session(conn, shell, scrollback=20)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -1802,7 +1861,7 @@ def start_gap_session(env, shell, scrollback_limit):
     conn.connect(str(socket_path(env)))
     send_hello(conn)
     send_resize(conn, 3, 40)
-    send_frame(conn, SESSION_NEW, pack_session_new(shell, scrollback=scrollback_limit))
+    create_and_attach_session(conn, shell, scrollback=scrollback_limit)
     message_type, payload = recv_frame(conn)
     if message_type != SESSION_ATTACHED:
         raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
@@ -1939,7 +1998,7 @@ def run_resize_epoch_does_not_clear_reconnect_scrollback_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, 3, 40)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell, scrollback=20))
+                create_and_attach_session(conn, shell, scrollback=20)
 
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
@@ -2021,7 +2080,7 @@ def run_slow_attachment_does_not_block_commands_test(base_env):
             conn.connect(str(socket_path(env)))
             send_hello(conn)
             send_resize(conn, 3, 200)
-            send_frame(conn, SESSION_NEW, pack_session_new(shell, scrollback=50000))
+            create_and_attach_session(conn, shell, scrollback=50000)
 
             message_type, payload = recv_frame(conn)
             if message_type != SESSION_ATTACHED:
@@ -2119,7 +2178,7 @@ def run_session_agent_registry_test(base_env):
             conn.connect(str(socket_file))
             send_hello(conn)
             send_resize(conn, rows=4, cols=40)
-            send_frame(conn, SESSION_NEW, pack_session_new(shell, session_id="s42"))
+            create_and_attach_session(conn, shell, session_id="s42")
             message_type, payload = recv_frame(conn)
             if message_type != SESSION_ATTACHED:
                 raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
@@ -2193,7 +2252,7 @@ def run_host_broker_starts_session_agent_test(base_env):
         try:
             send_hello(conn)
             send_resize(conn, rows=4, cols=40)
-            send_frame(conn, SESSION_NEW, pack_session_new(shell))
+            create_and_attach_session(conn, shell)
             message_type, payload = recv_frame(conn)
             if message_type != SESSION_ATTACHED:
                 raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
@@ -2254,7 +2313,7 @@ def run_host_broker_registry_commands_test(base_env):
         try:
             send_hello(conn)
             send_resize(conn, rows=4, cols=40)
-            send_frame(conn, SESSION_NEW, pack_session_new(shell))
+            create_and_attach_session(conn, shell)
             message_type, payload = recv_frame(conn)
             if message_type != SESSION_ATTACHED:
                 raise AssertionError((message_type, payload))
@@ -2318,7 +2377,7 @@ def run_host_broker_registry_commands_test(base_env):
         try:
             send_hello(conn)
             send_resize(conn, rows=4, cols=40)
-            send_frame(conn, SESSION_NEW, pack_session_new(shell, session_id="s2"))
+            create_and_attach_session(conn, shell, session_id="s2")
             message_type, payload = recv_frame(conn)
             if message_type != SESSION_ATTACHED:
                 raise AssertionError((message_type, payload))
@@ -2352,7 +2411,7 @@ def run_host_broker_registry_commands_test(base_env):
             try:
                 send_hello(conn)
                 send_resize(conn, rows=4, cols=40)
-                send_frame(conn, SESSION_NEW, pack_session_new(shell, session_id=expected_id))
+                create_and_attach_session(conn, shell, session_id=expected_id)
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
                     raise AssertionError((expected_id, message_type, payload))
@@ -2654,6 +2713,7 @@ def main():
             run_host_broker_registry_commands_test(env)
             run_broker_kill_edge_cases_test(env)
             run_minor_version_compatibility_test(env)
+            run_session_create_without_attach_protocol_test(env)
             run_live_draw_protocol_test(env)
             run_ping_protocol_test(env)
             run_session_ended_payload_protocol_test(env)

@@ -12,13 +12,14 @@ pub const MessageType = enum {
     hello_error,
     error_message,
 
-    session_new,
+    session_create,
     session_attach,
     input,
     resize,
     repaint_request,
     ping_request,
 
+    session_created,
     session_attached,
     session_ended,
     draw,
@@ -106,12 +107,13 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
         const payload = frame.payload orelse return error.UnknownFrame;
         return switch (payload) {
             .@"error" => |message| ownedFrameFromMessage(allocator, .error_message, message),
-            .session_new => |message| ownedFrameFromMessage(allocator, .session_new, message),
+            .session_create => |message| ownedFrameFromMessage(allocator, .session_create, message),
             .session_attach => |message| ownedFrameFromMessage(allocator, .session_attach, message),
             .input => |message| ownedFrameFromMessage(allocator, .input, message),
             .resize => |message| ownedFrameFromMessage(allocator, .resize, message),
             .repaint_request => |message| ownedFrameFromMessage(allocator, .repaint_request, message),
             .ping_request => |message| ownedFrameFromMessage(allocator, .ping_request, message),
+            .session_created => |message| ownedFrameFromMessage(allocator, .session_created, message),
             .session_attached => |message| ownedFrameFromMessage(allocator, .session_attached, message),
             .session_ended => |message| ownedFrameFromMessage(allocator, .session_ended, message),
             .draw => |message| ownedFrameFromMessage(allocator, .draw, message),
@@ -166,10 +168,10 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .@"error" = message } });
         },
-        .session_new => blk: {
-            var message = try decodePayload(pb.SessionNew, allocator, payload);
+        .session_create => blk: {
+            var message = try decodePayload(pb.SessionCreate, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_new = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_create = message } });
         },
         .session_attach => blk: {
             var message = try decodePayload(pb.SessionAttach, allocator, payload);
@@ -195,6 +197,11 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.PingRequest, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .ping_request = message } });
+        },
+        .session_created => blk: {
+            var message = try decodePayload(pb.SessionCreated, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_created = message } });
         },
         .session_attached => blk: {
             var message = try decodePayload(pb.SessionAttached, allocator, payload);

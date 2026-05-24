@@ -51,16 +51,16 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                 try attachAgentAndRelay(allocator, agent_fd, frame.payload);
                 return;
             },
-            .session_new => {
+            .session_create => {
                 defer frame.deinit(allocator);
                 const agent_fd = try startSessionAgentAndConnect(allocator, exe, frame.payload);
                 defer _ = c.close(agent_fd);
-                try startAgentAndRelay(allocator, agent_fd, frame.payload);
+                try createSessionAndRelay(allocator, agent_fd, frame.payload);
                 return;
             },
             else => {
                 defer frame.deinit(allocator);
-                try sendError(1, "PROTOCOL_ERROR", "broker only supports SESSION_NEW or SESSION_ATTACH in this mode", "");
+                try sendError(1, "PROTOCOL_ERROR", "broker only supports SESSION_CREATE or SESSION_ATTACH in this mode", "");
                 return;
             },
         }
@@ -412,8 +412,8 @@ fn statAbsolute(path: []const u8) !std.fs.File.Stat {
     return std.fs.cwd().statFile(path);
 }
 
-fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_new_payload: []const u8) !c.fd_t {
-    var request = try protocol.decodePayload(pb.SessionNew, allocator, session_new_payload);
+fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_create_payload: []const u8) !c.fd_t {
+    var request = try protocol.decodePayload(pb.SessionCreate, allocator, session_create_payload);
     defer request.deinit(allocator);
     var allocation = if (request.session_guid.len > 0)
         try session_registry.allocateSessionDirForGuid(allocator, request.session_guid)
@@ -445,10 +445,10 @@ fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, se
     return error.SessionAgentDidNotStart;
 }
 
-fn startAgentAndRelay(
+fn createSessionAndRelay(
     allocator: std.mem.Allocator,
     agent_fd: c.fd_t,
-    session_new_payload: []const u8,
+    session_create_payload: []const u8,
 ) !void {
     initiateRuntimeHandshake(allocator, agent_fd) catch |err| switch (err) {
         error.VersionMismatch => {
@@ -457,7 +457,7 @@ fn startAgentAndRelay(
         },
         else => return err,
     };
-    try protocol.sendFrame(agent_fd, .session_new, session_new_payload);
+    try protocol.sendFrame(agent_fd, .session_create, session_create_payload);
     try relay.relayFrames(0, 1, agent_fd);
 }
 

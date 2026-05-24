@@ -45,12 +45,13 @@ pub const Frame = struct {
 
     pub const _payload_case = enum {
         @"error",
-        session_new,
+        session_create,
         session_attach,
         input,
         resize,
         repaint_request,
         ping_request,
+        session_created,
         session_attached,
         session_ended,
         draw,
@@ -60,12 +61,13 @@ pub const Frame = struct {
     };
     pub const payload_union = union(_payload_case) {
         @"error": sessh_handshake_v1.Error,
-        session_new: SessionNew,
+        session_create: SessionCreate,
         session_attach: SessionAttach,
         input: Input,
         resize: Resize,
         repaint_request: RepaintRequest,
         ping_request: PingRequest,
+        session_created: SessionCreated,
         session_attached: SessionAttached,
         session_ended: SessionEnded,
         draw: Draw,
@@ -74,18 +76,19 @@ pub const Frame = struct {
         tty_transcript_chunk: TtyTranscriptChunk,
         pub const _desc_table = .{
             .@"error" = fd(10, .submessage),
-            .session_new = fd(11, .submessage),
+            .session_create = fd(11, .submessage),
             .session_attach = fd(12, .submessage),
             .input = fd(13, .submessage),
             .resize = fd(14, .submessage),
             .repaint_request = fd(15, .submessage),
             .ping_request = fd(16, .submessage),
-            .session_attached = fd(17, .submessage),
-            .session_ended = fd(18, .submessage),
-            .draw = fd(19, .submessage),
-            .ping_response = fd(20, .submessage),
-            .repaint_response = fd(21, .submessage),
-            .tty_transcript_chunk = fd(22, .submessage),
+            .session_created = fd(17, .submessage),
+            .session_attached = fd(18, .submessage),
+            .session_ended = fd(19, .submessage),
+            .draw = fd(20, .submessage),
+            .ping_response = fd(21, .submessage),
+            .repaint_response = fd(22, .submessage),
+            .tty_transcript_chunk = fd(23, .submessage),
         };
     };
 
@@ -152,7 +155,78 @@ pub const Frame = struct {
     }
 };
 
-/// Embedded in SessionNew.
+/// Embedded in SessionCreate.
+///
+/// Initial terminal size used when creating a new PTY session.
+pub const TerminalSize = struct {
+    terminal_rows: u32 = 0,
+    terminal_cols: u32 = 0,
+
+    pub const _desc_table = .{
+        .terminal_rows = fd(1, .{ .scalar = .uint32 }),
+        .terminal_cols = fd(2, .{ .scalar = .uint32 }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Embedded in SessionCreate.
 ///
 /// Environment value used when creating a new session.
 pub const EnvironmentEntry = struct {
@@ -223,7 +297,7 @@ pub const EnvironmentEntry = struct {
     }
 };
 
-/// Embedded in SessionNew.
+/// Embedded in SessionCreate.
 ///
 /// Outer terminal default colors reported by the client.
 pub const DefaultColors = struct {
@@ -296,23 +370,23 @@ pub const DefaultColors = struct {
 
 /// Framed payload, client -> session agent.
 ///
-/// Creates a new interactive PTY session. A successful SessionNew is followed
-/// by SessionAttached for the new session, then Draw messages.
-pub const SessionNew = struct {
-    resize: ?Resize = null,
+/// Creates a new interactive PTY session without attaching this client. A
+/// successful SessionCreate is followed by SessionCreated. The client may then
+/// attach using SessionAttach on the same connection, or close the connection
+/// and leave the session detached.
+pub const SessionCreate = struct {
+    terminal_size: ?TerminalSize = null,
     scrollback_row_limit: u32 = 0,
     environment: std.ArrayListUnmanaged(EnvironmentEntry) = .empty,
     query_default_colors: ?DefaultColors = null,
     session_guid: []const u8 = &.{},
-    capture_tty_transcript: bool = false,
 
     pub const _desc_table = .{
-        .resize = fd(1, .submessage),
+        .terminal_size = fd(1, .submessage),
         .scrollback_row_limit = fd(2, .{ .scalar = .uint32 }),
         .environment = fd(3, .{ .repeated = .submessage }),
         .query_default_colors = fd(4, .submessage),
         .session_guid = fd(5, .{ .scalar = .string }),
-        .capture_tty_transcript = fd(6, .{ .scalar = .bool }),
     };
 
     /// Encodes the message to the writer
@@ -674,6 +748,75 @@ pub const PingRequest = struct {
 
     pub const _desc_table = .{
         .ping_request_seq = fd(1, .{ .scalar = .uint64 }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, session agent -> client.
+///
+/// Confirms that a SessionCreate created the requested session.
+pub const SessionCreated = struct {
+    session_guid: []const u8 = &.{},
+
+    pub const _desc_table = .{
+        .session_guid = fd(1, .{ .scalar = .string }),
     };
 
     /// Encodes the message to the writer

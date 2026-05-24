@@ -1995,9 +1995,13 @@ pub fn startNewSessionOnRuntime(
 ) !RuntimeSession {
     const viewport_offset = queryInitialViewportOffset();
     try runtimeHandshake(read_fd, write_fd);
-    try sendSessionNew(write_fd, terminal.currentWindowSize(), scrollback_row_count, viewport_offset, session_guid);
+    const size = terminal.currentWindowSize();
+    const created_guid = try sendSessionCreateAndReadCreated(read_fd, write_fd, size, scrollback_row_count, session_guid);
+    defer app_allocator.allocator().free(created_guid);
+    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created_guid);
     var session = try readRuntimeSession(read_fd);
     session.viewport_offset = viewport_offset orelse 0;
+    session.pending_repaint.repaint_request_seq = repaint_request_seq;
     return session;
 }
 
@@ -2270,6 +2274,30 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
     }
 }
 
+fn readSessionCreated(read_fd: c.fd_t) ![]u8 {
+    while (true) {
+        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .error_message => {
+                const parsed = try parseErrorPayload(frame.payload);
+                if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
+                    freeErrorPayload(parsed);
+                    return error.VersionMismatch;
+                }
+                try printParsedError(parsed);
+                return process_exit.request(1);
+            },
+            .session_created => {
+                var created = try protocol.decodePayload(pb.SessionCreated, app_allocator.allocator(), frame.payload);
+                defer created.deinit(app_allocator.allocator());
+                return try app_allocator.allocator().dupe(u8, created.session_guid);
+            },
+            else => return error.UnexpectedFrame,
+        }
+    }
+}
+
 fn queryInitialViewportOffset() ?i32 {
     const position = terminal.queryCursorPosition(0, 1) catch return null;
     return if (position) |value| @intCast(value.row) else null;
@@ -2441,22 +2469,30 @@ fn errorPayloadFromHelloError(response_error: hpb.HelloError) ErrorPayload {
     };
 }
 
-fn sendSessionNew(
+fn sendSessionCreateAndReadCreated(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    size: WindowSize,
+    scrollback_row_count: u32,
+    session_guid: []const u8,
+) ![]u8 {
+    try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid);
+    return readSessionCreated(read_fd);
+}
+
+fn sendSessionCreate(
     conn: c.fd_t,
     size: WindowSize,
     scrollback_row_count: u32,
-    viewport_offset: ?i32,
     session_guid: []const u8,
 ) !void {
-    var message = pb.SessionNew{
-        .resize = .{
+    var message = pb.SessionCreate{
+        .terminal_size = .{
             .terminal_rows = size.rows,
             .terminal_cols = size.cols,
-            .viewport_offset = viewport_offset,
         },
         .scrollback_row_limit = scrollback_row_count,
         .session_guid = session_guid,
-        .capture_tty_transcript = tty_transcript.enabled(),
     };
     defer message.environment.deinit(app_allocator.allocator());
     const default_colors = queryDefaultColorsForSession();
@@ -2466,7 +2502,7 @@ fn sendSessionNew(
     };
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(conn, .session_new, payload);
+    try protocol.sendFrame(conn, .session_create, payload);
 }
 
 const ProtocolDefaultColors = struct {

@@ -11,43 +11,25 @@ sys.path.insert(0, str(TESTS))
 
 from harness_cleanup import cleanup_runtime
 from socket_harness import (
+    DRAW,
+    INPUT,
+    SESSION_ATTACHED,
+    create_and_attach_session,
+    encode_frame_body,
     pack_bytes,
-    pack_session_new,
     parse_draw,
     recv_frame,
-    run,
     send_frame,
     send_hello,
     send_resize,
     socket_path,
-    unpack_session_attached,
+    start_session_agent,
 )
 from test_env import isolated_env
 
 
-MESSAGE_NAMES = {
-    0x0001: "HELLO_REQUEST",
-    0x0002: "HELLO_OK",
-    0x0003: "HELLO_ERROR",
-    0x0004: "ERROR",
-    0x0005: "UNRECOGNIZED",
-    0x0010: "COMMAND_REQUEST",
-    0x0011: "SESSION_NEW",
-    0x0012: "SESSION_ATTACH",
-    0x0015: "INPUT",
-    0x0016: "RESIZE",
-    0x0017: "REPAINT",
-    0x0018: "PING_REQUEST",
-    0x0020: "COMMAND_RESPONSE",
-    0x0021: "SESSION_ATTACHED",
-    0x0022: "SESSION_ENDED",
-    0x0027: "DRAW",
-    0x0028: "PING_RESPONSE",
-}
-
-
 def message_name(message_type):
-    return MESSAGE_NAMES.get(message_type, f"0x{message_type:04x}")
+    return message_type.upper()
 
 
 def write_perf_shell(path):
@@ -73,7 +55,7 @@ def write_perf_shell(path):
 
 
 def frame_text(message_type, payload):
-    if message_type == 0x0027:
+    if message_type == DRAW:
         return parse_draw(payload)["draw_bytes"].decode(errors="replace")
     return ""
 
@@ -102,19 +84,17 @@ def summarize_frames(frames):
     wire_bytes = collections.Counter()
     draw_frames = 0
     draw_bytes = 0
-    draw_scroll_count = 0
 
     for message_type, payload in frames:
         name = message_name(message_type)
         by_message[name] += 1
         payload_bytes[name] += len(payload)
-        wire_bytes[name] += len(payload) + 16
+        wire_bytes[name] += len(encode_frame_body(message_type, payload)) + 4
 
-        if message_type == 0x0027:
+        if message_type == DRAW:
             draw_frames += 1
             parsed = parse_draw(payload)
             draw_bytes += len(parsed["draw_bytes"])
-            draw_scroll_count += parsed["scroll_count"]
 
     return {
         "frame_count": len(frames),
@@ -123,7 +103,6 @@ def summarize_frames(frames):
         "wire_bytes": wire_bytes,
         "draw_frames": draw_frames,
         "draw_bytes": draw_bytes,
-        "draw_scroll_count": draw_scroll_count,
     }
 
 
@@ -144,7 +123,6 @@ def print_summary(summary):
     print("  DRAW:")
     print(f"    frames: {summary['draw_frames']}")
     print(f"    terminal bytes: {summary['draw_bytes']}")
-    print(f"    scroll_count: {summary['draw_scroll_count']}")
 
 
 def main():
@@ -154,10 +132,9 @@ def main():
         write_perf_shell(shell)
         env["SHELL"] = str(shell)
         cleanup_runtime(env)
+        proc = None
         try:
-            started = run([":local:", "--list"], env, check=True, timeout=5.0)
-            if "ID\tATTACHED\tPID" not in started.stdout:
-                raise RuntimeError(started.stdout)
+            proc = start_session_agent(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -165,20 +142,21 @@ def main():
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, 24, 80)
-                send_frame(conn, 0x0011, pack_session_new(shell, scrollback=2000))
+                create_and_attach_session(conn, shell, scrollback=2000)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != 0x0021:
+                if message_type != SESSION_ATTACHED:
                     raise RuntimeError(f"expected SESSION_ATTACHED, got {message_name(message_type)}")
-                session_id = unpack_session_attached(payload)
 
                 wait_for_text(conn, "PERF_READY$ ")
-                _ = session_id
-                send_frame(conn, 0x0015, pack_bytes(b"seq 100\n"))
+                send_frame(conn, INPUT, pack_bytes(b"seq 100\n"))
                 frames = collect_until_text(conn, "PERF_DONE$ ")
             finally:
                 conn.close()
         finally:
+            if proc is not None:
+                proc.terminate()
+                proc.wait(timeout=5.0)
             cleanup_runtime(env)
 
     print_summary(summarize_frames(frames))

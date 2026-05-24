@@ -21,22 +21,33 @@ message Frame {
 
   oneof payload {
     sessh.handshake.v1.Error error = 10;
-    SessionNew session_new = 11;
+    SessionCreate session_create = 11;
     SessionAttach session_attach = 12;
     Input input = 13;
     Resize resize = 14;
     RepaintRequest repaint_request = 15;
     PingRequest ping_request = 16;
-    SessionAttached session_attached = 17;
-    SessionEnded session_ended = 18;
-    Draw draw = 19;
-    PingResponse ping_response = 20;
-    RepaintResponse repaint_response = 21;
-    TtyTranscriptChunk tty_transcript_chunk = 22;
+    SessionCreated session_created = 17;
+    SessionAttached session_attached = 18;
+    SessionEnded session_ended = 19;
+    Draw draw = 20;
+    PingResponse ping_response = 21;
+    RepaintResponse repaint_response = 22;
+    TtyTranscriptChunk tty_transcript_chunk = 23;
   }
 }
 
-// Embedded in SessionNew.
+// Embedded in SessionCreate.
+//
+// Initial terminal size used when creating a new PTY session.
+message TerminalSize {
+  // Rows visible in the terminal. The session agent bounds this to u16.
+  uint32 terminal_rows = 1;
+  // Columns visible in the terminal. The session agent bounds this to u16.
+  uint32 terminal_cols = 2;
+}
+
+// Embedded in SessionCreate.
 //
 // Environment value used when creating a new session.
 message EnvironmentEntry {
@@ -44,7 +55,7 @@ message EnvironmentEntry {
   string value = 2;
 }
 
-// Embedded in SessionNew.
+// Embedded in SessionCreate.
 //
 // Outer terminal default colors reported by the client.
 message DefaultColors {
@@ -56,11 +67,13 @@ message DefaultColors {
 
 // Framed payload, client -> session agent.
 //
-// Creates a new interactive PTY session. A successful SessionNew is followed
-// by SessionAttached for the new session, then Draw messages.
-message SessionNew {
-  // Initial terminal size for this attachment.
-  Resize resize = 1;
+// Creates a new interactive PTY session without attaching this client. A
+// successful SessionCreate is followed by SessionCreated. The client may then
+// attach using SessionAttach on the same connection, or close the connection
+// and leave the session detached.
+message SessionCreate {
+  // Initial PTY size.
+  TerminalSize terminal_size = 1;
   // Maximum session-agent-retained scrollback rows for this session.
   uint32 scrollback_row_limit = 2;
   // Session environment entries. Currently SHELL is the only used key.
@@ -69,9 +82,6 @@ message SessionNew {
   DefaultColors query_default_colors = 4;
   // Canonical session GUID in normal hyphenated UUID form.
   string session_guid = 5;
-  // When true, the session agent sends raw inner PTY transcript chunks for
-  // this attachment. The client still owns archive creation and storage.
-  bool capture_tty_transcript = 6;
 }
 
 // Framed payload, client -> session agent.
@@ -141,6 +151,14 @@ message RepaintRequest {
 // path through ssh/broker/session-agent, not application output or UI rendering.
 message PingRequest {
   uint64 ping_request_seq = 1;
+}
+
+// Framed payload, session agent -> client.
+//
+// Confirms that a SessionCreate created the requested session.
+message SessionCreated {
+  // Canonical session GUID in normal hyphenated UUID form.
+  string session_guid = 1;
 }
 
 // Framed payload, session agent -> client.
