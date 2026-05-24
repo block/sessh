@@ -1,8 +1,7 @@
 # Contributing to sessh
 
-sessh is being rewritten around a single native binary, per-session agents, and
-a runtime protocol. Start with [README.md](README.md), then read
-[Architecture](docs/ARCHITECTURE.md) before changing implementation behavior.
+Start with [README.md](README.md), then read
+[Architecture](docs/ARCHITECTURE.md).
 
 ## Development Setup
 
@@ -19,6 +18,13 @@ current implementation:
 scripts/check
 ```
 
+Run:
+```
+scripts/install
+```
+
+to build and install a binary in ~/.local/bin/sessh
+
 ## Testing
 
 Testing strategy is described in [Testing](docs/TESTING.md). Prefer
@@ -30,11 +36,13 @@ Use Podman only for slower end-to-end coverage across a real ssh boundary.
 
 ## Releases
 
-Releases are cut from version tags. See [RELEASING.md](RELEASING.md) for the exact
-release process.
+See [RELEASING.md](RELEASING.md).
 
 ## Issues
 
-Use GitHub issues for reproducible bugs. Include the command you ran, the local
-and remote environments, whether you used ssh or `:local:`, and relevant
-terminal output.
+Use GitHub issues for reproducible bugs. Include the command you ran and your
+~/.config/sessh/sessh.env.
+
+You can generate a transcript of TTY (for both the inner and outer terminals)
+using --capture-tty-transcript. Please audit this transcript for personal data
+before including it in bug reports.

@@ -82,6 +82,9 @@ message SessionCreate {
   DefaultColors query_default_colors = 4;
   // Canonical session GUID in normal hyphenated UUID form.
   string session_guid = 5;
+  // Alias to register for this session in the session agent's namespace. Empty
+  // asks the receiver to generate a remote alias.
+  string session_alias = 6;
 }
 
 // Framed payload, client -> session agent.
@@ -90,9 +93,9 @@ message SessionCreate {
 // SessionAttached for the selected session, then Draw/RepaintResponse messages.
 message SessionAttach {
   Resize resize = 1;
-  // Canonical session GUID in normal hyphenated UUID form. Empty means attach
-  // the most recent session known to the selected broker.
-  string session_guid = 2;
+  // Session GUID or alias. Empty means attach the most recent session known to
+  // the selected broker.
+  string session_ref = 2;
   // When true, the session agent sends raw inner PTY transcript chunks for
   // this attachment. The client still owns archive creation and storage.
   bool capture_tty_transcript = 3;
@@ -159,6 +162,8 @@ message PingRequest {
 message SessionCreated {
   // Canonical session GUID in normal hyphenated UUID form.
   string session_guid = 1;
+  // Alias registered for this session in the creating namespace.
+  string session_alias = 2;
 }
 
 // Framed payload, session agent -> client.
@@ -167,6 +172,8 @@ message SessionCreated {
 message SessionAttached {
   // Canonical session GUID in normal hyphenated UUID form.
   string session_guid = 1;
+  // Primary alias for this session in the attaching namespace, if known.
+  string session_alias = 2;
 }
 
 enum SessionEndReason {

@@ -291,6 +291,8 @@ def pack_session_create(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, se
     pb = sessh_pb()
     message = pb.SessionCreate(scrollback_row_limit=scrollback)
     message.session_guid = guid_for_ref(session_id)
+    if not is_guid_ref(session_id):
+        message.session_alias = session_id
     rows, cols = _LAST_RESIZE
     message.terminal_size.terminal_rows = rows
     message.terminal_size.terminal_cols = cols
@@ -302,10 +304,11 @@ def pack_session_create(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, se
     return message.SerializeToString()
 
 
-def pack_session_attach(initial_scrollback=None, reconnect_cursor=None):
+def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_ref=""):
     global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
     message = pb.SessionAttach()
+    message.session_ref = session_ref
     rows, cols = _LAST_RESIZE
     message.resize.terminal_rows = rows
     message.resize.terminal_cols = cols
@@ -369,11 +372,13 @@ def parse_session_ended(payload):
 def assert_session_attached(payload):
     message = sessh_pb().SessionAttached()
     message.ParseFromString(payload)
+    return message
 
 
 def assert_session_created(payload):
     message = sessh_pb().SessionCreated()
     message.ParseFromString(payload)
+    return message
 
 
 def create_and_attach_session(conn, shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", initial_scrollback=None):
@@ -1360,7 +1365,7 @@ def run_state_only_client_render_test(base_env):
         shell.chmod(0o700)
         env["SHELL"] = str(shell)
         cleanup_runtime(env)
-        pid, fd = spawn_client(env)
+        pid, fd = spawn_client(env, ["--alias", "s1"])
         try:
             read_until(fd, b"\x1b]2;state-only-client-ready\x1b\\", timeout=5.0)
             os.write(fd, b"insert\n")
@@ -1403,7 +1408,7 @@ def run_display_clear_not_forwarded_test(base_env):
         shell.chmod(0o700)
         env["SHELL"] = str(shell)
         cleanup_runtime(env)
-        pid, fd = spawn_client(env)
+        pid, fd = spawn_client(env, ["--alias", "s1"])
         try:
             read_until(fd, b"CLEAR$ ", timeout=5.0)
             read_available(fd)
@@ -2108,7 +2113,7 @@ def run_session_agent_crash_client_error_test(base_env):
         env = isolated_env(tmp)
         env["SHELL"] = "/bin/sh"
         cleanup_runtime(env)
-        pid, fd = spawn_client(env)
+        pid, fd = spawn_client(env, ["--alias", "s1"])
         child_closed = False
         try:
             read_until(fd, b"$ ")
@@ -2552,7 +2557,7 @@ def run_env_config_client_test(tmp_root):
     )
 
     try:
-        pid, fd = spawn_client(env)
+        pid, fd = spawn_client(env, ["--alias", "s1"])
         try:
             read_until(fd, b"$ ")
             os.write(
@@ -2583,7 +2588,7 @@ def run_env_config_client_test(tmp_root):
             raise AssertionError(killed.stdout)
 
         (config_dir / "sessh.env").write_text("leader=None\n")
-        pid, fd = spawn_client(env, ["--leader", "CTRL-B"])
+        pid, fd = spawn_client(env, ["--alias", "s2", "--leader", "CTRL-B"])
         try:
             read_until(fd, b"$ ")
             os.write(fd, b"\x02d")
@@ -2605,7 +2610,7 @@ def run_tty_transcript_capture_test(tmp_root):
 
     archive = Path(tmp_root) / "tty-transcript.tar.gz"
     try:
-        pid, fd = spawn_client(env, ["--capture-tty-transcript", str(archive)])
+        pid, fd = spawn_client(env, ["--alias", "s1", "--capture-tty-transcript", str(archive)])
         try:
             startup = read_until(fd, b"$ ")
             if b"WARNING: tty transcript capture is enabled" not in startup:
@@ -2742,7 +2747,7 @@ def main():
             if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:
                 raise AssertionError(listed.stdout)
 
-            pid, fd = spawn_client(env)
+            pid, fd = spawn_client(env, ["--alias", "s1"])
             try:
                 read_until(fd, b"$ ")
                 os.write(fd, b"echo TERM=$TERM\n")
@@ -2778,7 +2783,7 @@ def main():
                 if not closed:
                     close_client(pid, fd)
 
-            pid, fd = spawn_client(env, ["--scrollback-limit", "7"])
+            pid, fd = spawn_client(env, ["--alias", "s2", "--scrollback-limit", "7"])
             try:
                 read_until(fd, b"$ ")
                 os.write(fd, b"~.")
@@ -2802,7 +2807,7 @@ def main():
             if missing.returncode != 1 or "ERROR session not found" not in missing.stderr:
                 raise AssertionError(missing)
 
-            pid, fd = spawn_client(env, ["--leader", "CTRL-B"])
+            pid, fd = spawn_client(env, ["--alias", "s3", "--leader", "CTRL-B"])
             try:
                 read_until(fd, b"$ ")
                 os.write(fd, b"\x02d")
@@ -2818,7 +2823,7 @@ def main():
             if "ENDED s3" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
-            pid, fd = spawn_client(env, ["--leader", "CTRL-B"])
+            pid, fd = spawn_client(env, ["--alias", "s4", "--leader", "CTRL-B"])
             try:
                 read_until(fd, b"$ ")
                 os.write(fd, b"echo sessh_before_sever\n")
@@ -2835,7 +2840,7 @@ def main():
             if "ENDED s4" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
-            pid1, fd1 = spawn_client(env)
+            pid1, fd1 = spawn_client(env, ["--alias", "s5"])
             try:
                 read_until(fd1, b"$ ")
                 listed = run([":local:", "--list"], env, check=True, timeout=5.0)
@@ -2862,7 +2867,7 @@ def main():
                 raise AssertionError(killed.stdout)
 
             drain_done = Path(env["XDG_RUNTIME_DIR"]) / "detached_drain_done"
-            pid, fd = spawn_client(env)
+            pid, fd = spawn_client(env, ["--alias", "s6"])
             try:
                 read_until(fd, b"$ ")
                 os.write(

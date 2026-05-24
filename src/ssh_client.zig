@@ -296,6 +296,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (parsed_ssh_args.state_dir) |dir| socket_transport.setRuntimeRootOverride(dir);
     const resolved_ref_storage = try resolveLocalRefs(allocator, &parsed_ssh_args);
     defer if (resolved_ref_storage) |ref| allocator.free(ref);
+    const route_attach_ref = if (route_storage) |route| route.primary_alias else null;
     parsed_ssh_args.default_ipqos_option = try resolveDefaultIpQosOption(allocator, parsed_ssh_args.options, parsed_ssh_args.host);
     defer if (parsed_ssh_args.default_ipqos_option) |option| allocator.free(option);
 
@@ -359,26 +360,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer if (new_guid) |guid| allocator.free(guid);
     var new_alias: ?[]u8 = null;
     defer if (new_alias) |alias| allocator.free(alias);
-    var route_allocation: ?session_registry.Allocation = null;
-    defer if (route_allocation) |*allocation| allocation.deinit(allocator);
-
     if (parsed_ssh_args.action == .new) {
         new_guid = try session_registry.generateGuid(allocator);
-        route_allocation = try session_registry.allocateSessionDirForGuid(allocator, new_guid.?);
         if (parsed_ssh_args.alias) |alias| {
-            try session_registry.createAlias(allocator, alias, new_guid.?);
             new_alias = try allocator.dupe(u8, alias);
         } else {
-            new_alias = try session_registry.createGeneratedAlias(allocator, new_guid.?);
+            new_alias = try allocator.dupe(u8, "");
         }
-        try session_registry.writeSshRoute(
-            allocator,
-            route_allocation.?.paths,
-            new_guid.?,
-            new_alias.?,
-            parsed_ssh_args.host,
-            parsed_ssh_args.options,
-        );
     }
 
     var child = try startRuntimeConnection(
@@ -398,6 +386,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             child.child.stdin.?.handle,
             parsed_ssh_args.scrollback_row_count,
             new_guid.?,
+            new_alias.?,
         ),
         .attach => client.startAttachSessionOnRuntime(
             child.child.stdout.?.handle,
@@ -422,6 +411,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer session.deinit();
     child.suppressSshStderr();
+    if (parsed_ssh_args.action == .new or route_attach_ref == null) {
+        try client.ensureLocalRouteForRemoteSession(
+            allocator,
+            &session,
+            parsed_ssh_args.attach_id orelse "",
+            parsed_ssh_args.host,
+            parsed_ssh_args.options,
+        );
+    }
 
     while (true) {
         const end = client.relayRuntimeSession(
@@ -751,6 +749,26 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\compact_session_id() {{
         \\  printf '%s' "$1" | tr -d '-'
         \\}}
+        \\resolve_session_ref() {{
+        \\  ref=$1
+        \\  compact=$(compact_session_id "$ref")
+        \\  if [ ${{#compact}} -eq 32 ]; then
+        \\    case "$compact" in
+        \\      *[!0123456789abcdefABCDEF]*) ;;
+        \\      *) printf '%s\n' "$compact"; return ;;
+        \\    esac
+        \\  fi
+        \\  case "$ref" in
+        \\    ""|/*|*/*|.|..) printf '%s\n' "$compact"; return ;;
+        \\  esac
+        \\  alias_path=$runtime_root/alias/$ref
+        \\  if [ -L "$alias_path" ]; then
+        \\    target=$(readlink "$alias_path") || exit 1
+        \\    basename "$target"
+        \\    return
+        \\  fi
+        \\  printf '%s\n' "$compact"
+        \\}}
         \\find_latest_session_id() {{
         \\  detached=$(ls -t "$runtime_root"/g/*/detached 2>/dev/null | sed -n '1p')
         \\  if [ -z "$detached" ]; then
@@ -790,11 +808,11 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    if [ -z "$compat_session_id" ]; then
         \\      compat_session_id=$(find_latest_session_id)
         \\    fi
-        \\    compat_session_id=$(compact_session_id "$compat_session_id")
+        \\    compat_session_id=$(resolve_session_ref "$compat_session_id")
         \\    exec_one_compat "$runtime_root/g/$compat_session_id/compat"
         \\    ;;
         \\  kill)
-        \\    compat_session_id=$(compact_session_id "$compat_session_id")
+        \\    compat_session_id=$(resolve_session_ref "$compat_session_id")
         \\    exec_one_compat "$runtime_root/g/$compat_session_id/compat"
         \\    ;;
         \\  list|kill-all)
@@ -1650,12 +1668,14 @@ fn resolveLocalRefs(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !?[]u8
         .attach => {
             const ref = parsed.attach_id orelse return null;
             if (ref.len == 0) return null;
+            if (parsed.host.len > 0) return null;
             const guid = try session_registry.resolveRefToGuid(allocator, ref);
             parsed.attach_id = guid;
             return guid;
         },
         .kill => {
             const ref = parsed.kill_id orelse return null;
+            if (parsed.host.len > 0) return null;
             const guid = session_registry.resolveRefToGuid(allocator, ref) catch |err| switch (err) {
                 error.FileNotFound => return null,
                 else => return err,

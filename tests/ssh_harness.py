@@ -532,6 +532,20 @@ def ensure_alias(env, alias, guid=None):
     alias_path.symlink_to(Path("../g") / compact_guid(guid))
 
 
+def write_ssh_route(env, alias, guid, host, ssh_options=()):
+    ensure_alias(env, alias, guid)
+    session = sessions_dir(env) / compact_guid(guid)
+    session.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lines = [
+        f"guid={guid}",
+        f"primary_alias={alias}",
+        f"host={host.encode('utf-8').hex()}",
+    ]
+    lines.extend(f"ssh_option={option.encode('utf-8').hex()}" for option in ssh_options)
+    (session / "route").write_text("\n".join(lines) + "\n")
+    return session
+
+
 def session_path(env, session_id="s1"):
     if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
         return sessions_dir(env) / compact_guid(session_id)
@@ -682,7 +696,7 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
+    result = run_sessh(["-F", str(fake_config), "test-host", "--alias", "s1"], env, timeout=30.0)
 
     if not fake_log.exists():
         raise AssertionError(f"fake ssh was not invoked: {result}")
@@ -1128,6 +1142,56 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
     log_text = fake_log.read_text()
     if log_text.splitlines().count("invoked=1") < 2:
         raise AssertionError(log_text)
+
+
+def test_ssh_remote_default_alias_is_remote_generated(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_REMOTE_ALIAS_READY"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\nwhile :; do sleep 1; done\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    first = run_sessh_until_stdout(["test-host"], env, marker)
+    if first.returncode != 0:
+        raise AssertionError(first)
+
+    listed = run_sessh(["test-host", "--list"], env, timeout=30.0)
+    if listed.returncode != 0:
+        raise AssertionError(listed)
+    rows = [line.split("\t") for line in listed.stdout.splitlines()[1:] if line]
+    aliases = [row[0] for row in rows if len(row) >= 1]
+    remote_aliases = [alias for alias in aliases if re.fullmatch(r"r[0-9a-f]{8}", alias)]
+    if len(remote_aliases) != 1:
+        raise AssertionError(listed.stdout)
+
+    attached = run_sessh_until_stdout(["test-host", "--attach", remote_aliases[0]], env, marker)
+    if attached.returncode != 0:
+        raise AssertionError(attached)
+
+
+def test_ssh_host_attach_does_not_follow_remote_route(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    write_ssh_route(env, "remote-hop", guid_for_alias("remote-hop"), "other-host")
+
+    result = run_sessh(["test-host", "--attach", "remote-hop"], env, timeout=30.0)
+
+    if result.returncode == 0:
+        raise AssertionError(result)
+    if "session reference resolves to another host" not in result.stderr:
+        raise AssertionError(result)
+    if "session not found" in result.stderr:
+        raise AssertionError(result)
 
 
 def test_ssh_leader_sever_reconnects(tmp):
@@ -1601,7 +1665,7 @@ def test_ssh_remote_session_commands_use_broker(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    first = run_sessh_until_stdout(["test-host"], env, marker)
+    first = run_sessh_until_stdout(["test-host", "--alias", "s1"], env, marker)
     if first.returncode != 0:
         raise AssertionError(first)
 
@@ -1723,7 +1787,7 @@ def test_ssh_force_compat_uses_compat_path(tmp):
         raise AssertionError(log_text)
     expected_args = (
         f"compat_args=:local: --compat-version {sessh_version()} "
-        f"--attach {guid_for_alias('s1')} --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
+        "--attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
     )
     if expected_args not in log_text:
         raise AssertionError(log_text)
@@ -1810,6 +1874,14 @@ def main():
         (
             "ssh no-host attach uses local route",
             test_ssh_no_host_attach_uses_local_route,
+        ),
+        (
+            "ssh remote default alias is remote generated",
+            test_ssh_remote_default_alias_is_remote_generated,
+        ),
+        (
+            "ssh host attach does not follow remote route",
+            test_ssh_host_attach_does_not_follow_remote_route,
         ),
         (
             "ssh leader sever reconnects",

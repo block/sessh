@@ -380,6 +380,7 @@ pub const SessionCreate = struct {
     environment: std.ArrayListUnmanaged(EnvironmentEntry) = .empty,
     query_default_colors: ?DefaultColors = null,
     session_guid: []const u8 = &.{},
+    session_alias: []const u8 = &.{},
 
     pub const _desc_table = .{
         .terminal_size = fd(1, .submessage),
@@ -387,6 +388,7 @@ pub const SessionCreate = struct {
         .environment = fd(3, .{ .repeated = .submessage }),
         .query_default_colors = fd(4, .submessage),
         .session_guid = fd(5, .{ .scalar = .string }),
+        .session_alias = fd(6, .{ .scalar = .string }),
     };
 
     /// Encodes the message to the writer
@@ -454,12 +456,12 @@ pub const SessionCreate = struct {
 /// SessionAttached for the selected session, then Draw/RepaintResponse messages.
 pub const SessionAttach = struct {
     resize: ?Resize = null,
-    session_guid: []const u8 = &.{},
+    session_ref: []const u8 = &.{},
     capture_tty_transcript: bool = false,
 
     pub const _desc_table = .{
         .resize = fd(1, .submessage),
-        .session_guid = fd(2, .{ .scalar = .string }),
+        .session_ref = fd(2, .{ .scalar = .string }),
         .capture_tty_transcript = fd(3, .{ .scalar = .bool }),
     };
 
@@ -814,9 +816,11 @@ pub const PingRequest = struct {
 /// Confirms that a SessionCreate created the requested session.
 pub const SessionCreated = struct {
     session_guid: []const u8 = &.{},
+    session_alias: []const u8 = &.{},
 
     pub const _desc_table = .{
         .session_guid = fd(1, .{ .scalar = .string }),
+        .session_alias = fd(2, .{ .scalar = .string }),
     };
 
     /// Encodes the message to the writer
@@ -883,9 +887,11 @@ pub const SessionCreated = struct {
 /// Confirms the session selected for this connection.
 pub const SessionAttached = struct {
     session_guid: []const u8 = &.{},
+    session_alias: []const u8 = &.{},
 
     pub const _desc_table = .{
         .session_guid = fd(1, .{ .scalar = .string }),
+        .session_alias = fd(2, .{ .scalar = .string }),
     };
 
     /// Encodes the message to the writer

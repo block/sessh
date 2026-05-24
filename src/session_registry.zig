@@ -341,16 +341,58 @@ pub fn createAliasInRoot(allocator: std.mem.Allocator, root: []const u8, alias: 
     }
 }
 
-pub fn createGeneratedAlias(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+pub fn ensureAliasForGuid(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !void {
     const root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(root);
-    return createGeneratedAliasInRoot(allocator, root, guid);
+    return ensureAliasForGuidInRoot(allocator, root, alias, guid);
 }
 
-pub fn createGeneratedAliasInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
-    var n: u64 = 1;
-    while (true) : (n += 1) {
-        const alias = try std.fmt.allocPrint(allocator, "s{}", .{n});
+pub fn ensureAliasForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8, guid: []const u8) !void {
+    createAliasInRoot(allocator, root, alias, guid) catch |err| switch (err) {
+        error.AliasExists => {
+            const existing = try resolveRefToGuidInRoot(allocator, root, alias);
+            defer allocator.free(existing);
+            const canonical = try canonicalGuid(allocator, guid);
+            defer allocator.free(canonical);
+            if (!std.mem.eql(u8, existing, canonical)) return error.AliasExists;
+        },
+        else => return err,
+    };
+}
+
+pub fn removeAlias(allocator: std.mem.Allocator, alias: []const u8) !void {
+    const root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(root);
+    return removeAliasInRoot(allocator, root, alias);
+}
+
+pub fn removeAliasInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8) !void {
+    if (!isValidAlias(alias)) return error.InvalidAlias;
+    const aliases_dir = try aliasesDirInRoot(allocator, root);
+    defer allocator.free(aliases_dir);
+    const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, alias });
+    defer allocator.free(link_path);
+    try unlinkIfExists(link_path);
+}
+
+pub fn defaultAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    const canonical = try canonicalGuid(allocator, guid);
+    defer allocator.free(canonical);
+    return allocator.dupe(u8, canonical[0..8]);
+}
+
+pub fn createGeneratedRemoteAlias(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    const root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(root);
+    return createGeneratedRemoteAliasInRoot(allocator, root, guid);
+}
+
+pub fn createGeneratedRemoteAliasInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
+    while (true) {
+        var bytes: [4]u8 = undefined;
+        std.crypto.random.bytes(&bytes);
+        const hex = std.fmt.bytesToHex(bytes, .lower);
+        const alias = try std.fmt.allocPrint(allocator, "r{s}", .{&hex});
         errdefer allocator.free(alias);
         createAliasInRoot(allocator, root, alias, guid) catch |err| switch (err) {
             error.AliasExists => {
@@ -372,10 +414,14 @@ pub fn pathsForRef(allocator: std.mem.Allocator, ref: []const u8) !SessionPaths 
 }
 
 pub fn resolveRefToGuid(allocator: std.mem.Allocator, ref: []const u8) ![]u8 {
-    if (isValidSessionId(ref)) return canonicalGuid(allocator, ref);
-    if (!isValidAlias(ref)) return error.InvalidSessionId;
     const root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(root);
+    return resolveRefToGuidInRoot(allocator, root, ref);
+}
+
+pub fn resolveRefToGuidInRoot(allocator: std.mem.Allocator, root: []const u8, ref: []const u8) ![]u8 {
+    if (isValidSessionId(ref)) return canonicalGuid(allocator, ref);
+    if (!isValidAlias(ref)) return error.InvalidSessionId;
     const aliases_dir = try aliasesDirInRoot(allocator, root);
     defer allocator.free(aliases_dir);
     const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, ref });

@@ -41,6 +41,10 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                         try sendError(1, "SESSION_NOT_FOUND", "no sessions", "");
                         return;
                     },
+                    error.SessionRefNotLocal => {
+                        try sendError(1, "SESSION_REF_NOT_LOCAL", "session reference resolves to another host", "");
+                        return;
+                    },
                     error.InvalidSessionId, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
                         try sendError(1, "SESSION_NOT_FOUND", "session not found", "");
                         return;
@@ -53,7 +57,17 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
             },
             .session_create => {
                 defer frame.deinit(allocator);
-                const agent_fd = try startSessionAgentAndConnect(allocator, exe, frame.payload);
+                const agent_fd = startSessionAgentAndConnect(allocator, exe, frame.payload) catch |err| switch (err) {
+                    error.AliasExists => {
+                        try sendError(1, "ALIAS_EXISTS", "session alias already exists", "");
+                        return;
+                    },
+                    error.InvalidAlias => {
+                        try sendError(1, "INVALID_ALIAS", "invalid session alias", "");
+                        return;
+                    },
+                    else => return err,
+                };
                 defer _ = c.close(agent_fd);
                 try createSessionAndRelay(allocator, agent_fd, frame.payload);
                 return;
@@ -362,12 +376,23 @@ fn runCompatCommand(allocator: std.mem.Allocator, paths: session_registry.Sessio
 fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.fd_t {
     var request = try protocol.decodePayload(pb.SessionAttach, allocator, payload);
     defer request.deinit(allocator);
-    var paths = if (request.session_guid.len > 0)
-        try session_registry.pathsForSessionId(allocator, request.session_guid)
+    var paths = if (request.session_ref.len > 0)
+        try pathsForAttachRef(allocator, request.session_ref)
     else
         (try mostRecentAgent(allocator)) orelse return error.NoSessions;
     defer paths.deinit(allocator);
     return socket_transport.connectSocket(paths.socket);
+}
+
+fn pathsForAttachRef(allocator: std.mem.Allocator, ref: []const u8) !session_registry.SessionPaths {
+    if (session_registry.isValidSessionId(ref)) return session_registry.pathsForSessionId(allocator, ref);
+    if (!session_registry.isValidAlias(ref)) return error.InvalidSessionId;
+    const guid = try session_registry.resolveRefToGuid(allocator, ref);
+    defer allocator.free(guid);
+    var paths = try session_registry.pathsForSessionId(allocator, guid);
+    errdefer paths.deinit(allocator);
+    if (fileExists(paths.route) and !fileExists(paths.meta)) return error.SessionRefNotLocal;
+    return paths;
 }
 
 fn mostRecentAgent(allocator: std.mem.Allocator) !?session_registry.SessionPaths {
@@ -415,6 +440,10 @@ fn statAbsolute(path: []const u8) !std.fs.File.Stat {
 fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_create_payload: []const u8) !c.fd_t {
     var request = try protocol.decodePayload(pb.SessionCreate, allocator, session_create_payload);
     defer request.deinit(allocator);
+    if (request.session_alias.len > 0) {
+        if (!session_registry.isValidAlias(request.session_alias)) return error.InvalidAlias;
+        if (!try aliasAvailableForGuid(allocator, request.session_alias, request.session_guid)) return error.AliasExists;
+    }
     var allocation = if (request.session_guid.len > 0)
         try session_registry.allocateSessionDirForGuid(allocator, request.session_guid)
     else
@@ -443,6 +472,17 @@ fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, se
         io.sleepMillis(20);
     }
     return error.SessionAgentDidNotStart;
+}
+
+fn aliasAvailableForGuid(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !bool {
+    const existing = session_registry.resolveRefToGuid(allocator, alias) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return err,
+    };
+    defer allocator.free(existing);
+    const canonical = try session_registry.canonicalGuid(allocator, guid);
+    defer allocator.free(canonical);
+    return std.mem.eql(u8, existing, canonical);
 }
 
 fn createSessionAndRelay(

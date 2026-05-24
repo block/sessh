@@ -536,11 +536,11 @@ const TerminalOrigin = struct {
 
 const AttachRequest = struct {
     resize: ResizePayload,
-    session_guid: []u8,
+    session_ref: []u8,
     capture_tty_transcript: bool,
 
     fn deinit(self: *AttachRequest) void {
-        app_allocator.allocator().free(self.session_guid);
+        app_allocator.allocator().free(self.session_ref);
         self.* = undefined;
     }
 };
@@ -556,8 +556,10 @@ const SessionCreateRequest = struct {
     environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
     session_guid: []u8,
+    session_alias: []u8,
 
     fn deinit(self: *SessionCreateRequest) void {
+        app_allocator.allocator().free(self.session_alias);
         app_allocator.allocator().free(self.session_guid);
         self.environment.deinit();
         self.* = undefined;
@@ -1137,7 +1139,19 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     return false;
                 };
                 defer request.deinit();
-                const session_index = try createSession(
+                const alias = registerSessionAlias(request.session_guid, request.session_alias) catch |err| switch (err) {
+                    error.AliasExists => {
+                        try sendError(session_agent, fd, "ALIAS_EXISTS", "session alias already exists", "");
+                        return false;
+                    },
+                    error.InvalidAlias => {
+                        try sendError(session_agent, fd, "INVALID_ALIAS", "invalid session alias", "");
+                        return false;
+                    },
+                    else => return err,
+                };
+                defer app_allocator.allocator().free(alias);
+                const session_index = createSession(
                     session_agent,
                     request.terminal_size.rows,
                     request.terminal_size.cols,
@@ -1145,16 +1159,19 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.environment,
                     request.query_default_colors,
                     request.session_guid,
-                );
+                ) catch |err| {
+                    session_registry.removeAlias(app_allocator.allocator(), alias) catch {};
+                    return err;
+                };
                 if (session_agent.session_paths) |paths| session_registry.markDetached(paths) catch {};
-                try sendSessionCreatedForSession(fd, &session_agent.sessions[session_index]);
+                try sendSessionCreatedForSession(fd, &session_agent.sessions[session_index], alias);
                 continue;
             },
             .session_attach => {
                 var request = try readAttachRequest(frame.payload);
                 defer request.deinit();
-                const session_index = if (request.session_guid.len > 0)
-                    findSessionIndex(session_agent, request.session_guid)
+                const session_index = if (request.session_ref.len > 0)
+                    try findSessionIndexForRef(session_agent, request.session_ref)
                 else
                     findMostRecentSessionIndex(session_agent);
                 const resolved_session_index = session_index orelse {
@@ -1388,16 +1405,20 @@ fn attachedCount(session_agent: *SessionAgent, session_index: usize) u32 {
 }
 
 fn sendSessionAttachedForSession(attachment: *Attachment, session: *const Session) !void {
+    const maybe_alias = try session_registry.primaryAliasForGuid(app_allocator.allocator(), session.idSlice());
+    defer if (maybe_alias) |alias| app_allocator.allocator().free(alias);
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionAttached{
         .session_guid = session.idSlice(),
+        .session_alias = maybe_alias orelse "",
     });
     defer app_allocator.allocator().free(payload);
     try queueAttachmentFrame(attachment, .session_attached, payload);
 }
 
-fn sendSessionCreatedForSession(fd: c.fd_t, session: *const Session) !void {
+fn sendSessionCreatedForSession(fd: c.fd_t, session: *const Session, alias: []const u8) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionCreated{
         .session_guid = session.idSlice(),
+        .session_alias = alias,
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .session_created, payload);
@@ -1914,7 +1935,16 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
         .environment = environment,
         .query_default_colors = query_default_colors,
         .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
+        .session_alias = try app_allocator.allocator().dupe(u8, message.session_alias),
     };
+}
+
+fn registerSessionAlias(session_guid: []const u8, requested_alias: []const u8) ![]u8 {
+    if (requested_alias.len > 0) {
+        try session_registry.ensureAliasForGuid(app_allocator.allocator(), requested_alias, session_guid);
+        return try app_allocator.allocator().dupe(u8, requested_alias);
+    }
+    return session_registry.createGeneratedRemoteAlias(app_allocator.allocator(), session_guid);
 }
 
 fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.EnvironmentEntry) !void {
@@ -1971,10 +2001,13 @@ fn readAttachRequest(payload: []const u8) !AttachRequest {
     var message = try protocol.decodePayload(pb.SessionAttach, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     const resize = message.resize orelse return error.MissingResize;
-    if (message.session_guid.len > 0 and !session_registry.isValidGuid(message.session_guid)) return error.InvalidSessionGuid;
+    if (message.session_ref.len > 0 and
+        !session_registry.isValidGuid(message.session_ref) and
+        !session_registry.isValidCompactGuid(message.session_ref) and
+        !session_registry.isValidAlias(message.session_ref)) return error.InvalidSessionRef;
     return .{
         .resize = try resizePayloadFromMessage(resize),
-        .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
+        .session_ref = try app_allocator.allocator().dupe(u8, message.session_ref),
         .capture_tty_transcript = message.capture_tty_transcript,
     };
 }
@@ -2787,6 +2820,12 @@ fn findSessionIndex(session_agent: *SessionAgent, id: []const u8) ?usize {
         if (session.alive and std.mem.eql(u8, session.idSlice(), id)) return i;
     }
     return null;
+}
+
+fn findSessionIndexForRef(session_agent: *SessionAgent, ref: []const u8) !?usize {
+    const guid = try session_registry.resolveRefToGuid(app_allocator.allocator(), ref);
+    defer app_allocator.allocator().free(guid);
+    return findSessionIndex(session_agent, guid);
 }
 
 fn findMostRecentSessionIndex(session_agent: *SessionAgent) ?usize {
