@@ -97,7 +97,8 @@ The options in the config file can be overridden on the command-line:
   the alias on the remote host and cache a local route after the first attach.
 - `--runtime-dir DIR`: choose the runtime directory for live sockets and agent
   files. The default is `$SESSH_RUNTIME_DIR` if set, otherwise
-  `/tmp/sessh-<uid>`.
+  `$XDG_RUNTIME_DIR/sessh` when that path is short enough for session sockets,
+  otherwise `/tmp/sessh-<uid>`.
 
 Persistent client aliases and remote routes are stored under XDG state:
 `$XDG_STATE_HOME/sessh`, or `~/.local/state/sessh` if `XDG_STATE_HOME` is unset.

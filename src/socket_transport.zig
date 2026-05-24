@@ -6,6 +6,8 @@ const posix = std.posix;
 
 extern "c" fn socket(domain: c_int, socket_type: c_int, protocol: c_int) c_int;
 
+const session_socket_suffix_len = "/g/".len + 32 + "/s".len;
+
 var runtime_root_symlink_published = false;
 var runtime_root_override: ?[]const u8 = null;
 
@@ -19,11 +21,29 @@ pub fn setRuntimeRootOverride(path: []const u8) void {
 pub fn runtimeRoot(allocator: std.mem.Allocator) ![]u8 {
     if (runtime_root_override) |root| return allocator.dupe(u8, root);
     if (envVar("SESSH_RUNTIME_DIR")) |root| return allocator.dupe(u8, root);
+    if (envVar("XDG_RUNTIME_DIR")) |root| {
+        if (try runtimeRootForXdg(allocator, root)) |candidate| return candidate;
+    }
     return runtimeRootFor(allocator, c.getuid());
 }
 
 fn runtimeRootFor(allocator: std.mem.Allocator, uid: c.uid_t) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/sessh-{}", .{uid});
+}
+
+fn runtimeRootForXdg(allocator: std.mem.Allocator, xdg_runtime_dir: []const u8) !?[]u8 {
+    const root = try std.fmt.allocPrint(allocator, "{s}/sessh", .{xdg_runtime_dir});
+    errdefer allocator.free(root);
+    if (!runtimeRootCanFitSessionSocket(root)) {
+        allocator.free(root);
+        return null;
+    }
+    return root;
+}
+
+fn runtimeRootCanFitSessionSocket(root: []const u8) bool {
+    const addr: c.sockaddr.un = undefined;
+    return root.len + session_socket_suffix_len < addr.path.len;
 }
 
 /// Persistent client-side registry for aliases and remote routes.
@@ -240,4 +260,19 @@ test "runtime root uses fixed tmp fallback" {
     const fallback_root = try runtimeRootFor(allocator, 501);
     defer allocator.free(fallback_root);
     try std.testing.expectEqualStrings("/tmp/sessh-501", fallback_root);
+}
+
+test "xdg runtime root is used only when a session socket can fit" {
+    const allocator = std.testing.allocator;
+
+    const short = try runtimeRootForXdg(allocator, "/run/user/501") orelse return error.ExpectedRuntimeRoot;
+    defer allocator.free(short);
+    try std.testing.expectEqualStrings("/run/user/501/sessh", short);
+
+    const addr: c.sockaddr.un = undefined;
+    const too_long_len = addr.path.len - session_socket_suffix_len;
+    const too_long = try allocator.alloc(u8, too_long_len);
+    defer allocator.free(too_long);
+    @memset(too_long, 'x');
+    try std.testing.expect(try runtimeRootForXdg(allocator, too_long) == null);
 }

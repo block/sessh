@@ -1082,7 +1082,19 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\compat_session_id={s}
         \\runtime_root={s}
         \\if [ -z "$runtime_root" ]; then
-        \\  runtime_root=${{SESSH_RUNTIME_DIR:-/tmp/sessh-$(id -u)}}
+        \\  if [ -n "${{SESSH_RUNTIME_DIR:-}}" ]; then
+        \\    runtime_root=$SESSH_RUNTIME_DIR
+        \\  elif [ -n "${{XDG_RUNTIME_DIR:-}}" ]; then
+        \\    runtime_root_candidate=$XDG_RUNTIME_DIR/sessh
+        \\    # 66 leaves room for /g/<32 hex guid>/s under macOS' 104-byte socket path limit.
+        \\    if [ ${{#runtime_root_candidate}} -le 66 ]; then
+        \\      runtime_root=$runtime_root_candidate
+        \\    else
+        \\      runtime_root=/tmp/sessh-$(id -u)
+        \\    fi
+        \\  else
+        \\    runtime_root=/tmp/sessh-$(id -u)
+        \\  fi
         \\fi
         \\state_root=
         \\if [ -n "${{XDG_STATE_HOME:-}}" ]; then
