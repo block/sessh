@@ -43,11 +43,11 @@ pub const Recorder = struct {
     }
 
     pub fn warnEnabled(self: *const Recorder) !void {
-        try io.writeAll(2, "sessh: WARNING: tty transcript capture is enabled.\n");
-        try io.writeAll(2, "sessh: WARNING: captured data may include passwords, tokens, pasted text, private keys, terminal output, and command history.\n");
+        try io.writeAll(2, "sessh: WARNING: tty transcript capture is enabled.\r\n");
+        try io.writeAll(2, "sessh: WARNING: captured data may include passwords, tokens, pasted text, private keys, terminal output, and command history.\r\n");
         try io.writeAll(2, "sessh: WARNING: transcript bytes are buffered in memory and written only on clean exit to: ");
         try io.writeAll(2, self.path);
-        try io.writeAll(2, "\n");
+        try io.writeAll(2, "\r\n");
     }
 
     pub fn record(self: *Recorder, stream: Stream, bytes: []const u8) void {

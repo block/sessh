@@ -272,9 +272,26 @@ pub const Renderer = struct {
         try self.write("\r\n");
     }
 
+    pub fn reverseIndex(self: Renderer) !void {
+        if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
+        try self.write("\x1bM");
+    }
+
     pub fn clearLine(self: Renderer) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
         try self.write("\x1b[2K");
+    }
+
+    pub fn setScrollRegion(self: Renderer, top: u16, bottom: u16) !void {
+        if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
+        var buf: [32]u8 = undefined;
+        const seq = try std.fmt.bufPrint(&buf, "\x1b[{};{}r", .{ top + 1, bottom + 1 });
+        try self.write(seq);
+    }
+
+    pub fn resetScrollRegion(self: Renderer) !void {
+        if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
+        try self.write("\x1b[r");
     }
 
     pub fn cursorUp(self: Renderer, count: u16) !void {
@@ -304,6 +321,10 @@ pub const Renderer = struct {
     pub fn setCursorVisible(self: Renderer, visible: bool) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
         try self.write(if (visible) "\x1b[?25h" else "\x1b[?25l");
+    }
+
+    pub fn writeRaw(self: Renderer, bytes: []const u8) !void {
+        try self.write(bytes);
     }
 
     pub fn renderRow(self: Renderer, row: Row) !void {

@@ -2483,8 +2483,11 @@ fn handleResizeFrame(session_agent: *SessionAgent, attachment_index: usize, payl
         detachAttachment(session_agent, attachment_index);
         return;
     };
+    const reset_for_screen_repaint = resize.repaint_request != null and
+        resize.repaint_request.?.scrollback_cursor == null;
     attachment.rows = resize.rows;
     attachment.cols = resize.cols;
+    if (reset_for_screen_repaint) attachment.presentation.reset();
     attachment.presentation.setViewportOffset(resize.viewport_offset);
     updateSessionSize(session, resize.rows, resize.cols);
     if (resize.repaint_request) |request| {

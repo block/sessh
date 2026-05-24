@@ -459,7 +459,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             .reconnect => {
                 client_log.debug("event=disconnect reason=leader_sever host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.terminate();
-                client_log.flush(2);
             },
             .unresponsive => {
                 client_log.debug("event=disconnect reason=unresponsive host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
@@ -469,7 +468,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 client_log.debug("event=disconnect reason=transport_closed host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.closeStdin();
                 _ = child.wait() catch {};
-                client_log.flush(2);
             },
         }
 
@@ -490,7 +488,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             )) {
                 .recovered => {
                     try reconnect_ui.showConnectionResultBriefly(.recovered);
-                    try reconnect_ui.clearBanner();
+                    session.viewport_offset = try reconnect_ui.clearBanner();
                     try client.repaintRuntimeSession(child.child.stdout.?.handle, child.child.stdin.?.handle, &session);
                     try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
                     reconnect_ui.deinit();
@@ -500,13 +498,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 .reconnected => |new_child| {
                     child.terminate();
                     child = new_child;
+                    session.viewport_offset = try reconnect_ui.clearBanner();
                     try client.finishReconnectRepaint(child.child.stdout.?.handle, &session);
                     try reconnect_ui.showConnectionResultBriefly(.reconnected);
                     client_log.debug("event=reconnect_success host={s} session={s} attempt=0", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
                     });
-                    try reconnect_ui.clearBanner();
+                    session.viewport_offset = try reconnect_ui.clearBanner();
                     try client.repaintRuntimeSession(child.child.stdout.?.handle, child.child.stdin.?.handle, &session);
                     try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
                     reconnect_ui.deinit();
@@ -525,11 +524,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                     return;
                 },
                 .failed => |err| {
-                    client_log.warn("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
+                    client_log.debug("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
                         err,
                     });
+                    client_log.userDiagnostic("reconnect failed: parallel: {t}", .{err});
                     child.terminate();
                 },
             }
@@ -551,7 +551,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                         session.idSlice(),
                         reconnect_attempt,
                     });
-                    client_log.flush(2);
                     try tty_transcript.finishActiveOrReport();
                     return;
                 },
@@ -581,18 +580,19 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 },
                 error.OutOfMemory => return err,
                 else => {
-                    client_log.warn("event=reconnect_failed stage=transport host={s} session={s} attempt={} error={t}", .{
+                    client_log.debug("event=reconnect_failed stage=transport host={s} session={s} attempt={} error={t}", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
                         reconnect_attempt,
                         err,
                     });
-                    client_log.flush(2);
+                    client_log.userDiagnostic("reconnect failed: transport: {t}", .{err});
                     reconnect_attempt += 1;
                     continue;
                 },
             };
 
+            session.viewport_offset = try reconnect_ui.clearBanner();
             client.reconnectSessionOnRuntime(
                 child.child.stdout.?.handle,
                 child.child.stdin.?.handle,
@@ -604,13 +604,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                     error.ExitRequested => return err,
                     error.OutOfMemory => return err,
                     else => {
-                        client_log.warn("event=reconnect_failed stage=attach host={s} session={s} attempt={} error={t}", .{
+                        client_log.debug("event=reconnect_failed stage=attach host={s} session={s} attempt={} error={t}", .{
                             parsed_ssh_args.host,
                             session.idSlice(),
                             reconnect_attempt,
                             err,
                         });
-                        client_log.flush(2);
+                        client_log.userDiagnostic("reconnect failed: attach: {t}", .{err});
                         reconnect_attempt += 1;
                         continue;
                     },
@@ -623,8 +623,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 session.idSlice(),
                 reconnect_attempt,
             });
-            client_log.flush(2);
-            try reconnect_ui.clearBanner();
+            session.viewport_offset = try reconnect_ui.clearBanner();
             try client.repaintRuntimeSession(child.child.stdout.?.handle, child.child.stdin.?.handle, &session);
             try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
             reconnect_ui.deinit();
@@ -1007,6 +1006,7 @@ fn raceExistingConnectionWithReconnect(
     session: *client.RuntimeSession,
     reconnect_ui: *client.ReconnectUi,
 ) !ReconnectRaceOutcome {
+    session.viewport_offset = reconnect_ui.currentViewportOffset();
     var state = ParallelReconnectState{
         .parsed_ssh_args = parsed_ssh_args,
         .artifacts = artifacts,
@@ -1474,6 +1474,7 @@ fn exitAfterSshBootstrapFailure(
     term: ?std.process.Child.Term,
     cause: anyerror,
 ) !noreturn {
+    client_log.flush(2);
     if (term) |value| {
         switch (value) {
             .Exited => |code| {

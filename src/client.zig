@@ -434,23 +434,59 @@ pub const RuntimeSession = struct {
 
 pub const ReconnectUi = struct {
     const reconnected_banner_ms = 500;
+    const max_diagnostic_banner_lines = 3;
+    const max_banner_message_bytes = 256;
 
     mode_guard: terminal.TerminalModeGuard,
     escape_filter: terminal.EscapeFilter = .{ .at_line_start = false },
     buffered_input: std.ArrayList(u8) = .empty,
     viewport_offset: u16 = 0,
-    banner_row: ?u16 = null,
+    banner_state: ?BannerDrawState = null,
+    banner_message: [max_banner_message_bytes]u8 = undefined,
+    banner_message_len: usize = 0,
+    diagnostic_notify_read_fd: c.fd_t = -1,
+    diagnostic_notify_write_fd: c.fd_t = -1,
+    diagnostic_cursor: u64 = 0,
+    live_diagnostic_start_seq: u64 = 0,
+    rendered_diagnostic_seq: u64 = 0,
+    diagnostic_lines: [max_diagnostic_banner_lines]BannerDiagnosticLine = [_]BannerDiagnosticLine{.{}} ** max_diagnostic_banner_lines,
+    diagnostic_line_count: usize = 0,
     cursor_hidden: bool = false,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn begin(viewport_offset: i32) !ReconnectUi {
         var ui = ReconnectUi{ .mode_guard = try terminal.TerminalModeGuard.enable(0) };
+        errdefer ui.mode_guard.restore();
         ui.viewport_offset = if (viewport_offset > 0) @intCast(viewport_offset) else 0;
+        ui.diagnostic_cursor = client_log.displayedUserDiagnosticSeq();
+        ui.live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq();
+        ui.rendered_diagnostic_seq = ui.diagnostic_cursor;
+        const notify_pipe = try posix.pipe();
+        ui.diagnostic_notify_read_fd = notify_pipe[0];
+        ui.diagnostic_notify_write_fd = notify_pipe[1];
+        errdefer {
+            posix.close(ui.diagnostic_notify_read_fd);
+            posix.close(ui.diagnostic_notify_write_fd);
+        }
+        try setNonBlocking(ui.diagnostic_notify_read_fd);
+        try setNonBlocking(ui.diagnostic_notify_write_fd);
+        client_log.registerUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
+        errdefer client_log.unregisterUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
+        try ui.consumeDiagnostics();
         try ui.hideCursor();
         return ui;
     }
 
     pub fn deinit(self: *ReconnectUi) void {
+        if (self.diagnostic_notify_write_fd >= 0) {
+            client_log.unregisterUserDiagnosticNotifier(self.diagnostic_notify_write_fd);
+            posix.close(self.diagnostic_notify_write_fd);
+            self.diagnostic_notify_write_fd = -1;
+        }
+        if (self.diagnostic_notify_read_fd >= 0) {
+            posix.close(self.diagnostic_notify_read_fd);
+            self.diagnostic_notify_read_fd = -1;
+        }
         self.showCursor() catch {};
         self.buffered_input.deinit(app_allocator.allocator());
         self.mode_guard.restore();
@@ -470,7 +506,9 @@ pub const ReconnectUi = struct {
 
             const next_wake = @min(deadline, next_banner_update);
             const wait_ms: i32 = @intCast(@min(next_wake - now, @as(i64, std.math.maxInt(i32))));
-            switch (try self.pollInput(wait_ms)) {
+            const decision = try self.pollInput(wait_ms);
+            try self.refreshBannerIfDiagnosticsChanged();
+            switch (decision) {
                 .abort => return .abort,
                 .reconnect_now => {
                     try self.drawStaticBanner("--- sessh: reconnecting... CTRL-C aborts ---");
@@ -494,7 +532,10 @@ pub const ReconnectUi = struct {
 
     pub fn pollAbort(self: *ReconnectUi, timeout_ms: i32) !bool {
         if (self.isCancelled()) return true;
-        return switch (try self.pollInput(timeout_ms)) {
+        try self.refreshBannerIfDiagnosticsChanged();
+        const decision = try self.pollInput(timeout_ms);
+        try self.refreshBannerIfDiagnosticsChanged();
+        return switch (decision) {
             .abort => true,
             .reconnect_now, .wait_elapsed => false,
         };
@@ -513,14 +554,25 @@ pub const ReconnectUi = struct {
     }
 
     fn pollInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = 0,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, timeout_ms);
+        var pollfds = [_]posix.pollfd{
+            .{
+                .fd = 0,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = self.diagnostic_notify_read_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+        const poll_count: usize = if (self.diagnostic_notify_read_fd >= 0) 2 else 1;
+        const ready = try posix.poll(pollfds[0..poll_count], timeout_ms);
         if (ready == 0) return .wait_elapsed;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .abort;
+        if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
+            self.drainDiagnosticNotifier();
+        }
         if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
 
         var input: [256]u8 = undefined;
@@ -553,13 +605,21 @@ pub const ReconnectUi = struct {
         self.buffered_input.clearRetainingCapacity();
     }
 
-    pub fn clearBanner(self: *ReconnectUi) !void {
-        if (c.isatty(1) == 0) return;
-        const banner = self.banner_row orelse return;
+    pub fn clearBanner(self: *ReconnectUi) !i32 {
+        if (c.isatty(1) == 0) return @intCast(self.viewport_offset);
+        const banner = self.banner_state orelse return @intCast(self.viewport_offset);
         const renderer = client_renderer.Renderer.init(1);
-        try renderer.moveCursor(banner, 0);
-        try renderer.clearLine();
+        const size = terminal.currentWindowSize();
+        try eraseBannerRows(renderer, banner, size.rows, size.cols);
+        try restoreBannerExpansion(renderer, banner, size.rows);
+        self.viewport_offset = clearedViewportOffset(banner);
+        self.banner_state = null;
         try renderer.moveCursor(self.viewport_offset, 0);
+        return @intCast(self.viewport_offset);
+    }
+
+    pub fn currentViewportOffset(self: *const ReconnectUi) i32 {
+        return @intCast(self.viewport_offset);
     }
 
     pub fn showReconnectedBriefly(self: *ReconnectUi) !void {
@@ -588,30 +648,100 @@ pub const ReconnectUi = struct {
     }
 
     fn drawStaticBanner(self: *ReconnectUi, message: []const u8) !void {
+        const copy_len = @min(message.len, self.banner_message.len);
+        @memcpy(self.banner_message[0..copy_len], message[0..copy_len]);
+        self.banner_message_len = copy_len;
+        try self.consumeDiagnostics();
+        try self.drawCurrentBanner();
+    }
+
+    fn drawCurrentBanner(self: *ReconnectUi) !void {
+        const message = self.banner_message[0..self.banner_message_len];
+
         if (c.isatty(1) == 0) {
             try io_helpers.writeAll(1, "\r\n");
             try io_helpers.writeAll(1, message);
             try io_helpers.writeAll(1, "\r\n");
+            for (self.diagnostic_lines[0..self.diagnostic_line_count]) |*line| {
+                if (line.len == 0) continue;
+                try io_helpers.writeAll(1, line.slice());
+                try io_helpers.writeAll(1, "\r\n");
+            }
             return;
         }
 
         const size = terminal.currentWindowSize();
-        const top_row = self.viewport_offset;
-        const banner_row = bannerRowForSize(size.rows, top_row);
-        const visible_message = if (message.len > size.cols) message[0..size.cols] else message;
-        const col: u16 = if (size.cols > visible_message.len)
-            @intCast((@as(usize, size.cols) - visible_message.len) / 2)
+        const max_visible_diagnostic_lines: usize = if (size.rows > 1)
+            @min(max_diagnostic_banner_lines, @as(usize, size.rows - 1))
         else
             0;
-
+        const diagnostic_start = if (self.diagnostic_line_count > max_visible_diagnostic_lines)
+            self.diagnostic_line_count - max_visible_diagnostic_lines
+        else
+            0;
+        var banner_lines: [1 + max_diagnostic_banner_lines]BannerLine = undefined;
+        var banner_line_count: usize = 0;
+        banner_lines[banner_line_count] = .{ .text = message, .alignment = .center };
+        banner_line_count += 1;
+        for (self.diagnostic_lines[diagnostic_start..self.diagnostic_line_count]) |*line| {
+            banner_lines[banner_line_count] = .{ .text = line.slice(), .alignment = .left };
+            banner_line_count += 1;
+        }
         const renderer = client_renderer.Renderer.init(1);
-        self.banner_row = banner_row;
-        try renderer.moveCursor(banner_row, col);
-        try renderer.clearLine();
-        try io_helpers.writeAll(1, "\x1b[7m");
-        try io_helpers.writeAll(1, visible_message);
-        try io_helpers.writeAll(1, "\x1b[0m");
-        try renderer.moveCursor(top_row, 0);
+        const state = try drawBannerLines(renderer, size, self.viewport_offset, self.banner_state, banner_lines[0..banner_line_count]);
+        self.viewport_offset = state.viewport_offset;
+        self.banner_state = state;
+    }
+
+    fn refreshBannerIfDiagnosticsChanged(self: *ReconnectUi) !void {
+        if (self.banner_message_len == 0) return;
+        if (client_log.currentUserDiagnosticSeq() == self.rendered_diagnostic_seq) return;
+        try self.consumeDiagnostics();
+        try self.drawCurrentBanner();
+    }
+
+    fn consumeDiagnostics(self: *ReconnectUi) !void {
+        var diagnostics = [_]client_log.UserDiagnosticLine{.{}} ** max_diagnostic_banner_lines;
+        const new_cursor = client_log.copyUserDiagnosticsSince(self.diagnostic_cursor, &diagnostics);
+        if (new_cursor == self.diagnostic_cursor) {
+            self.rendered_diagnostic_seq = new_cursor;
+            return;
+        }
+
+        for (&diagnostics) |*diagnostic| {
+            if (diagnostic.seq == 0) continue;
+            self.appendDiagnosticLine(diagnostic);
+        }
+        self.diagnostic_cursor = new_cursor;
+        self.rendered_diagnostic_seq = new_cursor;
+        client_log.markUserDiagnosticsDisplayedThrough(new_cursor);
+    }
+
+    fn appendDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
+        if (self.diagnostic_line_count == self.diagnostic_lines.len) {
+            var i: usize = 1;
+            while (i < self.diagnostic_lines.len) : (i += 1) self.diagnostic_lines[i - 1] = self.diagnostic_lines[i];
+            self.diagnostic_line_count -= 1;
+        }
+        const delayed = diagnostic.seq <= self.live_diagnostic_start_seq;
+        const target = &self.diagnostic_lines[self.diagnostic_line_count];
+        target.len = formatBannerDiagnostic(target.bytes[0..], diagnostic, delayed);
+        self.diagnostic_line_count += 1;
+    }
+
+    fn drainDiagnosticNotifier(self: *ReconnectUi) void {
+        if (self.diagnostic_notify_read_fd < 0) return;
+        var buf: [128]u8 = undefined;
+        while (true) {
+            const n = c.read(self.diagnostic_notify_read_fd, &buf, buf.len);
+            if (n > 0) continue;
+            if (n == 0) return;
+            switch (posix.errno(n)) {
+                .AGAIN => return,
+                .INTR => continue,
+                else => return,
+            }
+        }
     }
 
     fn waitForDismiss(self: *ReconnectUi, timeout_ms: u64) !void {
@@ -620,7 +750,9 @@ pub const ReconnectUi = struct {
             const now = std.time.milliTimestamp();
             if (now >= deadline) return;
             const wait_ms: i32 = @intCast(@min(deadline - now, @as(i64, std.math.maxInt(i32))));
+            try self.refreshBannerIfDiagnosticsChanged();
             if (try self.pollDismissInput(wait_ms)) return;
+            try self.refreshBannerIfDiagnosticsChanged();
         }
     }
 
@@ -664,9 +796,358 @@ pub const ReconnectUi = struct {
     }
 };
 
-fn bannerRowForSize(rows: u16, top_row: u16) u16 {
-    if (rows <= 1) return 0;
-    return @min(top_row +| 1, rows - 1);
+const BannerAlign = enum {
+    left,
+    center,
+};
+
+const BannerLine = struct {
+    text: []const u8,
+    alignment: BannerAlign,
+};
+
+const BannerDiagnosticLine = struct {
+    bytes: [client_log.max_user_diagnostic_display_bytes]u8 = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const BannerDiagnosticLine) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+const max_banner_line_count = 1 + ReconnectUi.max_diagnostic_banner_lines;
+const max_banner_render_line_bytes = if (ReconnectUi.max_banner_message_bytes > client_log.max_user_diagnostic_display_bytes)
+    ReconnectUi.max_banner_message_bytes
+else
+    client_log.max_user_diagnostic_display_bytes;
+
+const RenderedBannerLine = struct {
+    start_col: u16 = 0,
+    len: u16 = 0,
+    bytes: [max_banner_render_line_bytes]u8 = undefined,
+
+    fn slice(self: *const RenderedBannerLine) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    fn endCol(self: *const RenderedBannerLine) u16 {
+        return self.start_col + self.len;
+    }
+
+    fn eql(self: *const RenderedBannerLine, other: *const RenderedBannerLine) bool {
+        return self.start_col == other.start_col and
+            self.len == other.len and
+            std.mem.eql(u8, self.slice(), other.slice());
+    }
+};
+
+const BannerDrawState = struct {
+    rows: u16,
+    cols: u16,
+    start_row: u16,
+    line_count: u16,
+    viewport_offset: u16,
+    restore_viewport_offset: u16,
+    scroll_top: u16,
+    scroll_lines: u16,
+    restores_expansion: bool = true,
+    lines: [max_banner_line_count]RenderedBannerLine = [_]RenderedBannerLine{.{}} ** max_banner_line_count,
+};
+
+const BannerLayout = struct {
+    start_row: u16,
+    visible_line_count: u16,
+    scroll_lines: u16,
+    viewport_offset: u16,
+};
+
+fn drawBannerLines(
+    renderer: client_renderer.Renderer,
+    size: WindowSize,
+    viewport_offset: u16,
+    previous: ?BannerDrawState,
+    lines: []const BannerLine,
+) !BannerDrawState {
+    const terminal_rows = normalizedTerminalRows(size.rows);
+    if (lines.len == 0) {
+        if (previous) |state| try eraseBannerRows(renderer, state, terminal_rows, size.cols);
+        if (previous) |state| try restoreBannerExpansion(renderer, state, terminal_rows);
+        const restored_viewport_offset = if (previous) |state| clearedViewportOffset(state) else viewport_offset;
+        return .{
+            .rows = terminal_rows,
+            .cols = size.cols,
+            .start_row = 0,
+            .line_count = 0,
+            .viewport_offset = restored_viewport_offset,
+            .restore_viewport_offset = restored_viewport_offset,
+            .scroll_top = restored_viewport_offset,
+            .scroll_lines = 0,
+        };
+    }
+
+    const layout = bannerLayoutForSize(terminal_rows, viewport_offset, lines.len);
+    const clamped_viewport_offset = @min(viewport_offset, terminal_rows - 1);
+    const prior_scroll_lines = if (previous) |state| state.scroll_lines else 0;
+    const restore_viewport_offset = if (previous) |state| state.restore_viewport_offset else clamped_viewport_offset;
+    const scroll_lines = prior_scroll_lines +| layout.scroll_lines;
+    const consumes_outer_rows = layout.scroll_lines > 0 and layout.viewport_offset < restore_viewport_offset;
+    const restores_expansion = (if (previous) |state| state.restores_expansion else true) and !consumes_outer_rows;
+    var next_state = BannerDrawState{
+        .rows = terminal_rows,
+        .cols = size.cols,
+        .start_row = layout.start_row,
+        .line_count = layout.visible_line_count,
+        .viewport_offset = layout.viewport_offset,
+        .restore_viewport_offset = restore_viewport_offset,
+        .scroll_top = layout.viewport_offset,
+        .scroll_lines = scroll_lines,
+        .restores_expansion = restores_expansion,
+    };
+    var row_offset: u16 = 0;
+    while (row_offset < layout.visible_line_count) : (row_offset += 1) {
+        next_state.lines[row_offset] = renderBannerLine(size.cols, lines[row_offset]);
+    }
+
+    const can_update_in_place = if (previous) |state|
+        layout.scroll_lines == 0 and
+            state.rows == terminal_rows and
+            state.cols == size.cols and
+            state.start_row == layout.start_row
+    else
+        false;
+
+    if (!can_update_in_place) {
+        if (previous) |state| try eraseBannerRows(renderer, state, terminal_rows, size.cols);
+    }
+    if (layout.scroll_lines > 0) {
+        if (restores_expansion) {
+            try expandBannerRegion(renderer, layout.viewport_offset, terminal_rows, layout.scroll_lines);
+        } else {
+            try expandBannerByScrollingTerminal(renderer, terminal_rows, layout.scroll_lines);
+        }
+    }
+
+    row_offset = 0;
+    while (row_offset < layout.visible_line_count) : (row_offset += 1) {
+        const old_line = if (can_update_in_place and row_offset < previous.?.line_count)
+            previous.?.lines[row_offset]
+        else
+            null;
+        if (old_line) |line| {
+            if (next_state.lines[row_offset].eql(&line)) continue;
+        }
+        try drawRenderedBannerLine(
+            renderer,
+            layout.start_row + row_offset,
+            size.cols,
+            next_state.lines[row_offset],
+            old_line,
+            old_line == null,
+        );
+    }
+    if (can_update_in_place) {
+        row_offset = layout.visible_line_count;
+        while (row_offset < previous.?.line_count) : (row_offset += 1) {
+            try eraseRenderedBannerLine(renderer, layout.start_row + row_offset, size.cols, previous.?.lines[row_offset]);
+        }
+    }
+    try renderer.restoreBannerPresentation();
+    try renderer.moveCursor(layout.viewport_offset, 0);
+    return next_state;
+}
+
+fn clearedViewportOffset(self: BannerDrawState) u16 {
+    return if (self.restores_expansion) self.restore_viewport_offset else self.viewport_offset;
+}
+
+fn eraseBannerRows(renderer: client_renderer.Renderer, state: BannerDrawState, rows: u16, cols: u16) !void {
+    const terminal_rows = normalizedTerminalRows(rows);
+    try renderer.restoreBannerPresentation();
+    var i: u16 = 0;
+    while (i < state.line_count) : (i += 1) {
+        const row = state.start_row +| i;
+        if (row >= terminal_rows) break;
+        try eraseRenderedBannerLine(renderer, row, cols, state.lines[i]);
+    }
+}
+
+fn expandBannerRegion(renderer: client_renderer.Renderer, top: u16, rows: u16, count: u16) !void {
+    if (count == 0) return;
+    const terminal_rows = normalizedTerminalRows(rows);
+    const bottom = terminal_rows - 1;
+    try renderer.restoreBannerPresentation();
+    try renderer.setScrollRegion(top, bottom);
+    try renderer.moveCursor(bottom, 0);
+    var i: u16 = 0;
+    while (i < count) : (i += 1) try renderer.newline();
+    try renderer.resetScrollRegion();
+}
+
+fn expandBannerByScrollingTerminal(renderer: client_renderer.Renderer, rows: u16, count: u16) !void {
+    if (count == 0) return;
+    const terminal_rows = normalizedTerminalRows(rows);
+    const bottom = terminal_rows - 1;
+    try renderer.restoreBannerPresentation();
+    try renderer.moveCursor(bottom, 0);
+    var i: u16 = 0;
+    while (i < count) : (i += 1) try renderer.newline();
+}
+
+fn restoreBannerExpansion(renderer: client_renderer.Renderer, state: BannerDrawState, rows: u16) !void {
+    if (state.scroll_lines == 0) return;
+    if (!state.restores_expansion) return;
+    const terminal_rows = normalizedTerminalRows(rows);
+    if (terminal_rows != state.rows) return;
+    const bottom = terminal_rows - 1;
+    try renderer.restoreBannerPresentation();
+    try renderer.setScrollRegion(state.scroll_top, bottom);
+    try renderer.moveCursor(state.scroll_top, 0);
+    var i: u16 = 0;
+    while (i < state.scroll_lines) : (i += 1) try renderer.reverseIndex();
+    try renderer.resetScrollRegion();
+}
+
+fn renderBannerLine(cols: u16, line: BannerLine) RenderedBannerLine {
+    const visible_len = @min(@min(line.text.len, @as(usize, cols)), max_banner_render_line_bytes);
+    const col: u16 = switch (line.alignment) {
+        .left => 0,
+        .center => if (cols > visible_len)
+            @intCast((@as(usize, cols) - visible_len) / 2)
+        else
+            0,
+    };
+    var rendered = RenderedBannerLine{
+        .start_col = col,
+        .len = @intCast(visible_len),
+    };
+    for (line.text[0..visible_len], 0..) |byte, i| {
+        rendered.bytes[i] = bannerSafeByte(byte);
+    }
+    return rendered;
+}
+
+fn drawRenderedBannerLine(
+    renderer: client_renderer.Renderer,
+    row: u16,
+    cols: u16,
+    line: RenderedBannerLine,
+    previous: ?RenderedBannerLine,
+    clear_full_row: bool,
+) !void {
+    if (cols == 0) return;
+    const line_end = line.endCol();
+    var cover_start: u16 = if (clear_full_row) 0 else line.start_col;
+    var cover_end: u16 = if (clear_full_row) cols else line_end;
+    if (!clear_full_row) {
+        if (previous) |old| {
+            cover_start = @min(cover_start, old.start_col);
+            cover_end = @max(cover_end, old.endCol());
+        }
+    }
+    if (cover_end <= cover_start) return;
+
+    try renderer.moveCursor(row, cover_start);
+    try renderer.restoreBannerPresentation();
+    try writeSpaces(renderer, line.start_col - cover_start);
+    try renderer.writeRaw("\x1b[7m");
+    try renderer.writeRaw(line.slice());
+    try renderer.writeRaw("\x1b[0m");
+    try writeSpaces(renderer, cover_end - line_end);
+}
+
+fn eraseRenderedBannerLine(renderer: client_renderer.Renderer, row: u16, cols: u16, line: RenderedBannerLine) !void {
+    const start_col = @min(line.start_col, cols);
+    const end_col = @min(line.endCol(), cols);
+    if (end_col <= start_col) return;
+    try renderer.moveCursor(row, start_col);
+    try renderer.restoreBannerPresentation();
+    try writeSpaces(renderer, end_col - start_col);
+}
+
+fn writeSpaces(renderer: client_renderer.Renderer, count: usize) !void {
+    const spaces = "                                                                ";
+    var remaining = count;
+    while (remaining > 0) {
+        const n = @min(remaining, spaces.len);
+        try renderer.writeRaw(spaces[0..n]);
+        remaining -= n;
+    }
+}
+
+fn bannerSafeByte(byte: u8) u8 {
+    return switch (byte) {
+        ' '...'~' => byte,
+        else => '?',
+    };
+}
+
+fn normalizedTerminalRows(rows: u16) u16 {
+    return if (rows == 0) 1 else rows;
+}
+
+fn bannerLayoutForSize(rows: u16, top_row: u16, line_count: usize) BannerLayout {
+    const terminal_rows = normalizedTerminalRows(rows);
+    const visible_line_count: u16 = @intCast(@min(line_count, @as(usize, terminal_rows)));
+    if (visible_line_count == 0) {
+        const viewport_offset = @min(top_row, terminal_rows - 1);
+        return .{ .start_row = viewport_offset, .visible_line_count = 0, .scroll_lines = 0, .viewport_offset = viewport_offset };
+    }
+
+    const clamped_top = @min(top_row, terminal_rows - 1);
+    const preferred_start = @as(usize, clamped_top) + 1;
+    const preferred_end = preferred_start + @as(usize, visible_line_count);
+    if (preferred_end <= terminal_rows) {
+        return .{
+            .start_row = @intCast(preferred_start),
+            .visible_line_count = visible_line_count,
+            .scroll_lines = 0,
+            .viewport_offset = clamped_top,
+        };
+    }
+
+    const scroll_lines: u16 = @intCast(@min(preferred_end - terminal_rows, @as(usize, std.math.maxInt(u16))));
+    const consumed_top = @min(clamped_top, scroll_lines);
+    return .{
+        .start_row = terminal_rows - visible_line_count,
+        .visible_line_count = visible_line_count,
+        .scroll_lines = scroll_lines,
+        .viewport_offset = clamped_top - consumed_top,
+    };
+}
+
+fn countSubstrings(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    var count: usize = 0;
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, index, needle)) |found| {
+        count += 1;
+        index = found + needle.len;
+    }
+    return count;
+}
+
+fn formatBannerDiagnostic(
+    out: []u8,
+    diagnostic: *const client_log.UserDiagnosticLine,
+    delayed: bool,
+) usize {
+    var stream = std.io.fixedBufferStream(out);
+    const writer = stream.writer();
+    if (delayed) {
+        writer.print("{s} ts_ms={}: ", .{ diagnostic.tag.label(), diagnostic.ts_ms }) catch return stream.pos;
+    } else {
+        writer.print("{s}: ", .{diagnostic.tag.label()}) catch return stream.pos;
+    }
+    writer.writeAll(diagnostic.slice()) catch {};
+    return stream.pos;
+}
+
+fn setNonBlocking(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
+    if ((flags & nonblocking_flag) != 0) return;
+    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
 }
 
 fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
@@ -726,10 +1207,142 @@ test "formatDelay uses compact reconnect labels" {
     try std.testing.expectEqualStrings("10min", try formatDelay(600_000, &buf));
 }
 
-test "reconnect banner row handles single-line terminals" {
-    try std.testing.expectEqual(@as(u16, 0), bannerRowForSize(1, 0));
-    try std.testing.expectEqual(@as(u16, 1), bannerRowForSize(24, 0));
-    try std.testing.expectEqual(@as(u16, 23), bannerRowForSize(24, 23));
+test "reconnect banner layout adds rows at terminal bottom" {
+    const single = bannerLayoutForSize(1, 0, 1);
+    try std.testing.expectEqual(@as(u16, 0), single.start_row);
+    try std.testing.expectEqual(@as(u16, 1), single.visible_line_count);
+    try std.testing.expectEqual(@as(u16, 1), single.scroll_lines);
+
+    const normal = bannerLayoutForSize(24, 0, 1);
+    try std.testing.expectEqual(@as(u16, 1), normal.start_row);
+    try std.testing.expectEqual(@as(u16, 0), normal.scroll_lines);
+
+    const bottom = bannerLayoutForSize(24, 23, 1);
+    try std.testing.expectEqual(@as(u16, 23), bottom.start_row);
+    try std.testing.expectEqual(@as(u16, 1), bottom.scroll_lines);
+    try std.testing.expectEqual(@as(u16, 22), bottom.viewport_offset);
+}
+
+test "reconnect banner draws clipped multiline content and pads stale rows" {
+    var single_row = std.ArrayList(u8).empty;
+    defer single_row.deinit(std.testing.allocator);
+    const single_renderer = client_renderer.Renderer.buffered(&single_row, .{ .kind = .xterm_compatible });
+    _ = try drawBannerLines(
+        single_renderer,
+        .{ .rows = 1, .cols = 8 },
+        0,
+        null,
+        &.{.{ .text = "single row", .alignment = .center }},
+    );
+    try std.testing.expect(std.mem.indexOf(u8, single_row.items, "\r\n") != null);
+
+    var first = std.ArrayList(u8).empty;
+    defer first.deinit(std.testing.allocator);
+    const renderer = client_renderer.Renderer.buffered(&first, .{ .kind = .xterm_compatible });
+    const first_state = try drawBannerLines(
+        renderer,
+        .{ .rows = 4, .cols = 8 },
+        0,
+        null,
+        &.{
+            .{ .text = "0123456789", .alignment = .center },
+            .{ .text = "ssh: first", .alignment = .left },
+        },
+    );
+    try std.testing.expect(std.mem.indexOf(u8, first.items, "01234567") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first.items, "ssh: fir") != null);
+    try std.testing.expectEqual(@as(u16, 1), first_state.start_row);
+    try std.testing.expectEqual(@as(u16, 2), first_state.line_count);
+
+    var second = std.ArrayList(u8).empty;
+    defer second.deinit(std.testing.allocator);
+    const second_renderer = client_renderer.Renderer.buffered(&second, .{ .kind = .xterm_compatible });
+    _ = try drawBannerLines(
+        second_renderer,
+        .{ .rows = 4, .cols = 8 },
+        first_state.viewport_offset,
+        first_state,
+        &.{.{ .text = "new", .alignment = .center }},
+    );
+    try std.testing.expectEqual(@as(usize, 0), countSubstrings(second.items, "\x1b[2K"));
+    try std.testing.expect(std.mem.indexOf(u8, second.items, "new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.items, "ssh: fir") == null);
+
+    var third = std.ArrayList(u8).empty;
+    defer third.deinit(std.testing.allocator);
+    const third_renderer = client_renderer.Renderer.buffered(&third, .{ .kind = .xterm_compatible });
+    _ = try drawBannerLines(
+        third_renderer,
+        .{ .rows = 4, .cols = 8 },
+        first_state.viewport_offset,
+        first_state,
+        &.{
+            .{ .text = "76543210", .alignment = .center },
+            .{ .text = "ssh: first", .alignment = .left },
+        },
+    );
+    try std.testing.expectEqual(@as(usize, 0), countSubstrings(third.items, "\x1b[2K"));
+    try std.testing.expect(std.mem.indexOf(u8, third.items, "76543210") != null);
+    try std.testing.expect(std.mem.indexOf(u8, third.items, "ssh: fir") == null);
+}
+
+test "reconnect banner restores temporary expansion within sessh-owned rows" {
+    var drawn = std.ArrayList(u8).empty;
+    defer drawn.deinit(std.testing.allocator);
+    const renderer = client_renderer.Renderer.buffered(&drawn, .{ .kind = .xterm_compatible });
+    const state = try drawBannerLines(
+        renderer,
+        .{ .rows = 4, .cols = 16 },
+        0,
+        null,
+        &.{
+            .{ .text = "one", .alignment = .center },
+            .{ .text = "two", .alignment = .left },
+            .{ .text = "three", .alignment = .left },
+            .{ .text = "four", .alignment = .left },
+        },
+    );
+    try std.testing.expectEqual(@as(u16, 1), state.scroll_lines);
+    try std.testing.expect(state.restores_expansion);
+    try std.testing.expectEqual(@as(u16, 0), state.restore_viewport_offset);
+
+    var cleared = std.ArrayList(u8).empty;
+    defer cleared.deinit(std.testing.allocator);
+    const clear_renderer = client_renderer.Renderer.buffered(&cleared, .{ .kind = .xterm_compatible });
+    try eraseBannerRows(clear_renderer, state, 4, 16);
+    try restoreBannerExpansion(clear_renderer, state, 4);
+    try std.testing.expectEqual(@as(usize, 1), countSubstrings(cleared.items, "\x1bM"));
+    try std.testing.expect(std.mem.indexOf(u8, cleared.items, "\x1b[r") != null);
+}
+
+test "reconnect banner scrolls outer rows into scrollback when expansion consumes them" {
+    var drawn = std.ArrayList(u8).empty;
+    defer drawn.deinit(std.testing.allocator);
+    const renderer = client_renderer.Renderer.buffered(&drawn, .{ .kind = .xterm_compatible });
+    const state = try drawBannerLines(
+        renderer,
+        .{ .rows = 4, .cols = 16 },
+        3,
+        null,
+        &.{
+            .{ .text = "one", .alignment = .center },
+            .{ .text = "two", .alignment = .left },
+        },
+    );
+    try std.testing.expectEqual(@as(u16, 2), state.scroll_lines);
+    try std.testing.expect(!state.restores_expansion);
+    try std.testing.expectEqual(@as(u16, 1), state.viewport_offset);
+    try std.testing.expectEqual(@as(u16, 3), state.restore_viewport_offset);
+    try std.testing.expect(std.mem.indexOf(u8, drawn.items, "\x1b[2;4r") == null);
+    try std.testing.expect(std.mem.indexOf(u8, drawn.items, "\x1b[4;1H\r\n\r\n") != null);
+
+    var cleared = std.ArrayList(u8).empty;
+    defer cleared.deinit(std.testing.allocator);
+    const clear_renderer = client_renderer.Renderer.buffered(&cleared, .{ .kind = .xterm_compatible });
+    try eraseBannerRows(clear_renderer, state, 4, 16);
+    try restoreBannerExpansion(clear_renderer, state, 4);
+    try std.testing.expectEqual(@as(usize, 0), countSubstrings(cleared.items, "\x1bM"));
+    try std.testing.expectEqual(@as(u16, 1), clearedViewportOffset(state));
 }
 
 test "reconnect banner updates every second under one minute" {
@@ -939,6 +1552,50 @@ test "reconnect waits for repaint response before returning" {
     try std.testing.expect(!session.pending_repaint.active());
     try std.testing.expectEqualStrings("fresh-cursor", session.scrollback_cursor.slice());
     try std.testing.expectEqual(@as(i32, 5), session.viewport_offset);
+}
+
+test "runtime repaint after local ui requests screen-only repaint" {
+    const remote_to_client = try posix.pipe();
+    defer posix.close(remote_to_client[0]);
+    defer posix.close(remote_to_client[1]);
+    const client_to_remote = try posix.pipe();
+    defer posix.close(client_to_remote[0]);
+    defer posix.close(client_to_remote[1]);
+
+    next_repaint_request_seq = 91;
+
+    const repaint_response = try protocol.encodePayload(app_allocator.allocator(), pb.RepaintResponse{
+        .repaint_request_seq = 91,
+        .draw = .{
+            .scrollback_cursor = "fresh-cursor",
+            .viewport_offset = 6,
+            .draw_bytes = "",
+        },
+    });
+    defer app_allocator.allocator().free(repaint_response);
+    try protocol.sendFrame(remote_to_client[1], .repaint_response, repaint_response);
+
+    var session = RuntimeSession{};
+    defer session.relay_end_restore.deinit(app_allocator.allocator());
+    try session.scrollback_cursor.set("old-cursor");
+    session.viewport_offset = 5;
+
+    try repaintRuntimeSession(remote_to_client[0], client_to_remote[1], &session);
+
+    var frame = try protocol.readFrameAlloc(app_allocator.allocator(), client_to_remote[0]);
+    defer frame.deinit(app_allocator.allocator());
+    try std.testing.expectEqual(protocol.MessageType.resize, frame.message_type);
+    var resize = try protocol.decodePayload(pb.Resize, app_allocator.allocator(), frame.payload);
+    defer resize.deinit(app_allocator.allocator());
+    try std.testing.expectEqual(@as(u32, 24), resize.terminal_rows);
+    try std.testing.expectEqual(@as(u32, 80), resize.terminal_cols);
+    try std.testing.expectEqual(@as(?i32, 5), resize.viewport_offset);
+    const repaint = resize.repaint_request orelse return error.ExpectedRepaintRequest;
+    try std.testing.expectEqual(@as(u64, 91), repaint.repaint_request_seq);
+    try std.testing.expect(repaint.scrollback_cursor == null);
+    try std.testing.expect(!session.pending_repaint.active());
+    try std.testing.expectEqualStrings("fresh-cursor", session.scrollback_cursor.slice());
+    try std.testing.expectEqual(@as(i32, 6), session.viewport_offset);
 }
 
 /// Implements the public `sessh :local:` path. This is both the local testing
@@ -1401,7 +2058,7 @@ pub fn repaintRuntimeSession(
     write_fd: c.fd_t,
     session: *RuntimeSession,
 ) !void {
-    try sendScreenRepaint(write_fd, &session.pending_repaint);
+    try sendResizeScreenRepaint(write_fd, terminal.currentWindowSize(), session.viewport_offset, &session.pending_repaint);
     try finishReconnectRepaint(read_fd, session);
 }
 
@@ -2209,6 +2866,25 @@ fn sendResizeWithRepaint(
         .repaint_request = .{
             .repaint_request_seq = repaint_request_seq,
             .scrollback_cursor = scrollback_cursor.slice(),
+        },
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(socket_fd, .resize, payload);
+}
+
+fn sendResizeScreenRepaint(
+    socket_fd: c.fd_t,
+    size: WindowSize,
+    viewport_offset: i32,
+    pending_repaint: *PendingRepaint,
+) !void {
+    const repaint_request_seq = pending_repaint.start();
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Resize{
+        .terminal_rows = size.rows,
+        .terminal_cols = size.cols,
+        .viewport_offset = nonZeroViewportOffset(viewport_offset),
+        .repaint_request = .{
+            .repaint_request_seq = repaint_request_seq,
         },
     });
     defer app_allocator.allocator().free(payload);

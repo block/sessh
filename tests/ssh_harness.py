@@ -1232,7 +1232,7 @@ done
         raise AssertionError("false unresponsive detection started a parallel reconnect attempt")
 
 
-def test_ssh_reconnect_buffers_and_displays_ssh_stderr_with_timestamps(tmp):
+def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1241,7 +1241,8 @@ def test_ssh_reconnect_buffers_and_displays_ssh_stderr_with_timestamps(tmp):
     raw_ssh_error = (
         "blox: error: looks like you are not connected to the VPN. Please connect to the VPN and try again\n"
         "Connection to test-host closed by remote host.\n"
-        "client_loop: send disconnect: Broken pipe"
+        "client_loop: send disconnect: Broken pipe\n"
+        "control sequence: \x1b[31mred"
     )
     remote_shell.write_text(
         f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
@@ -1267,12 +1268,21 @@ def test_ssh_reconnect_buffers_and_displays_ssh_stderr_with_timestamps(tmp):
         raise AssertionError(result)
     if raw_ssh_error in result.stdout:
         raise AssertionError(result)
-    for line in raw_ssh_error.splitlines():
-        expected = f"level=warn ssh stderr: {line}"
-        if expected not in result.stderr:
+    if "ssh: blox: error:" in result.stdout:
+        raise AssertionError(result)
+    for line in (
+        "ssh: Connection to test-host closed by remote host.",
+        "ssh: client_loop: send disconnect: Broken pipe",
+        "ssh: control sequence: ?[31mred",
+    ):
+        if line not in result.stdout:
             raise AssertionError(result)
-    if "ts_ms=" not in result.stderr:
-        raise AssertionError(result.stderr)
+    if "\x1b[31mred" in result.stdout:
+        raise AssertionError(result)
+    if "ssh stderr:" in result.stdout or "sessh: log" in result.stdout or "level=warn" in result.stdout:
+        raise AssertionError(result)
+    if result.stderr:
+        raise AssertionError(result)
     if (Path(env["XDG_CACHE_HOME"]) / "sessh" / "clients").exists():
         raise AssertionError("client logs were written to persistent cache")
 
@@ -1364,8 +1374,10 @@ def test_ssh_session_buffers_and_displays_stderr_after_attach(tmp):
         raise AssertionError(result)
     if raw_ssh_error in result.stdout:
         raise AssertionError(result)
-    expected = f"level=warn ssh stderr: {raw_ssh_error}"
-    if expected not in result.stderr or "ts_ms=" not in result.stderr:
+    expected = f"ssh ts_ms="
+    if expected not in result.stderr or f": {raw_ssh_error}" not in result.stderr:
+        raise AssertionError(result)
+    if "ssh stderr:" in result.stderr or "sessh: log" in result.stderr or "level=warn" in result.stderr:
         raise AssertionError(result)
     if (Path(env["XDG_CACHE_HOME"]) / "sessh" / "clients").exists():
         raise AssertionError("client logs were written to persistent cache")
@@ -1790,8 +1802,8 @@ def main():
             test_ssh_no_echo_ping_prevents_false_unresponsive,
         ),
         (
-            "ssh reconnect buffers and displays ssh stderr with timestamps",
-            test_ssh_reconnect_buffers_and_displays_ssh_stderr_with_timestamps,
+            "ssh reconnect displays live ssh stderr in banner",
+            test_ssh_reconnect_displays_live_ssh_stderr_in_banner,
         ),
         (
             "ssh log level quiet suppresses buffered stderr display",
