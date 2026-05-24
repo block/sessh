@@ -304,9 +304,7 @@ fn isMuxSubcommand(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "new") or
         std.mem.eql(u8, arg, "attach") or
         std.mem.eql(u8, arg, "list") or
-        std.mem.eql(u8, arg, "kill") or
-        std.mem.eql(u8, arg, "kill-all") or
-        std.mem.eql(u8, arg, "killall");
+        std.mem.eql(u8, arg, "kill");
 }
 
 fn translateMuxArgs(allocator: std.mem.Allocator, args: []const []const u8) !TranslatedMuxArgs {
@@ -323,8 +321,6 @@ fn translateMuxArgs(allocator: std.mem.Allocator, args: []const []const u8) !Tra
         try translateMuxList(&translated, args[2..]);
     } else if (std.mem.eql(u8, command, "kill")) {
         try translateMuxKill(&translated, args[2..]);
-    } else if (std.mem.eql(u8, command, "kill-all") or std.mem.eql(u8, command, "killall")) {
-        try translateMuxKillAll(&translated, args[2..]);
     } else {
         return error.UnsupportedMuxCommand;
     }
@@ -360,8 +356,7 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8) !vo
             if (std.mem.eql(u8, arg, "--list") or
                 std.mem.eql(u8, arg, "--attach") or
                 std.mem.eql(u8, arg, "--kill") or
-                std.mem.eql(u8, arg, "--kill-all") or
-                std.mem.eql(u8, arg, "--killall"))
+                std.mem.eql(u8, arg, "--kill-all"))
             {
                 return error.UnsupportedMuxOption;
             }
@@ -399,7 +394,7 @@ fn translateMuxAttach(translated: *TranslatedMuxArgs, args: []const []const u8) 
     defer positional.deinit(translated.allocator);
     var host_option: ?[]const u8 = null;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null);
     if (positional.items.len > 2) return error.TooManyMuxArguments;
 
     if (host_option) |host| {
@@ -434,7 +429,7 @@ fn translateMuxList(translated: *TranslatedMuxArgs, args: []const []const u8) !v
     defer positional.deinit(translated.allocator);
     var host_option: ?[]const u8 = null;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null);
     const host = try muxHostFromOptions(host_option, positional.items, 0);
     try appendMany(translated, ssh_options.items);
     try translated.append(host);
@@ -450,31 +445,25 @@ fn translateMuxKill(translated: *TranslatedMuxArgs, args: []const []const u8) !v
     var positional: std.ArrayList([]const u8) = .empty;
     defer positional.deinit(translated.allocator);
     var host_option: ?[]const u8 = null;
+    var all = false;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, &all);
+
+    if (all) {
+        const host = try muxHostFromOptions(host_option, positional.items, 0);
+        try appendMany(translated, ssh_options.items);
+        try translated.append(host);
+        try translated.append("--kill-all");
+        try appendMany(translated, sessh_options.items);
+        return;
+    }
+
     const host = try muxHostFromOptions(host_option, positional.items, 1);
     const id = if (host_option != null) positional.items[0] else positional.items[1];
     try appendMany(translated, ssh_options.items);
     try translated.append(host);
     try translated.append("--kill");
     try translated.append(id);
-    try appendMany(translated, sessh_options.items);
-}
-
-fn translateMuxKillAll(translated: *TranslatedMuxArgs, args: []const []const u8) !void {
-    var ssh_options: std.ArrayList([]const u8) = .empty;
-    defer ssh_options.deinit(translated.allocator);
-    var sessh_options: std.ArrayList([]const u8) = .empty;
-    defer sessh_options.deinit(translated.allocator);
-    var positional: std.ArrayList([]const u8) = .empty;
-    defer positional.deinit(translated.allocator);
-    var host_option: ?[]const u8 = null;
-
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false);
-    const host = try muxHostFromOptions(host_option, positional.items, 0);
-    try appendMany(translated, ssh_options.items);
-    try translated.append(host);
-    try translated.append("--kill-all");
     try appendMany(translated, sessh_options.items);
 }
 
@@ -486,6 +475,7 @@ fn parseMuxCommandOptions(
     positional: *std.ArrayList([]const u8),
     host_option: *?[]const u8,
     allow_command_argv: bool,
+    all_option: ?*bool,
 ) !void {
     var i: usize = 0;
     while (i < args.len) {
@@ -493,6 +483,13 @@ fn parseMuxCommandOptions(
         if (std.mem.eql(u8, arg, "--")) {
             if (!allow_command_argv) return error.UnsupportedMuxOption;
             return error.MissingCommandArgv;
+        } else if (std.mem.eql(u8, arg, "--all")) {
+            if (all_option) |all| {
+                all.* = true;
+                i += 1;
+            } else {
+                return error.UnsupportedMuxOption;
+            }
         } else if (std.mem.eql(u8, arg, "--host")) {
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingHost;
@@ -508,8 +505,7 @@ fn parseMuxCommandOptions(
                 std.mem.eql(u8, arg, "--attach") or
                 std.mem.eql(u8, arg, "--list") or
                 std.mem.eql(u8, arg, "--kill") or
-                std.mem.eql(u8, arg, "--kill-all") or
-                std.mem.eql(u8, arg, "--killall"))
+                std.mem.eql(u8, arg, "--kill-all"))
             {
                 return error.UnsupportedMuxOption;
             }
@@ -2147,7 +2143,7 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             parsed.action = .kill;
             parsed.kill_id = args[index.*];
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--kill-all") or std.mem.eql(u8, arg, "--killall")) {
+        } else if (std.mem.eql(u8, arg, "--kill-all")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.action = .kill_all;
             index.* += 1;
@@ -2179,8 +2175,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--capture-tty-transcript") or
         std.mem.eql(u8, arg, "--list") or
         std.mem.eql(u8, arg, "--kill") or
-        std.mem.eql(u8, arg, "--kill-all") or
-        std.mem.eql(u8, arg, "--killall");
+        std.mem.eql(u8, arg, "--kill-all");
 }
 
 fn isRemoteManagementAction(action: SshAction) bool {
@@ -2990,9 +2985,6 @@ test "parseSshArgs accepts translated remote session commands after host" {
 
     const kill_all = try parseSshArgs(&.{ "sesshmux", "example.com", "--kill-all" });
     try std.testing.expectEqual(SshAction.kill_all, kill_all.action);
-
-    const killall = try parseSshArgs(&.{ "sesshmux", "example.com", "--killall" });
-    try std.testing.expectEqual(SshAction.kill_all, killall.action);
 }
 
 test "parseSshArgs accepts persistent command argv after delimiter" {
@@ -3075,6 +3067,29 @@ test "translateMuxArgs maps local and host-qualified attach" {
     });
     defer remote.deinit();
     try expectArgvEqual(&.{ "sesshmux", "-F", "cfg", "example.com", "--attach", "s1" }, remote.args.items);
+}
+
+test "translateMuxArgs maps kill and kill all" {
+    var kill = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "kill",
+        "--host",
+        "example.com",
+        "s1",
+    });
+    defer kill.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "--kill", "s1" }, kill.args.items);
+
+    var kill_all = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "kill",
+        "--all",
+        "--ssh-options",
+        "-F cfg",
+        "example.com",
+    });
+    defer kill_all.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "-F", "cfg", "example.com", "--kill-all" }, kill_all.args.items);
 }
 
 fn expectArgvEqual(expected: []const []const u8, actual: []const []const u8) !void {

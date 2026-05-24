@@ -1891,7 +1891,7 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
         if (std.mem.eql(u8, arg, "--list")) {
             try setAction(&options, .list);
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--kill-all") or std.mem.eql(u8, arg, "--killall")) {
+        } else if (std.mem.eql(u8, arg, "--kill-all")) {
             try setAction(&options, .kill_all);
             i += 1;
         } else if (std.mem.eql(u8, arg, "--attach")) {

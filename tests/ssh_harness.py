@@ -1669,14 +1669,14 @@ def test_ssh_remote_session_commands_use_broker(tmp):
     if "s1" in listed.stdout:
         raise AssertionError(listed)
 
-    stopped = run_sessh(["kill-all", "test-host"], env, timeout=30.0)
+    stopped = run_sessh(["kill", "--all", "test-host"], env, timeout=30.0)
     if stopped.returncode != 0:
         raise AssertionError(stopped)
     if "KILLING_ALL" not in stopped.stdout:
         raise AssertionError(stopped)
 
 
-def test_ssh_remote_kill_all_does_not_start_agent(tmp):
+def test_ssh_remote_kill_all_option_does_not_start_agent(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1684,7 +1684,7 @@ def test_ssh_remote_kill_all_does_not_start_agent(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    stopped = run_sessh(["kill-all", "test-host"], env, timeout=30.0)
+    stopped = run_sessh(["kill", "--all", "test-host"], env, timeout=30.0)
 
     if stopped.returncode != 0:
         raise AssertionError(stopped)
@@ -1692,7 +1692,7 @@ def test_ssh_remote_kill_all_does_not_start_agent(tmp):
         raise AssertionError(stopped)
     registry = sessions_dir(env)
     if registry.exists() and any(registry.iterdir()):
-        raise AssertionError("remote kill-all started a session agent")
+        raise AssertionError("remote kill --all started a session agent")
 
 
 def test_ssh_version_mismatch_uses_compat_path(tmp):
@@ -1908,8 +1908,8 @@ def main():
             test_ssh_remote_session_commands_use_broker,
         ),
         (
-            "ssh remote kill-all does not start agent",
-            test_ssh_remote_kill_all_does_not_start_agent,
+            "ssh remote kill --all does not start agent",
+            test_ssh_remote_kill_all_option_does_not_start_agent,
         ),
         (
             "ssh version mismatch uses compat path",

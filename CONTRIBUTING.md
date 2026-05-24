@@ -3,6 +3,8 @@
 Start with [README.md](README.md), then read
 [Architecture](docs/ARCHITECTURE.md).
 
+Keep docs high-level. Details live in comments in code.
+
 ## Development Setup
 
 sessh currently requires Zig 0.15.2. On macOS, install it with:

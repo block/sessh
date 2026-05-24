@@ -72,7 +72,7 @@ fn usage(code: u8) !void {
         \\  sesshmux attach --host HOST [ID]
         \\  sesshmux list [--ssh-options "ssh args"] HOST
         \\  sesshmux kill [--ssh-options "ssh args"] HOST ID
-        \\  sesshmux kill-all [--ssh-options "ssh args"] HOST
+        \\  sesshmux kill --all [--ssh-options "ssh args"] HOST
         \\
         \\sessh-specific options:
         \\  --alias NAME

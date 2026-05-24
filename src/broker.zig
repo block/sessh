@@ -108,7 +108,7 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
         if (args.len != 2) return finishCommand(64, "", "ERROR usage: --kill ID\n");
         return killOneAgent(allocator, args[1]);
     }
-    if (std.mem.eql(u8, command, "--kill-all") or std.mem.eql(u8, command, "--killall")) {
+    if (std.mem.eql(u8, command, "--kill-all")) {
         if (args.len != 1) return finishCommand(64, "", "ERROR usage: --kill-all\n");
         return killAllAgents(allocator);
     }

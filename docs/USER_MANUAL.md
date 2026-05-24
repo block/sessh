@@ -42,11 +42,11 @@ Use `sesshmux` for session management:
 - `sesshmux attach ID`: attach using a local alias, cached remote route, or
   session GUID.
 - `sesshmux attach HOST ID`: attach by resolving `ID` on `HOST`.
-- `sesshmux attach --host HOST`: attach to the most recent attachable session
-  on `HOST`.
+- `sesshmux attach --host HOST [ID]`: attach by resolving `ID` on `HOST`, or
+  attach to the most recent attachable session on `HOST` if `ID` is omitted.
 - `sesshmux list HOST`: list attachable sessions on `HOST`.
 - `sesshmux kill HOST ID`: terminate the specified session on `HOST`.
-- `sesshmux kill-all HOST`: terminate all sessions on `HOST`.
+- `sesshmux kill --all HOST`: terminate all sessions on `HOST`.
 
 For remote commands, pass ssh options before the host or through
 `--ssh-options "..."`, for example `sesshmux list --ssh-options "-F cfg" HOST`.

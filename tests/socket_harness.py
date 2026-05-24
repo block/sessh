@@ -2726,7 +2726,7 @@ def main():
             if bad.returncode != 64:
                 raise AssertionError(bad)
 
-            for bare_command in (["list"], ["kill", "s1"], ["kill-all"]):
+            for bare_command in (["list"], ["kill", "s1"]):
                 bad = run([":local:", *bare_command], env, timeout=5.0)
                 if bad.returncode != 64:
                     raise AssertionError((bare_command, bad))
@@ -2742,11 +2742,8 @@ def main():
             stopped = run([":local:", "--kill-all"], env, timeout=5.0)
             if stopped.returncode != 0 or stopped.stdout != "KILLING_ALL\n":
                 raise AssertionError(stopped)
-            stopped_alias = run([":local:", "--killall"], env, timeout=5.0)
-            if stopped_alias.returncode != 0 or stopped_alias.stdout != "KILLING_ALL\n":
-                raise AssertionError(stopped_alias)
             if sessions_dir(env).exists() and any(sessions_dir(env).iterdir()):
-                raise AssertionError("kill-all started a session agent")
+                raise AssertionError("kill all started a session agent")
 
             run_login_shell_profile_test(env)
             run_session_create_command_argv_test(env)

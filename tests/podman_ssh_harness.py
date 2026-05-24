@@ -441,7 +441,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(killed)
 
         stopped = run(
-            [str(prefix / "bin" / "sesshmux"), "kill-all", "-F", str(config), host_alias],
+            [str(prefix / "bin" / "sesshmux"), "kill", "--all", "-F", str(config), host_alias],
             env=env,
             timeout=60.0,
             check=False,
@@ -452,7 +452,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(stopped)
 
         stopped_again = run(
-            [str(prefix / "bin" / "sesshmux"), "kill-all", "-F", str(config), host_alias],
+            [str(prefix / "bin" / "sesshmux"), "kill", "--all", "-F", str(config), host_alias],
             env=env,
             timeout=60.0,
             check=False,
