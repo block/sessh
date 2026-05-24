@@ -287,7 +287,7 @@ def pack_bytes(value):
     return sessh_pb().Input(data=value).SerializeToString()
 
 
-def pack_session_create(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1"):
+def pack_session_create(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", command_argv=None):
     pb = sessh_pb()
     message = pb.SessionCreate(scrollback_row_limit=scrollback)
     message.session_guid = guid_for_ref(session_id)
@@ -299,6 +299,8 @@ def pack_session_create(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, se
     entry = message.environment.add()
     entry.name = "SHELL"
     entry.value = str(shell)
+    if command_argv:
+        message.command_argv.extend(str(arg) for arg in command_argv)
     message.query_default_colors.foreground_color = fg
     message.query_default_colors.background_color = bg
     return message.SerializeToString()
@@ -381,8 +383,8 @@ def assert_session_created(payload):
     return message
 
 
-def create_and_attach_session(conn, shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", initial_scrollback=None):
-    send_frame(conn, SESSION_CREATE, pack_session_create(shell, scrollback=scrollback, fg=fg, bg=bg, session_id=session_id))
+def create_and_attach_session(conn, shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", initial_scrollback=None, command_argv=None):
+    send_frame(conn, SESSION_CREATE, pack_session_create(shell, scrollback=scrollback, fg=fg, bg=bg, session_id=session_id, command_argv=command_argv))
     assert_session_created(recv_until_message(conn, SESSION_CREATED))
     send_frame(conn, SESSION_ATTACH, pack_session_attach(initial_scrollback=initial_scrollback))
 
@@ -718,6 +720,45 @@ def run_login_shell_profile_test(_base_env):
                 if message_type != SESSION_ATTACHED:
                     raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
                 recv_draw_until(conn, b"LOGIN_PROFILE_READY")
+                send_frame(conn, INPUT, pack_bytes(b"exit\n"))
+                recv_until_message(conn, SESSION_ENDED)
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
+def run_session_create_command_argv_test(_base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-command-argv-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "shell-should-not-run"
+        command = Path(tmp) / "command-child"
+        shell.write_text("#!/bin/sh\nprintf 'UNEXPECTED_SHELL\\n'\nexit 1\n")
+        shell.chmod(0o700)
+        command.write_text(
+            "#!/bin/sh\n"
+            "printf 'COMMAND_ARGV_READY:%s\\n' \"$1\"\n"
+            "while IFS= read -r line; do\n"
+            "  [ \"$line\" = exit ] && exit 0\n"
+            "done\n"
+        )
+        command.chmod(0o700)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn)
+                create_and_attach_session(conn, shell, command_argv=[command, "arg-one"])
+                message_type, _payload = recv_frame(conn)
+                if message_type != SESSION_ATTACHED:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                draw = recv_draw_until(conn, b"COMMAND_ARGV_READY:arg-one")
+                if b"UNEXPECTED_SHELL" in draw:
+                    raise AssertionError(draw)
                 send_frame(conn, INPUT, pack_bytes(b"exit\n"))
                 recv_until_message(conn, SESSION_ENDED)
             finally:
@@ -2673,7 +2714,7 @@ def main():
 
         try:
             help_text = run(["--help"], env, timeout=5.0)
-            if help_text.returncode != 0 or "sessh [ssh-options] HOST [sessh-options]" not in help_text.stdout:
+            if help_text.returncode != 0 or "sessh [sessh-options] [ssh-options] HOST" not in help_text.stdout:
                 raise AssertionError(help_text)
             if ":local:" in help_text.stdout:
                 raise AssertionError(help_text.stdout)
@@ -2689,10 +2730,6 @@ def main():
                 bad = run([":local:", *bare_command], env, timeout=5.0)
                 if bad.returncode != 64:
                     raise AssertionError((bare_command, bad))
-
-            old_socket = run(["--socket", "--list"], env, timeout=5.0)
-            if old_socket.returncode != 64 or "unsupported ssh option" not in old_socket.stderr:
-                raise AssertionError(old_socket)
 
             bad = run([":local:", "--leader", "CTRL-C", "--list"], env, timeout=5.0)
             if bad.returncode != 64:
@@ -2712,6 +2749,7 @@ def main():
                 raise AssertionError("kill-all started a session agent")
 
             run_login_shell_profile_test(env)
+            run_session_create_command_argv_test(env)
             run_session_agent_crash_client_error_test(env)
             run_session_agent_registry_test(env)
             run_host_broker_starts_session_agent_test(env)

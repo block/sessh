@@ -111,7 +111,7 @@ def is_build_sessh_executable(resolved, expected_wrapper):
         resolved.relative_to(libexec.resolve(strict=False))
     except ValueError:
         return False
-    return resolved.name.startswith("sessh-")
+    return resolved.name.startswith("sesshmux-")
 
 
 def is_test_cached_sessh_command(resolved, command):

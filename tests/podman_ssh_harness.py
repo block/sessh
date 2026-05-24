@@ -366,7 +366,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         if "ReconnectUnsupported" in reconnected.stderr:
             raise AssertionError(reconnected.stderr)
 
-        artifact_path = prefix / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+        artifact_path = prefix / "libexec" / "sessh" / f"sesshmux-{os_name}-{arch}"
         if not artifact_path.exists():
             raise AssertionError(f"missing packaged artifact: {artifact_path}")
         remote_artifact = f"/root/.cache/sessh/bin/{sessh_version()}/{sha256(artifact_path)}"
@@ -403,7 +403,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(started)
 
         listed = run(
-            [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias, "--list"],
+            [str(prefix / "bin" / "sesshmux"), "list", "-F", str(config), host_alias],
             env=env,
             timeout=60.0,
             check=False,
@@ -430,7 +430,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(f"remote session compat symlink was not installed at {compat_path}")
 
         killed = run(
-            [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias, "--kill", session_id],
+            [str(prefix / "bin" / "sesshmux"), "kill", "-F", str(config), host_alias, session_id],
             env=env,
             timeout=60.0,
             check=False,
@@ -441,7 +441,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(killed)
 
         stopped = run(
-            [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias, "--kill-all"],
+            [str(prefix / "bin" / "sesshmux"), "kill-all", "-F", str(config), host_alias],
             env=env,
             timeout=60.0,
             check=False,
@@ -452,7 +452,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(stopped)
 
         stopped_again = run(
-            [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias, "--kill-all"],
+            [str(prefix / "bin" / "sesshmux"), "kill-all", "-F", str(config), host_alias],
             env=env,
             timeout=60.0,
             check=False,

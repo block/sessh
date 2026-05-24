@@ -50,10 +50,15 @@ case "$(uname -m)" in
     ;;
 esac
 
-real="$bindir/../libexec/sessh/sessh-$os-$arch"
+name=$(basename "$self")
+real="$bindir/../libexec/sessh/sesshmux-$os-$arch"
 if [ ! -x "$real" ]; then
   printf 'sessh: missing platform binary: %s\n' "$real" >&2
   exit 127
+fi
+
+if [ "$name" = "sessh" ]; then
+  exec "$real" new "$@"
 fi
 
 exec "$real" "$@"

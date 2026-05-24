@@ -28,30 +28,23 @@ pub fn build(b: *std.Build) void {
     addPlatformLibraries(exe_mod, target);
 
     const exe = b.addExecutable(.{
-        .name = "sessh-dev",
+        .name = "sesshmux-dev",
         .root_module = exe_mod,
     });
     exe.step.dependOn(&protoc_step.step);
 
-    const wrapper_install = b.addInstallFileWithDir(
-        b.path("src/sessh-wrapper.sh"),
-        .prefix,
-        "bin/sessh",
-    );
-    const wrapper_path = b.getInstallPath(.prefix, "bin/sessh");
-    const chmod_wrapper = b.addSystemCommand(&.{ "chmod", "755", wrapper_path });
-    chmod_wrapper.step.dependOn(&wrapper_install.step);
-    b.getInstallStep().dependOn(&chmod_wrapper.step);
+    installWrapper(b, "bin/sessh");
+    installWrapper(b, "bin/sesshmux");
 
-    const run_step = b.step("run", "Run sessh");
+    const run_step = b.step("run", "Run sesshmux");
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| run_cmd.addArgs(args);
     run_step.dependOn(&run_cmd.step);
 
-    const install_dev_step = b.step("install-dev", "Install the current sessh-dev executable for tests");
+    const install_dev_step = b.step("install-dev", "Install the current sesshmux-dev executable for tests");
     const install_dev = b.addInstallArtifact(exe, .{
         .dest_dir = .{ .override = .prefix },
-        .dest_sub_path = "bin/sessh-dev",
+        .dest_sub_path = "bin/sesshmux-dev",
     });
     install_dev_step.dependOn(&install_dev.step);
 
@@ -77,6 +70,18 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(artifacts_step);
 }
 
+fn installWrapper(b: *std.Build, dest_sub_path: []const u8) void {
+    const wrapper_install = b.addInstallFileWithDir(
+        b.path("src/sessh-wrapper.sh"),
+        .prefix,
+        dest_sub_path,
+    );
+    const wrapper_path = b.getInstallPath(.prefix, dest_sub_path);
+    const chmod_wrapper = b.addSystemCommand(&.{ "chmod", "755", wrapper_path });
+    chmod_wrapper.step.dependOn(&wrapper_install.step);
+    b.getInstallStep().dependOn(&chmod_wrapper.step);
+}
+
 const ArtifactTarget = struct {
     filename: []const u8,
     query: std.Target.Query,
@@ -90,31 +95,31 @@ fn addArtifactsStep(b: *std.Build, protoc_step: *std.Build.Step) *std.Build.Step
 
     const artifact_targets = [_]ArtifactTarget{
         .{
-            .filename = "sessh-macos-aarch64",
+            .filename = "sesshmux-macos-aarch64",
             .query = .{ .cpu_arch = .aarch64, .os_tag = .macos },
         },
         .{
-            .filename = "sessh-macos-x86_64",
+            .filename = "sesshmux-macos-x86_64",
             .query = .{ .cpu_arch = .x86_64, .os_tag = .macos },
         },
         .{
-            .filename = "sessh-linux-arm32",
+            .filename = "sesshmux-linux-arm32",
             .query = .{ .cpu_arch = .arm, .os_tag = .linux, .abi = .musleabihf },
         },
         .{
-            .filename = "sessh-linux-aarch64",
+            .filename = "sesshmux-linux-aarch64",
             .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
         },
         .{
-            .filename = "sessh-linux-x86_64",
+            .filename = "sesshmux-linux-x86_64",
             .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
         },
         .{
-            .filename = "sessh-linux-x86",
+            .filename = "sesshmux-linux-x86",
             .query = .{ .cpu_arch = .x86, .os_tag = .linux, .abi = .musl },
         },
         .{
-            .filename = "sessh-linux-riscv64",
+            .filename = "sesshmux-linux-riscv64",
             .query = .{
                 .cpu_arch = .riscv64,
                 .os_tag = .linux,

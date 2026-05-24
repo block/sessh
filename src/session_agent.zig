@@ -557,10 +557,13 @@ const SessionCreateRequest = struct {
     query_default_colors: vt.DefaultColors,
     session_guid: []u8,
     session_alias: []u8,
+    command_argv: [][]u8,
 
     fn deinit(self: *SessionCreateRequest) void {
         app_allocator.allocator().free(self.session_alias);
         app_allocator.allocator().free(self.session_guid);
+        for (self.command_argv) |arg| app_allocator.allocator().free(arg);
+        app_allocator.allocator().free(self.command_argv);
         self.environment.deinit();
         self.* = undefined;
     }
@@ -1159,6 +1162,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.environment,
                     request.query_default_colors,
                     request.session_guid,
+                    request.command_argv,
                 ) catch |err| {
                     session_registry.removeAlias(app_allocator.allocator(), alias) catch {};
                     return err;
@@ -1928,6 +1932,17 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
     if (message.query_default_colors) |colors| {
         query_default_colors = try readDefaultColors(colors);
     }
+    const command_argv = try app_allocator.allocator().alloc([]u8, message.command_argv.items.len);
+    var command_argv_initialized: usize = 0;
+    errdefer {
+        for (command_argv[0..command_argv_initialized]) |arg| app_allocator.allocator().free(arg);
+        app_allocator.allocator().free(command_argv);
+    }
+    for (message.command_argv.items, 0..) |arg, i| {
+        if (arg.len == 0) return error.InvalidCommandArgv;
+        command_argv[i] = try app_allocator.allocator().dupe(u8, arg);
+        command_argv_initialized += 1;
+    }
 
     return .{
         .terminal_size = try terminalSizePayloadFromMessage(terminal_size),
@@ -1936,6 +1951,7 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
         .query_default_colors = query_default_colors,
         .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
         .session_alias = try app_allocator.allocator().dupe(u8, message.session_alias),
+        .command_argv = command_argv,
     };
 }
 
@@ -2037,6 +2053,7 @@ fn createSession(
     session_environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
     session_guid: []const u8,
+    command_argv: []const []const u8,
 ) !usize {
     if (session_agent.fixed_session_id != null and session_agent.started_session) return error.TooManySessions;
 
@@ -2061,6 +2078,11 @@ fn createSession(
         defer app_allocator.allocator().free(shell_z);
         const shell_argv0 = try loginShellArg0(app_allocator.allocator(), shell_path);
         defer app_allocator.allocator().free(shell_argv0);
+        var prepared_command: ?PreparedCommand = if (command_argv.len > 0)
+            try prepareCommandArgv(app_allocator.allocator(), command_argv)
+        else
+            null;
+        defer if (prepared_command) |*command| command.deinit(app_allocator.allocator());
 
         var master: c_int = -1;
         var size = c.winsize{ .row = rows, .col = cols, .xpixel = 0, .ypixel = 0 };
@@ -2071,9 +2093,13 @@ fn createSession(
             _ = setenv("TERM", "xterm-256color", 1);
             _ = setenv("SHELL", shell_z.ptr, 1);
             _ = setenv("SESSH_GUID", session_guid_z.ptr, 1);
-            const dash_i: [*:0]const u8 = "-i";
-            var child_argv = [_:null]?[*:0]const u8{ shell_argv0.ptr, dash_i };
-            _ = c.execve(shell_z.ptr, &child_argv, @ptrCast(c.environ));
+            if (prepared_command) |command| {
+                posix.execvpeZ(command.argv[0].?, command.argv.ptr, @ptrCast(c.environ)) catch {};
+            } else {
+                const dash_i: [*:0]const u8 = "-i";
+                var child_argv = [_:null]?[*:0]const u8{ shell_argv0.ptr, dash_i };
+                _ = c.execve(shell_z.ptr, &child_argv, @ptrCast(c.environ));
+            }
             std.process.exit(127);
         }
 
@@ -2090,17 +2116,51 @@ fn createSession(
         session.id_len = session_guid.len;
         session_agent.started_session = true;
         if (session_agent.fixed_session_id == null) session_agent.next_id += 1;
-        logSessionAgent(session_agent, "event=session_create id={s} pid={} rows={} cols={} scrollback_rows={} shell={s}", .{
+        logSessionAgent(session_agent, "event=session_create id={s} pid={} rows={} cols={} scrollback_rows={} shell={s} command_argc={}", .{
             session.idSlice(),
             pid,
             rows,
             cols,
             scrollback_row_count,
             shell_path,
+            command_argv.len,
         });
         return session_index;
     }
     return error.TooManySessions;
+}
+
+const PreparedCommand = struct {
+    argv: [:null]?[*:0]const u8,
+    owned_args: [][:0]u8,
+
+    fn deinit(self: *PreparedCommand, allocator: std.mem.Allocator) void {
+        for (self.owned_args) |arg| allocator.free(arg);
+        allocator.free(self.owned_args);
+        allocator.free(self.argv);
+        self.* = undefined;
+    }
+};
+
+fn prepareCommandArgv(allocator: std.mem.Allocator, command_argv: []const []const u8) !PreparedCommand {
+    if (command_argv.len == 0) return error.InvalidCommandArgv;
+    var owned_args = try allocator.alloc([:0]u8, command_argv.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned_args[0..initialized]) |arg| allocator.free(arg);
+        allocator.free(owned_args);
+    }
+
+    var argv = try allocator.allocSentinel(?[*:0]const u8, command_argv.len, null);
+    errdefer allocator.free(argv);
+
+    for (command_argv, 0..) |arg, i| {
+        if (arg.len == 0) return error.InvalidCommandArgv;
+        owned_args[i] = try allocator.dupeZ(u8, arg);
+        initialized += 1;
+        argv[i] = owned_args[i].ptr;
+    }
+    return .{ .argv = argv, .owned_args = owned_args };
 }
 
 fn loginShellArg0(allocator: std.mem.Allocator, shell_path: []const u8) ![:0]u8 {

@@ -59,20 +59,22 @@ fn runMain() !void {
         return client.run(allocator, args);
     }
 
-    return ssh_client.run(allocator, args);
+    return ssh_client.runMux(allocator, args);
 }
 
 fn usage(code: u8) !void {
     const text =
         \\usage:
-        \\  sessh [ssh-options] HOST [sessh-options]
-        \\  sessh --attach ID
+        \\  sessh [sessh-options] [ssh-options] HOST [-- cmd arg...]
+        \\  sesshmux new [options] [--ssh-options "ssh args"] HOST [-- cmd arg...]
+        \\  sesshmux attach [options] ID
+        \\  sesshmux attach [options] HOST ID
+        \\  sesshmux attach --host HOST [ID]
+        \\  sesshmux list [--ssh-options "ssh args"] HOST
+        \\  sesshmux kill [--ssh-options "ssh args"] HOST ID
+        \\  sesshmux kill-all [--ssh-options "ssh args"] HOST
         \\
         \\sessh-specific options:
-        \\  --attach [ID]
-        \\  --list
-        \\  --kill ID
-        \\  --kill-all | --killall
         \\  --alias NAME
         \\  --state-dir DIR
         \\  --leader CTRL-KEY|None
@@ -82,6 +84,9 @@ fn usage(code: u8) !void {
         \\  --capture-tty-transcript PATH.tar.gz
         \\  --bootstrap | --no-bootstrap
         \\  --force-compat
+        \\
+        \\sesshmux-specific options:
+        \\  --ssh-options "SSH_ARGS"
         \\
     ;
     try io.writeAll(if (code == 0) 1 else 2, text);

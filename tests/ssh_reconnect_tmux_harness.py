@@ -230,7 +230,11 @@ def main():
             f"export PATH={shlex.quote(child_env['PATH'])}\n"
             f"export SHELL={shlex.quote(str(remote_shell))}\n"
             "export SESSH_FAKE_SSH_DELAY_ON_BATCH=1\n"
-            f"exec {shlex.quote(str(BIN))} test-host --leader CTRL-A --scrollback-limit 321 \"$@\"\n"
+            "if [ \"${1-}\" = attach ]; then\n"
+            "  shift\n"
+            f"  exec {shlex.quote(str(BIN))} attach --leader CTRL-A --scrollback-limit 321 --host test-host \"$@\"\n"
+            "fi\n"
+            f"exec {shlex.quote(str(BIN))} new --leader CTRL-A --scrollback-limit 321 test-host \"$@\"\n"
         )
         sessh_wrapper.chmod(sessh_wrapper.stat().st_mode | stat.S_IXUSR)
 
@@ -346,7 +350,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "C-a", "d"])
             time.sleep(0.5)
             idle_after = capture(env, idle_detach_session)
-            if "sessh: detached" not in idle_after or "sessh --leader CTRL-A --scrollback-limit 321 --attach" not in idle_after:
+            if "sessh: detached" not in idle_after or "sesshmux attach" not in idle_after:
                 raise AssertionError(f"detach did not print a reattach banner:\n{idle_after}")
             if f"REMOTE_PROMPT$ {PROMPT}" in idle_after or f"REMOTE_PROMPT${PROMPT}" in idle_after:
                 raise AssertionError(f"detach drew the outer prompt at the inner cursor:\n{idle_after}")
@@ -357,7 +361,7 @@ def main():
             run(env, [*TMUX_ARGS, "set-window-option", "-t", detach_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
             wait_capture(env, detach_session, PROMPT)
-            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, f"{sessh_cmd} --attach", "Enter"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, f"{sessh_cmd} attach", "Enter"])
             wait_capture(env, detach_session, "REMOTE_PROMPT$")
             run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, "spam", "Enter"])
             wait_capture(env, detach_session, "REMOTE_SPAM_")

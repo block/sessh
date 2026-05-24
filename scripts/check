@@ -71,7 +71,7 @@ run_isolated() {
   printf '\n==> %s\n' "$*"
   HOME=$SESSH_CHECK_HOME \
     HISTFILE=/dev/null \
-    SESSH_BIN=zig-out/bin/sessh-dev \
+    SESSH_BIN=zig-out/bin/sesshmux-dev \
     XDG_RUNTIME_DIR=$SESSH_CHECK_XDG_RUNTIME_DIR \
     XDG_CACHE_HOME=$SESSH_CHECK_XDG_CACHE_HOME \
     XDG_CONFIG_HOME=$SESSH_CHECK_XDG_CONFIG_HOME \

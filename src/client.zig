@@ -1708,6 +1708,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             options.scrollback_row_count,
             generated_guid.?,
             generated_alias.?,
+            &.{},
         ),
         .attach => startAttachSessionOnRuntime(
             child.stdout.?.handle,
@@ -2020,11 +2021,12 @@ pub fn startNewSessionOnRuntime(
     scrollback_row_count: u32,
     session_guid: []const u8,
     session_alias: []const u8,
+    command_argv: []const []const u8,
 ) !RuntimeSession {
     const viewport_offset = queryInitialViewportOffset();
     try runtimeHandshake(read_fd, write_fd);
     const size = terminal.currentWindowSize();
-    var created = try sendSessionCreateAndReadCreated(read_fd, write_fd, size, scrollback_row_count, session_guid, session_alias);
+    var created = try sendSessionCreateAndReadCreated(read_fd, write_fd, size, scrollback_row_count, session_guid, session_alias, command_argv);
     defer created.deinit(app_allocator.allocator());
     const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid);
     var session = try readRuntimeSession(read_fd);
@@ -2255,48 +2257,28 @@ pub fn pollRuntimeRecovery(
 
 pub fn writeDetachBannerForTarget(ssh_options: []const []const u8, target: []const u8, sessh_options: []const []const u8, session_id: []const u8) void {
     if (c.isatty(1) == 0) return;
-    writeDetachBannerForTargetInner(ssh_options, target, sessh_options, session_id) catch {};
+    _ = ssh_options;
+    _ = target;
+    _ = sessh_options;
+    writeDetachBannerForSessionRefInner(session_id) catch {};
 }
 
 pub fn writeDetachBannerForSessionRef(sessh_options: []const []const u8, session_ref: []const u8) void {
     if (c.isatty(1) == 0) return;
-    writeDetachBannerForSessionRefInner(sessh_options, session_ref) catch {};
+    _ = sessh_options;
+    writeDetachBannerForSessionRefInner(session_ref) catch {};
 }
 
-fn writeDetachBannerForSessionRefInner(sessh_options: []const []const u8, session_ref: []const u8) !void {
-    try io_helpers.writeAll(1, "--- sessh: detached. To re-attach: `");
-    try writeShellArg(1, "sessh");
-    for (sessh_options) |arg| {
-        try io_helpers.writeAll(1, " ");
-        try writeShellArg(1, arg);
-    }
-    try io_helpers.writeAll(1, " --attach");
+fn writeDetachBannerForSessionRefInner(session_ref: []const u8) !void {
+    try io_helpers.writeAll(1, "--- sessh: detached. Re-attach with: ");
+    try writeShellArg(1, "sesshmux");
+    try io_helpers.writeAll(1, " ");
+    try writeShellArg(1, "attach");
     if (session_ref.len > 0) {
         try io_helpers.writeAll(1, " ");
         try writeShellArg(1, session_ref);
     }
-    try io_helpers.writeAll(1, "` ---\r\n");
-}
-
-fn writeDetachBannerForTargetInner(ssh_options: []const []const u8, target: []const u8, sessh_options: []const []const u8, session_id: []const u8) !void {
-    try io_helpers.writeAll(1, "--- sessh: detached. To re-attach: `");
-    try writeShellArg(1, "sessh");
-    for (ssh_options) |arg| {
-        try io_helpers.writeAll(1, " ");
-        try writeShellArg(1, arg);
-    }
-    try io_helpers.writeAll(1, " ");
-    try writeShellArg(1, target);
-    for (sessh_options) |arg| {
-        try io_helpers.writeAll(1, " ");
-        try writeShellArg(1, arg);
-    }
-    try io_helpers.writeAll(1, " --attach");
-    if (session_id.len > 0) {
-        try io_helpers.writeAll(1, " ");
-        try writeShellArg(1, session_id);
-    }
-    try io_helpers.writeAll(1, "` ---\r\n");
+    try io_helpers.writeAll(1, " ---\r\n");
 }
 
 fn writeShellArg(fd: c.fd_t, arg: []const u8) !void {
@@ -2561,8 +2543,9 @@ fn sendSessionCreateAndReadCreated(
     scrollback_row_count: u32,
     session_guid: []const u8,
     session_alias: []const u8,
+    command_argv: []const []const u8,
 ) !CreatedSession {
-    try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid, session_alias);
+    try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid, session_alias, command_argv);
     return readSessionCreated(read_fd);
 }
 
@@ -2572,6 +2555,7 @@ fn sendSessionCreate(
     scrollback_row_count: u32,
     session_guid: []const u8,
     session_alias: []const u8,
+    command_argv: []const []const u8,
 ) !void {
     var message = pb.SessionCreate{
         .terminal_size = .{
@@ -2583,6 +2567,8 @@ fn sendSessionCreate(
         .session_alias = session_alias,
     };
     defer message.environment.deinit(app_allocator.allocator());
+    defer message.command_argv.deinit(app_allocator.allocator());
+    try message.command_argv.appendSlice(app_allocator.allocator(), command_argv);
     const default_colors = queryDefaultColorsForSession();
     message.query_default_colors = .{
         .foreground_color = default_colors.foreground_color,

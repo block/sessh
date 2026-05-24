@@ -85,6 +85,9 @@ message SessionCreate {
   // Alias to register for this session in the session agent's namespace. Empty
   // asks the receiver to generate a remote alias.
   string session_alias = 6;
+  // Optional argv to exec inside the PTY. Empty starts the user's interactive
+  // login shell.
+  repeated string command_argv = 7;
 }
 
 // Framed payload, client -> session agent.

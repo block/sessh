@@ -480,11 +480,11 @@ def canonical_local_platform():
 
 def local_artifact():
     os_name, arch = canonical_local_platform()
-    return ROOT / "zig-out" / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+    return ROOT / "zig-out" / "libexec" / "sessh" / f"sesshmux-{os_name}-{arch}"
 
 
 def remote_path_artifact():
-    if BIN.name == "sessh-dev":
+    if BIN.name == "sesshmux-dev":
         return BIN if BIN.is_absolute() else ROOT / BIN
     return local_artifact()
 
@@ -955,7 +955,7 @@ def test_ssh_unsupported_option_does_not_fallback_for_sessh_action(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
 
-    result = run_sessh(["-tt", "test-host", "--attach", "s1"], env, timeout=5.0)
+    result = run_sessh(["attach", "-tt", "test-host", "s1"], env, timeout=5.0)
 
     if result.returncode != 64:
         raise AssertionError(result)
@@ -996,7 +996,7 @@ def test_ssh_bootstrap_overrides_config_false_and_uploads(tmp):
         raise AssertionError("bootstrap flag did not upload artifact")
 
 
-def test_ssh_no_bootstrap_uses_remote_path_sessh(tmp):
+def test_ssh_no_bootstrap_uses_remote_path_sesshmux(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1008,12 +1008,12 @@ def test_ssh_no_bootstrap_uses_remote_path_sessh(tmp):
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "sessh.env").write_text("bootstrap=true\n")
     write_fake_ssh(fake_bin / "ssh")
-    (fake_bin / "sessh").write_text(
+    (fake_bin / "sesshmux").write_text(
         "#!/bin/sh\n"
         "printf 'direct_broker=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
         f"exec {shlex.quote(str(BIN))} \"$@\"\n"
     )
-    (fake_bin / "sessh").chmod(0o700)
+    (fake_bin / "sesshmux").chmod(0o700)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
@@ -1032,7 +1032,7 @@ def test_ssh_no_bootstrap_uses_remote_path_sessh(tmp):
     assert_cached_artifact(env, remote_path_artifact(), "--no-bootstrap")
 
 
-def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
+def test_ssh_bootstrap_false_config_uses_remote_path_sesshmux(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1044,12 +1044,12 @@ def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "sessh.env").write_text("bootstrap=false\n")
     write_fake_ssh(fake_bin / "ssh")
-    (fake_bin / "sessh").write_text(
+    (fake_bin / "sesshmux").write_text(
         "#!/bin/sh\n"
         "printf 'direct_broker=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
         f"exec {shlex.quote(str(BIN))} \"$@\"\n"
     )
-    (fake_bin / "sessh").chmod(0o700)
+    (fake_bin / "sesshmux").chmod(0o700)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
@@ -1066,26 +1066,6 @@ def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
     if "bootstrapper=1" in log_text:
         raise AssertionError(log_text)
     assert_cached_artifact(env, remote_path_artifact(), "bootstrap=false")
-
-
-def test_ssh_attach_option_is_sessh_option_after_host(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-
-    result = run_sessh(["test-host", "--attach"], env, timeout=30.0)
-
-    if not fake_log.exists():
-        raise AssertionError(f"fake ssh was not invoked: {result}")
-    if result.returncode != 1:
-        raise AssertionError(result)
-    if "ERROR no sessions" not in result.stderr:
-        raise AssertionError(result)
-    if "remote commands are not supported yet" in result.stderr:
-        raise AssertionError(result.stderr)
 
 
 def test_ssh_attach_without_id_reattaches_latest_session(tmp):
@@ -1105,7 +1085,7 @@ def test_ssh_attach_without_id_reattaches_latest_session(tmp):
     if first.returncode != 0:
         raise AssertionError(first)
 
-    attached = run_sessh_until_stdout(["test-host", "--attach"], env, marker)
+    attached = run_sessh_until_stdout(["attach", "--host", "test-host"], env, marker)
 
     if attached.returncode != 0:
         raise AssertionError(attached)
@@ -1134,7 +1114,7 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
     if "ID=unset GUID=" not in first.stdout:
         raise AssertionError(first)
 
-    attached = run_sessh_until_stdout(["--attach", "route-alias"], env, marker)
+    attached = run_sessh_until_stdout(["attach", "route-alias"], env, marker)
     if attached.returncode != 0:
         raise AssertionError(attached)
     if marker not in attached.stdout:
@@ -1161,7 +1141,7 @@ def test_ssh_remote_default_alias_is_remote_generated(tmp):
     if first.returncode != 0:
         raise AssertionError(first)
 
-    listed = run_sessh(["test-host", "--list"], env, timeout=30.0)
+    listed = run_sessh(["list", "test-host"], env, timeout=30.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
     rows = [line.split("\t") for line in listed.stdout.splitlines()[1:] if line]
@@ -1170,7 +1150,7 @@ def test_ssh_remote_default_alias_is_remote_generated(tmp):
     if len(remote_aliases) != 1:
         raise AssertionError(listed.stdout)
 
-    attached = run_sessh_until_stdout(["test-host", "--attach", remote_aliases[0]], env, marker)
+    attached = run_sessh_until_stdout(["attach", "test-host", remote_aliases[0]], env, marker)
     if attached.returncode != 0:
         raise AssertionError(attached)
 
@@ -1184,7 +1164,7 @@ def test_ssh_host_attach_does_not_follow_remote_route(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     write_ssh_route(env, "remote-hop", guid_for_alias("remote-hop"), "other-host")
 
-    result = run_sessh(["test-host", "--attach", "remote-hop"], env, timeout=30.0)
+    result = run_sessh(["attach", "test-host", "remote-hop"], env, timeout=30.0)
 
     if result.returncode == 0:
         raise AssertionError(result)
@@ -1640,7 +1620,7 @@ def test_ssh_unsupported_remote_platform_does_not_plain_ssh_fallback_for_attach(
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
     env["SESSH_FAKE_SSH_REMOTE_PATH"] = str(remote_bin)
 
-    result = run_sessh(["test-host", "--attach", guid_for_alias("s1")], env, timeout=30.0)
+    result = run_sessh(["attach", "test-host", guid_for_alias("s1")], env, timeout=30.0)
 
     if result.returncode == 0:
         raise AssertionError(result)
@@ -1671,25 +1651,25 @@ def test_ssh_remote_session_commands_use_broker(tmp):
 
     assert_session_compat_points_to_cached_artifact(env, remote_path_artifact(), "s1", "remote session command")
 
-    listed = run_sessh(["test-host", "--list"], env, timeout=30.0)
+    listed = run_sessh(["list", "test-host"], env, timeout=30.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
     if "ID\tATTACHED\tAGENT_PID" not in listed.stdout or "s1\tno\t" not in listed.stdout:
         raise AssertionError(listed)
 
-    killed = run_sessh(["test-host", "--kill", "s1"], env, timeout=30.0)
+    killed = run_sessh(["kill", "test-host", "s1"], env, timeout=30.0)
     if killed.returncode != 0:
         raise AssertionError(killed)
     if not killed.stdout.startswith("ENDED "):
         raise AssertionError(killed)
 
-    listed = run_sessh(["test-host", "--list"], env, timeout=30.0)
+    listed = run_sessh(["list", "test-host"], env, timeout=30.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
     if "s1" in listed.stdout:
         raise AssertionError(listed)
 
-    stopped = run_sessh(["test-host", "--kill-all"], env, timeout=30.0)
+    stopped = run_sessh(["kill-all", "test-host"], env, timeout=30.0)
     if stopped.returncode != 0:
         raise AssertionError(stopped)
     if "KILLING_ALL" not in stopped.stdout:
@@ -1704,7 +1684,7 @@ def test_ssh_remote_kill_all_does_not_start_agent(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    stopped = run_sessh(["test-host", "--kill-all"], env, timeout=30.0)
+    stopped = run_sessh(["kill-all", "test-host"], env, timeout=30.0)
 
     if stopped.returncode != 0:
         raise AssertionError(stopped)
@@ -1727,7 +1707,7 @@ def test_ssh_version_mismatch_uses_compat_path(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
     try:
-        result = run_sessh(["test-host", "--attach", "--leader", "CTRL-B"], env, timeout=30.0)
+        result = run_sessh(["attach", "--host", "test-host", "--leader", "CTRL-B"], env, timeout=30.0)
     finally:
         server.close()
         thread.join(timeout=5.0)
@@ -1772,7 +1752,7 @@ def test_ssh_force_compat_uses_compat_path(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    result = run_sessh(["test-host", "--force-compat", "--attach", "s1", "--leader", "CTRL-B"], env, timeout=30.0)
+    result = run_sessh(["attach", "--force-compat", "--host", "test-host", "s1", "--leader", "CTRL-B"], env, timeout=30.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -1856,16 +1836,12 @@ def main():
             test_ssh_bootstrap_overrides_config_false_and_uploads,
         ),
         (
-            "ssh no-bootstrap uses remote path sessh",
-            test_ssh_no_bootstrap_uses_remote_path_sessh,
+            "ssh no-bootstrap uses remote path sesshmux",
+            test_ssh_no_bootstrap_uses_remote_path_sesshmux,
         ),
         (
-            "ssh bootstrap false config uses remote path sessh",
-            test_ssh_bootstrap_false_config_uses_remote_path_sessh,
-        ),
-        (
-            "ssh attach is parsed as sessh option after host",
-            test_ssh_attach_option_is_sessh_option_after_host,
+            "ssh bootstrap false config uses remote path sesshmux",
+            test_ssh_bootstrap_false_config_uses_remote_path_sesshmux,
         ),
         (
             "ssh attach without id reattaches latest session",

@@ -381,6 +381,7 @@ pub const SessionCreate = struct {
     query_default_colors: ?DefaultColors = null,
     session_guid: []const u8 = &.{},
     session_alias: []const u8 = &.{},
+    command_argv: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub const _desc_table = .{
         .terminal_size = fd(1, .submessage),
@@ -389,6 +390,7 @@ pub const SessionCreate = struct {
         .query_default_colors = fd(4, .submessage),
         .session_guid = fd(5, .{ .scalar = .string }),
         .session_alias = fd(6, .{ .scalar = .string }),
+        .command_argv = fd(7, .{ .repeated = .{ .scalar = .string } }),
     };
 
     /// Encodes the message to the writer
