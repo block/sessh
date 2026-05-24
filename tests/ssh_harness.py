@@ -348,6 +348,22 @@ def run_sessh_reconnect_probe(
     )
 
 
+OSC_RE = re.compile(r"\x1b\][^\x1b]*(?:\x1b\\|\x07)")
+CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+UI_MESSAGE_RE = re.compile(r"(?:---\s*)?(?:ssh|sessh): [^\r\n]+")
+
+
+def normalized_ui_messages(text):
+    stripped = OSC_RE.sub("", text)
+    stripped = CSI_RE.sub("", stripped)
+    messages = []
+    for match in UI_MESSAGE_RE.finditer(stripped):
+        message = re.sub(r"\s+", " ", match.group(0).strip())
+        if message not in messages:
+            messages.append(message)
+    return messages
+
+
 def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, timeout=30.0):
     proc = subprocess.Popen(
         [str(BIN), *args],
@@ -1268,15 +1284,17 @@ def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
         raise AssertionError(result)
     if raw_ssh_error in result.stdout:
         raise AssertionError(result)
-    if "ssh: blox: error:" in result.stdout:
-        raise AssertionError(result)
-    for line in (
+    expected_messages = [
+        "--- sessh: disconnected. Retry in 5sec. SPACE retries now. CTRL-C aborts ---",
+        "--- sessh: reconnecting... CTRL-C aborts ---",
         "ssh: Connection to test-host closed by remote host.",
         "ssh: client_loop: send disconnect: Broken pipe",
         "ssh: control sequence: ?[31mred",
-    ):
-        if line not in result.stdout:
-            raise AssertionError(result)
+        "--- sessh: reconnected. SPACE to dismiss or wait 500ms ---",
+    ]
+    actual_messages = normalized_ui_messages(result.stdout)
+    if actual_messages != expected_messages:
+        raise AssertionError(f"expected UI messages {expected_messages!r}, got {actual_messages!r}\n{result}")
     if "\x1b[31mred" in result.stdout:
         raise AssertionError(result)
     if "ssh stderr:" in result.stdout or "sessh: log" in result.stdout or "level=warn" in result.stdout:

@@ -529,7 +529,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                         session.idSlice(),
                         err,
                     });
-                    client_log.userDiagnostic("reconnect failed: parallel: {t}", .{err});
+                    client_log.userDiagnosticInfo("reconnect failed: parallel: {t}", .{err});
                     child.terminate();
                 },
             }
@@ -586,7 +586,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                         reconnect_attempt,
                         err,
                     });
-                    client_log.userDiagnostic("reconnect failed: transport: {t}", .{err});
+                    client_log.userDiagnosticInfo("reconnect failed: transport: {t}", .{err});
                     reconnect_attempt += 1;
                     continue;
                 },
@@ -610,7 +610,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                             reconnect_attempt,
                             err,
                         });
-                        client_log.userDiagnostic("reconnect failed: attach: {t}", .{err});
+                        client_log.userDiagnosticInfo("reconnect failed: attach: {t}", .{err});
                         reconnect_attempt += 1;
                         continue;
                     },

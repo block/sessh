@@ -41,6 +41,7 @@ pub const DiagnosticTag = enum(u8) {
 const UserDiagnostic = struct {
     seq: u64,
     ts_ms: u64,
+    level: Level,
     tag: DiagnosticTag,
     bytes: [max_entry_bytes]u8,
     len: usize,
@@ -49,6 +50,7 @@ const UserDiagnostic = struct {
 pub const UserDiagnosticLine = struct {
     seq: u64 = 0,
     ts_ms: u64 = 0,
+    level: Level = .warn,
     tag: DiagnosticTag = .sessh,
     bytes: [max_entry_bytes]u8 = undefined,
     len: usize = 0,
@@ -137,7 +139,7 @@ pub fn appendSshStderr(bytes: []const u8, forwarded: bool) void {
         const line_end = std.mem.indexOfScalarPos(u8, bytes, line_start, '\n') orelse bytes.len;
         var line = bytes[line_start..line_end];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        appendUserDiagnosticLocked(.ssh, line);
+        appendUserDiagnosticLocked(.warn, .ssh, line);
         line_start = if (line_end < bytes.len) line_end + 1 else line_end;
     }
 }
@@ -150,12 +152,20 @@ pub fn flush(fd: c.fd_t) void {
 }
 
 pub fn userDiagnostic(comptime fmt: []const u8, args: anytype) void {
+    userDiagnosticLevel(.warn, fmt, args);
+}
+
+pub fn userDiagnosticInfo(comptime fmt: []const u8, args: anytype) void {
+    userDiagnosticLevel(.info, fmt, args);
+}
+
+fn userDiagnosticLevel(level: Level, comptime fmt: []const u8, args: anytype) void {
     var body_buf: [max_entry_bytes]u8 = undefined;
     const body = std.fmt.bufPrint(&body_buf, fmt, args) catch return;
 
     mutex.lock();
     defer mutex.unlock();
-    appendUserDiagnosticLocked(.sessh, body);
+    appendUserDiagnosticLocked(level, .sessh, body);
 }
 
 pub fn currentUserDiagnosticSeq() u64 {
@@ -180,8 +190,6 @@ pub fn copyUserDiagnosticsSince(since_seq: u64, out: []UserDiagnosticLine) u64 {
     mutex.lock();
     defer mutex.unlock();
 
-    if (!shouldDisplay(.warn)) return next_diagnostic_seq;
-
     var count: usize = 0;
     const oldest = oldestDiagnosticIndex();
     var offset: usize = 0;
@@ -189,6 +197,7 @@ pub fn copyUserDiagnosticsSince(since_seq: u64, out: []UserDiagnosticLine) u64 {
         const idx = (oldest + offset) % max_user_diagnostics;
         const diagnostic = &diagnostics[idx];
         if (diagnostic.seq <= since_seq) continue;
+        if (!shouldDisplay(diagnostic.level)) continue;
         if (out.len == 0) continue;
         if (count == out.len) {
             var i: usize = 1;
@@ -197,6 +206,7 @@ pub fn copyUserDiagnosticsSince(since_seq: u64, out: []UserDiagnosticLine) u64 {
         }
         out[count].seq = diagnostic.seq;
         out[count].ts_ms = diagnostic.ts_ms;
+        out[count].level = diagnostic.level;
         out[count].tag = diagnostic.tag;
         @memcpy(out[count].bytes[0..diagnostic.len], diagnostic.bytes[0..diagnostic.len]);
         out[count].len = diagnostic.len;
@@ -217,13 +227,14 @@ pub fn unregisterUserDiagnosticNotifier(fd: c.fd_t) void {
     if (diagnostic_notify_fd == fd) diagnostic_notify_fd = -1;
 }
 
-fn appendUserDiagnosticLocked(tag: DiagnosticTag, message: []const u8) void {
+fn appendUserDiagnosticLocked(level: Level, tag: DiagnosticTag, message: []const u8) void {
     next_diagnostic_seq +%= 1;
     if (next_diagnostic_seq == 0) next_diagnostic_seq = 1;
 
     const idx = next_diagnostic;
     diagnostics[idx].seq = next_diagnostic_seq;
     diagnostics[idx].ts_ms = nowUnixMs();
+    diagnostics[idx].level = level;
     diagnostics[idx].tag = tag;
     diagnostics[idx].len = copySanitizedMessage(&diagnostics[idx].bytes, message);
 
@@ -323,7 +334,7 @@ fn flushUserDiagnosticsLocked(fd: c.fd_t, delayed: bool) !void {
         const idx = (oldest + offset) % max_user_diagnostics;
         const diagnostic = &diagnostics[idx];
         if (diagnostic.seq <= displayed_diagnostic_seq) continue;
-        if (shouldDisplay(.warn)) try writeUserDiagnostic(fd, diagnostic, delayed);
+        if (shouldDisplay(diagnostic.level)) try writeUserDiagnostic(fd, diagnostic, delayed);
         displayed = @max(displayed, diagnostic.seq);
     }
     displayed_diagnostic_seq = displayed;
@@ -400,4 +411,25 @@ test "user diagnostics are sanitized and limited" {
     try std.testing.expectEqualStrings("bad?[31m", lines[0].slice());
     try std.testing.expectEqualStrings("three", lines[1].slice());
     try std.testing.expectEqualStrings("four", lines[2].slice());
+}
+
+test "info user diagnostics are hidden by default" {
+    resetForTest();
+    userDiagnosticInfo("hidden reconnect failure", .{});
+
+    var hidden_lines = [_]UserDiagnosticLine{.{}} ** 1;
+    const hidden_seq = copyUserDiagnosticsSince(0, &hidden_lines);
+    try std.testing.expectEqual(@as(u64, 1), hidden_seq);
+    try std.testing.expectEqual(@as(u64, 0), hidden_lines[0].seq);
+
+    resetForTest();
+    setLevel(.info);
+    userDiagnosticInfo("visible reconnect failure", .{});
+
+    var visible_lines = [_]UserDiagnosticLine{.{}} ** 1;
+    const visible_seq = copyUserDiagnosticsSince(0, &visible_lines);
+    try std.testing.expectEqual(@as(u64, 1), visible_seq);
+    try std.testing.expectEqual(@as(u64, 1), visible_lines[0].seq);
+    try std.testing.expectEqual(Level.info, visible_lines[0].level);
+    try std.testing.expectEqualStrings("visible reconnect failure", visible_lines[0].slice());
 }
