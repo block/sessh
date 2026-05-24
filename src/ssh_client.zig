@@ -1103,7 +1103,10 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\  state_root=$HOME/.local/state/sessh
         \\fi
         \\compact_session_id() {{
-        \\  printf '%s' "$1" | tr -d '-'
+        \\  case "$1" in
+        \\    s-*|S-*) printf '%s' "${{1#??}}" | tr -d '-' ;;
+        \\    *) printf '%s' "$1" | tr -d '-' ;;
+        \\  esac
         \\}}
         \\resolve_session_ref() {{
         \\  ref=$1

@@ -5,6 +5,13 @@ const posix = std.posix;
 
 const socket_transport = @import("socket_transport.zig");
 
+pub const guid_body_len = 36;
+pub const compact_guid_len = 32;
+pub const session_guid_prefix = "s-";
+pub const client_guid_prefix = "c-";
+pub const session_guid_len = session_guid_prefix.len + guid_body_len;
+pub const client_guid_len = client_guid_prefix.len + guid_body_len;
+
 pub const SessionPaths = struct {
     dir: []u8,
     socket: []u8,
@@ -161,11 +168,11 @@ fn pathsForSessionDirInStateRoot(allocator: std.mem.Allocator, dir: []const u8, 
 }
 
 pub fn isValidSessionId(id: []const u8) bool {
-    return isValidGuid(id) or isValidCompactGuid(id);
+    return isValidSessionGuid(id) or isValidCompactGuid(id);
 }
 
-pub fn isValidGuid(guid: []const u8) bool {
-    if (guid.len != 36) return false;
+fn isValidGuidBody(guid: []const u8) bool {
+    if (guid.len != guid_body_len) return false;
     for (guid, 0..) |byte, i| {
         switch (i) {
             8, 13, 18, 23 => if (byte != '-') return false,
@@ -175,8 +182,22 @@ pub fn isValidGuid(guid: []const u8) bool {
     return true;
 }
 
+pub fn isValidSessionGuid(guid: []const u8) bool {
+    return std.mem.startsWith(u8, guid, session_guid_prefix) and
+        isValidGuidBody(guid[session_guid_prefix.len..]);
+}
+
+pub fn isValidClientGuid(guid: []const u8) bool {
+    return std.mem.startsWith(u8, guid, client_guid_prefix) and
+        isValidGuidBody(guid[client_guid_prefix.len..]);
+}
+
+pub fn isValidGuid(guid: []const u8) bool {
+    return isValidSessionGuid(guid) or isValidClientGuid(guid);
+}
+
 pub fn isValidCompactGuid(guid: []const u8) bool {
-    if (guid.len != 32) return false;
+    if (guid.len != compact_guid_len) return false;
     for (guid) |byte| {
         if (!std.ascii.isHex(byte)) return false;
     }
@@ -184,15 +205,21 @@ pub fn isValidCompactGuid(guid: []const u8) bool {
 }
 
 pub fn canonicalGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    if (isValidGuid(guid)) {
-        const out = try allocator.alloc(u8, 36);
-        for (guid, 0..) |byte, i| out[i] = std.ascii.toLower(byte);
+    if (isValidSessionGuid(guid)) {
+        const out = try allocator.alloc(u8, session_guid_len);
+        out[0] = session_guid_prefix[0];
+        out[1] = session_guid_prefix[1];
+        for (guid[session_guid_prefix.len..], 0..) |byte, i| {
+            out[session_guid_prefix.len + i] = std.ascii.toLower(byte);
+        }
         return out;
     }
     if (isValidCompactGuid(guid)) {
-        const out = try allocator.alloc(u8, 36);
+        const out = try allocator.alloc(u8, session_guid_len);
+        out[0] = session_guid_prefix[0];
+        out[1] = session_guid_prefix[1];
         var src: usize = 0;
-        for (out, 0..) |*byte, i| {
+        for (out[session_guid_prefix.len..], 0..) |*byte, i| {
             switch (i) {
                 8, 13, 18, 23 => byte.* = '-',
                 else => {
@@ -206,16 +233,27 @@ pub fn canonicalGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     return error.InvalidSessionId;
 }
 
+pub fn canonicalClientGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (!isValidClientGuid(guid)) return error.InvalidClientId;
+    const out = try allocator.alloc(u8, client_guid_len);
+    out[0] = client_guid_prefix[0];
+    out[1] = client_guid_prefix[1];
+    for (guid[client_guid_prefix.len..], 0..) |byte, i| {
+        out[client_guid_prefix.len + i] = std.ascii.toLower(byte);
+    }
+    return out;
+}
+
 pub fn compactGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidCompactGuid(guid)) {
-        const out = try allocator.alloc(u8, 32);
+        const out = try allocator.alloc(u8, compact_guid_len);
         for (guid, 0..) |byte, i| out[i] = std.ascii.toLower(byte);
         return out;
     }
-    if (!isValidGuid(guid)) return error.InvalidSessionId;
-    var out = try allocator.alloc(u8, 32);
+    if (!isValidSessionGuid(guid)) return error.InvalidSessionId;
+    var out = try allocator.alloc(u8, compact_guid_len);
     var dst: usize = 0;
-    for (guid) |byte| {
+    for (guid[session_guid_prefix.len..]) |byte| {
         if (byte == '-') continue;
         out[dst] = std.ascii.toLower(byte);
         dst += 1;
@@ -230,6 +268,22 @@ pub fn generateGuid(allocator: std.mem.Allocator) ![]u8 {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     const compact = std.fmt.bytesToHex(bytes, .lower);
     return canonicalGuid(allocator, &compact);
+}
+
+pub fn generateClientGuid(allocator: std.mem.Allocator) ![]u8 {
+    var bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const compact = std.fmt.bytesToHex(bytes, .lower);
+    const session_guid = try canonicalGuid(allocator, &compact);
+    defer allocator.free(session_guid);
+
+    const out = try allocator.alloc(u8, client_guid_len);
+    out[0] = client_guid_prefix[0];
+    out[1] = client_guid_prefix[1];
+    @memcpy(out[client_guid_prefix.len..], session_guid[session_guid_prefix.len..]);
+    return out;
 }
 
 pub fn writeMeta(paths: SessionPaths, agent_pid: c.pid_t, version: []const u8) !void {
@@ -261,10 +315,13 @@ pub fn writeSshRoute(
     host: []const u8,
     ssh_options: []const []const u8,
 ) !void {
+    const canonical = try canonicalGuid(allocator, guid);
+    defer allocator.free(canonical);
+
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     const writer = text.writer(allocator);
-    try writer.print("guid={s}\n", .{guid});
+    try writer.print("guid={s}\n", .{canonical});
     try writer.print("primary_alias={s}\n", .{primary_alias});
     try writer.print("host=", .{});
     try appendHex(&text, allocator, host);
@@ -275,9 +332,9 @@ pub fn writeSshRoute(
         try writer.print("\n", .{});
     }
 
-    const route_path = try routePathForGuid(allocator, guid);
+    const route_path = try routePathForGuid(allocator, canonical);
     defer allocator.free(route_path);
-    try ensureRouteDirForGuid(allocator, guid);
+    try ensureRouteDirForGuid(allocator, canonical);
 
     const file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
     defer file.close();
@@ -333,7 +390,7 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
         const key = line[0..eq];
         const value = line[eq + 1 ..];
         if (std.mem.eql(u8, key, "guid")) {
-            if (!isValidGuid(value)) return error.InvalidRoute;
+            if (!isValidSessionGuid(value)) return error.InvalidRoute;
             guid = value;
         } else if (std.mem.eql(u8, key, "primary_alias")) {
             if (!isValidAlias(value)) return error.InvalidRoute;
@@ -435,7 +492,7 @@ pub fn removeAliasInRoot(allocator: std.mem.Allocator, root: []const u8, alias: 
 pub fn defaultAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     const canonical = try canonicalGuid(allocator, guid);
     defer allocator.free(canonical);
-    return allocator.dupe(u8, canonical[0..8]);
+    return allocator.dupe(u8, canonical[session_guid_prefix.len .. session_guid_prefix.len + 8]);
 }
 
 pub fn createGeneratedRemoteAlias(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
@@ -525,7 +582,10 @@ pub fn isValidAlias(alias: []const u8) bool {
     if (alias.len == 0 or alias.len > 128) return false;
     if (std.mem.eql(u8, alias, ".") or std.mem.eql(u8, alias, "..")) return false;
     if (alias[0] == '-') return false;
-    if (isValidGuid(alias) or isValidCompactGuid(alias)) return false;
+    if (isValidGuidBody(alias) or
+        isValidGuid(alias) or
+        isValidCompactGuid(alias) or
+        isReservedGuidLikeAlias(alias)) return false;
     for (alias) |byte| {
         switch (byte) {
             'A'...'Z', 'a'...'z', '0'...'9', '_', '-', '.' => {},
@@ -533,6 +593,13 @@ pub fn isValidAlias(alias: []const u8) bool {
         }
     }
     return true;
+}
+
+fn isReservedGuidLikeAlias(alias: []const u8) bool {
+    if (alias.len < 3) return false;
+    if (!std.ascii.isAlphabetic(alias[0]) or alias[1] != '-') return false;
+    const body = alias[2..];
+    return isValidGuidBody(body) or isValidCompactGuid(body);
 }
 
 fn appendHex(out: *std.ArrayList(u8), allocator: std.mem.Allocator, bytes: []const u8) !void {
@@ -677,11 +744,11 @@ test "session paths use short socket components and registry side files" {
     std.fs.cwd().deleteTree(root) catch {};
     defer std.fs.cwd().deleteTree(root) catch {};
 
-    const guid = "550e8400-e29b-41d4-a716-446655440000";
+    const guid = "s-550e8400-e29b-41d4-a716-446655440000";
     var allocation = try allocateSessionDirForGuidInRoot(allocator, root, guid);
     defer allocation.deinit(allocator);
 
-    try std.testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", allocation.id);
+    try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", allocation.id);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000", allocation.paths.dir);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/s", allocation.paths.socket);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/meta", allocation.paths.meta);
@@ -691,13 +758,24 @@ test "session paths use short socket components and registry side files" {
 }
 
 test "validates session ids and aliases" {
-    try std.testing.expect(isValidSessionId("550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(isValidSessionId("s-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(isValidSessionId("550e8400e29b41d4a716446655440000"));
+    try std.testing.expect(isValidSessionGuid("s-550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(isValidClientGuid("c-550e8400-e29b-41d4-a716-446655440000"));
+    const generated_client = try generateClientGuid(std.testing.allocator);
+    defer std.testing.allocator.free(generated_client);
+    try std.testing.expect(isValidClientGuid(generated_client));
+    try std.testing.expect(!isValidSessionId("550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(!isValidSessionId("c-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(!isValidSessionId(""));
     try std.testing.expect(!isValidSessionId("s1"));
     try std.testing.expect(!isValidSessionId("550e8400-e29b-41d4-a716-44665544000z"));
     try std.testing.expect(isValidAlias("s1"));
     try std.testing.expect(isValidAlias("my-awesome-session"));
+    try std.testing.expect(!isValidAlias("s-550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(!isValidAlias("c-550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(!isValidAlias("x-550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(!isValidAlias("x-550e8400e29b41d4a716446655440000"));
     try std.testing.expect(!isValidAlias("550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(!isValidAlias("550e8400e29b41d4a716446655440000"));
     try std.testing.expect(!isValidAlias("-bad"));

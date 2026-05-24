@@ -29,8 +29,10 @@ _LAST_RESIZE = (24, 80)
 _NEXT_REPAINT_REQUEST_SEQ = 1
 _NEXT_PING_REQUEST_SEQ = 1
 _SCROLLBACK_CURSOR_LEN = 16
-_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_GUID_RE = re.compile(r"^s-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_CLIENT_GUID_RE = re.compile(r"^c-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _COMPACT_GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+_NEXT_CLIENT_GUID = 1
 
 HELLO_REQUEST = "hello_request"
 HELLO_OK = "hello_ok"
@@ -306,11 +308,17 @@ def pack_session_create(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, se
     return message.SerializeToString()
 
 
-def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_ref=""):
-    global _NEXT_REPAINT_REQUEST_SEQ
+def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_ref="", client_guid=None):
+    global _NEXT_REPAINT_REQUEST_SEQ, _NEXT_CLIENT_GUID
     pb = sessh_pb()
     message = pb.SessionAttach()
     message.session_ref = session_ref
+    if client_guid is None:
+        client_guid = client_guid_for_index(_NEXT_CLIENT_GUID)
+        _NEXT_CLIENT_GUID += 1
+    if not _CLIENT_GUID_RE.match(client_guid):
+        raise AssertionError(f"invalid client guid: {client_guid}")
+    message.client_guid = client_guid
     rows, cols = _LAST_RESIZE
     message.resize.terminal_rows = rows
     message.resize.terminal_cols = cols
@@ -547,7 +555,7 @@ def compact_guid(guid):
         return guid.lower()
     if not _GUID_RE.match(guid):
         raise AssertionError(f"invalid guid: {guid}")
-    return guid.replace("-", "").lower()
+    return guid[2:].replace("-", "").lower()
 
 
 def guid_for_ref(ref):
@@ -555,11 +563,15 @@ def guid_for_ref(ref):
         return ref.lower()
     if _COMPACT_GUID_RE.match(ref):
         compact = ref.lower()
-        return f"{compact[0:8]}-{compact[8:12]}-{compact[12:16]}-{compact[16:20]}-{compact[20:32]}"
+        return f"s-{compact[0:8]}-{compact[8:12]}-{compact[12:16]}-{compact[16:20]}-{compact[20:32]}"
     match = re.fullmatch(r"s([0-9]+)", ref)
     if not match:
         raise AssertionError(f"test alias cannot be mapped to a deterministic guid: {ref}")
-    return f"00000000-0000-4000-8000-{int(match.group(1)):012x}"
+    return f"s-00000000-0000-4000-8000-{int(match.group(1)):012x}"
+
+
+def client_guid_for_index(index):
+    return f"c-00000000-0000-4000-8000-{index:012x}"
 
 
 def ensure_alias(env, alias, guid=None):

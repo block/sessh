@@ -19,7 +19,7 @@ from test_env import isolated_env
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
-GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+GUID_RE = re.compile(r"^s-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 COMPACT_GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
@@ -517,15 +517,15 @@ def compact_guid(guid):
         return guid.lower()
     if not GUID_RE.match(guid):
         raise AssertionError(f"invalid guid: {guid}")
-    return guid.replace("-", "").lower()
+    return guid[2:].replace("-", "").lower()
 
 
 def guid_for_alias(alias):
     match = re.fullmatch(r"s([0-9]+)", alias)
     if match:
-        return f"00000000-0000-4000-8000-{int(match.group(1)):012x}"
+        return f"s-00000000-0000-4000-8000-{int(match.group(1)):012x}"
     digest = hashlib.sha256(alias.encode("utf-8")).hexdigest()
-    return f"{digest[0:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+    return f"s-{digest[0:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
 
 
 def ensure_alias(env, alias, guid=None):

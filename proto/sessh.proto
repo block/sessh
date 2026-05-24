@@ -80,7 +80,8 @@ message SessionCreate {
   repeated EnvironmentEntry environment = 3;
   // Colors the session agent may use to answer early OSC 10/11 queries.
   DefaultColors query_default_colors = 4;
-  // Canonical session GUID in normal hyphenated UUID form.
+  // Canonical session GUID in s-prefixed hyphenated UUID form, e.g.
+  // s-550e8400-e29b-41d4-a716-446655440000.
   string session_guid = 5;
   // Alias to register for this session in the session agent's namespace. Empty
   // asks the receiver to generate a remote alias.
@@ -96,12 +97,15 @@ message SessionCreate {
 // SessionAttached for the selected session, then Draw/RepaintResponse messages.
 message SessionAttach {
   Resize resize = 1;
-  // Session GUID or alias. Empty means attach the most recent session known to
-  // the selected broker.
+  // Session GUID, compact session GUID, or alias. Empty means attach the most
+  // recent session known to the selected broker.
   string session_ref = 2;
   // When true, the session agent sends raw inner PTY transcript chunks for
   // this attachment. The client still owns archive creation and storage.
   bool capture_tty_transcript = 3;
+  // Canonical client GUID in c-prefixed hyphenated UUID form. This identifies
+  // the attaching client, not the durable session.
+  string client_guid = 4;
 }
 
 // Framed payload, client -> session agent.
@@ -163,7 +167,7 @@ message PingRequest {
 //
 // Confirms that a SessionCreate created the requested session.
 message SessionCreated {
-  // Canonical session GUID in normal hyphenated UUID form.
+  // Canonical session GUID in s-prefixed hyphenated UUID form.
   string session_guid = 1;
   // Alias registered for this session in the creating namespace.
   string session_alias = 2;
@@ -173,7 +177,7 @@ message SessionCreated {
 //
 // Confirms the session selected for this connection.
 message SessionAttached {
-  // Canonical session GUID in normal hyphenated UUID form.
+  // Canonical session GUID in s-prefixed hyphenated UUID form.
   string session_guid = 1;
   // Primary alias for this session in the attaching namespace, if known.
   string session_alias = 2;

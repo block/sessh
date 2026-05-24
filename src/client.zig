@@ -400,8 +400,10 @@ const PendingRepaint = struct {
 
 /// Client-side state carried across runtime transports for one attached session.
 pub const RuntimeSession = struct {
-    guid: [36]u8 = [_]u8{0} ** 36,
+    guid: [session_registry.session_guid_len]u8 = [_]u8{0} ** session_registry.session_guid_len,
     guid_len: usize = 0,
+    client_guid: [session_registry.client_guid_len]u8 = [_]u8{0} ** session_registry.client_guid_len,
+    client_guid_len: usize = 0,
     primary_alias: [128]u8 = [_]u8{0} ** 128,
     primary_alias_len: usize = 0,
     scrollback_cursor: ScrollbackCursor = .{},
@@ -426,6 +428,26 @@ pub const RuntimeSession = struct {
 
     pub fn guidSlice(self: *const RuntimeSession) []const u8 {
         return self.guid[0..self.guid_len];
+    }
+
+    pub fn clientGuidSlice(self: *const RuntimeSession) []const u8 {
+        return self.client_guid[0..self.client_guid_len];
+    }
+
+    pub fn ensureClientGuid(self: *RuntimeSession) ![]const u8 {
+        if (self.client_guid_len == 0) {
+            const generated = try session_registry.generateClientGuid(app_allocator.allocator());
+            defer app_allocator.allocator().free(generated);
+            try self.setClientGuid(generated);
+        }
+        return self.clientGuidSlice();
+    }
+
+    pub fn setClientGuid(self: *RuntimeSession, client_guid: []const u8) !void {
+        if (!session_registry.isValidClientGuid(client_guid)) return error.InvalidClientGuid;
+        if (client_guid.len > self.client_guid.len) return error.ClientGuidTooLarge;
+        @memcpy(self.client_guid[0..client_guid.len], client_guid);
+        self.client_guid_len = client_guid.len;
     }
 
     pub fn setIdentity(self: *RuntimeSession, guid: []const u8) !void {
@@ -2029,8 +2051,11 @@ pub fn startNewSessionOnRuntime(
     const size = terminal.currentWindowSize();
     var created = try sendSessionCreateAndReadCreated(read_fd, write_fd, size, scrollback_row_count, session_guid, session_alias, command_argv);
     defer created.deinit(app_allocator.allocator());
-    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid);
+    const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
+    defer app_allocator.allocator().free(client_guid);
+    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid, client_guid);
     var session = try readRuntimeSession(read_fd);
+    try session.setClientGuid(client_guid);
     session.viewport_offset = viewport_offset orelse 0;
     session.pending_repaint.repaint_request_seq = repaint_request_seq;
     return session;
@@ -2044,8 +2069,11 @@ pub fn startAttachSessionOnRuntime(
 ) !RuntimeSession {
     const viewport_offset = queryInitialViewportOffset();
     try runtimeHandshake(read_fd, write_fd);
-    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref);
+    const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
+    defer app_allocator.allocator().free(client_guid);
+    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, client_guid);
     var session = try readRuntimeSession(read_fd);
+    try session.setClientGuid(client_guid);
     session.viewport_offset = viewport_offset orelse 0;
     session.pending_repaint.repaint_request_seq = repaint_request_seq;
     return session;
@@ -2112,7 +2140,8 @@ fn reconnectSessionOnRuntimeInner(
     wait_for_repaint: bool,
 ) !void {
     try runtimeHandshakeInner(read_fd, write_fd, cancelled);
-    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice());
+    const client_guid = try session.ensureClientGuid();
+    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice(), client_guid);
     try readSessionAttachedInner(read_fd, cancelled);
     if (wait_for_repaint) try finishReconnectRepaintInner(read_fd, session, cancelled);
 }
@@ -2590,6 +2619,7 @@ fn sendSessionAttach(
     initial_scrollback_row_count: ?u32,
     reconnect_cursor: ?*const ScrollbackCursor,
     session_ref: []const u8,
+    client_guid: []const u8,
 ) !u64 {
     const repaint_request_seq = allocateRepaintRequestSeq();
     const message = pb.SessionAttach{
@@ -2611,6 +2641,7 @@ fn sendSessionAttach(
         },
         .session_ref = session_ref,
         .capture_tty_transcript = tty_transcript.enabled(),
+        .client_guid = client_guid,
     };
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);

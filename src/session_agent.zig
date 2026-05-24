@@ -85,6 +85,8 @@ const Session = struct {
 const Attachment = struct {
     fd: c.fd_t = -1,
     session_index: usize = 0,
+    client_guid: [session_registry.client_guid_len]u8 = [_]u8{0} ** session_registry.client_guid_len,
+    client_guid_len: usize = 0,
     rows: u16 = 24,
     cols: u16 = 80,
     origin: ?TerminalOrigin = null,
@@ -537,9 +539,11 @@ const TerminalOrigin = struct {
 const AttachRequest = struct {
     resize: ResizePayload,
     session_ref: []u8,
+    client_guid: []u8,
     capture_tty_transcript: bool,
 
     fn deinit(self: *AttachRequest) void {
+        app_allocator.allocator().free(self.client_guid);
         app_allocator.allocator().free(self.session_ref);
         self.* = undefined;
     }
@@ -1183,7 +1187,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     return false;
                 };
                 updateSessionSize(&session_agent.sessions[resolved_session_index], request.resize.rows, request.resize.cols);
-                try attachSession(session_agent, resolved_session_index, fd, request.resize, request.capture_tty_transcript);
+                try attachSession(session_agent, resolved_session_index, fd, request.resize, request.client_guid, request.capture_tty_transcript);
                 return true;
             },
             else => {
@@ -1921,7 +1925,7 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
     var message = try protocol.decodePayload(pb.SessionCreate, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     const terminal_size = message.terminal_size orelse return error.MissingTerminalSize;
-    if (!session_registry.isValidGuid(message.session_guid)) return error.InvalidSessionGuid;
+    if (!session_registry.isValidSessionGuid(message.session_guid)) return error.InvalidSessionGuid;
     var environment = SessionEnvironment{};
     errdefer environment.deinit();
     var query_default_colors = vt.DefaultColors{};
@@ -2018,12 +2022,13 @@ fn readAttachRequest(payload: []const u8) !AttachRequest {
     defer message.deinit(app_allocator.allocator());
     const resize = message.resize orelse return error.MissingResize;
     if (message.session_ref.len > 0 and
-        !session_registry.isValidGuid(message.session_ref) and
-        !session_registry.isValidCompactGuid(message.session_ref) and
+        !session_registry.isValidSessionId(message.session_ref) and
         !session_registry.isValidAlias(message.session_ref)) return error.InvalidSessionRef;
+    if (!session_registry.isValidClientGuid(message.client_guid)) return error.InvalidClientGuid;
     return .{
         .resize = try resizePayloadFromMessage(resize),
         .session_ref = try app_allocator.allocator().dupe(u8, message.session_ref),
+        .client_guid = try app_allocator.allocator().dupe(u8, message.client_guid),
         .capture_tty_transcript = message.capture_tty_transcript,
     };
 }
@@ -2069,7 +2074,7 @@ fn createSession(
         );
         errdefer terminal_model.destroy();
 
-        if (!session_registry.isValidGuid(session_guid)) return error.InvalidSessionGuid;
+        if (!session_registry.isValidSessionGuid(session_guid)) return error.InvalidSessionGuid;
         const session_guid_z = try app_allocator.allocator().dupeZ(u8, session_guid);
         defer app_allocator.allocator().free(session_guid_z);
 
@@ -2209,6 +2214,7 @@ fn attachSession(
     session_index: usize,
     client_fd: c.fd_t,
     resize: ResizePayload,
+    client_guid: []const u8,
     capture_tty_transcript: bool,
 ) !void {
     const session = &session_agent.sessions[session_index];
@@ -2218,11 +2224,13 @@ fn attachSession(
         attachment.* = .{
             .fd = client_fd,
             .session_index = session_index,
+            .client_guid_len = client_guid.len,
             .rows = resize.rows,
             .cols = resize.cols,
             .active = true,
             .capture_tty_transcript = capture_tty_transcript,
         };
+        @memcpy(attachment.client_guid[0..client_guid.len], client_guid);
         attachment.presentation.setViewportOffset(resize.viewport_offset);
         errdefer {
             attachment.output.deinit(app_allocator.allocator());
@@ -2235,8 +2243,9 @@ fn attachSession(
             try sendSessionSnapshot(attachment, session);
         }
         refreshAttachedFlag(session_agent, session_index);
-        logSessionAgent(session_agent, "event=attach id={s} rows={} cols={} attachments={}", .{
+        logSessionAgent(session_agent, "event=attach id={s} client={s} rows={} cols={} attachments={}", .{
             session.idSlice(),
+            client_guid,
             resize.rows,
             resize.cols,
             attachedCount(session_agent, session_index),

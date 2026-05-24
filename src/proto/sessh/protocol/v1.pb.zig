@@ -460,11 +460,13 @@ pub const SessionAttach = struct {
     resize: ?Resize = null,
     session_ref: []const u8 = &.{},
     capture_tty_transcript: bool = false,
+    client_guid: []const u8 = &.{},
 
     pub const _desc_table = .{
         .resize = fd(1, .submessage),
         .session_ref = fd(2, .{ .scalar = .string }),
         .capture_tty_transcript = fd(3, .{ .scalar = .bool }),
+        .client_guid = fd(4, .{ .scalar = .string }),
     };
 
     /// Encodes the message to the writer

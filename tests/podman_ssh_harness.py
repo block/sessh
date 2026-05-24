@@ -197,6 +197,8 @@ def first_session_id(list_stdout):
 
 
 def compact_session_id(session_id):
+    if session_id.startswith("s-"):
+        session_id = session_id[2:]
     return session_id.replace("-", "")
 
 
