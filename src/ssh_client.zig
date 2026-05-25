@@ -777,9 +777,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         ),
         .list, .kill, .kill_all => unreachable,
     }) catch |err| {
-        child.closeStdin();
-        _ = child.wait() catch {};
         if (err == error.VersionMismatch) {
+            child.closeStdin();
+            _ = child.wait() catch {};
             if (parsed_ssh_args.capture_tty_transcript != null) {
                 try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with compat-fallback\n");
                 return process_exit.request(1);
@@ -790,6 +790,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             }
             try runRemoteCompat(allocator, parsed_ssh_args, .version_mismatch);
         }
+        waitAfterRuntimeAttachFailure(&child, "start");
         if (process_exit.is(err)) return err;
         try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
         return process_exit.request(1);
@@ -814,8 +815,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             parsed_ssh_args.leader,
             .{ .monitor_connection = true },
         ) catch |err| {
-            child.closeStdin();
-            _ = child.wait() catch {};
+            waitAfterRuntimeAttachFailure(&child, "relay");
             if (process_exit.is(err)) return err;
             try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
             return process_exit.request(1);
@@ -1014,6 +1014,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             break;
         }
     }
+}
+
+fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) void {
+    child.closeStdin();
+    const term = child.wait() catch |err| {
+        client_log.flush(2);
+        io.stderrPrint("sessh: ssh runtime wait failed after attach {s} failure: {t}\n", .{ stage, err }) catch {};
+        return;
+    };
+    client_log.flush(2);
+    io.stderrPrint("sessh: ssh runtime ended after attach {s} failure: {t}\n", .{ stage, term }) catch {};
 }
 
 fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, reason: CompatModeReason) !noreturn {
