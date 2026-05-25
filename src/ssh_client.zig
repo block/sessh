@@ -850,7 +850,19 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             .transport_closed => {
                 client_log.debug("event=disconnect reason=transport_closed host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.closeStdin();
-                _ = child.wait() catch {};
+                const term: ?std.process.Child.Term = child.wait() catch |err| blk: {
+                    client_log.debug("event=transport_closed_wait_failed host={s} session={s} error={t}", .{ parsed_ssh_args.host, session.idSlice(), err });
+                    break :blk null;
+                };
+                if (term) |value| {
+                    if (transportClosedCleanly(value)) {
+                        client_log.debug("event=transport_closed_clean host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
+                        client_log.flush(2);
+                        try tty_transcript.finishActiveOrReport();
+                        return;
+                    }
+                    client_log.debug("event=transport_closed_ssh_exit host={s} session={s} term={t}", .{ parsed_ssh_args.host, session.idSlice(), value });
+                }
             },
         }
 
@@ -1025,6 +1037,13 @@ fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) v
     };
     client_log.flush(2);
     io.stderrPrint("sessh: ssh runtime ended after attach {s} failure: {t}\n", .{ stage, term }) catch {};
+}
+
+fn transportClosedCleanly(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, reason: CompatModeReason) !noreturn {
@@ -3334,6 +3353,12 @@ test "reconnectDelayMs follows the documented backoff schedule" {
     try std.testing.expectEqual(@as(u64, 240_000), reconnectDelayMs(5));
     try std.testing.expectEqual(@as(u64, 600_000), reconnectDelayMs(6));
     try std.testing.expectEqual(@as(u64, 600_000), reconnectDelayMs(7));
+}
+
+test "transportClosedCleanly requires zero exit" {
+    try std.testing.expect(transportClosedCleanly(.{ .Exited = 0 }));
+    try std.testing.expect(!transportClosedCleanly(.{ .Exited = 255 }));
+    try std.testing.expect(!transportClosedCleanly(.{ .Signal = 15 }));
 }
 
 test "parseSshArgs rejects remote commands for now" {

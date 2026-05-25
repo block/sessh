@@ -1483,6 +1483,82 @@ test "connection monitor treats any inbound frame as ping response progress" {
     try std.testing.expect(monitor.pending_ping_request_seq != null);
 }
 
+test "relay drains pending session end before monitor ping" {
+    const input = try posix.pipe();
+    defer posix.close(input[0]);
+    defer posix.close(input[1]);
+    const remote_to_client = try posix.pipe();
+    defer posix.close(remote_to_client[0]);
+    defer posix.close(remote_to_client[1]);
+
+    const draw = try protocol.encodePayload(app_allocator.allocator(), pb.Draw{
+        .scrollback_cursor = "cursor-v1",
+    });
+    defer app_allocator.allocator().free(draw);
+    try protocol.sendFrame(remote_to_client[1], .draw, draw);
+
+    const session_ended = try protocol.encodePayload(app_allocator.allocator(), pb.SessionEnded{
+        .reason = .SESSION_END_REASON_PROCESS_EXITED,
+    });
+    defer app_allocator.allocator().free(session_ended);
+    try protocol.sendFrame(remote_to_client[1], .session_ended, session_ended);
+
+    var presentation_guard = client_renderer.PresentationGuard.init(1);
+    var scrollback_cursor = ScrollbackCursor{};
+    var viewport_offset: i32 = 0;
+    var pending_repaint = PendingRepaint{};
+    var relay_end_restore = std.ArrayList(u8).empty;
+    defer relay_end_restore.deinit(app_allocator.allocator());
+
+    try std.testing.expectEqual(
+        RelayEnd.session_ended,
+        try relayTerminal(
+            input[0],
+            remote_to_client[0],
+            @as(c.fd_t, -1),
+            .none,
+            &presentation_guard,
+            &scrollback_cursor,
+            &viewport_offset,
+            &pending_repaint,
+            &relay_end_restore,
+            .{ .monitor_connection = true },
+        ),
+    );
+}
+
+test "relay treats monitor ping write failure as transport closed" {
+    const input = try posix.pipe();
+    defer posix.close(input[0]);
+    defer posix.close(input[1]);
+    const remote_to_client = try posix.pipe();
+    defer posix.close(remote_to_client[0]);
+    defer posix.close(remote_to_client[1]);
+
+    var presentation_guard = client_renderer.PresentationGuard.init(1);
+    var scrollback_cursor = ScrollbackCursor{};
+    var viewport_offset: i32 = 0;
+    var pending_repaint = PendingRepaint{};
+    var relay_end_restore = std.ArrayList(u8).empty;
+    defer relay_end_restore.deinit(app_allocator.allocator());
+
+    try std.testing.expectEqual(
+        RelayEnd.transport_closed,
+        try relayTerminal(
+            input[0],
+            remote_to_client[0],
+            @as(c.fd_t, -1),
+            .none,
+            &presentation_guard,
+            &scrollback_cursor,
+            &viewport_offset,
+            &pending_repaint,
+            &relay_end_restore,
+            .{ .monitor_connection = true },
+        ),
+    );
+}
+
 test "cancelled reconnect frame read returns without input" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
@@ -2805,52 +2881,19 @@ fn relayTerminal(
     _ = presentation_guard;
 
     while (true) {
-        try connection_monitor.maybeSendPing(write_fd);
         _ = try posix.poll(&pollfds, connection_monitor.pollTimeoutMs());
-        try connection_monitor.maybeSendPing(write_fd);
-        maybeSendResize(write_fd, &last_size, scrollback_cursor, viewport_offset, pending_repaint);
-
-        if (connection_monitor.isUnresponsive()) {
-            return .unresponsive;
-        }
 
         if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
-            defer frame.deinit(app_allocator.allocator());
-            switch (frame.message_type) {
-                .draw => {
-                    connection_monitor.noteInboundFrame();
-                    if (!pending_repaint.active()) {
-                        try handleDrawFrame(frame.payload, relay_end_restore, scrollback_cursor, viewport_offset);
-                    }
-                },
-                .repaint_response => {
-                    connection_monitor.noteInboundFrame();
-                    _ = try handleRepaintResponseFrame(
-                        frame.payload,
-                        relay_end_restore,
-                        scrollback_cursor,
-                        viewport_offset,
-                        pending_repaint,
-                    );
-                },
-                .ping_response => try connection_monitor.handlePingResponse(frame.payload),
-                .tty_transcript_chunk => {
-                    connection_monitor.noteInboundFrame();
-                    try handleTtyTranscriptChunkFrame(frame.payload);
-                },
-                .session_ended => {
-                    connection_monitor.noteInboundFrame();
-                    return finishRelay(.session_ended, relay_end_restore);
-                },
-                .error_message => {
-                    connection_monitor.noteInboundFrame();
-                    try printErrorPayload(frame.payload);
-                    return finishRelay(.session_ended, relay_end_restore);
-                },
-                else => return error.UnexpectedFrame,
-            }
+            if (try drainRelayRuntimeFrames(
+                read_fd,
+                &connection_monitor,
+                scrollback_cursor,
+                viewport_offset,
+                pending_repaint,
+                relay_end_restore,
+            )) |end| return finishRelay(end, relay_end_restore);
         }
+
         if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             const n = c.read(input_fd, &buf, buf.len);
             if (n <= 0) return finishRelay(requestSessionDetach(read_fd, write_fd), relay_end_restore);
@@ -2858,14 +2901,165 @@ fn relayTerminal(
             const result = escape_filter.filter(buf[0..@intCast(n)], &filtered);
             if (result.bytes.len > 0) {
                 try sendInputChunks(write_fd, result.bytes);
-                try connection_monitor.afterInput(write_fd);
+                connection_monitor.afterInput(write_fd) catch |err| switch (err) {
+                    error.WriteFailed => return try finishRelayAfterRuntimeWriteFailed(
+                        read_fd,
+                        &connection_monitor,
+                        scrollback_cursor,
+                        viewport_offset,
+                        pending_repaint,
+                        relay_end_restore,
+                    ),
+                    else => return err,
+                };
             }
             if (result.end) |end| switch (end) {
                 .detach => return finishRelay(requestSessionDetach(read_fd, write_fd), relay_end_restore),
-                .repaint => sendRepaint(write_fd, "", pending_repaint) catch return .transport_closed,
+                .repaint => sendRepaint(write_fd, "", pending_repaint) catch |err| switch (err) {
+                    error.WriteFailed => return try finishRelayAfterRuntimeWriteFailed(
+                        read_fd,
+                        &connection_monitor,
+                        scrollback_cursor,
+                        viewport_offset,
+                        pending_repaint,
+                        relay_end_restore,
+                    ),
+                    else => return err,
+                },
                 .reconnect => return .reconnect,
             };
         }
+
+        maybeSendResize(write_fd, &last_size, scrollback_cursor, viewport_offset, pending_repaint) catch |err| switch (err) {
+            error.WriteFailed => return try finishRelayAfterRuntimeWriteFailed(
+                read_fd,
+                &connection_monitor,
+                scrollback_cursor,
+                viewport_offset,
+                pending_repaint,
+                relay_end_restore,
+            ),
+            else => return err,
+        };
+        connection_monitor.maybeSendPing(write_fd) catch |err| switch (err) {
+            error.WriteFailed => return try finishRelayAfterRuntimeWriteFailed(
+                read_fd,
+                &connection_monitor,
+                scrollback_cursor,
+                viewport_offset,
+                pending_repaint,
+                relay_end_restore,
+            ),
+            else => return err,
+        };
+
+        if (connection_monitor.isUnresponsive()) {
+            return .unresponsive;
+        }
+    }
+}
+
+fn drainRelayRuntimeFrames(
+    read_fd: c.fd_t,
+    connection_monitor: *ConnectionMonitor,
+    scrollback_cursor: *ScrollbackCursor,
+    viewport_offset: *i32,
+    pending_repaint: *PendingRepaint,
+    relay_end_restore: *std.ArrayList(u8),
+) !?RelayEnd {
+    while (true) {
+        var runtime_poll = [_]posix.pollfd{.{
+            .fd = read_fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        _ = try posix.poll(&runtime_poll, 0);
+        const revents = runtime_poll[0].revents;
+        if ((revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (revents & posix.POLL.IN) == 0)
+        {
+            return .transport_closed;
+        }
+        if ((revents & posix.POLL.IN) == 0) return null;
+
+        if (try handleRelayRuntimeFrame(
+            read_fd,
+            connection_monitor,
+            scrollback_cursor,
+            viewport_offset,
+            pending_repaint,
+            relay_end_restore,
+        )) |end| return end;
+    }
+}
+
+fn finishRelayAfterRuntimeWriteFailed(
+    read_fd: c.fd_t,
+    connection_monitor: *ConnectionMonitor,
+    scrollback_cursor: *ScrollbackCursor,
+    viewport_offset: *i32,
+    pending_repaint: *PendingRepaint,
+    relay_end_restore: *std.ArrayList(u8),
+) !RelayEnd {
+    if (try drainRelayRuntimeFrames(
+        read_fd,
+        connection_monitor,
+        scrollback_cursor,
+        viewport_offset,
+        pending_repaint,
+        relay_end_restore,
+    )) |end| return finishRelay(end, relay_end_restore);
+    return .transport_closed;
+}
+
+fn handleRelayRuntimeFrame(
+    read_fd: c.fd_t,
+    connection_monitor: *ConnectionMonitor,
+    scrollback_cursor: *ScrollbackCursor,
+    viewport_offset: *i32,
+    pending_repaint: *PendingRepaint,
+    relay_end_restore: *std.ArrayList(u8),
+) !?RelayEnd {
+    var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
+    defer frame.deinit(app_allocator.allocator());
+    switch (frame.message_type) {
+        .draw => {
+            connection_monitor.noteInboundFrame();
+            if (!pending_repaint.active()) {
+                try handleDrawFrame(frame.payload, relay_end_restore, scrollback_cursor, viewport_offset);
+            }
+            return null;
+        },
+        .repaint_response => {
+            connection_monitor.noteInboundFrame();
+            _ = try handleRepaintResponseFrame(
+                frame.payload,
+                relay_end_restore,
+                scrollback_cursor,
+                viewport_offset,
+                pending_repaint,
+            );
+            return null;
+        },
+        .ping_response => {
+            try connection_monitor.handlePingResponse(frame.payload);
+            return null;
+        },
+        .tty_transcript_chunk => {
+            connection_monitor.noteInboundFrame();
+            try handleTtyTranscriptChunkFrame(frame.payload);
+            return null;
+        },
+        .session_ended => {
+            connection_monitor.noteInboundFrame();
+            return .session_ended;
+        },
+        .error_message => {
+            connection_monitor.noteInboundFrame();
+            try printErrorPayload(frame.payload);
+            return .session_ended;
+        },
+        else => return error.UnexpectedFrame,
     }
 }
 
@@ -2981,14 +3175,15 @@ fn maybeSendResize(
     scrollback_cursor: *const ScrollbackCursor,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
-) void {
+) !void {
     const size = terminal.currentWindowSize();
     if (size.rows == last_size.rows and size.cols == last_size.cols) return;
     last_size.* = size;
     const resize_viewport_offset: i32 = if (viewport_offset.* == 0) 0 else -1;
     viewport_offset.* = resize_viewport_offset;
-    sendResizeWithRepaint(socket_fd, size, scrollback_cursor, resize_viewport_offset, pending_repaint) catch {
+    sendResizeWithRepaint(socket_fd, size, scrollback_cursor, resize_viewport_offset, pending_repaint) catch |err| {
         pending_repaint.clear();
+        return err;
     };
 }
 
