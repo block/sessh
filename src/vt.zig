@@ -871,8 +871,15 @@ pub const SessionTerminal = struct {
     }
 
     fn captureDisplayClearRowsForSyntheticHistory(self: *SessionTerminal, mode: DisplayClearMode) !void {
-        try self.render_state.update(self.allocator, &self.terminal);
-        const row_data = self.render_state.row_data.slice();
+        // This callback runs before Ghostty applies the screen clear. Use a
+        // temporary snapshot for the rows we copy to scrollback; advancing
+        // self.render_state here would make the later draw think the old rows
+        // were already rendered after the clear.
+        var state: RenderState = .empty;
+        defer state.deinit(self.allocator);
+        try state.update(self.allocator, &self.terminal);
+
+        const row_data = state.row_data.slice();
         const row_pins = row_data.items(.pin);
         const row_rows = row_data.items(.raw);
         const row_cells = row_data.items(.cells);
@@ -891,7 +898,7 @@ pub const SessionTerminal = struct {
         while (row_index < row_count) : (row_index += 1) {
             try self.synthetic_history_rows.append(self.allocator, .{
                 .cells = try rowCellsAlloc(self.allocator, row_cells[row_index], row_pins[row_index]),
-                .width_cols = @intCast(self.render_state.cols),
+                .width_cols = @intCast(state.cols),
                 .flags = rowFlags(row_rows[row_index]),
             });
         }

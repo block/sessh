@@ -10,7 +10,7 @@ fake-ssh harness, socket harness, tmux terminal harness, terminal conformance
 harness, and slow Podman ssh harness.
 
 Options:
-  --fast    Skip the slow terminal conformance and Podman ssh harnesses.
+  --fast    Skip the slow Podman ssh harness.
 EOF
 }
 
@@ -191,9 +191,9 @@ run_isolated python3 tests/ssh_harness.py
 run_isolated python3 tests/ssh_reconnect_tmux_harness.py
 run_isolated python3 tests/socket_harness.py
 run_isolated python3 tests/tmux_harness.py
+# Tmux-only conformance catches renderer regressions without the Podman setup.
+run_isolated python3 tests/terminal_conformance_harness.py
 if [ "$fast" -eq 0 ]; then
-  printf '\n==> Slow terminal conformance harness is about to start. Run `scripts/check --fast` to skip it.\n'
-  run_isolated python3 tests/terminal_conformance_harness.py
   printf '\n==> Slow Podman ssh harness is about to start. Run `scripts/check --fast` to skip it.\n'
   run_isolated python3 tests/podman_ssh_harness.py
 fi

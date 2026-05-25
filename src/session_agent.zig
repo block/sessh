@@ -1616,12 +1616,20 @@ fn queueScrollbackRowsAndScreenDraw(
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    var effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, align_viewport);
+    // Screen clears first copy the old visible rows into scrollback, then draw
+    // the cleared screen. After that copy, another alignment pass would only
+    // add blank rows to scrollback.
+    const align_after_scrollback = align_viewport and screen.display_clear == null;
+    var effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, align_after_scrollback);
     if (shouldClearOuterVisibleForDisplayClear(screen)) {
-        try attachment.presentation.clearOuterVisibleForScreen(renderer, screen);
         effective_align_viewport = false;
     }
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
+    if (shouldClearOuterVisibleForDisplayClear(screen)) {
+        // Full-screen clears must happen after copying the old rows. Clearing
+        // first would leave those rows nowhere to go except back on screen.
+        try attachment.presentation.clearOuterVisibleForScreen(renderer, screen);
+    }
     try attachment.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
     if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
     updateMouseOriginAfterDraw(attachment, screen);
