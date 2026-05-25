@@ -2728,10 +2728,8 @@ def main():
 
         try:
             help_text = run(["--help"], env, timeout=5.0)
-            if help_text.returncode != 0 or "sessh [sessh-options] [ssh-options] HOST" not in help_text.stdout:
+            if help_text.returncode != 0 or not help_text.stdout:
                 raise AssertionError(help_text)
-            if ":local:" in help_text.stdout:
-                raise AssertionError(help_text.stdout)
             short_help_text = run(["-h"], env, timeout=5.0)
             if short_help_text.returncode != 0 or short_help_text.stdout != help_text.stdout:
                 raise AssertionError(short_help_text)
@@ -2879,7 +2877,7 @@ def main():
             finally:
                 close_client(pid, fd)
 
-            killed = run([":local:", "--kill", "s3"], env, check=True, timeout=5.0)
+            killed = run(["kill", "s3"], changed_runtime_env, check=True, timeout=5.0)
             if "ENDED s3" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 

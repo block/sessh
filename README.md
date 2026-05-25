@@ -14,7 +14,7 @@ To get started:
 
 ```sh
 % brew install block/tap/sessh
-% sessh [ssh-options ...] destination
+% sessh [ssh-option ...] destination
 ```
 
 User-facing commands and configuration:

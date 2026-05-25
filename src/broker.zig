@@ -170,8 +170,8 @@ fn listAgents(allocator: std.mem.Allocator) !u8 {
 }
 
 fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
-    var paths = session_registry.pathsForRef(allocator, session_id) catch |err| switch (err) {
-        error.InvalidSessionId, error.FileNotFound => {
+    var paths = pathsForLocalSessionRef(allocator, session_id) catch |err| switch (err) {
+        error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
             return finishCommand(1, "", "ERROR session not found\n");
         },
         else => return err,
@@ -380,14 +380,14 @@ fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.f
         if (!std.mem.startsWith(u8, request.session_dir, "/")) return error.InvalidSessionDir;
         break :blk try session_registry.pathsForSessionDir(allocator, request.session_dir);
     } else if (request.session_ref.len > 0)
-        try pathsForAttachRef(allocator, request.session_ref)
+        try pathsForLocalSessionRef(allocator, request.session_ref)
     else
         (try mostRecentAgent(allocator)) orelse return error.NoSessions;
     defer paths.deinit(allocator);
     return socket_transport.connectSocket(paths.socket);
 }
 
-fn pathsForAttachRef(allocator: std.mem.Allocator, ref: []const u8) !session_registry.SessionPaths {
+fn pathsForLocalSessionRef(allocator: std.mem.Allocator, ref: []const u8) !session_registry.SessionPaths {
     if (!session_registry.isValidSessionId(ref) and !session_registry.isValidAlias(ref)) return error.InvalidSessionId;
     const guid = try session_registry.resolveRefToGuid(allocator, ref);
     defer allocator.free(guid);

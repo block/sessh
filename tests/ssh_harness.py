@@ -1128,6 +1128,11 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
         raise AssertionError(attached)
     if marker not in attached.stdout:
         raise AssertionError(attached)
+    killed = run_sessh(["kill", "route-alias"], changed_runtime_env, timeout=30.0)
+    if killed.returncode != 0:
+        raise AssertionError(killed)
+    if not killed.stdout.startswith("ENDED "):
+        raise AssertionError(killed)
     log_text = fake_log.read_text()
     if log_text.splitlines().count("invoked=1") < 2:
         raise AssertionError(log_text)

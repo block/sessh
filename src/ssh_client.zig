@@ -459,13 +459,27 @@ fn translateMuxKill(translated: *TranslatedMuxArgs, args: []const []const u8) !v
         return;
     }
 
-    const host = try muxHostFromOptions(host_option, positional.items, 1);
-    const id = if (host_option != null) positional.items[0] else positional.items[1];
-    try appendMany(translated, ssh_options.items);
-    try translated.append(host);
-    try translated.append("--kill");
-    try translated.append(id);
-    try appendMany(translated, sessh_options.items);
+    if (host_option) |host| {
+        if (positional.items.len != 1) return error.TooManyMuxArguments;
+        try appendMany(translated, ssh_options.items);
+        try translated.append(host);
+        try translated.append("--kill");
+        try translated.append(positional.items[0]);
+        try appendMany(translated, sessh_options.items);
+    } else if (positional.items.len == 2) {
+        try appendMany(translated, ssh_options.items);
+        try translated.append(positional.items[0]);
+        try translated.append("--kill");
+        try translated.append(positional.items[1]);
+        try appendMany(translated, sessh_options.items);
+    } else if (positional.items.len == 1) {
+        if (ssh_options.items.len > 0) return error.MissingHost;
+        try translated.append("--kill");
+        try translated.append(positional.items[0]);
+        try appendMany(translated, sessh_options.items);
+    } else {
+        return error.MissingKillId;
+    }
 }
 
 fn parseMuxCommandOptions(
@@ -604,15 +618,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var route_storage: ?session_registry.Route = null;
     defer if (route_storage) |*route| route.deinit(allocator);
 
-    var parsed_ssh_args = if (try parseRouteAttachArgs(allocator, args, &route_storage)) |parsed| parsed else parseSshArgs(args) catch |err| {
+    var parsed_ssh_args = if (try parseRouteRefArgs(allocator, args, &route_storage)) |parsed| parsed else parseSshArgs(args) catch |err| {
         if (shouldUsePlainSshFallbackForArgError(args, err)) {
             try runPlainSshFallbackForUnsupportedArgs(allocator, args, err);
         }
         try printSshArgError(err);
         return process_exit.request(64);
     };
-    if (parsed_ssh_args.action == .attach and parsed_ssh_args.host.len == 0) {
-        return runLocalRouteAttach(allocator, args);
+    if ((parsed_ssh_args.action == .attach or parsed_ssh_args.action == .kill) and parsed_ssh_args.host.len == 0) {
+        return runLocalRouteCommand(allocator, args);
     }
     applyFileConfigToSsh(allocator, &parsed_ssh_args) catch |err| {
         try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
@@ -1968,21 +1982,31 @@ fn shellQuote(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn parseRouteAttachArgs(
+fn parseRouteRefArgs(
     allocator: std.mem.Allocator,
     args: []const []const u8,
     route_storage: *?session_registry.Route,
 ) !?ParsedSshArgs {
     if (args.len < 2) return null;
-    var parsed = ParsedSshArgs{ .options = &.{}, .host = "", .action = .attach };
-    var attach_ref: ?[]const u8 = null;
+    var parsed = ParsedSshArgs{ .options = &.{}, .host = "" };
+    var action: ?SshAction = null;
+    var ref: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--attach")) {
+            if (action != null) return error.ConflictingSesshAction;
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingAttachId;
-            attach_ref = args[i];
+            action = .attach;
+            ref = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--kill")) {
+            if (action != null) return error.ConflictingSesshAction;
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingKillId;
+            action = .kill;
+            ref = args[i];
             i += 1;
         } else if (std.mem.eql(u8, arg, "--runtime-dir")) {
             i += 1;
@@ -2024,17 +2048,25 @@ fn parseRouteAttachArgs(
             return null;
         }
     }
-    const ref = attach_ref orelse return null;
-    route_storage.* = try session_registry.readRouteForRef(allocator, ref);
+    const resolved_ref = ref orelse return null;
+    const resolved_action = action.?;
+    route_storage.* = try session_registry.readRouteForRef(allocator, resolved_ref);
     const route = &route_storage.*.?;
     parsed.options = route.ssh_options;
     parsed.host = route.host;
-    parsed.attach_id = route.guid;
-    parsed.attach_session_dir = route.session_dir;
+    parsed.action = resolved_action;
+    switch (resolved_action) {
+        .attach => {
+            parsed.attach_id = route.guid;
+            parsed.attach_session_dir = route.session_dir;
+        },
+        .kill => parsed.kill_id = route.guid,
+        .new, .list, .kill_all => unreachable,
+    }
     return parsed;
 }
 
-fn runLocalRouteAttach(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runLocalRouteCommand(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const local_args = try allocator.alloc([]const u8, args.len + 1);
     defer allocator.free(local_args);
     local_args[0] = args[0];
@@ -3126,6 +3158,14 @@ test "translateMuxArgs maps local and host-qualified attach" {
 }
 
 test "translateMuxArgs maps kill and kill all" {
+    var local_kill = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "kill",
+        "s1",
+    });
+    defer local_kill.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "--kill", "s1" }, local_kill.args.items);
+
     var kill = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
         "kill",

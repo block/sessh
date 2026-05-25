@@ -65,28 +65,19 @@ fn runMain() !void {
 fn usage(code: u8) !void {
     const text =
         \\usage:
-        \\  sessh [sessh-options] [ssh-options] HOST [-- cmd arg...]
-        \\  sesshmux new [options] [--ssh-options "ssh args"] HOST [-- cmd arg...]
-        \\  sesshmux attach [options] ID
-        \\  sesshmux attach [options] HOST ID
-        \\  sesshmux attach --host HOST [ID]
-        \\  sesshmux list [--ssh-options "ssh args"] HOST
-        \\  sesshmux kill [--ssh-options "ssh args"] HOST ID
-        \\  sesshmux kill --all [--ssh-options "ssh args"] HOST
+        \\  sessh [ssh-option ...] destination [command argument ...]
         \\
-        \\sessh-specific options:
-        \\  --alias NAME
-        \\  --runtime-dir DIR
-        \\  --leader CTRL-KEY|None
-        \\  --scrollback-limit N
-        \\  --initial-scrollback N
-        \\  --log-level quiet|error|warn|info|debug|verbose
-        \\  --capture-tty-transcript PATH.tar.gz
-        \\  --bootstrap | --no-bootstrap
-        \\  --force-compat
+        \\sessh wraps ssh, making sessions persistent and automatically
+        \\reconnecting when ssh drops.
         \\
-        \\sesshmux-specific options:
-        \\  --ssh-options "SSH_ARGS"
+        \\sessh changes the meaning of `ENTER ~ .`: It detaches the local client
+        \\but leaves the session running, printing the session ID to stderr.
+        \\After detach you may run one of the following:
+        \\  sesshmux attach ID
+        \\  sesshmux kill ID
+        \\
+        \\See the user manual for advanced usage:
+        \\  https://github.com/block/sessh/blob/main/docs/USER_MANUAL.md
         \\
     ;
     try io.writeAll(if (code == 0) 1 else 2, text);
