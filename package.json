@@ -1,0 +1,16 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:termless": "npm run test:termless:smoke",
+    "test:termless:all": "npm run test:termless:smoke && npm run test:termless:conformance",
+    "test:termless:conformance": "vitest run tests/sessh_termless_conformance.test.mjs",
+    "test:termless:smoke": "vitest run tests/sessh_termless.test.mjs"
+  },
+  "devDependencies": {
+    "@termless/core": "0.6.0",
+    "@xterm/headless": "5.5.0",
+    "node-pty": "1.1.0",
+    "vitest": "4.1.7"
+  }
+}

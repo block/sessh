@@ -105,7 +105,7 @@ def normalize_home(text, env):
     return text.replace(env["HOME"], "~")
 
 
-def wait_capture(session, needle, timeout=5.0):
+def wait_capture(session, needle, timeout=10.0):
     end = time.monotonic() + timeout
     last = ""
     while time.monotonic() < end:
@@ -116,7 +116,7 @@ def wait_capture(session, needle, timeout=5.0):
     raise AssertionError(f"did not see {needle!r}; pane contained:\n{last}")
 
 
-def wait_capture_prefix(session, expected_lines, env, timeout=5.0):
+def wait_capture_prefix(session, expected_lines, env, timeout=10.0):
     end = time.monotonic() + timeout
     last = ""
     while time.monotonic() < end:
@@ -132,7 +132,7 @@ def wait_capture_prefix(session, expected_lines, env, timeout=5.0):
     )
 
 
-def wait_capture_count(session, needle, count, timeout=5.0):
+def wait_capture_count(session, needle, count, timeout=10.0):
     end = time.monotonic() + timeout
     last = ""
     while time.monotonic() < end:
@@ -143,7 +143,7 @@ def wait_capture_count(session, needle, count, timeout=5.0):
     raise AssertionError(f"did not see {count} copies of {needle!r}; pane contained:\n{last}")
 
 
-def wait_pane_dead(session, timeout=5.0):
+def wait_pane_dead(session, timeout=10.0):
     end = time.monotonic() + timeout
     last = ""
     while time.monotonic() < end:

@@ -10,3 +10,4 @@ build/
 zig-cache/
 zig-pkg/
 zig-out/
+node_modules/

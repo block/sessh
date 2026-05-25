@@ -28,14 +28,10 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 
     while (true) {
         var frame = try protocol.readFrameAlloc(allocator, 0);
-        errdefer frame.deinit(allocator);
+        defer frame.deinit(allocator);
         switch (frame.message_type) {
-            .resize => {
-                frame.deinit(allocator);
-                continue;
-            },
+            .resize => continue,
             .session_attach => {
-                defer frame.deinit(allocator);
                 const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
                     error.NoSessions => {
                         try sendError(1, "SESSION_NOT_FOUND", "no sessions", "");
@@ -56,7 +52,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                 return;
             },
             .session_create => {
-                defer frame.deinit(allocator);
                 const agent_fd = startSessionAgentAndConnect(allocator, exe, frame.payload) catch |err| switch (err) {
                     error.AliasExists => {
                         try sendError(1, "ALIAS_EXISTS", "session alias already exists", "");
@@ -73,7 +68,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                 return;
             },
             else => {
-                defer frame.deinit(allocator);
                 try sendError(1, "PROTOCOL_ERROR", "broker only supports SESSION_CREATE or SESSION_ATTACH in this mode", "");
                 return;
             },

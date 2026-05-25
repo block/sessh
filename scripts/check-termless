@@ -1,0 +1,136 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat <<'EOF'
+usage: scripts/check-termless [--full] [--no-build]
+
+Builds sesshmux-dev, ensures the Node test dependencies are installed, and
+runs the Termless smoke test. With --full, also runs the slower Termless
+conformance suite. Safe to run from inside an outer sessh session; the tests
+spawn their own PTYs and isolated sessh runtime directories.
+
+Options:
+  --full        Also run the comprehensive Termless conformance suite.
+  --no-build    Use the existing SESSH_BIN or zig-out/bin/sesshmux-dev.
+
+Environment:
+  ZIG           Zig 0.15.2 executable to use for the build.
+  SESSH_PROTOC  protobuf protoc executable to use for gen-proto.
+  SESSH_BIN     sessh/sesshmux binary to test. Defaults to zig-out/bin/sesshmux-dev.
+EOF
+}
+
+run() {
+  printf '\n==> %s\n' "$*"
+  "$@"
+}
+
+find_zig() {
+  if [ -n "${ZIG:-}" ]; then
+    printf '%s\n' "$ZIG"
+  elif [ -x /opt/homebrew/opt/zig@0.15/bin/zig ]; then
+    printf '%s\n' /opt/homebrew/opt/zig@0.15/bin/zig
+  elif [ -x /usr/local/opt/zig@0.15/bin/zig ]; then
+    printf '%s\n' /usr/local/opt/zig@0.15/bin/zig
+  elif [ -x /home/linuxbrew/.linuxbrew/opt/zig@0.15/bin/zig ]; then
+    printf '%s\n' /home/linuxbrew/.linuxbrew/opt/zig@0.15/bin/zig
+  elif command -v zig >/dev/null 2>&1; then
+    command -v zig
+  else
+    echo "missing Zig 0.15.2" >&2
+    exit 1
+  fi
+}
+
+find_protoc() {
+  if [ -n "${SESSH_PROTOC:-}" ]; then
+    printf '%s\n' "$SESSH_PROTOC"
+  elif command -v protoc-33.0.0 >/dev/null 2>&1; then
+    command -v protoc-33.0.0
+  elif [ -x /opt/homebrew/opt/protobuf/bin/protoc ]; then
+    printf '%s\n' /opt/homebrew/opt/protobuf/bin/protoc
+  elif [ -x /usr/local/opt/protobuf/bin/protoc ]; then
+    printf '%s\n' /usr/local/opt/protobuf/bin/protoc
+  elif command -v protoc >/dev/null 2>&1 && protoc --version >/dev/null 2>&1; then
+    command -v protoc
+  else
+    cat >&2 <<'EOF'
+missing protobuf protoc.
+
+Install it with:
+  brew install protobuf
+
+If your PATH has a wrapper protoc, set SESSH_PROTOC to the real protobuf binary.
+EOF
+    exit 1
+  fi
+}
+
+ensure_node_deps() {
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "missing npm" >&2
+    exit 1
+  fi
+
+  if [ ! -d node_modules/vitest ] || [ ! -d node_modules/@termless/core ] || [ ! -d node_modules/node-pty ]; then
+    if [ -f package-lock.json ]; then
+      run npm ci
+    else
+      run npm install
+    fi
+  fi
+
+  if [ -d node_modules/node-pty/prebuilds ]; then
+    find node_modules/node-pty/prebuilds -type f -name spawn-helper -exec chmod a+x {} +
+  fi
+}
+
+build=1
+full=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --full)
+      full=1
+      shift
+      ;;
+    --no-build)
+      build=0
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 64
+      ;;
+  esac
+done
+
+if [ "$build" -eq 1 ]; then
+  zig_bin=$(find_zig)
+  zig_version=$("$zig_bin" version)
+  if [ "$zig_version" != "0.15.2" ]; then
+    echo "expected Zig 0.15.2, got $zig_version from $zig_bin" >&2
+    exit 1
+  fi
+  protoc_bin=$(find_protoc)
+  run env SESSH_PROTOC="$protoc_bin" "$zig_bin" build install-dev
+fi
+
+ensure_node_deps
+
+sessh_bin=${SESSH_BIN:-zig-out/bin/sesshmux-dev}
+if [ ! -x "$sessh_bin" ]; then
+  echo "missing executable sessh test binary: $sessh_bin" >&2
+  echo "run scripts/check-termless without --no-build, or set SESSH_BIN" >&2
+  exit 1
+fi
+
+run env SESSH_BIN="$sessh_bin" npm run test:termless:smoke
+if [ "$full" -eq 1 ]; then
+  run env SESSH_BIN="$sessh_bin" npm run test:termless:conformance
+fi

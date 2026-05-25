@@ -1,0 +1,92 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat <<'EOF'
+usage: scripts/download-ghostty-deps [OUTPUT.tar.gz]
+
+Downloads the Ghostty dependency archives currently needed by the sessh build
+and packages those archives into one tar.gz file.
+
+Environment:
+  GHOSTTY_DEPS_BASE_URL  Override the source base URL.
+                         Defaults to https://deps.files.ghostty.org
+EOF
+}
+
+case "${1-}" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+esac
+
+if [ "$#" -gt 1 ]; then
+  usage >&2
+  exit 64
+fi
+
+output=${1:-ghostty-deps.tar.gz}
+base_url=${GHOSTTY_DEPS_BASE_URL:-https://deps.files.ghostty.org}
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "missing curl" >&2
+  exit 1
+fi
+
+if ! command -v tar >/dev/null 2>&1; then
+  echo "missing tar" >&2
+  exit 1
+fi
+
+tmp_parent=${TMPDIR:-/tmp}
+workdir=$(mktemp -d "$tmp_parent/ghostty-deps.XXXXXX")
+cleanup() {
+  rm -rf "$workdir"
+}
+trap cleanup EXIT HUP INT TERM
+
+cat > "$workdir/files.txt" <<'EOF'
+libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz
+vaxis-7dbb9fd3122e4ffad262dd7c151d80d863b68558.tar.gz
+z2d-0.10.0-j5P_Hu-6FgBsZNgwphIqh17jDnj8_yPtD8yzjO6PpHRQ.tar.gz
+zf-3c52637b7e937c5ae61fd679717da3e276765b23.tar.gz
+gobject-2025-11-08-23-1.tar.zst
+JetBrainsMono-2.304.tar.gz
+NerdFontsSymbolsOnly-3.4.0.tar.gz
+ghostty-themes-release-20260216-151611-fc73ce3.tgz
+DearBindings_v0.17_ImGui_v1.92.5-docking.tar.gz
+highway-66486a10623fa0d72fe91260f96c892e41aceb06.tar.gz
+freetype-1220b81f6ecfb3fd222f76cf9106fecfa6554ab07ec7fdc4124b9bb063ae2adf969d.tar.gz
+fontconfig-2.14.2.tar.gz
+harfbuzz-11.0.0.tar.xz
+oniguruma-1220c15e72eadd0d9085a8af134904d9a0f5dfcbed5f606ad60edc60ebeccd9706bb.tar.gz
+libpng-1220aa013f0c83da3fb64ea6d327f9173fa008d10e28bc9349eac3463457723b1c66.tar.gz
+utfcpp-1220d4d18426ca72fc2b7e56ce47273149815501d0d2395c2a98c726b31ba931e641.tar.gz
+libxml2-2.11.5.tar.gz
+zlib-1220fed0c74e1019b3ee29edae2051788b080cd96e90d56836eea857b0b966742efb.tar.gz
+wuffs-122037b39d577ec2db3fd7b2130e7b69ef6cc1807d68607a7c232c958315d381b5cd.tar.gz
+pixels-12207ff340169c7d40c570b4b6a97db614fe47e0d83b5801a932dcd44917424c8806.tar.gz
+spirv_cross-1220fb3b5586e8be67bc3feb34cbe749cf42a60d628d2953632c2f8141302748c8da.tar.gz
+glslang-12201278a1a05c0ce0b6eb6026c65cd3e9247aa041b1c260324bf29cee559dd23ba1.tar.gz
+EOF
+
+mkdir "$workdir/downloads"
+
+while IFS= read -r file; do
+  [ -n "$file" ] || continue
+  url=$base_url/$file
+  printf 'downloading %s\n' "$url"
+  curl --fail --location --show-error --retry 3 --retry-delay 2 \
+    --output "$workdir/downloads/$file" \
+    "$url"
+done < "$workdir/files.txt"
+
+case "$output" in
+  /*) output_abs=$output ;;
+  *) output_abs=$PWD/$output ;;
+esac
+
+mkdir -p "$(dirname "$output_abs")"
+tar -C "$workdir/downloads" -czf "$output_abs" .
+printf 'wrote %s\n' "$output_abs"

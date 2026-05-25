@@ -22,6 +22,8 @@ const Leader = terminal.Leader;
 var next_repaint_request_seq: u64 = 1;
 var next_ping_request_seq: u64 = 1;
 
+const unknown_viewport_offset: i32 = -1;
+
 const LocalAction = enum {
     new,
     attach,
@@ -2478,12 +2480,22 @@ fn readSessionCreated(read_fd: c.fd_t) !CreatedSession {
 }
 
 fn queryInitialViewportOffset() ?i32 {
-    const position = terminal.queryCursorPosition(0, 1) catch return null;
-    return if (position) |value| @intCast(value.row) else null;
+    if (c.isatty(0) == 0 or c.isatty(1) == 0) return null;
+    const position = terminal.queryCursorPosition(0, 1) catch return unknown_viewport_offset;
+    return initialViewportOffsetFromCursorPosition(position);
+}
+
+fn initialViewportOffsetFromCursorPosition(position: ?terminal.CursorPosition) ?i32 {
+    return if (position) |value| @as(i32, @intCast(value.row)) else unknown_viewport_offset;
 }
 
 fn nonZeroViewportOffset(viewport_offset: i32) ?i32 {
     return if (viewport_offset == 0) null else viewport_offset;
+}
+
+test "initial viewport offset marks missing cursor response unknown" {
+    try std.testing.expectEqual(@as(?i32, unknown_viewport_offset), initialViewportOffsetFromCursorPosition(null));
+    try std.testing.expectEqual(@as(?i32, 4), initialViewportOffsetFromCursorPosition(.{ .row = 4, .col = 12 }));
 }
 
 fn readSessionAttached(conn: c.fd_t) !void {

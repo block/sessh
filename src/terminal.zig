@@ -28,6 +28,33 @@ pub const CursorPosition = struct {
     col: u16,
 };
 
+const terminal_query_timeout_ms: i64 = 150;
+const terminal_query_poll_ms: i64 = 25;
+const terminal_probe_request =
+    "\x1b]60;?\x1b\\" ++
+    "\x1b[6n" ++
+    "\x1b]10;?\x1b\\" ++
+    "\x1b]11;?\x1b\\";
+
+pub const TerminalProbe = struct {
+    cursor_position: ?CursorPosition = null,
+    default_colors: DefaultColorQuery = .{},
+    allowed_features_answered: bool = false,
+    color_ops_allowed: ?bool = null,
+
+    fn complete(self: TerminalProbe) bool {
+        const have_cursor = self.cursor_position != null;
+        const have_colors = self.default_colors.foreground != null and self.default_colors.background != null;
+        if (have_cursor and have_colors) return true;
+        if (have_cursor and self.color_ops_allowed != null and !self.color_ops_allowed.?) return true;
+        return false;
+    }
+};
+
+var cached_probe: ?TerminalProbe = null;
+var cached_probe_input_fd: c.fd_t = -1;
+var cached_probe_output_fd: c.fd_t = -1;
+
 pub const Leader = union(enum) {
     none,
     ctrl: u8,
@@ -151,50 +178,26 @@ pub fn currentWindowSize() WindowSize {
 }
 
 pub fn queryDefaultColors(input_fd: c.fd_t, output_fd: c.fd_t) !DefaultColorQuery {
-    if (c.isatty(input_fd) == 0 or c.isatty(output_fd) == 0) return .{};
-
-    var guard = try TerminalModeGuard.enable(input_fd);
-    defer guard.restore();
-
-    try io.writeAll(output_fd, "\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
-
-    var result = DefaultColorQuery{};
-    var bytes: [512]u8 = undefined;
-    var len: usize = 0;
-    const deadline = std.time.milliTimestamp() + 150;
-    while (std.time.milliTimestamp() < deadline and (result.foreground == null or result.background == null)) {
-        const remaining = deadline - std.time.milliTimestamp();
-        if (remaining <= 0) break;
-        var pollfds = [_]posix.pollfd{.{
-            .fd = input_fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const timeout: i32 = @intCast(@min(remaining, 25));
-        const ready = try posix.poll(&pollfds, timeout);
-        if (ready == 0) continue;
-        if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) == 0) continue;
-        if (len == bytes.len) break;
-        const n = c.read(input_fd, bytes[len..].ptr, bytes.len - len);
-        if (n <= 0) break;
-        io.noteRead(input_fd, bytes[len..][0..@intCast(n)]);
-        len += @intCast(n);
-        parseDefaultColorResponses(bytes[0..len], &result);
-    }
-    return result;
+    return (try queryTerminalProbe(input_fd, output_fd)).default_colors;
 }
 
 pub fn queryCursorPosition(input_fd: c.fd_t, output_fd: c.fd_t) !?CursorPosition {
-    if (c.isatty(input_fd) == 0 or c.isatty(output_fd) == 0) return null;
+    return (try queryTerminalProbe(input_fd, output_fd)).cursor_position;
+}
+
+pub fn queryTerminalProbe(input_fd: c.fd_t, output_fd: c.fd_t) !TerminalProbe {
+    if (cached_probe != null and cached_probe_input_fd == input_fd and cached_probe_output_fd == output_fd) return cached_probe.?;
+    var probe = TerminalProbe{};
+    if (c.isatty(input_fd) == 0 or c.isatty(output_fd) == 0) return probe;
 
     var guard = try TerminalModeGuard.enable(input_fd);
     defer guard.restore();
 
-    try io.writeAll(output_fd, "\x1b[6n");
+    try io.writeAll(output_fd, terminal_probe_request);
 
-    var bytes: [64]u8 = undefined;
+    var bytes: [512]u8 = undefined;
     var len: usize = 0;
-    const deadline = std.time.milliTimestamp() + 150;
+    const deadline = std.time.milliTimestamp() + terminal_query_timeout_ms;
     while (std.time.milliTimestamp() < deadline) {
         const remaining = deadline - std.time.milliTimestamp();
         if (remaining <= 0) break;
@@ -203,19 +206,29 @@ pub fn queryCursorPosition(input_fd: c.fd_t, output_fd: c.fd_t) !?CursorPosition
             .events = posix.POLL.IN,
             .revents = 0,
         }};
-        const timeout: i32 = @intCast(@min(remaining, 25));
+        const timeout: i32 = @intCast(@min(remaining, terminal_query_poll_ms));
         const ready = try posix.poll(&pollfds, timeout);
         if (ready == 0) continue;
-        if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) == 0) continue;
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) {
+            if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) break;
+            continue;
+        }
         if (len == bytes.len) break;
-        const n = c.read(input_fd, bytes[len..].ptr, bytes.len - len);
-        if (n <= 0) break;
-        io.noteRead(input_fd, bytes[len..][0..@intCast(n)]);
-        len += @intCast(n);
-        if (parseCursorPositionResponse(bytes[0..len])) |position| return position;
+        const n = posix.read(input_fd, bytes[len..]) catch |err| switch (err) {
+            error.WouldBlock, error.InputOutput => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        io.noteRead(input_fd, bytes[len..][0..n]);
+        len += n;
+        parseTerminalProbeResponses(bytes[0..len], &probe);
+        if (probe.complete()) break;
     }
 
-    return null;
+    cached_probe = probe;
+    cached_probe_input_fd = input_fd;
+    cached_probe_output_fd = output_fd;
+    return probe;
 }
 
 pub fn setPtySize(fd: c.fd_t, rows: u16, cols: u16) bool {
@@ -292,7 +305,12 @@ fn parseCursorPositionResponse(bytes: []const u8) ?CursorPosition {
     return null;
 }
 
-fn parseDefaultColorResponses(bytes: []const u8, result: *DefaultColorQuery) void {
+fn parseTerminalProbeResponses(bytes: []const u8, probe: *TerminalProbe) void {
+    if (probe.cursor_position == null) probe.cursor_position = parseCursorPositionResponse(bytes);
+    parseOscProbeResponses(bytes, probe);
+}
+
+fn parseOscProbeResponses(bytes: []const u8, probe: *TerminalProbe) void {
     var rest = bytes;
     while (std.mem.indexOf(u8, rest, "\x1b]")) |start| {
         const content_start = start + 2;
@@ -306,16 +324,37 @@ fn parseDefaultColorResponses(bytes: []const u8, result: *DefaultColorQuery) voi
         else
             return;
 
-        const content = content_and_after[0..end];
-        if (std.mem.startsWith(u8, content, "10;")) {
-            result.foreground = parseRgbSpec(content[3..]) orelse result.foreground;
-        } else if (std.mem.startsWith(u8, content, "11;")) {
-            result.background = parseRgbSpec(content[3..]) orelse result.background;
-        }
+        parseOscProbeContent(content_and_after[0..end], probe);
 
         const terminator_len: usize = if (bel != null and bel.? == end) 1 else 2;
         rest = content_and_after[end + terminator_len ..];
     }
+}
+
+fn parseOscProbeContent(content: []const u8, probe: *TerminalProbe) void {
+    if (std.mem.startsWith(u8, content, "10;")) {
+        probe.default_colors.foreground = parseRgbSpec(content[3..]) orelse probe.default_colors.foreground;
+    } else if (std.mem.startsWith(u8, content, "11;")) {
+        probe.default_colors.background = parseRgbSpec(content[3..]) orelse probe.default_colors.background;
+    } else if (std.mem.startsWith(u8, content, "60;")) {
+        probe.allowed_features_answered = true;
+        probe.color_ops_allowed = featureListContains(content[3..], "allowColorOps");
+    }
+}
+
+fn featureListContains(list: []const u8, name: []const u8) bool {
+    var tokens = std.mem.splitScalar(u8, list, ',');
+    while (tokens.next()) |raw_token| {
+        const token = std.mem.trim(u8, raw_token, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(token, name)) return true;
+    }
+    return false;
+}
+
+fn parseDefaultColorResponses(bytes: []const u8, result: *DefaultColorQuery) void {
+    var probe = TerminalProbe{ .default_colors = result.* };
+    parseOscProbeResponses(bytes, &probe);
+    result.* = probe.default_colors;
 }
 
 fn parseRgbSpec(spec: []const u8) ?Rgb {
@@ -344,4 +383,34 @@ test "default color response parser handles OSC 10 and OSC 11" {
 
     try std.testing.expectEqual(Rgb{ .r = 255, .g = 238, .b = 221 }, result.foreground.?);
     try std.testing.expectEqual(Rgb{ .r = 1, .g = 35, .b = 69 }, result.background.?);
+}
+
+test "terminal probe parser handles batched allowed features, cursor, and color responses" {
+    var probe = TerminalProbe{};
+    parseTerminalProbeResponses(
+        "\x1b]60;allowTitleOps,allowColorOps\x1b\\" ++
+            "\x1b[7;9R" ++
+            "\x1b]10;rgb:0a/0b/0c\x1b\\" ++
+            "\x1b]11;rgb:0d/0e/0f\x1b\\",
+        &probe,
+    );
+
+    try std.testing.expect(probe.allowed_features_answered);
+    try std.testing.expect(probe.color_ops_allowed.?);
+    try std.testing.expectEqual(CursorPosition{ .row = 6, .col = 8 }, probe.cursor_position.?);
+    try std.testing.expectEqual(Rgb{ .r = 10, .g = 11, .b = 12 }, probe.default_colors.foreground.?);
+    try std.testing.expectEqual(Rgb{ .r = 13, .g = 14, .b = 15 }, probe.default_colors.background.?);
+    try std.testing.expect(probe.complete());
+}
+
+test "terminal probe parser treats answered allowed features without color ops as complete after cursor" {
+    var probe = TerminalProbe{};
+    parseTerminalProbeResponses("\x1b]60;allowTitleOps\x1b\\\x1b[2;3R", &probe);
+
+    try std.testing.expect(probe.allowed_features_answered);
+    try std.testing.expect(!probe.color_ops_allowed.?);
+    try std.testing.expectEqual(CursorPosition{ .row = 1, .col = 2 }, probe.cursor_position.?);
+    try std.testing.expect(probe.default_colors.foreground == null);
+    try std.testing.expect(probe.default_colors.background == null);
+    try std.testing.expect(probe.complete());
 }

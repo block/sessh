@@ -5,9 +5,9 @@ usage() {
   cat <<'EOF'
 usage: scripts/check [--fast]
 
-Runs the sessh Zig build, bootstrapper harness, fake-ssh harness,
-socket harness, tmux terminal harness, terminal conformance harness, and slow
-Podman ssh harness.
+Runs the sessh Zig build, Termless smoke tests, bootstrapper harness,
+fake-ssh harness, socket harness, tmux terminal harness, terminal conformance
+harness, and slow Podman ssh harness.
 
 Options:
   --fast    Skip the slow terminal conformance and Podman ssh harnesses.
@@ -177,11 +177,12 @@ export SESSH_PROTOC=$protoc_bin
 check_python_protobuf
 
 run "$zig_bin" build gen-proto
-run sh -n scripts/build scripts/check scripts/install
+run sh -n scripts/build scripts/check scripts/check-termless scripts/download-ghostty-deps scripts/install
 run python3 -m py_compile scripts/release
 run "$zig_bin" fmt --check build.zig build.zig.zon src/*.zig
 run "$zig_bin" build
 run "$zig_bin" build install-dev
+run scripts/check-termless --no-build
 run "$zig_bin" build test
 setup_isolation
 trap cleanup_isolation EXIT
