@@ -1,8 +1,10 @@
 # Architecture
 
-The path when sessh connects to a remote for the first time (simplified):
+## Timeline (simplified)
 
-1. sessh client invokes `ssh <HOST> <script>`.
+The path when `sessh` connects to a remote for the first time:
+
+1. `sesshmux` client invokes `ssh <HOST> <script>`.
 2. The script (i.e. the bootstrapper) runs on the remote, reading
    newline-separated commands from stdin.
 3. The client tells the script to execute a binary, identified by a list of
@@ -26,8 +28,19 @@ The path when sessh connects to a remote for the first time (simplified):
     stdin while the session-agent sends rendering instructions (in the form of
     ASCII and escape codes)
 
-`sessh` is a tiny frontend around `sesshmux` that gives it the same shape as
-`ssh`. The same `sesshmux` binary supports all three modalities: client,
-broker, and session-agent.
+## Modality
+
+`sesshmux` is a binary with four modalities:
+
+1. `sessh` (the tiny frontend around `sesshmux` that gives it the same CLI as
+   `ssh`)
+2. `sesshmux` client
+3. `sesshmux` broker
+4. `sesshmux` session-agent
+
+The default modality is client, but `sesshmux` switches to the other modalities
+when special sentinel values are passed as the first argument.
+
+## Other Docs
 
 Networking behavior is documented in [NETWORKING](NETWORKING.md).

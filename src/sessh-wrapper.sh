@@ -58,7 +58,7 @@ if [ ! -x "$real" ]; then
 fi
 
 if [ "$name" = "sessh" ]; then
-  SESSH_ENTRYPOINT=sessh exec "$real" new "$@"
+  exec "$real" :internal-sessh: "$@"
 fi
 
-SESSH_ENTRYPOINT=sesshmux exec "$real" "$@"
+exec "$real" "$@"

@@ -2823,6 +2823,11 @@ def main():
             short_help_text = run(["-h"], env, timeout=5.0)
             if short_help_text.returncode != 0 or short_help_text.stdout != help_text.stdout:
                 raise AssertionError(short_help_text)
+            internal_sessh_help = run([":internal-sessh:", "--help"], env, timeout=5.0)
+            if internal_sessh_help.returncode != 0 or "sessh [ssh-option" not in internal_sessh_help.stdout:
+                raise AssertionError(internal_sessh_help)
+            if "sesshmux new" in internal_sessh_help.stdout:
+                raise AssertionError(internal_sessh_help.stdout)
             sessh_wrapper = ROOT / "zig-out" / "bin" / "sessh"
             if sessh_wrapper.exists():
                 sessh_help = subprocess.run(

@@ -1,5 +1,4 @@
 const std = @import("std");
-const c = std.c;
 const posix = std.posix;
 
 const app_allocator = @import("app_allocator.zig");
@@ -37,18 +36,20 @@ fn runMain() !void {
     defer allocator.free(args);
     for (argv, 0..) |arg, i| args[i] = arg;
 
-    const entrypoint = detectEntryPoint(args[0]);
+    const entrypoint: EntryPoint = if (args.len >= 2 and std.mem.eql(u8, args[1], ":internal-sessh:")) .sessh else .sesshmux;
 
     if (args.len == 1) return usage(0, entrypoint);
+    if (entrypoint == .sessh and args.len == 2) return usage(0, entrypoint);
     if (hasAnyArg(args, &.{ "--help", "-h" })) return usage(0, entrypoint);
     if (hasArg(args, "--version")) {
         try io.writeAll(1, "sessh " ++ config.version ++ "\n");
         return;
     }
 
-    if (isMuxOnlyEntryMode(args[1]) and entrypoint != .sesshmux) {
-        try io.writeAll(2, "sessh: local/internal modes are only supported by sesshmux\n");
-        return process_exit.request(64);
+    if (entrypoint == .sessh) {
+        const sessh_args = try sesshArgsFromInternal(allocator, args);
+        defer allocator.free(sessh_args);
+        return ssh_client.runMux(allocator, sessh_args);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-session-agent:")) {
@@ -75,48 +76,31 @@ const EntryPoint = enum {
     sesshmux,
 };
 
-fn detectEntryPoint(exe_path: []const u8) EntryPoint {
-    if (c.getenv("SESSH_ENTRYPOINT")) |entrypoint_z| {
-        const entrypoint = std.mem.span(entrypoint_z);
-        if (std.mem.eql(u8, entrypoint, "sessh")) return .sessh;
-        if (std.mem.eql(u8, entrypoint, "sesshmux")) return .sesshmux;
-    }
-    return if (isMuxExecutable(exe_path)) .sesshmux else .sessh;
+fn sesshArgsFromInternal(allocator: std.mem.Allocator, args: []const []const u8) ![][]const u8 {
+    std.debug.assert(args.len >= 2);
+    std.debug.assert(std.mem.eql(u8, args[1], ":internal-sessh:"));
+
+    const sessh_args = try allocator.alloc([]const u8, args.len);
+    sessh_args[0] = args[0];
+    sessh_args[1] = "new";
+    @memcpy(sessh_args[2..], args[2..]);
+    return sessh_args;
 }
 
-fn isMuxOnlyEntryMode(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, ".") or std.mem.startsWith(u8, arg, ":internal-");
-}
+test "internal sessh modality maps to mux new command" {
+    const rewritten = try sesshArgsFromInternal(std.testing.allocator, &.{
+        "sesshmux-macos-aarch64",
+        ":internal-sessh:",
+        "-v",
+        "example.com",
+    });
+    defer std.testing.allocator.free(rewritten);
 
-fn isMuxExecutable(path: []const u8) bool {
-    const name = std.fs.path.basename(path);
-    return std.mem.eql(u8, name, "sesshmux") or
-        std.mem.eql(u8, name, "sesshmux-dev") or
-        std.mem.startsWith(u8, name, "sesshmux-") or
-        isSha256HexName(name);
-}
-
-fn isSha256HexName(name: []const u8) bool {
-    if (name.len != 64) return false;
-    for (name) |byte| {
-        _ = std.fmt.charToDigit(byte, 16) catch return false;
-    }
-    return true;
-}
-
-test "mux-only entry modes are limited to sesshmux executable names" {
-    try std.testing.expect(isMuxOnlyEntryMode(":internal-broker:"));
-    try std.testing.expect(isMuxOnlyEntryMode(":internal-session-agent:"));
-    try std.testing.expect(isMuxOnlyEntryMode("."));
-    try std.testing.expect(!isMuxOnlyEntryMode("new"));
-
-    try std.testing.expect(isMuxExecutable("/opt/sessh/bin/sesshmux"));
-    try std.testing.expect(isMuxExecutable("/tmp/sesshmux-dev"));
-    try std.testing.expect(isMuxExecutable("/opt/sessh/libexec/sessh/sesshmux-linux-x86_64"));
-    try std.testing.expect(isMuxExecutable("/tmp/cache/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
-    try std.testing.expect(!isMuxExecutable("/opt/sessh/bin/sessh"));
-    try std.testing.expect(!isMuxExecutable("/tmp/sessh-dev"));
-    try std.testing.expect(!isMuxExecutable("/tmp/cache/not-a-sha256"));
+    try std.testing.expectEqual(@as(usize, 4), rewritten.len);
+    try std.testing.expectEqualStrings("sesshmux-macos-aarch64", rewritten[0]);
+    try std.testing.expectEqualStrings("new", rewritten[1]);
+    try std.testing.expectEqualStrings("-v", rewritten[2]);
+    try std.testing.expectEqualStrings("example.com", rewritten[3]);
 }
 
 fn usage(code: u8, entrypoint: EntryPoint) !void {
