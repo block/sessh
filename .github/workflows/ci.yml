@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          brew install protobuf tmux
+
+      - name: Install Zig 0.15.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64|aarch64)
+              zig_url="https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz"
+              zig_sha256="3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b"
+              ;;
+            x86_64)
+              zig_url="https://ziglang.org/download/0.15.2/zig-x86_64-macos-0.15.2.tar.xz"
+              zig_sha256="375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f"
+              ;;
+            *)
+              echo "unsupported macOS runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          curl -fsSL "$zig_url" -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$zig_sha256  $RUNNER_TEMP/zig.tar.xz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -C "$RUNNER_TEMP/zig" --strip-components=1 -xf "$RUNNER_TEMP/zig.tar.xz"
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/python"
+          "$RUNNER_TEMP/python/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/python/bin/python" -m pip install protobuf
+          echo "$RUNNER_TEMP/python/bin" >> "$GITHUB_PATH"
+
+      - name: Verify
+        run: scripts/check --fast
+
+      - name: Build release archive
+        run: scripts/build --dist "$RUNNER_TEMP/dist"
+
+      - name: Verify release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^pub const version = "\(.*\)";$/\1/p' src/config.zig)"
+          archive="$RUNNER_TEMP/dist/sessh-$version.tar.gz"
+          test -f "$archive"
+          test -f "$archive.sha256"
+          test -x "$RUNNER_TEMP/dist/sessh-$version/bin/sessh"
+          actual_version="$("$RUNNER_TEMP/dist/sessh-$version/bin/sessh" --version)"
+          if [[ "$actual_version" != "sessh $version" ]]; then
+            echo "archive binary reported '$actual_version', expected 'sessh $version'" >&2
+            exit 1
+          fi
