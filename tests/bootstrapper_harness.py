@@ -76,7 +76,7 @@ def test_cache_hit_execs_without_platform_or_tool_probe(tmp):
     result = run_bootstrapper(f"EXEC test-set {artifact_hash}\n", env)
 
     assert_ok(result)
-    if result.stdout != "OK\nCACHED :internal-host-broker:\n":
+    if result.stdout != "OK\nCACHED :internal-broker:\n":
         raise AssertionError(result.stdout)
 
 
@@ -100,7 +100,7 @@ def test_upload_installs_and_execs(tmp):
         raise AssertionError(result.stdout)
     if lines[1] != "OK":
         raise AssertionError(result.stdout)
-    if lines[2] != "UPLOADED :internal-host-broker:":
+    if lines[2] != "UPLOADED :internal-broker:":
         raise AssertionError(result.stdout)
 
     installed = artifact_path(env, artifact_hash)

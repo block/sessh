@@ -830,7 +830,7 @@ def send_hello(conn, major_delta=0, minor_delta=0, expect_ok=True):
 
 def broker_hello(env, **kwargs):
     proc = subprocess.Popen(
-        [str(BIN), ":internal-host-broker:"],
+        [str(BIN), ":internal-broker:"],
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -2282,8 +2282,8 @@ def run_session_agent_registry_test(base_env):
                     proc.wait(timeout=2.0)
 
 
-def run_host_broker_starts_session_agent_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-host-broker-", dir="/tmp") as tmp:
+def run_broker_starts_session_agent_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-broker-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         shell = Path(tmp) / "broker-shell"
         shell.write_text(
@@ -2297,7 +2297,7 @@ def run_host_broker_starts_session_agent_test(base_env):
         shell.chmod(0o700)
 
         proc = subprocess.Popen(
-            [str(BIN), ":internal-host-broker:"],
+            [str(BIN), ":internal-broker:"],
             cwd=ROOT,
             env=env,
             stdin=subprocess.PIPE,
@@ -2317,9 +2317,9 @@ def run_host_broker_starts_session_agent_test(base_env):
 
             session_path = session_dir(env, "s1")
             if not (session_path / "s").exists():
-                raise AssertionError("host broker did not create a session-agent socket")
+                raise AssertionError("broker did not create a session-agent socket")
             if not os.path.islink(session_path / "compat"):
-                raise AssertionError("host broker session agent did not write compat symlink")
+                raise AssertionError("broker session agent did not write compat symlink")
             assert_runtime_dir_symlink(env, Path(env["SESSH_RUNTIME_DIR"]))
 
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
@@ -2331,7 +2331,7 @@ def run_host_broker_starts_session_agent_test(base_env):
             wait_missing(session_path / "s")
             wait_missing(session_path / "compat")
             if not session_path.exists():
-                raise AssertionError("host broker removed session tombstone")
+                raise AssertionError("broker removed session tombstone")
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -2342,8 +2342,8 @@ def run_host_broker_starts_session_agent_test(base_env):
                     proc.wait(timeout=2.0)
 
 
-def run_host_broker_registry_commands_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-host-broker-commands-", dir="/tmp") as tmp:
+def run_broker_registry_commands_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-broker-commands-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         shell = Path(tmp) / "broker-command-shell"
         shell.write_text(
@@ -2358,7 +2358,7 @@ def run_host_broker_registry_commands_test(base_env):
         session_path = session_dir(env, "s1")
 
         proc = subprocess.Popen(
-            [str(BIN), ":internal-host-broker:"],
+            [str(BIN), ":internal-broker:"],
             cwd=ROOT,
             env=env,
             stdin=subprocess.PIPE,
@@ -2383,12 +2383,12 @@ def run_host_broker_registry_commands_test(base_env):
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        listed = run([":internal-host-broker:", "--list"], env, check=True, timeout=5.0)
+        listed = run([":internal-broker:", "list"], env, check=True, timeout=5.0)
         if "s1\tno\t" not in listed.stdout:
             raise AssertionError(listed.stdout)
 
         proc = subprocess.Popen(
-            [str(BIN), ":internal-host-broker:"],
+            [str(BIN), ":internal-broker:"],
             cwd=ROOT,
             env=env,
             stdin=subprocess.PIPE,
@@ -2417,12 +2417,12 @@ def run_host_broker_registry_commands_test(base_env):
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        missing = run([":internal-host-broker:", "--kill", "s1"], env, timeout=5.0)
+        missing = run([":internal-broker:", "kill", "s1"], env, timeout=5.0)
         if missing.returncode != 1 or "session not found" not in missing.stderr:
             raise AssertionError(missing)
 
         proc = subprocess.Popen(
-            [str(BIN), ":internal-host-broker:"],
+            [str(BIN), ":internal-broker:"],
             cwd=ROOT,
             env=env,
             stdin=subprocess.PIPE,
@@ -2447,7 +2447,7 @@ def run_host_broker_registry_commands_test(base_env):
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        killed = run([":internal-host-broker:", "--kill", "s2"], env, check=True, timeout=5.0)
+        killed = run([":internal-broker:", "kill", "s2"], env, check=True, timeout=5.0)
         if "ENDED s2" not in killed.stdout or killed.stderr:
             raise AssertionError(killed)
         s2_dir = session_dir(env, "s2")
@@ -2456,7 +2456,7 @@ def run_host_broker_registry_commands_test(base_env):
 
         for expected_id in ("s3", "s4"):
             proc = subprocess.Popen(
-                [str(BIN), ":internal-host-broker:"],
+                [str(BIN), ":internal-broker:"],
                 cwd=ROOT,
                 env=env,
                 stdin=subprocess.PIPE,
@@ -2481,7 +2481,7 @@ def run_host_broker_registry_commands_test(base_env):
                     proc.terminate()
                     proc.wait(timeout=2.0)
 
-        stopped = run([":internal-host-broker:", "--kill-all"], env, check=True, timeout=5.0)
+        stopped = run([":internal-broker:", "kill", "--all"], env, check=True, timeout=5.0)
         if "KILLING_ALL" not in stopped.stdout or stopped.stderr:
             raise AssertionError(stopped)
         for expected_id in ("s3", "s4"):
@@ -2497,7 +2497,7 @@ def run_broker_kill_edge_cases_test(base_env):
         agent_pid, term_marker = start_sigterm_ignoring_process(tmp, "ignore-term-agent")
         try:
             write_session_meta(env, "s1", agent_pid)
-            killed = run([":internal-host-broker:", "--kill", "s1"], env, timeout=6.0)
+            killed = run([":internal-broker:", "kill", "s1"], env, timeout=6.0)
             if killed.returncode != 0 or "ENDED s1" not in killed.stdout:
                 raise AssertionError(killed)
             wait_file(term_marker)
@@ -2517,7 +2517,7 @@ def run_broker_kill_edge_cases_test(base_env):
             compat_log = Path(tmp) / "compat.log"
             write_compat_script(session_path / "compat", compat_log)
 
-            killed = run([":internal-host-broker:", "--kill", "s1"], env, check=True, timeout=5.0)
+            killed = run([":internal-broker:", "kill", "s1"], env, check=True, timeout=5.0)
             if killed.stdout or killed.stderr:
                 raise AssertionError(killed)
             expected = f":local: --compat-version {sessh_version()} --kill s1"
@@ -2544,7 +2544,7 @@ def run_broker_kill_edge_cases_test(base_env):
                 session_path = write_session_meta(env, session_id, proc.pid, version="0.0.0-compat-test")
                 write_compat_script(session_path / "compat", compat_log)
 
-            stopped = run([":internal-host-broker:", "--kill-all"], env, check=True, timeout=5.0)
+            stopped = run([":internal-broker:", "kill", "--all"], env, check=True, timeout=5.0)
             if stopped.stdout != "KILLING_ALL\n" or stopped.stderr:
                 raise AssertionError(stopped)
             lines = compat_log.read_text().splitlines()
@@ -2761,8 +2761,8 @@ def main():
             run_session_create_command_argv_test(env)
             run_session_agent_crash_client_error_test(env)
             run_session_agent_registry_test(env)
-            run_host_broker_starts_session_agent_test(env)
-            run_host_broker_registry_commands_test(env)
+            run_broker_starts_session_agent_test(env)
+            run_broker_registry_commands_test(env)
             run_broker_kill_edge_cases_test(env)
             run_minor_version_compatibility_test(env)
             run_session_create_without_attach_protocol_test(env)

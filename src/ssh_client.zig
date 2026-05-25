@@ -609,7 +609,7 @@ fn sesshLongOptionMissingValueError(arg: []const u8) anyerror {
 
 /// Start the ssh transport by running the bootstrapper as the remote command.
 ///
-/// The bootstrapper eventually execs `sesshmux :internal-host-broker:`, at which
+/// The bootstrapper eventually execs `sesshmux :internal-broker:`, at which
 /// point the normal framed runtime protocol can flow over ssh stdio. Installed
 /// packages keep one binary per supported platform in libexec/sessh, named
 /// `sesshmux-<os>-<arch>`. If that layout is unavailable, upload the current
@@ -1047,17 +1047,19 @@ fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[4][]const u8) []co
     switch (parsed_ssh_args.action) {
         .new, .attach => {},
         .list => {
-            buf[len] = "--list";
+            buf[len] = "list";
             len += 1;
         },
         .kill => {
-            buf[len] = "--kill";
+            buf[len] = "kill";
             len += 1;
             buf[len] = parsed_ssh_args.kill_id.?;
             len += 1;
         },
         .kill_all => {
-            buf[len] = "--kill-all";
+            buf[len] = "kill";
+            len += 1;
+            buf[len] = "--all";
             len += 1;
         },
     }
@@ -1949,7 +1951,7 @@ fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
 fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []const u8) ![]u8 {
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(allocator);
-    try script.appendSlice(allocator, "exec sesshmux :internal-host-broker:");
+    try script.appendSlice(allocator, "exec sesshmux :internal-broker:");
     for (broker_args) |arg| {
         const quoted = try shellQuote(allocator, arg);
         defer allocator.free(quoted);
@@ -3058,6 +3060,29 @@ test "parseSshArgs accepts translated remote session commands after host" {
 
     const kill_all = try parseSshArgs(&.{ "sesshmux", "example.com", "--kill-all" });
     try std.testing.expectEqual(SshAction.kill_all, kill_all.action);
+}
+
+test "brokerArgsForAction uses broker subcommands" {
+    var buf: [4][]const u8 = undefined;
+
+    try expectArgvEqual(&.{"list"}, brokerArgsForAction(.{
+        .options = &.{},
+        .host = "example.com",
+        .action = .list,
+    }, &buf));
+
+    try expectArgvEqual(&.{ "kill", "s1" }, brokerArgsForAction(.{
+        .options = &.{},
+        .host = "example.com",
+        .action = .kill,
+        .kill_id = "s1",
+    }, &buf));
+
+    try expectArgvEqual(&.{ "kill", "--all" }, brokerArgsForAction(.{
+        .options = &.{},
+        .host = "example.com",
+        .action = .kill_all,
+    }, &buf));
 }
 
 test "parseSshArgs accepts persistent command argv after delimiter" {

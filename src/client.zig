@@ -1689,21 +1689,21 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     switch (options.action) {
         .list => {
             var command_args_buf: [3][]const u8 = undefined;
-            const command_args = appendBrokerCommand(runtime_broker_args, "--list", null, &command_args_buf);
+            const command_args = appendBrokerCommand(runtime_broker_args, "list", null, &command_args_buf);
             const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
         .kill => {
             var command_args_buf: [4][]const u8 = undefined;
-            const command_args = appendBrokerCommand(runtime_broker_args, "--kill", options.kill_id.?, &command_args_buf);
+            const command_args = appendBrokerCommand(runtime_broker_args, "kill", options.kill_id.?, &command_args_buf);
             const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
         .kill_all => {
-            var command_args_buf: [3][]const u8 = undefined;
-            const command_args = appendBrokerCommand(runtime_broker_args, "--kill-all", null, &command_args_buf);
+            var command_args_buf: [4][]const u8 = undefined;
+            const command_args = appendBrokerCommand(runtime_broker_args, "kill", "--all", &command_args_buf);
             const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
@@ -1859,7 +1859,7 @@ fn startLocalBroker(allocator: std.mem.Allocator, exe: []const u8, broker_args: 
     const argv = try allocator.alloc([]const u8, 2 + broker_args.len);
     defer allocator.free(argv);
     argv[0] = exe;
-    argv[1] = ":internal-host-broker:";
+    argv[1] = ":internal-broker:";
     @memcpy(argv[2..], broker_args);
     var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Pipe;
@@ -1873,7 +1873,7 @@ fn runLocalBrokerCommand(allocator: std.mem.Allocator, exe: []const u8, broker_a
     const argv = try allocator.alloc([]const u8, 2 + broker_args.len);
     defer allocator.free(argv);
     argv[0] = exe;
-    argv[1] = ":internal-host-broker:";
+    argv[1] = ":internal-broker:";
     @memcpy(argv[2..], broker_args);
 
     var child = std.process.Child.init(argv, allocator);
@@ -1896,9 +1896,9 @@ fn brokerListMatches(allocator: std.mem.Allocator, exe: []const u8, broker_args:
     const argv = allocator.alloc([]const u8, 3 + broker_args.len) catch return false;
     defer allocator.free(argv);
     argv[0] = exe;
-    argv[1] = ":internal-host-broker:";
+    argv[1] = ":internal-broker:";
     @memcpy(argv[2 .. 2 + broker_args.len], broker_args);
-    argv[2 + broker_args.len] = "--list";
+    argv[2 + broker_args.len] = "list";
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = argv,

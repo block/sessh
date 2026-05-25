@@ -43,6 +43,11 @@ fn runMain() !void {
         return;
     }
 
+    if (isInternalMode(args[1]) and !isMuxExecutable(args[0])) {
+        try io.writeAll(2, "sessh: internal modes are only supported by sesshmux\n");
+        return process_exit.request(64);
+    }
+
     if (std.mem.eql(u8, args[1], ":internal-session-agent:")) {
         if (args.len != 4 or !std.mem.eql(u8, args[2], "--session-dir")) {
             try io.writeAll(2, "sessh: :internal-session-agent: requires --session-dir DIR\n");
@@ -51,7 +56,7 @@ fn runMain() !void {
         return session_agent.runSessionAgent(args[3]);
     }
 
-    if (std.mem.eql(u8, args[1], ":internal-host-broker:")) {
+    if (std.mem.eql(u8, args[1], ":internal-broker:")) {
         return broker.run(allocator, args[0], args[2..]);
     }
 
@@ -60,6 +65,41 @@ fn runMain() !void {
     }
 
     return ssh_client.runMux(allocator, args);
+}
+
+fn isInternalMode(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, ":local:") or std.mem.startsWith(u8, arg, ":internal-");
+}
+
+fn isMuxExecutable(path: []const u8) bool {
+    const name = std.fs.path.basename(path);
+    return std.mem.eql(u8, name, "sesshmux") or
+        std.mem.eql(u8, name, "sesshmux-dev") or
+        std.mem.startsWith(u8, name, "sesshmux-") or
+        isSha256HexName(name);
+}
+
+fn isSha256HexName(name: []const u8) bool {
+    if (name.len != 64) return false;
+    for (name) |byte| {
+        _ = std.fmt.charToDigit(byte, 16) catch return false;
+    }
+    return true;
+}
+
+test "internal modes are only supported by sesshmux executable names" {
+    try std.testing.expect(isInternalMode(":internal-broker:"));
+    try std.testing.expect(isInternalMode(":internal-session-agent:"));
+    try std.testing.expect(isInternalMode(":local:"));
+    try std.testing.expect(!isInternalMode("new"));
+
+    try std.testing.expect(isMuxExecutable("/opt/sessh/bin/sesshmux"));
+    try std.testing.expect(isMuxExecutable("/tmp/sesshmux-dev"));
+    try std.testing.expect(isMuxExecutable("/opt/sessh/libexec/sessh/sesshmux-linux-x86_64"));
+    try std.testing.expect(isMuxExecutable("/tmp/cache/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(!isMuxExecutable("/opt/sessh/bin/sessh"));
+    try std.testing.expect(!isMuxExecutable("/tmp/sessh-dev"));
+    try std.testing.expect(!isMuxExecutable("/tmp/cache/not-a-sha256"));
 }
 
 fn usage(code: u8) !void {

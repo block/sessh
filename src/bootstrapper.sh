@@ -174,7 +174,7 @@ for hash in $hashes; do
   candidate=$cache_dir/$hash
   if [ -f "$candidate" ] && [ -x "$candidate" ]; then
     printf 'OK\n'
-    exec "$candidate" :internal-host-broker: $broker_args
+    exec "$candidate" :internal-broker: $broker_args
   fi
 done
 
@@ -205,4 +205,4 @@ mv "$tmp" "$cache_dir/$upload_hash" || err INSTALL_FAILED rename
 trap - EXIT HUP INT TERM
 
 printf 'OK\n'
-exec "$cache_dir/$upload_hash" :internal-host-broker: $broker_args
+exec "$cache_dir/$upload_hash" :internal-broker: $broker_args

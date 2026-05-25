@@ -99,18 +99,15 @@ fn applyBrokerOptions(args: []const []const u8) ![]const []const u8 {
 
 fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const command = args[0];
-    if (std.mem.eql(u8, command, "--list")) {
-        if (args.len != 1) return finishCommand(64, "", "ERROR usage: --list\n");
+    if (std.mem.eql(u8, command, "list")) {
+        if (args.len != 1) return finishCommand(64, "", "ERROR usage: list\n");
         const exit_status = try listAgents(allocator);
         return process_exit.request(exit_status);
     }
-    if (std.mem.eql(u8, command, "--kill")) {
-        if (args.len != 2) return finishCommand(64, "", "ERROR usage: --kill ID\n");
+    if (std.mem.eql(u8, command, "kill")) {
+        if (args.len != 2) return finishCommand(64, "", "ERROR usage: kill ID | kill --all\n");
+        if (std.mem.eql(u8, args[1], "--all")) return killAllAgents(allocator);
         return killOneAgent(allocator, args[1]);
-    }
-    if (std.mem.eql(u8, command, "--kill-all")) {
-        if (args.len != 1) return finishCommand(64, "", "ERROR usage: --kill-all\n");
-        return killAllAgents(allocator);
     }
     return finishCommand(64, "", "ERROR unknown broker command\n");
 }
