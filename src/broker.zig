@@ -438,6 +438,13 @@ fn mostRecentAgent(allocator: std.mem.Allocator) !?session_registry.SessionPaths
             },
             else => return err,
         };
+        _ = statAbsolute(paths.detached) catch |err| switch (err) {
+            error.FileNotFound => {
+                paths.deinit(allocator);
+                continue;
+            },
+            else => return err,
+        };
         const stat = statAbsolute(paths.meta) catch {
             paths.deinit(allocator);
             continue;

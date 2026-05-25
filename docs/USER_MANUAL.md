@@ -41,12 +41,12 @@ Use `sesshmux` for session management:
 
 - `sesshmux attach ID`: attach using a local alias, cached remote route, or
   session GUID.
-- `sesshmux attach HOST ID`: attach by resolving `ID` on `HOST`.
 - `sesshmux attach --host HOST [ID]`: attach by resolving `ID` on `HOST`, or
   attach to the most recent attachable session on `HOST` if `ID` is omitted.
-- `sesshmux list HOST`: list attachable sessions on `HOST`.
-- `sesshmux kill HOST ID`: terminate the specified session on `HOST`.
-- `sesshmux kill --all HOST`: terminate all sessions on `HOST`.
+- `sesshmux list [HOST]`: list attachable sessions locally or on `HOST`.
+- `sesshmux kill [HOST] ID`: terminate the specified local or remote session.
+- `sesshmux kill --all [HOST]`: terminate all local sessions or all sessions on
+  `HOST`.
 
 For remote commands, pass ssh options before the host or through
 `--ssh-options "..."`, for example `sesshmux list --ssh-options "-F cfg" HOST`.
@@ -128,15 +128,15 @@ don't specify one, `sessh` will generate one randomly.
 
 After you attach to a remote session, sessh caches a local route so later
 `sesshmux attach ALIAS` can reconnect without restating the host. If
-`sesshmux attach HOST ALIAS` resolves to a route for another host, sessh fails
-instead of following that route.
+`sesshmux attach --host HOST ALIAS` resolves to a route for another host, sessh
+fails instead of following that route.
 
 ## Reconnects
 
 Reconnect uses non-interactive ssh authentication. If reconnect would require a
 password or another interactive prompt, sessh exits instead of prompting
 through the session stream. The session is still attachable with
-`sesshmux attach HOST ID`.
+`sesshmux attach ID`.
 
 ## Interacting with attached sessions
 

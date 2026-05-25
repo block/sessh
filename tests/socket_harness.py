@@ -2490,6 +2490,94 @@ def run_broker_registry_commands_test(base_env):
             wait_missing(path / "compat")
 
 
+def run_broker_attach_without_id_uses_latest_detached_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-broker-latest-detached-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "broker-latest-detached-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "printf 'BROKER_LATEST_DETACHED_READY\\n'\n"
+            "while IFS= read -r line; do\n"
+            "  if [ \"$line\" = exit ]; then exit 0; fi\n"
+            "  printf 'BROKER_LATEST_DETACHED:%s\\n' \"$line\"\n"
+            "done\n"
+        )
+        shell.chmod(0o700)
+        attached = []
+
+        def start_attached_session(session_id):
+            proc = subprocess.Popen(
+                [str(BIN), ":internal-broker:"],
+                cwd=ROOT,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            conn = FdConn(proc.stdout.fileno(), proc.stdin.fileno())
+            attached.append((proc, conn))
+            send_hello(conn)
+            send_resize(conn, rows=4, cols=40)
+            create_and_attach_session(conn, shell, session_id=session_id)
+            message_type, payload = recv_frame(conn)
+            if message_type != SESSION_ATTACHED:
+                raise AssertionError((session_id, message_type, payload))
+            message = assert_session_attached(payload)
+            if message.session_guid != guid_for_ref(session_id):
+                raise AssertionError((session_id, message.session_guid))
+            recv_draw_until(conn, b"BROKER_LATEST_DETACHED_READY")
+            return proc, conn
+
+        try:
+            s1_proc, _ = start_attached_session("s1")
+            s1_proc.stdin.close()
+            s1_proc.wait(timeout=5.0)
+            attached = [(proc, conn) for proc, conn in attached if proc is not s1_proc]
+            wait_file(session_dir(env, "s1") / "detached")
+
+            time.sleep(0.02)
+            s2_proc, s2_conn = start_attached_session("s2")
+            if (session_dir(env, "s2") / "detached").exists():
+                raise AssertionError("newer attached session has detached marker")
+
+            attach_proc = subprocess.Popen(
+                [str(BIN), ":internal-broker:"],
+                cwd=ROOT,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            attach_conn = FdConn(attach_proc.stdout.fileno(), attach_proc.stdin.fileno())
+            attached.append((attach_proc, attach_conn))
+            send_hello(attach_conn)
+            send_resize(attach_conn, rows=4, cols=40)
+            send_frame(attach_conn, SESSION_ATTACH, pack_session_attach())
+            message_type, payload = recv_frame(attach_conn)
+            if message_type != SESSION_ATTACHED:
+                raise AssertionError((message_type, payload))
+            message = assert_session_attached(payload)
+            if message.session_guid != guid_for_ref("s1"):
+                raise AssertionError(f"expected no-id attach to select detached s1, got {message.session_guid}")
+
+            send_frame(attach_conn, INPUT, pack_bytes(b"exit\n"))
+            recv_until_message(attach_conn, SESSION_ENDED)
+            attach_proc.stdin.close()
+            attach_proc.wait(timeout=5.0)
+            attached = [(proc, conn) for proc, conn in attached if proc is not attach_proc]
+
+            send_frame(s2_conn, INPUT, pack_bytes(b"exit\n"))
+            recv_until_message(s2_conn, SESSION_ENDED)
+            s2_proc.stdin.close()
+            s2_proc.wait(timeout=5.0)
+            attached = [(proc, conn) for proc, conn in attached if proc is not s2_proc]
+        finally:
+            for proc, _ in attached:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=2.0)
+
+
 def run_broker_kill_edge_cases_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-broker-sigkill-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
@@ -2728,11 +2816,30 @@ def main():
 
         try:
             help_text = run(["--help"], env, timeout=5.0)
-            if help_text.returncode != 0 or not help_text.stdout:
+            if help_text.returncode != 0 or "sesshmux new" not in help_text.stdout:
                 raise AssertionError(help_text)
+            if "sessh [ssh-option" in help_text.stdout:
+                raise AssertionError(help_text.stdout)
             short_help_text = run(["-h"], env, timeout=5.0)
             if short_help_text.returncode != 0 or short_help_text.stdout != help_text.stdout:
                 raise AssertionError(short_help_text)
+            sessh_wrapper = ROOT / "zig-out" / "bin" / "sessh"
+            if sessh_wrapper.exists():
+                sessh_help = subprocess.run(
+                    [str(sessh_wrapper), "--help"],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5.0,
+                    check=False,
+                )
+                if sessh_help.returncode != 0 or "sessh [ssh-option" not in sessh_help.stdout:
+                    raise AssertionError(sessh_help)
+                if "sesshmux new" in sessh_help.stdout:
+                    raise AssertionError(sessh_help.stdout)
 
             bad = run([".", "/tmp/not-a-socket-path"], env, timeout=5.0)
             if bad.returncode != 64:
@@ -2763,6 +2870,7 @@ def main():
             run_session_agent_registry_test(env)
             run_broker_starts_session_agent_test(env)
             run_broker_registry_commands_test(env)
+            run_broker_attach_without_id_uses_latest_detached_test(env)
             run_broker_kill_edge_cases_test(env)
             run_minor_version_compatibility_test(env)
             run_session_create_without_attach_protocol_test(env)

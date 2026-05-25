@@ -1,4 +1,5 @@
 const std = @import("std");
+const c = std.c;
 const posix = std.posix;
 
 const app_allocator = @import("app_allocator.zig");
@@ -36,14 +37,16 @@ fn runMain() !void {
     defer allocator.free(args);
     for (argv, 0..) |arg, i| args[i] = arg;
 
-    if (args.len == 1) return usage(0);
-    if (hasAnyArg(args, &.{ "--help", "-h" })) return usage(0);
+    const entrypoint = detectEntryPoint(args[0]);
+
+    if (args.len == 1) return usage(0, entrypoint);
+    if (hasAnyArg(args, &.{ "--help", "-h" })) return usage(0, entrypoint);
     if (hasArg(args, "--version")) {
         try io.writeAll(1, "sessh " ++ config.version ++ "\n");
         return;
     }
 
-    if (isMuxOnlyEntryMode(args[1]) and !isMuxExecutable(args[0])) {
+    if (isMuxOnlyEntryMode(args[1]) and entrypoint != .sesshmux) {
         try io.writeAll(2, "sessh: local/internal modes are only supported by sesshmux\n");
         return process_exit.request(64);
     }
@@ -65,6 +68,20 @@ fn runMain() !void {
     }
 
     return ssh_client.runMux(allocator, args);
+}
+
+const EntryPoint = enum {
+    sessh,
+    sesshmux,
+};
+
+fn detectEntryPoint(exe_path: []const u8) EntryPoint {
+    if (c.getenv("SESSH_ENTRYPOINT")) |entrypoint_z| {
+        const entrypoint = std.mem.span(entrypoint_z);
+        if (std.mem.eql(u8, entrypoint, "sessh")) return .sessh;
+        if (std.mem.eql(u8, entrypoint, "sesshmux")) return .sesshmux;
+    }
+    return if (isMuxExecutable(exe_path)) .sesshmux else .sessh;
 }
 
 fn isMuxOnlyEntryMode(arg: []const u8) bool {
@@ -102,8 +119,9 @@ test "mux-only entry modes are limited to sesshmux executable names" {
     try std.testing.expect(!isMuxExecutable("/tmp/cache/not-a-sha256"));
 }
 
-fn usage(code: u8) !void {
-    const text =
+fn usage(code: u8, entrypoint: EntryPoint) !void {
+    const text = switch (entrypoint) {
+        .sessh =>
         \\usage:
         \\  sessh [ssh-option ...] destination [command argument ...]
         \\
@@ -119,7 +137,28 @@ fn usage(code: u8) !void {
         \\See the user manual for advanced usage:
         \\  https://github.com/block/sessh/blob/main/docs/USER_MANUAL.md
         \\
-    ;
+        ,
+        .sesshmux =>
+        \\usage:
+        \\  sesshmux new [options] [--ssh-options "ssh args"] HOST [-- cmd arg...]
+        \\  sesshmux attach [options] [[--ssh-options "ssh args"] --host HOST] [ID]
+        \\  sesshmux list [[--ssh-options "ssh args"] HOST]
+        \\  sesshmux kill [[--ssh-options "ssh args"] HOST] ID
+        \\  sesshmux kill --all [[--ssh-options "ssh args"] HOST]
+        \\
+        \\local target:
+        \\  Use . as HOST to operate on local sessions.
+        \\
+        \\common options:
+        \\  --alias NAME
+        \\  --leader CTRL-KEY|None
+        \\  --runtime-dir DIR
+        \\  --ssh-options "SSH_ARGS"
+        \\
+        \\See the user manual for advanced usage:
+        \\  https://github.com/block/sessh/blob/main/docs/USER_MANUAL.md
+        \\
+    };
     try io.writeAll(if (code == 0) 1 else 2, text);
     return process_exit.request(code);
 }

@@ -396,7 +396,6 @@ fn translateMuxAttach(translated: *TranslatedMuxArgs, args: []const []const u8) 
     var host_option: ?[]const u8 = null;
 
     try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null);
-    if (positional.items.len > 2) return error.TooManyMuxArguments;
 
     if (host_option) |host| {
         if (positional.items.len > 1) return error.TooManyMuxArguments;
@@ -405,19 +404,18 @@ fn translateMuxAttach(translated: *TranslatedMuxArgs, args: []const []const u8) 
         try translated.append("--attach");
         if (positional.items.len == 1) try translated.append(positional.items[0]);
         try appendMany(translated, sessh_options.items);
-    } else if (positional.items.len == 2) {
-        try appendMany(translated, ssh_options.items);
-        try translated.append(positional.items[0]);
-        try translated.append("--attach");
-        try translated.append(positional.items[1]);
-        try appendMany(translated, sessh_options.items);
     } else if (positional.items.len == 1) {
         if (ssh_options.items.len > 0) return error.MissingHost;
         try translated.append("--attach");
         try translated.append(positional.items[0]);
         try appendMany(translated, sessh_options.items);
+    } else if (positional.items.len == 0) {
+        if (ssh_options.items.len > 0) return error.MissingHost;
+        try translated.append(".");
+        try translated.append("--attach");
+        try appendMany(translated, sessh_options.items);
     } else {
-        return error.MissingAttachId;
+        return error.TooManyMuxArguments;
     }
 }
 
@@ -431,11 +429,25 @@ fn translateMuxList(translated: *TranslatedMuxArgs, args: []const []const u8) !v
     var host_option: ?[]const u8 = null;
 
     try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null);
-    const host = try muxHostFromOptions(host_option, positional.items, 0);
-    try appendMany(translated, ssh_options.items);
-    try translated.append(host);
-    try translated.append("--list");
-    try appendMany(translated, sessh_options.items);
+    if (host_option) |host| {
+        if (positional.items.len != 0) return error.TooManyMuxArguments;
+        try appendMany(translated, ssh_options.items);
+        try translated.append(host);
+        try translated.append("--list");
+        try appendMany(translated, sessh_options.items);
+    } else if (positional.items.len == 0) {
+        if (ssh_options.items.len > 0) return error.MissingHost;
+        try translated.append(".");
+        try translated.append("--list");
+        try appendMany(translated, sessh_options.items);
+    } else if (positional.items.len == 1) {
+        try appendMany(translated, ssh_options.items);
+        try translated.append(positional.items[0]);
+        try translated.append("--list");
+        try appendMany(translated, sessh_options.items);
+    } else {
+        return error.TooManyMuxArguments;
+    }
 }
 
 fn translateMuxKill(translated: *TranslatedMuxArgs, args: []const []const u8) !void {
@@ -451,11 +463,25 @@ fn translateMuxKill(translated: *TranslatedMuxArgs, args: []const []const u8) !v
     try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, &all);
 
     if (all) {
-        const host = try muxHostFromOptions(host_option, positional.items, 0);
-        try appendMany(translated, ssh_options.items);
-        try translated.append(host);
-        try translated.append("--kill-all");
-        try appendMany(translated, sessh_options.items);
+        if (host_option) |host| {
+            if (positional.items.len != 0) return error.TooManyMuxArguments;
+            try appendMany(translated, ssh_options.items);
+            try translated.append(host);
+            try translated.append("--kill-all");
+            try appendMany(translated, sessh_options.items);
+        } else if (positional.items.len == 0) {
+            if (ssh_options.items.len > 0) return error.MissingHost;
+            try translated.append(".");
+            try translated.append("--kill-all");
+            try appendMany(translated, sessh_options.items);
+        } else if (positional.items.len == 1) {
+            try appendMany(translated, ssh_options.items);
+            try translated.append(positional.items[0]);
+            try translated.append("--kill-all");
+            try appendMany(translated, sessh_options.items);
+        } else {
+            return error.TooManyMuxArguments;
+        }
         return;
     }
 
@@ -2373,7 +2399,7 @@ fn sshConfigValueIs(raw_option: []const u8, key_len: usize, expected: []const u8
 fn printSshArgError(err: anyerror) !void {
     switch (err) {
         error.MissingHost => try io.writeAll(2, "sessh: missing host\n"),
-        error.MissingAttachId => try io.writeAll(2, "sesshmux: attach requires an id when no host is provided\n"),
+        error.MissingAttachId => try io.writeAll(2, "sesshmux: --attach requires an id in this form\n"),
         error.MissingKillId => try io.writeAll(2, "sesshmux: kill requires an id\n"),
         error.MissingAlias => try io.writeAll(2, "sessh: --alias requires a value\n"),
         error.MissingRuntimeDir => try io.writeAll(2, "sessh: --runtime-dir requires a value\n"),
@@ -3162,14 +3188,12 @@ test "translateMuxArgs rejects sessh options after host" {
 }
 
 test "translateMuxArgs maps local and host-qualified attach" {
-    var explicit_local = try translateMuxArgs(std.testing.allocator, &.{
+    var latest_local = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
         "attach",
-        ".",
-        "s1",
     });
-    defer explicit_local.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--attach", "s1" }, explicit_local.args.items);
+    defer latest_local.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "--attach" }, latest_local.args.items);
 
     var local = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -3192,9 +3216,32 @@ test "translateMuxArgs maps local and host-qualified attach" {
     });
     defer remote.deinit();
     try expectArgvEqual(&.{ "sesshmux", "-F", "cfg", "example.com", "--attach", "s1" }, remote.args.items);
+
+    var remote_latest = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "attach",
+        "--host",
+        "example.com",
+    });
+    defer remote_latest.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "--attach" }, remote_latest.args.items);
+
+    try std.testing.expectError(error.TooManyMuxArguments, translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "attach",
+        "example.com",
+        "s1",
+    }));
 }
 
 test "translateMuxArgs maps explicit local list" {
+    var default_local_list = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "list",
+    });
+    defer default_local_list.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "--list" }, default_local_list.args.items);
+
     var local_list = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
         "list",
@@ -3233,6 +3280,14 @@ test "translateMuxArgs maps kill and kill all" {
     });
     defer kill_all.deinit();
     try expectArgvEqual(&.{ "sesshmux", "-F", "cfg", "example.com", "--kill-all" }, kill_all.args.items);
+
+    var default_local_kill_all = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "kill",
+        "--all",
+    });
+    defer default_local_kill_all.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "--kill-all" }, default_local_kill_all.args.items);
 
     var local_kill_all = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",

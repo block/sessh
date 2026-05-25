@@ -58,7 +58,7 @@ if [ ! -x "$real" ]; then
 fi
 
 if [ "$name" = "sessh" ]; then
-  exec "$real" new "$@"
+  SESSH_ENTRYPOINT=sessh exec "$real" new "$@"
 fi
 
-exec "$real" "$@"
+SESSH_ENTRYPOINT=sesshmux exec "$real" "$@"

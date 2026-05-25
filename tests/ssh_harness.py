@@ -1164,7 +1164,7 @@ def test_ssh_remote_default_alias_is_remote_generated(tmp):
     if len(remote_aliases) != 1:
         raise AssertionError(listed.stdout)
 
-    attached = run_sessh_until_stdout(["attach", "test-host", remote_aliases[0]], env, marker)
+    attached = run_sessh_until_stdout(["attach", "--host", "test-host", remote_aliases[0]], env, marker)
     if attached.returncode != 0:
         raise AssertionError(attached)
 
@@ -1178,7 +1178,7 @@ def test_ssh_host_attach_does_not_follow_remote_route(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     write_ssh_route(env, "remote-hop", guid_for_alias("remote-hop"), "other-host")
 
-    result = run_sessh(["attach", "test-host", "remote-hop"], env, timeout=30.0)
+    result = run_sessh(["attach", "--host", "test-host", "remote-hop"], env, timeout=30.0)
 
     if result.returncode == 0:
         raise AssertionError(result)
@@ -1634,7 +1634,7 @@ def test_ssh_unsupported_remote_platform_does_not_plain_ssh_fallback_for_attach(
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
     env["SESSH_FAKE_SSH_REMOTE_PATH"] = str(remote_bin)
 
-    result = run_sessh(["attach", "test-host", guid_for_alias("s1")], env, timeout=30.0)
+    result = run_sessh(["attach", "--host", "test-host", guid_for_alias("s1")], env, timeout=30.0)
 
     if result.returncode == 0:
         raise AssertionError(result)
