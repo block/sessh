@@ -178,7 +178,7 @@ trying the normal bootstrap/runtime path.
 
 ## Local mode
 
-You may specify `:local:` in place of host to use `sessh` locally without
+You may specify `.` in place of host to use `sessh` locally without
 `ssh`. This mode is a super-primitive version of `tmux`/`screen`, but with
 native scrolling and mouse behavior. It's not very useful by itself, but that's
 how we support the compat-fallback path documented above.

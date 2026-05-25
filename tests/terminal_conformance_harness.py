@@ -547,7 +547,7 @@ def sessh_command(env, shell):
         *quoted_env_assignments(env),
         f"SHELL={shlex.quote(str(shell))}",
         shlex.quote(str(BIN)),
-        ":local:",
+        ".",
     ]
     return " ".join(parts)
 

@@ -353,7 +353,7 @@ fn runCompatCommand(allocator: std.mem.Allocator, paths: session_registry.Sessio
     const argv = try allocator.alloc([]const u8, 4 + args.len);
     defer allocator.free(argv);
     argv[0] = paths.compat;
-    argv[1] = ":local:";
+    argv[1] = ".";
     argv[2] = "--compat-version";
     argv[3] = config.version;
     @memcpy(argv[4..], args);

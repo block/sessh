@@ -2148,7 +2148,7 @@ def run_slow_attachment_does_not_block_commands_test(base_env):
             time.sleep(0.5)
 
             try:
-                listed = run([":local:", "--compat-version", sessh_version(), "--list"], env, check=True, timeout=2.0)
+                listed = run([".", "--compat-version", sessh_version(), "--list"], env, check=True, timeout=2.0)
             except subprocess.TimeoutExpired as exc:
                 raise AssertionError("management command path blocked behind a slow attachment") from exc
             if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:
@@ -2520,7 +2520,7 @@ def run_broker_kill_edge_cases_test(base_env):
             killed = run([":internal-broker:", "kill", "s1"], env, check=True, timeout=5.0)
             if killed.stdout or killed.stderr:
                 raise AssertionError(killed)
-            expected = f":local: --compat-version {sessh_version()} --kill s1"
+            expected = f". --compat-version {sessh_version()} --kill s1"
             if expected not in compat_log.read_text().splitlines():
                 raise AssertionError(compat_log.read_text())
             if sleeper.poll() is not None:
@@ -2549,7 +2549,7 @@ def run_broker_kill_edge_cases_test(base_env):
                 raise AssertionError(stopped)
             lines = compat_log.read_text().splitlines()
             for session_id in ("s1", "s2"):
-                expected = f":local: --compat-version {sessh_version()} --kill {compact_guid(guid_for_ref(session_id))}"
+                expected = f". --compat-version {sessh_version()} --kill {compact_guid(guid_for_ref(session_id))}"
                 if expected not in lines:
                     raise AssertionError(lines)
             if any(proc.poll() is not None for proc in sleepers):
@@ -2572,7 +2572,7 @@ def spawn_bin(env, args):
 
 def spawn_client(env, extra_args=None):
     extra_args = extra_args or []
-    return spawn_bin(env, [":local:", *extra_args])
+    return spawn_bin(env, [".", *extra_args])
 
 
 def close_client(pid, fd):
@@ -2638,7 +2638,7 @@ def run_env_config_client_test(tmp_root):
         finally:
             close_client(pid, fd)
 
-        killed = run([":local:", "--kill", "s1"], env, check=True, timeout=5.0)
+        killed = run([".", "--kill", "s1"], env, check=True, timeout=5.0)
         if "ENDED s1" not in killed.stdout:
             raise AssertionError(killed.stdout)
 
@@ -2651,7 +2651,7 @@ def run_env_config_client_test(tmp_root):
         finally:
             close_client(pid, fd)
 
-        killed = run([":local:", "--kill", "s2"], env, check=True, timeout=5.0)
+        killed = run([".", "--kill", "s2"], env, check=True, timeout=5.0)
         if "ENDED s2" not in killed.stdout:
             raise AssertionError(killed.stdout)
     finally:
@@ -2710,7 +2710,7 @@ def run_tty_transcript_capture_test(tmp_root):
         if b"transcript_inner_marker" not in inner_out:
             raise AssertionError(inner_out)
 
-        killed = run([":local:", "--kill", "s1"], env, check=True, timeout=5.0)
+        killed = run([".", "--kill", "s1"], env, check=True, timeout=5.0)
         if "ENDED s1" not in killed.stdout:
             raise AssertionError(killed.stdout)
     finally:
@@ -2734,24 +2734,24 @@ def main():
             if short_help_text.returncode != 0 or short_help_text.stdout != help_text.stdout:
                 raise AssertionError(short_help_text)
 
-            bad = run([":local:", "/tmp/not-a-socket-path"], env, timeout=5.0)
+            bad = run([".", "/tmp/not-a-socket-path"], env, timeout=5.0)
             if bad.returncode != 64:
                 raise AssertionError(bad)
 
             for bare_command in (["list"], ["kill", "s1"]):
-                bad = run([":local:", *bare_command], env, timeout=5.0)
+                bad = run([".", *bare_command], env, timeout=5.0)
                 if bad.returncode != 64:
                     raise AssertionError((bare_command, bad))
 
-            bad = run([":local:", "--leader", "CTRL-C", "--list"], env, timeout=5.0)
+            bad = run([".", "--leader", "CTRL-C", "--list"], env, timeout=5.0)
             if bad.returncode != 64:
                 raise AssertionError(bad)
 
-            bad = run([":local:", "--scrollback-limit", "0"], env, timeout=5.0)
+            bad = run([".", "--scrollback-limit", "0"], env, timeout=5.0)
             if bad.returncode != 64:
                 raise AssertionError(bad)
 
-            stopped = run([":local:", "--kill-all"], env, timeout=5.0)
+            stopped = run([".", "--kill-all"], env, timeout=5.0)
             if stopped.returncode != 0 or stopped.stdout != "KILLING_ALL\n":
                 raise AssertionError(stopped)
             if sessions_dir(env).exists() and any(sessions_dir(env).iterdir()):
@@ -2790,7 +2790,7 @@ def main():
             run_env_config_client_test(tmp)
             run_tty_transcript_capture_test(tmp)
 
-            listed = run([":local:", "--list"], env, check=True, timeout=5.0)
+            listed = run([".", "--list"], env, check=True, timeout=5.0)
             if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:
                 raise AssertionError(listed.stdout)
 
@@ -2810,7 +2810,7 @@ def main():
             finally:
                 close_client(pid, fd)
 
-            listed = run([":local:", "--list"], env, check=True, timeout=5.0)
+            listed = run([".", "--list"], env, check=True, timeout=5.0)
             if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:
                 raise AssertionError(listed.stdout)
             if "s1\tno\t" not in listed.stdout:
@@ -2837,20 +2837,20 @@ def main():
             finally:
                 close_client(pid, fd)
 
-            listed = run([":local:", "--list"], env, check=True, timeout=5.0)
+            listed = run([".", "--list"], env, check=True, timeout=5.0)
             current_sessions = sessions(listed.stdout)
             if "s2" not in current_sessions:
                 raise AssertionError(listed.stdout)
 
-            killed = run([":local:", "--kill", "s2"], env, check=True, timeout=5.0)
+            killed = run([".", "--kill", "s2"], env, check=True, timeout=5.0)
             if "ENDED s2" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
-            listed = run([":local:", "--list"], env, check=True, timeout=5.0)
+            listed = run([".", "--list"], env, check=True, timeout=5.0)
             if "s2" in sessions(listed.stdout):
                 raise AssertionError(listed.stdout)
 
-            missing = run([":local:", "--kill", "missing"], env, timeout=5.0)
+            missing = run([".", "--kill", "missing"], env, timeout=5.0)
             if missing.returncode != 1 or "ERROR session not found" not in missing.stderr:
                 raise AssertionError(missing)
 
@@ -2861,7 +2861,7 @@ def main():
             finally:
                 close_client(pid, fd)
 
-            listed = run([":local:", "--list"], env, check=True, timeout=5.0)
+            listed = run([".", "--list"], env, check=True, timeout=5.0)
             current_sessions = sessions(listed.stdout)
             if current_sessions.get("s3", {}).get("attached") != "no":
                 raise AssertionError(listed.stdout)
@@ -2894,14 +2894,14 @@ def main():
             finally:
                 close_client(pid, fd)
 
-            killed = run([":local:", "--kill", "s4"], env, check=True, timeout=5.0)
+            killed = run([".", "--kill", "s4"], env, check=True, timeout=5.0)
             if "ENDED s4" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
             pid1, fd1 = spawn_client(env, ["--alias", "s5"])
             try:
                 read_until(fd1, b"$ ")
-                listed = run([":local:", "--list"], env, check=True, timeout=5.0)
+                listed = run([".", "--list"], env, check=True, timeout=5.0)
                 current_sessions = sessions(listed.stdout)
                 if current_sessions.get("s5", {}).get("attached") != "yes":
                     raise AssertionError(listed.stdout)
@@ -2920,7 +2920,7 @@ def main():
             finally:
                 close_client(pid1, fd1)
 
-            killed = run([":local:", "--kill", "s5"], env, check=True, timeout=5.0)
+            killed = run([".", "--kill", "s5"], env, check=True, timeout=5.0)
             if "ENDED s5" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
@@ -2940,7 +2940,7 @@ def main():
                 close_client(pid, fd)
             wait_file(drain_done)
 
-            killed = run([":local:", "--kill", "s6"], env, check=True, timeout=5.0)
+            killed = run([".", "--kill", "s6"], env, check=True, timeout=5.0)
             if "ENDED s6" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
@@ -2958,7 +2958,7 @@ def main():
                 if needle not in log_text:
                     raise AssertionError(f"missing session-agent log entry {needle!r}; log was {log_text!r}")
 
-            stopped = run([":local:", "--kill-all"], env, check=True, timeout=5.0)
+            stopped = run([".", "--kill-all"], env, check=True, timeout=5.0)
             if "KILLING_ALL" not in stopped.stdout:
                 raise AssertionError(stopped.stdout)
         finally:

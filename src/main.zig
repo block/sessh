@@ -43,8 +43,8 @@ fn runMain() !void {
         return;
     }
 
-    if (isInternalMode(args[1]) and !isMuxExecutable(args[0])) {
-        try io.writeAll(2, "sessh: internal modes are only supported by sesshmux\n");
+    if (isMuxOnlyEntryMode(args[1]) and !isMuxExecutable(args[0])) {
+        try io.writeAll(2, "sessh: local/internal modes are only supported by sesshmux\n");
         return process_exit.request(64);
     }
 
@@ -60,15 +60,15 @@ fn runMain() !void {
         return broker.run(allocator, args[0], args[2..]);
     }
 
-    if (std.mem.eql(u8, args[1], ":local:")) {
+    if (std.mem.eql(u8, args[1], ".")) {
         return client.run(allocator, args);
     }
 
     return ssh_client.runMux(allocator, args);
 }
 
-fn isInternalMode(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, ":local:") or std.mem.startsWith(u8, arg, ":internal-");
+fn isMuxOnlyEntryMode(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, ".") or std.mem.startsWith(u8, arg, ":internal-");
 }
 
 fn isMuxExecutable(path: []const u8) bool {
@@ -87,11 +87,11 @@ fn isSha256HexName(name: []const u8) bool {
     return true;
 }
 
-test "internal modes are only supported by sesshmux executable names" {
-    try std.testing.expect(isInternalMode(":internal-broker:"));
-    try std.testing.expect(isInternalMode(":internal-session-agent:"));
-    try std.testing.expect(isInternalMode(":local:"));
-    try std.testing.expect(!isInternalMode("new"));
+test "mux-only entry modes are limited to sesshmux executable names" {
+    try std.testing.expect(isMuxOnlyEntryMode(":internal-broker:"));
+    try std.testing.expect(isMuxOnlyEntryMode(":internal-session-agent:"));
+    try std.testing.expect(isMuxOnlyEntryMode("."));
+    try std.testing.expect(!isMuxOnlyEntryMode("new"));
 
     try std.testing.expect(isMuxExecutable("/opt/sessh/bin/sesshmux"));
     try std.testing.expect(isMuxExecutable("/tmp/sesshmux-dev"));

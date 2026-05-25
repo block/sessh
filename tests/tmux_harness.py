@@ -84,13 +84,13 @@ def sessh_command(env, *extra, shell="/bin/sh"):
         f"SHELL={shlex.quote(str(shell))}",
         f"PS1={shlex.quote(HARNESS_PROMPT)}",
     ]
-    parts.extend([shlex.quote(str(BIN)), ":local:", *extra])
+    parts.extend([shlex.quote(str(BIN)), ".", *extra])
     return " ".join(parts)
 
 
 def home_shell_command(name, *extra):
     suffix = "" if not extra else " " + " ".join(extra)
-    return f"SHELL=~/{name} {shlex.quote(str(BIN))} :local:{suffix}"
+    return f"SHELL=~/{name} {shlex.quote(str(BIN))} .{suffix}"
 
 
 def capture(session):

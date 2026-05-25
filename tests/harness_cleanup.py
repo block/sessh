@@ -45,7 +45,7 @@ def kill_all(env, timeout=5.0):
         return
 
     subprocess.run(
-        [str(BIN), ":local:", "--kill-all"],
+        [str(BIN), ".", "--kill-all"],
         cwd=ROOT,
         env=env,
         text=True,

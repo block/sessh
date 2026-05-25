@@ -244,7 +244,7 @@ def main():
             direct = capture_seq100_output([shell], env)
             tmux = capture_tmux_output(shell, env, tmp)
             screen = capture_screen_output(shell, env, tmp)
-            through_sessh = capture_seq100_output([BIN, ":local:"], env)
+            through_sessh = capture_seq100_output([BIN, "."], env)
         finally:
             cleanup_runtime(env)
 
@@ -257,7 +257,7 @@ def main():
         ("direct PTY", direct),
         ("tmux", tmux),
         ("screen", screen),
-        ("sessh :local:", through_sessh),
+        ("sessh .", through_sessh),
     ]
     summaries = {}
     for name, data in results:
@@ -269,7 +269,7 @@ def main():
 
     direct_bytes = summaries["direct PTY"]["bytes"]
     print("overhead vs direct PTY:")
-    for name in ("tmux", "screen", "sessh :local:"):
+    for name in ("tmux", "screen", "sessh ."):
         summary = summaries.get(name)
         if summary is None:
             continue

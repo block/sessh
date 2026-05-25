@@ -32,7 +32,7 @@ to build and install a binary in ~/.local/bin/sessh
 Prefer process-level tests that invoke the `sessh` binary and exercise real
 protocol, socket, PTY, filesystem, and terminal behavior (i.e. avoid mocks).
 
-Most behavior should be tested without ssh by using the `:local:` transport.
+Most behavior should be tested without ssh by using the `.` transport.
 Use Podman only for slower end-to-end coverage across a real ssh boundary.
 
 When fixing a bug or introducing new functionality, write a test first, and

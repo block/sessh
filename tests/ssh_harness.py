@@ -1744,7 +1744,7 @@ def test_ssh_version_mismatch_uses_compat_path(tmp):
     if "compat_invoked=1" not in log_text:
         raise AssertionError(log_text)
     expected_args = (
-        f"compat_args=:local: --compat-version {sessh_version()} "
+        f"compat_args=. --compat-version {sessh_version()} "
         "--attach --leader CTRL-B --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
     )
     if expected_args not in log_text:
@@ -1780,7 +1780,7 @@ def test_ssh_force_compat_uses_compat_path(tmp):
     if "batch_mode=1" in log_text:
         raise AssertionError(log_text)
     expected_args = (
-        f"compat_args=:local: --compat-version {sessh_version()} "
+        f"compat_args=. --compat-version {sessh_version()} "
         "--attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
     )
     if expected_args not in log_text:

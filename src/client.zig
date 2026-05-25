@@ -1661,11 +1661,11 @@ test "runtime repaint after local ui requests screen-only repaint" {
     try std.testing.expectEqual(@as(i32, 6), session.viewport_offset);
 }
 
-/// Implements the public `sessh :local:` path. This is both the local testing
+/// Implements the public `sessh .` path. This is both the local testing
 /// transport and the same broker/agent flow used by ssh after bootstrap.
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var options = parseLocalOptions(args) catch |err| {
-        try io_helpers.stderrPrint("sessh: invalid :local: arguments: {t}\n", .{err});
+        try io_helpers.stderrPrint("sessh: invalid . arguments: {t}\n", .{err});
         return process_exit.request(64);
     };
     applyFileConfigToLocal(allocator, &options) catch |err| {
@@ -1791,7 +1791,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             .detach => {
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
-                writeDetachBannerForTarget(&.{}, ":local:", options.banner_args.slice(), session.idSlice());
+                writeDetachBannerForTarget(&.{}, ".", options.banner_args.slice(), session.idSlice());
                 return;
             },
             .session_ended => {

@@ -628,6 +628,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if ((parsed_ssh_args.action == .attach or parsed_ssh_args.action == .kill) and parsed_ssh_args.host.len == 0) {
         return runLocalRouteCommand(allocator, args);
     }
+    if (std.mem.eql(u8, parsed_ssh_args.host, ".")) {
+        return client.run(allocator, args);
+    }
     applyFileConfigToSsh(allocator, &parsed_ssh_args) catch |err| {
         try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
         return process_exit.request(64);
@@ -1170,7 +1173,7 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    printf 'sessh: session compat binary is unavailable\n' >&2
         \\    exit 1
         \\  fi
-        \\  SESSH_RUNTIME_DIR=$runtime_root exec "$compat" :local: --compat-version {s}{s}
+        \\  SESSH_RUNTIME_DIR=$runtime_root exec "$compat" . --compat-version {s}{s}
         \\}}
         \\run_each_compat() {{
         \\  found=0
@@ -1178,7 +1181,7 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\  for compat in "$runtime_root"/g/*/compat; do
         \\    [ -e "$compat" ] || continue
         \\    found=1
-        \\    SESSH_RUNTIME_DIR=$runtime_root "$compat" :local: --compat-version {s}{s}
+        \\    SESSH_RUNTIME_DIR=$runtime_root "$compat" . --compat-version {s}{s}
         \\    code=$?
         \\    if [ "$code" -ne 0 ]; then
         \\      status=$code
@@ -2072,7 +2075,7 @@ fn runLocalRouteCommand(allocator: std.mem.Allocator, args: []const []const u8) 
     const local_args = try allocator.alloc([]const u8, args.len + 1);
     defer allocator.free(local_args);
     local_args[0] = args[0];
-    local_args[1] = ":local:";
+    local_args[1] = ".";
     @memcpy(local_args[2..], args[1..]);
     return client.run(allocator, local_args);
 }
@@ -3159,6 +3162,15 @@ test "translateMuxArgs rejects sessh options after host" {
 }
 
 test "translateMuxArgs maps local and host-qualified attach" {
+    var explicit_local = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "attach",
+        ".",
+        "s1",
+    });
+    defer explicit_local.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "--attach", "s1" }, explicit_local.args.items);
+
     var local = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
         "attach",
@@ -3180,6 +3192,16 @@ test "translateMuxArgs maps local and host-qualified attach" {
     });
     defer remote.deinit();
     try expectArgvEqual(&.{ "sesshmux", "-F", "cfg", "example.com", "--attach", "s1" }, remote.args.items);
+}
+
+test "translateMuxArgs maps explicit local list" {
+    var local_list = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "list",
+        ".",
+    });
+    defer local_list.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "--list" }, local_list.args.items);
 }
 
 test "translateMuxArgs maps kill and kill all" {
@@ -3211,6 +3233,15 @@ test "translateMuxArgs maps kill and kill all" {
     });
     defer kill_all.deinit();
     try expectArgvEqual(&.{ "sesshmux", "-F", "cfg", "example.com", "--kill-all" }, kill_all.args.items);
+
+    var local_kill_all = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "kill",
+        "--all",
+        ".",
+    });
+    defer local_kill_all.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "--kill-all" }, local_kill_all.args.items);
 }
 
 fn expectArgvEqual(expected: []const []const u8, actual: []const []const u8) !void {
