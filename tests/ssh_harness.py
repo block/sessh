@@ -629,6 +629,30 @@ def guid_for_alias(alias):
     return f"s-{digest[0:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
 
 
+def list_rows(list_stdout):
+    rows = []
+    for line in list_stdout.splitlines()[1:]:
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            raise AssertionError(f"invalid list row: {line!r}\n{list_stdout}")
+        rows.append(parts[:3])
+    return rows
+
+
+def has_list_header(list_stdout):
+    header = list_stdout.splitlines()[0] if list_stdout.splitlines() else ""
+    return all(column in header for column in ("ID", "HOST", "GUID"))
+
+
+def list_has_session(list_stdout, session_id):
+    for row in list_rows(list_stdout):
+        if row[0] == session_id or row[2] == session_id:
+            return True
+    return False
+
+
 def ensure_alias(env, alias, guid=None):
     guid = guid or guid_for_alias(alias)
     alias_path = aliases_dir(env) / alias
@@ -646,10 +670,10 @@ def write_ssh_route(env, alias, guid, host, ssh_options=()):
     lines = [
         f"guid={guid}",
         f"primary_alias={alias}",
-        f"session_dir={str(remote_session_dir).encode('utf-8').hex()}",
-        f"host={host.encode('utf-8').hex()}",
+        f"session_dir={remote_session_dir}",
+        f"host={host}",
     ]
-    lines.extend(f"ssh_option={option.encode('utf-8').hex()}" for option in ssh_options)
+    lines.extend(f"ssh_option={option}" for option in ssh_options)
     (session / "route").write_text("\n".join(lines) + "\n")
     return session
 
@@ -1274,7 +1298,7 @@ def test_ssh_remote_default_alias_is_remote_generated(tmp):
     listed = run_sesshmux(["list", "test-host"], env, timeout=30.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
-    rows = [line.split("\t") for line in listed.stdout.splitlines()[1:] if line]
+    rows = list_rows(listed.stdout)
     aliases = [row[0] for row in rows if len(row) >= 1]
     remote_aliases = [alias for alias in aliases if re.fullmatch(r"s-[0-9a-f]{4,32}", alias)]
     if len(remote_aliases) != 1:
@@ -1922,7 +1946,7 @@ def test_ssh_remote_session_commands_use_broker(tmp):
     listed = run_sesshmux(["list", "test-host"], env, timeout=30.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
-    if "ID\tATTACHED\tAGENT_PID" not in listed.stdout or "s1\tno\t" not in listed.stdout:
+    if not has_list_header(listed.stdout) or not list_has_session(listed.stdout, "s1"):
         raise AssertionError(listed)
 
     killed = run_sesshmux(["kill", "test-host", "s1"], env, timeout=30.0)

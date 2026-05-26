@@ -1411,7 +1411,7 @@ fn flushAttachmentOutput(session_agent: *SessionAgent, attachment_index: usize) 
 fn attachedCount(session_agent: *SessionAgent, session_index: usize) u32 {
     var count: u32 = 0;
     for (&session_agent.attachments) |*attachment| {
-        if (attachment.active and attachment.session_index == session_index) count += 1;
+        if (attachment.active and attachment.session_index == session_index and !attachment.close_after_flush) count += 1;
     }
     return count;
 }
@@ -2813,16 +2813,10 @@ fn refreshAttachedFlag(session_agent: *SessionAgent, session_index: usize) void 
         return;
     }
 
-    const was_attached = session_agent.sessions[session_index].attached;
-    var now_attached = false;
-    for (&session_agent.attachments) |*attachment| {
-        if (attachment.active and attachment.session_index == session_index) {
-            now_attached = true;
-            break;
-        }
-    }
+    const count = attachedCount(session_agent, session_index);
+    const now_attached = count > 0;
     session_agent.sessions[session_index].attached = now_attached;
-    updateDetachedHint(session_agent, was_attached, now_attached);
+    updateAttachmentHints(session_agent, now_attached);
 }
 
 fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, exit_info: ExitInfo) void {
@@ -2852,23 +2846,23 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
         model.destroy();
         session.terminal_model = null;
     }
-    clearDetachedHint(session_agent);
+    clearAttachmentHints(session_agent);
     session.deinit();
     session.alive = false;
     session.attached = false;
 }
 
-fn updateDetachedHint(session_agent: *SessionAgent, was_attached: bool, now_attached: bool) void {
+fn updateAttachmentHints(session_agent: *SessionAgent, attached: bool) void {
     if (session_agent.session_paths == null) return;
-    if (!was_attached and now_attached) {
+    if (attached) {
         session_registry.markAttached(session_agent.session_paths.?) catch {};
-    } else if (was_attached and !now_attached) {
+    } else {
         session_registry.markDetached(session_agent.session_paths.?) catch {};
     }
 }
 
-fn clearDetachedHint(session_agent: *SessionAgent) void {
-    if (session_agent.session_paths) |paths| session_registry.markAttached(paths) catch {};
+fn clearAttachmentHints(session_agent: *SessionAgent) void {
+    if (session_agent.session_paths) |paths| session_registry.removeEndedHints(paths) catch {};
 }
 
 fn stopSessionAgentIfComplete(session_agent: *SessionAgent) void {

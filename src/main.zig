@@ -139,7 +139,7 @@ fn usage(code: u8, entrypoint: EntryPoint) !void {
         \\usage:
         \\  sesshmux new [options] [--ssh-options "ssh args"] HOST [-- cmd arg...]
         \\  sesshmux attach [options] [[--ssh-options "ssh args"] --host HOST] [ID]
-        \\  sesshmux list [[--ssh-options "ssh args"] HOST]
+        \\  sesshmux list [--refresh] [[--ssh-options "ssh args"] HOST]
         \\  sesshmux kill [[--ssh-options "ssh args"] HOST] ID
         \\  sesshmux kill --all [[--ssh-options "ssh args"] HOST]
         \\

@@ -50,7 +50,10 @@ Use `sesshmux` for session management:
   session GUID.
 - `sesshmux attach --host HOST [ID]`: attach by resolving `ID` on `HOST`, or
   attach to the most recent attachable session on `HOST` if `ID` is omitted.
-- `sesshmux list [HOST]`: list attachable sessions locally or on `HOST`.
+- `sesshmux list [--refresh] [HOST]`: list attachable sessions locally or on
+  `HOST`. Without `HOST`, local sessions and cached remote routes are shown.
+  Use `sesshmux list .` to show only local sessions. `--refresh` checks cached
+  remote routes that were alive the last time sessh checked them.
 - `sesshmux kill [HOST] ID`: terminate the specified local or remote session.
 - `sesshmux kill --all [HOST]`: terminate all local sessions or all sessions on
   `HOST`.

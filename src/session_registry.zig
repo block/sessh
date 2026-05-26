@@ -126,6 +126,12 @@ pub fn sessionsDir(allocator: std.mem.Allocator) ![]u8 {
     return sessionsDirInRoot(allocator, root);
 }
 
+pub fn stateSessionsDir(allocator: std.mem.Allocator) ![]u8 {
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    return sessionsDirInRoot(allocator, root);
+}
+
 pub fn sessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/g", .{root});
 }
@@ -370,6 +376,7 @@ pub const Route = struct {
     session_dir: []const u8,
     host: []const u8,
     ssh_options: []const []const u8,
+    last_known_alive: bool,
 
     pub fn deinit(self: *Route, allocator: std.mem.Allocator) void {
         allocator.free(self.ssh_options);
@@ -386,7 +393,7 @@ pub fn writeSshRoute(
     host: []const u8,
     ssh_options: []const []const u8,
 ) !void {
-    return writeRoute(allocator, guid, primary_alias, session_dir, host, ssh_options);
+    return writeRoute(allocator, guid, primary_alias, session_dir, host, ssh_options, .{});
 }
 
 pub fn writeLocalRoute(
@@ -395,8 +402,12 @@ pub fn writeLocalRoute(
     primary_alias: []const u8,
     session_dir: []const u8,
 ) !void {
-    return writeRoute(allocator, guid, primary_alias, session_dir, "", &.{});
+    return writeRoute(allocator, guid, primary_alias, session_dir, ".", &.{}, .{});
 }
+
+const RouteStatus = struct {
+    last_known_alive: bool = true,
+};
 
 fn writeRoute(
     allocator: std.mem.Allocator,
@@ -405,6 +416,7 @@ fn writeRoute(
     session_dir: []const u8,
     host: []const u8,
     ssh_options: []const []const u8,
+    status: RouteStatus,
 ) !void {
     if (!isAbsolutePath(session_dir)) return error.InvalidSessionDir;
     const canonical = try canonicalGuid(allocator, guid);
@@ -413,18 +425,13 @@ fn writeRoute(
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     const writer = text.writer(allocator);
-    try writer.print("guid={s}\n", .{canonical});
-    try writer.print("primary_alias={s}\n", .{primary_alias});
-    try writer.print("session_dir=", .{});
-    try appendHex(&text, allocator, session_dir);
-    try writer.print("\n", .{});
-    try writer.print("host=", .{});
-    try appendHex(&text, allocator, host);
-    try writer.print("\n", .{});
+    try writeRouteField(writer, "guid", canonical);
+    try writeRouteField(writer, "primary_alias", primary_alias);
+    try writeRouteField(writer, "session_dir", session_dir);
+    try writeRouteField(writer, "host", host);
+    try writer.print("alive={s}\n", .{if (status.last_known_alive) "1" else "0"});
     for (ssh_options) |arg| {
-        try writer.print("ssh_option=", .{});
-        try appendHex(&text, allocator, arg);
-        try writer.print("\n", .{});
+        try writeRouteField(writer, "ssh_option", arg);
     }
 
     const route_path = try routePathForGuid(allocator, canonical);
@@ -434,6 +441,20 @@ fn writeRoute(
     const file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
     defer file.close();
     try file.writeAll(text.items);
+}
+
+pub fn updateRouteStatus(allocator: std.mem.Allocator, guid: []const u8, last_known_alive: bool) !void {
+    var route = try readRouteForRef(allocator, guid);
+    defer route.deinit(allocator);
+    try writeRoute(
+        allocator,
+        route.guid,
+        route.primary_alias,
+        route.session_dir,
+        route.host,
+        route.ssh_options,
+        .{ .last_known_alive = last_known_alive },
+    );
 }
 
 pub fn readRouteForRef(allocator: std.mem.Allocator, ref: []const u8) !Route {
@@ -478,6 +499,7 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
     var primary_alias: ?[]const u8 = null;
     var session_dir: ?[]const u8 = null;
     var host: ?[]const u8 = null;
+    var last_known_alive = true;
     var option_count: usize = 0;
 
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -495,6 +517,8 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
             session_dir = value;
         } else if (std.mem.eql(u8, key, "host")) {
             host = value;
+        } else if (std.mem.eql(u8, key, "alive")) {
+            last_known_alive = try parseRouteAlive(value);
         } else if (std.mem.eql(u8, key, "ssh_option")) {
             option_count += 1;
         }
@@ -509,23 +533,35 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
         const key = line[0..eq];
         const value = line[eq + 1 ..];
         if (std.mem.eql(u8, key, "ssh_option")) {
-            options[option_index] = try decodeHexInPlace(value);
+            options[option_index] = value;
             option_index += 1;
         }
     }
 
-    const decoded_session_dir = if (session_dir) |value| try decodeHexInPlace(value) else "";
-    if (decoded_session_dir.len > 0 and !isAbsolutePath(decoded_session_dir)) return error.InvalidRoute;
-    const decoded_host = if (host) |value| try decodeHexInPlace(value) else "";
+    const plain_session_dir = session_dir orelse "";
+    if (plain_session_dir.len > 0 and !isAbsolutePath(plain_session_dir)) return error.InvalidRoute;
+    const plain_host = host orelse "";
 
     return .{
         .bytes = bytes,
         .guid = guid orelse return error.InvalidRoute,
         .primary_alias = primary_alias orelse return error.InvalidRoute,
-        .session_dir = decoded_session_dir,
-        .host = decoded_host,
+        .session_dir = plain_session_dir,
+        .host = plain_host,
         .ssh_options = options,
+        .last_known_alive = last_known_alive,
     };
+}
+
+fn writeRouteField(writer: anytype, key: []const u8, value: []const u8) !void {
+    if (std.mem.indexOfAny(u8, value, "\r\n") != null) return error.InvalidRouteValue;
+    try writer.print("{s}={s}\n", .{ key, value });
+}
+
+fn parseRouteAlive(value: []const u8) !bool {
+    if (std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes")) return true;
+    if (std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "no")) return false;
+    return error.InvalidRoute;
 }
 
 pub fn createAlias(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !void {
@@ -767,29 +803,6 @@ fn isReservedGuidLikeAlias(alias: []const u8) bool {
     if (!std.ascii.isAlphabetic(alias[0]) or alias[1] != '-') return false;
     const body = alias[2..];
     return isValidGuidBody(body) or isValidCompactGuid(body);
-}
-
-fn appendHex(out: *std.ArrayList(u8), allocator: std.mem.Allocator, bytes: []const u8) !void {
-    const alphabet = "0123456789abcdef";
-    try out.ensureUnusedCapacity(allocator, bytes.len * 2);
-    for (bytes) |byte| {
-        out.appendAssumeCapacity(alphabet[byte >> 4]);
-        out.appendAssumeCapacity(alphabet[byte & 0x0f]);
-    }
-}
-
-fn decodeHexInPlace(value: []const u8) ![]const u8 {
-    if (value.len % 2 != 0) return error.InvalidRoute;
-    const mutable: []u8 = @constCast(value);
-    var dst: usize = 0;
-    var src: usize = 0;
-    while (src < value.len) : (src += 2) {
-        const hi = std.fmt.charToDigit(value[src], 16) catch return error.InvalidRoute;
-        const lo = std.fmt.charToDigit(value[src + 1], 16) catch return error.InvalidRoute;
-        mutable[dst] = @intCast((hi << 4) | lo);
-        dst += 1;
-    }
-    return mutable[0..dst];
 }
 
 fn isAbsolutePath(path: []const u8) bool {
@@ -1049,14 +1062,10 @@ test "route files persist absolute session directories" {
     try writer.writeAll("guid=s-550e8400-e29b-41d4-a716-446655440000\n");
     try writer.writeAll("primary_alias=s-550e\n");
     try writer.writeAll("session_dir=");
-    try appendHex(&text, allocator, session_dir);
+    try writer.writeAll(session_dir);
     try writer.writeAll("\n");
-    try writer.writeAll("host=");
-    try appendHex(&text, allocator, "work.example");
-    try writer.writeAll("\n");
-    try writer.writeAll("ssh_option=");
-    try appendHex(&text, allocator, "-F");
-    try writer.writeAll("\n");
+    try writer.writeAll("host=work.example\n");
+    try writer.writeAll("ssh_option=-F\n");
 
     const file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
     try file.writeAll(text.items);
@@ -1068,6 +1077,7 @@ test "route files persist absolute session directories" {
     try std.testing.expectEqualStrings("s-550e", route.primary_alias);
     try std.testing.expectEqualStrings(session_dir, route.session_dir);
     try std.testing.expectEqualStrings("work.example", route.host);
+    try std.testing.expect(route.last_known_alive);
     try std.testing.expectEqual(@as(usize, 1), route.ssh_options.len);
     try std.testing.expectEqualStrings("-F", route.ssh_options[0]);
 }

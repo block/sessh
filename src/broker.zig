@@ -5,6 +5,7 @@ const posix = std.posix;
 
 const config = @import("config.zig");
 const io = @import("io.zig");
+const list_format = @import("list_format.zig");
 const process_exit = @import("process_exit.zig");
 const protocol = @import("protocol.zig");
 const relay = @import("relay.zig");
@@ -94,8 +95,8 @@ fn applyBrokerOptions(args: []const []const u8) ![]const []const u8 {
 fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const command = args[0];
     if (std.mem.eql(u8, command, "list")) {
-        if (args.len != 1) return finishCommand(64, "", "ERROR usage: list\n");
-        const exit_status = try listAgents(allocator);
+        const host_display = parseListHostDisplay(args) catch return finishCommand(64, "", "ERROR usage: list [--host-display HOST]\n");
+        const exit_status = try listAgents(allocator, host_display);
         return process_exit.request(exit_status);
     }
     if (std.mem.eql(u8, command, "kill")) {
@@ -112,10 +113,17 @@ fn finishCommand(exit_status: u8, stdout: []const u8, stderr: []const u8) !void 
     return process_exit.request(exit_status);
 }
 
-fn listAgents(allocator: std.mem.Allocator) !u8 {
+fn parseListHostDisplay(args: []const []const u8) ![]const u8 {
+    if (args.len == 1) return ".";
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--host-display")) return args[2];
+    return error.InvalidListArgs;
+}
+
+fn listAgents(allocator: std.mem.Allocator, host_display: []const u8) !u8 {
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
-    try stdout.appendSlice(allocator, "ID\tATTACHED\tAGENT_PID\n");
+    const writer = stdout.writer(allocator);
+    try list_format.writeHeader(writer);
 
     const sessions_dir = try session_registry.sessionsDir(allocator);
     defer allocator.free(sessions_dir);
@@ -149,11 +157,7 @@ fn listAgents(allocator: std.mem.Allocator) !u8 {
         defer allocator.free(guid);
         const display_id = (try session_registry.primaryAliasForGuid(allocator, guid)) orelse try allocator.dupe(u8, guid);
         defer allocator.free(display_id);
-        try stdout.writer(allocator).print("{s}\t{s}\t{}\n", .{
-            display_id,
-            if (fileExists(paths.detached)) "no" else "yes",
-            meta.agent_pid,
-        });
+        try list_format.writeRow(writer, display_id, host_display, guid);
     }
 
     try io.writeAll(1, stdout.items);
@@ -392,10 +396,10 @@ fn pathsForLocalSessionRef(allocator: std.mem.Allocator, ref: []const u8) !sessi
         if (value.session_dir.len > 0) {
             var routed_paths = try session_registry.pathsForSessionDir(allocator, value.session_dir);
             errdefer routed_paths.deinit(allocator);
-            if (fileExists(routed_paths.meta) or value.host.len == 0) return routed_paths;
+            if (fileExists(routed_paths.meta) or value.host.len == 0 or std.mem.eql(u8, value.host, ".")) return routed_paths;
             return error.SessionRefNotLocal;
         }
-        if (value.host.len > 0) {
+        if (value.host.len > 0 and !std.mem.eql(u8, value.host, ".")) {
             var current_paths = try session_registry.pathsForSessionId(allocator, guid);
             errdefer current_paths.deinit(allocator);
             if (!fileExists(current_paths.meta)) return error.SessionRefNotLocal;

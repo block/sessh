@@ -540,6 +540,10 @@ def state_root(env):
     return Path(env["XDG_STATE_HOME"]) / "sessh"
 
 
+def state_sessions_dir(env):
+    return state_root(env) / "g"
+
+
 def is_guid_ref(value):
     return bool(_GUID_RE.match(value) or _COMPACT_GUID_RE.match(value))
 
@@ -577,6 +581,22 @@ def ensure_alias(env, alias, guid=None):
     alias_path.symlink_to(Path("../g") / compact_guid(guid))
 
 
+def write_cached_remote_route(env, alias, host, guid=None, alive=True):
+    guid = guid or guid_for_ref(alias)
+    ensure_alias(env, alias, guid)
+    route_dir = state_root(env) / "g" / compact_guid(guid)
+    route_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    remote_session_dir = f"/tmp/sessh-remote/g/{compact_guid(guid)}"
+    lines = [
+        f"guid={guid}",
+        f"primary_alias={alias}",
+        f"session_dir={remote_session_dir}",
+        f"host={host}",
+        f"alive={1 if alive else 0}",
+    ]
+    (route_dir / "route").write_text("\n".join(lines) + "\n")
+
+
 def assert_runtime_dir_symlink(env, expected_runtime_root):
     link = Path(env["XDG_CACHE_HOME"]) / "sessh" / "runtime_dir"
     if not link.is_symlink():
@@ -594,6 +614,16 @@ def session_dir(env, session_id="s1"):
     if alias_path.is_symlink():
         return sessions_dir(env) / Path(os.readlink(alias_path)).name
     return sessions_dir(env) / compact_guid(guid_for_ref(session_id))
+
+
+def route_file(env, session_id="s1"):
+    if is_guid_ref(session_id):
+        return state_sessions_dir(env) / compact_guid(session_id) / "route"
+    ensure_alias(env, session_id)
+    alias_path = aliases_dir(env) / session_id
+    if alias_path.is_symlink():
+        return state_sessions_dir(env) / Path(os.readlink(alias_path)).name / "route"
+    return state_sessions_dir(env) / compact_guid(guid_for_ref(session_id)) / "route"
 
 
 def socket_path(env, session_id="s1"):
@@ -2145,8 +2175,7 @@ def run_slow_attachment_does_not_block_commands_test(base_env):
                 listed = run([".", "--compat-version", sessh_version(), "--list"], env, check=True, timeout=2.0)
             except subprocess.TimeoutExpired as exc:
                 raise AssertionError("management command path blocked behind a slow attachment") from exc
-            if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:
-                raise AssertionError(listed.stdout)
+            assert_list_header(listed.stdout)
         finally:
             if conn is not None:
                 conn.close()
@@ -2378,7 +2407,7 @@ def run_broker_registry_commands_test(base_env):
                 proc.wait(timeout=2.0)
 
         listed = run([":internal-broker:", "list"], env, check=True, timeout=5.0)
-        if "s1\tno\t" not in listed.stdout:
+        if "s1" not in sessions(listed.stdout):
             raise AssertionError(listed.stdout)
 
         proc = subprocess.Popen(
@@ -2677,9 +2706,19 @@ def sessions(stdout):
     for line in stdout.splitlines()[1:]:
         if not line.strip():
             continue
-        session_id, attached, pid = line.split("\t")
-        result[session_id] = {"attached": attached, "pid": pid}
+        parts = line.split()
+        if len(parts) < 3:
+            raise AssertionError(f"invalid list row: {line!r}\n{stdout}")
+        session_id, host, guid = parts[:3]
+        result[session_id] = {"host": host, "guid": guid}
     return result
+
+
+def assert_list_header(stdout):
+    header = stdout.splitlines()[0] if stdout.splitlines() else ""
+    for column in ("ID", "HOST", "GUID"):
+        if column not in header:
+            raise AssertionError(stdout)
 
 
 def run_env_config_client_test(tmp_root):
@@ -2932,7 +2971,19 @@ def main():
             run_tty_transcript_capture_test(tmp)
 
             listed = run([".", "--list"], env, check=True, timeout=5.0)
-            if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:
+            assert_list_header(listed.stdout)
+
+            remote_guid = guid_for_ref("s7")
+            write_cached_remote_route(env, "remote8", "work.blox", remote_guid)
+            listed = run([".", "--list"], env, check=True, timeout=5.0)
+            current_sessions = sessions(listed.stdout)
+            remote_route = current_sessions.get("remote8")
+            if remote_route is None:
+                raise AssertionError(listed.stdout)
+            if remote_route.get("host") != "work.blox" or remote_route.get("guid") != remote_guid:
+                raise AssertionError(listed.stdout)
+            listed = run([".", "--list", "--local-only"], env, check=True, timeout=5.0)
+            if "remote8" in sessions(listed.stdout):
                 raise AssertionError(listed.stdout)
 
             pid, fd = spawn_client(env, ["--alias", "s1"])
@@ -2952,10 +3003,14 @@ def main():
                 close_client(pid, fd)
 
             listed = run([".", "--list"], env, check=True, timeout=5.0)
-            if "ID\tATTACHED\tAGENT_PID" not in listed.stdout:
+            assert_list_header(listed.stdout)
+            if "s1" not in sessions(listed.stdout):
                 raise AssertionError(listed.stdout)
-            if "s1\tno\t" not in listed.stdout:
-                raise AssertionError(listed.stdout)
+            route_text = route_file(env, "s1").read_text()
+            if f"session_dir={session_dir(env, 's1')}\n" not in route_text or "host=.\n" not in route_text:
+                raise AssertionError(route_text)
+            if "session_dir=2f" in route_text or "host=2e" in route_text:
+                raise AssertionError(route_text)
 
             pid, fd = spawn_client(env, ["--attach"])
             closed = False
@@ -3004,7 +3059,7 @@ def main():
 
             listed = run([".", "--list"], env, check=True, timeout=5.0)
             current_sessions = sessions(listed.stdout)
-            if current_sessions.get("s3", {}).get("attached") != "no":
+            if "s3" not in current_sessions:
                 raise AssertionError(listed.stdout)
 
             changed_runtime_env = dict(env)
@@ -3046,7 +3101,7 @@ def main():
                 read_until(fd1, b"$ ")
                 listed = run([".", "--list"], env, check=True, timeout=5.0)
                 current_sessions = sessions(listed.stdout)
-                if current_sessions.get("s5", {}).get("attached") != "yes":
+                if "s5" not in current_sessions:
                     raise AssertionError(listed.stdout)
 
                 pid2, fd2 = spawn_client(env, ["--attach", "s5"])

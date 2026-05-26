@@ -192,8 +192,21 @@ def first_session_id(list_stdout):
     for line in list_stdout.splitlines()[1:]:
         if not line:
             continue
-        return line.split("\t", 1)[0]
+        return line.split(None, 1)[0]
     raise AssertionError(f"no sessions in list output: {list_stdout!r}")
+
+
+def has_list_header(list_stdout):
+    header = list_stdout.splitlines()[0] if list_stdout.splitlines() else ""
+    return all(column in header for column in ("ID", "HOST", "GUID"))
+
+
+def has_session_row(list_stdout):
+    for line in list_stdout.splitlines()[1:]:
+        if not line.strip():
+            continue
+        return True
+    return False
 
 
 def compact_session_id(session_id):
@@ -412,7 +425,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         )
         if listed.returncode != 0:
             raise AssertionError(listed)
-        if "ID\tATTACHED\tAGENT_PID" not in listed.stdout or "\tno\t" not in listed.stdout:
+        if not has_list_header(listed.stdout) or not has_session_row(listed.stdout):
             raise AssertionError(listed)
         session_id = first_session_id(listed.stdout)
         compat_path = f"/tmp/sessh-0/g/{compact_session_id(session_id)}/compat"
