@@ -198,7 +198,7 @@ def first_session_id(list_stdout):
 
 def has_list_header(list_stdout):
     header = list_stdout.splitlines()[0] if list_stdout.splitlines() else ""
-    return all(column in header for column in ("ID", "HOST", "GUID"))
+    return all(column in header for column in ("ID", "HOST", "VERSION", "GUID"))
 
 
 def has_session_row(list_stdout):

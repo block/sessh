@@ -41,6 +41,7 @@ const LocalOptions = struct {
     runtime_dir: ?[]const u8 = null,
     list_refresh: bool = false,
     list_include_cached_routes: bool = true,
+    list_jsonl: bool = false,
     leader: Leader = .none,
     leader_set: bool = false,
     banner_args: DetachBannerArgs = .{},
@@ -1930,7 +1931,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     const runtime_broker_args = brokerRuntimeArgs(options, &broker_arg_buf);
     switch (options.action) {
         .list => {
-            const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes);
+            const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
@@ -2008,7 +2009,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     defer session.deinit();
     if (options.action == .new) {
         try session_registry.ensureAliasForGuid(allocator, session.idSlice(), session.guidSlice());
-        try session_registry.writeLocalRoute(allocator, session.guidSlice(), session.idSlice(), session.sessionDirSlice());
+        try session_registry.writeLocalRoute(allocator, session.guidSlice(), session.idSlice(), session.sessionDirSlice(), config.version);
         local_alias_created = true;
     }
 
@@ -2128,16 +2129,25 @@ fn runLocalBrokerCommand(allocator: std.mem.Allocator, exe: []const u8, broker_a
     };
 }
 
-fn runLocalListCommand(allocator: std.mem.Allocator, exe: []const u8, runtime_broker_args: []const []const u8, refresh: bool, include_cached_routes: bool) !u8 {
+fn runLocalListCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    runtime_broker_args: []const []const u8,
+    refresh: bool,
+    include_cached_routes: bool,
+    jsonl: bool,
+) !u8 {
     if (include_cached_routes and refresh) try refreshCachedRemoteRoutes(allocator, exe);
 
-    var command_args_buf: [3][]const u8 = undefined;
+    var command_args_buf: [4][]const u8 = undefined;
     const command_args = appendBrokerCommand(runtime_broker_args, "list", null, &command_args_buf);
-    const argv = try allocator.alloc([]const u8, 2 + command_args.len);
+    const extra_args: usize = if (jsonl) 1 else 0;
+    const argv = try allocator.alloc([]const u8, 2 + command_args.len + extra_args);
     defer allocator.free(argv);
     argv[0] = exe;
     argv[1] = ":internal-broker:";
-    @memcpy(argv[2..], command_args);
+    @memcpy(argv[2 .. 2 + command_args.len], command_args);
+    if (jsonl) argv[2 + command_args.len] = "--jsonl";
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
@@ -2153,11 +2163,11 @@ fn runLocalListCommand(allocator: std.mem.Allocator, exe: []const u8, runtime_br
         else => 1,
     };
     if (exit_status != 0) return exit_status;
-    if (include_cached_routes) try appendCachedRemoteRouteRows(allocator);
+    if (include_cached_routes) try appendCachedRemoteRouteRows(allocator, jsonl);
     return 0;
 }
 
-fn appendCachedRemoteRouteRows(allocator: std.mem.Allocator) !void {
+fn appendCachedRemoteRouteRows(allocator: std.mem.Allocator, jsonl: bool) !void {
     var routes: std.ArrayList(session_registry.Route) = .empty;
     defer {
         for (routes.items) |*route| route.deinit(allocator);
@@ -2169,7 +2179,11 @@ fn appendCachedRemoteRouteRows(allocator: std.mem.Allocator) !void {
     defer out.deinit(allocator);
     const writer = out.writer(allocator);
     for (routes.items) |route| {
-        try list_format.writeRow(writer, route.primary_alias, route.host, route.guid);
+        if (jsonl) {
+            try list_format.writeJsonlRow(writer, route.primary_alias, route.host, route.agent_version, route.guid);
+        } else {
+            try list_format.writeRow(writer, route.primary_alias, route.host, route.agent_version, route.guid);
+        }
     }
     if (out.items.len > 0) try io_helpers.writeAll(1, out.items);
 }
@@ -2215,7 +2229,14 @@ fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !voi
         defer allocator.free(stdout);
         for (routes.items) |*candidate| {
             if (!sameRouteConnection(route, candidate)) continue;
-            try session_registry.updateRouteStatus(allocator, candidate.guid, remoteListContainsGuid(stdout, candidate.guid));
+            const remote_version = try remoteListVersionForGuid(allocator, stdout, candidate.guid);
+            defer if (remote_version) |version| allocator.free(version);
+            try session_registry.updateRouteStatus(
+                allocator,
+                candidate.guid,
+                remote_version != null,
+                remote_version,
+            );
         }
     }
 }
@@ -2237,12 +2258,13 @@ fn sameRouteConnection(a: *const session_registry.Route, b: *const session_regis
 }
 
 fn queryRemoteRouteList(allocator: std.mem.Allocator, exe: []const u8, route: *const session_registry.Route) ![]u8 {
-    const argv = try allocator.alloc([]const u8, 2 + route.ssh_options.len + 1);
+    const argv = try allocator.alloc([]const u8, 2 + route.ssh_options.len + 2);
     defer allocator.free(argv);
     argv[0] = exe;
     @memcpy(argv[1 .. 1 + route.ssh_options.len], route.ssh_options);
     argv[1 + route.ssh_options.len] = route.host;
     argv[2 + route.ssh_options.len] = "--list";
+    argv[3 + route.ssh_options.len] = "--jsonl";
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
@@ -2262,14 +2284,44 @@ fn queryRemoteRouteList(allocator: std.mem.Allocator, exe: []const u8, route: *c
     }
 }
 
-fn remoteListContainsGuid(stdout: []const u8, guid: []const u8) bool {
+fn remoteListVersionForGuid(allocator: std.mem.Allocator, stdout: []const u8, guid: []const u8) !?[]u8 {
     var lines = std.mem.splitScalar(u8, stdout, '\n');
     while (lines.next()) |line| {
-        const row = list_format.parseRow(line) orelse continue;
-        if (!std.mem.eql(u8, row.guid, guid)) continue;
-        return true;
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |object| object,
+            else => continue,
+        };
+        const row_guid = jsonStringField(object, "guid") orelse continue;
+        if (!std.mem.eql(u8, row_guid, guid)) continue;
+        const version = jsonStringField(object, "version") orelse "";
+        return try allocator.dupe(u8, version);
     }
-    return false;
+    return null;
+}
+
+fn jsonStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .string => |string| string,
+        else => null,
+    };
+}
+
+test "remoteListVersionForGuid reads jsonl rows" {
+    const guid = "s-550e8400-e29b-41d4-a716-446655440000";
+    const stdout =
+        \\{"id":"s-550e","host":"work.blox","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000"}
+        \\s-550e work.blox s-550e8400-e29b-41d4-a716-446655440000
+        \\
+    ;
+
+    const version = (try remoteListVersionForGuid(std.testing.allocator, stdout, guid)) orelse return error.MissingVersion;
+    defer std.testing.allocator.free(version);
+    try std.testing.expectEqualStrings("0.5.0-dev", version);
+    try std.testing.expect(try remoteListVersionForGuid(std.testing.allocator, stdout, "s-00000000-0000-4000-8000-000000000000") == null);
 }
 
 fn anySessionExistsViaBroker(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8) bool {
@@ -2352,6 +2404,9 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
         } else if (std.mem.eql(u8, arg, "--local-only")) {
             options.list_include_cached_routes = false;
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--jsonl")) {
+            options.list_jsonl = true;
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--leader")) {
             i += 1;
             if (i >= args.len) return error.MissingLeader;
@@ -2400,6 +2455,7 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
     }
     if (options.list_refresh and options.action != .list) return error.UnsupportedListRefresh;
     if (!options.list_include_cached_routes and options.action != .list) return error.UnsupportedListLocalOnly;
+    if (options.list_jsonl and options.action != .list) return error.UnsupportedListJsonl;
     return options;
 }
 
@@ -2511,6 +2567,7 @@ pub fn ensureLocalRouteForRemoteSession(
         session.sessionDirSlice(),
         host,
         ssh_options,
+        config.version,
     );
 }
 

@@ -1173,7 +1173,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                 };
                 const session = &session_agent.sessions[session_index];
                 if (session_agent.session_paths) |paths| {
-                    try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), alias, paths.dir);
+                    try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), alias, paths.dir, config.version);
                     session_registry.markDetached(paths) catch {};
                 }
                 try sendSessionCreatedForSession(session_agent, fd, session, alias);

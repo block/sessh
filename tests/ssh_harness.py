@@ -635,20 +635,20 @@ def list_rows(list_stdout):
         if not line.strip():
             continue
         parts = line.split()
-        if len(parts) < 3:
+        if len(parts) < 4:
             raise AssertionError(f"invalid list row: {line!r}\n{list_stdout}")
-        rows.append(parts[:3])
+        rows.append(parts[:4])
     return rows
 
 
 def has_list_header(list_stdout):
     header = list_stdout.splitlines()[0] if list_stdout.splitlines() else ""
-    return all(column in header for column in ("ID", "HOST", "GUID"))
+    return all(column in header for column in ("ID", "HOST", "VERSION", "GUID"))
 
 
 def list_has_session(list_stdout, session_id):
     for row in list_rows(list_stdout):
-        if row[0] == session_id or row[2] == session_id:
+        if row[0] == session_id or row[3] == session_id:
             return True
     return False
 
@@ -672,6 +672,7 @@ def write_ssh_route(env, alias, guid, host, ssh_options=()):
         f"primary_alias={alias}",
         f"session_dir={remote_session_dir}",
         f"host={host}",
+        "agent_version=cached-test",
     ]
     lines.extend(f"ssh_option={option}" for option in ssh_options)
     (session / "route").write_text("\n".join(lines) + "\n")

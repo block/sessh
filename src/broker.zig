@@ -95,8 +95,8 @@ fn applyBrokerOptions(args: []const []const u8) ![]const []const u8 {
 fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const command = args[0];
     if (std.mem.eql(u8, command, "list")) {
-        const host_display = parseListHostDisplay(args) catch return finishCommand(64, "", "ERROR usage: list [--host-display HOST]\n");
-        const exit_status = try listAgents(allocator, host_display);
+        const options = parseListOptions(args) catch return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl]\n");
+        const exit_status = try listAgents(allocator, options);
         return process_exit.request(exit_status);
     }
     if (std.mem.eql(u8, command, "kill")) {
@@ -113,17 +113,40 @@ fn finishCommand(exit_status: u8, stdout: []const u8, stderr: []const u8) !void 
     return process_exit.request(exit_status);
 }
 
-fn parseListHostDisplay(args: []const []const u8) ![]const u8 {
-    if (args.len == 1) return ".";
-    if (args.len == 3 and std.mem.eql(u8, args[1], "--host-display")) return args[2];
-    return error.InvalidListArgs;
+const ListFormat = enum {
+    table,
+    jsonl,
+};
+
+const ListOptions = struct {
+    host_display: []const u8 = ".",
+    format: ListFormat = .table,
+};
+
+fn parseListOptions(args: []const []const u8) !ListOptions {
+    var options = ListOptions{};
+    var i: usize = 1;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--host-display")) {
+            i += 1;
+            if (i >= args.len) return error.MissingHostDisplay;
+            options.host_display = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--jsonl")) {
+            options.format = .jsonl;
+            i += 1;
+        } else {
+            return error.InvalidListArgs;
+        }
+    }
+    return options;
 }
 
-fn listAgents(allocator: std.mem.Allocator, host_display: []const u8) !u8 {
+fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
     const writer = stdout.writer(allocator);
-    try list_format.writeHeader(writer);
+    if (options.format == .table) try list_format.writeHeader(writer);
 
     const sessions_dir = try session_registry.sessionsDir(allocator);
     defer allocator.free(sessions_dir);
@@ -157,7 +180,10 @@ fn listAgents(allocator: std.mem.Allocator, host_display: []const u8) !u8 {
         defer allocator.free(guid);
         const display_id = (try session_registry.primaryAliasForGuid(allocator, guid)) orelse try allocator.dupe(u8, guid);
         defer allocator.free(display_id);
-        try list_format.writeRow(writer, display_id, host_display, guid);
+        switch (options.format) {
+            .table => try list_format.writeRow(writer, display_id, options.host_display, meta.version, guid),
+            .jsonl => try list_format.writeJsonlRow(writer, display_id, options.host_display, meta.version, guid),
+        }
     }
 
     try io.writeAll(1, stdout.items);

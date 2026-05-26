@@ -375,6 +375,7 @@ pub const Route = struct {
     primary_alias: []const u8,
     session_dir: []const u8,
     host: []const u8,
+    agent_version: []const u8,
     ssh_options: []const []const u8,
     last_known_alive: bool,
 
@@ -392,8 +393,9 @@ pub fn writeSshRoute(
     session_dir: []const u8,
     host: []const u8,
     ssh_options: []const []const u8,
+    agent_version: []const u8,
 ) !void {
-    return writeRoute(allocator, guid, primary_alias, session_dir, host, ssh_options, .{});
+    return writeRoute(allocator, guid, primary_alias, session_dir, host, ssh_options, .{ .agent_version = agent_version });
 }
 
 pub fn writeLocalRoute(
@@ -401,12 +403,14 @@ pub fn writeLocalRoute(
     guid: []const u8,
     primary_alias: []const u8,
     session_dir: []const u8,
+    agent_version: []const u8,
 ) !void {
-    return writeRoute(allocator, guid, primary_alias, session_dir, ".", &.{}, .{});
+    return writeRoute(allocator, guid, primary_alias, session_dir, ".", &.{}, .{ .agent_version = agent_version });
 }
 
 const RouteStatus = struct {
     last_known_alive: bool = true,
+    agent_version: []const u8 = "",
 };
 
 fn writeRoute(
@@ -429,6 +433,7 @@ fn writeRoute(
     try writeRouteField(writer, "primary_alias", primary_alias);
     try writeRouteField(writer, "session_dir", session_dir);
     try writeRouteField(writer, "host", host);
+    try writeRouteField(writer, "agent_version", status.agent_version);
     try writer.print("alive={s}\n", .{if (status.last_known_alive) "1" else "0"});
     for (ssh_options) |arg| {
         try writeRouteField(writer, "ssh_option", arg);
@@ -443,7 +448,7 @@ fn writeRoute(
     try file.writeAll(text.items);
 }
 
-pub fn updateRouteStatus(allocator: std.mem.Allocator, guid: []const u8, last_known_alive: bool) !void {
+pub fn updateRouteStatus(allocator: std.mem.Allocator, guid: []const u8, last_known_alive: bool, agent_version: ?[]const u8) !void {
     var route = try readRouteForRef(allocator, guid);
     defer route.deinit(allocator);
     try writeRoute(
@@ -453,7 +458,10 @@ pub fn updateRouteStatus(allocator: std.mem.Allocator, guid: []const u8, last_kn
         route.session_dir,
         route.host,
         route.ssh_options,
-        .{ .last_known_alive = last_known_alive },
+        .{
+            .last_known_alive = last_known_alive,
+            .agent_version = agent_version orelse route.agent_version,
+        },
     );
 }
 
@@ -499,6 +507,7 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
     var primary_alias: ?[]const u8 = null;
     var session_dir: ?[]const u8 = null;
     var host: ?[]const u8 = null;
+    var agent_version: []const u8 = "";
     var last_known_alive = true;
     var option_count: usize = 0;
 
@@ -517,6 +526,8 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
             session_dir = value;
         } else if (std.mem.eql(u8, key, "host")) {
             host = value;
+        } else if (std.mem.eql(u8, key, "agent_version")) {
+            agent_version = value;
         } else if (std.mem.eql(u8, key, "alive")) {
             last_known_alive = try parseRouteAlive(value);
         } else if (std.mem.eql(u8, key, "ssh_option")) {
@@ -548,6 +559,7 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
         .primary_alias = primary_alias orelse return error.InvalidRoute,
         .session_dir = plain_session_dir,
         .host = plain_host,
+        .agent_version = agent_version,
         .ssh_options = options,
         .last_known_alive = last_known_alive,
     };
@@ -1065,6 +1077,7 @@ test "route files persist absolute session directories" {
     try writer.writeAll(session_dir);
     try writer.writeAll("\n");
     try writer.writeAll("host=work.example\n");
+    try writer.writeAll("agent_version=0.5.0-test\n");
     try writer.writeAll("ssh_option=-F\n");
 
     const file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
@@ -1077,6 +1090,7 @@ test "route files persist absolute session directories" {
     try std.testing.expectEqualStrings("s-550e", route.primary_alias);
     try std.testing.expectEqualStrings(session_dir, route.session_dir);
     try std.testing.expectEqualStrings("work.example", route.host);
+    try std.testing.expectEqualStrings("0.5.0-test", route.agent_version);
     try std.testing.expect(route.last_known_alive);
     try std.testing.expectEqual(@as(usize, 1), route.ssh_options.len);
     try std.testing.expectEqualStrings("-F", route.ssh_options[0]);

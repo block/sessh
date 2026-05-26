@@ -581,7 +581,7 @@ def ensure_alias(env, alias, guid=None):
     alias_path.symlink_to(Path("../g") / compact_guid(guid))
 
 
-def write_cached_remote_route(env, alias, host, guid=None, alive=True):
+def write_cached_remote_route(env, alias, host, guid=None, alive=True, agent_version="cached-test"):
     guid = guid or guid_for_ref(alias)
     ensure_alias(env, alias, guid)
     route_dir = state_root(env) / "g" / compact_guid(guid)
@@ -592,6 +592,7 @@ def write_cached_remote_route(env, alias, host, guid=None, alive=True):
         f"primary_alias={alias}",
         f"session_dir={remote_session_dir}",
         f"host={host}",
+        f"agent_version={agent_version}",
         f"alive={1 if alive else 0}",
     ]
     (route_dir / "route").write_text("\n".join(lines) + "\n")
@@ -2707,16 +2708,26 @@ def sessions(stdout):
         if not line.strip():
             continue
         parts = line.split()
-        if len(parts) < 3:
+        if len(parts) < 4:
             raise AssertionError(f"invalid list row: {line!r}\n{stdout}")
-        session_id, host, guid = parts[:3]
-        result[session_id] = {"host": host, "guid": guid}
+        session_id, host, version, guid = parts[:4]
+        result[session_id] = {"host": host, "version": version, "guid": guid}
+    return result
+
+
+def jsonl_sessions(stdout):
+    result = {}
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        result[row["id"]] = {"host": row["host"], "version": row["version"], "guid": row["guid"]}
     return result
 
 
 def assert_list_header(stdout):
     header = stdout.splitlines()[0] if stdout.splitlines() else ""
-    for column in ("ID", "HOST", "GUID"):
+    for column in ("ID", "HOST", "VERSION", "GUID"):
         if column not in header:
             raise AssertionError(stdout)
 
@@ -2980,8 +2991,20 @@ def main():
             remote_route = current_sessions.get("remote8")
             if remote_route is None:
                 raise AssertionError(listed.stdout)
-            if remote_route.get("host") != "work.blox" or remote_route.get("guid") != remote_guid:
+            if (
+                remote_route.get("host") != "work.blox"
+                or remote_route.get("version") != "cached-test"
+                or remote_route.get("guid") != remote_guid
+            ):
                 raise AssertionError(listed.stdout)
+            listed_jsonl = run([".", "--list", "--jsonl"], env, check=True, timeout=5.0)
+            jsonl_route = jsonl_sessions(listed_jsonl.stdout).get("remote8")
+            if jsonl_route != {
+                "host": "work.blox",
+                "version": "cached-test",
+                "guid": remote_guid,
+            }:
+                raise AssertionError(listed_jsonl.stdout)
             listed = run([".", "--list", "--local-only"], env, check=True, timeout=5.0)
             if "remote8" in sessions(listed.stdout):
                 raise AssertionError(listed.stdout)
@@ -3004,10 +3027,17 @@ def main():
 
             listed = run([".", "--list"], env, check=True, timeout=5.0)
             assert_list_header(listed.stdout)
-            if "s1" not in sessions(listed.stdout):
+            current_sessions = sessions(listed.stdout)
+            if "s1" not in current_sessions:
+                raise AssertionError(listed.stdout)
+            if current_sessions["s1"].get("version") != sessh_version():
                 raise AssertionError(listed.stdout)
             route_text = route_file(env, "s1").read_text()
-            if f"session_dir={session_dir(env, 's1')}\n" not in route_text or "host=.\n" not in route_text:
+            if (
+                f"session_dir={session_dir(env, 's1')}\n" not in route_text
+                or "host=.\n" not in route_text
+                or f"agent_version={sessh_version()}\n" not in route_text
+            ):
                 raise AssertionError(route_text)
             if "session_dir=2f" in route_text or "host=2e" in route_text:
                 raise AssertionError(route_text)

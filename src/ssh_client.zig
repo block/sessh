@@ -119,6 +119,7 @@ const ParsedSshArgs = struct {
     attach_session_dir: []const u8 = "",
     kill_id: ?[]const u8 = null,
     list_refresh: bool = false,
+    list_jsonl: bool = false,
     command_argv: []const []const u8 = &.{},
     alias: ?[]const u8 = null,
     runtime_dir: ?[]const u8 = null,
@@ -715,7 +716,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
     const artifacts = if (artifacts_storage) |*value| value else null;
 
-    var broker_arg_buf: [5][]const u8 = undefined;
+    var broker_arg_buf: [6][]const u8 = undefined;
     const broker_args = brokerArgsForAction(parsed_ssh_args, &broker_arg_buf);
     const remote_command = if (parsed_ssh_args.bootstrap)
         try bootstrapCommand(allocator)
@@ -1176,7 +1177,7 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
     }
 }
 
-fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[5][]const u8) []const []const u8 {
+fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[6][]const u8) []const []const u8 {
     var len: usize = 0;
     if (parsed_ssh_args.runtime_dir) |dir| {
         buf[len] = "--runtime-dir";
@@ -1193,6 +1194,10 @@ fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[5][]const u8) []co
                 buf[len] = "--host-display";
                 len += 1;
                 buf[len] = parsed_ssh_args.host;
+                len += 1;
+            }
+            if (parsed_ssh_args.list_jsonl) {
+                buf[len] = "--jsonl";
                 len += 1;
             }
         },
@@ -2571,6 +2576,10 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             if (parsed.action != .list) return error.UnsupportedSesshOption;
             parsed.list_refresh = true;
             index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--jsonl")) {
+            if (parsed.action != .list) return error.UnsupportedSesshOption;
+            parsed.list_jsonl = true;
+            index.* += 1;
         } else if (std.mem.eql(u8, arg, "--kill")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             index.* += 1;
@@ -2610,6 +2619,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--capture-tty-transcript") or
         std.mem.eql(u8, arg, "--list") or
         std.mem.eql(u8, arg, "--refresh") or
+        std.mem.eql(u8, arg, "--jsonl") or
         std.mem.eql(u8, arg, "--kill") or
         std.mem.eql(u8, arg, "--kill-all");
 }
@@ -3498,12 +3508,18 @@ test "parseSshArgs accepts translated remote session commands after host" {
 }
 
 test "brokerArgsForAction uses broker subcommands" {
-    var buf: [5][]const u8 = undefined;
+    var buf: [6][]const u8 = undefined;
 
     try expectArgvEqual(&.{ "list", "--host-display", "example.com" }, brokerArgsForAction(.{
         .options = &.{},
         .host = "example.com",
         .action = .list,
+    }, &buf));
+    try expectArgvEqual(&.{ "list", "--host-display", "example.com", "--jsonl" }, brokerArgsForAction(.{
+        .options = &.{},
+        .host = "example.com",
+        .action = .list,
+        .list_jsonl = true,
     }, &buf));
 
     try expectArgvEqual(&.{ "kill", "s1" }, brokerArgsForAction(.{
@@ -3688,6 +3704,24 @@ test "translateMuxArgs maps explicit local list" {
     });
     defer refresh_remote_list.deinit();
     try expectArgvEqual(&.{ "sesshmux", "example.com", "--list", "--refresh" }, refresh_remote_list.args.items);
+
+    var jsonl_local_list = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "list",
+        "--jsonl",
+    });
+    defer jsonl_local_list.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "--list", "--jsonl" }, jsonl_local_list.args.items);
+
+    var jsonl_remote_list = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "list",
+        "--refresh",
+        "--jsonl",
+        "example.com",
+    });
+    defer jsonl_remote_list.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "--list", "--refresh", "--jsonl" }, jsonl_remote_list.args.items);
 }
 
 test "translateMuxArgs maps kill and kill all" {
