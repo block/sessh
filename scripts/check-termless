@@ -68,6 +68,18 @@ EOF
 }
 
 ensure_node_deps() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo "missing node" >&2
+    exit 1
+  fi
+  node - <<'EOF'
+const [major, minor] = process.versions.node.split(".").map(Number);
+if (major < 23 || (major === 23 && minor < 6)) {
+  console.error(`Termless tests require Node >=23.6.0; found ${process.version}`);
+  process.exit(1);
+}
+EOF
+
   if ! command -v npm >/dev/null 2>&1; then
     echo "missing npm" >&2
     exit 1

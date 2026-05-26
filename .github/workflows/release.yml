@@ -16,6 +16,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Install Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Install system dependencies
         run: |
           brew install protobuf tmux
@@ -86,9 +91,15 @@ jobs:
           test -f "$archive"
           test -f "$archive.sha256"
           test -x "dist/sessh-$version/bin/sessh"
+          test -x "dist/sessh-$version/bin/sesshmux"
           actual_version="$(dist/sessh-$version/bin/sessh --version)"
           if [[ "$actual_version" != "sessh $version" ]]; then
             echo "archive binary reported '$actual_version', expected 'sessh $version'" >&2
+            exit 1
+          fi
+          actual_mux_version="$(dist/sessh-$version/bin/sesshmux --version)"
+          if [[ "$actual_mux_version" != "sesshmux $version" ]]; then
+            echo "archive mux binary reported '$actual_mux_version', expected 'sesshmux $version'" >&2
             exit 1
           fi
 

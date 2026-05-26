@@ -42,7 +42,8 @@ fn runMain() !void {
     if (entrypoint == .sessh and args.len == 2) return usage(0, entrypoint);
     if (hasAnyArg(args, &.{ "--help", "-h" })) return usage(0, entrypoint);
     if (hasArg(args, "--version")) {
-        try io.writeAll(1, "sessh " ++ config.version ++ "\n");
+        try io.writeAll(1, entrypointName(entrypoint));
+        try io.writeAll(1, " " ++ config.version ++ "\n");
         return;
     }
 
@@ -76,6 +77,13 @@ const EntryPoint = enum {
     sesshmux,
 };
 
+fn entrypointName(entrypoint: EntryPoint) []const u8 {
+    return switch (entrypoint) {
+        .sessh => "sessh",
+        .sesshmux => "sesshmux",
+    };
+}
+
 fn sesshArgsFromInternal(allocator: std.mem.Allocator, args: []const []const u8) ![][]const u8 {
     std.debug.assert(args.len >= 2);
     std.debug.assert(std.mem.eql(u8, args[1], ":internal-sessh:"));
@@ -85,6 +93,11 @@ fn sesshArgsFromInternal(allocator: std.mem.Allocator, args: []const []const u8)
     sessh_args[1] = "new";
     @memcpy(sessh_args[2..], args[2..]);
     return sessh_args;
+}
+
+test "version label follows entrypoint" {
+    try std.testing.expectEqualStrings("sessh", entrypointName(.sessh));
+    try std.testing.expectEqualStrings("sesshmux", entrypointName(.sesshmux));
 }
 
 test "internal sessh modality maps to mux new command" {

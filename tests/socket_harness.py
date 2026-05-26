@@ -2820,6 +2820,9 @@ def main():
                 raise AssertionError(help_text)
             if "sessh [ssh-option" in help_text.stdout:
                 raise AssertionError(help_text.stdout)
+            version_text = run(["--version"], env, timeout=5.0)
+            if version_text.returncode != 0 or version_text.stdout != f"sesshmux {sessh_version()}\n":
+                raise AssertionError(version_text)
             short_help_text = run(["-h"], env, timeout=5.0)
             if short_help_text.returncode != 0 or short_help_text.stdout != help_text.stdout:
                 raise AssertionError(short_help_text)
@@ -2828,6 +2831,9 @@ def main():
                 raise AssertionError(internal_sessh_help)
             if "sesshmux new" in internal_sessh_help.stdout:
                 raise AssertionError(internal_sessh_help.stdout)
+            internal_sessh_version = run([":internal-sessh:", "--version"], env, timeout=5.0)
+            if internal_sessh_version.returncode != 0 or internal_sessh_version.stdout != f"sessh {sessh_version()}\n":
+                raise AssertionError(internal_sessh_version)
             sessh_wrapper = ROOT / "zig-out" / "bin" / "sessh"
             if sessh_wrapper.exists():
                 sessh_help = subprocess.run(
@@ -2845,6 +2851,34 @@ def main():
                     raise AssertionError(sessh_help)
                 if "sesshmux new" in sessh_help.stdout:
                     raise AssertionError(sessh_help.stdout)
+                sessh_version_text = subprocess.run(
+                    [str(sessh_wrapper), "--version"],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5.0,
+                    check=False,
+                )
+                if sessh_version_text.returncode != 0 or sessh_version_text.stdout != f"sessh {sessh_version()}\n":
+                    raise AssertionError(sessh_version_text)
+            sesshmux_wrapper = ROOT / "zig-out" / "bin" / "sesshmux"
+            if sesshmux_wrapper.exists():
+                sesshmux_version_text = subprocess.run(
+                    [str(sesshmux_wrapper), "--version"],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5.0,
+                    check=False,
+                )
+                if sesshmux_version_text.returncode != 0 or sesshmux_version_text.stdout != f"sesshmux {sessh_version()}\n":
+                    raise AssertionError(sesshmux_version_text)
 
             bad = run([".", "/tmp/not-a-socket-path"], env, timeout=5.0)
             if bad.returncode != 64:
