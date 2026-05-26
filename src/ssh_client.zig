@@ -216,7 +216,7 @@ const ReconnectRaceOutcome = union(enum) {
     reconnected: RuntimeConnection,
     session_ended,
     failed: anyerror,
-    abort,
+    detach,
 };
 
 const SshStderrPump = struct {
@@ -882,10 +882,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 &reconnect_ui,
             )) {
                 .recovered => {
-                    try reconnect_ui.showConnectionResultBriefly(.recovered);
+                    session.noteUnresponsiveRecovery();
                     session.viewport_offset = try reconnect_ui.clearBanner();
-                    try client.repaintRuntimeSession(child.child.stdout.?.handle, child.child.stdin.?.handle, &session);
-                    try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
+                    try client.repaintRuntimeSessionWithTransientBanner(
+                        child.child.stdout.?.handle,
+                        child.child.stdin.?.handle,
+                        &session,
+                        client.connectionResultBanner(.recovered),
+                    );
                     reconnect_ui.deinit();
                     reconnect_ui_active = false;
                     continue;
@@ -895,14 +899,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                     child = new_child;
                     session.viewport_offset = try reconnect_ui.clearBanner();
                     try client.finishReconnectRepaint(child.child.stdout.?.handle, &session);
-                    try reconnect_ui.showConnectionResultBriefly(.reconnected);
                     client_log.debug("event=reconnect_success host={s} session={s} attempt=0", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
                     });
-                    session.viewport_offset = try reconnect_ui.clearBanner();
-                    try client.repaintRuntimeSession(child.child.stdout.?.handle, child.child.stdin.?.handle, &session);
-                    try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
                     reconnect_ui.deinit();
                     reconnect_ui_active = false;
                     continue;
@@ -913,7 +913,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                     try tty_transcript.finishActiveOrReport();
                     return;
                 },
-                .abort => {
+                .detach => {
                     child.terminate();
                     try tty_transcript.finishActiveOrReport();
                     return;
@@ -940,8 +940,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 delay_ms,
             });
             switch (try reconnect_ui.waitForReconnect(delay_ms)) {
-                .abort => {
-                    client_log.debug("event=reconnect_abort host={s} session={s} attempt={}", .{
+                .detach => {
+                    client_log.debug("event=reconnect_detach host={s} session={s} attempt={}", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
                         reconnect_attempt,
@@ -969,7 +969,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 true,
             ) catch |err| switch (err) {
                 error.ExitRequested => return err,
-                error.ReconnectAborted => {
+                error.ReconnectDetached => {
                     try tty_transcript.finishActiveOrReport();
                     return;
                 },
@@ -1012,15 +1012,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 }
             };
 
-            try reconnect_ui.showReconnectedBriefly();
             client_log.debug("event=reconnect_success host={s} session={s} attempt={}", .{
                 parsed_ssh_args.host,
                 session.idSlice(),
                 reconnect_attempt,
             });
-            session.viewport_offset = try reconnect_ui.clearBanner();
-            try client.repaintRuntimeSession(child.child.stdout.?.handle, child.child.stdin.?.handle, &session);
-            try reconnect_ui.flushBufferedInput(child.child.stdin.?.handle);
             reconnect_ui.deinit();
             reconnect_ui_active = false;
             break;
@@ -1487,13 +1483,23 @@ fn raceExistingConnectionWithReconnect(
         thread.join();
         cleanupParallelReconnectResult(&state);
     };
+    var ready_connection: ?RuntimeConnection = null;
+    defer if (ready_connection) |*connection| connection.terminate();
+    var ready_session = client.RuntimeSession{};
 
     var old_available = true;
     while (true) {
-        if (state.done.load(.acquire)) {
+        if (ready_connection == null and state.done.load(.acquire)) {
             joined = true;
             thread.join();
-            return parallelResultToRaceOutcome(state.take().?, &state.session, session);
+            switch (state.take().?) {
+                .connected => |connection| {
+                    ready_connection = connection;
+                    ready_session = state.session;
+                    try reconnect_ui.showReconnectReady();
+                },
+                .failed => |err| return .{ .failed = err },
+            }
         }
 
         if (old_available) {
@@ -1501,16 +1507,20 @@ fn raceExistingConnectionWithReconnect(
                 switch (recovery) {
                     .recovered => {
                         reconnect_ui.cancel();
-                        joined = true;
-                        thread.join();
-                        cleanupParallelReconnectResult(&state);
+                        if (!joined) {
+                            joined = true;
+                            thread.join();
+                            cleanupParallelReconnectResult(&state);
+                        }
                         return .recovered;
                     },
                     .session_ended => {
                         reconnect_ui.cancel();
-                        joined = true;
-                        thread.join();
-                        cleanupParallelReconnectResult(&state);
+                        if (!joined) {
+                            joined = true;
+                            thread.join();
+                            cleanupParallelReconnectResult(&state);
+                        }
                         return .session_ended;
                     },
                     .transport_closed => {
@@ -1521,21 +1531,45 @@ fn raceExistingConnectionWithReconnect(
                 }
             }
         } else {
-            if (try reconnect_ui.pollAbort(50)) {
-                reconnect_ui.cancel();
-                joined = true;
-                thread.join();
-                cleanupParallelReconnectResult(&state);
-                return .abort;
+            switch (try reconnect_ui.pollDecision(50)) {
+                .detach => {
+                    reconnect_ui.cancel();
+                    if (!joined) {
+                        joined = true;
+                        thread.join();
+                        cleanupParallelReconnectResult(&state);
+                    }
+                    return .detach;
+                },
+                .reconnect_now => {
+                    if (ready_connection) |connection| {
+                        session.adoptReconnectState(&ready_session);
+                        ready_connection = null;
+                        return .{ .reconnected = connection };
+                    }
+                },
+                .wait_elapsed => {},
             }
         }
 
-        if (try reconnect_ui.pollAbort(0)) {
-            reconnect_ui.cancel();
-            joined = true;
-            thread.join();
-            cleanupParallelReconnectResult(&state);
-            return .abort;
+        switch (try reconnect_ui.pollDecision(0)) {
+            .detach => {
+                reconnect_ui.cancel();
+                if (!joined) {
+                    joined = true;
+                    thread.join();
+                    cleanupParallelReconnectResult(&state);
+                }
+                return .detach;
+            },
+            .reconnect_now => {
+                if (ready_connection) |connection| {
+                    session.adoptReconnectState(&ready_session);
+                    ready_connection = null;
+                    return .{ .reconnected = connection };
+                }
+            },
+            .wait_elapsed => {},
         }
     }
 }
@@ -1561,7 +1595,7 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
         &state.session,
         state.reconnect_ui.cancellationFlag(),
     ) catch |err| {
-        if (err == error.ReconnectAborted) {
+        if (err == error.ReconnectDetached) {
             connection.terminate();
         } else {
             connection.closeStdin();
@@ -1674,7 +1708,7 @@ fn startRuntimeConnection(
 
     var line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
         connection.closeStdin();
-        if (err == error.ReconnectAborted) {
+        if (err == error.ReconnectDetached) {
             connection.terminate();
             return err;
         }
@@ -1712,7 +1746,7 @@ fn startRuntimeConnection(
 
         sendUpload(allocator, connection.child.stdin.?.handle, artifact, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
-            if (err == error.ReconnectAborted) {
+            if (err == error.ReconnectDetached) {
                 connection.terminate();
                 return err;
             }
@@ -1723,7 +1757,7 @@ fn startRuntimeConnection(
         allocator.free(line);
         line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
-            if (err == error.ReconnectAborted) {
+            if (err == error.ReconnectDetached) {
                 connection.terminate();
                 return err;
             }
@@ -2804,7 +2838,7 @@ fn writeAllMaybeCancellable(
             .revents = 0,
         }};
         const ready = try posix.poll(&pollfds, 50);
-        if (try reconnectShouldAbort(reconnect_ui.?, poll_reconnect_input)) return error.ReconnectAborted;
+        if (try reconnectShouldDetach(reconnect_ui.?, poll_reconnect_input)) return error.ReconnectDetached;
         if (ready == 0) continue;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
         if ((pollfds[0].revents & posix.POLL.OUT) == 0) continue;
@@ -2833,7 +2867,7 @@ fn readBootstrapLine(
         }};
         const ready = try posix.poll(&pollfds, if (reconnect_ui == null) -1 else 50);
         if (reconnect_ui) |ui| {
-            if (try reconnectShouldAbort(ui, poll_reconnect_input)) return error.ReconnectAborted;
+            if (try reconnectShouldDetach(ui, poll_reconnect_input)) return error.ReconnectDetached;
         }
         if (ready == 0) continue;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
@@ -2857,9 +2891,9 @@ fn readBootstrapLine(
     return error.BootstrapLineTooLong;
 }
 
-fn reconnectShouldAbort(reconnect_ui: *client.ReconnectUi, poll_reconnect_input: bool) !bool {
+fn reconnectShouldDetach(reconnect_ui: *client.ReconnectUi, poll_reconnect_input: bool) !bool {
     if (!poll_reconnect_input) return reconnect_ui.isCancelled();
-    return reconnect_ui.pollAbort(0);
+    return reconnect_ui.pollDetach(0);
 }
 
 test "readBootstrapLine returns the first line without the newline" {

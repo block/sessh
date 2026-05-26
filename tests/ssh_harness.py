@@ -366,21 +366,18 @@ def run_sessh_reconnect_probe(
     stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
     proc.stdin.write(b"\x02s")
     proc.stdin.flush()
-    stdout += read_until_pipe(proc.stdout, b"sessh: disconnected. Retry in 5sec", timeout)
+    stdout += read_until_pipe(proc.stdout, b"sessh: disconnected. Retry 5sec", timeout)
     if expect_countdown:
-        stdout += read_until_pipe(proc.stdout, b"sessh: disconnected. Retry in 4sec", timeout)
+        stdout += read_until_pipe(proc.stdout, b"sessh: disconnected. Retry 4sec", timeout)
     if during is not None:
         proc.stdin.write(during.encode("utf-8") + b"\n")
         proc.stdin.flush()
-    proc.stdin.write(b" ")
+        stdout += read_until_pipe(proc.stdout, b"\x07", timeout)
+    proc.stdin.write(b"\x12")
     proc.stdin.flush()
     if expect_reconnecting:
-        stdout += read_until_pipe(proc.stdout, b"sessh: reconnecting... CTRL-C aborts", timeout)
+        stdout += read_until_pipe(proc.stdout, b"sessh: reconnecting. Ctrl-C detach", timeout)
     stdout += read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
-    if during is not None:
-        during_needle = f"REMOTE:{during}".encode("utf-8")
-        if during_needle not in stdout:
-            stdout += read_until_pipe(proc.stdout, during_needle, timeout)
     proc.stdin.write(after.encode("utf-8") + b"\n")
     proc.stdin.flush()
     after_needle = f"REMOTE:{after}".encode("utf-8")
@@ -430,7 +427,7 @@ def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, tim
         read_until_pipe(proc.stdout, alt_ready.encode("utf-8"), timeout)
         proc.stdin.write(b"\x02s")
         proc.stdin.flush()
-        stdout = read_until_pipe(proc.stdout, b"sessh: disconnected. Retry in 5sec", timeout)
+        stdout = read_until_pipe(proc.stdout, b"sessh: disconnected. Retry 5sec", timeout)
         proc.stdin.write(b"\x03")
         proc.stdin.flush()
         proc.stdin.close()
@@ -448,7 +445,7 @@ def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, tim
     )
 
 
-def run_sessh_abort_reconnect_probe(args, env, ready, abort_bytes=b"\r~.", timeout=10.0):
+def run_sessh_detach_reconnect_probe(args, env, ready, detach_bytes=b"\x03", timeout=10.0):
     proc = subprocess.Popen(
         [str(BIN), *args],
         cwd=ROOT,
@@ -460,8 +457,8 @@ def run_sessh_abort_reconnect_probe(args, env, ready, abort_bytes=b"\r~.", timeo
     stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
     proc.stdin.write(b"\x02s")
     proc.stdin.flush()
-    stdout += read_until_pipe(proc.stdout, b"sessh: disconnected. Retry in 5sec", timeout)
-    proc.stdin.write(abort_bytes)
+    stdout += read_until_pipe(proc.stdout, b"sessh: disconnected. Retry 5sec", timeout)
+    proc.stdin.write(detach_bytes)
     proc.stdin.flush()
     proc.stdin.close()
     returncode = proc.wait(timeout=timeout)
@@ -1282,15 +1279,15 @@ def test_ssh_leader_sever_reconnects(tmp):
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if "sessh: disconnected. Retry in 5sec" not in result.stdout:
+    if "sessh: disconnected. Retry 5sec" not in result.stdout:
         raise AssertionError(result)
-    if "sessh: disconnected. Retry in 4sec" not in result.stdout:
+    if "sessh: disconnected. Retry 4sec" not in result.stdout:
         raise AssertionError(result)
-    if "sessh: reconnecting... CTRL-C aborts" not in result.stdout:
+    if "sessh: reconnecting. Ctrl-C detach" not in result.stdout:
         raise AssertionError(result)
     if "REMOTE:after-reconnect" not in result.stdout:
         raise AssertionError(result)
-    if "REMOTE:during-reconnect" not in result.stdout:
+    if "REMOTE:during-reconnect" in result.stdout:
         raise AssertionError(result)
     if "ReconnectUnsupported" in result.stderr:
         raise AssertionError(result.stderr)
@@ -1403,17 +1400,17 @@ def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if "sessh: disconnected. Retry in 5sec" not in result.stdout:
+    if "sessh: disconnected. Retry 5sec" not in result.stdout:
         raise AssertionError(result)
     if raw_ssh_error in result.stdout:
         raise AssertionError(result)
     expected_messages = [
-        "--- sessh: disconnected. Retry in 5sec. SPACE retries now. CTRL-C aborts ---",
-        "--- sessh: reconnecting... CTRL-C aborts ---",
+        "--- sessh: disconnected. Retry 5sec. Ctrl-R retry now. Ctrl-C detach ---",
+        "--- sessh: reconnecting. Ctrl-C detach ---",
         "ssh: Connection to test-host closed by remote host.",
         "ssh: client_loop: send disconnect: Broken pipe",
         "ssh: control sequence: ?[31mred",
-        "--- sessh: reconnected. SPACE to dismiss or wait 500ms ---",
+        "sessh: reconnected",
     ]
     actual_messages = normalized_ui_messages(result.stdout)
     if actual_messages != expected_messages:
@@ -1553,13 +1550,13 @@ def test_ssh_reconnect_does_not_apply_active_screen_cleanup(tmp):
         timeout=30.0,
     )
 
-    if "sessh: disconnected. Retry in 5sec" not in result.stdout:
+    if "sessh: disconnected. Retry 5sec" not in result.stdout:
         raise AssertionError(result)
     if primary_marker in result.stdout:
         raise AssertionError(result)
 
 
-def test_ssh_reconnect_can_be_aborted_while_bootstrapping(tmp):
+def test_ssh_reconnect_can_detach_while_bootstrapping(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1575,7 +1572,7 @@ def test_ssh_reconnect_can_be_aborted_while_bootstrapping(tmp):
     env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "20"
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh_abort_reconnect_probe(
+    result = run_sessh_detach_reconnect_probe(
         ["test-host", "--leader", "CTRL-B"],
         env,
         marker,
@@ -1584,13 +1581,13 @@ def test_ssh_reconnect_can_be_aborted_while_bootstrapping(tmp):
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if "sessh: disconnected. Retry in 5sec" not in result.stdout:
+    if "sessh: disconnected. Retry 5sec" not in result.stdout:
         raise AssertionError(result)
     if "REMOTE:" in result.stdout:
         raise AssertionError(result)
 
 
-def test_ssh_reconnect_can_be_aborted_with_ctrl_c(tmp):
+def test_ssh_reconnect_can_detach_with_ctrl_c(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1606,17 +1603,17 @@ def test_ssh_reconnect_can_be_aborted_with_ctrl_c(tmp):
     env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "20"
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh_abort_reconnect_probe(
+    result = run_sessh_detach_reconnect_probe(
         ["test-host", "--leader", "CTRL-B"],
         env,
         marker,
-        abort_bytes=b"\x03",
+        detach_bytes=b"\x03",
         timeout=10.0,
     )
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if "sessh: disconnected. Retry in 5sec" not in result.stdout:
+    if "sessh: disconnected. Retry 5sec" not in result.stdout:
         raise AssertionError(result)
     if "REMOTE:" in result.stdout:
         raise AssertionError(result)
@@ -1963,12 +1960,12 @@ def main():
             test_ssh_reconnect_does_not_apply_active_screen_cleanup,
         ),
         (
-            "ssh reconnect can be aborted while bootstrapping",
-            test_ssh_reconnect_can_be_aborted_while_bootstrapping,
+            "ssh reconnect can detach while bootstrapping",
+            test_ssh_reconnect_can_detach_while_bootstrapping,
         ),
         (
-            "ssh reconnect can be aborted with ctrl-c",
-            test_ssh_reconnect_can_be_aborted_with_ctrl_c,
+            "ssh reconnect can detach with ctrl-c",
+            test_ssh_reconnect_can_detach_with_ctrl_c,
         ),
         (
             "ssh leader detach exits while remote output is flowing",

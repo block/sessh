@@ -141,6 +141,19 @@ message Resize {
 
 // Framed payload, client -> session agent.
 //
+// Presentation-only overlay drawn for one attachment and then removed after the
+// requested duration or when that attachment next sends input.
+message TransientBanner {
+  string text = 1;
+  double duration_seconds = 2;
+  // Zero-based terminal-grid row where the banner text begins.
+  uint32 start_row = 3;
+  // Zero-based terminal-grid column where the banner text begins.
+  uint32 start_col = 4;
+}
+
+// Framed payload, client -> session agent.
+//
 // Requests that the session agent redraw terminal state for this attachment.
 message RepaintRequest {
   // Client-local repaint request sequence copied into RepaintResponse. While
@@ -157,6 +170,10 @@ message RepaintRequest {
   // Optional cap for retained scrollback rows included with an initial attach
   // repaint. Absent means all available retained scrollback.
   optional uint32 initial_scrollback_rows = 3;
+  // Optional attachment-local transient banner to draw over the repaint. This
+  // is presentation-only; the session agent must not write it to the PTY model
+  // or show it to other attachments.
+  optional TransientBanner transient_banner = 4;
 }
 
 // Framed payload, client -> session agent.

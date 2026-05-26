@@ -17,6 +17,8 @@ const max_attachments = 128;
 const max_attachment_output_queue_bytes = 64 * 1024 * 1024;
 const preferred_live_output_batch_bytes = 1024;
 const max_live_output_reads_per_batch = 64;
+const max_transient_banner_text_bytes = 96;
+const max_transient_banner_duration_seconds: f64 = 60.0;
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
@@ -25,6 +27,7 @@ extern "c" fn forkpty(amaster: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp:
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 var shutdown_signal_write_fd: c.fd_t = -1;
+var transient_banner_timer: ?std.time.Timer = null;
 
 fn handleShutdownSignal(_: c_int) callconv(.c) void {
     const fd = shutdown_signal_write_fd;
@@ -98,9 +101,26 @@ const Attachment = struct {
     input_pending: [128]u8 = [_]u8{0} ** 128,
     input_pending_len: usize = 0,
     capture_tty_transcript: bool = false,
+    transient_banner_active: bool = false,
+    transient_banner_expires_at_ns: u64 = 0,
+    transient_banner_start_row: u16 = 0,
+    transient_banner_start_col: u16 = 0,
+    transient_banner_text: [max_transient_banner_text_bytes]u8 = [_]u8{0} ** max_transient_banner_text_bytes,
+    transient_banner_text_len: usize = 0,
+    transient_banner_restore: std.ArrayList(u8) = .empty,
 
     fn queuedBytes(self: *const Attachment) usize {
         return self.output.items.len - self.output_offset;
+    }
+
+    fn transientBannerText(self: *const Attachment) []const u8 {
+        return self.transient_banner_text[0..self.transient_banner_text_len];
+    }
+
+    fn deinit(self: *Attachment) void {
+        self.output.deinit(app_allocator.allocator());
+        self.transient_banner_restore.deinit(app_allocator.allocator());
+        self.* = Attachment{};
     }
 };
 
@@ -577,6 +597,28 @@ const RepaintRequest = struct {
     repaint_request_seq: u64,
     scrollback_cursor: ?ScrollbackCursor,
     initial_scrollback_rows: ?u32 = null,
+    transient_banner_text: [max_transient_banner_text_bytes]u8 = [_]u8{0} ** max_transient_banner_text_bytes,
+    transient_banner_text_len: usize = 0,
+    transient_banner_duration_ms: i64 = 0,
+    transient_banner_start_row: u16 = 0,
+    transient_banner_start_col: u16 = 0,
+
+    fn transientBanner(self: *const RepaintRequest) ?TransientBanner {
+        if (self.transient_banner_text_len == 0 or self.transient_banner_duration_ms <= 0) return null;
+        return .{
+            .text = self.transient_banner_text[0..self.transient_banner_text_len],
+            .duration_ms = self.transient_banner_duration_ms,
+            .start_row = self.transient_banner_start_row,
+            .start_col = self.transient_banner_start_col,
+        };
+    }
+};
+
+const TransientBanner = struct {
+    text: []const u8,
+    duration_ms: i64,
+    start_row: u16 = 0,
+    start_col: u16 = 0,
 };
 
 const ScrollbackCursor = struct {
@@ -585,6 +627,12 @@ const ScrollbackCursor = struct {
 };
 
 const encoded_scrollback_cursor_len = 16;
+
+fn transientBannerNowNs() u64 {
+    if (transient_banner_timer) |*timer| return timer.read();
+    transient_banner_timer = std.time.Timer.start() catch @panic("monotonic timer unavailable");
+    return transientBannerNowNs();
+}
 
 const ResizePayload = struct {
     rows: u16,
@@ -613,6 +661,174 @@ fn renderVtRow(renderer: client_renderer.Renderer, row: vt.RenderedRow) !void {
         };
     }
     try renderer.renderRow(.{ .cells = cells });
+}
+
+fn appendTransientBannerOverlay(
+    attachment: *const Attachment,
+    session: *const Session,
+    draw_bytes: *std.ArrayList(u8),
+    message: []const u8,
+) !bool {
+    if (message.len == 0 or session.rows == 0 or session.cols == 0) return false;
+    const target = transientBannerTarget(attachment, session) orelse return false;
+    const renderer = client_renderer.Renderer.buffered(draw_bytes, .{ .kind = .xterm_compatible });
+    var presentation = attachment.presentation;
+    var status: [max_transient_banner_text_bytes]u8 = undefined;
+    const status_len = formatTransientBannerText(message, status[0..], session.cols - target.col);
+    if (status_len == 0) return false;
+
+    try renderer.setCursorVisible(false);
+    try presentation.moveToGridPosition(renderer, target.row, target.col);
+    try renderer.writeRaw("\x1b[7m");
+    try renderer.writeRaw(status[0..status_len]);
+    try renderer.writeRaw("\x1b[0m");
+    presentation.cursor_row = target.row;
+    presentation.cursor_col = target.col + @as(u16, @intCast(status_len));
+    try presentation.moveWithinGrid(renderer, attachment.presentation.cursor_row, attachment.presentation.cursor_col);
+    try renderer.setCursorVisible(attachment.presentation.cursor_visible);
+    try renderer.setCursorStyle(attachment.presentation.cursor_style);
+    try renderer.restoreBannerPresentation();
+    return true;
+}
+
+fn formatTransientBannerText(message: []const u8, out: []u8, available_cols: u16) usize {
+    const visible_len = @min(@min(message.len, out.len), @as(usize, available_cols));
+    var i: usize = 0;
+    while (i < visible_len) {
+        const byte = message[i];
+        if (byte == '\n' or byte == '\r') break;
+        out[i] = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+        i += 1;
+    }
+    return i;
+}
+
+fn transientBannerDurationMs(seconds: f64) i64 {
+    if (!std.math.isFinite(seconds) or seconds <= 0) return 0;
+    const clamped = @min(seconds, max_transient_banner_duration_seconds);
+    const millis: i64 = @intFromFloat(@ceil(clamped * @as(f64, @floatFromInt(std.time.ms_per_s))));
+    return @max(1, millis);
+}
+
+fn clearTransientBannerState(attachment: *Attachment) void {
+    attachment.transient_banner_active = false;
+    attachment.transient_banner_expires_at_ns = 0;
+    attachment.transient_banner_start_row = 0;
+    attachment.transient_banner_start_col = 0;
+    attachment.transient_banner_text_len = 0;
+    attachment.transient_banner_restore.clearRetainingCapacity();
+}
+
+fn expireTransientBannerOnNextDraw(attachment: *Attachment) void {
+    if (!attachment.transient_banner_active) {
+        clearTransientBannerState(attachment);
+        return;
+    }
+    attachment.transient_banner_expires_at_ns = 0;
+    attachment.transient_banner_text_len = 0;
+}
+
+fn startTransientBanner(attachment: *Attachment, banner: TransientBanner) void {
+    if (banner.text.len == 0 or banner.duration_ms <= 0) {
+        expireTransientBannerOnNextDraw(attachment);
+        return;
+    }
+    const copy_len = @min(banner.text.len, attachment.transient_banner_text.len);
+    if (copy_len == 0) {
+        expireTransientBannerOnNextDraw(attachment);
+        return;
+    }
+    @memcpy(attachment.transient_banner_text[0..copy_len], banner.text[0..copy_len]);
+    attachment.transient_banner_text_len = copy_len;
+    attachment.transient_banner_start_row = banner.start_row;
+    attachment.transient_banner_start_col = banner.start_col;
+    attachment.transient_banner_active = true;
+    attachment.transient_banner_expires_at_ns =
+        transientBannerNowNs() + @as(u64, @intCast(banner.duration_ms)) * std.time.ns_per_ms;
+}
+
+fn appendActiveTransientBannerOverlay(
+    attachment: *const Attachment,
+    session: *const Session,
+    draw_bytes: *std.ArrayList(u8),
+    now_ns: u64,
+) !void {
+    if (!attachment.transient_banner_active) return;
+    if (transientBannerExpired(attachment, now_ns)) return;
+    _ = try appendTransientBannerOverlay(attachment, session, draw_bytes, attachment.transientBannerText());
+}
+
+const TransientBannerTarget = struct {
+    row: u16,
+    col: u16,
+};
+
+fn transientBannerExpired(attachment: *const Attachment, now_ns: u64) bool {
+    return attachment.transient_banner_expires_at_ns <= now_ns;
+}
+
+fn transientBannerTarget(attachment: *const Attachment, session: *const Session) ?TransientBannerTarget {
+    if (session.rows == 0 or session.cols == 0 or attachment.presentation.rendered_rows == 0) return null;
+    if (attachment.transient_banner_start_col >= session.cols) return null;
+    const visible_rows = @min(session.rows, attachment.presentation.rendered_rows);
+    if (visible_rows == 0) return null;
+    return .{
+        .row = @min(attachment.transient_banner_start_row, visible_rows - 1),
+        .col = attachment.transient_banner_start_col,
+    };
+}
+
+fn updateTransientBannerRestore(
+    attachment: *Attachment,
+    session: *const Session,
+    screen: *const vt.RenderedScreen,
+    now_ns: u64,
+) !void {
+    if (!attachment.transient_banner_active) return;
+    attachment.transient_banner_restore.clearRetainingCapacity();
+    if (transientBannerExpired(attachment, now_ns)) return;
+    const target = transientBannerTarget(attachment, session) orelse return;
+
+    const renderer = client_renderer.Renderer.buffered(&attachment.transient_banner_restore, .{ .kind = .xterm_compatible });
+    var presentation = attachment.presentation;
+
+    try renderer.setCursorVisible(false);
+    try presentation.moveToGridPosition(renderer, target.row, 0);
+    try renderer.clearLine();
+    if (target.row < screen.rows.len) {
+        try renderVtRow(renderer, screen.rows[target.row]);
+    }
+    try presentation.moveWithinGrid(renderer, attachment.presentation.cursor_row, attachment.presentation.cursor_col);
+    try renderer.setCursorVisible(attachment.presentation.cursor_visible);
+    try renderer.setCursorStyle(attachment.presentation.cursor_style);
+    try renderer.restoreBannerPresentation();
+}
+
+fn drawBytesWithTransientBanner(
+    attachment: *Attachment,
+    session: *const Session,
+    draw_bytes: []const u8,
+    screen_after_draw: ?*const vt.RenderedScreen,
+    out: *std.ArrayList(u8),
+) ![]const u8 {
+    if (!attachment.transient_banner_active) return draw_bytes;
+
+    if (attachment.transient_banner_restore.items.len > 0) {
+        try out.appendSlice(app_allocator.allocator(), attachment.transient_banner_restore.items);
+    }
+    try out.appendSlice(app_allocator.allocator(), draw_bytes);
+
+    const now_ns = transientBannerNowNs();
+    if (transientBannerExpired(attachment, now_ns)) {
+        clearTransientBannerState(attachment);
+        return out.items;
+    }
+
+    if (screen_after_draw) |screen| {
+        try updateTransientBannerRestore(attachment, session, screen, now_ns);
+    }
+    try appendActiveTransientBannerOverlay(attachment, session, out, now_ns);
+    return out.items;
 }
 
 fn renderedCellsDisplayWidth(cells: []const vt.RenderedCell) u16 {
@@ -797,6 +1013,386 @@ test "relay-end restore moves to rendered top only once" {
     try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
 }
 
+test "transient banner is attachment-local and restores underlying content" {
+    var screen = try testRenderedScreen(
+        std.testing.allocator,
+        0,
+        2,
+        &.{ "TOP", "MIDDLE", "OLDROW" },
+    );
+    defer screen.deinit(std.testing.allocator);
+    var next_screen = try testRenderedScreen(
+        std.testing.allocator,
+        0,
+        2,
+        &.{ "TOP", "MIDDLE", "NEWROW" },
+    );
+    defer next_screen.deinit(std.testing.allocator);
+
+    var session = Session{ .rows = 3, .cols = 40 };
+    var status_attachment = Attachment{ .active = true, .rows = 3, .cols = 40 };
+    defer status_attachment.deinit();
+    var other_attachment = Attachment{ .active = true, .rows = 3, .cols = 40 };
+    defer other_attachment.deinit();
+
+    try queueRepaintResponseDraw(
+        &status_attachment,
+        &session,
+        7,
+        false,
+        0,
+        &.{},
+        &screen,
+        null,
+        0,
+        .{ .text = "sessh: reconnected", .duration_ms = 500 },
+    );
+
+    try std.testing.expect(status_attachment.transient_banner_active);
+    try std.testing.expectEqual(@as(usize, 0), other_attachment.output.items.len);
+
+    var status_frame = try queuedFrame(&status_attachment);
+    defer status_frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.repaint_response, status_frame.message_type);
+    var response = try protocol.decodePayload(pb.RepaintResponse, std.testing.allocator, status_frame.payload);
+    defer response.deinit(std.testing.allocator);
+    const status_draw = response.draw orelse return error.MissingDraw;
+    try std.testing.expect(std.mem.indexOf(u8, status_draw.draw_bytes, "OLDROW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_draw.draw_bytes, "sessh: reconnected") != null);
+
+    clearQueuedOutput(&status_attachment);
+    _ = try queueScreenDraw(&status_attachment, &session, &next_screen, null, true, false, 0);
+    try std.testing.expect(status_attachment.transient_banner_active);
+
+    var redraw_frame = try queuedFrame(&status_attachment);
+    defer redraw_frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.draw, redraw_frame.message_type);
+    var redraw = try protocol.decodePayload(pb.Draw, std.testing.allocator, redraw_frame.payload);
+    defer redraw.deinit(std.testing.allocator);
+    const old_index = std.mem.indexOf(u8, redraw.draw_bytes, "OLDROW") orelse return error.MissingOldUnderlay;
+    const new_index = std.mem.indexOf(u8, redraw.draw_bytes, "NEWROW") orelse return error.MissingNewUnderlay;
+    const banner_index = std.mem.indexOf(u8, redraw.draw_bytes, "sessh: reconnected") orelse return error.MissingTransientBanner;
+    try std.testing.expect(old_index < new_index);
+    try std.testing.expect(new_index < banner_index);
+
+    clearQueuedOutput(&status_attachment);
+    clearTransientBannerState(&status_attachment);
+    _ = try queueScreenDraw(&status_attachment, &session, &next_screen, null, true, false, 0);
+
+    var restore_frame = try queuedFrame(&status_attachment);
+    defer restore_frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.draw, restore_frame.message_type);
+    var restore_draw = try protocol.decodePayload(pb.Draw, std.testing.allocator, restore_frame.payload);
+    defer restore_draw.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, restore_draw.draw_bytes, "NEWROW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restore_draw.draw_bytes, "sessh: reconnected") == null);
+}
+
+test "transient banner does not consume first input" {
+    const pty_pipe = try posix.pipe();
+    defer posix.close(pty_pipe[0]);
+    defer posix.close(pty_pipe[1]);
+
+    const attachment_pipe = try posix.pipe();
+    defer posix.close(attachment_pipe[0]);
+    defer posix.close(attachment_pipe[1]);
+
+    var session_agent = SessionAgent{};
+    session_agent.sessions[0] = .{
+        .pty_fd = pty_pipe[1],
+        .rows = 3,
+        .cols = 40,
+        .alive = true,
+    };
+    session_agent.attachments[0] = .{
+        .fd = attachment_pipe[1],
+        .session_index = 0,
+        .rows = 3,
+        .cols = 40,
+        .active = true,
+        .transient_banner_active = true,
+        .transient_banner_expires_at_ns = transientBannerNowNs() + 500 * std.time.ns_per_ms,
+    };
+    defer session_agent.attachments[0].deinit();
+
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Input{ .data = "x" });
+    defer app_allocator.allocator().free(payload);
+    handleInputFrame(&session_agent, 0, payload);
+
+    try std.testing.expect(session_agent.attachments[0].active);
+    try std.testing.expect(!session_agent.attachments[0].transient_banner_active);
+
+    var pollfds = [_]posix.pollfd{.{ .fd = pty_pipe[0], .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 100));
+
+    var forwarded: [1]u8 = undefined;
+    const n = c.read(pty_pipe[0], &forwarded, forwarded.len);
+    try std.testing.expect(n == 1);
+    try std.testing.expectEqual(@as(u8, 'x'), forwarded[0]);
+}
+
+test "repaint request decodes transient banner duration" {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.RepaintRequest{
+        .repaint_request_seq = 42,
+        .transient_banner = .{
+            .text = "sessh: reconnected",
+            .duration_seconds = 1.25,
+            .start_row = 2,
+            .start_col = 3,
+        },
+    });
+    defer app_allocator.allocator().free(payload);
+
+    const request = try readRepaintRequest(payload);
+    try std.testing.expectEqual(@as(u64, 42), request.repaint_request_seq);
+    const banner = request.transientBanner() orelse return error.MissingTransientBanner;
+    try std.testing.expectEqualStrings("sessh: reconnected", banner.text);
+    try std.testing.expectEqual(@as(i64, 1250), banner.duration_ms);
+    try std.testing.expectEqual(@as(u16, 2), banner.start_row);
+    try std.testing.expectEqual(@as(u16, 3), banner.start_col);
+}
+
+test "expired transient banner clears restore and stops saving restore" {
+    var screen = try testRenderedScreen(
+        std.testing.allocator,
+        0,
+        1,
+        &.{ "TOP", "BOTTOM" },
+    );
+    defer screen.deinit(std.testing.allocator);
+
+    var session = Session{ .rows = 2, .cols = 40 };
+    var attachment = Attachment{ .active = true, .rows = 2, .cols = 40 };
+    defer attachment.deinit();
+    try queueRepaintResponseDraw(
+        &attachment,
+        &session,
+        7,
+        false,
+        0,
+        &.{},
+        &screen,
+        null,
+        0,
+        .{ .text = "sessh: reconnected", .duration_ms = 500 },
+    );
+    try std.testing.expect(attachment.transient_banner_restore.items.len > 0);
+    clearQueuedOutput(&attachment);
+
+    attachment.transient_banner_expires_at_ns = 0;
+
+    _ = try queueScreenDraw(&attachment, &session, &screen, null, true, false, 0);
+
+    var frame = try queuedFrame(&attachment);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.draw, frame.message_type);
+    var draw = try protocol.decodePayload(pb.Draw, std.testing.allocator, frame.payload);
+    defer draw.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, draw.draw_bytes, "BOTTOM") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draw.draw_bytes, "sessh: reconnected") == null);
+    try std.testing.expect(!attachment.transient_banner_active);
+    try std.testing.expectEqual(@as(usize, 0), attachment.transient_banner_restore.items.len);
+}
+
+test "expired transient banner queues clearing frame without screen changes" {
+    const terminal_model = try vt.SessionTerminal.create(std.testing.allocator, 2, 40, 100);
+    defer terminal_model.destroy();
+    try terminal_model.feed("TOP\r\nBOTTOM");
+
+    var screen = try terminal_model.renderedScreen(std.testing.allocator);
+    defer screen.deinit(std.testing.allocator);
+
+    const attachment_pipe = try posix.pipe();
+    defer posix.close(attachment_pipe[0]);
+    defer posix.close(attachment_pipe[1]);
+
+    var session_agent = SessionAgent{};
+    session_agent.sessions[0] = .{
+        .terminal_model = terminal_model,
+        .rows = 2,
+        .cols = 40,
+        .alive = true,
+    };
+    session_agent.attachments[0] = .{
+        .fd = attachment_pipe[1],
+        .session_index = 0,
+        .rows = 2,
+        .cols = 40,
+        .active = true,
+    };
+    defer session_agent.attachments[0].deinit();
+
+    try queueRepaintResponseDraw(
+        &session_agent.attachments[0],
+        &session_agent.sessions[0],
+        7,
+        false,
+        0,
+        &.{},
+        &screen,
+        null,
+        try terminal_model.scrollbackCursor(),
+        .{ .text = "sessh: reconnected", .duration_ms = 500 },
+    );
+    clearQueuedOutput(&session_agent.attachments[0]);
+    session_agent.attachments[0].transient_banner_expires_at_ns = 0;
+
+    expireTransientBanners(&session_agent);
+
+    try std.testing.expect(session_agent.attachments[0].active);
+    try std.testing.expect(!session_agent.attachments[0].transient_banner_active);
+    try std.testing.expectEqual(@as(usize, 0), session_agent.attachments[0].transient_banner_restore.items.len);
+
+    var frame = try protocol.readFrameAlloc(std.testing.allocator, attachment_pipe[0]);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.draw, frame.message_type);
+    var draw = try protocol.decodePayload(pb.Draw, std.testing.allocator, frame.payload);
+    defer draw.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, draw.draw_bytes, "TOP") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draw.draw_bytes, "sessh: reconnected") == null);
+}
+
+test "transient banner clips to width and newline" {
+    var screen = try testRenderedScreen(std.testing.allocator, 0, 0, &.{"QQQQQQ"});
+    defer screen.deinit(std.testing.allocator);
+
+    var session = Session{ .rows = 1, .cols = 6 };
+    var attachment = Attachment{ .active = true, .rows = 1, .cols = 6 };
+    defer attachment.deinit();
+
+    try queueRepaintResponseDraw(
+        &attachment,
+        &session,
+        7,
+        false,
+        0,
+        &.{},
+        &screen,
+        null,
+        0,
+        .{ .text = "ABCDE", .duration_ms = 500, .start_col = 3 },
+    );
+    var width_frame = try queuedFrame(&attachment);
+    defer width_frame.deinit(std.testing.allocator);
+    var width_response = try protocol.decodePayload(pb.RepaintResponse, std.testing.allocator, width_frame.payload);
+    defer width_response.deinit(std.testing.allocator);
+    const width_draw = width_response.draw orelse return error.MissingDraw;
+    try std.testing.expect(std.mem.indexOf(u8, width_draw.draw_bytes, "ABC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, width_draw.draw_bytes, "D") == null);
+
+    clearQueuedOutput(&attachment);
+    try queueRepaintResponseDraw(
+        &attachment,
+        &session,
+        8,
+        false,
+        0,
+        &.{},
+        &screen,
+        null,
+        0,
+        .{ .text = "XY\nTAIL", .duration_ms = 500, .start_col = 0 },
+    );
+    var newline_frame = try queuedFrame(&attachment);
+    defer newline_frame.deinit(std.testing.allocator);
+    var newline_response = try protocol.decodePayload(pb.RepaintResponse, std.testing.allocator, newline_frame.payload);
+    defer newline_response.deinit(std.testing.allocator);
+    const newline_draw = newline_response.draw orelse return error.MissingDraw;
+    try std.testing.expect(std.mem.indexOf(u8, newline_draw.draw_bytes, "XY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, newline_draw.draw_bytes, "TAIL") == null);
+}
+
+test "transient banner clips after resize" {
+    var screen = try testRenderedScreen(std.testing.allocator, 0, 0, &.{"BASE"});
+    defer screen.deinit(std.testing.allocator);
+    var resized_screen = try testRenderedScreen(std.testing.allocator, 0, 0, &.{"AFTER"});
+    defer resized_screen.deinit(std.testing.allocator);
+
+    var session = Session{ .rows = 1, .cols = 10 };
+    var attachment = Attachment{ .active = true, .rows = 1, .cols = 10 };
+    defer attachment.deinit();
+
+    try queueRepaintResponseDraw(
+        &attachment,
+        &session,
+        7,
+        false,
+        0,
+        &.{},
+        &screen,
+        null,
+        0,
+        .{ .text = "ABCDE", .duration_ms = 500, .start_col = 5 },
+    );
+    clearQueuedOutput(&attachment);
+
+    session.cols = 8;
+    attachment.cols = 8;
+    _ = try queueScreenDraw(&attachment, &session, &resized_screen, null, true, false, 0);
+
+    var frame = try queuedFrame(&attachment);
+    defer frame.deinit(std.testing.allocator);
+    var draw = try protocol.decodePayload(pb.Draw, std.testing.allocator, frame.payload);
+    defer draw.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, draw.draw_bytes, "ABC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draw.draw_bytes, "D") == null);
+}
+
+test "new transient banner replaces old banner" {
+    var screen = try testRenderedScreen(std.testing.allocator, 0, 0, &.{"UNDER"});
+    defer screen.deinit(std.testing.allocator);
+
+    var session = Session{ .rows = 1, .cols = 40 };
+    var attachment = Attachment{ .active = true, .rows = 1, .cols = 40 };
+    defer attachment.deinit();
+
+    try queueRepaintResponseDraw(
+        &attachment,
+        &session,
+        7,
+        false,
+        0,
+        &.{},
+        &screen,
+        null,
+        0,
+        .{ .text = "LONG-BANNER", .duration_ms = 60_000 },
+    );
+    clearQueuedOutput(&attachment);
+
+    try queueRepaintResponseDraw(
+        &attachment,
+        &session,
+        8,
+        false,
+        0,
+        &.{},
+        &screen,
+        null,
+        0,
+        .{ .text = "NEW", .duration_ms = 500 },
+    );
+
+    var replacement_frame = try queuedFrame(&attachment);
+    defer replacement_frame.deinit(std.testing.allocator);
+    var replacement_response = try protocol.decodePayload(pb.RepaintResponse, std.testing.allocator, replacement_frame.payload);
+    defer replacement_response.deinit(std.testing.allocator);
+    const replacement_draw = replacement_response.draw orelse return error.MissingDraw;
+    try std.testing.expect(std.mem.indexOf(u8, replacement_draw.draw_bytes, "NEW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replacement_draw.draw_bytes, "LONG-BANNER") == null);
+
+    clearQueuedOutput(&attachment);
+    attachment.transient_banner_expires_at_ns = 0;
+    _ = try queueScreenDraw(&attachment, &session, &screen, null, true, false, 0);
+
+    var expired_frame = try queuedFrame(&attachment);
+    defer expired_frame.deinit(std.testing.allocator);
+    var expired_draw = try protocol.decodePayload(pb.Draw, std.testing.allocator, expired_frame.payload);
+    defer expired_draw.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, expired_draw.draw_bytes, "NEW") == null);
+    try std.testing.expect(std.mem.indexOf(u8, expired_draw.draw_bytes, "LONG-BANNER") == null);
+}
+
 fn testRenderedScreen(
     allocator: std.mem.Allocator,
     active_screen: u8,
@@ -849,6 +1445,19 @@ fn testRenderedRow(allocator: std.mem.Allocator, label: []const u8) !vt.Rendered
         .flags = 0,
         .dirty = true,
     };
+}
+
+fn queuedFrame(attachment: *const Attachment) !protocol.OwnedFrame {
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
+    try io.writeAll(pipe[1], attachment.output.items[attachment.output_offset..]);
+    return protocol.readFrameAlloc(std.testing.allocator, pipe[0]);
+}
+
+fn clearQueuedOutput(attachment: *Attachment) void {
+    attachment.output.clearRetainingCapacity();
+    attachment.output_offset = 0;
 }
 
 fn vtAttrsToClient(attrs: vt.CellAttrs) !client_renderer.CellAttrs {
@@ -1052,6 +1661,8 @@ fn chmodPath(path: []const u8, mode: c.mode_t) !void {
 }
 
 fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: c.fd_t, shutdown_signal_fd: c.fd_t) !void {
+    expireTransientBanners(session_agent);
+
     var pollfds: [2 + max_sessions + max_attachments]posix.pollfd = undefined;
     var kinds: [2 + max_sessions + max_attachments]PollKind = undefined;
     var count: usize = 0;
@@ -1082,7 +1693,11 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: c.fd_t, shutdow
         count += 1;
     }
 
-    _ = try posix.poll(pollfds[0..count], -1);
+    const ready = try posix.poll(pollfds[0..count], transientBannerPollTimeoutMs(session_agent));
+    if (ready == 0) {
+        expireTransientBanners(session_agent);
+        return;
+    }
 
     for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
         if (pollfd.revents == 0) continue;
@@ -1092,6 +1707,35 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: c.fd_t, shutdow
             .session => |session_index| drainSessionOutput(session_agent, session_index),
             .attachment => |attachment_index| handleAttachmentEvents(session_agent, attachment_index, pollfd.revents),
         }
+    }
+    expireTransientBanners(session_agent);
+}
+
+fn transientBannerPollTimeoutMs(session_agent: *const SessionAgent) i32 {
+    const now = transientBannerNowNs();
+    var best: ?u64 = null;
+    for (&session_agent.attachments) |*attachment| {
+        if (!attachment.active or !attachment.transient_banner_active) continue;
+        if (attachment.transient_banner_expires_at_ns <= now) return 0;
+        const remaining = attachment.transient_banner_expires_at_ns - now;
+        best = if (best) |current| @min(current, remaining) else remaining;
+    }
+    const timeout_ns = best orelse return -1;
+    const timeout_ms = (timeout_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+    return @intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
+}
+
+fn expireTransientBanners(session_agent: *SessionAgent) void {
+    const now = transientBannerNowNs();
+    for (&session_agent.attachments, 0..) |*attachment, i| {
+        if (!attachment.active or !attachment.transient_banner_active) continue;
+        if (attachment.transient_banner_expires_at_ns > now) continue;
+        const session = &session_agent.sessions[attachment.session_index];
+        clearTransientBanner(attachment, session) catch {
+            detachAttachment(session_agent, i);
+            continue;
+        };
+        flushAttachmentOutput(session_agent, i);
     }
 }
 
@@ -1539,13 +2183,18 @@ fn queueDrawFrame(
     scrollback_cursor: u64,
     draw_bytes: []const u8,
     relay_end_restore_bytes: ?[]const u8,
+    screen_after_draw: ?*const vt.RenderedScreen,
 ) !void {
+    var banner_bytes = std.ArrayList(u8).empty;
+    defer banner_bytes.deinit(app_allocator.allocator());
+    const effective_draw_bytes = try drawBytesWithTransientBanner(attachment, session, draw_bytes, screen_after_draw, &banner_bytes);
+
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
     encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Draw{
         .scrollback_cursor = encoded_cursor[0..],
         .viewport_offset = attachment.presentation.protocolViewportOffset(),
-        .draw_bytes = draw_bytes,
+        .draw_bytes = effective_draw_bytes,
         .relay_end_restore_bytes = relay_end_restore_bytes,
     });
     defer app_allocator.allocator().free(payload);
@@ -1586,7 +2235,7 @@ fn queueScrollbackRowsDraw(
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null);
+    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null, null);
 }
 
 fn queueScrollbackRowsAndScreenDraw(
@@ -1600,7 +2249,6 @@ fn queueScrollbackRowsAndScreenDraw(
 ) !void {
     if (rows.len == 0) return;
     if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
-
     const passthrough = session.pending_plain_output.items;
     if (try attachment.presentation.canApplyPlainPassthrough(
         screen,
@@ -1609,7 +2257,7 @@ fn queueScrollbackRowsAndScreenDraw(
         session.pendingPlainOutputCanReplay(),
     )) {
         try attachment.presentation.assumePlainPassthroughScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, null);
+        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, null, screen);
         return;
     }
 
@@ -1637,7 +2285,7 @@ fn queueScrollbackRowsAndScreenDraw(
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
     const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, restore);
+    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, restore, screen);
 }
 
 fn queueScrollbackTruncatedDraw(
@@ -1651,7 +2299,7 @@ fn queueScrollbackTruncatedDraw(
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
-    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null);
+    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null, null);
 }
 
 fn appendScrollbackTruncatedMarker(bytes: *std.ArrayList(u8), renderer: client_renderer.Renderer, truncated_rows: u64) !void {
@@ -1708,7 +2356,7 @@ fn queueScreenDraw(
         session.pendingPlainOutputCanReplay(),
     )) {
         try attachment.presentation.assumePlainPassthroughScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, null);
+        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, null, screen);
         return true;
     }
 
@@ -1728,7 +2376,7 @@ fn queueScreenDraw(
         var restore_bytes = std.ArrayList(u8).empty;
         defer restore_bytes.deinit(app_allocator.allocator());
         const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-        try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, restore);
+        try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, restore, screen);
         return true;
     }
     return false;
@@ -1749,7 +2397,7 @@ fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session) 
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try renderer.clearScrollback();
-    try queueDrawFrame(attachment, session, 0, bytes.items, null);
+    try queueDrawFrame(attachment, session, 0, bytes.items, null, null);
 }
 
 fn queueRepaintResponseFrame(
@@ -1759,7 +2407,12 @@ fn queueRepaintResponseFrame(
     scrollback_cursor: u64,
     draw_bytes: []const u8,
     relay_end_restore_bytes: ?[]const u8,
+    screen_after_draw: ?*const vt.RenderedScreen,
 ) !void {
+    var banner_bytes = std.ArrayList(u8).empty;
+    defer banner_bytes.deinit(app_allocator.allocator());
+    const effective_draw_bytes = try drawBytesWithTransientBanner(attachment, session, draw_bytes, screen_after_draw, &banner_bytes);
+
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
     encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.RepaintResponse{
@@ -1767,7 +2420,7 @@ fn queueRepaintResponseFrame(
         .draw = .{
             .scrollback_cursor = encoded_cursor[0..],
             .viewport_offset = attachment.presentation.protocolViewportOffset(),
-            .draw_bytes = draw_bytes,
+            .draw_bytes = effective_draw_bytes,
             .relay_end_restore_bytes = relay_end_restore_bytes,
         },
     });
@@ -1785,6 +2438,7 @@ fn queueRepaintResponseDraw(
     screen: *const vt.RenderedScreen,
     restore_screen: ?*const vt.RenderedScreen,
     scrollback_cursor: u64,
+    transient_banner: ?TransientBanner,
 ) !void {
     if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
 
@@ -1795,6 +2449,7 @@ fn queueRepaintResponseDraw(
         try renderer.clearForReplace();
         attachment.presentation.reset();
     }
+    if (transient_banner) |banner| startTransientBanner(attachment, banner);
     var effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, false);
     if (!clear_for_replace and shouldClearOuterVisibleForDisplayClear(screen)) {
         try attachment.presentation.clearOuterVisibleForScreen(renderer, screen);
@@ -1809,7 +2464,7 @@ fn queueRepaintResponseDraw(
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
     const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-    try queueRepaintResponseFrame(attachment, session, repaint_request_seq, scrollback_cursor, bytes.items, restore);
+    try queueRepaintResponseFrame(attachment, session, repaint_request_seq, scrollback_cursor, bytes.items, restore, screen);
 }
 
 fn queueRepaintSnapshot(
@@ -1868,6 +2523,7 @@ fn queueRepaintSnapshot(
             &screen,
             if (primary_screen) |*primary| primary else null,
             scrollback.absolute_count,
+            request.transientBanner(),
         );
     } else {
         const scrollback_cursor = try model.scrollbackCursor();
@@ -1881,6 +2537,7 @@ fn queueRepaintSnapshot(
             &screen,
             if (primary_screen) |*primary| primary else null,
             scrollback_cursor,
+            request.transientBanner(),
         );
     }
 
@@ -1926,6 +2583,31 @@ fn sendSessionRepaintSnapshot(attachment: *Attachment, session: *Session, reques
     const screen_rows = try queueRepaintSnapshot(attachment, session, request, false);
     model.markScrollbackReported();
     model.markRendered(screen_rows);
+}
+
+fn clearTransientBanner(attachment: *Attachment, session: *Session) !void {
+    if (!attachment.transient_banner_active) return;
+    const model = session.terminal_model orelse {
+        clearTransientBannerState(attachment);
+        return;
+    };
+    var screen = try model.renderedScreen(app_allocator.allocator());
+    defer screen.deinit(app_allocator.allocator());
+    var primary_screen: ?vt.RenderedScreen = null;
+    defer if (primary_screen) |*primary| primary.deinit(app_allocator.allocator());
+    if (screen.active_screen == 1) {
+        primary_screen = try model.renderedPrimaryScreen(app_allocator.allocator());
+    }
+    clearTransientBannerState(attachment);
+    _ = try queueScreenDraw(
+        attachment,
+        session,
+        &screen,
+        if (primary_screen) |*primary| primary else null,
+        true,
+        false,
+        try model.scrollbackCursor(),
+    );
 }
 
 fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
@@ -2058,7 +2740,7 @@ fn readRepaintRequest(payload: []const u8) !RepaintRequest {
 }
 
 fn repaintRequestFromMessage(message: pb.RepaintRequest) !RepaintRequest {
-    return .{
+    var request = RepaintRequest{
         .repaint_request_seq = message.repaint_request_seq,
         .scrollback_cursor = if (message.scrollback_cursor) |cursor|
             try decodeScrollbackCursor(cursor)
@@ -2066,6 +2748,15 @@ fn repaintRequestFromMessage(message: pb.RepaintRequest) !RepaintRequest {
             null,
         .initial_scrollback_rows = message.initial_scrollback_rows,
     };
+    if (message.transient_banner) |banner| {
+        const copy_len = @min(banner.text.len, request.transient_banner_text.len);
+        @memcpy(request.transient_banner_text[0..copy_len], banner.text[0..copy_len]);
+        request.transient_banner_text_len = copy_len;
+        request.transient_banner_duration_ms = transientBannerDurationMs(banner.duration_seconds);
+        request.transient_banner_start_row = @intCast(@min(banner.start_row, std.math.maxInt(u16)));
+        request.transient_banner_start_col = @intCast(@min(banner.start_col, std.math.maxInt(u16)));
+    }
+    return request;
 }
 
 fn createSession(
@@ -2250,10 +2941,7 @@ fn attachSession(
         };
         @memcpy(attachment.client_guid[0..client_guid.len], client_guid);
         attachment.presentation.setViewportOffset(resize.viewport_offset);
-        errdefer {
-            attachment.output.deinit(app_allocator.allocator());
-            attachment.* = Attachment{};
-        }
+        errdefer attachment.deinit();
         try sendSessionAttachedForSession(session_agent, attachment, session);
         if (resize.repaint_request) |request| {
             try sendSessionRepaintSnapshot(attachment, session, request);
@@ -2403,6 +3091,13 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, paylo
     };
     defer input.deinit(app_allocator.allocator());
     if (input.data.len == 0) return;
+
+    const had_transient_banner = attachment.transient_banner_active;
+    clearTransientBanner(attachment, session) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    if (had_transient_banner) flushAttachmentOutput(session_agent, attachment_index);
 
     if (session.rows != attachment.rows or session.cols != attachment.cols) {
         updateSessionSize(session, attachment.rows, attachment.cols);
@@ -2803,8 +3498,7 @@ fn detachAttachment(session_agent: *SessionAgent, attachment_index: usize) void 
         logSessionAgent(session_agent, "event=detach id={s} rows={} cols={}", .{ session.idSlice(), attachment.rows, attachment.cols });
     }
     _ = c.close(attachment.fd);
-    attachment.output.deinit(app_allocator.allocator());
-    attachment.* = Attachment{};
+    attachment.deinit();
     refreshAttachedFlag(session_agent, session_index);
 }
 

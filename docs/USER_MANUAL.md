@@ -19,10 +19,10 @@ session. While disconnected, `sessh` shows a temporary banner. The banner
 disappears when `sessh` successfully reconnects.
 
 ```text
---- sessh: disconnected. Retry in 10min. SPACE retries now. CTRL-C aborts ---
+--- sessh: disconnected. Retry 10min. Ctrl-R retry now. Ctrl-C detach ---
 ```
 
-Even if you abort the reconnect, the session will remain running on the remote.
+Even if you detach during reconnect, the session will remain running on the remote.
 You may re-attach or kill the session with `sesshmux`, documented below.
 
 # Advanced Usage

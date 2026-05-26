@@ -210,7 +210,7 @@ pub const RelayEnd = enum {
 pub const ReconnectDecision = enum {
     wait_elapsed,
     reconnect_now,
-    abort,
+    detach,
 };
 
 pub const RuntimeRecovery = enum {
@@ -223,6 +223,20 @@ pub const ConnectionResult = enum {
     recovered,
     reconnected,
 };
+
+const connection_result_banner_seconds: f64 = 0.5;
+
+pub fn connectionResultBanner(result: ConnectionResult) pb.TransientBanner {
+    return .{
+        .text = switch (result) {
+            .recovered => "sessh: connection recovered",
+            .reconnected => "sessh: reconnected",
+        },
+        .duration_seconds = connection_result_banner_seconds,
+        .start_row = 0,
+        .start_col = 0,
+    };
+}
 
 const CreatedSession = struct {
     guid: []u8,
@@ -237,12 +251,12 @@ const CreatedSession = struct {
 
 pub const RelayOptions = struct {
     monitor_connection: bool = false,
+    responsiveness_timeout_floor_ms: i64 = default_responsiveness_timeout_ms,
 };
 
 const input_chunk_bytes = 1024;
 const ping_min_interval_ms: i64 = 1_000;
-const initial_responsiveness_timeout_ms: i64 = 2_000;
-const min_responsiveness_timeout_ms: i64 = 1_000;
+const default_responsiveness_timeout_ms: i64 = 5_000;
 const max_responsiveness_timeout_ms: i64 = 15_000;
 
 const ConnectionMonitor = struct {
@@ -254,6 +268,7 @@ const ConnectionMonitor = struct {
     any_response_wait_started_ms: ?i64 = null,
     smoothed_rtt_ms: ?i64 = null,
     rtt_variance_ms: i64 = 0,
+    responsiveness_timeout_floor_ms: i64 = default_responsiveness_timeout_ms,
 
     fn afterInput(self: *ConnectionMonitor, write_fd: c.fd_t) !void {
         if (!self.enabled) return;
@@ -357,8 +372,9 @@ const ConnectionMonitor = struct {
         const timeout = if (self.smoothed_rtt_ms) |srtt|
             srtt + 4 * self.rtt_variance_ms
         else
-            initial_responsiveness_timeout_ms;
-        return @min(max_responsiveness_timeout_ms, @max(min_responsiveness_timeout_ms, timeout));
+            default_responsiveness_timeout_ms;
+        const floor = @min(max_responsiveness_timeout_ms, @max(default_responsiveness_timeout_ms, self.responsiveness_timeout_floor_ms));
+        return @min(max_responsiveness_timeout_ms, @max(floor, timeout));
     }
 };
 
@@ -415,9 +431,17 @@ pub const RuntimeSession = struct {
     /// Latest outstanding RepaintRequest sequence. Older responses are stale.
     pending_repaint: PendingRepaint = .{},
     relay_end_restore: std.ArrayList(u8) = .empty,
+    unresponsive_timeout_floor_ms: i64 = default_responsiveness_timeout_ms,
 
     pub fn adoptReconnectState(self: *RuntimeSession, reconnected: *const RuntimeSession) void {
         self.pending_repaint = reconnected.pending_repaint;
+    }
+
+    pub fn noteUnresponsiveRecovery(self: *RuntimeSession) void {
+        self.unresponsive_timeout_floor_ms = @min(
+            max_responsiveness_timeout_ms,
+            @max(default_responsiveness_timeout_ms, self.unresponsive_timeout_floor_ms * 2),
+        );
     }
 
     pub fn deinit(self: *RuntimeSession) void {
@@ -498,13 +522,12 @@ pub const RuntimeSession = struct {
 };
 
 pub const ReconnectUi = struct {
-    const reconnected_banner_ms = 500;
     const max_diagnostic_banner_lines = 3;
     const max_banner_message_bytes = 256;
+    const ctrl_c = 0x03;
+    const ctrl_r = 0x12;
 
     mode_guard: terminal.TerminalModeGuard,
-    escape_filter: terminal.EscapeFilter = .{ .at_line_start = false },
-    buffered_input: std.ArrayList(u8) = .empty,
     viewport_offset: u16 = 0,
     banner_state: ?BannerDrawState = null,
     banner_message: [max_banner_message_bytes]u8 = undefined,
@@ -553,7 +576,6 @@ pub const ReconnectUi = struct {
             self.diagnostic_notify_read_fd = -1;
         }
         self.showCursor() catch {};
-        self.buffered_input.deinit(app_allocator.allocator());
         self.mode_guard.restore();
     }
 
@@ -565,7 +587,7 @@ pub const ReconnectUi = struct {
         while (true) {
             const now = std.time.milliTimestamp();
             if (now >= deadline) {
-                try self.drawStaticBanner("--- sessh: reconnecting... CTRL-C aborts ---");
+                try self.drawStaticBanner("--- sessh: reconnecting. Ctrl-C detach ---");
                 return .wait_elapsed;
             }
 
@@ -574,9 +596,9 @@ pub const ReconnectUi = struct {
             const decision = try self.pollInput(wait_ms);
             try self.refreshBannerIfDiagnosticsChanged();
             switch (decision) {
-                .abort => return .abort,
+                .detach => return .detach,
                 .reconnect_now => {
-                    try self.drawStaticBanner("--- sessh: reconnecting... CTRL-C aborts ---");
+                    try self.drawStaticBanner("--- sessh: reconnecting. Ctrl-C detach ---");
                     return .reconnect_now;
                 },
                 .wait_elapsed => {},
@@ -592,18 +614,27 @@ pub const ReconnectUi = struct {
     }
 
     pub fn showConnectionUnresponsive(self: *ReconnectUi) !void {
-        try self.drawStaticBanner("--- sessh: connection unresponsive - attempting reconnect ---");
+        try self.drawStaticBanner("--- sessh: unresponsive. reconnecting. Ctrl-C detach ---");
     }
 
-    pub fn pollAbort(self: *ReconnectUi, timeout_ms: i32) !bool {
-        if (self.isCancelled()) return true;
+    pub fn showReconnectReady(self: *ReconnectUi) !void {
+        try self.drawStaticBanner("--- sessh: connection ready. Ctrl-R switch. Ctrl-C detach ---");
+    }
+
+    pub fn pollDetach(self: *ReconnectUi, timeout_ms: i32) !bool {
+        const decision = try self.pollDecision(timeout_ms);
+        return switch (decision) {
+            .detach => true,
+            .reconnect_now, .wait_elapsed => false,
+        };
+    }
+
+    pub fn pollDecision(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
+        if (self.isCancelled()) return .detach;
         try self.refreshBannerIfDiagnosticsChanged();
         const decision = try self.pollInput(timeout_ms);
         try self.refreshBannerIfDiagnosticsChanged();
-        return switch (decision) {
-            .abort => true,
-            .reconnect_now, .wait_elapsed => false,
-        };
+        return decision;
     }
 
     pub fn cancel(self: *ReconnectUi) void {
@@ -634,40 +665,34 @@ pub const ReconnectUi = struct {
         const poll_count: usize = if (self.diagnostic_notify_read_fd >= 0) 2 else 1;
         const ready = try posix.poll(pollfds[0..poll_count], timeout_ms);
         if (ready == 0) return .wait_elapsed;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .abort;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .detach;
         if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
             self.drainDiagnosticNotifier();
         }
         if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
 
         var input: [256]u8 = undefined;
-        var filtered: [512]u8 = undefined;
         const n = c.read(0, &input, input.len);
-        if (n <= 0) return .abort;
+        if (n <= 0) return .detach;
         io_helpers.noteRead(0, input[0..@intCast(n)]);
 
+        var ignored = false;
         for (input[0..@intCast(n)]) |byte| {
-            if (byte == 0x03) return .abort;
-            if (byte == ' ') return .reconnect_now;
-
-            const one = [_]u8{byte};
-            const result = self.escape_filter.filter(&one, &filtered);
-            try self.buffered_input.appendSlice(app_allocator.allocator(), result.bytes);
-            if (result.end) |end| {
-                if (end == .detach) return .abort;
-            }
+            if (byte == ctrl_c) return .detach;
+            if (byte == ctrl_r) return .reconnect_now;
+            ignored = true;
         }
+        if (ignored) try self.alertDisconnectedInput();
         return .wait_elapsed;
     }
 
-    pub fn flushBufferedInput(self: *ReconnectUi, write_fd: c.fd_t) !void {
-        if (self.escape_filter.pending_tilde) {
-            try self.buffered_input.append(app_allocator.allocator(), '~');
-            self.escape_filter.pending_tilde = false;
-        }
-        if (self.buffered_input.items.len == 0) return;
-        try sendInput(write_fd, self.buffered_input.items);
-        self.buffered_input.clearRetainingCapacity();
+    fn alertDisconnectedInput(self: *ReconnectUi) !void {
+        _ = self;
+        try io_helpers.writeAll(1, "\x07");
+        if (c.isatty(1) == 0) return;
+        try io_helpers.writeAll(1, "\x1b[?5h");
+        defer io_helpers.writeAll(1, "\x1b[?5l") catch {};
+        std.Thread.sleep(35 * std.time.ns_per_ms);
     }
 
     pub fn clearBanner(self: *ReconnectUi) !i32 {
@@ -687,26 +712,13 @@ pub const ReconnectUi = struct {
         return @intCast(self.viewport_offset);
     }
 
-    pub fn showReconnectedBriefly(self: *ReconnectUi) !void {
-        try self.showConnectionResultBriefly(.reconnected);
-    }
-
-    pub fn showConnectionResultBriefly(self: *ReconnectUi, result: ConnectionResult) !void {
-        const message = switch (result) {
-            .recovered => "--- sessh: connection recovered. SPACE to dismiss or wait 500ms ---",
-            .reconnected => "--- sessh: reconnected. SPACE to dismiss or wait 500ms ---",
-        };
-        try self.drawStaticBanner(message);
-        try self.waitForDismiss(reconnected_banner_ms);
-    }
-
     fn drawBanner(self: *ReconnectUi, delay_ms: u64) !void {
         var delay_buf: [16]u8 = undefined;
         const delay = try formatDelay(delay_ms, &delay_buf);
         var message_buf: [96]u8 = undefined;
         const message = try std.fmt.bufPrint(
             &message_buf,
-            "--- sessh: disconnected. Retry in {s}. SPACE retries now. CTRL-C aborts ---",
+            "--- sessh: disconnected. Retry {s}. Ctrl-R retry now. Ctrl-C detach ---",
             .{delay},
         );
         try self.drawStaticBanner(message);
@@ -807,45 +819,6 @@ pub const ReconnectUi = struct {
                 else => return,
             }
         }
-    }
-
-    fn waitForDismiss(self: *ReconnectUi, timeout_ms: u64) !void {
-        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-        while (true) {
-            const now = std.time.milliTimestamp();
-            if (now >= deadline) return;
-            const wait_ms: i32 = @intCast(@min(deadline - now, @as(i64, std.math.maxInt(i32))));
-            try self.refreshBannerIfDiagnosticsChanged();
-            if (try self.pollDismissInput(wait_ms)) return;
-            try self.refreshBannerIfDiagnosticsChanged();
-        }
-    }
-
-    fn pollDismissInput(self: *ReconnectUi, timeout_ms: i32) !bool {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = 0,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, timeout_ms);
-        if (ready == 0) return false;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return true;
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) return false;
-
-        var input: [256]u8 = undefined;
-        var filtered: [512]u8 = undefined;
-        const n = c.read(0, &input, input.len);
-        if (n <= 0) return true;
-        io_helpers.noteRead(0, input[0..@intCast(n)]);
-
-        for (input[0..@intCast(n)]) |byte| {
-            if (byte == ' ') return true;
-
-            const one = [_]u8{byte};
-            const result = self.escape_filter.filter(&one, &filtered);
-            try self.buffered_input.appendSlice(app_allocator.allocator(), result.bytes);
-        }
-        return false;
     }
 
     fn hideCursor(self: *ReconnectUi) !void {
@@ -1456,8 +1429,8 @@ test "connection monitor probes idle connections" {
     try monitor.maybeSendPingAt(fds[1], 1_000);
     const pending = monitor.pending_ping_request_seq orelse return error.ExpectedPendingPing;
     try std.testing.expectEqual(@as(?i64, 1_000), monitor.any_response_wait_started_ms);
-    try std.testing.expect(!monitor.isUnresponsiveAt(2_999));
-    try std.testing.expect(monitor.isUnresponsiveAt(3_000));
+    try std.testing.expect(!monitor.isUnresponsiveAt(5_999));
+    try std.testing.expect(monitor.isUnresponsiveAt(6_000));
 
     var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);
@@ -1465,6 +1438,17 @@ test "connection monitor probes idle connections" {
     var request = try protocol.decodePayload(pb.PingRequest, std.testing.allocator, frame.payload);
     defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(pending, request.ping_request_seq);
+}
+
+test "runtime session backs off unresponsive floor after recovery" {
+    var session = RuntimeSession{};
+    try std.testing.expectEqual(default_responsiveness_timeout_ms, session.unresponsive_timeout_floor_ms);
+    session.noteUnresponsiveRecovery();
+    try std.testing.expectEqual(@as(i64, 10_000), session.unresponsive_timeout_floor_ms);
+    session.noteUnresponsiveRecovery();
+    try std.testing.expectEqual(max_responsiveness_timeout_ms, session.unresponsive_timeout_floor_ms);
+    session.noteUnresponsiveRecovery();
+    try std.testing.expectEqual(max_responsiveness_timeout_ms, session.unresponsive_timeout_floor_ms);
 }
 
 test "connection monitor treats any inbound frame as ping response progress" {
@@ -1567,7 +1551,7 @@ test "cancelled reconnect frame read returns without input" {
     defer posix.close(fds[1]);
 
     var cancelled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.ReconnectAborted, readFrameAllocMaybeCancelled(fds[0], &cancelled));
+    try std.testing.expectError(error.ReconnectDetached, readFrameAllocMaybeCancelled(fds[0], &cancelled));
 }
 
 test "recovery polling stores relay-end restore bytes from draw" {
@@ -1894,7 +1878,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             },
         }
 
-        try io_helpers.writeAll(2, "\r\nsessh: reconnecting; type <enter>~. to abort\r\n");
+        try io_helpers.writeAll(2, "\r\nsessh: reconnecting; type Ctrl-C to detach\r\n");
         child = startLocalBroker(allocator, args[0], runtime_broker_args) catch |err| {
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
@@ -2152,7 +2136,7 @@ pub fn startNewSessionOnRuntime(
     defer created.deinit(app_allocator.allocator());
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
     defer app_allocator.allocator().free(client_guid);
-    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid, client_guid, "");
+    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, null, created.guid, client_guid, "");
     var session = try readRuntimeSession(read_fd);
     try session.setClientGuid(client_guid);
     session.viewport_offset = viewport_offset orelse 0;
@@ -2171,7 +2155,7 @@ pub fn startAttachSessionOnRuntime(
     try runtimeHandshake(read_fd, write_fd);
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
     defer app_allocator.allocator().free(client_guid);
-    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, client_guid, session_dir);
+    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, null, session_ref, client_guid, session_dir);
     var session = try readRuntimeSession(read_fd);
     try session.setClientGuid(client_guid);
     session.viewport_offset = viewport_offset orelse 0;
@@ -2221,7 +2205,7 @@ pub fn reconnectSessionOnRuntime(
     write_fd: c.fd_t,
     session: *RuntimeSession,
 ) !void {
-    try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, null, true);
+    try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, null, true, connectionResultBanner(.reconnected));
 }
 
 pub fn reconnectSessionOnRuntimeCancellable(
@@ -2230,7 +2214,7 @@ pub fn reconnectSessionOnRuntimeCancellable(
     session: *RuntimeSession,
     cancelled: *const std.atomic.Value(bool),
 ) !void {
-    try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, cancelled, false);
+    try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, cancelled, false, connectionResultBanner(.reconnected));
 }
 
 fn reconnectSessionOnRuntimeInner(
@@ -2239,10 +2223,11 @@ fn reconnectSessionOnRuntimeInner(
     session: *RuntimeSession,
     cancelled: ?*const std.atomic.Value(bool),
     wait_for_repaint: bool,
+    transient_banner: ?pb.TransientBanner,
 ) !void {
     try runtimeHandshakeInner(read_fd, write_fd, cancelled);
     const client_guid = try session.ensureClientGuid();
-    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice(), client_guid, session.sessionDirSlice());
+    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, transient_banner, session.guidSlice(), client_guid, session.sessionDirSlice());
     try readSessionAttachedInner(read_fd, cancelled);
     if (wait_for_repaint) try finishReconnectRepaintInner(read_fd, session, cancelled);
 }
@@ -2259,7 +2244,16 @@ pub fn repaintRuntimeSession(
     write_fd: c.fd_t,
     session: *RuntimeSession,
 ) !void {
-    try sendResizeScreenRepaint(write_fd, terminal.currentWindowSize(), session.viewport_offset, &session.pending_repaint);
+    try repaintRuntimeSessionWithTransientBanner(read_fd, write_fd, session, null);
+}
+
+pub fn repaintRuntimeSessionWithTransientBanner(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    session: *RuntimeSession,
+    transient_banner: ?pb.TransientBanner,
+) !void {
+    try sendResizeScreenRepaintWithTransientBanner(write_fd, terminal.currentWindowSize(), session.viewport_offset, &session.pending_repaint, transient_banner);
     try finishReconnectRepaint(read_fd, session);
 }
 
@@ -2309,7 +2303,10 @@ pub fn relayRuntimeSession(
         &session.viewport_offset,
         &session.pending_repaint,
         &session.relay_end_restore,
-        options,
+        .{
+            .monitor_connection = options.monitor_connection,
+            .responsiveness_timeout_floor_ms = @max(options.responsiveness_timeout_floor_ms, session.unresponsive_timeout_floor_ms),
+        },
     );
 }
 
@@ -2535,14 +2532,14 @@ fn readFrameAllocMaybeCancelled(
 ) !protocol.OwnedFrame {
     const flag = cancelled orelse return protocol.readFrameAlloc(app_allocator.allocator(), fd);
     while (true) {
-        if (flag.load(.acquire)) return error.ReconnectAborted;
+        if (flag.load(.acquire)) return error.ReconnectDetached;
         var pollfds = [_]posix.pollfd{.{
             .fd = fd,
             .events = posix.POLL.IN,
             .revents = 0,
         }};
         const ready = try posix.poll(&pollfds, 50);
-        if (flag.load(.acquire)) return error.ReconnectAborted;
+        if (flag.load(.acquire)) return error.ReconnectDetached;
         if (ready == 0) continue;
         if ((pollfds[0].revents & posix.POLL.IN) != 0) {
             return protocol.readFrameAlloc(app_allocator.allocator(), fd);
@@ -2730,6 +2727,7 @@ fn sendSessionAttach(
     viewport_offset: ?i32,
     initial_scrollback_row_count: ?u32,
     reconnect_cursor: ?*const ScrollbackCursor,
+    transient_banner: ?pb.TransientBanner,
     session_ref: []const u8,
     client_guid: []const u8,
     session_dir: []const u8,
@@ -2743,6 +2741,7 @@ fn sendSessionAttach(
             .repaint_request = if (reconnect_cursor) |cursor| .{
                 .repaint_request_seq = repaint_request_seq,
                 .scrollback_cursor = cursor.slice(),
+                .transient_banner = transient_banner,
             } else .{
                 .repaint_request_seq = repaint_request_seq,
                 .scrollback_cursor = if (initial_scrollback_row_count != null and initial_scrollback_row_count.? == 0)
@@ -2750,6 +2749,7 @@ fn sendSessionAttach(
                 else
                     "",
                 .initial_scrollback_rows = initial_scrollback_row_count,
+                .transient_banner = transient_banner,
             },
         },
         .session_ref = session_ref,
@@ -2889,7 +2889,10 @@ fn relayTerminal(
     var filtered: [8192]u8 = undefined;
     var escape_filter = terminal.EscapeFilter{ .leader_byte = terminal.leaderByte(leader) };
     var last_size = terminal.currentWindowSize();
-    var connection_monitor = ConnectionMonitor{ .enabled = options.monitor_connection };
+    var connection_monitor = ConnectionMonitor{
+        .enabled = options.monitor_connection,
+        .responsiveness_timeout_floor_ms = options.responsiveness_timeout_floor_ms,
+    };
     _ = presentation_guard;
 
     while (true) {
@@ -3235,6 +3238,16 @@ fn sendResizeScreenRepaint(
     viewport_offset: i32,
     pending_repaint: *PendingRepaint,
 ) !void {
+    try sendResizeScreenRepaintWithTransientBanner(socket_fd, size, viewport_offset, pending_repaint, null);
+}
+
+fn sendResizeScreenRepaintWithTransientBanner(
+    socket_fd: c.fd_t,
+    size: WindowSize,
+    viewport_offset: i32,
+    pending_repaint: *PendingRepaint,
+    transient_banner: ?pb.TransientBanner,
+) !void {
     const repaint_request_seq = pending_repaint.start();
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Resize{
         .terminal_rows = size.rows,
@@ -3242,6 +3255,7 @@ fn sendResizeScreenRepaint(
         .viewport_offset = nonZeroViewportOffset(viewport_offset),
         .repaint_request = .{
             .repaint_request_seq = repaint_request_seq,
+            .transient_banner = transient_banner,
         },
     });
     defer app_allocator.allocator().free(payload);
