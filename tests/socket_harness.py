@@ -814,18 +814,22 @@ def config_version():
     return version, major, minor
 
 
-def send_hello(conn, major_delta=0, minor_delta=0, expect_ok=True):
+def send_hello(conn, major_delta=0, minor_delta=0, version_override=None, expect_ok=True):
     version, major, minor = config_version()
+    peer_version = version_override or version
+    peer_major = major + major_delta
     peer_minor = minor + minor_delta
+    if peer_major < 0:
+        raise AssertionError(f"invalid negative protocol major: {peer_major}")
     if peer_minor < 0:
         raise AssertionError(f"invalid negative protocol minor: {peer_minor}")
     send_frame(
         conn,
         HELLO_REQUEST,
         sessh_hpb().HelloRequest(
-            protocol_major=major + major_delta,
+            protocol_major=peer_major,
             protocol_minor=peer_minor,
-            version=version,
+            version=peer_version,
         ).SerializeToString(),
     )
     message_type, payload = recv_frame(conn)
@@ -891,16 +895,34 @@ def run_minor_version_compatibility_test(base_env):
             finally:
                 newer.close()
 
-            wrong_major = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            wrong_major.settimeout(5.0)
+            different_version = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            different_version.settimeout(5.0)
             try:
-                wrong_major.connect(str(socket_path(env)))
-                send_hello(wrong_major, major_delta=1, expect_ok=False)
+                different_version.connect(str(socket_path(env)))
+                send_hello(different_version, version_override="0.0.0-compatible-test")
             finally:
-                wrong_major.close()
+                different_version.close()
+
+            newer_major = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            newer_major.settimeout(5.0)
+            try:
+                newer_major.connect(str(socket_path(env)))
+                send_hello(newer_major, major_delta=1)
+            finally:
+                newer_major.close()
+
+            older_major = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            older_major.settimeout(5.0)
+            try:
+                older_major.connect(str(socket_path(env)))
+                send_hello(older_major, major_delta=-1, expect_ok=False)
+            finally:
+                older_major.close()
 
             broker_hello(env, minor_delta=1)
-            broker_hello(env, major_delta=1, expect_ok=False)
+            broker_hello(env, version_override="0.0.0-compatible-test")
+            broker_hello(env, major_delta=1)
+            broker_hello(env, major_delta=-1, expect_ok=False)
         finally:
             if "proc" in locals() and proc.poll() is None:
                 proc.terminate()

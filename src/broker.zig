@@ -637,7 +637,7 @@ fn readHelloReply(allocator: std.mem.Allocator, read_fd: c.fd_t) !?hpb.HelloErro
 }
 
 fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
-    return protocol.helloRequestIsCompatible(hello, config.protocol_major, config.protocol_minor, config.version);
+    return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
 }
 
 fn sendHelloRequest(fd: c.fd_t) !void {

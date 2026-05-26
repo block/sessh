@@ -24,8 +24,10 @@ message HelloFrame {
 }
 
 message HelloRequest {
+  // Maximum remote protocol version this peer can speak.
   uint32 protocol_major = 1;
   uint32 protocol_minor = 2;
+  // Human-readable binary version for diagnostics and display only.
   string version = 3;
 }
 

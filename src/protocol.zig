@@ -53,13 +53,11 @@ pub fn decodePayload(comptime T: type, allocator: std.mem.Allocator, payload: []
 
 pub fn helloRequestIsCompatible(
     hello: hpb.HelloRequest,
-    local_major: u32,
-    local_minor: u32,
-    local_version: []const u8,
+    min_major: u32,
+    min_minor: u32,
 ) bool {
-    return hello.protocol_major == local_major and
-        hello.protocol_minor >= local_minor and
-        std.mem.eql(u8, hello.version, local_version);
+    return hello.protocol_major > min_major or
+        (hello.protocol_major == min_major and hello.protocol_minor >= min_minor);
 }
 
 pub fn readFrameAlloc(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedFrame {
@@ -275,27 +273,37 @@ test "frame envelope round trip" {
     try std.testing.expectEqual(@as(u64, 42), decoded.input_seq);
 }
 
-test "hello compatibility accepts higher minor only for same major and version" {
+test "hello compatibility accepts peer max protocol when it satisfies local minimum" {
     try std.testing.expect(helloRequestIsCompatible(.{
         .protocol_major = 2,
         .protocol_minor = 4,
         .version = "0.5.0-dev",
-    }, 2, 3, "0.5.0-dev"));
+    }, 2, 3));
     try std.testing.expect(!helloRequestIsCompatible(.{
         .protocol_major = 2,
         .protocol_minor = 2,
         .version = "0.5.0-dev",
-    }, 2, 3, "0.5.0-dev"));
+    }, 2, 3));
     try std.testing.expect(!helloRequestIsCompatible(.{
-        .protocol_major = 3,
+        .protocol_major = 1,
         .protocol_minor = 4,
         .version = "0.5.0-dev",
-    }, 2, 3, "0.5.0-dev"));
-    try std.testing.expect(!helloRequestIsCompatible(.{
+    }, 2, 3));
+    try std.testing.expect(helloRequestIsCompatible(.{
+        .protocol_major = 3,
+        .protocol_minor = 0,
+        .version = "0.5.0-dev",
+    }, 2, 3));
+    try std.testing.expect(helloRequestIsCompatible(.{
+        .protocol_major = 2,
+        .protocol_minor = 1,
+        .version = "0.5.0-dev",
+    }, 2, 0));
+    try std.testing.expect(helloRequestIsCompatible(.{
         .protocol_major = 2,
         .protocol_minor = 4,
         .version = "0.6.0-dev",
-    }, 2, 3, "0.5.0-dev"));
+    }, 2, 3));
 }
 
 test "session ended exit status is optional" {

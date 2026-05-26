@@ -35,11 +35,11 @@ pub const TtyTranscriptStream = enum(i32) {
 /// sides accept the handshake, this file's messages are governed by
 /// protocol_major/protocol_minor: a major protocol version bump permits
 /// incompatible frame-format or message-schema changes, including reusing field
-/// numbers with new names or semantics. Minor versions are for changes that are
-/// intended to preserve forward and/or backward compatibility: if the peer
-/// reports a higher minor version for the same major version, the peer is
-/// responsible for remaining compatible with this side; if the peer reports a
-/// lower minor version, this side decides whether it can proceed.
+/// numbers with new names or semantics. HelloRequest reports the maximum
+/// protocol version a peer can speak. If a newer peer accepts an older peer, the
+/// newer peer must speak the older peer's protocol for that connection; otherwise
+/// it must reject the handshake. Each side rejects peers whose maximum protocol
+/// is older than the oldest protocol it still supports.
 pub const Frame = struct {
     payload: ?payload_union = null,
 
