@@ -121,7 +121,7 @@ def run_reconnect_probe(cmd, env, ready, after, timeout=60.0):
     stdout = read_until_pipe(proc, proc.stdout, ready.encode("utf-8"), timeout)
     proc.stdin.write(b"\x02s")
     proc.stdin.flush()
-    stdout += read_until_pipe(proc, proc.stdout, b"sessh: disconnected. Retry 5sec", timeout)
+    stdout += read_until_pipe(proc, proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
     proc.stdin.write(b"\x12")
     proc.stdin.flush()
     stdout += read_until_pipe(proc, proc.stdout, ready.encode("utf-8"), timeout)
@@ -353,7 +353,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         env["SHELL"] = remote_shell
 
         reconnected = run_reconnect_probe(
-            [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias, "--leader", "CTRL-B"],
+            [str(prefix / "bin" / "sessh"), "--leader", "CTRL-B", "-F", str(config), host_alias],
             env,
             reconnect_marker,
             f"after-reconnect-{arch}",
@@ -361,7 +361,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         )
         if reconnected.returncode != 0:
             raise AssertionError(reconnected)
-        if "sessh: disconnected. Retry 5sec" not in reconnected.stdout:
+        if "sessh: disconnected: Retry connecting 10sec" not in reconnected.stdout:
             raise AssertionError(reconnected)
         if f"REMOTE:after-reconnect-{arch}" not in reconnected.stdout:
             raise AssertionError(reconnected)

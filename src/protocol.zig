@@ -17,15 +17,14 @@ pub const MessageType = enum {
     input,
     resize,
     repaint_request,
-    ping_request,
 
     session_created,
     session_attached,
     session_ended,
     draw,
-    ping_response,
     repaint_response,
     tty_transcript_chunk,
+    input_ack,
 };
 
 pub const frame_header_len = 4;
@@ -112,14 +111,13 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .input => |message| ownedFrameFromMessage(allocator, .input, message),
             .resize => |message| ownedFrameFromMessage(allocator, .resize, message),
             .repaint_request => |message| ownedFrameFromMessage(allocator, .repaint_request, message),
-            .ping_request => |message| ownedFrameFromMessage(allocator, .ping_request, message),
             .session_created => |message| ownedFrameFromMessage(allocator, .session_created, message),
             .session_attached => |message| ownedFrameFromMessage(allocator, .session_attached, message),
             .session_ended => |message| ownedFrameFromMessage(allocator, .session_ended, message),
             .draw => |message| ownedFrameFromMessage(allocator, .draw, message),
-            .ping_response => |message| ownedFrameFromMessage(allocator, .ping_response, message),
             .repaint_response => |message| ownedFrameFromMessage(allocator, .repaint_response, message),
             .tty_transcript_chunk => |message| ownedFrameFromMessage(allocator, .tty_transcript_chunk, message),
+            .input_ack => |message| ownedFrameFromMessage(allocator, .input_ack, message),
         };
     }
 
@@ -193,11 +191,6 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .repaint_request = message } });
         },
-        .ping_request => blk: {
-            var message = try decodePayload(pb.PingRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .ping_request = message } });
-        },
         .session_created => blk: {
             var message = try decodePayload(pb.SessionCreated, allocator, payload);
             defer message.deinit(allocator);
@@ -218,11 +211,6 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .draw = message } });
         },
-        .ping_response => blk: {
-            var message = try decodePayload(pb.PingResponse, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .ping_response = message } });
-        },
         .repaint_response => blk: {
             var message = try decodePayload(pb.RepaintResponse, allocator, payload);
             defer message.deinit(allocator);
@@ -232,6 +220,11 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.TtyTranscriptChunk, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_transcript_chunk = message } });
+        },
+        .input_ack => blk: {
+            var message = try decodePayload(pb.InputAck, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .input_ack = message } });
         },
     };
 }
@@ -267,19 +260,19 @@ test "generated protobuf payload round trip" {
 }
 
 test "frame envelope round trip" {
-    const payload = try encodePayload(std.testing.allocator, pb.PingRequest{ .ping_request_seq = 42 });
+    const payload = try encodePayload(std.testing.allocator, pb.InputAck{ .input_seq = 42 });
     defer std.testing.allocator.free(payload);
-    const frame_bytes = try encodeFrame(std.testing.allocator, .ping_request, payload);
+    const frame_bytes = try encodeFrame(std.testing.allocator, .input_ack, payload);
     defer std.testing.allocator.free(frame_bytes);
 
     const envelope = frame_bytes[frame_header_len..];
     var frame = try decodeEnvelopeAlloc(std.testing.allocator, envelope);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(MessageType.ping_request, frame.message_type);
+    try std.testing.expectEqual(MessageType.input_ack, frame.message_type);
 
-    var decoded = try decodePayload(pb.PingRequest, std.testing.allocator, frame.payload);
+    var decoded = try decodePayload(pb.InputAck, std.testing.allocator, frame.payload);
     defer decoded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 42), decoded.ping_request_seq);
+    try std.testing.expectEqual(@as(u64, 42), decoded.input_seq);
 }
 
 test "hello compatibility accepts higher minor only for same major and version" {

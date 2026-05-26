@@ -80,6 +80,11 @@ pub const EscapeFilter = struct {
     pending_tilde: bool = false,
     pending_leader: bool = false,
 
+    pub fn setLeader(self: *EscapeFilter, leader_byte: ?u8) void {
+        if (self.leader_byte == leader_byte) return;
+        self.* = .{ .leader_byte = leader_byte };
+    }
+
     pub fn filter(self: *EscapeFilter, input: []const u8, out: []u8) FilterResult {
         var written: usize = 0;
         for (input) |byte| {

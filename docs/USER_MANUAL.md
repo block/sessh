@@ -14,12 +14,19 @@ command is provided). Non-interactive invocation will cause `sessh` to fallback
 to plain `ssh`.
 
 If the `ssh` disconnects while `sessh` is running interactively then it will
-automatically reconnect (with exponential backoff) and reattach to the same
-session. While disconnected, `sessh` shows a temporary banner. The banner
-disappears when `sessh` successfully reconnects.
+retry the connection in the background (with exponential backoff) and reattach
+to the same session. While disconnected, `sessh` shows a temporary banner:
 
 ```text
---- sessh: disconnected. Retry 10min. Ctrl-R retry now. Ctrl-C detach ---
+--- sessh: disconnected: Retry connecting 10min. CTRL-R now. CTRL-C detach ---
+```
+
+`sessh` will switch to prepared connections automatically when it can do so
+without a confusing user experience. Otherwise it displays a temporary banner
+like:
+
+```text
+--- sessh: disconnected: Connection ready. CTRL-R switch. CTRL-C detach ---
 ```
 
 Even if you detach during reconnect, the session will remain running on the remote.

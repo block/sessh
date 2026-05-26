@@ -14,6 +14,8 @@ from test_env import isolated_env
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
+DEFAULT_MUX_BIN = BIN if BIN.name == "sesshmux-dev" else BIN.with_name("sesshmux")
+MUX_BIN = Path(os.environ.get("SESSHMUX_BIN", str(DEFAULT_MUX_BIN)))
 TMUX = shutil.which("tmux")
 TMUX_ARGS = [TMUX, "-L", f"sessh-ssh-reconnect-{os.getpid()}"] if TMUX else []
 PROMPT = "OUTER_TEST>"
@@ -180,9 +182,12 @@ def main():
         raise SystemExit("missing tmux")
     if not BIN.exists():
         raise SystemExit(f"missing binary: {BIN}")
+    if not MUX_BIN.exists():
+        raise SystemExit(f"missing binary: {MUX_BIN}")
 
     session = f"sessh-ssh-reconnect-{os.getpid()}"
     detach_session = f"{session}-detach"
+    reconnect_detach_session = f"{session}-reconnect-detach"
     alt_detach_session = f"{session}-alt-detach"
     bottom_session = f"{session}-bottom"
     with tempfile.TemporaryDirectory(prefix="sessh-ssh-reconnect-tmux-", dir="/tmp") as tmp_text:
@@ -234,9 +239,9 @@ def main():
             "export SESSH_FAKE_SSH_DELAY_ON_BATCH=1\n"
             "if [ \"${1-}\" = attach ]; then\n"
             "  shift\n"
-            f"  exec {shlex.quote(str(BIN))} attach --leader CTRL-A --scrollback-limit 321 --host test-host \"$@\"\n"
+            f"  exec {shlex.quote(str(MUX_BIN))} attach --leader CTRL-A --scrollback-limit 321 --host test-host \"$@\"\n"
             "fi\n"
-            f"exec {shlex.quote(str(BIN))} new --leader CTRL-A --scrollback-limit 321 test-host \"$@\"\n"
+            f"exec {shlex.quote(str(BIN))} --leader CTRL-A --scrollback-limit 321 test-host \"$@\"\n"
         )
         sessh_wrapper.chmod(sessh_wrapper.stat().st_mode | stat.S_IXUSR)
 
@@ -259,10 +264,10 @@ def main():
             remote_top_index = before_lines.index("REMOTE_TOP")
 
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "C-a", "s"])
-            wait_capture(env, session, "sessh: disconnected. Retry 5sec")
-            wait_capture(env, session, "sessh: disconnected. Retry 4sec", timeout=2.0)
+            wait_capture(env, session, "sessh: disconnected: Retry connecting 10sec")
+            wait_capture(env, session, "sessh: disconnected: Retry connecting 9sec", timeout=2.0)
             banner = capture_visible(env, session).splitlines()
-            if remote_top_index + 1 >= len(banner) or "sessh: disconnected. Retry 4sec" not in banner[remote_top_index + 1]:
+            if remote_top_index + 1 >= len(banner) or "sessh: disconnected: Retry connecting 9sec" not in banner[remote_top_index + 1]:
                 raise AssertionError(
                     "reconnect banner was not drawn one row below the sessh screen top\n"
                     f"before:\n{before}\n"
@@ -270,14 +275,12 @@ def main():
                 )
 
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "C-r"])
-            wait_capture(env, session, "sessh: reconnecting. Ctrl-C detach", timeout=2.0)
-            success_banner = "sessh: reconnected"
-            wait_capture(env, session, success_banner, timeout=10.0)
+            wait_capture(env, session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=2.0)
+            wait_visible_absent(env, session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=10.0)
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "after-reconnect", "Enter"])
             final = wait_capture(env, session, "REMOTE:after-reconnect")
-            wait_visible_absent(env, session, success_banner, timeout=2.0)
             after_repaint = capture_visible(env, session)
-            if "sessh: disconnected. Retry" in after_repaint:
+            if "sessh: disconnected: Retry" in after_repaint:
                 raise AssertionError(f"reconnect banner was still visible after repaint:\n{after_repaint}")
             if after_repaint.count("REMOTE_TOP") != 1:
                 raise AssertionError(f"reconnect did not repaint the session screen before input:\n{after_repaint}")
@@ -288,7 +291,7 @@ def main():
                     f"before:\n{before}\n"
                     f"after:\n{after_repaint}"
                 )
-            if "sessh: disconnected. Retry" in final:
+            if "sessh: disconnected: Retry" in final:
                 raise AssertionError(f"reconnect banner leaked into final pane:\n{final}")
             if "sessh: reconnected" in final:
                 raise AssertionError(f"reconnected banner leaked into final pane:\n{final}")
@@ -296,6 +299,21 @@ def main():
                 raise AssertionError(f"reconnect duplicated session screen content:\n{final}")
             if "OUTER_BEFORE_1" not in final or "OUTER_BEFORE_2" not in final:
                 raise AssertionError(f"reconnect damaged outer scrollback:\n{final}")
+
+            new_tmux_session(env, reconnect_detach_session, 100, 24)
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", reconnect_detach_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, reconnect_detach_session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, sessh_cmd, "Enter"])
+            wait_capture(env, reconnect_detach_session, "REMOTE_PROMPT$")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, "C-a", "s"])
+            wait_capture(env, reconnect_detach_session, "sessh: disconnected: Retry connecting 10sec")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, "C-c"])
+            reconnect_detached = wait_capture(env, reconnect_detach_session, "sessh: detached", timeout=5.0)
+            if "Re-attach: `sesshmux attach" not in reconnect_detached or "Kill: `sesshmux kill" not in reconnect_detached:
+                raise AssertionError(f"reconnect detach did not print attach/kill commands:\n{reconnect_detached}")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, "printf 'OUTER_RECONNECT_DETACHED\\n'", "Enter"])
+            wait_capture(env, reconnect_detach_session, "OUTER_RECONNECT_DETACHED")
 
             new_tmux_session(env, bottom_session, 100, 8)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", bottom_session, "remain-on-exit", "on"])
@@ -324,11 +342,10 @@ def main():
                 raise AssertionError(f"bottom regression did not place sessh near pane bottom:\n{bottom_before}")
 
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_session, "C-a", "s"])
-            wait_capture(env, bottom_session, "sessh: disconnected. Retry 5sec")
+            wait_capture(env, bottom_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_session, "C-r"])
-            wait_capture(env, bottom_session, "sessh: reconnecting. Ctrl-C detach", timeout=2.0)
-            wait_capture(env, bottom_session, success_banner, timeout=10.0)
-            wait_visible_absent(env, bottom_session, success_banner, timeout=2.0)
+            wait_capture(env, bottom_session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=2.0)
+            wait_visible_absent(env, bottom_session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=10.0)
             bottom_after = capture_visible(env, bottom_session)
             bottom_after_lines = bottom_after.splitlines()
             if "REMOTE_TOP" not in bottom_after_lines:
@@ -350,7 +367,11 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "C-a", "d"])
             time.sleep(0.5)
             idle_after = capture(env, idle_detach_session)
-            if "sessh: detached" not in idle_after or "sesshmux attach" not in idle_after:
+            if (
+                "sessh: detached" not in idle_after
+                or "Re-attach: `sesshmux attach" not in idle_after
+                or "Kill: `sesshmux kill" not in idle_after
+            ):
                 raise AssertionError(f"detach did not print a reattach banner:\n{idle_after}")
             if f"REMOTE_PROMPT$ {PROMPT}" in idle_after or f"REMOTE_PROMPT${PROMPT}" in idle_after:
                 raise AssertionError(f"detach drew the outer prompt at the inner cursor:\n{idle_after}")
@@ -394,7 +415,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "printf 'OUTER_ALT_DETACHED\\n'", "Enter"])
             wait_capture(env, alt_detach_session, "OUTER_ALT_DETACHED")
         finally:
-            for tmux_session in (session, detach_session, f"{detach_session}-idle", alt_detach_session, bottom_session):
+            for tmux_session in (session, detach_session, reconnect_detach_session, f"{detach_session}-idle", alt_detach_session, bottom_session):
                 subprocess.run(
                     [*TMUX_ARGS, "kill-session", "-t", tmux_session],
                     cwd=ROOT,

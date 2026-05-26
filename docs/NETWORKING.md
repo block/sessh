@@ -28,13 +28,13 @@ DSCP setting for the host as configured, then pass
 If the connection dies, the client will attempt a new connection, retrying
 failed reconnections with exponential backoff.
 
-The client sends pings to remote, up to one per second, as long as there is
-input. The client monitors ping responses to understand latency. It's possible
-for a connection to have high latency due to us sending excessive traffic over
-it, so the client also watches for *any* response post-ping to understand if
-the connection has become unresponsive.
+The session agent ACKs client input. After a timeout, if the client doesn't see
+*any* messages from the session agent when there is unacknowledged input, then
+the client will consider the connection unresponsive.
 
 When the client detects that the connection is unresponsive it will attempt a
 new connection. If the old connection recovers in the meantime, the client will
-close the new connection. If the new connection is established first, the
-client will close the old connection.
+close the new connection.
+
+See [RECONNECTION UX](RECONNECTION_UX.md) for details on the reconnection user
+experience.

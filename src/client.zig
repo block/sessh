@@ -20,7 +20,6 @@ const WindowSize = terminal.WindowSize;
 const Leader = terminal.Leader;
 
 var next_repaint_request_seq: u64 = 1;
-var next_ping_request_seq: u64 = 1;
 
 const unknown_viewport_offset: i32 = -1;
 
@@ -213,30 +212,25 @@ pub const ReconnectDecision = enum {
     detach,
 };
 
+pub const ReconnectInputPumpResult = enum {
+    wait_elapsed,
+    reconnect_now,
+    detach,
+    transport_closed,
+};
+
+pub const ReconnectSwitchDisposition = enum {
+    automatic,
+    delayed,
+    manual_disconnected,
+    manual_unresponsive,
+};
+
 pub const RuntimeRecovery = enum {
     recovered,
     transport_closed,
     session_ended,
 };
-
-pub const ConnectionResult = enum {
-    recovered,
-    reconnected,
-};
-
-const connection_result_banner_seconds: f64 = 0.5;
-
-pub fn connectionResultBanner(result: ConnectionResult) pb.TransientBanner {
-    return .{
-        .text = switch (result) {
-            .recovered => "sessh: connection recovered",
-            .reconnected => "sessh: reconnected",
-        },
-        .duration_seconds = connection_result_banner_seconds,
-        .start_row = 0,
-        .start_col = 0,
-    };
-}
 
 const CreatedSession = struct {
     guid: []u8,
@@ -255,78 +249,42 @@ pub const RelayOptions = struct {
 };
 
 const input_chunk_bytes = 1024;
-const ping_min_interval_ms: i64 = 1_000;
 const default_responsiveness_timeout_ms: i64 = 5_000;
 const max_responsiveness_timeout_ms: i64 = 15_000;
+const paste_like_single_read_bytes = 32;
+const paste_like_window_bytes = 64;
+const paste_like_window_ms: i64 = 250;
 
 const ConnectionMonitor = struct {
     enabled: bool = false,
-    pending_ping_request_seq: ?u64 = null,
-    deferred_ping: bool = false,
-    ping_sent_ms: i64 = 0,
-    last_ping_sent_ms: ?i64 = null,
     any_response_wait_started_ms: ?i64 = null,
     smoothed_rtt_ms: ?i64 = null,
     rtt_variance_ms: i64 = 0,
     responsiveness_timeout_floor_ms: i64 = default_responsiveness_timeout_ms,
+    clock: ?std.time.Timer = null,
 
-    fn afterInput(self: *ConnectionMonitor, write_fd: c.fd_t) !void {
+    fn afterInput(self: *ConnectionMonitor) void {
         if (!self.enabled) return;
-        const now = std.time.milliTimestamp();
-        try self.afterInputAt(write_fd, now);
+        const now = self.nowMs();
+        self.afterInputAt(now);
     }
 
-    fn afterInputAt(self: *ConnectionMonitor, write_fd: c.fd_t, now: i64) !void {
+    fn afterInputAt(self: *ConnectionMonitor, now: i64) void {
         if (!self.enabled) return;
         if (self.any_response_wait_started_ms == null) {
             self.any_response_wait_started_ms = now;
         }
-        if (self.pending_ping_request_seq == null and self.canSendPing(now)) {
-            self.pending_ping_request_seq = try sendPingRequest(write_fd);
-            self.ping_sent_ms = now;
-            self.last_ping_sent_ms = now;
-            self.deferred_ping = false;
-        } else if (self.pending_ping_request_seq == null) {
-            self.deferred_ping = true;
-        }
     }
 
-    fn canSendPing(self: *const ConnectionMonitor, now: i64) bool {
-        const last = self.last_ping_sent_ms orelse return true;
-        return now - last >= ping_min_interval_ms;
-    }
-
-    fn maybeSendPing(self: *ConnectionMonitor, write_fd: c.fd_t) !void {
-        if (!self.enabled) return;
-        try self.maybeSendPingAt(write_fd, std.time.milliTimestamp());
-    }
-
-    fn maybeSendPingAt(self: *ConnectionMonitor, write_fd: c.fd_t, now: i64) !void {
-        if (self.pending_ping_request_seq != null or !self.canSendPing(now)) return;
-        self.pending_ping_request_seq = try sendPingRequest(write_fd);
-        self.ping_sent_ms = now;
-        self.last_ping_sent_ms = now;
-        self.any_response_wait_started_ms = now;
-        self.deferred_ping = false;
-    }
-
-    fn noteInboundFrame(self: *ConnectionMonitor) void {
-        self.pending_ping_request_seq = null;
-        self.any_response_wait_started_ms = null;
-        self.deferred_ping = false;
-    }
-
-    fn handlePingResponse(self: *ConnectionMonitor, payload: []const u8) !void {
-        var response = try protocol.decodePayload(pb.PingResponse, app_allocator.allocator(), payload);
-        defer response.deinit(app_allocator.allocator());
-        const pending_seq = self.pending_ping_request_seq;
-        if (pending_seq != null and response.ping_request_seq == pending_seq.?) {
-            const rtt_ms = @max(std.time.milliTimestamp() - self.ping_sent_ms, 0);
+    fn noteInputAckProgress(self: *ConnectionMonitor, still_pending: bool) void {
+        if (self.any_response_wait_started_ms) |started| {
+            const now = self.nowMs();
+            const rtt_ms = @max(now - started, 0);
             self.updateRtt(rtt_ms);
+            self.any_response_wait_started_ms = if (still_pending) now else null;
+            return;
         }
-        self.pending_ping_request_seq = null;
-        self.any_response_wait_started_ms = null;
-        self.deferred_ping = false;
+        self.any_response_wait_started_ms = if (still_pending) self.nowMs() else null;
     }
 
     fn updateRtt(self: *ConnectionMonitor, rtt_ms: i64) void {
@@ -340,28 +298,21 @@ const ConnectionMonitor = struct {
         }
     }
 
-    fn pollTimeoutMs(self: *const ConnectionMonitor) i32 {
+    fn pollTimeoutMs(self: *ConnectionMonitor) i32 {
         if (!self.enabled) return 100;
-        if (self.deferred_ping and self.pending_ping_request_seq == null) {
-            const last = self.last_ping_sent_ms orelse return 0;
-            const until_ping = ping_min_interval_ms - (std.time.milliTimestamp() - last);
-            if (until_ping <= 0) return 0;
-            return @intCast(@min(@as(i64, 100), until_ping));
-        }
         const started = self.any_response_wait_started_ms orelse return 100;
-        const elapsed = std.time.milliTimestamp() - started;
+        const elapsed = self.nowMs() - started;
         const remaining = self.responsivenessTimeoutMs() - elapsed;
         if (remaining <= 0) return 0;
         return @intCast(@min(@as(i64, 100), remaining));
     }
 
-    fn isUnresponsive(self: *const ConnectionMonitor) bool {
-        return self.isUnresponsiveAt(std.time.milliTimestamp());
+    fn isUnresponsive(self: *ConnectionMonitor) bool {
+        return self.isUnresponsiveAt(self.nowMs());
     }
 
     fn isUnresponsiveAt(self: *const ConnectionMonitor, now: i64) bool {
         if (!self.enabled) return false;
-        if (self.deferred_ping and self.pending_ping_request_seq == null) return false;
         const started = self.any_response_wait_started_ms orelse return false;
         return now - started >= self.responsivenessTimeoutMs();
     }
@@ -375,6 +326,54 @@ const ConnectionMonitor = struct {
             default_responsiveness_timeout_ms;
         const floor = @min(max_responsiveness_timeout_ms, @max(default_responsiveness_timeout_ms, self.responsiveness_timeout_floor_ms));
         return @min(max_responsiveness_timeout_ms, @max(floor, timeout));
+    }
+
+    fn nowMs(self: *ConnectionMonitor) i64 {
+        if (self.clock == null) {
+            self.clock = std.time.Timer.start() catch return std.time.milliTimestamp();
+        }
+        return if (self.clock) |*timer|
+            @intCast(timer.read() / std.time.ns_per_ms)
+        else
+            std.time.milliTimestamp();
+    }
+};
+
+const PasteLikeInputClassifier = struct {
+    window_started_ms: ?i64 = null,
+    window_bytes: usize = 0,
+    clock: ?std.time.Timer = null,
+
+    fn classify(self: *PasteLikeInputClassifier, forwarded_bytes: usize) bool {
+        if (forwarded_bytes == 0) return false;
+        // TODO: Detect bracketed paste delimiters here once client input
+        // parsing tracks them explicitly.
+        if (forwarded_bytes >= paste_like_single_read_bytes) return true;
+
+        const now = self.nowMs();
+        if (self.window_started_ms) |started| {
+            if (now - started <= paste_like_window_ms) {
+                self.window_bytes += forwarded_bytes;
+            } else {
+                self.window_started_ms = now;
+                self.window_bytes = forwarded_bytes;
+            }
+        } else {
+            self.window_started_ms = now;
+            self.window_bytes = forwarded_bytes;
+        }
+
+        return self.window_bytes >= paste_like_window_bytes;
+    }
+
+    fn nowMs(self: *PasteLikeInputClassifier) i64 {
+        if (self.clock == null) {
+            self.clock = std.time.Timer.start() catch return std.time.milliTimestamp();
+        }
+        return if (self.clock) |*timer|
+            @intCast(timer.read() / std.time.ns_per_ms)
+        else
+            std.time.milliTimestamp();
     }
 };
 
@@ -432,6 +431,9 @@ pub const RuntimeSession = struct {
     pending_repaint: PendingRepaint = .{},
     relay_end_restore: std.ArrayList(u8) = .empty,
     unresponsive_timeout_floor_ms: i64 = default_responsiveness_timeout_ms,
+    input_ack_tracker: InputAckTracker = .{},
+    input_escape_filter: terminal.EscapeFilter = .{},
+    paste_like_input_classifier: PasteLikeInputClassifier = .{},
 
     pub fn adoptReconnectState(self: *RuntimeSession, reconnected: *const RuntimeSession) void {
         self.pending_repaint = reconnected.pending_repaint;
@@ -442,6 +444,18 @@ pub const RuntimeSession = struct {
             max_responsiveness_timeout_ms,
             @max(default_responsiveness_timeout_ms, self.unresponsive_timeout_floor_ms * 2),
         );
+    }
+
+    pub fn hasPendingInputAck(self: *const RuntimeSession) bool {
+        return self.input_ack_tracker.pending();
+    }
+
+    pub fn hasPendingPasteLikeInputAck(self: *const RuntimeSession) bool {
+        return self.input_ack_tracker.pendingPasteLike();
+    }
+
+    pub fn discardPendingInputAcks(self: *RuntimeSession) void {
+        self.input_ack_tracker.discardPending();
     }
 
     pub fn deinit(self: *RuntimeSession) void {
@@ -540,6 +554,8 @@ pub const ReconnectUi = struct {
     diagnostic_lines: [max_diagnostic_banner_lines]BannerDiagnosticLine = [_]BannerDiagnosticLine{.{}} ** max_diagnostic_banner_lines,
     diagnostic_line_count: usize = 0,
     cursor_hidden: bool = false,
+    reconnect_acknowledged: bool = false,
+    input_during_disconnect: bool = false,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn begin(viewport_offset: i32) !ReconnectUi {
@@ -581,44 +597,105 @@ pub const ReconnectUi = struct {
 
     pub fn waitForReconnect(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
         try self.drawBanner(delay_ms);
-        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(delay_ms));
-        var next_banner_update = std.time.milliTimestamp() + @as(i64, @intCast(nextBannerUpdateDelayMs(delay_ms)));
+        var timer = try std.time.Timer.start();
+        var next_banner_update_ms = nextBannerUpdateDelayMs(delay_ms);
 
         while (true) {
-            const now = std.time.milliTimestamp();
-            if (now >= deadline) {
-                try self.drawStaticBanner("--- sessh: reconnecting. Ctrl-C detach ---");
+            const elapsed_ms = elapsedTimerMs(&timer);
+            if (elapsed_ms >= delay_ms) {
+                try self.drawStaticBanner("--- sessh: disconnected: Reconnecting... Ctrl-C detach ---");
                 return .wait_elapsed;
             }
 
-            const next_wake = @min(deadline, next_banner_update);
-            const wait_ms: i32 = @intCast(@min(next_wake - now, @as(i64, std.math.maxInt(i32))));
+            const next_wake_ms = @min(delay_ms, next_banner_update_ms);
+            const wait_ms: i32 = @intCast(@min(next_wake_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
             const decision = try self.pollInput(wait_ms);
             try self.refreshBannerIfDiagnosticsChanged();
             switch (decision) {
                 .detach => return .detach,
                 .reconnect_now => {
-                    try self.drawStaticBanner("--- sessh: reconnecting. Ctrl-C detach ---");
+                    try self.drawStaticBanner("--- sessh: disconnected: Reconnecting... Ctrl-C detach ---");
                     return .reconnect_now;
                 },
                 .wait_elapsed => {},
             }
 
-            const after_poll = std.time.milliTimestamp();
-            if (after_poll >= next_banner_update and after_poll < deadline) {
-                const remaining_ms: u64 = @intCast(deadline - after_poll);
+            const after_poll_ms = elapsedTimerMs(&timer);
+            if (after_poll_ms >= next_banner_update_ms and after_poll_ms < delay_ms) {
+                const remaining_ms = delay_ms - after_poll_ms;
                 try self.drawBanner(remaining_ms);
-                next_banner_update = after_poll + @as(i64, @intCast(nextBannerUpdateDelayMs(remaining_ms)));
+                next_banner_update_ms = after_poll_ms + nextBannerUpdateDelayMs(remaining_ms);
             }
         }
     }
 
     pub fn showConnectionUnresponsive(self: *ReconnectUi) !void {
-        try self.drawStaticBanner("--- sessh: unresponsive. reconnecting. Ctrl-C detach ---");
+        try self.drawStaticBanner("--- sessh: disconnected: Unresponsive. Reconnecting... Ctrl-C detach ---");
     }
 
-    pub fn showReconnectReady(self: *ReconnectUi) !void {
-        try self.drawStaticBanner("--- sessh: connection ready. Ctrl-R switch. Ctrl-C detach ---");
+    pub fn showReconnectReady(self: *ReconnectUi, disposition: ReconnectSwitchDisposition) !void {
+        try self.drawReconnectReadyBanner(disposition, 0);
+    }
+
+    pub fn hasReconnectAcknowledgement(self: *const ReconnectUi) bool {
+        return self.reconnect_acknowledged;
+    }
+
+    pub fn consumeReconnectAcknowledgement(self: *ReconnectUi) bool {
+        const acknowledged = self.reconnect_acknowledged;
+        self.reconnect_acknowledged = false;
+        return acknowledged;
+    }
+
+    pub fn reconnectSwitchDisposition(
+        self: *const ReconnectUi,
+        pending_input_at_disconnect: bool,
+        pending_paste_like_input_at_disconnect: bool,
+        unresponsive: bool,
+    ) ReconnectSwitchDisposition {
+        if (unresponsive) return .manual_unresponsive;
+        if (pending_paste_like_input_at_disconnect) return .manual_disconnected;
+        if (pending_input_at_disconnect or self.input_during_disconnect) return .delayed;
+        return .automatic;
+    }
+
+    pub fn waitForReconnectSwitch(self: *ReconnectUi, disposition: ReconnectSwitchDisposition) !ReconnectDecision {
+        if (self.hasReconnectAcknowledgement()) return .reconnect_now;
+        try self.showReconnectReady(disposition);
+        while (true) {
+            switch (try self.pollDecision(-1)) {
+                .detach => return .detach,
+                .reconnect_now => return .reconnect_now,
+                .wait_elapsed => {},
+            }
+        }
+    }
+
+    pub fn waitForReconnectSwitchOrTimeout(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
+        if (self.hasReconnectAcknowledgement()) return .reconnect_now;
+        try self.drawReconnectReadyBanner(.delayed, delay_ms);
+        var timer = try std.time.Timer.start();
+        var next_banner_update_ms = nextBannerUpdateDelayMs(delay_ms);
+
+        while (true) {
+            const elapsed_ms = elapsedTimerMs(&timer);
+            if (elapsed_ms >= delay_ms) return .wait_elapsed;
+
+            const next_wake_ms = @min(delay_ms, next_banner_update_ms);
+            const wait_ms: i32 = @intCast(@min(next_wake_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
+            switch (try self.pollDecision(wait_ms)) {
+                .detach => return .detach,
+                .reconnect_now => return .reconnect_now,
+                .wait_elapsed => {},
+            }
+
+            const after_poll_ms = elapsedTimerMs(&timer);
+            if (after_poll_ms >= next_banner_update_ms and after_poll_ms < delay_ms) {
+                const remaining_ms = delay_ms - after_poll_ms;
+                try self.drawReconnectReadyBanner(.delayed, remaining_ms);
+                next_banner_update_ms = after_poll_ms + nextBannerUpdateDelayMs(remaining_ms);
+            }
+        }
     }
 
     pub fn pollDetach(self: *ReconnectUi, timeout_ms: i32) !bool {
@@ -679,10 +756,16 @@ pub const ReconnectUi = struct {
         var ignored = false;
         for (input[0..@intCast(n)]) |byte| {
             if (byte == ctrl_c) return .detach;
-            if (byte == ctrl_r) return .reconnect_now;
+            if (byte == ctrl_r) {
+                self.reconnect_acknowledged = true;
+                return .reconnect_now;
+            }
             ignored = true;
         }
-        if (ignored) try self.alertDisconnectedInput();
+        if (ignored) {
+            self.input_during_disconnect = true;
+            try self.alertDisconnectedInput();
+        }
         return .wait_elapsed;
     }
 
@@ -718,9 +801,28 @@ pub const ReconnectUi = struct {
         var message_buf: [96]u8 = undefined;
         const message = try std.fmt.bufPrint(
             &message_buf,
-            "--- sessh: disconnected. Retry {s}. Ctrl-R retry now. Ctrl-C detach ---",
+            "--- sessh: disconnected: Retry connecting {s}. CTRL-R now. CTRL-C detach ---",
             .{delay},
         );
+        try self.drawStaticBanner(message);
+    }
+
+    fn drawReconnectReadyBanner(self: *ReconnectUi, disposition: ReconnectSwitchDisposition, delay_ms: u64) !void {
+        var message_buf: [128]u8 = undefined;
+        const message = switch (disposition) {
+            .delayed => blk: {
+                var delay_buf: [16]u8 = undefined;
+                const delay = try formatSwitchDelay(delay_ms, &delay_buf);
+                break :blk try std.fmt.bufPrint(
+                    &message_buf,
+                    "--- sessh: disconnected: Connection ready. Switch {s}. CTRL-R now. CTRL-C detach ---",
+                    .{delay},
+                );
+            },
+            .manual_disconnected => "--- sessh: disconnected: Connection ready. CTRL-R switch. CTRL-C detach ---",
+            .manual_unresponsive => "--- sessh: unresponsive: Connection ready. CTRL-R switch. CTRL-C detach ---",
+            .automatic => "--- sessh: disconnected: Connection ready. CTRL-R switch. CTRL-C detach ---",
+        };
         try self.drawStaticBanner(message);
     }
 
@@ -858,6 +960,42 @@ const max_banner_render_line_bytes = if (ReconnectUi.max_banner_message_bytes > 
     ReconnectUi.max_banner_message_bytes
 else
     client_log.max_user_diagnostic_display_bytes;
+
+const InputAckTracker = struct {
+    next_seq: u64 = 1,
+    last_sent_seq: u64 = 0,
+    last_acked_seq: u64 = 0,
+    paste_like_sent_seq: u64 = 0,
+
+    fn allocate(self: *InputAckTracker, paste_like: bool) u64 {
+        const seq = self.next_seq;
+        self.last_sent_seq = seq;
+        if (paste_like) self.paste_like_sent_seq = seq;
+        self.next_seq +%= 1;
+        if (self.next_seq == 0) self.next_seq = 1;
+        return seq;
+    }
+
+    fn acknowledge(self: *InputAckTracker, input_seq: u64) bool {
+        if (input_seq <= self.last_acked_seq) return false;
+        self.last_acked_seq = input_seq;
+        if (self.paste_like_sent_seq <= self.last_acked_seq) self.paste_like_sent_seq = 0;
+        return true;
+    }
+
+    fn pending(self: InputAckTracker) bool {
+        return self.last_sent_seq > self.last_acked_seq;
+    }
+
+    fn pendingPasteLike(self: InputAckTracker) bool {
+        return self.paste_like_sent_seq > self.last_acked_seq;
+    }
+
+    fn discardPending(self: *InputAckTracker) void {
+        self.last_acked_seq = self.last_sent_seq;
+        self.paste_like_sent_seq = 0;
+    }
+};
 
 const RenderedBannerLine = struct {
     start_col: u16 = 0,
@@ -1195,10 +1333,19 @@ fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{}min", .{minutes});
 }
 
+fn formatSwitchDelay(delay_ms: u64, buf: []u8) ![]const u8 {
+    const seconds = @max(@divTrunc(delay_ms + 999, 1000), 1);
+    return std.fmt.bufPrint(buf, "{}sec", .{seconds});
+}
+
 fn nextBannerUpdateDelayMs(remaining_ms: u64) u64 {
     if (remaining_ms <= 1_000) return remaining_ms;
     if (remaining_ms <= 60_000) return 1_000;
     return @min(remaining_ms - 59_000, 60_000);
+}
+
+fn elapsedTimerMs(timer: *std.time.Timer) u64 {
+    return timer.read() / std.time.ns_per_ms;
 }
 
 const DrawPayload = struct {
@@ -1243,6 +1390,32 @@ test "formatDelay uses compact reconnect labels" {
     try std.testing.expectEqualStrings("20sec", try formatDelay(20_000, &buf));
     try std.testing.expectEqualStrings("1min", try formatDelay(60_000, &buf));
     try std.testing.expectEqualStrings("10min", try formatDelay(600_000, &buf));
+    try std.testing.expectEqualStrings("60sec", try formatSwitchDelay(60_000, &buf));
+}
+
+test "reconnect switch disposition distinguishes typing paste and unresponsive" {
+    var ui = ReconnectUi{ .mode_guard = undefined };
+    try std.testing.expectEqual(
+        ReconnectSwitchDisposition.automatic,
+        ui.reconnectSwitchDisposition(false, false, false),
+    );
+    try std.testing.expectEqual(
+        ReconnectSwitchDisposition.delayed,
+        ui.reconnectSwitchDisposition(true, false, false),
+    );
+    ui.input_during_disconnect = true;
+    try std.testing.expectEqual(
+        ReconnectSwitchDisposition.delayed,
+        ui.reconnectSwitchDisposition(false, false, false),
+    );
+    try std.testing.expectEqual(
+        ReconnectSwitchDisposition.manual_disconnected,
+        ui.reconnectSwitchDisposition(false, true, false),
+    );
+    try std.testing.expectEqual(
+        ReconnectSwitchDisposition.manual_unresponsive,
+        ui.reconnectSwitchDisposition(false, false, true),
+    );
 }
 
 test "reconnect banner layout adds rows at terminal bottom" {
@@ -1390,54 +1563,13 @@ test "reconnect banner updates every second under one minute" {
     try std.testing.expectEqual(@as(u64, 60_000), nextBannerUpdateDelayMs(600_000));
 }
 
-test "connection monitor defers rate-limited ping and starts responsiveness wait" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
-    var monitor = ConnectionMonitor{
-        .enabled = true,
-        .last_ping_sent_ms = 1_000,
-    };
-
-    try monitor.afterInputAt(fds[1], 1_100);
-    try std.testing.expectEqual(@as(?u64, null), monitor.pending_ping_request_seq);
-    try std.testing.expect(monitor.deferred_ping);
-    try std.testing.expectEqual(@as(?i64, 1_100), monitor.any_response_wait_started_ms);
-    try std.testing.expect(!monitor.isUnresponsive());
-
-    try monitor.maybeSendPingAt(fds[1], 2_000);
-    const pending = monitor.pending_ping_request_seq orelse return error.ExpectedPendingPing;
-    try std.testing.expect(!monitor.deferred_ping);
-    try std.testing.expectEqual(@as(?i64, 2_000), monitor.any_response_wait_started_ms);
-
-    var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
-    defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.ping_request, frame.message_type);
-    var request = try protocol.decodePayload(pb.PingRequest, std.testing.allocator, frame.payload);
-    defer request.deinit(std.testing.allocator);
-    try std.testing.expectEqual(pending, request.ping_request_seq);
-}
-
-test "connection monitor probes idle connections" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
+test "connection monitor starts responsiveness wait after input" {
     var monitor = ConnectionMonitor{ .enabled = true };
 
-    try monitor.maybeSendPingAt(fds[1], 1_000);
-    const pending = monitor.pending_ping_request_seq orelse return error.ExpectedPendingPing;
+    monitor.afterInputAt(1_000);
     try std.testing.expectEqual(@as(?i64, 1_000), monitor.any_response_wait_started_ms);
     try std.testing.expect(!monitor.isUnresponsiveAt(5_999));
     try std.testing.expect(monitor.isUnresponsiveAt(6_000));
-
-    var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
-    defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.ping_request, frame.message_type);
-    var request = try protocol.decodePayload(pb.PingRequest, std.testing.allocator, frame.payload);
-    defer request.deinit(std.testing.allocator);
-    try std.testing.expectEqual(pending, request.ping_request_seq);
 }
 
 test "runtime session backs off unresponsive floor after recovery" {
@@ -1451,25 +1583,58 @@ test "runtime session backs off unresponsive floor after recovery" {
     try std.testing.expectEqual(max_responsiveness_timeout_ms, session.unresponsive_timeout_floor_ms);
 }
 
-test "connection monitor treats any inbound frame as ping response progress" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
+test "connection monitor clears responsiveness wait after input ack progress" {
     var monitor = ConnectionMonitor{ .enabled = true };
 
-    try monitor.afterInputAt(fds[1], 1_000);
-    _ = monitor.pending_ping_request_seq orelse return error.ExpectedPendingPing;
+    monitor.afterInputAt(1_000);
+    try std.testing.expectEqual(@as(?i64, 1_000), monitor.any_response_wait_started_ms);
 
-    monitor.noteInboundFrame();
-    try std.testing.expectEqual(@as(?u64, null), monitor.pending_ping_request_seq);
+    monitor.noteInputAckProgress(false);
     try std.testing.expectEqual(@as(?i64, null), monitor.any_response_wait_started_ms);
-
-    try monitor.maybeSendPingAt(fds[1], 2_000);
-    try std.testing.expect(monitor.pending_ping_request_seq != null);
 }
 
-test "relay drains pending session end before monitor ping" {
+test "input ack tracker records pending and acknowledged input" {
+    var tracker = InputAckTracker{};
+    try std.testing.expect(!tracker.pending());
+    const first = tracker.allocate(false);
+    try std.testing.expectEqual(@as(u64, 1), first);
+    try std.testing.expect(tracker.pending());
+    try std.testing.expect(tracker.acknowledge(first));
+    try std.testing.expect(!tracker.pending());
+    const second = tracker.allocate(false);
+    _ = second;
+    try std.testing.expect(!tracker.acknowledge(first));
+    try std.testing.expect(tracker.pending());
+    tracker.discardPending();
+    try std.testing.expect(!tracker.pending());
+}
+
+test "input ack tracker records pending paste-like input" {
+    var tracker = InputAckTracker{};
+    const normal = tracker.allocate(false);
+    try std.testing.expect(!tracker.pendingPasteLike());
+    const pasted = tracker.allocate(true);
+    try std.testing.expect(tracker.pendingPasteLike());
+    try std.testing.expect(tracker.acknowledge(normal));
+    try std.testing.expect(tracker.pendingPasteLike());
+    try std.testing.expect(tracker.acknowledge(pasted));
+    try std.testing.expect(!tracker.pendingPasteLike());
+}
+
+test "paste-like input classifier uses read size and short rolling window" {
+    var classifier = PasteLikeInputClassifier{};
+    try std.testing.expect(!classifier.classify(31));
+
+    var large_read = PasteLikeInputClassifier{};
+    try std.testing.expect(large_read.classify(32));
+
+    var window = PasteLikeInputClassifier{};
+    try std.testing.expect(!window.classify(20));
+    try std.testing.expect(!window.classify(20));
+    try std.testing.expect(window.classify(24));
+}
+
+test "relay drains pending session end before monitor timeout" {
     const input = try posix.pipe();
     defer posix.close(input[0]);
     defer posix.close(input[1]);
@@ -1495,6 +1660,9 @@ test "relay drains pending session end before monitor ping" {
     var pending_repaint = PendingRepaint{};
     var relay_end_restore = std.ArrayList(u8).empty;
     defer relay_end_restore.deinit(app_allocator.allocator());
+    var input_ack_tracker = InputAckTracker{};
+    var input_escape_filter = terminal.EscapeFilter{};
+    var paste_like_input_classifier = PasteLikeInputClassifier{};
 
     try std.testing.expectEqual(
         RelayEnd.session_ended,
@@ -1502,18 +1670,20 @@ test "relay drains pending session end before monitor ping" {
             input[0],
             remote_to_client[0],
             @as(c.fd_t, -1),
-            .none,
+            &input_escape_filter,
             &presentation_guard,
             &scrollback_cursor,
             &viewport_offset,
             &pending_repaint,
             &relay_end_restore,
+            &input_ack_tracker,
+            &paste_like_input_classifier,
             .{ .monitor_connection = true },
         ),
     );
 }
 
-test "relay treats monitor ping write failure as transport closed" {
+test "relay treats input write failure as transport closed" {
     const input = try posix.pipe();
     defer posix.close(input[0]);
     defer posix.close(input[1]);
@@ -1527,6 +1697,11 @@ test "relay treats monitor ping write failure as transport closed" {
     var pending_repaint = PendingRepaint{};
     var relay_end_restore = std.ArrayList(u8).empty;
     defer relay_end_restore.deinit(app_allocator.allocator());
+    var input_ack_tracker = InputAckTracker{};
+    var input_escape_filter = terminal.EscapeFilter{};
+    var paste_like_input_classifier = PasteLikeInputClassifier{};
+
+    try io_helpers.writeAll(input[1], "typed");
 
     try std.testing.expectEqual(
         RelayEnd.transport_closed,
@@ -1534,12 +1709,14 @@ test "relay treats monitor ping write failure as transport closed" {
             input[0],
             remote_to_client[0],
             @as(c.fd_t, -1),
-            .none,
+            &input_escape_filter,
             &presentation_guard,
             &scrollback_cursor,
             &viewport_offset,
             &pending_repaint,
             &relay_end_restore,
+            &input_ack_tracker,
+            &paste_like_input_classifier,
             .{ .monitor_connection = true },
         ),
     );
@@ -1878,7 +2055,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             },
         }
 
-        try io_helpers.writeAll(2, "\r\nsessh: reconnecting; type Ctrl-C to detach\r\n");
+        try io_helpers.writeAll(2, "\r\nsessh: disconnected: Reconnecting... Ctrl-C detach\r\n");
         child = startLocalBroker(allocator, args[0], runtime_broker_args) catch |err| {
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
@@ -2136,7 +2313,7 @@ pub fn startNewSessionOnRuntime(
     defer created.deinit(app_allocator.allocator());
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
     defer app_allocator.allocator().free(client_guid);
-    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, null, created.guid, client_guid, "");
+    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid, client_guid, "");
     var session = try readRuntimeSession(read_fd);
     try session.setClientGuid(client_guid);
     session.viewport_offset = viewport_offset orelse 0;
@@ -2155,7 +2332,7 @@ pub fn startAttachSessionOnRuntime(
     try runtimeHandshake(read_fd, write_fd);
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
     defer app_allocator.allocator().free(client_guid);
-    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, null, session_ref, client_guid, session_dir);
+    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, client_guid, session_dir);
     var session = try readRuntimeSession(read_fd);
     try session.setClientGuid(client_guid);
     session.viewport_offset = viewport_offset orelse 0;
@@ -2205,7 +2382,7 @@ pub fn reconnectSessionOnRuntime(
     write_fd: c.fd_t,
     session: *RuntimeSession,
 ) !void {
-    try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, null, true, connectionResultBanner(.reconnected));
+    try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, null, true);
 }
 
 pub fn reconnectSessionOnRuntimeCancellable(
@@ -2214,7 +2391,7 @@ pub fn reconnectSessionOnRuntimeCancellable(
     session: *RuntimeSession,
     cancelled: *const std.atomic.Value(bool),
 ) !void {
-    try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, cancelled, false, connectionResultBanner(.reconnected));
+    try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, cancelled, false);
 }
 
 fn reconnectSessionOnRuntimeInner(
@@ -2223,11 +2400,10 @@ fn reconnectSessionOnRuntimeInner(
     session: *RuntimeSession,
     cancelled: ?*const std.atomic.Value(bool),
     wait_for_repaint: bool,
-    transient_banner: ?pb.TransientBanner,
 ) !void {
     try runtimeHandshakeInner(read_fd, write_fd, cancelled);
     const client_guid = try session.ensureClientGuid();
-    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, transient_banner, session.guidSlice(), client_guid, session.sessionDirSlice());
+    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice(), client_guid, session.sessionDirSlice());
     try readSessionAttachedInner(read_fd, cancelled);
     if (wait_for_repaint) try finishReconnectRepaintInner(read_fd, session, cancelled);
 }
@@ -2244,16 +2420,7 @@ pub fn repaintRuntimeSession(
     write_fd: c.fd_t,
     session: *RuntimeSession,
 ) !void {
-    try repaintRuntimeSessionWithTransientBanner(read_fd, write_fd, session, null);
-}
-
-pub fn repaintRuntimeSessionWithTransientBanner(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    session: *RuntimeSession,
-    transient_banner: ?pb.TransientBanner,
-) !void {
-    try sendResizeScreenRepaintWithTransientBanner(write_fd, terminal.currentWindowSize(), session.viewport_offset, &session.pending_repaint, transient_banner);
+    try sendResizeScreenRepaint(write_fd, terminal.currentWindowSize(), session.viewport_offset, &session.pending_repaint);
     try finishReconnectRepaint(read_fd, session);
 }
 
@@ -2276,7 +2443,9 @@ fn finishReconnectRepaintInner(
                     &session.pending_repaint,
                 );
             },
-            .ping_response => {},
+            .input_ack => {
+                _ = try handleInputAckFrame(frame.payload, &session.input_ack_tracker);
+            },
             .tty_transcript_chunk => try handleTtyTranscriptChunkFrame(frame.payload),
             .session_ended => return error.SessionEnded,
             .error_message => {
@@ -2295,14 +2464,17 @@ pub fn relayRuntimeSession(
     leader: Leader,
     options: RelayOptions,
 ) !RelayEnd {
+    session.input_escape_filter.setLeader(terminal.leaderByte(leader));
     return relayInteractive(
         read_fd,
         write_fd,
-        leader,
+        &session.input_escape_filter,
         &session.scrollback_cursor,
         &session.viewport_offset,
         &session.pending_repaint,
         &session.relay_end_restore,
+        &session.input_ack_tracker,
+        &session.paste_like_input_classifier,
         .{
             .monitor_connection = options.monitor_connection,
             .responsiveness_timeout_floor_ms = @max(options.responsiveness_timeout_floor_ms, session.unresponsive_timeout_floor_ms),
@@ -2347,7 +2519,10 @@ pub fn pollRuntimeRecovery(
             );
             return if (applied) .recovered else null;
         },
-        .ping_response => return .recovered,
+        .input_ack => {
+            _ = try handleInputAckFrame(frame.payload, &session.input_ack_tracker);
+            return .recovered;
+        },
         .tty_transcript_chunk => {
             try handleTtyTranscriptChunkFrame(frame.payload);
             return .recovered;
@@ -2365,6 +2540,67 @@ pub fn pollRuntimeRecovery(
     }
 }
 
+pub fn pollAndForwardReconnectInput(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    session: *RuntimeSession,
+    leader: Leader,
+    reconnect_ui: *ReconnectUi,
+    timeout_ms: i32,
+) !ReconnectInputPumpResult {
+    session.input_escape_filter.setLeader(terminal.leaderByte(leader));
+    try reconnect_ui.refreshBannerIfDiagnosticsChanged();
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = 0,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try posix.poll(&pollfds, timeout_ms);
+    if (ready == 0) return .wait_elapsed;
+    if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .detach;
+    if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
+
+    var input: [4096]u8 = undefined;
+    var filtered: [8192]u8 = undefined;
+    const n = c.read(0, &input, input.len);
+    if (n <= 0) return .detach;
+    const bytes = input[0..@intCast(n)];
+    io_helpers.noteRead(0, bytes);
+
+    for (bytes) |byte| {
+        if (byte == 0x03) return .detach;
+        if (byte == 0x12) {
+            reconnect_ui.reconnect_acknowledged = true;
+            return .reconnect_now;
+        }
+    }
+
+    const result = session.input_escape_filter.filter(bytes, &filtered);
+    if (result.bytes.len > 0) {
+        const paste_like = session.paste_like_input_classifier.classify(result.bytes.len);
+        sendInputChunks(write_fd, result.bytes, &session.input_ack_tracker, paste_like) catch |err| switch (err) {
+            error.WriteFailed => return .transport_closed,
+            else => return err,
+        };
+    }
+
+    if (result.end) |end| switch (end) {
+        .detach => return switch (requestSessionDetach(read_fd, write_fd)) {
+            .detach => .detach,
+            else => .transport_closed,
+        },
+        .repaint => sendRepaint(write_fd, "", &session.pending_repaint) catch |err| switch (err) {
+            error.WriteFailed => return .transport_closed,
+            else => return err,
+        },
+        .reconnect => return .reconnect_now,
+    };
+
+    try reconnect_ui.refreshBannerIfDiagnosticsChanged();
+    return .wait_elapsed;
+}
+
 pub fn writeDetachBannerForTarget(ssh_options: []const []const u8, target: []const u8, sessh_options: []const []const u8, session_id: []const u8) void {
     if (c.isatty(1) == 0) return;
     _ = ssh_options;
@@ -2380,7 +2616,7 @@ pub fn writeDetachBannerForSessionRef(sessh_options: []const []const u8, session
 }
 
 fn writeDetachBannerForSessionRefInner(session_ref: []const u8) !void {
-    try io_helpers.writeAll(1, "--- sessh: detached. Re-attach with: ");
+    try io_helpers.writeAll(1, "--- sessh: detached. Re-attach: `");
     try writeShellArg(1, "sesshmux");
     try io_helpers.writeAll(1, " ");
     try writeShellArg(1, "attach");
@@ -2388,7 +2624,15 @@ fn writeDetachBannerForSessionRefInner(session_ref: []const u8) !void {
         try io_helpers.writeAll(1, " ");
         try writeShellArg(1, session_ref);
     }
-    try io_helpers.writeAll(1, " ---\r\n");
+    try io_helpers.writeAll(1, "` / Kill: `");
+    try writeShellArg(1, "sesshmux");
+    try io_helpers.writeAll(1, " ");
+    try writeShellArg(1, "kill");
+    if (session_ref.len > 0) {
+        try io_helpers.writeAll(1, " ");
+        try writeShellArg(1, session_ref);
+    }
+    try io_helpers.writeAll(1, "` ---\r\n");
 }
 
 fn writeShellArg(fd: c.fd_t, arg: []const u8) !void {
@@ -2727,7 +2971,6 @@ fn sendSessionAttach(
     viewport_offset: ?i32,
     initial_scrollback_row_count: ?u32,
     reconnect_cursor: ?*const ScrollbackCursor,
-    transient_banner: ?pb.TransientBanner,
     session_ref: []const u8,
     client_guid: []const u8,
     session_dir: []const u8,
@@ -2741,7 +2984,6 @@ fn sendSessionAttach(
             .repaint_request = if (reconnect_cursor) |cursor| .{
                 .repaint_request_seq = repaint_request_seq,
                 .scrollback_cursor = cursor.slice(),
-                .transient_banner = transient_banner,
             } else .{
                 .repaint_request_seq = repaint_request_seq,
                 .scrollback_cursor = if (initial_scrollback_row_count != null and initial_scrollback_row_count.? == 0)
@@ -2749,7 +2991,6 @@ fn sendSessionAttach(
                 else
                     "",
                 .initial_scrollback_rows = initial_scrollback_row_count,
-                .transient_banner = transient_banner,
             },
         },
         .session_ref = session_ref,
@@ -2836,11 +3077,13 @@ fn listHasAnySession(stdout: []const u8) bool {
 fn relayInteractive(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
-    leader: Leader,
+    input_escape_filter: *terminal.EscapeFilter,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
     relay_end_restore: *std.ArrayList(u8),
+    input_ack_tracker: *InputAckTracker,
+    paste_like_input_classifier: *PasteLikeInputClassifier,
     options: RelayOptions,
 ) !RelayEnd {
     var mode_guard = try terminal.TerminalModeGuard.enable(0);
@@ -2857,12 +3100,14 @@ fn relayInteractive(
         0,
         read_fd,
         write_fd,
-        leader,
+        input_escape_filter,
         &presentation_guard,
         scrollback_cursor,
         viewport_offset,
         pending_repaint,
         relay_end_restore,
+        input_ack_tracker,
+        paste_like_input_classifier,
         options,
     );
     if (end == .detach) writeDetachBoundary();
@@ -2873,12 +3118,14 @@ fn relayTerminal(
     input_fd: c.fd_t,
     read_fd: c.fd_t,
     write_fd: c.fd_t,
-    leader: Leader,
+    input_escape_filter: *terminal.EscapeFilter,
     presentation_guard: *client_renderer.PresentationGuard,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
     relay_end_restore: *std.ArrayList(u8),
+    input_ack_tracker: *InputAckTracker,
+    paste_like_input_classifier: *PasteLikeInputClassifier,
     options: RelayOptions,
 ) !RelayEnd {
     var pollfds = [_]posix.pollfd{
@@ -2887,7 +3134,6 @@ fn relayTerminal(
     };
     var buf: [4096]u8 = undefined;
     var filtered: [8192]u8 = undefined;
-    var escape_filter = terminal.EscapeFilter{ .leader_byte = terminal.leaderByte(leader) };
     var last_size = terminal.currentWindowSize();
     var connection_monitor = ConnectionMonitor{
         .enabled = options.monitor_connection,
@@ -2906,6 +3152,7 @@ fn relayTerminal(
                 viewport_offset,
                 pending_repaint,
                 relay_end_restore,
+                input_ack_tracker,
             )) |end| return finishRelay(end, relay_end_restore);
         }
 
@@ -2913,10 +3160,10 @@ fn relayTerminal(
             const n = c.read(input_fd, &buf, buf.len);
             if (n <= 0) return finishRelay(requestSessionDetach(read_fd, write_fd), relay_end_restore);
             io_helpers.noteRead(input_fd, buf[0..@intCast(n)]);
-            const result = escape_filter.filter(buf[0..@intCast(n)], &filtered);
+            const result = input_escape_filter.filter(buf[0..@intCast(n)], &filtered);
             if (result.bytes.len > 0) {
-                try sendInputChunks(write_fd, result.bytes);
-                connection_monitor.afterInput(write_fd) catch |err| switch (err) {
+                const paste_like = paste_like_input_classifier.classify(result.bytes.len);
+                sendInputChunks(write_fd, result.bytes, input_ack_tracker, paste_like) catch |err| switch (err) {
                     error.WriteFailed => return try finishRelayAfterRuntimeWriteFailed(
                         read_fd,
                         &connection_monitor,
@@ -2924,9 +3171,11 @@ fn relayTerminal(
                         viewport_offset,
                         pending_repaint,
                         relay_end_restore,
+                        input_ack_tracker,
                     ),
                     else => return err,
                 };
+                connection_monitor.afterInput();
             }
             if (result.end) |end| switch (end) {
                 .detach => return finishRelay(requestSessionDetach(read_fd, write_fd), relay_end_restore),
@@ -2938,6 +3187,7 @@ fn relayTerminal(
                         viewport_offset,
                         pending_repaint,
                         relay_end_restore,
+                        input_ack_tracker,
                     ),
                     else => return err,
                 },
@@ -2953,17 +3203,7 @@ fn relayTerminal(
                 viewport_offset,
                 pending_repaint,
                 relay_end_restore,
-            ),
-            else => return err,
-        };
-        connection_monitor.maybeSendPing(write_fd) catch |err| switch (err) {
-            error.WriteFailed => return try finishRelayAfterRuntimeWriteFailed(
-                read_fd,
-                &connection_monitor,
-                scrollback_cursor,
-                viewport_offset,
-                pending_repaint,
-                relay_end_restore,
+                input_ack_tracker,
             ),
             else => return err,
         };
@@ -2981,6 +3221,7 @@ fn drainRelayRuntimeFrames(
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
     relay_end_restore: *std.ArrayList(u8),
+    input_ack_tracker: *InputAckTracker,
 ) !?RelayEnd {
     while (true) {
         var runtime_poll = [_]posix.pollfd{.{
@@ -3004,6 +3245,7 @@ fn drainRelayRuntimeFrames(
             viewport_offset,
             pending_repaint,
             relay_end_restore,
+            input_ack_tracker,
         )) |end| return end;
     }
 }
@@ -3015,6 +3257,7 @@ fn finishRelayAfterRuntimeWriteFailed(
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
     relay_end_restore: *std.ArrayList(u8),
+    input_ack_tracker: *InputAckTracker,
 ) !RelayEnd {
     if (try drainRelayRuntimeFrames(
         read_fd,
@@ -3023,6 +3266,7 @@ fn finishRelayAfterRuntimeWriteFailed(
         viewport_offset,
         pending_repaint,
         relay_end_restore,
+        input_ack_tracker,
     )) |end| return finishRelay(end, relay_end_restore);
     return .transport_closed;
 }
@@ -3034,19 +3278,18 @@ fn handleRelayRuntimeFrame(
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
     relay_end_restore: *std.ArrayList(u8),
+    input_ack_tracker: *InputAckTracker,
 ) !?RelayEnd {
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
         .draw => {
-            connection_monitor.noteInboundFrame();
             if (!pending_repaint.active()) {
                 try handleDrawFrame(frame.payload, relay_end_restore, scrollback_cursor, viewport_offset);
             }
             return null;
         },
         .repaint_response => {
-            connection_monitor.noteInboundFrame();
             _ = try handleRepaintResponseFrame(
                 frame.payload,
                 relay_end_restore,
@@ -3056,21 +3299,19 @@ fn handleRelayRuntimeFrame(
             );
             return null;
         },
-        .ping_response => {
-            try connection_monitor.handlePingResponse(frame.payload);
-            return null;
-        },
         .tty_transcript_chunk => {
-            connection_monitor.noteInboundFrame();
             try handleTtyTranscriptChunkFrame(frame.payload);
             return null;
         },
+        .input_ack => {
+            const ack = try handleInputAckFrame(frame.payload, input_ack_tracker);
+            if (ack.progressed) connection_monitor.noteInputAckProgress(ack.still_pending);
+            return null;
+        },
         .session_ended => {
-            connection_monitor.noteInboundFrame();
             return .session_ended;
         },
         .error_message => {
-            connection_monitor.noteInboundFrame();
             try printErrorPayload(frame.payload);
             return .session_ended;
         },
@@ -3136,6 +3377,20 @@ fn handleTtyTranscriptChunkFrame(payload: []const u8) !void {
         .TTY_TRANSCRIPT_STREAM_UNSPECIFIED => {},
         _ => {},
     }
+}
+
+const InputAckResult = struct {
+    progressed: bool,
+    still_pending: bool,
+};
+
+fn handleInputAckFrame(payload: []const u8, input_ack_tracker: *InputAckTracker) !InputAckResult {
+    var ack = try protocol.decodePayload(pb.InputAck, app_allocator.allocator(), payload);
+    defer ack.deinit(app_allocator.allocator());
+    return .{
+        .progressed = input_ack_tracker.acknowledge(ack.input_seq),
+        .still_pending = input_ack_tracker.pending(),
+    };
 }
 
 fn handleDrawPayload(
@@ -3238,16 +3493,6 @@ fn sendResizeScreenRepaint(
     viewport_offset: i32,
     pending_repaint: *PendingRepaint,
 ) !void {
-    try sendResizeScreenRepaintWithTransientBanner(socket_fd, size, viewport_offset, pending_repaint, null);
-}
-
-fn sendResizeScreenRepaintWithTransientBanner(
-    socket_fd: c.fd_t,
-    size: WindowSize,
-    viewport_offset: i32,
-    pending_repaint: *PendingRepaint,
-    transient_banner: ?pb.TransientBanner,
-) !void {
     const repaint_request_seq = pending_repaint.start();
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Resize{
         .terminal_rows = size.rows,
@@ -3255,7 +3500,6 @@ fn sendResizeScreenRepaintWithTransientBanner(
         .viewport_offset = nonZeroViewportOffset(viewport_offset),
         .repaint_request = .{
             .repaint_request_seq = repaint_request_seq,
-            .transient_banner = transient_banner,
         },
     });
     defer app_allocator.allocator().free(payload);
@@ -3286,34 +3530,20 @@ fn allocateRepaintRequestSeq() u64 {
     return seq;
 }
 
-fn sendInput(socket_fd: c.fd_t, bytes: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Input{ .data = bytes });
+fn sendInput(socket_fd: c.fd_t, bytes: []const u8, input_ack_tracker: *InputAckTracker, paste_like: bool) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Input{
+        .data = bytes,
+        .input_seq = input_ack_tracker.allocate(paste_like),
+    });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(socket_fd, .input, payload);
 }
 
-fn sendPingRequest(socket_fd: c.fd_t) !u64 {
-    const ping_request_seq = allocatePingRequestSeq();
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.PingRequest{
-        .ping_request_seq = ping_request_seq,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .ping_request, payload);
-    return ping_request_seq;
-}
-
-fn allocatePingRequestSeq() u64 {
-    const seq = next_ping_request_seq;
-    next_ping_request_seq +%= 1;
-    if (next_ping_request_seq == 0) next_ping_request_seq = 1;
-    return seq;
-}
-
-fn sendInputChunks(socket_fd: c.fd_t, bytes: []const u8) !void {
+fn sendInputChunks(socket_fd: c.fd_t, bytes: []const u8, input_ack_tracker: *InputAckTracker, paste_like: bool) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
         const end = @min(offset + input_chunk_bytes, bytes.len);
-        try sendInput(socket_fd, bytes[offset..end]);
+        try sendInput(socket_fd, bytes[offset..end], input_ack_tracker, paste_like);
         offset = end;
     }
 }

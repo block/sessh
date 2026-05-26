@@ -27,7 +27,6 @@ _PROTO_HANDSHAKE_MODULE = None
 _FRAME_HEADER_LEN = 4
 _LAST_RESIZE = (24, 80)
 _NEXT_REPAINT_REQUEST_SEQ = 1
-_NEXT_PING_REQUEST_SEQ = 1
 _SCROLLBACK_CURSOR_LEN = 16
 _GUID_RE = re.compile(r"^s-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _CLIENT_GUID_RE = re.compile(r"^c-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -43,13 +42,12 @@ SESSION_ATTACH = "session_attach"
 INPUT = "input"
 RESIZE = "resize"
 REPAINT_REQUEST = "repaint_request"
-PING_REQUEST = "ping_request"
 SESSION_CREATED = "session_created"
 SESSION_ATTACHED = "session_attached"
 SESSION_ENDED = "session_ended"
 DRAW = "draw"
-PING_RESPONSE = "ping_response"
 REPAINT_RESPONSE = "repaint_response"
+INPUT_ACK = "input_ack"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -63,13 +61,12 @@ _FRAME_FIELDS = {
     INPUT: INPUT,
     RESIZE: RESIZE,
     REPAINT_REQUEST: REPAINT_REQUEST,
-    PING_REQUEST: PING_REQUEST,
     SESSION_CREATED: SESSION_CREATED,
     SESSION_ATTACHED: SESSION_ATTACHED,
     SESSION_ENDED: SESSION_ENDED,
     DRAW: DRAW,
-    PING_RESPONSE: PING_RESPONSE,
     REPAINT_RESPONSE: REPAINT_RESPONSE,
+    INPUT_ACK: INPUT_ACK,
 }
 
 
@@ -285,8 +282,12 @@ def sessh_hpb():
     return _PROTO_HANDSHAKE_MODULE
 
 
+def pack_input(value, input_seq=0):
+    return sessh_pb().Input(data=value, input_seq=input_seq).SerializeToString()
+
+
 def pack_bytes(value):
-    return sessh_pb().Input(data=value).SerializeToString()
+    return pack_input(value)
 
 
 def pack_session_create(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", command_argv=None):
@@ -360,17 +361,10 @@ def pack_repaint(repaint_request_seq, scrollback_cursor=None, scrollback_epoch=0
     return message.SerializeToString()
 
 
-def pack_ping_request():
-    global _NEXT_PING_REQUEST_SEQ
-    ping_request_seq = _NEXT_PING_REQUEST_SEQ
-    _NEXT_PING_REQUEST_SEQ += 1
-    return ping_request_seq, sessh_pb().PingRequest(ping_request_seq=ping_request_seq).SerializeToString()
-
-
-def parse_ping_response(payload):
-    message = sessh_pb().PingResponse()
+def parse_input_ack(payload):
+    message = sessh_pb().InputAck()
     message.ParseFromString(payload)
-    return message.ping_request_seq
+    return message.input_seq
 
 
 def parse_session_ended(payload):
@@ -977,11 +971,11 @@ def run_session_create_without_attach_protocol_test(base_env):
             cleanup_runtime(env)
 
 
-def run_ping_protocol_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-ping-protocol-", dir="/tmp") as tmp:
+def run_input_ack_protocol_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-input-ack-protocol-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
-        shell = Path(tmp) / "ping-shell"
-        shell.write_text("#!/bin/sh\nwhile :; do sleep 1; done\n")
+        shell = Path(tmp) / "input-ack-shell"
+        shell.write_text("#!/bin/sh\nwhile IFS= read -r line; do printf 'ACK:%s\\n' \"$line\"; done\n")
         shell.chmod(0o700)
         env["SHELL"] = str(shell)
         cleanup_runtime(env)
@@ -1001,11 +995,11 @@ def run_ping_protocol_test(base_env):
                     raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
                 assert_session_attached(payload)
 
-                ping_request_seq, ping_payload = pack_ping_request()
-                send_frame(conn, PING_REQUEST, ping_payload)
-                response = recv_until_message(conn, PING_RESPONSE)
-                if parse_ping_response(response) != ping_request_seq:
-                    raise AssertionError(f"unexpected ping response: {response!r}")
+                send_frame(conn, INPUT, pack_input(b"go\n", input_seq=7))
+                response = recv_until_message(conn, INPUT_ACK)
+                if parse_input_ack(response) != 7:
+                    raise AssertionError(f"unexpected input ack: {response!r}")
+                recv_draw_until(conn, b"ACK:go")
             finally:
                 conn.close()
         finally:
@@ -2914,7 +2908,7 @@ def main():
             run_minor_version_compatibility_test(env)
             run_session_create_without_attach_protocol_test(env)
             run_live_draw_protocol_test(env)
-            run_ping_protocol_test(env)
+            run_input_ack_protocol_test(env)
             run_session_ended_payload_protocol_test(env)
             run_plain_scroll_protocol_test(env)
             run_plain_screen_protocol_test(env)
@@ -3034,7 +3028,9 @@ def main():
                 os.write(fd, b"echo sessh_before_sever\n")
                 read_until_count(fd, b"sessh_before_sever", 2)
                 os.write(fd, b"\x02s")
-                read_until(fd, b"sessh: reconnecting")
+                read_until(fd, b"sessh: disconnected: Reconnecting")
+                os.write(fd, b"\x12")
+                read_until(fd, b"$ ")
                 os.write(fd, b"echo sessh_after_sever\n")
                 read_until_count(fd, b"sessh_after_sever", 2)
                 os.write(fd, b"~.")

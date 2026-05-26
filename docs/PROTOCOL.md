@@ -76,6 +76,13 @@ the banner doesn't end up in the outer terminal's scrollback.
 The client uses banners to notify the user when the connection has died or
 become unresponsive.
 
+## Input acknowledgements
+
+Each Input frame carries a client-assigned sequence number. The session agent
+answers with InputAck after receiving a nonzero input sequence. The client uses
+the highest acknowledged sequence to know whether input was still pending when
+a connection died, and to detect unresponsive connections after user input.
+
 ## Client-side state cleanup
 
 Both of the previous capabilities rely on the remote generating well-formed

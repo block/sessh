@@ -26,14 +26,13 @@ message Frame {
     Input input = 13;
     Resize resize = 14;
     RepaintRequest repaint_request = 15;
-    PingRequest ping_request = 16;
     SessionCreated session_created = 17;
     SessionAttached session_attached = 18;
     SessionEnded session_ended = 19;
     Draw draw = 20;
-    PingResponse ping_response = 21;
     RepaintResponse repaint_response = 22;
     TtyTranscriptChunk tty_transcript_chunk = 23;
+    InputAck input_ack = 24;
   }
 }
 
@@ -118,6 +117,16 @@ message SessionAttach {
 message Input {
   // Raw bytes read from the local terminal.
   bytes data = 1;
+  // Client-assigned input sequence. The session agent acknowledges nonzero
+  // sequence numbers after receiving the input frame.
+  uint64 input_seq = 2;
+}
+
+// Framed payload, session agent -> client.
+//
+// Confirms that the session agent received an Input frame.
+message InputAck {
+  uint64 input_seq = 1;
 }
 
 // Framed payload, client -> session agent.
@@ -141,19 +150,6 @@ message Resize {
 
 // Framed payload, client -> session agent.
 //
-// Presentation-only overlay drawn for one attachment and then removed after the
-// requested duration or when that attachment next sends input.
-message TransientBanner {
-  string text = 1;
-  double duration_seconds = 2;
-  // Zero-based terminal-grid row where the banner text begins.
-  uint32 start_row = 3;
-  // Zero-based terminal-grid column where the banner text begins.
-  uint32 start_col = 4;
-}
-
-// Framed payload, client -> session agent.
-//
 // Requests that the session agent redraw terminal state for this attachment.
 message RepaintRequest {
   // Client-local repaint request sequence copied into RepaintResponse. While
@@ -170,18 +166,6 @@ message RepaintRequest {
   // Optional cap for retained scrollback rows included with an initial attach
   // repaint. Absent means all available retained scrollback.
   optional uint32 initial_scrollback_rows = 3;
-  // Optional attachment-local transient banner to draw over the repaint. This
-  // is presentation-only; the session agent must not write it to the PTY model
-  // or show it to other attachments.
-  optional TransientBanner transient_banner = 4;
-}
-
-// Framed payload, client -> session agent.
-//
-// Requests a transport responsiveness acknowledgement. This measures the framed
-// path through ssh/broker/session-agent, not application output or UI rendering.
-message PingRequest {
-  uint64 ping_request_seq = 1;
 }
 
 // Framed payload, session agent -> client.
@@ -266,13 +250,6 @@ message Draw {
 message RepaintResponse {
   uint64 repaint_request_seq = 1;
   Draw draw = 2;
-}
-
-// Framed payload, session agent -> client.
-//
-// Acknowledges a PingRequest.
-message PingResponse {
-  uint64 ping_request_seq = 1;
 }
 
 enum TtyTranscriptStream {
