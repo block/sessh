@@ -1,4 +1,4 @@
-pub const version = "0.5.0";
+pub const version = "0.6.0-dev";
 
 pub const default_scrollback_row_count = 2000;
 
