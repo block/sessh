@@ -26,6 +26,25 @@ run() {
   "$@"
 }
 
+dump_npm_debug_log() {
+  log_dir=${NPM_CONFIG_CACHE:-${HOME:-}/.npm}/_logs
+  log=$(find "$log_dir" -type f -name '*-debug-*.log' -print 2>/dev/null | sort | tail -n 1 || true)
+  if [ -n "$log" ] && [ -f "$log" ]; then
+    printf '\n==> %s\n' "$log" >&2
+    tail -n 240 "$log" >&2
+  fi
+}
+
+run_npm_install() {
+  printf '\n==> %s\n' "$*"
+  if "$@"; then
+    return 0
+  fi
+  status=$?
+  dump_npm_debug_log
+  return "$status"
+}
+
 find_zig() {
   if [ -n "${ZIG:-}" ]; then
     printf '%s\n' "$ZIG"
@@ -87,9 +106,9 @@ EOF
 
   if [ ! -d node_modules/vitest ] || [ ! -d node_modules/@termless/core ] || [ ! -d node_modules/node-pty ]; then
     if [ -f package-lock.json ]; then
-      run npm ci
+      run_npm_install npm ci
     else
-      run npm install
+      run_npm_install npm install
     fi
   fi
 
