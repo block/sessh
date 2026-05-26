@@ -75,6 +75,17 @@ fi
 if [ "$batch_mode" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_DELAY_ON_BATCH:-}" ]; then
   sleep "$SESSH_FAKE_SSH_DELAY_ON_BATCH"
 fi
+if [ "$batch_mode" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_FAIL_BATCH_COUNT_FILE:-}" ] && [ -f "$SESSH_FAKE_SSH_FAIL_BATCH_COUNT_FILE" ]; then
+  fail_count=$(cat "$SESSH_FAKE_SSH_FAIL_BATCH_COUNT_FILE" 2>/dev/null || printf '0')
+  case "$fail_count" in
+    ''|*[!0-9]*) fail_count=0 ;;
+  esac
+  if [ "$fail_count" -gt 0 ]; then
+    printf '%s\n' "$((fail_count - 1))" > "$SESSH_FAKE_SSH_FAIL_BATCH_COUNT_FILE"
+    printf 'fake ssh: planned batch reconnect failure\n' >&2
+    exit 98
+  fi
+fi
 export SESSH_TEST_HOST=$host
 exec sh -c "$1"
 """
@@ -190,11 +201,13 @@ def main():
     reconnect_detach_session = f"{session}-reconnect-detach"
     alt_detach_session = f"{session}-alt-detach"
     bottom_session = f"{session}-bottom"
+    bottom_failure_session = f"{session}-bottom-failure"
     with tempfile.TemporaryDirectory(prefix="sessh-ssh-reconnect-tmux-", dir="/tmp") as tmp_text:
         tmp = Path(tmp_text)
         env = isolated_env(tmp)
         fake_bin = tmp / "fake-bin"
         fake_ssh = fake_bin / "ssh"
+        fail_batch_count_file = tmp / "fail-batch-count"
         remote_shell = Path(env["HOME"]) / "remote-shell"
         write_fake_ssh(fake_ssh)
         remote_shell.write_text(
@@ -237,6 +250,7 @@ def main():
             f"export PATH={shlex.quote(child_env['PATH'])}\n"
             f"export SHELL={shlex.quote(str(remote_shell))}\n"
             "export SESSH_FAKE_SSH_DELAY_ON_BATCH=1\n"
+            f"export SESSH_FAKE_SSH_FAIL_BATCH_COUNT_FILE={shlex.quote(str(fail_batch_count_file))}\n"
             "if [ \"${1-}\" = attach ]; then\n"
             "  shift\n"
             f"  exec {shlex.quote(str(MUX_BIN))} attach --leader CTRL-A --scrollback-limit 321 --host test-host \"$@\"\n"
@@ -357,6 +371,42 @@ def main():
                     f"after:\n{bottom_after}"
                 )
 
+            new_tmux_session(env, bottom_failure_session, 100, 8)
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", bottom_failure_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, bottom_failure_session, PROMPT)
+            run(
+                env,
+                [
+                    *TMUX_ARGS,
+                    "send-keys",
+                    "-t",
+                    bottom_failure_session,
+                    "i=1; while [ $i -le 16 ]; do printf 'BOTTOM_FAIL_OUTER_%02d\\n' $i; i=$((i+1)); done",
+                    "Enter",
+                ],
+            )
+            wait_capture(env, bottom_failure_session, "BOTTOM_FAIL_OUTER_16")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, sessh_cmd, "Enter"])
+            wait_capture(env, bottom_failure_session, "REMOTE_PROMPT$")
+            bottom_failure_before = capture_visible(env, bottom_failure_session)
+            if "REMOTE_TOP" not in bottom_failure_before.splitlines():
+                raise AssertionError(f"REMOTE_TOP not found in bottom failure pane:\n{bottom_failure_before}")
+
+            fail_batch_count_file.write_text("1\n")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, "C-a", "s"])
+            wait_capture(env, bottom_failure_session, "sessh: disconnected: Retry connecting 10sec")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, "C-r"])
+            wait_capture(env, bottom_failure_session, "planned batch reconnect failure", timeout=6.0)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, "C-r"])
+            wait_capture(env, bottom_failure_session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=2.0)
+            wait_visible_absent(env, bottom_failure_session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=10.0)
+            bottom_failure_after = capture_visible(env, bottom_failure_session)
+            if bottom_failure_after.count("REMOTE_TOP") != 1:
+                raise AssertionError(f"bottom reconnect after failed attempt duplicated session screen content:\n{bottom_failure_after}")
+            if "sessh: disconnected" in bottom_failure_after:
+                raise AssertionError(f"bottom reconnect after failed attempt leaked banner:\n{bottom_failure_after}")
+
             idle_detach_session = f"{detach_session}-idle"
             new_tmux_session(env, idle_detach_session, 140, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", idle_detach_session, "remain-on-exit", "on"])
@@ -415,7 +465,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "printf 'OUTER_ALT_DETACHED\\n'", "Enter"])
             wait_capture(env, alt_detach_session, "OUTER_ALT_DETACHED")
         finally:
-            for tmux_session in (session, detach_session, reconnect_detach_session, f"{detach_session}-idle", alt_detach_session, bottom_session):
+            for tmux_session in (session, detach_session, reconnect_detach_session, f"{detach_session}-idle", alt_detach_session, bottom_session, bottom_failure_session):
                 subprocess.run(
                     [*TMUX_ARGS, "kill-session", "-t", tmux_session],
                     cwd=ROOT,

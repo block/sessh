@@ -1020,6 +1020,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 },
             };
 
+            session.viewport_offset = reconnect_ui.currentViewportOffset();
             client.reconnectSessionOnRuntimeCancellable(
                 child.child.stdout.?.handle,
                 child.child.stdin.?.handle,
@@ -1705,6 +1706,7 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
         return;
     };
 
+    state.session.viewport_offset = state.reconnect_ui.currentViewportOffset();
     client.reconnectSessionOnRuntimeCancellable(
         connection.child.stdout.?.handle,
         connection.child.stdin.?.handle,
