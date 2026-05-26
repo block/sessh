@@ -36,6 +36,7 @@ class Probe:
     payload: bytes
     expected_cursor: tuple[int, int] | None = None
     expected_capture: str | None = None
+    normalize_capture_tabs: bool = False
     expected_styled_capture: str | None = None
     rows: int = 10
     cols: int = 40
@@ -349,6 +350,8 @@ PROBES = (
         payload=b"\tX",
         expected_cursor=(9, 0),
         expected_capture="        X\n\n\n\n\n\n\n\n",
+        # tmux 3.6 can preserve literal tabs in capture-pane output; older tmux expands them.
+        normalize_capture_tabs=True,
         rows=8,
         cols=30,
     ),
@@ -397,6 +400,7 @@ PROBES = (
         payload=b"\x1b[3g\x1b[6G\x1bH\x1b[1G\t",
         expected_cursor=(5, 0),
         expected_capture="\n\n\n\n\n\n\n\n",
+        normalize_capture_tabs=True,
         rows=8,
         cols=30,
     ),
@@ -567,11 +571,21 @@ def write_emitter(path, payload, barrier_title):
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def captures_match(probe, actual, expected):
+    return normalize_capture(probe, actual) == normalize_capture(probe, expected)
+
+
+def normalize_capture(probe, capture):
+    if not probe.normalize_capture_tabs:
+        return capture
+    return "\n".join(line.expandtabs(8).rstrip(" ") for line in capture.split("\n"))
+
+
 def assert_expected(probe, state, label):
     failures = []
     if probe.expected_cursor is not None and state.cursor != probe.expected_cursor:
         failures.append(f"cursor {state.cursor!r}, expected {probe.expected_cursor!r}")
-    if probe.expected_capture is not None and state.capture != probe.expected_capture:
+    if probe.expected_capture is not None and not captures_match(probe, state.capture, probe.expected_capture):
         failures.append(
             "capture differed:\n"
             + "\n".join(
@@ -605,7 +619,7 @@ def assert_matches_direct(probe, direct, through_sessh):
     failures = []
     if probe.expected_cursor is not None and through_sessh.cursor != direct.cursor:
         failures.append(f"cursor direct={direct.cursor!r} sessh={through_sessh.cursor!r}")
-    if probe.expected_capture is not None and through_sessh.capture != direct.capture:
+    if probe.expected_capture is not None and not captures_match(probe, through_sessh.capture, direct.capture):
         failures.append(
             "capture differed:\n"
             + "\n".join(
