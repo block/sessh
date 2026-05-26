@@ -35,6 +35,30 @@ verbose=
 plain_option=
 ipqos_option=
 
+trace_fake_ssh_start() {
+  if [ -n "${SESSH_FAKE_SSH_TRACE:-}" ]; then
+    {
+      printf 'pid=%s event=start argc=%s\\n' "$$" "$#"
+      i=0
+      for arg in "$@"; do
+        printf 'pid=%s arg%d=%s\\n' "$$" "$i" "$arg"
+        i=$((i + 1))
+      done
+    } >>"$SESSH_FAKE_SSH_TRACE"
+  fi
+}
+
+trace_fake_ssh_parsed() {
+  if [ -n "${SESSH_FAKE_SSH_TRACE:-}" ]; then
+    {
+      printf 'pid=%s event=parsed host=%s config=%s config_query=%s saw_t=%s batch_mode=%s remaining=%s\\n' "$$" "$host" "$config" "$config_query" "$saw_t" "$batch_mode" "$#"
+      if [ "$#" -eq 1 ]; then
+        printf 'pid=%s remote_command=%s\\n' "$$" "$1"
+      fi
+    } >>"$SESSH_FAKE_SSH_TRACE"
+  fi
+}
+
 record_o_option() {
   case "$1" in
     [Ii][Pp][Qq][Oo][Ss]=*)
@@ -49,6 +73,8 @@ record_o_option() {
       ;;
   esac
 }
+
+trace_fake_ssh_start "$@"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -119,6 +145,8 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+trace_fake_ssh_parsed "$@"
 
 if [ "$config_query" -eq 1 ]; then
   if [ -z "$host" ]; then
@@ -244,6 +272,28 @@ def run_sessh(args, env, timeout=5.0):
         stderr=subprocess.PIPE,
         timeout=timeout,
         check=False,
+    )
+
+
+def optional_text(path):
+    return path.read_text() if path.exists() else "<missing>"
+
+
+def process_diagnostics(result):
+    return (
+        f"returncode={result.returncode}\n"
+        f"args={result.args!r}\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def ssh_failure_diagnostics(message, result, fake_log, fake_trace):
+    return (
+        f"{message}\n"
+        f"\nfake ssh log:\n{optional_text(fake_log)}"
+        f"\nfake ssh trace:\n{optional_text(fake_trace)}"
+        f"\nsessh result:\n{process_diagnostics(result)}"
     )
 
 
@@ -692,6 +742,7 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
     fake_config = tmp / "ssh_config"
     remote_shell = tmp / "remote-shell"
     marker = "SSH_ATTACH_READY"
@@ -701,23 +752,37 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     write_fake_ssh(fake_bin / "ssh")
     env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh(["-F", str(fake_config), "test-host", "--alias", "s1"], env, timeout=30.0)
 
     if not fake_log.exists():
-        raise AssertionError(f"fake ssh was not invoked: {result}")
+        raise AssertionError(ssh_failure_diagnostics("fake ssh was not invoked", result, fake_log, fake_trace))
     expected_log = f"invoked=1\nconfig={fake_config}\n"
     if fake_log.read_text() != expected_log:
-        raise AssertionError(fake_log.read_text())
+        raise AssertionError(
+            ssh_failure_diagnostics(
+                f"unexpected fake ssh log; expected:\n{expected_log}",
+                result,
+                fake_log,
+                fake_trace,
+            )
+        )
     if result.returncode != 0:
-        raise AssertionError(result)
+        raise AssertionError(ssh_failure_diagnostics("sessh returned non-zero", result, fake_log, fake_trace))
     if marker not in result.stdout:
-        raise AssertionError(f"ssh attach did not render remote output: {result}")
+        raise AssertionError(
+            ssh_failure_diagnostics("ssh attach did not render remote output", result, fake_log, fake_trace)
+        )
     if "ssh runtime attach is not implemented yet" in result.stderr:
-        raise AssertionError(result.stderr)
+        raise AssertionError(
+            ssh_failure_diagnostics("ssh runtime attach fallback was used", result, fake_log, fake_trace)
+        )
     if any(token in result.stdout or token in result.stderr for token in ("MISSING ", "UPLOAD ", "OK\n")):
-        raise AssertionError(result)
+        raise AssertionError(
+            ssh_failure_diagnostics("bootstrap protocol leaked to client output", result, fake_log, fake_trace)
+        )
 
     artifact = remote_path_artifact()
     installed = artifact_cache_path(env, artifact)
