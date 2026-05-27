@@ -4,7 +4,7 @@ const posix = std.posix;
 
 const session_registry = @import("session_registry.zig");
 
-const default_refresh_interval_ms: u64 = 60 * 60 * 1000;
+pub const default_refresh_interval_ms: u64 = 60 * 60 * 1000;
 const sticky_bit: c.mode_t = c.S.ISVTX;
 
 pub const RuntimeRefresher = struct {
@@ -13,19 +13,34 @@ pub const RuntimeRefresher = struct {
     mutex: std.Thread.Mutex = .{},
     condition: std.Thread.Condition = .{},
     stop_requested: bool = false,
+    repair_signal_fd: c.fd_t = -1,
     thread: ?std.Thread = null,
 
     pub fn start(self: *RuntimeRefresher, allocator: std.mem.Allocator, session_paths: session_registry.SessionPaths) !void {
-        try self.startWithInterval(allocator, session_paths, default_refresh_interval_ms);
+        try self.startWithIntervalAndRepairSignal(allocator, session_paths, default_refresh_interval_ms, -1);
+    }
+
+    pub fn startWithRepairSignal(self: *RuntimeRefresher, allocator: std.mem.Allocator, session_paths: session_registry.SessionPaths, refresh_interval_ms: u64, repair_signal_fd: c.fd_t) !void {
+        try self.startWithIntervalAndRepairSignal(allocator, session_paths, refresh_interval_ms, repair_signal_fd);
     }
 
     fn startWithInterval(self: *RuntimeRefresher, allocator: std.mem.Allocator, session_paths: session_registry.SessionPaths, refresh_interval_ms: u64) !void {
-        if (refresh_interval_ms == 0) return error.InvalidRefreshInterval;
-        self.* = .{ .refresh_interval_ms = refresh_interval_ms };
-        self.paths = try PathSet.init(allocator, session_paths);
-        errdefer self.paths.deinit(allocator);
+        try self.startWithIntervalAndRepairSignal(allocator, session_paths, refresh_interval_ms, -1);
+    }
 
-        refreshPathSet(&self.paths);
+    fn startWithIntervalAndRepairSignal(self: *RuntimeRefresher, allocator: std.mem.Allocator, session_paths: session_registry.SessionPaths, refresh_interval_ms: u64, repair_signal_fd: c.fd_t) !void {
+        if (refresh_interval_ms == 0) return error.InvalidRefreshInterval;
+        self.* = .{
+            .refresh_interval_ms = refresh_interval_ms,
+            .repair_signal_fd = repair_signal_fd,
+        };
+        self.paths = try PathSet.init(allocator, session_paths);
+        errdefer {
+            self.paths.deinit(allocator);
+            self.* = .{};
+        }
+
+        _ = refreshPathSet(&self.paths);
         self.thread = try std.Thread.spawn(.{}, refreshThreadMain, .{self});
     }
 
@@ -57,7 +72,8 @@ pub const RuntimeRefresher = struct {
 
 fn refreshThreadMain(refresher: *RuntimeRefresher) void {
     while (refresher.waitForNextRefresh()) {
-        refreshPathSet(&refresher.paths);
+        const result = refreshPathSet(&refresher.paths);
+        if (result.needs_agent_repair) signalAgentRepair(refresher.repair_signal_fd);
     }
 }
 
@@ -66,10 +82,15 @@ const PathSet = struct {
 
     paths: [max_paths][]u8 = undefined,
     len: usize = 0,
+    session_paths: session_registry.SessionPaths = undefined,
+    session_paths_initialized: bool = false,
 
     fn init(allocator: std.mem.Allocator, session_paths: session_registry.SessionPaths) !PathSet {
         var set = PathSet{};
         errdefer set.deinit(allocator);
+
+        set.session_paths = try cloneSessionPaths(allocator, session_paths);
+        set.session_paths_initialized = true;
 
         const runtime_root = try runtimeRootFromSessionDir(allocator, session_paths.dir);
         defer allocator.free(runtime_root);
@@ -79,7 +100,7 @@ const PathSet = struct {
         defer allocator.free(sessions_dir);
         try set.add(allocator, sessions_dir);
 
-        const sockets_dir = try std.fmt.allocPrint(allocator, "{s}/s", .{runtime_root});
+        const sockets_dir = try session_registry.sessionSocketsDirInRoot(allocator, runtime_root);
         defer allocator.free(sockets_dir);
         try set.add(allocator, sockets_dir);
 
@@ -95,6 +116,7 @@ const PathSet = struct {
 
     fn deinit(self: *PathSet, allocator: std.mem.Allocator) void {
         for (self.paths[0..self.len]) |path| allocator.free(path);
+        if (self.session_paths_initialized) self.session_paths.deinit(allocator);
         self.* = .{};
     }
 
@@ -105,14 +127,57 @@ const PathSet = struct {
     }
 };
 
+fn cloneSessionPaths(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !session_registry.SessionPaths {
+    const dir = try allocator.dupe(u8, paths.dir);
+    errdefer allocator.free(dir);
+    const socket = try allocator.dupe(u8, paths.socket);
+    errdefer allocator.free(socket);
+    const agent_sock_link = try allocator.dupe(u8, paths.agent_sock_link);
+    errdefer allocator.free(agent_sock_link);
+    const meta = try allocator.dupe(u8, paths.meta);
+    errdefer allocator.free(meta);
+    const detached = try allocator.dupe(u8, paths.detached);
+    errdefer allocator.free(detached);
+    const compat = try allocator.dupe(u8, paths.compat);
+    errdefer allocator.free(compat);
+    const route = try allocator.dupe(u8, paths.route);
+    errdefer allocator.free(route);
+    return .{
+        .dir = dir,
+        .socket = socket,
+        .agent_sock_link = agent_sock_link,
+        .meta = meta,
+        .detached = detached,
+        .compat = compat,
+        .route = route,
+    };
+}
+
 fn runtimeRootFromSessionDir(allocator: std.mem.Allocator, session_dir: []const u8) ![]u8 {
     const sessions_dir = std.fs.path.dirname(session_dir) orelse return error.InvalidSessionDir;
     const runtime_root = std.fs.path.dirname(sessions_dir) orelse return error.InvalidSessionDir;
     return allocator.dupe(u8, runtime_root);
 }
 
-fn refreshPathSet(paths: *const PathSet) void {
+const RefreshResult = struct {
+    needs_agent_repair: bool = false,
+};
+
+fn refreshPathSet(paths: *const PathSet) RefreshResult {
+    var result = RefreshResult{
+        .needs_agent_repair = pathMissing(paths.session_paths.dir) or
+            pathMissing(paths.session_paths.socket) or
+            pathMissing(paths.session_paths.agent_sock_link) or
+            pathMissing(paths.session_paths.meta) or
+            pathMissing(paths.session_paths.compat),
+    };
+
+    session_registry.ensureRuntimeLayout(std.heap.page_allocator, paths.session_paths) catch {
+        result.needs_agent_repair = true;
+    };
+
     for (paths.paths[0..paths.len]) |path| refreshPath(path);
+    return result;
 }
 
 fn refreshPath(path: []const u8) void {
@@ -120,6 +185,20 @@ fn refreshPath(path: []const u8) void {
     touchNoFollow(path) catch {};
     if (c.S.ISLNK(info.mode)) return;
     setStickyBitNoFollow(path, info.mode) catch {};
+}
+
+fn signalAgentRepair(fd: c.fd_t) void {
+    if (fd < 0) return;
+    var byte = [_]u8{1};
+    _ = c.write(fd, &byte, byte.len);
+}
+
+fn pathMissing(path: []const u8) bool {
+    _ = statNoFollow(path) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return false,
+    };
+    return false;
 }
 
 fn touchNoFollow(path: []const u8) !void {
@@ -184,7 +263,7 @@ test "refresh pass marks session runtime paths sticky without following symlinks
 
     var path_set = try PathSet.init(allocator, allocation.paths);
     defer path_set.deinit(allocator);
-    refreshPathSet(&path_set);
+    _ = refreshPathSet(&path_set);
 
     const sessions_dir = try session_registry.sessionsDirInRoot(allocator, root);
     defer allocator.free(sessions_dir);

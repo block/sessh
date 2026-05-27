@@ -3,6 +3,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import signal
 import socket
 import stat
@@ -2279,6 +2280,7 @@ def run_session_agent_crash_client_error_test(base_env):
 def run_session_agent_registry_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-agent-registry-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
+        env["SESSH_TEST_RUNTIME_REFRESH_MS"] = "50"
         shell = Path(tmp) / "agent-shell"
         shell.write_text(
             "#!/bin/sh\n"
@@ -2308,6 +2310,7 @@ def run_session_agent_registry_test(base_env):
         )
         conn = None
         attach = None
+        rescued_attach = None
         try:
             wait_file(socket_file)
             wait_file(meta_file)
@@ -2336,6 +2339,39 @@ def run_session_agent_registry_test(base_env):
             if detached_file.exists():
                 raise AssertionError("detached marker exists while attached")
             recv_draw_until(conn, b"AGENT_READY")
+
+            shutil.rmtree(runtime_root(env))
+            if socket_file.exists() or socket_link.exists() or socket_link.is_symlink():
+                raise AssertionError("runtime session files survived test deletion")
+
+            send_frame(conn, INPUT, pack_bytes(b"old-client\n"))
+            recv_draw_until(conn, b"AGENT:old-client")
+
+            wait_file(socket_file, timeout=10.0)
+            wait_file(meta_file, timeout=10.0)
+            wait_file(compat_file, timeout=10.0)
+            wait_sticky(session_path, timeout=10.0)
+            wait_sticky(socket_file, timeout=10.0)
+            wait_sticky(meta_file, timeout=10.0)
+            if not socket_link.is_symlink():
+                raise AssertionError("session agent did not recreate socket link")
+            if detached_file.exists():
+                raise AssertionError("detached marker was recreated while an attachment was active")
+
+            rescued_attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            rescued_attach.settimeout(5.0)
+            rescued_attach.connect(str(socket_file))
+            send_hello(rescued_attach)
+            send_resize(rescued_attach, rows=4, cols=40)
+            send_frame(rescued_attach, SESSION_ATTACH, pack_session_attach())
+            message_type, payload = recv_frame(rescued_attach)
+            if message_type != SESSION_ATTACHED:
+                raise AssertionError(f"expected SESSION_ATTACHED after runtime resurrection, got {message_type}")
+            assert_session_attached(payload)
+            send_frame(rescued_attach, INPUT, pack_bytes(b"new-client\n"))
+            recv_draw_until(rescued_attach, b"AGENT:new-client")
+            rescued_attach.close()
+            rescued_attach = None
 
             conn.close()
             conn = None
@@ -2367,6 +2403,8 @@ def run_session_agent_registry_test(base_env):
                 conn.close()
             if attach is not None:
                 attach.close()
+            if rescued_attach is not None:
+                rescued_attach.close()
             if proc.poll() is None:
                 proc.terminate()
                 try:

@@ -151,8 +151,21 @@ fn stateSessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 
     return std.fmt.allocPrint(allocator, "{s}/guid", .{root});
 }
 
-fn sessionSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+pub fn sessionSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/s", .{root});
+}
+
+pub fn ensureRuntimeLayout(allocator: std.mem.Allocator, paths: SessionPaths) !void {
+    const sessions_dir = std.fs.path.dirname(paths.dir) orelse return error.InvalidSessionDir;
+    const runtime_root = std.fs.path.dirname(sessions_dir) orelse return error.InvalidSessionDir;
+    try ensureRegistryRoot(allocator, runtime_root);
+    try mkdirIgnoreExists(allocator, sessions_dir);
+
+    const socket_dir = std.fs.path.dirname(paths.socket) orelse return error.InvalidSocketPath;
+    try mkdirIgnoreExists(allocator, socket_dir);
+    try mkdirIgnoreExists(allocator, paths.dir);
+
+    try ensureAgentSocketLinkForSocketPath(allocator, paths.agent_sock_link, paths.socket);
 }
 
 pub fn pathsForSessionId(allocator: std.mem.Allocator, id: []const u8) !SessionPaths {
@@ -985,6 +998,25 @@ fn installAgentSocketLink(allocator: std.mem.Allocator, link_path: []const u8, s
         .SUCCESS => return,
         else => return error.RenameFailed,
     }
+}
+
+fn ensureAgentSocketLinkForSocketPath(allocator: std.mem.Allocator, link_path: []const u8, socket_path: []const u8) !void {
+    const socket_name = std.fs.path.basename(socket_path);
+    const expected_target = try std.fmt.allocPrint(allocator, "../../s/{s}", .{socket_name});
+    defer allocator.free(expected_target);
+
+    const existing_target = readLinkAlloc(allocator, link_path, 4096) catch |err| switch (err) {
+        error.FileNotFound => {
+            try installAgentSocketLink(allocator, link_path, socket_name);
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(existing_target);
+
+    if (std.mem.eql(u8, existing_target, expected_target)) return;
+    try unlinkIfExists(link_path);
+    try installAgentSocketLink(allocator, link_path, socket_name);
 }
 
 fn socketPathFromAgentSocketLink(allocator: std.mem.Allocator, dir: []const u8, link_path: []const u8) ![]u8 {

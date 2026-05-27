@@ -120,6 +120,7 @@ const SessionAgent = struct {
 const PollKind = union(enum) {
     listen,
     shutdown_signal,
+    runtime_repair,
     session: usize,
     attachment: usize,
 };
@@ -931,9 +932,15 @@ pub fn runSessionAgent(session_dir: []const u8) !void {
     };
     defer if (session_agent.session_paths) |*session_paths| session_paths.deinit(app_allocator.allocator());
 
-    const listen_fd = try socket_transport.listenSocket(session_agent.session_paths.?.socket);
+    var listen_fd = try socket_transport.listenSocket(session_agent.session_paths.?.socket);
     defer _ = c.close(listen_fd);
     defer session_registry.removeEndedHints(session_agent.session_paths.?) catch {};
+
+    const runtime_repair_pipe = try posix.pipe();
+    defer {
+        posix.close(runtime_repair_pipe[0]);
+        posix.close(runtime_repair_pipe[1]);
+    }
 
     try writeAgentCompatBinary(session_agent.session_paths.?);
     try session_registry.writeMeta(session_agent.session_paths.?, c.getpid(), config.version);
@@ -941,7 +948,7 @@ pub fn runSessionAgent(session_dir: []const u8) !void {
     defer closeSessionAgentLog(&session_agent);
     logSessionAgent(&session_agent, "event=session_agent_start id={s} socket={s}", .{ fixed_session_id, session_agent.session_paths.?.socket });
     var refresher = runtime_refresher.RuntimeRefresher{};
-    refresher.start(app_allocator.allocator(), session_agent.session_paths.?) catch |err| {
+    refresher.startWithRepairSignal(app_allocator.allocator(), session_agent.session_paths.?, runtimeRefreshIntervalMs(), runtime_repair_pipe[1]) catch |err| {
         logSessionAgent(&session_agent, "event=runtime_refresher_start_failed error={t}", .{err});
     };
     defer refresher.stopAndJoin(app_allocator.allocator());
@@ -949,10 +956,19 @@ pub fn runSessionAgent(session_dir: []const u8) !void {
     defer closeSessionAgent(&session_agent);
 
     while (session_agent.running) {
-        try sessionAgentPollOnce(&session_agent, listen_fd, shutdown_pipe[0]);
+        try sessionAgentPollOnce(&session_agent, &listen_fd, shutdown_pipe[0], runtime_repair_pipe[0]);
         reapSessions(&session_agent);
         stopSessionAgentIfComplete(&session_agent);
     }
+}
+
+fn runtimeRefreshIntervalMs() u64 {
+    const value_z = c.getenv("SESSH_TEST_RUNTIME_REFRESH_MS") orelse return runtime_refresher.default_refresh_interval_ms;
+    const value = std.mem.span(value_z);
+    if (value.len == 0) return runtime_refresher.default_refresh_interval_ms;
+    const parsed = std.fmt.parseInt(u64, value, 10) catch return runtime_refresher.default_refresh_interval_ms;
+    if (parsed == 0) return runtime_refresher.default_refresh_interval_ms;
+    return parsed;
 }
 
 fn installShutdownSignalHandler(write_fd: c.fd_t) void {
@@ -1057,17 +1073,21 @@ fn chmodPath(path: []const u8, mode: c.mode_t) !void {
     }
 }
 
-fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: c.fd_t, shutdown_signal_fd: c.fd_t) !void {
-    var pollfds: [2 + max_sessions + max_attachments]posix.pollfd = undefined;
-    var kinds: [2 + max_sessions + max_attachments]PollKind = undefined;
+fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdown_signal_fd: c.fd_t, runtime_repair_fd: c.fd_t) !void {
+    var pollfds: [3 + max_sessions + max_attachments]posix.pollfd = undefined;
+    var kinds: [3 + max_sessions + max_attachments]PollKind = undefined;
     var count: usize = 0;
 
     pollfds[count] = .{ .fd = shutdown_signal_fd, .events = posix.POLL.IN, .revents = 0 };
     kinds[count] = .shutdown_signal;
     count += 1;
 
+    pollfds[count] = .{ .fd = runtime_repair_fd, .events = posix.POLL.IN, .revents = 0 };
+    kinds[count] = .runtime_repair;
+    count += 1;
+
     if (!session_agent.shutting_down) {
-        pollfds[count] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
+        pollfds[count] = .{ .fd = listen_fd.*, .events = posix.POLL.IN, .revents = 0 };
         kinds[count] = .listen;
         count += 1;
     }
@@ -1093,11 +1113,68 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: c.fd_t, shutdow
     for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
         if (pollfd.revents == 0) continue;
         switch (kind) {
-            .listen => acceptSessionAgentClient(session_agent, listen_fd),
+            .listen => acceptSessionAgentClient(session_agent, listen_fd.*),
             .shutdown_signal => handleShutdownSignalEvent(session_agent, shutdown_signal_fd),
+            .runtime_repair => handleRuntimeRepairEvent(session_agent, listen_fd, runtime_repair_fd),
             .session => |session_index| drainSessionOutput(session_agent, session_index),
             .attachment => |attachment_index| handleAttachmentEvents(session_agent, attachment_index, pollfd.revents),
         }
+    }
+}
+
+fn handleRuntimeRepairEvent(session_agent: *SessionAgent, listen_fd: *c.fd_t, runtime_repair_fd: c.fd_t) void {
+    drainSignalPipe(runtime_repair_fd);
+    repairSessionAgentRuntime(session_agent, listen_fd) catch |err| {
+        logSessionAgent(session_agent, "event=runtime_repair_failed error={t}", .{err});
+    };
+}
+
+fn drainSignalPipe(fd: c.fd_t) void {
+    var buf: [64]u8 = undefined;
+    _ = c.read(fd, &buf, buf.len);
+}
+
+fn repairSessionAgentRuntime(session_agent: *SessionAgent, listen_fd: *c.fd_t) !void {
+    const paths = session_agent.session_paths orelse return;
+    const socket_was_missing = !try socketPathIsSocket(paths.socket);
+
+    try session_registry.ensureRuntimeLayout(app_allocator.allocator(), paths);
+    try writeAgentCompatBinary(paths);
+    try session_registry.writeMeta(paths, c.getpid(), config.version);
+    refreshRuntimeAttachmentHints(session_agent);
+
+    if (socket_was_missing or !try socketPathIsSocket(paths.socket)) {
+        const new_listen_fd = try socket_transport.listenSocket(paths.socket);
+        const old_listen_fd = listen_fd.*;
+        listen_fd.* = new_listen_fd;
+        _ = c.close(old_listen_fd);
+        logSessionAgent(session_agent, "event=runtime_socket_rebound socket={s}", .{paths.socket});
+    }
+}
+
+fn refreshRuntimeAttachmentHints(session_agent: *SessionAgent) void {
+    var any_live = false;
+    var any_attached = false;
+    for (&session_agent.sessions, 0..) |*session, i| {
+        if (!session.alive) continue;
+        any_live = true;
+        if (attachedCount(session_agent, i) > 0) {
+            any_attached = true;
+            break;
+        }
+    }
+    if (!any_live) return;
+    updateAttachmentHints(session_agent, any_attached);
+}
+
+fn socketPathIsSocket(path: []const u8) !bool {
+    const path_z = try app_allocator.allocator().dupeZ(u8, path);
+    defer app_allocator.allocator().free(path_z);
+    var stat: c.Stat = undefined;
+    switch (posix.errno(c.fstatat(c.AT.FDCWD, path_z.ptr, &stat, c.AT.SYMLINK_NOFOLLOW))) {
+        .SUCCESS => return c.S.ISSOCK(stat.mode),
+        .NOENT, .NOTDIR => return false,
+        else => return error.SocketStatFailed,
     }
 }
 
