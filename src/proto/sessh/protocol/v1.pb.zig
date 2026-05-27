@@ -1203,10 +1203,12 @@ pub const SessionLiveStateQuery = struct {
 pub const SessionLiveState = struct {
     detached_at_unix_ms: ?u64 = null,
     attached_clients: std.ArrayListUnmanaged(AttachedClient) = .empty,
+    last_input_at_unix_ms: ?u64 = null,
 
     pub const _desc_table = .{
         .detached_at_unix_ms = fd(1, .{ .scalar = .uint64 }),
         .attached_clients = fd(2, .{ .repeated = .submessage }),
+        .last_input_at_unix_ms = fd(3, .{ .scalar = .uint64 }),
     };
 
     /// Encodes the message to the writer

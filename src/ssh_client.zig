@@ -588,14 +588,26 @@ fn translateMuxListClients(translated: *TranslatedMuxArgs, args: []const []const
         if (filtered_positionals.len > 1) return error.TooManyMuxArguments;
         try appendMany(translated, ssh_options.items);
         try translated.append(host);
+        try translated.append("--list-clients");
+        if (jsonl) try translated.append("--jsonl");
+        if (filtered_positionals.len == 1) try translated.append(filtered_positionals[0]);
+        try appendMany(translated, sessh_options.items);
     } else {
         if (ssh_options.items.len > 0) return error.MissingHost;
-        try translated.append(".");
+        if (filtered_positionals.len == 0) {
+            try translated.append(".");
+            try translated.append("--list-clients");
+            if (jsonl) try translated.append("--jsonl");
+            try appendMany(translated, sessh_options.items);
+        } else if (filtered_positionals.len == 1) {
+            try translated.append("--list-clients");
+            try translated.append(filtered_positionals[0]);
+            if (jsonl) try translated.append("--jsonl");
+            try appendMany(translated, sessh_options.items);
+        } else {
+            return error.TooManyMuxArguments;
+        }
     }
-    try translated.append("--list-clients");
-    if (jsonl) try translated.append("--jsonl");
-    if (filtered_positionals.len == 1) try translated.append(filtered_positionals[0]);
-    try appendMany(translated, sessh_options.items);
 }
 
 fn translateMuxClientControl(
@@ -864,7 +876,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try printSshArgError(err);
         return process_exit.request(64);
     };
-    if ((parsed_ssh_args.action == .attach or parsed_ssh_args.action == .kill) and
+    if ((parsed_ssh_args.action == .attach or
+        parsed_ssh_args.action == .kill or
+        parsed_ssh_args.action == .list_clients) and
         (parsed_ssh_args.host.len == 0 or std.mem.eql(u8, parsed_ssh_args.host, ".")))
     {
         return runLocalRouteCommand(allocator, args);
@@ -2548,6 +2562,18 @@ fn parseRouteRefArgs(
             action = .kill;
             ref = args[i];
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--list-clients")) {
+            if (action != null) return error.ConflictingSesshAction;
+            action = .list_clients;
+            i += 1;
+            if (i < args.len and !std.mem.startsWith(u8, args[i], "--")) {
+                ref = args[i];
+                i += 1;
+            }
+        } else if (std.mem.eql(u8, arg, "--jsonl")) {
+            if (action == null or action.? != .list_clients) return null;
+            parsed.list_jsonl = true;
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--runtime-dir")) {
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingRuntimeDir;
@@ -2584,6 +2610,9 @@ fn parseRouteRefArgs(
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingTtyTranscriptPath;
             parsed.capture_tty_transcript = args[i];
             i += 1;
+        } else if (action != null and action.? == .list_clients and ref == null and !std.mem.startsWith(u8, arg, "--")) {
+            ref = arg;
+            i += 1;
         } else {
             return null;
         }
@@ -2601,7 +2630,8 @@ fn parseRouteRefArgs(
             parsed.attach_session_dir = route.session_dir;
         },
         .kill => parsed.kill_id = route.guid,
-        .new, .list, .kill_all, .list_clients, .detach_client, .repaint_client, .debug_client => unreachable,
+        .list_clients => parsed.client_session_ref = route.guid,
+        .new, .list, .kill_all, .detach_client, .repaint_client, .debug_client => unreachable,
     }
     return parsed;
 }
@@ -4144,7 +4174,15 @@ test "translateMuxArgs maps client management commands" {
         "s1",
     });
     defer list_clients.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--list-clients", "s1", "--jsonl" }, list_clients.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "--list-clients", "s1", "--jsonl" }, list_clients.args.items);
+
+    var list_current_clients = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "list-clients",
+        "--jsonl",
+    });
+    defer list_current_clients.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "--list-clients", "--jsonl" }, list_current_clients.args.items);
 
     var detach_last = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",

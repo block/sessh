@@ -227,6 +227,8 @@ message SessionLiveState {
   // Present only when the session is detached.
   optional uint64 detached_at_unix_ms = 1;
   repeated AttachedClient attached_clients = 2;
+  // Present after any attached client has sent non-control-sequence input.
+  optional uint64 last_input_at_unix_ms = 3;
 }
 
 message AttachedClient {

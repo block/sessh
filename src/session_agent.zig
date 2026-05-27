@@ -48,6 +48,7 @@ const Session = struct {
     end_reason: u8 = 0,
     attached: bool = false,
     detached_at_unix_ms: u64 = 0,
+    last_input_at_unix_ms: u64 = 0,
     alive: bool = false,
     pending_plain_output: std.ArrayList(u8) = .empty,
     pending_plain_starts_at_boundary: bool = false,
@@ -1534,6 +1535,7 @@ fn sendSessionLiveState(session_agent: *SessionAgent, fd: c.fd_t) !void {
     defer response.attached_clients.deinit(app_allocator.allocator());
 
     if (session.detached_at_unix_ms != 0) response.detached_at_unix_ms = session.detached_at_unix_ms;
+    if (session.last_input_at_unix_ms != 0) response.last_input_at_unix_ms = session.last_input_at_unix_ms;
     for (&session_agent.attachments) |*attachment| {
         if (!attachment.active or attachment.close_after_flush or attachment.session_index != session_index) continue;
         try response.attached_clients.append(app_allocator.allocator(), .{
@@ -1568,6 +1570,7 @@ fn handleSessionClientControlRequest(session_agent: *SessionAgent, fd: c.fd_t, p
             error.MultipleAttachedClients => try sendError(session_agent, fd, "MULTIPLE_ATTACHED_CLIENTS", "multiple clients are attached", "Pass --all, --last-input, or a client GUID"),
             error.NoLastInputClient => try sendError(session_agent, fd, "NO_LAST_INPUT_CLIENT", "no attached client has sent user input", ""),
             error.ClientNotFound => try sendError(session_agent, fd, "CLIENT_NOT_FOUND", "client not found", ""),
+            error.AmbiguousClientControlTarget => try sendError(session_agent, fd, "AMBIGUOUS_CLIENT_TARGET", "client target is ambiguous", ""),
             error.InvalidClientControlTarget => try sendError(session_agent, fd, "INVALID_TARGET", "invalid client target", ""),
             else => return err,
         }
@@ -1705,14 +1708,73 @@ fn resolveClientGuidTarget(
     client_guid: []const u8,
     selected: *[max_attachments]usize,
 ) !usize {
-    if (!session_registry.isValidClientGuid(client_guid)) return error.InvalidClientControlTarget;
+    if (!session_registry.isValidClientGuid(client_guid) and
+        !session_registry.isValidClientGuidPrefix(client_guid)) return error.InvalidClientControlTarget;
+    const prefix = if (session_registry.isValidClientGuidPrefix(client_guid))
+        client_guid
+    else
+        null;
+    var found: ?usize = null;
     for (&session_agent.attachments, 0..) |*attachment, i| {
         if (!controlTargetActive(attachment, session_index)) continue;
-        if (!std.mem.eql(u8, attachment.clientGuidSlice(), client_guid)) continue;
-        selected[0] = i;
-        return 1;
+        const matches = if (prefix) |value|
+            clientGuidMatchesPrefix(attachment.clientGuidSlice(), value)
+        else
+            std.mem.eql(u8, attachment.clientGuidSlice(), client_guid);
+        if (!matches) continue;
+        if (found != null) return error.AmbiguousClientControlTarget;
+        found = i;
     }
-    return error.ClientNotFound;
+    selected[0] = found orelse return error.ClientNotFound;
+    return 1;
+}
+
+fn clientGuidMatchesPrefix(client_guid: []const u8, prefix: []const u8) bool {
+    var prefix_buf: [session_registry.compact_guid_len]u8 = undefined;
+    const prefix_len = compactClientGuidPrefix(prefix, &prefix_buf) orelse return false;
+    var compact_buf: [session_registry.compact_guid_len]u8 = undefined;
+    var dst: usize = 0;
+    for (client_guid[session_registry.client_guid_prefix.len..]) |byte| {
+        if (byte == '-') continue;
+        compact_buf[dst] = std.ascii.toLower(byte);
+        dst += 1;
+    }
+    return std.mem.startsWith(u8, compact_buf[0..dst], prefix_buf[0..prefix_len]);
+}
+
+fn compactClientGuidPrefix(prefix: []const u8, out: *[session_registry.compact_guid_len]u8) ?usize {
+    if (!std.mem.startsWith(u8, prefix, session_registry.client_guid_prefix)) return null;
+    const body = prefix[session_registry.client_guid_prefix.len..];
+    if (body.len == 0) return null;
+    if (body.len <= session_registry.compact_guid_len) {
+        var len: usize = 0;
+        for (body) |byte| {
+            if (!std.ascii.isHex(byte)) {
+                len = 0;
+                break;
+            }
+            out[len] = std.ascii.toLower(byte);
+            len += 1;
+        }
+        if (len == body.len) return len;
+    }
+
+    if (body.len >= session_registry.guid_body_len) return null;
+    var len: usize = 0;
+    for (body, 0..) |byte, i| {
+        switch (i) {
+            8, 13, 18, 23 => {
+                if (byte != '-') return null;
+            },
+            else => {
+                if (!std.ascii.isHex(byte)) return null;
+                out[len] = std.ascii.toLower(byte);
+                len += 1;
+            },
+        }
+    }
+    if (len == 0) return null;
+    return len;
 }
 
 fn requestClientDetachFromControl(session_agent: *SessionAgent, attachment_index: usize) void {
@@ -2350,9 +2412,7 @@ fn readAttachRequest(payload: []const u8) !AttachRequest {
     var message = try protocol.decodePayload(pb.SessionAttach, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     const resize = message.resize orelse return error.MissingResize;
-    if (message.session_ref.len > 0 and
-        !session_registry.isValidSessionId(message.session_ref) and
-        !session_registry.isValidAlias(message.session_ref)) return error.InvalidSessionRef;
+    if (message.session_ref.len > 0 and !session_registry.isValidSessionRef(message.session_ref)) return error.InvalidSessionRef;
     if (!session_registry.isValidClientGuid(message.client_guid)) return error.InvalidClientGuid;
     return .{
         .resize = try resizePayloadFromMessage(resize),
@@ -2774,7 +2834,11 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, paylo
         detachAttachment(session_agent, attachment_index);
         return;
     };
-    if (inputBytesContainUserInput(attachment, input.data)) attachment.last_input_at_unix_ms = nowUnixMs();
+    if (inputBytesContainUserInput(attachment, input.data)) {
+        const now_ms = nowUnixMs();
+        attachment.last_input_at_unix_ms = now_ms;
+        session.last_input_at_unix_ms = now_ms;
+    }
     if (translated.items.len == 0) return;
 
     queueTtyTranscriptChunk(attachment, .TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {

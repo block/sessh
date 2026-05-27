@@ -266,6 +266,7 @@ fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
     defer stdout.deinit(allocator);
     const writer = stdout.writer(allocator);
     if (options.format == .table) try list_format.writeHeader(writer);
+    const now_ms = nowUnixMs();
 
     const sessions_dir = try session_registry.sessionsDir(allocator);
     defer allocator.free(sessions_dir);
@@ -297,16 +298,41 @@ fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
             continue;
         };
         defer allocator.free(guid);
-        const display_id = (try session_registry.primaryAliasForGuid(allocator, guid)) orelse try allocator.dupe(u8, guid);
+        const display_id = (try session_registry.primaryAliasForGuid(allocator, guid)) orelse try session_registry.shortSessionGuid(allocator, guid);
         defer allocator.free(display_id);
+
+        const live = querySessionListLiveStatus(allocator, paths) catch null;
         switch (options.format) {
-            .table => try list_format.writeRow(writer, display_id, options.host_display, meta.version, guid),
-            .jsonl => try list_format.writeJsonlRow(writer, display_id, options.host_display, meta.version, guid),
+            .table => {
+                var attached_buf: [32]u8 = undefined;
+                var input_buf: [32]u8 = undefined;
+                const attached = formatAttachedCount(&attached_buf, if (live) |status| status.attached_count else null);
+                const input = try formatOptionalRelativeUnixMs(&input_buf, now_ms, if (live) |status| status.last_input_at_unix_ms else null);
+                try list_format.writeRow(writer, display_id, attached, input, options.host_display, meta.version);
+            },
+            .jsonl => try list_format.writeJsonlRow(
+                writer,
+                display_id,
+                options.host_display,
+                meta.version,
+                guid,
+                if (live) |status| status.attached_count else null,
+                if (live) |status| status.last_input_at_unix_ms else null,
+            ),
         }
     }
 
     try io.writeAll(1, stdout.items);
     return 0;
+}
+
+fn querySessionListLiveStatus(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !session_registry.RouteLiveStatus {
+    var state = try querySessionLiveState(allocator, paths);
+    defer state.deinit(allocator);
+    return .{
+        .attached_count = @intCast(state.attached_clients.items.len),
+        .last_input_at_unix_ms = state.last_input_at_unix_ms,
+    };
 }
 
 fn listClients(allocator: std.mem.Allocator, options: ListClientsOptions) !u8 {
@@ -393,22 +419,21 @@ fn attachedClientSortLessThan(_: void, a: pb.AttachedClient, b: pb.AttachedClien
 }
 
 fn writeClientTable(writer: anytype, clients: []const pb.AttachedClient) !void {
-    try writer.writeAll("CLIENT                                ATTACHED  INPUT     SIZE\n");
+    try writer.writeAll("CLIENT      ATTACHED  INPUT     SIZE\n");
     const now_ms = nowUnixMs();
     for (clients) |client_info| {
+        const client_id = try session_registry.shortClientGuid(app_allocator.allocator(), client_info.client_guid);
+        defer app_allocator.allocator().free(client_id);
         var attached_buf: [32]u8 = undefined;
         var input_buf: [32]u8 = undefined;
         var size_buf: [24]u8 = undefined;
         const attached = try formatRelativeUnixMs(&attached_buf, now_ms, client_info.attached_at_unix_ms);
-        const input = if (client_info.last_input_at_unix_ms) |ts|
-            try formatRelativeUnixMs(&input_buf, now_ms, ts)
-        else
-            "never";
+        const input = try formatOptionalRelativeUnixMs(&input_buf, now_ms, client_info.last_input_at_unix_ms);
         const size = if (client_info.terminal_size) |size_value|
             try std.fmt.bufPrint(&size_buf, "{}x{}", .{ size_value.terminal_rows, size_value.terminal_cols })
         else
             "unknown";
-        try writePadded(writer, client_info.client_guid, 38);
+        try writePadded(writer, client_id, session_registry.generated_alias_len);
         try writer.writeAll("  ");
         try writePadded(writer, attached, 8);
         try writer.writeAll("  ");
@@ -441,6 +466,16 @@ fn writeClientJsonlRows(writer: anytype, clients: []const pb.AttachedClient) !vo
         }
         try writer.writeAll("}\n");
     }
+}
+
+fn formatAttachedCount(buf: []u8, attached_count: ?u32) []const u8 {
+    if (attached_count) |count| return std.fmt.bufPrint(buf, "{}", .{count}) catch "???";
+    return "???";
+}
+
+fn formatOptionalRelativeUnixMs(buf: []u8, now_ms: u64, ts_ms: ?u64) ![]const u8 {
+    if (ts_ms) |ts| return formatRelativeUnixMs(buf, now_ms, ts);
+    return "never";
 }
 
 fn writePadded(writer: anytype, value: []const u8, width: usize) !void {
@@ -714,7 +749,7 @@ fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.f
 }
 
 fn pathsForLocalSessionRef(allocator: std.mem.Allocator, ref: []const u8) !session_registry.SessionPaths {
-    if (!session_registry.isValidSessionId(ref) and !session_registry.isValidAlias(ref)) return error.InvalidSessionId;
+    if (!session_registry.isValidSessionRef(ref)) return error.InvalidSessionId;
     const guid = try session_registry.resolveRefToGuid(allocator, ref);
     defer allocator.free(guid);
 

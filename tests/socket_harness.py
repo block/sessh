@@ -2806,6 +2806,13 @@ def run_client_control_commands_test(base_env):
             if clients[client_two].HasField("last_input_at_unix_ms"):
                 raise AssertionError("other client unexpectedly gained last input timestamp")
 
+            listed_sessions = run([".", "--list"], env, check=True, timeout=5.0)
+            session_rows = sessions(listed_sessions.stdout)
+            if session_rows.get("s1", {}).get("attached") != "2":
+                raise AssertionError(listed_sessions.stdout)
+            if session_rows["s1"].get("input") == "never":
+                raise AssertionError(listed_sessions.stdout)
+
             listed = run([".", "--list-clients", "--jsonl", "s1"], env, check=True, timeout=5.0)
             rows = [json.loads(line) for line in listed.stdout.splitlines()]
             if [row["client_guid"] for row in rows] != [client_one, client_two]:
@@ -2814,6 +2821,10 @@ def run_client_control_commands_test(base_env):
                 raise AssertionError(rows)
             if rows[0]["terminal_size"] != {"terminal_rows": 8, "terminal_cols": 60}:
                 raise AssertionError(rows)
+
+            listed_clients = run([".", "--list-clients", "s1"], env, check=True, timeout=5.0)
+            if client_one in listed_clients.stdout or "c-11111111" not in listed_clients.stdout:
+                raise AssertionError(listed_clients.stdout)
 
             ambiguous = run([".", "--detach-client", "s1"], env, timeout=5.0)
             if ambiguous.returncode == 0 or "multiple clients are attached" not in ambiguous.stderr:
@@ -2835,6 +2846,12 @@ def run_client_control_commands_test(base_env):
                 raise AssertionError(repaint_request)
             assert_no_frame(conn2)
 
+            repainted = run([".", "--repaint-client", "--client", "c-11111111", "s1"], env, check=True, timeout=5.0)
+            if f"REPAINTED {client_one}" not in repainted.stdout:
+                raise AssertionError(repainted)
+            recv_until_message(conn1, CLIENT_REPAINT_REQUEST)
+            assert_no_frame(conn2)
+
             detached = run([".", "--detach-client", "--last-input", "s1"], env, check=True, timeout=5.0)
             if f"DETACHED {client_one}" not in detached.stdout:
                 raise AssertionError(detached)
@@ -2849,6 +2866,12 @@ def run_client_control_commands_test(base_env):
                 if time.time() > deadline:
                     raise AssertionError(state)
                 time.sleep(0.02)
+            listed_sessions = run([".", "--list"], env, check=True, timeout=5.0)
+            session_rows = sessions(listed_sessions.stdout)
+            if session_rows.get("s1", {}).get("attached") != "1":
+                raise AssertionError(listed_sessions.stdout)
+            if session_rows["s1"].get("input") == "never":
+                raise AssertionError(listed_sessions.stdout)
 
             missing_last_input = run([".", "--detach-client", "--last-input", "s1"], env, timeout=5.0)
             if missing_last_input.returncode == 0 or "no attached client has sent user input" not in missing_last_input.stderr:
@@ -3077,11 +3100,14 @@ def sessions(stdout):
     for line in stdout.splitlines()[1:]:
         if not line.strip():
             continue
-        parts = line.split()
-        if len(parts) < 4:
+        if len(line) < 58:
             raise AssertionError(f"invalid list row: {line!r}\n{stdout}")
-        session_id, host, version, guid = parts[:4]
-        result[session_id] = {"host": host, "version": version, "guid": guid}
+        session_id = line[0:10].strip()
+        attached = line[12:20].strip()
+        last_input = line[22:30].strip()
+        host = line[32:56].strip()
+        version = line[58:].strip()
+        result[session_id] = {"attached": attached, "input": last_input, "host": host, "version": version}
     return result
 
 
@@ -3091,13 +3117,19 @@ def jsonl_sessions(stdout):
         if not line.strip():
             continue
         row = json.loads(line)
-        result[row["id"]] = {"host": row["host"], "version": row["version"], "guid": row["guid"]}
+        result[row["id"]] = {
+            "host": row["host"],
+            "version": row["version"],
+            "guid": row["guid"],
+            "attached_count": row.get("attached_count"),
+            "last_input_at_unix_ms": row.get("last_input_at_unix_ms"),
+        }
     return result
 
 
 def assert_list_header(stdout):
     header = stdout.splitlines()[0] if stdout.splitlines() else ""
-    for column in ("ID", "HOST", "VERSION", "GUID"):
+    for column in ("ID", "ATTACHED", "INPUT", "HOST", "VERSION"):
         if column not in header:
             raise AssertionError(stdout)
 
@@ -3358,6 +3390,8 @@ def main():
             remote_guid = guid_for_ref("s7")
             write_cached_remote_route(env, "remote8", "work.blox", remote_guid)
             listed = run([".", "--list"], env, check=True, timeout=5.0)
+            if "cached remote session status may be out of date" not in listed.stderr:
+                raise AssertionError(listed)
             current_sessions = sessions(listed.stdout)
             remote_route = current_sessions.get("remote8")
             if remote_route is None:
@@ -3365,18 +3399,25 @@ def main():
             if (
                 remote_route.get("host") != "work.blox"
                 or remote_route.get("version") != "cached-test"
-                or remote_route.get("guid") != remote_guid
+                or remote_route.get("attached") != "???"
+                or remote_route.get("input") != "???"
             ):
                 raise AssertionError(listed.stdout)
             listed_jsonl = run([".", "--list", "--jsonl"], env, check=True, timeout=5.0)
+            if "cached remote session status may be out of date" not in listed_jsonl.stderr:
+                raise AssertionError(listed_jsonl)
             jsonl_route = jsonl_sessions(listed_jsonl.stdout).get("remote8")
             if jsonl_route != {
                 "host": "work.blox",
                 "version": "cached-test",
                 "guid": remote_guid,
+                "attached_count": None,
+                "last_input_at_unix_ms": None,
             }:
                 raise AssertionError(listed_jsonl.stdout)
             listed = run([".", "--list", "--local-only"], env, check=True, timeout=5.0)
+            if listed.stderr:
+                raise AssertionError(listed)
             if "remote8" in sessions(listed.stdout):
                 raise AssertionError(listed.stdout)
 

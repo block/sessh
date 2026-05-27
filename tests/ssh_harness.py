@@ -814,21 +814,28 @@ def list_rows(list_stdout):
     for line in list_stdout.splitlines()[1:]:
         if not line.strip():
             continue
-        parts = line.split()
-        if len(parts) < 4:
+        if len(line) < 58:
             raise AssertionError(f"invalid list row: {line!r}\n{list_stdout}")
-        rows.append(parts[:4])
+        rows.append(
+            [
+                line[0:10].strip(),
+                line[12:20].strip(),
+                line[22:30].strip(),
+                line[32:56].strip(),
+                line[58:].strip(),
+            ]
+        )
     return rows
 
 
 def has_list_header(list_stdout):
     header = list_stdout.splitlines()[0] if list_stdout.splitlines() else ""
-    return all(column in header for column in ("ID", "HOST", "VERSION", "GUID"))
+    return all(column in header for column in ("ID", "ATTACHED", "INPUT", "HOST", "VERSION"))
 
 
 def list_has_session(list_stdout, session_id):
     for row in list_rows(list_stdout):
-        if row[0] == session_id or row[3] == session_id:
+        if row[0] == session_id:
             return True
     return False
 
@@ -1506,6 +1513,29 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_no_host_list_clients_uses_remote_route(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "42"
+    write_ssh_route(env, "remote-clients", guid_for_alias("remote-clients"), "test-host")
+
+    result = run_sesshmux(["list-clients", "remote-clients"], env, timeout=30.0)
+
+    if result.returncode == 0:
+        raise AssertionError(result)
+    log_text = optional_text(fake_log)
+    if "invoked=1" not in log_text:
+        raise AssertionError(
+            "list-clients did not delegate to ssh for a remote route\n"
+            f"fake ssh log:\n{log_text}\n"
+            f"sesshmux result:\n{process_diagnostics(result)}"
+        )
+
+
 def test_ssh_remote_default_alias_is_remote_generated(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1528,7 +1558,7 @@ def test_ssh_remote_default_alias_is_remote_generated(tmp):
         raise AssertionError(listed)
     rows = list_rows(listed.stdout)
     aliases = [row[0] for row in rows if len(row) >= 1]
-    remote_aliases = [alias for alias in aliases if re.fullmatch(r"s-[0-9a-f]{4,32}", alias)]
+    remote_aliases = [alias for alias in aliases if re.fullmatch(r"s-[0-9a-f]{8}", alias)]
     if len(remote_aliases) != 1:
         raise AssertionError(listed.stdout)
 
@@ -2419,6 +2449,10 @@ def main(argv=None):
         (
             "ssh no-host attach uses local route",
             test_ssh_no_host_attach_uses_local_route,
+        ),
+        (
+            "ssh no-host list-clients uses remote route",
+            test_ssh_no_host_list_clients_uses_remote_route,
         ),
         (
             "ssh remote default alias is remote generated",

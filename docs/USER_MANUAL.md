@@ -46,15 +46,16 @@ All sessh-specific options must appear before `HOST`.
 
 Use `sesshmux` for session management:
 
-- `sesshmux attach ID`: attach using a local alias, cached remote route, or
-  session GUID.
+- `sesshmux attach ID`: attach using a local alias, cached remote route, session
+  GUID, or unique `s-` GUID prefix.
 - `sesshmux attach --host HOST [ID]`: attach by resolving `ID` on `HOST`, or
   attach to the most recent attachable session on `HOST` if `ID` is omitted.
 - `sesshmux list [--refresh] [--jsonl] [HOST]`: list attachable sessions locally or on
   `HOST`. Without `HOST`, local sessions and cached remote routes are shown.
   Use `sesshmux list .` to show only local sessions. `--refresh` checks cached
-  remote routes that were alive the last time sessh checked them. `--jsonl`
-  emits one JSON object per session.
+  remote routes that were alive the last time sessh checked them. Without
+  `--refresh`, cached remote status such as attached count and input time may be
+  stale. `--jsonl` emits one JSON object per session.
 - `sesshmux kill [HOST] ID`: terminate the specified local or remote session.
 - `sesshmux kill --all [HOST]`: terminate all local sessions or all sessions on
   `HOST`.
@@ -138,7 +139,8 @@ Each attached client uses a `c-`-prefixed GUID.
 
 When creating a new session, you can specify a custom alias with `--alias`. Any
 value is allowed as long as `-` isn't one of the first two characters. If you
-don't specify one, `sessh` will generate one randomly.
+don't specify one, `sessh` generates a 10-character alias such as
+`s-550e8400`.
 
 After you attach to a remote session, sessh caches a local route so later
 `sesshmux attach ALIAS` can reconnect without restating the host. If

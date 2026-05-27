@@ -2406,11 +2406,16 @@ fn runLocalListCommand(
         else => 1,
     };
     if (exit_status != 0) return exit_status;
-    if (include_cached_routes) try appendCachedRemoteRouteRows(allocator, jsonl);
+    if (include_cached_routes) {
+        const appended_cached_routes = try appendCachedRemoteRouteRows(allocator, jsonl);
+        if (appended_cached_routes and !refresh) {
+            try io_helpers.writeAll(2, "sessh: cached remote session status may be out of date; run `sesshmux list --refresh` to update\n");
+        }
+    }
     return 0;
 }
 
-fn appendCachedRemoteRouteRows(allocator: std.mem.Allocator, jsonl: bool) !void {
+fn appendCachedRemoteRouteRows(allocator: std.mem.Allocator, jsonl: bool) !bool {
     var routes: std.ArrayList(session_registry.Route) = .empty;
     defer {
         for (routes.items) |*route| route.deinit(allocator);
@@ -2422,13 +2427,53 @@ fn appendCachedRemoteRouteRows(allocator: std.mem.Allocator, jsonl: bool) !void 
     defer out.deinit(allocator);
     const writer = out.writer(allocator);
     for (routes.items) |route| {
+        var input_buf: [32]u8 = undefined;
+        const input = try formatRouteInput(&input_buf, route.last_input_at_unix_ms);
+        var attached_buf: [32]u8 = undefined;
+        const attached = formatRouteAttachedCount(&attached_buf, route.attached_count);
         if (jsonl) {
-            try list_format.writeJsonlRow(writer, route.primary_alias, route.host, route.agent_version, route.guid);
+            try list_format.writeJsonlRow(
+                writer,
+                route.primary_alias,
+                route.host,
+                route.agent_version,
+                route.guid,
+                route.attached_count,
+                route.last_input_at_unix_ms,
+            );
         } else {
-            try list_format.writeRow(writer, route.primary_alias, route.host, route.agent_version, route.guid);
+            try list_format.writeRow(writer, route.primary_alias, attached, input, route.host, route.agent_version);
         }
     }
     if (out.items.len > 0) try io_helpers.writeAll(1, out.items);
+    return routes.items.len > 0;
+}
+
+fn formatRouteAttachedCount(buf: []u8, attached_count: ?u32) []const u8 {
+    if (attached_count) |count| return std.fmt.bufPrint(buf, "{}", .{count}) catch "???";
+    return "???";
+}
+
+fn formatRouteInput(buf: []u8, last_input_at_unix_ms: ?u64) ![]const u8 {
+    const ts = last_input_at_unix_ms orelse return "???";
+    return formatRelativeUnixMs(buf, nowUnixMs(), ts);
+}
+
+fn formatRelativeUnixMs(buf: []u8, now_ms: u64, ts_ms: u64) ![]const u8 {
+    const delta_ms = now_ms -| ts_ms;
+    const seconds = delta_ms / std.time.ms_per_s;
+    if (seconds < 60) return std.fmt.bufPrint(buf, "{}s ago", .{seconds});
+    const minutes = seconds / 60;
+    if (minutes < 60) return std.fmt.bufPrint(buf, "{}m ago", .{minutes});
+    const hours = minutes / 60;
+    if (hours < 24) return std.fmt.bufPrint(buf, "{}h ago", .{hours});
+    return std.fmt.bufPrint(buf, "{}d ago", .{hours / 24});
+}
+
+fn nowUnixMs() u64 {
+    const ms = std.time.milliTimestamp();
+    if (ms <= 0) return 0;
+    return @intCast(ms);
 }
 
 fn loadCachedRemoteRoutes(allocator: std.mem.Allocator, routes: *std.ArrayList(session_registry.Route), alive_only: bool) !void {
@@ -2472,13 +2517,17 @@ fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !voi
         defer allocator.free(stdout);
         for (routes.items) |*candidate| {
             if (!sameRouteConnection(route, candidate)) continue;
-            const remote_version = try remoteListVersionForGuid(allocator, stdout, candidate.guid);
-            defer if (remote_version) |version| allocator.free(version);
+            const remote_status = try remoteListStatusForGuid(allocator, stdout, candidate.guid);
+            defer if (remote_status) |status| allocator.free(status.version);
             try session_registry.updateRouteStatus(
                 allocator,
                 candidate.guid,
-                remote_version != null,
-                remote_version,
+                remote_status != null,
+                if (remote_status) |status| status.version else null,
+                if (remote_status) |status| .{
+                    .attached_count = status.attached_count,
+                    .last_input_at_unix_ms = status.last_input_at_unix_ms,
+                } else null,
             );
         }
     }
@@ -2527,7 +2576,13 @@ fn queryRemoteRouteList(allocator: std.mem.Allocator, exe: []const u8, route: *c
     }
 }
 
-fn remoteListVersionForGuid(allocator: std.mem.Allocator, stdout: []const u8, guid: []const u8) !?[]u8 {
+const RemoteListStatus = struct {
+    version: []u8,
+    attached_count: ?u32,
+    last_input_at_unix_ms: ?u64,
+};
+
+fn remoteListStatusForGuid(allocator: std.mem.Allocator, stdout: []const u8, guid: []const u8) !?RemoteListStatus {
     var lines = std.mem.splitScalar(u8, stdout, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -2540,8 +2595,22 @@ fn remoteListVersionForGuid(allocator: std.mem.Allocator, stdout: []const u8, gu
         const row_guid = jsonStringField(object, "guid") orelse continue;
         if (!std.mem.eql(u8, row_guid, guid)) continue;
         const version = jsonStringField(object, "version") orelse "";
-        return try allocator.dupe(u8, version);
+        const attached_count = if (try jsonU64Field(object, "attached_count")) |count| blk: {
+            if (count > std.math.maxInt(u32)) break :blk null;
+            break :blk @as(?u32, @intCast(count));
+        } else null;
+        return .{
+            .version = try allocator.dupe(u8, version),
+            .attached_count = attached_count,
+            .last_input_at_unix_ms = try jsonU64Field(object, "last_input_at_unix_ms"),
+        };
     }
+    return null;
+}
+
+fn remoteListVersionForGuid(allocator: std.mem.Allocator, stdout: []const u8, guid: []const u8) !?[]u8 {
+    const status = try remoteListStatusForGuid(allocator, stdout, guid);
+    if (status) |value| return value.version;
     return null;
 }
 
@@ -2553,17 +2622,33 @@ fn jsonStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+fn jsonU64Field(object: std.json.ObjectMap, key: []const u8) !?u64 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |integer| blk: {
+            if (integer < 0) return error.InvalidJson;
+            break :blk @intCast(integer);
+        },
+        else => null,
+    };
+}
+
 test "remoteListVersionForGuid reads jsonl rows" {
     const guid = "s-550e8400-e29b-41d4-a716-446655440000";
     const stdout =
-        \\{"id":"s-550e","host":"work.blox","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000"}
-        \\s-550e work.blox s-550e8400-e29b-41d4-a716-446655440000
+        \\{"id":"s-550e8400","host":"work.blox","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000","attached_count":2,"last_input_at_unix_ms":1234}
+        \\s-550e8400  2         0s ago    work.blox                 0.5.0-dev
         \\
     ;
 
     const version = (try remoteListVersionForGuid(std.testing.allocator, stdout, guid)) orelse return error.MissingVersion;
     defer std.testing.allocator.free(version);
     try std.testing.expectEqualStrings("0.5.0-dev", version);
+    const status = (try remoteListStatusForGuid(std.testing.allocator, stdout, guid)) orelse return error.MissingStatus;
+    defer std.testing.allocator.free(status.version);
+    try std.testing.expectEqual(@as(?u32, 2), status.attached_count);
+    try std.testing.expectEqual(@as(?u64, 1234), status.last_input_at_unix_ms);
     try std.testing.expect(try remoteListVersionForGuid(std.testing.allocator, stdout, "s-00000000-0000-4000-8000-000000000000") == null);
 }
 
@@ -2572,12 +2657,13 @@ fn anySessionExistsViaBroker(allocator: std.mem.Allocator, exe: []const u8, brok
 }
 
 fn brokerListMatches(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8, session_id: ?[]const u8) bool {
-    const argv = allocator.alloc([]const u8, 3 + broker_args.len) catch return false;
+    const argv = allocator.alloc([]const u8, 4 + broker_args.len) catch return false;
     defer allocator.free(argv);
     argv[0] = exe;
     argv[1] = ":internal-broker:";
     @memcpy(argv[2 .. 2 + broker_args.len], broker_args);
     argv[2 + broker_args.len] = "list";
+    argv[3 + broker_args.len] = "--jsonl";
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = argv,
@@ -3579,17 +3665,23 @@ fn freeErrorPayload(parsed: ErrorPayload) void {
 
 fn listContainsSession(stdout: []const u8, session_id: []const u8) bool {
     var lines = std.mem.splitScalar(u8, stdout, '\n');
-    _ = lines.next();
     while (lines.next()) |line| {
-        const row = list_format.parseRow(line) orelse continue;
-        if (std.mem.eql(u8, row.id, session_id) or std.mem.eql(u8, row.guid, session_id)) return true;
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, app_allocator.allocator(), line, .{}) catch continue;
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |object| object,
+            else => continue,
+        };
+        const id = jsonStringField(object, "id") orelse "";
+        const guid = jsonStringField(object, "guid") orelse "";
+        if (std.mem.eql(u8, id, session_id) or std.mem.eql(u8, guid, session_id)) return true;
     }
     return false;
 }
 
 fn listHasAnySession(stdout: []const u8) bool {
     var lines = std.mem.splitScalar(u8, stdout, '\n');
-    _ = lines.next();
     while (lines.next()) |line| {
         if (line.len != 0) return true;
     }
