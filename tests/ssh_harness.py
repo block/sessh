@@ -774,6 +774,14 @@ def state_sessions_dir(env):
     return state_root(env) / "guid"
 
 
+def runtime_root(env):
+    return Path(env["XDG_RUNTIME_DIR"])
+
+
+def sessions_dir(env):
+    return runtime_root(env) / "guid"
+
+
 def compact_guid(guid):
     if COMPACT_GUID_RE.match(guid):
         return guid.lower()
@@ -837,7 +845,7 @@ def write_ssh_route(env, alias, guid, host, ssh_options=()):
     ensure_alias(env, alias, guid)
     session = state_sessions_dir(env) / guid
     session.mkdir(mode=0o700, parents=True, exist_ok=True)
-    remote_session_dir = Path(env["SESSH_RUNTIME_DIR"]) / "g" / compact_guid(guid)
+    remote_session_dir = runtime_root(env) / "guid" / guid
     lines = [
         f"guid={guid}",
         f"primary_alias={alias}",
@@ -852,12 +860,32 @@ def write_ssh_route(env, alias, guid, host, ssh_options=()):
 
 def session_path(env, session_id="s1"):
     if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
-        return sessions_dir(env) / compact_guid(session_id)
+        return sessions_dir(env) / canonical_guid(session_id)
     alias_path = aliases_dir(env) / session_id
     if alias_path.is_symlink():
-        return sessions_dir(env) / compact_guid(Path(os.readlink(alias_path)).name)
+        return sessions_dir(env) / canonical_guid(Path(os.readlink(alias_path)).name)
     ensure_alias(env, session_id)
-    return sessions_dir(env) / compact_guid(Path(os.readlink(alias_path)).name)
+    return sessions_dir(env) / canonical_guid(Path(os.readlink(alias_path)).name)
+
+
+def actual_socket_path(env, session_id="s1"):
+    if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
+        guid = canonical_guid(session_id)
+    else:
+        alias_path = aliases_dir(env) / session_id
+        if not alias_path.is_symlink():
+            ensure_alias(env, session_id)
+        guid = canonical_guid(Path(os.readlink(alias_path)).name)
+    return runtime_root(env) / "s" / compact_guid(guid)
+
+
+def ensure_agent_socket_link(env, session_id="s1"):
+    session = session_path(env, session_id)
+    session.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (runtime_root(env) / "s").mkdir(mode=0o700, parents=True, exist_ok=True)
+    link = session / "agent.sock"
+    if not link.exists() and not link.is_symlink():
+        link.symlink_to(Path("../../s") / actual_socket_path(env, session_id).name)
 
 
 def session_compat_path(env, session_id="s1"):
@@ -904,11 +932,11 @@ def version_mismatch_frame():
 
 
 def start_version_mismatch_agent(env, session_id="s1"):
+    ensure_agent_socket_link(env, session_id)
     session = session_path(env, session_id)
-    session.mkdir(mode=0o700, parents=True, exist_ok=True)
     (session / "meta").write_text(f"agent_pid={os.getpid()}\nversion=0.0.0-compat-test\n")
     (session / "detached").write_text("")
-    sock_path = session / "s"
+    sock_path = actual_socket_path(env, session_id)
     try:
         sock_path.unlink()
     except FileNotFoundError:
@@ -1434,7 +1462,7 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
         raise AssertionError(first)
 
     changed_runtime_env = dict(env)
-    changed_runtime_env["SESSH_RUNTIME_DIR"] = str(tmp / "changed-runtime")
+    changed_runtime_env["XDG_RUNTIME_DIR"] = str(tmp / "changed-runtime")
     attached = run_sesshmux_until_stdout(["attach", "route-alias"], changed_runtime_env, marker)
     if attached.returncode != 0:
         raise AssertionError(attached)

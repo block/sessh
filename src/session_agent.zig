@@ -936,7 +936,7 @@ pub fn runSessionAgent(session_dir: []const u8) !void {
 
     try writeAgentCompatBinary(session_agent.session_paths.?);
     try session_registry.writeMeta(session_agent.session_paths.?, c.getpid(), config.version);
-    try openSessionAgentLog(&session_agent, session_agent.session_paths.?.socket);
+    try openSessionAgentLog(&session_agent, session_agent.session_paths.?.dir);
     defer closeSessionAgentLog(&session_agent);
     logSessionAgent(&session_agent, "event=session_agent_start id={s} socket={s}", .{ fixed_session_id, session_agent.session_paths.?.socket });
     defer logSessionAgent(&session_agent, "event=session_agent_stop id={s}", .{fixed_session_id});
@@ -1211,15 +1211,14 @@ fn requestGracefulShutdown(session_agent: *SessionAgent) void {
     }
 }
 
-fn openSessionAgentLog(session_agent: *SessionAgent, socket_path: []const u8) !void {
-    const log_path = try sessionAgentLogPath(app_allocator.allocator(), socket_path);
+fn openSessionAgentLog(session_agent: *SessionAgent, session_dir: []const u8) !void {
+    const log_path = try sessionAgentLogPath(app_allocator.allocator(), session_dir);
     defer app_allocator.allocator().free(log_path);
     session_agent.log_file = try std.fs.createFileAbsolute(log_path, .{ .truncate = true });
 }
 
-fn sessionAgentLogPath(allocator: std.mem.Allocator, socket_path: []const u8) ![]u8 {
-    const slash = std.mem.lastIndexOfScalar(u8, socket_path, '/') orelse return error.InvalidSocketPath;
-    return std.fmt.allocPrint(allocator, "{s}/agent.log", .{socket_path[0..slash]});
+fn sessionAgentLogPath(allocator: std.mem.Allocator, session_dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/agent.log", .{session_dir});
 }
 
 fn closeSessionAgentLog(session_agent: *SessionAgent) void {

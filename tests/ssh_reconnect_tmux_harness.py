@@ -157,7 +157,6 @@ def tmux_session_env_args(env):
         "HOME",
         "HISTFILE",
         "XDG_RUNTIME_DIR",
-        "SESSH_RUNTIME_DIR",
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
@@ -242,7 +241,6 @@ def main():
             "#!/bin/sh\n"
             f"export HOME={shlex.quote(env['HOME'])}\n"
             f"export XDG_RUNTIME_DIR={shlex.quote(env['XDG_RUNTIME_DIR'])}\n"
-            f"export SESSH_RUNTIME_DIR={shlex.quote(env['SESSH_RUNTIME_DIR'])}\n"
             f"export XDG_CACHE_HOME={shlex.quote(env['XDG_CACHE_HOME'])}\n"
             f"export XDG_CONFIG_HOME={shlex.quote(env['XDG_CONFIG_HOME'])}\n"
             f"export XDG_DATA_HOME={shlex.quote(env['XDG_DATA_HOME'])}\n"

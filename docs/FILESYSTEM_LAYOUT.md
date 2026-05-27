@@ -5,4 +5,4 @@ layout:
 - `XDG_CONFIG_HOME` for user-defined `sessh` config (TODO: we should support `XDG_CONFIG_DIRS` too)
 - `XDG_CACHE_HOME` for bootstrapping the binary when connecting to a new host
 - `XDG_STATE_HOME` for client routes
-- `XDG_RUNTIME_HOME` for session data
+- `XDG_RUNTIME_DIR` for live session metadata and sockets

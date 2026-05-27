@@ -218,7 +218,7 @@ def wait_file(path, timeout=5.0):
 def wait_missing(path, timeout=5.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        if not path.exists():
+        if not os.path.lexists(path):
             return
         time.sleep(0.05)
     raise AssertionError(f"file still exists: {path}")
@@ -526,10 +526,14 @@ def recv_exact(conn, length):
 
 
 def sessions_dir(env):
-    runtime_dir = env.get("SESSH_RUNTIME_DIR")
+    runtime_dir = env.get("XDG_RUNTIME_DIR")
     if not runtime_dir:
-        raise AssertionError("socket harness requires SESSH_RUNTIME_DIR")
-    return Path(runtime_dir) / "g"
+        raise AssertionError("socket harness requires XDG_RUNTIME_DIR")
+    return Path(runtime_dir) / "guid"
+
+
+def runtime_root(env):
+    return Path(env["XDG_RUNTIME_DIR"])
 
 
 def aliases_dir(env):
@@ -586,7 +590,7 @@ def write_cached_remote_route(env, alias, host, guid=None, alive=True, agent_ver
     ensure_alias(env, alias, guid)
     route_dir = state_sessions_dir(env) / guid
     route_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    remote_session_dir = f"/tmp/sessh-remote/g/{compact_guid(guid)}"
+    remote_session_dir = f"/tmp/sessh-remote/guid/{guid}"
     lines = [
         f"guid={guid}",
         f"primary_alias={alias}",
@@ -609,12 +613,12 @@ def assert_runtime_dir_symlink(env, expected_runtime_root):
 
 def session_dir(env, session_id="s1"):
     if is_guid_ref(session_id):
-        return sessions_dir(env) / compact_guid(session_id)
+        return sessions_dir(env) / guid_for_ref(session_id)
     ensure_alias(env, session_id)
     alias_path = aliases_dir(env) / session_id
     if alias_path.is_symlink():
-        return sessions_dir(env) / compact_guid(Path(os.readlink(alias_path)).name)
-    return sessions_dir(env) / compact_guid(guid_for_ref(session_id))
+        return sessions_dir(env) / guid_for_ref(Path(os.readlink(alias_path)).name)
+    return sessions_dir(env) / guid_for_ref(session_id)
 
 
 def route_file(env, session_id="s1"):
@@ -628,14 +632,35 @@ def route_file(env, session_id="s1"):
 
 
 def socket_path(env, session_id="s1"):
-    return session_dir(env, session_id) / "s"
+    link = agent_sock_link_path(env, session_id)
+    if link.is_symlink():
+        return (link.parent / os.readlink(link)).resolve()
+    return actual_socket_path(env, session_id)
+
+
+def actual_socket_path(env, session_id="s1"):
+    return runtime_root(env) / "s" / compact_guid(guid_for_ref(session_id))
+
+
+def agent_sock_link_path(env, session_id="s1"):
+    return session_dir(env, session_id) / "agent.sock"
+
+
+def ensure_agent_socket_link(env, session_id="s1"):
+    path = session_dir(env, session_id)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (runtime_root(env) / "s").mkdir(mode=0o700, parents=True, exist_ok=True)
+    link = path / "agent.sock"
+    if not link.exists() and not link.is_symlink():
+        link.symlink_to(Path("../../s") / compact_guid(guid_for_ref(session_id)))
 
 
 def start_session_agent(env, session_id="s1"):
+    ensure_agent_socket_link(env, session_id)
     path = socket_path(env, session_id)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    session_path = session_dir(env, session_id)
     proc = subprocess.Popen(
-        [str(BIN), ":internal-session-agent:", "--session-dir", str(path.parent)],
+        [str(BIN), ":internal-session-agent:", "--session-dir", str(session_path)],
         cwd=ROOT,
         env=env,
         stdin=subprocess.DEVNULL,
@@ -647,8 +672,8 @@ def start_session_agent(env, session_id="s1"):
 
 
 def write_session_meta(env, session_id, agent_pid, version=None):
+    ensure_agent_socket_link(env, session_id)
     path = session_dir(env, session_id)
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
     (path / "meta").write_text(f"agent_pid={agent_pid}\nversion={version or sessh_version()}\n")
     return path
 
@@ -2249,8 +2274,9 @@ def run_session_agent_registry_test(base_env):
         shell.chmod(0o700)
 
         session_path = session_dir(env, "s42")
-        session_path.mkdir(mode=0o700, parents=True)
-        socket_file = session_path / "s"
+        ensure_agent_socket_link(env, "s42")
+        socket_file = socket_path(env, "s42")
+        socket_link = agent_sock_link_path(env, "s42")
         meta_file = session_path / "meta"
         detached_file = session_path / "detached"
         compat_file = session_path / "compat"
@@ -2269,6 +2295,8 @@ def run_session_agent_registry_test(base_env):
             wait_file(socket_file)
             wait_file(meta_file)
             wait_file(compat_file)
+            if not socket_link.is_symlink():
+                raise AssertionError("session agent socket link is not a symlink")
             meta = meta_file.read_text()
             if f"agent_pid={proc.pid}\n" not in meta or f"version={sessh_version()}\n" not in meta:
                 raise AssertionError(meta)
@@ -2310,6 +2338,7 @@ def run_session_agent_registry_test(base_env):
             recv_until_message(attach, SESSION_ENDED)
             proc.wait(timeout=5.0)
             wait_missing(socket_file)
+            wait_missing(socket_link)
             wait_missing(compat_file)
             wait_missing(detached_file)
             if not session_path.exists():
@@ -2362,11 +2391,13 @@ def run_broker_starts_session_agent_test(base_env):
             recv_draw_until(conn, b"BROKER_READY")
 
             session_path = session_dir(env, "s1")
-            if not (session_path / "s").exists():
+            if not agent_sock_link_path(env, "s1").is_symlink():
+                raise AssertionError("broker did not create a session-agent socket link")
+            if not socket_path(env, "s1").exists():
                 raise AssertionError("broker did not create a session-agent socket")
             if not os.path.islink(session_path / "compat"):
                 raise AssertionError("broker session agent did not write compat symlink")
-            assert_runtime_dir_symlink(env, Path(env["SESSH_RUNTIME_DIR"]))
+            assert_runtime_dir_symlink(env, Path(env["XDG_RUNTIME_DIR"]))
 
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
             recv_until_message(conn, SESSION_ENDED)
@@ -2374,7 +2405,8 @@ def run_broker_starts_session_agent_test(base_env):
             proc.wait(timeout=5.0)
             if proc.returncode != 0:
                 raise AssertionError(proc.stderr.read().decode("utf-8", "replace"))
-            wait_missing(session_path / "s")
+            wait_missing(socket_path(env, "s1"))
+            wait_missing(agent_sock_link_path(env, "s1"))
             wait_missing(session_path / "compat")
             if not session_path.exists():
                 raise AssertionError("broker removed session tombstone")
@@ -2683,7 +2715,7 @@ def run_broker_kill_edge_cases_test(base_env):
                 raise AssertionError(stopped)
             lines = compat_log.read_text().splitlines()
             for session_id in ("s1", "s2"):
-                expected = f". --compat-version {sessh_version()} --kill {compact_guid(guid_for_ref(session_id))}"
+                expected = f". --compat-version {sessh_version()} --kill {guid_for_ref(session_id)}"
                 if expected not in lines:
                     raise AssertionError(lines)
             if any(proc.poll() is not None for proc in sleepers):
@@ -3115,7 +3147,7 @@ def main():
                 raise AssertionError(listed.stdout)
 
             changed_runtime_env = dict(env)
-            changed_runtime_env["SESSH_RUNTIME_DIR"] = str(Path(tmp) / "changed-runtime")
+            changed_runtime_env["XDG_RUNTIME_DIR"] = str(Path(tmp) / "changed-runtime")
             pid, fd = spawn_bin(changed_runtime_env, ["attach", "s3"])
             try:
                 read_until(fd, b"$ ")

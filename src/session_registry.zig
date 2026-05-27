@@ -16,6 +16,7 @@ pub const default_alias_hex_len = 4;
 pub const SessionPaths = struct {
     dir: []u8,
     socket: []u8,
+    agent_sock_link: []u8,
     meta: []u8,
     detached: []u8,
     compat: []u8,
@@ -26,6 +27,7 @@ pub const SessionPaths = struct {
         allocator.free(self.compat);
         allocator.free(self.detached);
         allocator.free(self.meta);
+        allocator.free(self.agent_sock_link);
         allocator.free(self.socket);
         allocator.free(self.dir);
         self.* = undefined;
@@ -99,12 +101,14 @@ fn allocateSessionDirForGuidInRoots(allocator: std.mem.Allocator, runtime_root: 
     defer allocator.free(sessions_dir);
     try mkdirIgnoreExists(allocator, sessions_dir);
 
+    const socket_dir = try sessionSocketsDirInRoot(allocator, runtime_root);
+    defer allocator.free(socket_dir);
+    try mkdirIgnoreExists(allocator, socket_dir);
+
     const canonical = try canonicalGuid(allocator, guid);
     errdefer allocator.free(canonical);
-    const compact = try compactGuid(allocator, canonical);
-    defer allocator.free(compact);
 
-    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, compact });
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, canonical });
     defer allocator.free(dir);
     switch (try mkdirSessionDir(allocator, dir)) {
         .created => {},
@@ -112,10 +116,17 @@ fn allocateSessionDirForGuidInRoots(allocator: std.mem.Allocator, runtime_root: 
             var existing_paths = try pathsForSessionDirInStateRoot(allocator, dir, state_root);
             errdefer existing_paths.deinit(allocator);
             if (liveHintsExist(existing_paths)) return error.SessionExists;
-            return .{ .id = canonical, .paths = existing_paths };
+            existing_paths.deinit(allocator);
         },
     }
-    var paths = try pathsForSessionDirInStateRoot(allocator, dir, state_root);
+
+    var socket_allocation = try allocateSocketPathForGuidInRoot(allocator, runtime_root, canonical);
+    defer socket_allocation.deinit(allocator);
+    const link = try agentSocketLinkPath(allocator, dir);
+    defer allocator.free(link);
+    try installAgentSocketLink(allocator, link, socket_allocation.name);
+
+    var paths = try pathsForSessionDirWithSocketInStateRoot(allocator, dir, socket_allocation.path, state_root);
     errdefer paths.deinit(allocator);
     return .{ .id = canonical, .paths = paths };
 }
@@ -133,11 +144,15 @@ pub fn stateSessionsDir(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn sessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/g", .{root});
+    return std.fmt.allocPrint(allocator, "{s}/guid", .{root});
 }
 
 fn stateSessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/guid", .{root});
+}
+
+fn sessionSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/s", .{root});
 }
 
 pub fn pathsForSessionId(allocator: std.mem.Allocator, id: []const u8) !SessionPaths {
@@ -146,9 +161,9 @@ pub fn pathsForSessionId(allocator: std.mem.Allocator, id: []const u8) !SessionP
     defer allocator.free(sessions_dir);
     const state_root = try socket_transport.stateRoot(allocator);
     defer allocator.free(state_root);
-    const compact = try compactGuid(allocator, id);
-    defer allocator.free(compact);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, compact });
+    const canonical = try canonicalGuid(allocator, id);
+    defer allocator.free(canonical);
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, canonical });
     defer allocator.free(dir);
     return pathsForSessionDirInStateRoot(allocator, dir, state_root);
 }
@@ -160,11 +175,28 @@ pub fn pathsForSessionDir(allocator: std.mem.Allocator, dir: []const u8) !Sessio
 }
 
 fn pathsForSessionDirInStateRoot(allocator: std.mem.Allocator, dir: []const u8, state_root: []const u8) !SessionPaths {
+    const agent_sock_link = try agentSocketLinkPath(allocator, dir);
+    errdefer allocator.free(agent_sock_link);
+    const socket = socketPathFromAgentSocketLink(allocator, dir, agent_sock_link) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, agent_sock_link),
+        else => return err,
+    };
+    defer allocator.free(socket);
+    return pathsForSessionDirWithSocketAndLinkInStateRoot(allocator, dir, socket, agent_sock_link, state_root);
+}
+
+fn pathsForSessionDirWithSocketInStateRoot(allocator: std.mem.Allocator, dir: []const u8, socket: []const u8, state_root: []const u8) !SessionPaths {
+    const agent_sock_link = try agentSocketLinkPath(allocator, dir);
+    errdefer allocator.free(agent_sock_link);
+    return pathsForSessionDirWithSocketAndLinkInStateRoot(allocator, dir, socket, agent_sock_link, state_root);
+}
+
+fn pathsForSessionDirWithSocketAndLinkInStateRoot(allocator: std.mem.Allocator, dir: []const u8, socket: []const u8, agent_sock_link: []u8, state_root: []const u8) !SessionPaths {
     const dir_copy = try allocator.dupe(u8, dir);
     errdefer allocator.free(dir_copy);
 
-    const socket = try std.fmt.allocPrint(allocator, "{s}/s", .{dir});
-    errdefer allocator.free(socket);
+    const socket_copy = try allocator.dupe(u8, socket);
+    errdefer allocator.free(socket_copy);
 
     const meta = try std.fmt.allocPrint(allocator, "{s}/meta", .{dir});
     errdefer allocator.free(meta);
@@ -182,7 +214,8 @@ fn pathsForSessionDirInStateRoot(allocator: std.mem.Allocator, dir: []const u8, 
 
     return .{
         .dir = dir_copy,
-        .socket = socket,
+        .socket = socket_copy,
+        .agent_sock_link = agent_sock_link,
         .meta = meta,
         .detached = detached,
         .compat = compat,
@@ -843,6 +876,129 @@ fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8, max_len: usize)
     return allocator.dupe(u8, buf[0..@intCast(n)]);
 }
 
+const SocketPathAllocation = struct {
+    name: []u8,
+    path: []u8,
+
+    fn deinit(self: *SocketPathAllocation, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+fn allocateSocketPathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !SocketPathAllocation {
+    const socket_dir = try sessionSocketsDirInRoot(allocator, root);
+    defer allocator.free(socket_dir);
+
+    const compact = try compactGuid(allocator, guid);
+    defer allocator.free(compact);
+    const compact_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ socket_dir, compact });
+    errdefer allocator.free(compact_path);
+    if (socketPathFits(compact_path) and !try pathExists(compact_path)) {
+        return .{
+            .name = try allocator.dupe(u8, compact),
+            .path = compact_path,
+        };
+    }
+    allocator.free(compact_path);
+
+    if (socket_dir.len + 1 >= maxUnixSocketPathLen()) return error.SocketPathTooLong;
+    const hex_len = maxUnixSocketPathLen() - socket_dir.len - 1;
+    if (hex_len < 8) return error.SocketPathTooLong;
+
+    var attempts: usize = 0;
+    while (attempts < 4096) : (attempts += 1) {
+        const name = try randomHex(allocator, hex_len);
+        errdefer allocator.free(name);
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ socket_dir, name });
+        errdefer allocator.free(path);
+        if (!try pathExists(path)) {
+            return .{ .name = name, .path = path };
+        }
+        allocator.free(path);
+        allocator.free(name);
+    }
+    return error.SocketNameExhausted;
+}
+
+fn randomHex(allocator: std.mem.Allocator, len: usize) ![]u8 {
+    const bytes = try allocator.alloc(u8, (len + 1) / 2);
+    defer allocator.free(bytes);
+    std.crypto.random.bytes(bytes);
+
+    const alphabet = "0123456789abcdef";
+    const out = try allocator.alloc(u8, len);
+    for (out, 0..) |*byte, i| {
+        const raw = bytes[i / 2];
+        const nibble = if ((i % 2) == 0) raw >> 4 else raw & 0x0f;
+        byte.* = alphabet[nibble];
+    }
+    return out;
+}
+
+fn maxUnixSocketPathLen() usize {
+    const addr: c.sockaddr.un = undefined;
+    return addr.path.len - 1;
+}
+
+fn socketPathFits(path: []const u8) bool {
+    return path.len <= maxUnixSocketPathLen();
+}
+
+fn pathExists(path: []const u8) !bool {
+    _ = std.fs.cwd().statFile(path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn agentSocketLinkPath(allocator: std.mem.Allocator, dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/agent.sock", .{dir});
+}
+
+fn installAgentSocketLink(allocator: std.mem.Allocator, link_path: []const u8, socket_name: []const u8) !void {
+    const target = try std.fmt.allocPrint(allocator, "../../s/{s}", .{socket_name});
+    defer allocator.free(target);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ link_path, c.getpid() });
+    defer allocator.free(tmp_path);
+
+    std.fs.cwd().deleteFile(tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    const target_z = try allocator.dupeZ(u8, target);
+    defer allocator.free(target_z);
+    const tmp_z = try allocator.dupeZ(u8, tmp_path);
+    defer allocator.free(tmp_z);
+    switch (posix.errno(c.symlink(target_z.ptr, tmp_z.ptr))) {
+        .SUCCESS => {},
+        .EXIST => return error.SymlinkFailed,
+        else => return error.SymlinkFailed,
+    }
+
+    const link_z = try allocator.dupeZ(u8, link_path);
+    defer allocator.free(link_z);
+    switch (posix.errno(c.rename(tmp_z.ptr, link_z.ptr))) {
+        .SUCCESS => return,
+        else => return error.RenameFailed,
+    }
+}
+
+fn socketPathFromAgentSocketLink(allocator: std.mem.Allocator, dir: []const u8, link_path: []const u8) ![]u8 {
+    const target = try readLinkAlloc(allocator, link_path, 4096);
+    defer allocator.free(target);
+    if (isAbsolutePath(target)) return allocator.dupe(u8, target);
+    if (std.mem.startsWith(u8, target, "../../s/")) {
+        const guid_dir = std.fs.path.dirname(dir) orelse return error.InvalidSessionDir;
+        const root = std.fs.path.dirname(guid_dir) orelse return error.InvalidSessionDir;
+        return std.fmt.allocPrint(allocator, "{s}/s/{s}", .{ root, target["../../s/".len..] });
+    }
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, target });
+}
+
 pub fn markDetached(paths: SessionPaths) !void {
     const file = try std.fs.cwd().createFile(paths.detached, .{ .truncate = true, .mode = 0o600 });
     file.close();
@@ -856,6 +1012,7 @@ pub fn markAttached(paths: SessionPaths) !void {
 /// socket is stale. Keep the session directory as the id tombstone.
 pub fn removeStaleHints(paths: SessionPaths) !void {
     try unlinkIfExists(paths.socket);
+    try unlinkIfExists(paths.agent_sock_link);
     try unlinkIfExists(paths.compat);
 }
 
@@ -863,6 +1020,7 @@ pub fn removeStaleHints(paths: SessionPaths) !void {
 /// directory as the id tombstone.
 pub fn removeEndedHints(paths: SessionPaths) !void {
     try unlinkIfExists(paths.socket);
+    try unlinkIfExists(paths.agent_sock_link);
     try unlinkIfExists(paths.compat);
     try unlinkIfExists(paths.detached);
 }
@@ -941,7 +1099,7 @@ test "allocates GUID session directories without reusing tombstones" {
     try std.testing.expectError(error.SessionExists, allocateSessionDirForGuidInRoot(allocator, root, first.id));
 }
 
-test "session paths use short socket components and registry side files" {
+test "session paths use guid session directories and separate socket directory" {
     const allocator = std.testing.allocator;
     const root = "zig-cache/session-registry-path-test";
     std.fs.cwd().deleteTree(root) catch {};
@@ -952,12 +1110,50 @@ test "session paths use short socket components and registry side files" {
     defer allocation.deinit(allocator);
 
     try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", allocation.id);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000", allocation.paths.dir);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/s", allocation.paths.socket);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/meta", allocation.paths.meta);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/detached", allocation.paths.detached);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/compat", allocation.paths.compat);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000", allocation.paths.dir);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/s/550e8400e29b41d4a716446655440000", allocation.paths.socket);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/agent.sock", allocation.paths.agent_sock_link);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/meta", allocation.paths.meta);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/detached", allocation.paths.detached);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/compat", allocation.paths.compat);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/route", allocation.paths.route);
+
+    const link_target = try readLinkAlloc(allocator, allocation.paths.agent_sock_link, 4096);
+    defer allocator.free(link_target);
+    try std.testing.expectEqualStrings("../../s/550e8400e29b41d4a716446655440000", link_target);
+}
+
+test "long runtime roots use random socket names when compact guid does not fit" {
+    const allocator = std.testing.allocator;
+    const prefix = "zig-cache/session-registry-long-root-";
+    const root_len = maxUnixSocketPathLen() - "/s/".len - 16;
+    try std.testing.expect(root_len > prefix.len);
+
+    const root = try allocator.alloc(u8, root_len);
+    defer allocator.free(root);
+    @memcpy(root[0..prefix.len], prefix);
+    @memset(root[prefix.len..], 'x');
+
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+
+    const guid = "s-550e8400-e29b-41d4-a716-446655440000";
+    var allocation = try allocateSessionDirForGuidInRoot(allocator, root, guid);
+    defer allocation.deinit(allocator);
+
+    try std.testing.expectEqualStrings(guid, allocation.id);
+    try std.testing.expectEqualStrings(root, allocation.paths.dir[0..root.len]);
+    try std.testing.expect(std.mem.endsWith(u8, allocation.paths.dir, "/guid/s-550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(allocation.paths.socket.len <= maxUnixSocketPathLen());
+    const socket_name = std.fs.path.basename(allocation.paths.socket);
+    try std.testing.expectEqual(@as(usize, 16), socket_name.len);
+    try std.testing.expect(!std.mem.eql(u8, socket_name, "550e8400e29b41d4a716446655440000"));
+
+    const link_target = try readLinkAlloc(allocator, allocation.paths.agent_sock_link, 4096);
+    defer allocator.free(link_target);
+    const expected_target = try std.fmt.allocPrint(allocator, "../../s/{s}", .{socket_name});
+    defer allocator.free(expected_target);
+    try std.testing.expectEqualStrings(expected_target, link_target);
 }
 
 test "validates session ids and aliases" {
@@ -1073,7 +1269,7 @@ test "route files persist absolute session directories" {
 
     const route_path = try std.fmt.allocPrint(allocator, "{s}/route", .{root});
     defer allocator.free(route_path);
-    const session_dir = "/tmp/sessh-runtime-test/g/550e8400e29b41d4a716446655440000";
+    const session_dir = "/tmp/sessh-runtime-test/guid/s-550e8400-e29b-41d4-a716-446655440000";
 
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);

@@ -13,7 +13,6 @@ def isolated_env(root):
     env["HISTFILE"] = "/dev/null"
     env["HOME"] = str(root / "home")
     env["XDG_RUNTIME_DIR"] = str(root / "runtime")
-    env["SESSH_RUNTIME_DIR"] = str(root / "runtime" / "sessh")
     env["XDG_CACHE_HOME"] = str(root / "cache")
     env["XDG_CONFIG_HOME"] = str(root / "config")
     env["XDG_DATA_HOME"] = str(root / "data")
@@ -22,7 +21,6 @@ def isolated_env(root):
     for key in (
         "HOME",
         "XDG_RUNTIME_DIR",
-        "SESSH_RUNTIME_DIR",
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",

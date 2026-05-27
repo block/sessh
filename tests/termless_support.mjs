@@ -368,7 +368,6 @@ export function makeIsolatedEnv(root, shell) {
     SESSH_ID: "",
     HOME: join(root, "home"),
     XDG_RUNTIME_DIR: join(root, "runtime"),
-    SESSH_RUNTIME_DIR: join(root, "runtime", "sessh"),
     XDG_CACHE_HOME: join(root, "cache"),
     XDG_CONFIG_HOME: join(root, "config"),
     XDG_DATA_HOME: join(root, "data"),
@@ -379,7 +378,6 @@ export function makeIsolatedEnv(root, shell) {
   for (const key of [
     "HOME",
     "XDG_RUNTIME_DIR",
-    "SESSH_RUNTIME_DIR",
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",

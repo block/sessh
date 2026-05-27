@@ -1260,16 +1260,8 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\compat_session_id={s}
         \\runtime_root={s}
         \\if [ -z "$runtime_root" ]; then
-        \\  if [ -n "${{SESSH_RUNTIME_DIR:-}}" ]; then
-        \\    runtime_root=$SESSH_RUNTIME_DIR
-        \\  elif [ -n "${{XDG_RUNTIME_DIR:-}}" ]; then
-        \\    runtime_root_candidate=$XDG_RUNTIME_DIR/sessh
-        \\    # 66 leaves room for /g/<32 hex guid>/s under macOS' 104-byte socket path limit.
-        \\    if [ ${{#runtime_root_candidate}} -le 66 ]; then
-        \\      runtime_root=$runtime_root_candidate
-        \\    else
-        \\      runtime_root=/tmp/sessh-$(id -u)
-        \\    fi
+        \\  if [ -n "${{XDG_RUNTIME_DIR:-}}" ]; then
+        \\    runtime_root=$XDG_RUNTIME_DIR
         \\  else
         \\    runtime_root=/tmp/sessh-$(id -u)
         \\  fi
@@ -1286,36 +1278,46 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    *) printf '%s' "$1" | tr -d '-' ;;
         \\  esac
         \\}}
+        \\canonical_session_id() {{
+        \\  compact=$(compact_session_id "$1")
+        \\  if [ ${{#compact}} -eq 32 ]; then
+        \\    case "$compact" in
+        \\      *[!0123456789abcdefABCDEF]*) ;;
+        \\      *) compact=$(printf '%s' "$compact" | tr 'ABCDEF' 'abcdef'); printf 's-%s-%s-%s-%s-%s\n' "$(printf '%s' "$compact" | cut -c1-8)" "$(printf '%s' "$compact" | cut -c9-12)" "$(printf '%s' "$compact" | cut -c13-16)" "$(printf '%s' "$compact" | cut -c17-20)" "$(printf '%s' "$compact" | cut -c21-32)"; return ;;
+        \\    esac
+        \\  fi
+        \\  printf '%s\n' "$1"
+        \\}}
         \\resolve_session_ref() {{
         \\  ref=$1
         \\  compact=$(compact_session_id "$ref")
         \\  if [ ${{#compact}} -eq 32 ]; then
         \\    case "$compact" in
         \\      *[!0123456789abcdefABCDEF]*) ;;
-        \\      *) printf '%s\n' "$compact"; return ;;
+        \\      *) canonical_session_id "$compact"; return ;;
         \\    esac
         \\  fi
         \\  case "$ref" in
-        \\    ""|/*|*/*|.|..) printf '%s\n' "$compact"; return ;;
+        \\    ""|/*|*/*|.|..) canonical_session_id "$compact"; return ;;
         \\  esac
         \\  if [ -n "$state_root" ]; then
         \\    alias_path=$state_root/alias/$ref
         \\    if [ -L "$alias_path" ]; then
         \\      target=$(readlink "$alias_path") || exit 1
-        \\      compact_session_id "$(basename "$target")"
+        \\      canonical_session_id "$(basename "$target")"
         \\      return
         \\    fi
         \\  fi
         \\  alias_path=$runtime_root/alias/$ref
         \\  if [ -L "$alias_path" ]; then
         \\    target=$(readlink "$alias_path") || exit 1
-        \\    compact_session_id "$(basename "$target")"
+        \\    canonical_session_id "$(basename "$target")"
         \\    return
         \\  fi
-        \\  printf '%s\n' "$compact"
+        \\  canonical_session_id "$compact"
         \\}}
         \\find_latest_session_id() {{
-        \\  detached=$(ls -t "$runtime_root"/g/*/detached 2>/dev/null | sed -n '1p')
+        \\  detached=$(ls -t "$runtime_root"/guid/*/detached 2>/dev/null | sed -n '1p')
         \\  if [ -z "$detached" ]; then
         \\    printf 'sessh: no detached session is available for compat-mode\n' >&2
         \\    exit 1
@@ -1328,15 +1330,15 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    printf 'sessh: session compat binary is unavailable\n' >&2
         \\    exit 1
         \\  fi
-        \\  SESSH_RUNTIME_DIR=$runtime_root exec "$compat" . --compat-version {s}{s}
+        \\  XDG_RUNTIME_DIR=$runtime_root exec "$compat" . --compat-version {s}{s}
         \\}}
         \\run_each_compat() {{
         \\  found=0
         \\  status=0
-        \\  for compat in "$runtime_root"/g/*/compat; do
+        \\  for compat in "$runtime_root"/guid/*/compat; do
         \\    [ -e "$compat" ] || continue
         \\    found=1
-        \\    SESSH_RUNTIME_DIR=$runtime_root "$compat" . --compat-version {s}{s}
+        \\    XDG_RUNTIME_DIR=$runtime_root "$compat" . --compat-version {s}{s}
         \\    code=$?
         \\    if [ "$code" -ne 0 ]; then
         \\      status=$code
@@ -1354,11 +1356,11 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\      compat_session_id=$(find_latest_session_id)
         \\    fi
         \\    compat_session_id=$(resolve_session_ref "$compat_session_id")
-        \\    exec_one_compat "$runtime_root/g/$compat_session_id/compat"
+        \\    exec_one_compat "$runtime_root/guid/$compat_session_id/compat"
         \\    ;;
         \\  kill)
         \\    compat_session_id=$(resolve_session_ref "$compat_session_id")
-        \\    exec_one_compat "$runtime_root/g/$compat_session_id/compat"
+        \\    exec_one_compat "$runtime_root/guid/$compat_session_id/compat"
         \\    ;;
         \\  list|kill-all)
         \\    run_each_compat

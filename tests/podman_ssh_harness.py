@@ -428,7 +428,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         if not has_list_header(listed.stdout) or not has_session_row(listed.stdout):
             raise AssertionError(listed)
         session_id = first_session_id(listed.stdout)
-        compat_path = f"/tmp/sessh-0/g/{compact_session_id(session_id)}/compat"
+        compat_path = f"/tmp/sessh-0/guid/{session_id}/compat"
         compat = run(
             [
                 "podman",
