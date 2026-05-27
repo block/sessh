@@ -175,18 +175,21 @@ fn artifactExecutable(
     name: []const u8,
     target: std.Build.ResolvedTarget,
 ) *std.Build.Step.Compile {
+    // Ship runtime safety checks in packaged binaries. sessh handles terminal
+    // input, remote output, and network frames; catching bounds/overflow bugs at
+    // runtime is worth the size tradeoff.
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseSafe,
         .link_libc = true,
     });
     const protobuf_dep = b.dependency("protobuf", .{
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseSafe,
     });
     mod.addImport("protobuf", protobuf_dep.module("protobuf"));
-    addGhosttyVtImport(b, mod, target, .ReleaseSmall);
+    addGhosttyVtImport(b, mod, target, .ReleaseSafe);
     addPlatformLibraries(mod, target);
 
     return b.addExecutable(.{
