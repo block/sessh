@@ -541,7 +541,7 @@ def state_root(env):
 
 
 def state_sessions_dir(env):
-    return state_root(env) / "g"
+    return state_root(env) / "guid"
 
 
 def is_guid_ref(value):
@@ -573,18 +573,18 @@ def client_guid_for_index(index):
 
 
 def ensure_alias(env, alias, guid=None):
-    guid = guid or guid_for_ref(alias)
+    guid = guid_for_ref(guid) if guid is not None else guid_for_ref(alias)
     alias_path = aliases_dir(env) / alias
     alias_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if alias_path.exists() or alias_path.is_symlink():
         return
-    alias_path.symlink_to(Path("../g") / compact_guid(guid))
+    alias_path.symlink_to(Path("../guid") / guid)
 
 
 def write_cached_remote_route(env, alias, host, guid=None, alive=True, agent_version="cached-test"):
-    guid = guid or guid_for_ref(alias)
+    guid = guid_for_ref(guid) if guid is not None else guid_for_ref(alias)
     ensure_alias(env, alias, guid)
-    route_dir = state_root(env) / "g" / compact_guid(guid)
+    route_dir = state_sessions_dir(env) / guid
     route_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     remote_session_dir = f"/tmp/sessh-remote/g/{compact_guid(guid)}"
     lines = [
@@ -613,18 +613,18 @@ def session_dir(env, session_id="s1"):
     ensure_alias(env, session_id)
     alias_path = aliases_dir(env) / session_id
     if alias_path.is_symlink():
-        return sessions_dir(env) / Path(os.readlink(alias_path)).name
+        return sessions_dir(env) / compact_guid(Path(os.readlink(alias_path)).name)
     return sessions_dir(env) / compact_guid(guid_for_ref(session_id))
 
 
 def route_file(env, session_id="s1"):
     if is_guid_ref(session_id):
-        return state_sessions_dir(env) / compact_guid(session_id) / "route"
+        return state_sessions_dir(env) / guid_for_ref(session_id) / "route"
     ensure_alias(env, session_id)
     alias_path = aliases_dir(env) / session_id
     if alias_path.is_symlink():
-        return state_sessions_dir(env) / Path(os.readlink(alias_path)).name / "route"
-    return state_sessions_dir(env) / compact_guid(guid_for_ref(session_id)) / "route"
+        return state_sessions_dir(env) / guid_for_ref(Path(os.readlink(alias_path)).name) / "route"
+    return state_sessions_dir(env) / guid_for_ref(session_id) / "route"
 
 
 def socket_path(env, session_id="s1"):

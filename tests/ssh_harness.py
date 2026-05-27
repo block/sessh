@@ -771,7 +771,7 @@ def state_root(env):
 
 
 def state_sessions_dir(env):
-    return state_root(env) / "g"
+    return state_root(env) / "guid"
 
 
 def compact_guid(guid):
@@ -780,6 +780,15 @@ def compact_guid(guid):
     if not GUID_RE.match(guid):
         raise AssertionError(f"invalid guid: {guid}")
     return guid[2:].replace("-", "").lower()
+
+
+def canonical_guid(guid):
+    if GUID_RE.match(guid):
+        return guid.lower()
+    if COMPACT_GUID_RE.match(guid):
+        compact = guid.lower()
+        return f"s-{compact[0:8]}-{compact[8:12]}-{compact[12:16]}-{compact[16:20]}-{compact[20:32]}"
+    raise AssertionError(f"invalid guid: {guid}")
 
 
 def guid_for_alias(alias):
@@ -815,17 +824,18 @@ def list_has_session(list_stdout, session_id):
 
 
 def ensure_alias(env, alias, guid=None):
-    guid = guid or guid_for_alias(alias)
+    guid = canonical_guid(guid or guid_for_alias(alias))
     alias_path = aliases_dir(env) / alias
     alias_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if alias_path.exists() or alias_path.is_symlink():
         return
-    alias_path.symlink_to(Path("../g") / compact_guid(guid))
+    alias_path.symlink_to(Path("../guid") / guid)
 
 
 def write_ssh_route(env, alias, guid, host, ssh_options=()):
+    guid = canonical_guid(guid)
     ensure_alias(env, alias, guid)
-    session = state_sessions_dir(env) / compact_guid(guid)
+    session = state_sessions_dir(env) / guid
     session.mkdir(mode=0o700, parents=True, exist_ok=True)
     remote_session_dir = Path(env["SESSH_RUNTIME_DIR"]) / "g" / compact_guid(guid)
     lines = [
@@ -845,9 +855,9 @@ def session_path(env, session_id="s1"):
         return sessions_dir(env) / compact_guid(session_id)
     alias_path = aliases_dir(env) / session_id
     if alias_path.is_symlink():
-        return sessions_dir(env) / Path(os.readlink(alias_path)).name
+        return sessions_dir(env) / compact_guid(Path(os.readlink(alias_path)).name)
     ensure_alias(env, session_id)
-    return sessions_dir(env) / Path(os.readlink(alias_path)).name
+    return sessions_dir(env) / compact_guid(Path(os.readlink(alias_path)).name)
 
 
 def session_compat_path(env, session_id="s1"):

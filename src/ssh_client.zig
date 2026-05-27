@@ -1302,14 +1302,14 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    alias_path=$state_root/alias/$ref
         \\    if [ -L "$alias_path" ]; then
         \\      target=$(readlink "$alias_path") || exit 1
-        \\      basename "$target"
+        \\      compact_session_id "$(basename "$target")"
         \\      return
         \\    fi
         \\  fi
         \\  alias_path=$runtime_root/alias/$ref
         \\  if [ -L "$alias_path" ]; then
         \\    target=$(readlink "$alias_path") || exit 1
-        \\    basename "$target"
+        \\    compact_session_id "$(basename "$target")"
         \\    return
         \\  fi
         \\  printf '%s\n' "$compact"

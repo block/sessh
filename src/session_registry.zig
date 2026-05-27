@@ -129,11 +129,15 @@ pub fn sessionsDir(allocator: std.mem.Allocator) ![]u8 {
 pub fn stateSessionsDir(allocator: std.mem.Allocator) ![]u8 {
     const root = try socket_transport.stateRoot(allocator);
     defer allocator.free(root);
-    return sessionsDirInRoot(allocator, root);
+    return stateSessionsDirInRoot(allocator, root);
 }
 
 pub fn sessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/g", .{root});
+}
+
+fn stateSessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/guid", .{root});
 }
 
 pub fn pathsForSessionId(allocator: std.mem.Allocator, id: []const u8) !SessionPaths {
@@ -171,8 +175,9 @@ fn pathsForSessionDirInStateRoot(allocator: std.mem.Allocator, dir: []const u8, 
     const compat = try std.fmt.allocPrint(allocator, "{s}/compat", .{dir});
     errdefer allocator.free(compat);
 
-    const compact = std.fs.path.basename(dir);
-    const route = try std.fmt.allocPrint(allocator, "{s}/g/{s}/route", .{ state_root, compact });
+    const canonical = try canonicalGuid(allocator, std.fs.path.basename(dir));
+    defer allocator.free(canonical);
+    const route = try routePathForGuidInStateRoot(allocator, state_root, canonical);
     errdefer allocator.free(route);
 
     return .{
@@ -474,13 +479,13 @@ pub fn readRouteForRef(allocator: std.mem.Allocator, ref: []const u8) !Route {
 fn routePathForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     const state_root = try socket_transport.stateRoot(allocator);
     defer allocator.free(state_root);
-    const compact = try compactGuid(allocator, guid);
-    defer allocator.free(compact);
-    return routePathForCompactInStateRoot(allocator, state_root, compact);
+    const canonical = try canonicalGuid(allocator, guid);
+    defer allocator.free(canonical);
+    return routePathForGuidInStateRoot(allocator, state_root, canonical);
 }
 
-fn routePathForCompactInStateRoot(allocator: std.mem.Allocator, state_root: []const u8, compact: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/g/{s}/route", .{ state_root, compact });
+fn routePathForGuidInStateRoot(allocator: std.mem.Allocator, state_root: []const u8, guid: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/guid/{s}/route", .{ state_root, guid });
 }
 
 fn ensureRouteDirForGuid(allocator: std.mem.Allocator, guid: []const u8) !void {
@@ -488,13 +493,13 @@ fn ensureRouteDirForGuid(allocator: std.mem.Allocator, guid: []const u8) !void {
     defer allocator.free(state_root);
     try ensureRegistryRoot(allocator, state_root);
 
-    const state_sessions_dir = try sessionsDirInRoot(allocator, state_root);
+    const state_sessions_dir = try stateSessionsDirInRoot(allocator, state_root);
     defer allocator.free(state_sessions_dir);
     try mkdirIgnoreExists(allocator, state_sessions_dir);
 
-    const compact = try compactGuid(allocator, guid);
-    defer allocator.free(compact);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ state_sessions_dir, compact });
+    const canonical = try canonicalGuid(allocator, guid);
+    defer allocator.free(canonical);
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ state_sessions_dir, canonical });
     defer allocator.free(dir);
     try mkdirIgnoreExists(allocator, dir);
 }
@@ -589,11 +594,11 @@ pub fn createAliasInRoot(allocator: std.mem.Allocator, root: []const u8, alias: 
     try ensureRegistryRoot(allocator, root);
     try mkdirIgnoreExists(allocator, aliases_dir);
 
-    const compact = try compactGuid(allocator, guid);
-    defer allocator.free(compact);
+    const canonical = try canonicalGuid(allocator, guid);
+    defer allocator.free(canonical);
     const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, alias });
     defer allocator.free(link_path);
-    const target = try std.fmt.allocPrint(allocator, "../g/{s}", .{compact});
+    const target = try std.fmt.allocPrint(allocator, "../guid/{s}", .{canonical});
     defer allocator.free(target);
     const link_path_z = try allocator.dupeZ(u8, link_path);
     defer allocator.free(link_path_z);
@@ -754,8 +759,8 @@ pub fn primaryAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) !?[]u
     };
     defer dir.close();
 
-    const compact = try compactGuid(allocator, guid);
-    defer allocator.free(compact);
+    const canonical = try canonicalGuid(allocator, guid);
+    defer allocator.free(canonical);
 
     var iterator = dir.iterate();
     while (try iterator.next()) |entry| {
@@ -764,7 +769,9 @@ pub fn primaryAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) !?[]u
         defer allocator.free(link_path);
         const target = readLinkAlloc(allocator, link_path, 4096) catch continue;
         defer allocator.free(target);
-        if (std.mem.eql(u8, std.fs.path.basename(target), compact)) {
+        const target_guid = canonicalGuid(allocator, std.fs.path.basename(target)) catch continue;
+        defer allocator.free(target_guid);
+        if (std.mem.eql(u8, target_guid, canonical)) {
             return try allocator.dupe(u8, entry.name);
         }
     }
@@ -950,7 +957,7 @@ test "session paths use short socket components and registry side files" {
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/meta", allocation.paths.meta);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/detached", allocation.paths.detached);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/compat", allocation.paths.compat);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/g/550e8400e29b41d4a716446655440000/route", allocation.paths.route);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/route", allocation.paths.route);
 }
 
 test "validates session ids and aliases" {
