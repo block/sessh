@@ -1152,7 +1152,7 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
     appendDefaultSshOptions(ssh_argv, &arg_index, parsed_ssh_args.default_ipqos_option);
     @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.options.len], parsed_ssh_args.options);
     arg_index += parsed_ssh_args.options.len;
-    ssh_argv[arg_index] = "-T";
+    ssh_argv[arg_index] = compatSshTtyOption(parsed_ssh_args, c.isatty(0) != 0, c.isatty(1) != 0);
     ssh_argv[arg_index + 1] = parsed_ssh_args.host;
     ssh_argv[ssh_argv.len - 1] = remote_command;
 
@@ -1175,6 +1175,13 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
             return process_exit.request(255);
         },
     }
+}
+
+fn compatSshTtyOption(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool, stdout_is_tty: bool) []const u8 {
+    if (parsed_ssh_args.action == .attach and stdin_is_tty and stdout_is_tty) {
+        return "-t";
+    }
+    return "-T";
 }
 
 fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[6][]const u8) []const []const u8 {

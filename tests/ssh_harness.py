@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 import hashlib
+import fcntl
 import os
+import pty
 import re
 import select
 import shlex
+import signal
 import socket
 import stat
 import struct
 import subprocess
 import tempfile
 import threading
+import termios
 import time
 from pathlib import Path
 
@@ -29,6 +33,7 @@ FAKE_SSH = """#!/bin/sh
 set -eu
 
 saw_t=0
+request_tty=0
 config_query=0
 host=
 config=
@@ -53,7 +58,7 @@ trace_fake_ssh_start() {
 trace_fake_ssh_parsed() {
   if [ -n "${SESSH_FAKE_SSH_TRACE:-}" ]; then
     {
-      printf 'pid=%s event=parsed host=%s config=%s config_query=%s saw_t=%s batch_mode=%s remaining=%s\\n' "$$" "$host" "$config" "$config_query" "$saw_t" "$batch_mode" "$#"
+      printf 'pid=%s event=parsed host=%s config=%s config_query=%s saw_t=%s request_tty=%s batch_mode=%s remaining=%s\\n' "$$" "$host" "$config" "$config_query" "$saw_t" "$request_tty" "$batch_mode" "$#"
       if [ "$#" -eq 1 ]; then
         printf 'pid=%s remote_command=%s\\n' "$$" "$1"
       fi
@@ -108,6 +113,11 @@ while [ "$#" -gt 0 ]; do
       saw_t=1
       shift
       ;;
+    -t|-tt)
+      request_tty=1
+      plain_option=$1
+      shift
+      ;;
     -F)
       shift
       if [ "$#" -eq 0 ]; then
@@ -127,7 +137,7 @@ while [ "$#" -gt 0 ]; do
       esac
       shift
       ;;
-    -t|-tt|-N)
+    -N)
       if [ -n "${SESSH_FAKE_SSH_ALLOW_PLAIN:-}" ]; then
         plain_option=$1
         shift
@@ -186,8 +196,10 @@ if [ "$saw_t" -ne 1 ]; then
     printf 'PLAIN_SSH host=%s\\n' "$host"
     exit 0
   fi
-  printf 'fake ssh: missing -T\\n' >&2
-  exit 97
+  if [ "$request_tty" -ne 1 ]; then
+    printf 'fake ssh: missing -T\\n' >&2
+    exit 97
+  fi
 fi
 if [ -z "$host" ]; then
   printf 'fake ssh: missing host\\n' >&2
@@ -240,6 +252,60 @@ if [ -n "${SESSH_FAKE_SSH_STDERR_AFTER_SIGNAL:-}" ]; then
       : >"$SESSH_FAKE_SSH_STDERR_DONE_FILE"
     fi
   ) &
+fi
+if [ "$saw_t" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_SIMULATE_NO_PTY:-}" ] && [ -t 0 ]; then
+  python3 - "$1" <<'PY'
+import os
+import select
+import subprocess
+import sys
+
+proc = subprocess.Popen(
+    ["sh", "-c", sys.argv[1]],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+)
+stdin_open = True
+stdout_open = True
+stdout_fd = proc.stdout.fileno()
+try:
+    while stdin_open or stdout_open:
+        fds = []
+        if stdin_open:
+            fds.append(0)
+        if stdout_open:
+            fds.append(stdout_fd)
+        if not fds:
+            break
+        ready, _, _ = select.select(fds, [], [])
+        if stdin_open and 0 in ready:
+            data = os.read(0, 4096)
+            if data:
+                try:
+                    proc.stdin.write(data)
+                    proc.stdin.flush()
+                except BrokenPipeError:
+                    stdin_open = False
+                    proc.stdin.close()
+            else:
+                stdin_open = False
+                proc.stdin.close()
+        if stdout_open and stdout_fd in ready:
+            data = os.read(stdout_fd, 4096)
+            if data:
+                os.write(1, data)
+            else:
+                stdout_open = False
+                proc.stdout.close()
+        if proc.poll() is not None and not stdout_open:
+            break
+finally:
+    if stdin_open:
+        proc.stdin.close()
+    if stdout_open:
+        proc.stdout.close()
+sys.exit(proc.wait())
+PY
 fi
 exec sh -c "$1"
 """
@@ -397,6 +463,101 @@ def run_sesshmux_until_stdout(args, env, needle, timeout=10.0):
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
     )
+
+
+def read_pty_until(fd, output, needle, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while needle not in output:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"timed out waiting for {needle!r}; got {output!r}")
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            raise AssertionError(f"timed out waiting for {needle!r}; got {output!r}")
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError as exc:
+            raise AssertionError(f"pty closed waiting for {needle!r}; got {output!r}") from exc
+        if not chunk:
+            raise AssertionError(f"pty closed waiting for {needle!r}; got {output!r}")
+        output += chunk
+    return output
+
+
+def run_sesshmux_in_pty(args, env, steps, timeout=10.0):
+    argv = [str(MUX_BIN), *args]
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(argv[0], argv, env)
+
+    output = b""
+    waited = False
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        for needle, to_send in steps:
+            output = read_pty_until(fd, output, needle, timeout)
+            if to_send:
+                os.write(fd, to_send)
+
+        deadline = time.monotonic() + timeout
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                waited = True
+                returncode = wait_status_to_returncode(status)
+                output += read_available_pty(fd)
+                return subprocess.CompletedProcess(
+                    argv,
+                    returncode,
+                    output.decode("utf-8", "replace"),
+                    "",
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"timed out waiting for pty command to exit; got {output!r}")
+            ready, _, _ = select.select([fd], [], [], min(remaining, 0.05))
+            if ready:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    output += chunk
+    finally:
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(fd)
+
+
+def wait_status_to_returncode(status):
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return 255
+
+
+def read_available_pty(fd):
+    output = b""
+    while True:
+        ready, _, _ = select.select([fd], [], [], 0)
+        if not ready:
+            return output
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            return output
+        if not chunk:
+            return output
+        output += chunk
 
 
 def run_sessh_reconnect_probe(
@@ -2066,6 +2227,52 @@ def test_ssh_force_compat_uses_compat_path(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_force_compat_ctrl_c_reaches_remote_pty(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_FORCE_COMPAT_SIGNAL_READY"
+    remote_shell.write_text(
+        "#!/bin/sh\n"
+        "trap 'printf \"\\nREMOTE_SIGINT\\nREMOTE_PROMPT$ \"' INT\n"
+        f"printf '{marker}\\nREMOTE_PROMPT$ '\n"
+        "while :; do\n"
+        "  if IFS= read -r line; then\n"
+        "    printf 'REMOTE:%s\\nREMOTE_PROMPT$ ' \"$line\"\n"
+        "  fi\n"
+        "done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_SIMULATE_NO_PTY"] = "1"
+    env["SHELL"] = str(remote_shell)
+
+    first = run_sessh_until_stdout(["--alias", "s1", "test-host"], env, marker, timeout=30.0)
+    if first.returncode != 0:
+        raise AssertionError(first)
+    assert_session_compat_points_to_cached_artifact(env, remote_path_artifact(), "s1", "force compat signal")
+
+    result = run_sesshmux_in_pty(
+        ["attach", "--force-compat", "--leader", "CTRL-B", "--host", "test-host", "s1"],
+        env,
+        (
+            (b"REMOTE_PROMPT$", b"\x03"),
+            (b"REMOTE_SIGINT", b"after-ctrl-c\n"),
+            (b"REMOTE:after-ctrl-c", b"\x02d"),
+            (b"sessh: detached", None),
+        ),
+        timeout=30.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "REMOTE_SIGINT" not in result.stdout or "REMOTE:after-ctrl-c" not in result.stdout:
+        raise AssertionError(result)
+
+
 def run_test(name, fn):
     with tempfile.TemporaryDirectory(prefix="sessh-ssh-", dir="/tmp") as tmp:
         root = Path(tmp)
@@ -2219,6 +2426,10 @@ def main():
         (
             "ssh force compat uses compat path",
             test_ssh_force_compat_uses_compat_path,
+        ),
+        (
+            "ssh force compat ctrl-c reaches remote pty",
+            test_ssh_force_compat_ctrl_c_reaches_remote_pty,
         ),
     )
     for name, fn in tests:
