@@ -35,6 +35,10 @@ message Frame {
     InputAck input_ack = 24;
     SessionLiveStateQuery session_live_state_query = 25;
     SessionLiveState session_live_state = 26;
+    SessionClientControlRequest session_client_control_request = 27;
+    SessionClientControlResponse session_client_control_response = 28;
+    ClientRepaintRequest client_repaint_request = 29;
+    ClientDetachRequest client_detach_request = 30;
   }
 }
 
@@ -172,6 +176,22 @@ message RepaintRequest {
 
 // Framed payload, session agent -> client.
 //
+// Requests that an attached client initiate its normal repaint flow by sending
+// a RepaintRequest back to the session agent.
+message ClientRepaintRequest {
+  // When true, the client clears outer terminal scrollback and requests all
+  // retained inner scrollback plus the current screen. When false, it requests
+  // only the current screen.
+  bool include_scrollback = 1;
+}
+
+// Framed payload, session agent -> client.
+//
+// Requests that an attached client detach using its normal local detach flow.
+message ClientDetachRequest {}
+
+// Framed payload, session agent -> client.
+//
 // Confirms that a SessionCreate created the requested session.
 message SessionCreated {
   // Canonical session GUID in s-prefixed hyphenated UUID form.
@@ -214,6 +234,45 @@ message AttachedClient {
   string client_guid = 1;
   TerminalSize terminal_size = 2;
   uint64 attached_at_unix_ms = 3;
+  // Present after the client has sent non-control-sequence input.
+  optional uint64 last_input_at_unix_ms = 4;
+}
+
+enum ClientControlAction {
+  CLIENT_CONTROL_ACTION_UNSPECIFIED = 0;
+  CLIENT_CONTROL_ACTION_DETACH = 1;
+  CLIENT_CONTROL_ACTION_REPAINT = 2;
+  CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION = 3;
+  CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION = 4;
+}
+
+enum ClientControlTargetKind {
+  CLIENT_CONTROL_TARGET_KIND_UNSPECIFIED = 0;
+  CLIENT_CONTROL_TARGET_KIND_DEFAULT = 1;
+  CLIENT_CONTROL_TARGET_KIND_ALL = 2;
+  CLIENT_CONTROL_TARGET_KIND_LAST_INPUT = 3;
+  CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID = 4;
+}
+
+// Framed payload, broker/client -> session agent.
+//
+// Applies a client-management operation to one or more attachments for this
+// agent's live session.
+message SessionClientControlRequest {
+  ClientControlAction action = 1;
+  ClientControlTargetKind target_kind = 2;
+  string client_guid = 3;
+  // Only used for CLIENT_CONTROL_ACTION_REPAINT. When true, the selected
+  // client clears outer terminal scrollback and requests retained inner
+  // scrollback plus the current screen.
+  bool include_scrollback = 4;
+}
+
+// Framed payload, session agent -> broker/client.
+//
+// Confirms which attached clients were affected by a client-control request.
+message SessionClientControlResponse {
+  repeated string affected_client_guid = 1;
 }
 
 enum SessionEndReason {

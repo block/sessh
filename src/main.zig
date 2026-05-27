@@ -142,6 +142,10 @@ fn usage(code: u8, entrypoint: EntryPoint) !void {
         \\  sesshmux list [--refresh] [--jsonl] [[--ssh-options "ssh args"] HOST]
         \\  sesshmux kill [[--ssh-options "ssh args"] HOST] ID
         \\  sesshmux kill --all [[--ssh-options "ssh args"] HOST]
+        \\  sesshmux list-clients [--jsonl] [ID]
+        \\  sesshmux detach [--all|--last-input|CLIENT_GUID] [ID]
+        \\  sesshmux repaint [--scrollback] [--last-input|CLIENT_GUID] [ID]
+        \\  sesshmux debug sever-connection|unresponsive-connection [--all|--last-input|CLIENT_GUID] [ID]
         \\
         \\local target:
         \\  Use . as HOST to operate on local sessions.

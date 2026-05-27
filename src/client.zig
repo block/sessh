@@ -30,6 +30,22 @@ const LocalAction = enum {
     list,
     kill,
     kill_all,
+    list_clients,
+    detach_client,
+    repaint_client,
+    debug_client,
+};
+
+const ClientTarget = enum {
+    default,
+    all,
+    last_input,
+    client_guid,
+};
+
+const DebugClientAction = enum {
+    sever_connection,
+    unresponsive_connection,
 };
 
 const LocalOptions = struct {
@@ -42,6 +58,12 @@ const LocalOptions = struct {
     list_refresh: bool = false,
     list_include_cached_routes: bool = true,
     list_jsonl: bool = false,
+    client_session_ref: ?[]const u8 = null,
+    client_target: ClientTarget = .default,
+    client_guid: ?[]const u8 = null,
+    client_jsonl: bool = false,
+    client_repaint_scrollback: bool = false,
+    debug_client_action: ?DebugClientAction = null,
     leader: Leader = .none,
     leader_set: bool = false,
     banner_args: DetachBannerArgs = .{},
@@ -234,6 +256,7 @@ pub const RuntimeRecovery = enum {
     recovered,
     transport_closed,
     session_ended,
+    detach,
 };
 
 const CreatedSession = struct {
@@ -1904,6 +1927,140 @@ test "runtime repaint after local ui requests screen-only repaint" {
     try std.testing.expectEqual(@as(i32, 6), session.viewport_offset);
 }
 
+test "client repaint request sends screen-only repaint request" {
+    const remote_to_client = try posix.pipe();
+    defer posix.close(remote_to_client[0]);
+    defer posix.close(remote_to_client[1]);
+    const client_to_remote = try posix.pipe();
+    defer posix.close(client_to_remote[0]);
+    defer posix.close(client_to_remote[1]);
+
+    next_repaint_request_seq = 123;
+
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.ClientRepaintRequest{});
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(remote_to_client[1], .client_repaint_request, payload);
+
+    var connection_monitor = ConnectionMonitor{};
+    var scrollback_cursor = ScrollbackCursor{};
+    var viewport_offset: i32 = 0;
+    var pending_repaint = PendingRepaint{};
+    var relay_end_restore = std.ArrayList(u8).empty;
+    defer relay_end_restore.deinit(app_allocator.allocator());
+    var input_ack_tracker = InputAckTracker{};
+
+    try std.testing.expectEqual(
+        @as(?RelayEnd, null),
+        try handleRelayRuntimeFrame(
+            remote_to_client[0],
+            client_to_remote[1],
+            &connection_monitor,
+            &scrollback_cursor,
+            &viewport_offset,
+            &pending_repaint,
+            &relay_end_restore,
+            &input_ack_tracker,
+        ),
+    );
+
+    try std.testing.expect(pending_repaint.active());
+    try std.testing.expectEqual(@as(u64, 123), pending_repaint.repaint_request_seq);
+
+    var frame = try protocol.readFrameAlloc(app_allocator.allocator(), client_to_remote[0]);
+    defer frame.deinit(app_allocator.allocator());
+    try std.testing.expectEqual(protocol.MessageType.repaint_request, frame.message_type);
+    var request = try protocol.decodePayload(pb.RepaintRequest, app_allocator.allocator(), frame.payload);
+    defer request.deinit(app_allocator.allocator());
+    try std.testing.expectEqual(@as(u64, 123), request.repaint_request_seq);
+    try std.testing.expect(request.scrollback_cursor == null);
+}
+
+test "client repaint request can request retained scrollback" {
+    const remote_to_client = try posix.pipe();
+    defer posix.close(remote_to_client[0]);
+    defer posix.close(remote_to_client[1]);
+    const client_to_remote = try posix.pipe();
+    defer posix.close(client_to_remote[0]);
+    defer posix.close(client_to_remote[1]);
+
+    next_repaint_request_seq = 456;
+
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.ClientRepaintRequest{
+        .include_scrollback = true,
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(remote_to_client[1], .client_repaint_request, payload);
+
+    var connection_monitor = ConnectionMonitor{};
+    var scrollback_cursor = ScrollbackCursor{};
+    var viewport_offset: i32 = 0;
+    var pending_repaint = PendingRepaint{};
+    var relay_end_restore = std.ArrayList(u8).empty;
+    defer relay_end_restore.deinit(app_allocator.allocator());
+    var input_ack_tracker = InputAckTracker{};
+
+    try std.testing.expectEqual(
+        @as(?RelayEnd, null),
+        try handleRelayRuntimeFrame(
+            remote_to_client[0],
+            client_to_remote[1],
+            &connection_monitor,
+            &scrollback_cursor,
+            &viewport_offset,
+            &pending_repaint,
+            &relay_end_restore,
+            &input_ack_tracker,
+        ),
+    );
+
+    try std.testing.expect(pending_repaint.active());
+    try std.testing.expectEqual(@as(u64, 456), pending_repaint.repaint_request_seq);
+
+    var frame = try protocol.readFrameAlloc(app_allocator.allocator(), client_to_remote[0]);
+    defer frame.deinit(app_allocator.allocator());
+    try std.testing.expectEqual(protocol.MessageType.repaint_request, frame.message_type);
+    var request = try protocol.decodePayload(pb.RepaintRequest, app_allocator.allocator(), frame.payload);
+    defer request.deinit(app_allocator.allocator());
+    try std.testing.expectEqual(@as(u64, 456), request.repaint_request_seq);
+    const cursor = request.scrollback_cursor orelse return error.ExpectedScrollbackCursor;
+    try std.testing.expectEqual(@as(usize, 0), cursor.len);
+}
+
+test "client detach request uses normal detach relay end" {
+    const remote_to_client = try posix.pipe();
+    defer posix.close(remote_to_client[0]);
+    defer posix.close(remote_to_client[1]);
+    const client_to_remote = try posix.pipe();
+    defer posix.close(client_to_remote[0]);
+    defer posix.close(client_to_remote[1]);
+
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.ClientDetachRequest{});
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(remote_to_client[1], .client_detach_request, payload);
+
+    var connection_monitor = ConnectionMonitor{};
+    var scrollback_cursor = ScrollbackCursor{};
+    var viewport_offset: i32 = 0;
+    var pending_repaint = PendingRepaint{};
+    var relay_end_restore = std.ArrayList(u8).empty;
+    defer relay_end_restore.deinit(app_allocator.allocator());
+    var input_ack_tracker = InputAckTracker{};
+
+    try std.testing.expectEqual(
+        RelayEnd.detach,
+        (try handleRelayRuntimeFrame(
+            remote_to_client[0],
+            client_to_remote[1],
+            &connection_monitor,
+            &scrollback_cursor,
+            &viewport_offset,
+            &pending_repaint,
+            &relay_end_restore,
+            &input_ack_tracker,
+        )).?,
+    );
+}
+
 /// Implements the public `sessh .` path. This is both the local testing
 /// transport and the same broker/agent flow used by ssh after bootstrap.
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -1946,6 +2103,28 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             var command_args_buf: [4][]const u8 = undefined;
             const command_args = appendBrokerCommand(runtime_broker_args, "kill", "--all", &command_args_buf);
             const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
+            if (exit_status != 0) return process_exit.request(exit_status);
+            return;
+        },
+        .list_clients => {
+            const exit_status = runLocalClientListCommand(allocator, args[0], runtime_broker_args, options) catch |err| switch (err) {
+                error.MissingSessionRef => {
+                    try io_helpers.writeAll(2, "sessh: list-clients requires an ID outside a sessh session\n");
+                    return process_exit.request(64);
+                },
+                else => return err,
+            };
+            if (exit_status != 0) return process_exit.request(exit_status);
+            return;
+        },
+        .detach_client, .repaint_client, .debug_client => {
+            const exit_status = runLocalClientControlCommand(allocator, args[0], runtime_broker_args, options) catch |err| switch (err) {
+                error.MissingSessionRef => {
+                    try io_helpers.writeAll(2, "sessh: client command requires an ID outside a sessh session\n");
+                    return process_exit.request(64);
+                },
+                else => return err,
+            };
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
@@ -1999,7 +2178,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             "",
             options.initial_scrollback_row_count,
         ),
-        .list, .kill, .kill_all => unreachable,
+        .list, .kill, .kill_all, .list_clients, .detach_client, .repaint_client, .debug_client => unreachable,
     }) catch |err| {
         if (process_exit.is(err)) return err;
         terminateChild(&child);
@@ -2094,6 +2273,70 @@ fn appendBrokerCommand(
         return buf[0 .. runtime_args.len + 2];
     }
     return buf[0 .. runtime_args.len + 1];
+}
+
+fn runLocalClientListCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    runtime_broker_args: []const []const u8,
+    options: LocalOptions,
+) !u8 {
+    const session_ref = try resolveClientSessionRef(allocator, options.client_session_ref);
+    defer allocator.free(session_ref);
+
+    var command_args: std.ArrayList([]const u8) = .empty;
+    defer command_args.deinit(allocator);
+    try command_args.appendSlice(allocator, runtime_broker_args);
+    try command_args.append(allocator, "list-clients");
+    if (options.client_jsonl) try command_args.append(allocator, "--jsonl");
+    try command_args.append(allocator, session_ref);
+    return runLocalBrokerCommand(allocator, exe, command_args.items);
+}
+
+fn runLocalClientControlCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    runtime_broker_args: []const []const u8,
+    options: LocalOptions,
+) !u8 {
+    const session_ref = try resolveClientSessionRef(allocator, options.client_session_ref);
+    defer allocator.free(session_ref);
+
+    var command_args: std.ArrayList([]const u8) = .empty;
+    defer command_args.deinit(allocator);
+    try command_args.appendSlice(allocator, runtime_broker_args);
+    switch (options.action) {
+        .detach_client => try command_args.append(allocator, "detach-client"),
+        .repaint_client => try command_args.append(allocator, "repaint-client"),
+        .debug_client => {
+            try command_args.append(allocator, "debug-client");
+            try command_args.append(allocator, switch (options.debug_client_action.?) {
+                .sever_connection => "sever-connection",
+                .unresponsive_connection => "unresponsive-connection",
+            });
+        },
+        else => unreachable,
+    }
+    switch (options.client_target) {
+        .default => {},
+        .all => try command_args.append(allocator, "--all"),
+        .last_input => try command_args.append(allocator, "--last-input"),
+        .client_guid => {
+            try command_args.append(allocator, "--client");
+            try command_args.append(allocator, options.client_guid.?);
+        },
+    }
+    if (options.client_repaint_scrollback) try command_args.append(allocator, "--scrollback");
+    try command_args.append(allocator, session_ref);
+    return runLocalBrokerCommand(allocator, exe, command_args.items);
+}
+
+fn resolveClientSessionRef(allocator: std.mem.Allocator, explicit_ref: ?[]const u8) ![]u8 {
+    if (explicit_ref) |ref| return allocator.dupe(u8, ref);
+    return std.process.getEnvVarOwned(allocator, "SESSH_GUID") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => error.MissingSessionRef,
+        else => err,
+    };
 }
 
 fn startLocalBroker(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8) !std.process.Child {
@@ -2371,6 +2614,31 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
         if (std.mem.eql(u8, arg, "--list")) {
             try setAction(&options, .list);
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--list-clients")) {
+            try setAction(&options, .list_clients);
+            i += 1;
+            if (i < args.len and !std.mem.startsWith(u8, args[i], "--")) {
+                options.client_session_ref = args[i];
+                i += 1;
+            }
+        } else if (std.mem.eql(u8, arg, "--detach-client")) {
+            try setAction(&options, .detach_client);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--repaint-client")) {
+            try setAction(&options, .repaint_client);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--debug-client")) {
+            try setAction(&options, .debug_client);
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingDebugAction;
+            if (std.mem.eql(u8, args[i], "sever-connection")) {
+                options.debug_client_action = .sever_connection;
+            } else if (std.mem.eql(u8, args[i], "unresponsive-connection")) {
+                options.debug_client_action = .unresponsive_connection;
+            } else {
+                return error.InvalidDebugAction;
+            }
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--kill-all")) {
             try setAction(&options, .kill_all);
             i += 1;
@@ -2406,6 +2674,21 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--jsonl")) {
             options.list_jsonl = true;
+            options.client_jsonl = true;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--all")) {
+            try setClientTarget(&options, .all, null);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--last-input")) {
+            try setClientTarget(&options, .last_input, null);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--client")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingClientGuid;
+            try setClientTarget(&options, .client_guid, args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--scrollback")) {
+            options.client_repaint_scrollback = true;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--leader")) {
             i += 1;
@@ -2449,14 +2732,36 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingTtyTranscriptPath;
             options.capture_tty_transcript = args[i];
             i += 1;
+        } else if (!std.mem.startsWith(u8, arg, "--") and actionSupportsClientSessionRef(options.action) and options.client_session_ref == null) {
+            options.client_session_ref = arg;
+            i += 1;
         } else {
             return error.UnknownArgument;
         }
     }
     if (options.list_refresh and options.action != .list) return error.UnsupportedListRefresh;
     if (!options.list_include_cached_routes and options.action != .list) return error.UnsupportedListLocalOnly;
-    if (options.list_jsonl and options.action != .list) return error.UnsupportedListJsonl;
+    if (options.list_jsonl and options.action != .list and options.action != .list_clients) return error.UnsupportedListJsonl;
+    if (options.client_target != .default and !actionSupportsClientTarget(options.action)) return error.UnsupportedClientTarget;
+    if (options.client_guid != null and options.client_target != .client_guid) return error.UnsupportedClientTarget;
+    if (options.client_repaint_scrollback and options.action != .repaint_client) return error.UnsupportedClientTarget;
+    if (options.debug_client_action != null and options.action != .debug_client) return error.UnsupportedDebugAction;
+    if (options.action == .debug_client and options.debug_client_action == null) return error.MissingDebugAction;
     return options;
+}
+
+fn actionSupportsClientSessionRef(action: LocalAction) bool {
+    return action == .list_clients or actionSupportsClientTarget(action);
+}
+
+fn actionSupportsClientTarget(action: LocalAction) bool {
+    return action == .detach_client or action == .repaint_client or action == .debug_client;
+}
+
+fn setClientTarget(options: *LocalOptions, target: ClientTarget, client_guid: ?[]const u8) !void {
+    if (options.client_target != .default) return error.MultipleTargets;
+    options.client_target = target;
+    options.client_guid = client_guid;
 }
 
 fn applyFileConfigToLocal(allocator: std.mem.Allocator, options: *LocalOptions) !void {
@@ -2656,6 +2961,7 @@ fn finishReconnectRepaintInner(
             .input_ack => {
                 _ = try handleInputAckFrame(frame.payload, &session.input_ack_tracker);
             },
+            .client_repaint_request => {},
             .tty_transcript_chunk => try handleTtyTranscriptChunkFrame(frame.payload),
             .session_ended => return error.SessionEnded,
             .error_message => {
@@ -2732,6 +3038,13 @@ pub fn pollRuntimeRecovery(
         .input_ack => {
             _ = try handleInputAckFrame(frame.payload, &session.input_ack_tracker);
             return .recovered;
+        },
+        .client_repaint_request => return null,
+        .client_detach_request => {
+            var request = try protocol.decodePayload(pb.ClientDetachRequest, app_allocator.allocator(), frame.payload);
+            defer request.deinit(app_allocator.allocator());
+            _ = finishRelay(.detach, &session.relay_end_restore);
+            return .detach;
         },
         .tty_transcript_chunk => {
             try handleTtyTranscriptChunkFrame(frame.payload);
@@ -3356,6 +3669,7 @@ fn relayTerminal(
         if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             if (try drainRelayRuntimeFrames(
                 read_fd,
+                write_fd,
                 &connection_monitor,
                 scrollback_cursor,
                 viewport_offset,
@@ -3425,6 +3739,7 @@ fn relayTerminal(
 
 fn drainRelayRuntimeFrames(
     read_fd: c.fd_t,
+    write_fd: c.fd_t,
     connection_monitor: *ConnectionMonitor,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
@@ -3449,6 +3764,7 @@ fn drainRelayRuntimeFrames(
 
         if (try handleRelayRuntimeFrame(
             read_fd,
+            write_fd,
             connection_monitor,
             scrollback_cursor,
             viewport_offset,
@@ -3470,6 +3786,7 @@ fn finishRelayAfterRuntimeWriteFailed(
 ) !RelayEnd {
     if (try drainRelayRuntimeFrames(
         read_fd,
+        @as(c.fd_t, -1),
         connection_monitor,
         scrollback_cursor,
         viewport_offset,
@@ -3482,6 +3799,7 @@ fn finishRelayAfterRuntimeWriteFailed(
 
 fn handleRelayRuntimeFrame(
     read_fd: c.fd_t,
+    write_fd: c.fd_t,
     connection_monitor: *ConnectionMonitor,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
@@ -3507,6 +3825,27 @@ fn handleRelayRuntimeFrame(
                 pending_repaint,
             );
             return null;
+        },
+        .client_repaint_request => {
+            var request = try protocol.decodePayload(pb.ClientRepaintRequest, app_allocator.allocator(), frame.payload);
+            defer request.deinit(app_allocator.allocator());
+            if (request.include_scrollback) {
+                sendRepaint(write_fd, "", pending_repaint) catch |err| switch (err) {
+                    error.WriteFailed => return .transport_closed,
+                    else => return err,
+                };
+            } else {
+                sendScreenRepaint(write_fd, pending_repaint) catch |err| switch (err) {
+                    error.WriteFailed => return .transport_closed,
+                    else => return err,
+                };
+            }
+            return null;
+        },
+        .client_detach_request => {
+            var request = try protocol.decodePayload(pb.ClientDetachRequest, app_allocator.allocator(), frame.payload);
+            defer request.deinit(app_allocator.allocator());
+            return .detach;
         },
         .tty_transcript_chunk => {
             try handleTtyTranscriptChunkFrame(frame.payload);

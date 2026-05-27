@@ -92,9 +92,11 @@ const Attachment = struct {
     rows: u16 = 24,
     cols: u16 = 80,
     attached_at_unix_ms: u64 = 0,
+    last_input_at_unix_ms: u64 = 0,
     origin: ?TerminalOrigin = null,
     active: bool = false,
     close_after_flush: bool = false,
+    debug_unresponsive: bool = false,
     presentation: PresentationState = .{},
     output: std.ArrayList(u8) = .empty,
     output_offset: usize = 0,
@@ -1107,8 +1109,8 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
 
     for (&session_agent.attachments, 0..) |*attachment, i| {
         if (!attachment.active) continue;
-        var events: i16 = if (attachment.close_after_flush) 0 else posix.POLL.IN;
-        if (attachment.queuedBytes() > 0) events |= posix.POLL.OUT;
+        var events: i16 = if (attachment.close_after_flush or attachment.debug_unresponsive) 0 else posix.POLL.IN;
+        if (!attachment.debug_unresponsive and attachment.queuedBytes() > 0) events |= posix.POLL.OUT;
         pollfds[count] = .{ .fd = attachment.fd, .events = events, .revents = 0 };
         kinds[count] = .{ .attachment = i };
         count += 1;
@@ -1254,6 +1256,10 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
             },
             .session_live_state_query => {
                 try sendSessionLiveState(session_agent, fd);
+                return false;
+            },
+            .session_client_control_request => {
+                try handleSessionClientControlRequest(session_agent, fd, frame.payload);
                 return false;
             },
             .session_attach => {
@@ -1463,6 +1469,7 @@ fn compactAttachmentOutput(attachment: *Attachment) void {
 fn flushAttachmentOutput(session_agent: *SessionAgent, attachment_index: usize) void {
     const attachment = &session_agent.attachments[attachment_index];
     if (!attachment.active) return;
+    if (attachment.debug_unresponsive) return;
 
     while (attachment.output_offset < attachment.output.items.len) {
         const result = io.writeSomeNonBlocking(attachment.fd, attachment.output.items[attachment.output_offset..]) catch {
@@ -1536,12 +1543,210 @@ fn sendSessionLiveState(session_agent: *SessionAgent, fd: c.fd_t) !void {
                 .terminal_cols = attachment.cols,
             },
             .attached_at_unix_ms = attachment.attached_at_unix_ms,
+            .last_input_at_unix_ms = if (attachment.last_input_at_unix_ms == 0) null else attachment.last_input_at_unix_ms,
         });
     }
 
     const payload = try protocol.encodePayload(app_allocator.allocator(), response);
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .session_live_state, payload);
+}
+
+fn handleSessionClientControlRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
+    var request = try protocol.decodePayload(pb.SessionClientControlRequest, app_allocator.allocator(), payload);
+    defer request.deinit(app_allocator.allocator());
+
+    const session_index = findMostRecentSessionIndex(session_agent) orelse {
+        try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
+        return;
+    };
+
+    var selected: [max_attachments]usize = undefined;
+    const selected_count = resolveClientControlTargets(session_agent, session_index, request, &selected) catch |err| {
+        switch (err) {
+            error.NoAttachedClients => try sendError(session_agent, fd, "NO_ATTACHED_CLIENTS", "no attached clients", ""),
+            error.MultipleAttachedClients => try sendError(session_agent, fd, "MULTIPLE_ATTACHED_CLIENTS", "multiple clients are attached", "Pass --all, --last-input, or a client GUID"),
+            error.NoLastInputClient => try sendError(session_agent, fd, "NO_LAST_INPUT_CLIENT", "no attached client has sent user input", ""),
+            error.ClientNotFound => try sendError(session_agent, fd, "CLIENT_NOT_FOUND", "client not found", ""),
+            error.InvalidClientControlTarget => try sendError(session_agent, fd, "INVALID_TARGET", "invalid client target", ""),
+            else => return err,
+        }
+        return;
+    };
+
+    const action = request.action;
+    switch (action) {
+        .CLIENT_CONTROL_ACTION_DETACH,
+        .CLIENT_CONTROL_ACTION_REPAINT,
+        .CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION,
+        .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION,
+        => {},
+        else => {
+            try sendError(session_agent, fd, "INVALID_ACTION", "invalid client control action", "");
+            return;
+        },
+    }
+
+    var guid_bufs: [max_attachments][session_registry.client_guid_len]u8 = undefined;
+    var guid_lens: [max_attachments]usize = undefined;
+    for (selected[0..selected_count], 0..) |attachment_index, i| {
+        const client_guid = session_agent.attachments[attachment_index].clientGuidSlice();
+        @memcpy(guid_bufs[i][0..client_guid.len], client_guid);
+        guid_lens[i] = client_guid.len;
+    }
+
+    switch (action) {
+        .CLIENT_CONTROL_ACTION_DETACH => {
+            for (selected[0..selected_count]) |attachment_index| {
+                requestClientDetachFromControl(session_agent, attachment_index);
+            }
+        },
+        .CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION => {
+            for (selected[0..selected_count]) |attachment_index| {
+                detachAttachment(session_agent, attachment_index);
+            }
+        },
+        .CLIENT_CONTROL_ACTION_REPAINT => {
+            for (selected[0..selected_count]) |attachment_index| {
+                requestClientRepaintFromControl(session_agent, attachment_index, request.include_scrollback);
+            }
+        },
+        .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION => {
+            for (selected[0..selected_count]) |attachment_index| {
+                if (attachment_index < session_agent.attachments.len and session_agent.attachments[attachment_index].active) {
+                    session_agent.attachments[attachment_index].debug_unresponsive = true;
+                }
+            }
+        },
+        else => unreachable,
+    }
+
+    var response = pb.SessionClientControlResponse{};
+    defer response.affected_client_guid.deinit(app_allocator.allocator());
+    for (guid_bufs[0..selected_count], guid_lens[0..selected_count]) |*buf, len| {
+        try response.affected_client_guid.append(app_allocator.allocator(), buf[0..len]);
+    }
+    const response_payload = try protocol.encodePayload(app_allocator.allocator(), response);
+    defer app_allocator.allocator().free(response_payload);
+    try protocol.sendFrame(fd, .session_client_control_response, response_payload);
+}
+
+fn resolveClientControlTargets(
+    session_agent: *const SessionAgent,
+    session_index: usize,
+    request: pb.SessionClientControlRequest,
+    selected: *[max_attachments]usize,
+) !usize {
+    return switch (request.target_kind) {
+        .CLIENT_CONTROL_TARGET_KIND_DEFAULT => resolveDefaultClientTarget(session_agent, session_index, selected),
+        .CLIENT_CONTROL_TARGET_KIND_ALL => resolveAllClientTargets(session_agent, session_index, selected),
+        .CLIENT_CONTROL_TARGET_KIND_LAST_INPUT => resolveLastInputClientTarget(session_agent, session_index, selected),
+        .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID => resolveClientGuidTarget(session_agent, session_index, request.client_guid, selected),
+        else => error.InvalidClientControlTarget,
+    };
+}
+
+fn controlTargetActive(attachment: *const Attachment, session_index: usize) bool {
+    return attachment.active and attachment.session_index == session_index and !attachment.close_after_flush;
+}
+
+fn resolveDefaultClientTarget(
+    session_agent: *const SessionAgent,
+    session_index: usize,
+    selected: *[max_attachments]usize,
+) !usize {
+    var found: ?usize = null;
+    for (&session_agent.attachments, 0..) |*attachment, i| {
+        if (!controlTargetActive(attachment, session_index)) continue;
+        if (found != null) return error.MultipleAttachedClients;
+        found = i;
+    }
+    selected[0] = found orelse return error.NoAttachedClients;
+    return 1;
+}
+
+fn resolveAllClientTargets(
+    session_agent: *const SessionAgent,
+    session_index: usize,
+    selected: *[max_attachments]usize,
+) !usize {
+    var count: usize = 0;
+    for (&session_agent.attachments, 0..) |*attachment, i| {
+        if (!controlTargetActive(attachment, session_index)) continue;
+        selected[count] = i;
+        count += 1;
+    }
+    if (count == 0) return error.NoAttachedClients;
+    return count;
+}
+
+fn resolveLastInputClientTarget(
+    session_agent: *const SessionAgent,
+    session_index: usize,
+    selected: *[max_attachments]usize,
+) !usize {
+    var found: ?usize = null;
+    var found_ts: u64 = 0;
+    for (&session_agent.attachments, 0..) |*attachment, i| {
+        if (!controlTargetActive(attachment, session_index)) continue;
+        if (attachment.last_input_at_unix_ms == 0) continue;
+        if (found == null or attachment.last_input_at_unix_ms >= found_ts) {
+            found = i;
+            found_ts = attachment.last_input_at_unix_ms;
+        }
+    }
+    selected[0] = found orelse return error.NoLastInputClient;
+    return 1;
+}
+
+fn resolveClientGuidTarget(
+    session_agent: *const SessionAgent,
+    session_index: usize,
+    client_guid: []const u8,
+    selected: *[max_attachments]usize,
+) !usize {
+    if (!session_registry.isValidClientGuid(client_guid)) return error.InvalidClientControlTarget;
+    for (&session_agent.attachments, 0..) |*attachment, i| {
+        if (!controlTargetActive(attachment, session_index)) continue;
+        if (!std.mem.eql(u8, attachment.clientGuidSlice(), client_guid)) continue;
+        selected[0] = i;
+        return 1;
+    }
+    return error.ClientNotFound;
+}
+
+fn requestClientDetachFromControl(session_agent: *SessionAgent, attachment_index: usize) void {
+    if (attachment_index >= session_agent.attachments.len) return;
+    const attachment = &session_agent.attachments[attachment_index];
+    if (!attachment.active or attachment.close_after_flush) return;
+    const payload = protocol.encodePayload(app_allocator.allocator(), pb.ClientDetachRequest{}) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    defer app_allocator.allocator().free(payload);
+    queueAttachmentFrame(attachment, .client_detach_request, payload) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    flushAttachmentOutput(session_agent, attachment_index);
+}
+
+fn requestClientRepaintFromControl(session_agent: *SessionAgent, attachment_index: usize, include_scrollback: bool) void {
+    if (attachment_index >= session_agent.attachments.len) return;
+    const attachment = &session_agent.attachments[attachment_index];
+    if (!attachment.active or attachment.close_after_flush) return;
+    const payload = protocol.encodePayload(app_allocator.allocator(), pb.ClientRepaintRequest{
+        .include_scrollback = include_scrollback,
+    }) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    defer app_allocator.allocator().free(payload);
+    queueAttachmentFrame(attachment, .client_repaint_request, payload) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    flushAttachmentOutput(session_agent, attachment_index);
 }
 
 fn sessionDirSlice(session_agent: *const SessionAgent) []const u8 {
@@ -2367,6 +2572,7 @@ fn attachSession(
     capture_tty_transcript: bool,
 ) !void {
     const session = &session_agent.sessions[session_index];
+    detachExistingAttachmentWithClientGuid(session_agent, session_index, client_guid);
 
     for (&session_agent.attachments, 0..) |*attachment, attachment_index| {
         if (attachment.active) continue;
@@ -2405,6 +2611,14 @@ fn attachSession(
     }
 
     return error.TooManyAttachments;
+}
+
+fn detachExistingAttachmentWithClientGuid(session_agent: *SessionAgent, session_index: usize, client_guid: []const u8) void {
+    for (&session_agent.attachments, 0..) |*attachment, attachment_index| {
+        if (!attachment.active or attachment.session_index != session_index) continue;
+        if (!std.mem.eql(u8, attachment.clientGuidSlice(), client_guid)) continue;
+        detachAttachment(session_agent, attachment_index);
+    }
 }
 
 fn drainSessionOutput(session_agent: *SessionAgent, session_index: usize) void {
@@ -2560,6 +2774,7 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, paylo
         detachAttachment(session_agent, attachment_index);
         return;
     };
+    if (inputBytesContainUserInput(attachment, input.data)) attachment.last_input_at_unix_ms = nowUnixMs();
     if (translated.items.len == 0) return;
 
     queueTtyTranscriptChunk(attachment, .TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {
@@ -2704,6 +2919,82 @@ fn parseSgrMouseNumber(input: []const u8, index: *usize) ?u32 {
     return value;
 }
 
+const EscapeSequenceClassification = union(enum) {
+    incomplete,
+    terminal_response: usize,
+    user_input: usize,
+};
+
+fn inputBytesContainUserInput(attachment: *const Attachment, bytes: []const u8) bool {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const byte = bytes[index];
+        if (byte == 0x1b) {
+            switch (parseSgrMouseReport(bytes, index)) {
+                .complete => |report| {
+                    index = report.end;
+                    continue;
+                },
+                .incomplete => if (attachmentSgrMouseActive(attachment)) return false,
+                .not_mouse => {},
+            }
+            switch (classifyEscapeSequence(bytes, index)) {
+                .terminal_response => |end| {
+                    index = end;
+                    continue;
+                },
+                .incomplete, .user_input => return true,
+            }
+        }
+        // Treat C0 controls such as ENTER and CTRL-A as user input. The
+        // terminal-generated responses we filter are escape sequences.
+        return true;
+    }
+    return false;
+}
+
+fn classifyEscapeSequence(bytes: []const u8, start: usize) EscapeSequenceClassification {
+    if (start + 1 >= bytes.len) return .incomplete;
+    return switch (bytes[start + 1]) {
+        ']' => classifyStringControl(bytes, start + 2),
+        'P', '_', '^', 'X' => classifyStringControl(bytes, start + 2),
+        '[' => classifyCsiSequence(bytes, start + 2),
+        else => .{ .user_input = start + 2 },
+    };
+}
+
+fn classifyStringControl(bytes: []const u8, start: usize) EscapeSequenceClassification {
+    var index = start;
+    while (index < bytes.len) : (index += 1) {
+        if (bytes[index] == 0x07) return .{ .terminal_response = index + 1 };
+        if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '\\') {
+            return .{ .terminal_response = index + 2 };
+        }
+    }
+    return .incomplete;
+}
+
+fn classifyCsiSequence(bytes: []const u8, start: usize) EscapeSequenceClassification {
+    var index = start;
+    while (index < bytes.len) : (index += 1) {
+        const byte = bytes[index];
+        if (byte < 0x40 or byte > 0x7e) continue;
+        const end = index + 1;
+        if (isTerminalGeneratedCsiResponse(bytes[start..index], byte)) return .{ .terminal_response = end };
+        return .{ .user_input = end };
+    }
+    return .incomplete;
+}
+
+fn isTerminalGeneratedCsiResponse(params_and_intermediates: []const u8, final: u8) bool {
+    switch (final) {
+        'c', 'n', 'R', 't', 'x' => return true,
+        'I', 'O' => return params_and_intermediates.len == 0,
+        'y' => return std.mem.indexOfScalar(u8, params_and_intermediates, '$') != null,
+        else => return false,
+    }
+}
+
 fn appendTranslatedSgrMouseReport(
     attachment: *const Attachment,
     session: *const Session,
@@ -2745,6 +3036,25 @@ test "SGR mouse input is translated from outer to inner coordinates" {
     out.clearRetainingCapacity();
     try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;3M", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "last input classifier ignores terminal generated responses" {
+    var attachment = Attachment{
+        .origin = .{ .row = 0, .col = 0 },
+        .presentation = .{
+            .terminal_modes = .{ .mouse_tracking = .normal, .mouse_sgr = true },
+            .terminal_modes_initialized = true,
+        },
+    };
+
+    try std.testing.expect(!inputBytesContainUserInput(&attachment, "\x1b[<0;12;5M"));
+    try std.testing.expect(!inputBytesContainUserInput(&attachment, "\x1b]10;rgb:ffff/ffff/ffff\x07"));
+    try std.testing.expect(!inputBytesContainUserInput(&attachment, "\x1b[?1;2c"));
+    try std.testing.expect(!inputBytesContainUserInput(&attachment, "\x1b[24;80R"));
+    try std.testing.expect(!inputBytesContainUserInput(&attachment, "\x1b[0n"));
+    try std.testing.expect(inputBytesContainUserInput(&attachment, "\x1b[A"));
+    try std.testing.expect(inputBytesContainUserInput(&attachment, "\x01"));
+    try std.testing.expect(inputBytesContainUserInput(&attachment, "\x1b]10;rgb:ffff/ffff/ffff\x07x"));
 }
 
 fn handleResizeFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {

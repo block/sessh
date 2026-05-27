@@ -52,6 +52,10 @@ REPAINT_RESPONSE = "repaint_response"
 INPUT_ACK = "input_ack"
 SESSION_LIVE_STATE_QUERY = "session_live_state_query"
 SESSION_LIVE_STATE = "session_live_state"
+SESSION_CLIENT_CONTROL_REQUEST = "session_client_control_request"
+SESSION_CLIENT_CONTROL_RESPONSE = "session_client_control_response"
+CLIENT_REPAINT_REQUEST = "client_repaint_request"
+CLIENT_DETACH_REQUEST = "client_detach_request"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -73,6 +77,10 @@ _FRAME_FIELDS = {
     INPUT_ACK: INPUT_ACK,
     SESSION_LIVE_STATE_QUERY: SESSION_LIVE_STATE_QUERY,
     SESSION_LIVE_STATE: SESSION_LIVE_STATE,
+    SESSION_CLIENT_CONTROL_REQUEST: SESSION_CLIENT_CONTROL_REQUEST,
+    SESSION_CLIENT_CONTROL_RESPONSE: SESSION_CLIENT_CONTROL_RESPONSE,
+    CLIENT_REPAINT_REQUEST: CLIENT_REPAINT_REQUEST,
+    CLIENT_DETACH_REQUEST: CLIENT_DETACH_REQUEST,
 }
 
 
@@ -409,10 +417,16 @@ def parse_session_live_state(payload):
     return message
 
 
-def create_and_attach_session(conn, shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", initial_scrollback=None, command_argv=None):
+def parse_client_repaint_request(payload):
+    message = sessh_pb().ClientRepaintRequest()
+    message.ParseFromString(payload)
+    return message
+
+
+def create_and_attach_session(conn, shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", initial_scrollback=None, command_argv=None, client_guid=None):
     send_frame(conn, SESSION_CREATE, pack_session_create(shell, scrollback=scrollback, fg=fg, bg=bg, session_id=session_id, command_argv=command_argv))
     assert_session_created(recv_until_message(conn, SESSION_CREATED))
-    send_frame(conn, SESSION_ATTACH, pack_session_attach(initial_scrollback=initial_scrollback))
+    send_frame(conn, SESSION_ATTACH, pack_session_attach(initial_scrollback=initial_scrollback, client_guid=client_guid))
 
 
 def parse_draw(payload):
@@ -2704,6 +2718,171 @@ def run_broker_registry_commands_test(base_env):
             wait_missing(path / "compat")
 
 
+def run_client_control_commands_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-client-control-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "client-control-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "printf 'CLIENT_CONTROL_READY\\n'\n"
+            "while IFS= read -r line; do\n"
+            "  printf 'CLIENT_CONTROL:%s\\n' \"$line\"\n"
+            "done\n"
+        )
+        shell.chmod(0o700)
+        client_one = "c-11111111-1111-1111-1111-111111111111"
+        client_two = "c-22222222-2222-2222-2222-222222222222"
+        proc = None
+        conns = []
+
+        def connect_socket():
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            conn.connect(str(socket_path(env)))
+            send_hello(conn)
+            conns.append(conn)
+            return conn
+
+        def attach_existing(client_guid):
+            conn = connect_socket()
+            send_resize(conn, rows=8, cols=60)
+            send_frame(conn, SESSION_ATTACH, pack_session_attach(session_ref="s1", client_guid=client_guid))
+            message_type, payload = recv_frame(conn)
+            if message_type != SESSION_ATTACHED:
+                raise AssertionError((message_type, payload))
+            assert_session_attached(payload)
+            recv_draw(conn)
+            return conn
+
+        def clients_by_guid():
+            state = query_session_live_state(env)
+            return {client.client_guid: client for client in state.attached_clients}
+
+        def assert_no_frame(conn):
+            old_timeout = conn.gettimeout()
+            conn.settimeout(0.2)
+            try:
+                try:
+                    frame = recv_frame(conn)
+                except TimeoutError:
+                    return
+            finally:
+                conn.settimeout(old_timeout)
+            raise AssertionError(f"unexpected frame: {frame!r}")
+
+        try:
+            proc = start_session_agent(env)
+            conn1 = connect_socket()
+            send_resize(conn1, rows=8, cols=60)
+            create_and_attach_session(conn1, shell, session_id="s1", client_guid=client_one)
+            message_type, payload = recv_frame(conn1)
+            if message_type != SESSION_ATTACHED:
+                raise AssertionError((message_type, payload))
+            assert_session_attached(payload)
+            recv_draw_until(conn1, b"CLIENT_CONTROL_READY")
+
+            conn2 = attach_existing(client_two)
+            clients = clients_by_guid()
+            if set(clients) != {client_one, client_two}:
+                raise AssertionError(clients)
+            if clients[client_one].HasField("last_input_at_unix_ms") or clients[client_two].HasField("last_input_at_unix_ms"):
+                raise AssertionError(clients)
+
+            send_frame(conn2, INPUT, pack_input(b"\x1b]10;rgb:ffff/ffff/ffff\x07", input_seq=21))
+            if parse_input_ack(recv_until_message(conn2, INPUT_ACK)) != 21:
+                raise AssertionError("missing terminal-response input ack")
+            clients = clients_by_guid()
+            if clients[client_two].HasField("last_input_at_unix_ms"):
+                raise AssertionError("terminal response counted as user input")
+
+            send_frame(conn1, INPUT, pack_input(b"from-one\n", input_seq=22))
+            if parse_input_ack(recv_until_message(conn1, INPUT_ACK)) != 22:
+                raise AssertionError("missing user input ack")
+            recv_draw_until(conn1, b"CLIENT_CONTROL:from-one")
+            recv_draw_until(conn2, b"CLIENT_CONTROL:from-one")
+            clients = clients_by_guid()
+            if not clients[client_one].HasField("last_input_at_unix_ms"):
+                raise AssertionError("user input did not update last input timestamp")
+            if clients[client_two].HasField("last_input_at_unix_ms"):
+                raise AssertionError("other client unexpectedly gained last input timestamp")
+
+            listed = run([".", "--list-clients", "--jsonl", "s1"], env, check=True, timeout=5.0)
+            rows = [json.loads(line) for line in listed.stdout.splitlines()]
+            if [row["client_guid"] for row in rows] != [client_one, client_two]:
+                raise AssertionError(listed.stdout)
+            if rows[0]["last_input_at_unix_ms"] is None or rows[1]["last_input_at_unix_ms"] is not None:
+                raise AssertionError(rows)
+            if rows[0]["terminal_size"] != {"terminal_rows": 8, "terminal_cols": 60}:
+                raise AssertionError(rows)
+
+            ambiguous = run([".", "--detach-client", "s1"], env, timeout=5.0)
+            if ambiguous.returncode == 0 or "multiple clients are attached" not in ambiguous.stderr:
+                raise AssertionError(ambiguous)
+
+            repainted = run([".", "--repaint-client", "--last-input", "s1"], env, check=True, timeout=5.0)
+            if f"REPAINTED {client_one}" not in repainted.stdout:
+                raise AssertionError(repainted)
+            repaint_request = parse_client_repaint_request(recv_until_message(conn1, CLIENT_REPAINT_REQUEST))
+            if repaint_request.include_scrollback:
+                raise AssertionError(repaint_request)
+            assert_no_frame(conn2)
+
+            repainted = run([".", "--repaint-client", "--scrollback", "--last-input", "s1"], env, check=True, timeout=5.0)
+            if f"REPAINTED {client_one}" not in repainted.stdout:
+                raise AssertionError(repainted)
+            repaint_request = parse_client_repaint_request(recv_until_message(conn1, CLIENT_REPAINT_REQUEST))
+            if not repaint_request.include_scrollback:
+                raise AssertionError(repaint_request)
+            assert_no_frame(conn2)
+
+            detached = run([".", "--detach-client", "--last-input", "s1"], env, check=True, timeout=5.0)
+            if f"DETACHED {client_one}" not in detached.stdout:
+                raise AssertionError(detached)
+            recv_until_message(conn1, CLIENT_DETACH_REQUEST)
+            assert_no_frame(conn2)
+            conn1.close()
+            deadline = time.time() + 5.0
+            while True:
+                state = query_session_live_state(env)
+                if [client.client_guid for client in state.attached_clients] == [client_two]:
+                    break
+                if time.time() > deadline:
+                    raise AssertionError(state)
+                time.sleep(0.02)
+
+            missing_last_input = run([".", "--detach-client", "--last-input", "s1"], env, timeout=5.0)
+            if missing_last_input.returncode == 0 or "no attached client has sent user input" not in missing_last_input.stderr:
+                raise AssertionError(missing_last_input)
+
+            unresponsive = run([".", "--debug-client", "unresponsive-connection", "--client", client_two, "s1"], env, check=True, timeout=5.0)
+            if f"UNRESPONSIVE {client_two}" not in unresponsive.stdout:
+                raise AssertionError(unresponsive)
+            send_frame(conn2, INPUT, pack_input(b"ignored\n", input_seq=23))
+            try:
+                recv_until_message(conn2, INPUT_ACK, timeout=0.2)
+                raise AssertionError("unresponsive debug client still acknowledged input")
+            except TimeoutError:
+                pass
+
+            replacement = attach_existing(client_two)
+            clients = clients_by_guid()
+            if set(clients) != {client_two}:
+                raise AssertionError(clients)
+            send_frame(replacement, INPUT, pack_input(b"replacement\n", input_seq=24))
+            if parse_input_ack(recv_until_message(replacement, INPUT_ACK)) != 24:
+                raise AssertionError("replacement client did not receive input ack")
+        finally:
+            for conn in conns:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            cleanup_runtime(env)
+
+
 def run_broker_attach_without_id_uses_latest_detached_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-broker-latest-detached-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
@@ -3144,6 +3323,7 @@ def main():
             run_session_agent_registry_test(env)
             run_broker_starts_session_agent_test(env)
             run_broker_registry_commands_test(env)
+            run_client_control_commands_test(env)
             run_broker_attach_without_id_uses_latest_detached_test(env)
             run_broker_kill_edge_cases_test(env)
             run_minor_version_compatibility_test(env)
@@ -3224,10 +3404,11 @@ def main():
             if current_sessions["s1"].get("version") != sessh_version():
                 raise AssertionError(listed.stdout)
             route_text = route_file(env, "s1").read_text()
+            route = json.loads(route_text)
             if (
-                f"session_dir={session_dir(env, 's1')}\n" not in route_text
-                or "host=.\n" not in route_text
-                or f"agent_version={sessh_version()}\n" not in route_text
+                route.get("session_dir") != str(session_dir(env, "s1"))
+                or route.get("host") != "."
+                or route.get("agent_version") != sessh_version()
             ):
                 raise AssertionError(route_text)
             if "session_dir=2f" in route_text or "host=2e" in route_text:

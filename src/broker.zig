@@ -104,6 +104,18 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
         if (std.mem.eql(u8, args[1], "--all")) return killAllAgents(allocator);
         return killOneAgent(allocator, args[1]);
     }
+    if (std.mem.eql(u8, command, "list-clients")) {
+        const options = parseListClientsOptions(args) catch return finishCommand(64, "", "ERROR usage: list-clients [--jsonl] ID\n");
+        const exit_status = try listClients(allocator, options);
+        return process_exit.request(exit_status);
+    }
+    if (std.mem.eql(u8, command, "detach-client") or
+        std.mem.eql(u8, command, "repaint-client") or
+        std.mem.eql(u8, command, "debug-client"))
+    {
+        const options = parseClientControlOptions(args) catch return finishCommand(64, "", "ERROR usage: detach-client|repaint-client|debug-client [options] ID\n");
+        return runClientControlCommand(allocator, options);
+    }
     return finishCommand(64, "", "ERROR unknown broker command\n");
 }
 
@@ -123,6 +135,19 @@ const ListOptions = struct {
     format: ListFormat = .table,
 };
 
+const ListClientsOptions = struct {
+    session_ref: []const u8,
+    format: ListFormat = .table,
+};
+
+const ClientControlOptions = struct {
+    session_ref: []const u8,
+    action: pb.ClientControlAction,
+    target_kind: pb.ClientControlTargetKind,
+    client_guid: []const u8 = "",
+    include_scrollback: bool = false,
+};
+
 fn parseListOptions(args: []const []const u8) !ListOptions {
     var options = ListOptions{};
     var i: usize = 1;
@@ -140,6 +165,100 @@ fn parseListOptions(args: []const []const u8) !ListOptions {
         }
     }
     return options;
+}
+
+fn parseListClientsOptions(args: []const []const u8) !ListClientsOptions {
+    var format: ListFormat = .table;
+    var session_ref: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--jsonl")) {
+            format = .jsonl;
+            i += 1;
+        } else if (std.mem.startsWith(u8, args[i], "--")) {
+            return error.InvalidListClientsArgs;
+        } else if (session_ref == null) {
+            session_ref = args[i];
+            i += 1;
+        } else {
+            return error.InvalidListClientsArgs;
+        }
+    }
+    return .{
+        .session_ref = session_ref orelse return error.MissingSessionRef,
+        .format = format,
+    };
+}
+
+fn parseClientControlOptions(args: []const []const u8) !ClientControlOptions {
+    const command = args[0];
+    var i: usize = 1;
+    const action: pb.ClientControlAction = if (std.mem.eql(u8, command, "detach-client"))
+        .CLIENT_CONTROL_ACTION_DETACH
+    else if (std.mem.eql(u8, command, "repaint-client"))
+        .CLIENT_CONTROL_ACTION_REPAINT
+    else if (std.mem.eql(u8, command, "debug-client")) blk: {
+        if (i >= args.len) return error.MissingDebugAction;
+        const debug_action = args[i];
+        i += 1;
+        if (std.mem.eql(u8, debug_action, "sever-connection")) {
+            break :blk .CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION;
+        } else if (std.mem.eql(u8, debug_action, "unresponsive-connection")) {
+            break :blk .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION;
+        } else {
+            return error.InvalidDebugAction;
+        }
+    } else return error.InvalidClientControlCommand;
+
+    var target_kind: pb.ClientControlTargetKind = if (action == .CLIENT_CONTROL_ACTION_REPAINT)
+        .CLIENT_CONTROL_TARGET_KIND_ALL
+    else
+        .CLIENT_CONTROL_TARGET_KIND_DEFAULT;
+    var explicit_target = false;
+    var client_guid: []const u8 = "";
+    var include_scrollback = false;
+    var session_ref: ?[]const u8 = null;
+
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--all")) {
+            if (explicit_target) return error.MultipleTargets;
+            explicit_target = true;
+            target_kind = .CLIENT_CONTROL_TARGET_KIND_ALL;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--last-input")) {
+            if (explicit_target) return error.MultipleTargets;
+            explicit_target = true;
+            target_kind = .CLIENT_CONTROL_TARGET_KIND_LAST_INPUT;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--client")) {
+            if (explicit_target) return error.MultipleTargets;
+            explicit_target = true;
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingClientGuid;
+            client_guid = args[i];
+            target_kind = .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--scrollback")) {
+            if (action != .CLIENT_CONTROL_ACTION_REPAINT) return error.UnsupportedClientControlArgs;
+            include_scrollback = true;
+            i += 1;
+        } else if (std.mem.startsWith(u8, args[i], "--")) {
+            return error.InvalidClientControlArgs;
+        } else if (session_ref == null) {
+            session_ref = args[i];
+            i += 1;
+        } else {
+            return error.InvalidClientControlArgs;
+        }
+    }
+
+    return .{
+        .session_ref = session_ref orelse return error.MissingSessionRef,
+        .action = action,
+        .target_kind = target_kind,
+        .client_guid = client_guid,
+        .include_scrollback = include_scrollback,
+    };
 }
 
 fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
@@ -188,6 +307,235 @@ fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
 
     try io.writeAll(1, stdout.items);
     return 0;
+}
+
+fn listClients(allocator: std.mem.Allocator, options: ListClientsOptions) !u8 {
+    var paths = pathsForLocalSessionRef(allocator, options.session_ref) catch |err| switch (err) {
+        error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
+            try io.writeAll(2, "ERROR session not found\n");
+            return 1;
+        },
+        else => return err,
+    };
+    defer paths.deinit(allocator);
+
+    var meta = session_registry.readMeta(allocator, paths) catch {
+        session_registry.removeStaleHints(paths) catch {};
+        try io.writeAll(2, "ERROR session not found\n");
+        return 1;
+    };
+    defer meta.deinit(allocator);
+    if (!processExists(meta.agent_pid)) {
+        session_registry.removeStaleHints(paths) catch {};
+        try io.writeAll(2, "ERROR session not found\n");
+        return 1;
+    }
+
+    var state = querySessionLiveState(allocator, paths) catch |err| {
+        try writeCommandErrorForAgentFailure(err);
+        return 1;
+    };
+    defer state.deinit(allocator);
+    std.mem.sort(pb.AttachedClient, state.attached_clients.items, {}, attachedClientSortLessThan);
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    const writer = stdout.writer(allocator);
+    switch (options.format) {
+        .table => try writeClientTable(writer, state.attached_clients.items),
+        .jsonl => try writeClientJsonlRows(writer, state.attached_clients.items),
+    }
+    try io.writeAll(1, stdout.items);
+    return 0;
+}
+
+fn runClientControlCommand(allocator: std.mem.Allocator, options: ClientControlOptions) !void {
+    var paths = pathsForLocalSessionRef(allocator, options.session_ref) catch |err| switch (err) {
+        error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
+            return finishCommand(1, "", "ERROR session not found\n");
+        },
+        else => return err,
+    };
+    defer paths.deinit(allocator);
+
+    var meta = session_registry.readMeta(allocator, paths) catch {
+        session_registry.removeStaleHints(paths) catch {};
+        return finishCommand(1, "", "ERROR session not found\n");
+    };
+    defer meta.deinit(allocator);
+    if (!processExists(meta.agent_pid)) {
+        session_registry.removeStaleHints(paths) catch {};
+        return finishCommand(1, "", "ERROR session not found\n");
+    }
+
+    var response = sendSessionClientControlRequest(allocator, paths, options) catch |err| {
+        try writeCommandErrorForAgentFailure(err);
+        return process_exit.request(1);
+    };
+    defer response.deinit(allocator);
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    const writer = stdout.writer(allocator);
+    const verb = clientControlResultVerb(options.action);
+    for (response.affected_client_guid.items) |client_guid| {
+        try writer.print("{s} {s}\n", .{ verb, client_guid });
+    }
+    return finishCommand(0, stdout.items, "");
+}
+
+fn attachedClientSortLessThan(_: void, a: pb.AttachedClient, b: pb.AttachedClient) bool {
+    const a_input = a.last_input_at_unix_ms orelse 0;
+    const b_input = b.last_input_at_unix_ms orelse 0;
+    if (a_input != b_input) return a_input > b_input;
+    if (a.attached_at_unix_ms != b.attached_at_unix_ms) return a.attached_at_unix_ms > b.attached_at_unix_ms;
+    return std.mem.lessThan(u8, a.client_guid, b.client_guid);
+}
+
+fn writeClientTable(writer: anytype, clients: []const pb.AttachedClient) !void {
+    try writer.writeAll("CLIENT                                ATTACHED  INPUT     SIZE\n");
+    const now_ms = nowUnixMs();
+    for (clients) |client_info| {
+        var attached_buf: [32]u8 = undefined;
+        var input_buf: [32]u8 = undefined;
+        var size_buf: [24]u8 = undefined;
+        const attached = try formatRelativeUnixMs(&attached_buf, now_ms, client_info.attached_at_unix_ms);
+        const input = if (client_info.last_input_at_unix_ms) |ts|
+            try formatRelativeUnixMs(&input_buf, now_ms, ts)
+        else
+            "never";
+        const size = if (client_info.terminal_size) |size_value|
+            try std.fmt.bufPrint(&size_buf, "{}x{}", .{ size_value.terminal_rows, size_value.terminal_cols })
+        else
+            "unknown";
+        try writePadded(writer, client_info.client_guid, 38);
+        try writer.writeAll("  ");
+        try writePadded(writer, attached, 8);
+        try writer.writeAll("  ");
+        try writePadded(writer, input, 8);
+        try writer.writeAll("  ");
+        try writer.writeAll(size);
+        try writer.writeAll("\n");
+    }
+}
+
+fn writeClientJsonlRows(writer: anytype, clients: []const pb.AttachedClient) !void {
+    for (clients) |client_info| {
+        try writer.writeAll("{\"client_guid\":");
+        try writeJsonString(writer, client_info.client_guid);
+        try writer.print(",\"attached_at_unix_ms\":{}", .{client_info.attached_at_unix_ms});
+        try writer.writeAll(",\"last_input_at_unix_ms\":");
+        if (client_info.last_input_at_unix_ms) |ts| {
+            try writer.print("{}", .{ts});
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"terminal_size\":");
+        if (client_info.terminal_size) |size_value| {
+            try writer.print(
+                "{{\"terminal_rows\":{},\"terminal_cols\":{}}}",
+                .{ size_value.terminal_rows, size_value.terminal_cols },
+            );
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll("}\n");
+    }
+}
+
+fn writePadded(writer: anytype, value: []const u8, width: usize) !void {
+    try writer.writeAll(value);
+    if (value.len >= width) return;
+    for (0..(width - value.len)) |_| try writer.writeByte(' ');
+}
+
+fn writeJsonString(writer: anytype, value: []const u8) !void {
+    try writer.writeByte('"');
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0c => try writer.writeAll("\\f"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x00...0x07, 0x0b, 0x0e...0x1f => try writer.print("\\u{x:0>4}", .{byte}),
+            else => try writer.writeByte(byte),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn formatRelativeUnixMs(buf: []u8, now_ms: u64, ts_ms: u64) ![]const u8 {
+    const delta_ms = now_ms -| ts_ms;
+    const seconds = delta_ms / std.time.ms_per_s;
+    if (seconds < 60) return std.fmt.bufPrint(buf, "{}s ago", .{seconds});
+    const minutes = seconds / 60;
+    if (minutes < 60) return std.fmt.bufPrint(buf, "{}m ago", .{minutes});
+    const hours = minutes / 60;
+    if (hours < 24) return std.fmt.bufPrint(buf, "{}h ago", .{hours});
+    return std.fmt.bufPrint(buf, "{}d ago", .{hours / 24});
+}
+
+fn nowUnixMs() u64 {
+    const ms = std.time.milliTimestamp();
+    if (ms <= 0) return 0;
+    return @intCast(ms);
+}
+
+fn sendSessionClientControlRequest(
+    allocator: std.mem.Allocator,
+    paths: session_registry.SessionPaths,
+    options: ClientControlOptions,
+) !pb.SessionClientControlResponse {
+    const fd = try socket_transport.connectSocket(paths.socket);
+    defer _ = c.close(fd);
+
+    try initiateRuntimeHandshake(allocator, fd);
+    const payload = try protocol.encodePayload(allocator, pb.SessionClientControlRequest{
+        .action = options.action,
+        .target_kind = options.target_kind,
+        .client_guid = options.client_guid,
+        .include_scrollback = options.include_scrollback,
+    });
+    defer allocator.free(payload);
+    try protocol.sendFrame(fd, .session_client_control_request, payload);
+
+    var frame = try protocol.readFrameAlloc(allocator, fd);
+    defer frame.deinit(allocator);
+    switch (frame.message_type) {
+        .session_client_control_response => return protocol.decodePayload(pb.SessionClientControlResponse, allocator, frame.payload),
+        .error_message => {
+            var message = try protocol.decodePayload(hpb.Error, allocator, frame.payload);
+            defer message.deinit(allocator);
+            try io.stderrPrint("ERROR {s}\n", .{message.message});
+            return error.AgentRejectedClientControl;
+        },
+        else => return error.UnexpectedFrame,
+    }
+}
+
+fn clientControlResultVerb(action: pb.ClientControlAction) []const u8 {
+    return switch (action) {
+        .CLIENT_CONTROL_ACTION_DETACH => "DETACHED",
+        .CLIENT_CONTROL_ACTION_REPAINT => "REPAINTED",
+        .CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION => "SEVERED",
+        .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION => "UNRESPONSIVE",
+        else => "UPDATED",
+    };
+}
+
+fn writeCommandErrorForAgentFailure(err: anyerror) !void {
+    const message = switch (err) {
+        error.AgentRejectedClientControl => "",
+        error.SessionLiveStateUnavailable => "ERROR session state unavailable\n",
+        error.VersionMismatch => "ERROR session agent is incompatible\n",
+        error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => "ERROR session not found\n",
+        else => "ERROR session command failed\n",
+    };
+    if (message.len == 0) return;
+    try io.writeAll(2, message);
 }
 
 fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
@@ -449,6 +797,12 @@ fn mostRecentAgent(allocator: std.mem.Allocator) !?session_registry.SessionPaths
 }
 
 fn querySessionLiveStateDetachedAt(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !?u64 {
+    var state = try querySessionLiveState(allocator, paths);
+    defer state.deinit(allocator);
+    return state.detached_at_unix_ms;
+}
+
+fn querySessionLiveState(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !pb.SessionLiveState {
     const fd = try socket_transport.connectSocket(paths.socket);
     defer _ = c.close(fd);
 
@@ -461,11 +815,7 @@ fn querySessionLiveStateDetachedAt(allocator: std.mem.Allocator, paths: session_
     var frame = try protocol.readFrameAlloc(allocator, fd);
     defer frame.deinit(allocator);
     switch (frame.message_type) {
-        .session_live_state => {
-            var state = try protocol.decodePayload(pb.SessionLiveState, allocator, frame.payload);
-            defer state.deinit(allocator);
-            return state.detached_at_unix_ms;
-        },
+        .session_live_state => return protocol.decodePayload(pb.SessionLiveState, allocator, frame.payload),
         .error_message => return error.SessionLiveStateUnavailable,
         else => return error.UnexpectedFrame,
     }

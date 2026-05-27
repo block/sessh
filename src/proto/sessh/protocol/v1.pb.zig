@@ -7,6 +7,24 @@ const fd = protobuf.fd;
 /// import package sessh.handshake.v1
 const sessh_handshake_v1 = @import("../handshake/v1.pb.zig");
 
+pub const ClientControlAction = enum(i32) {
+    CLIENT_CONTROL_ACTION_UNSPECIFIED = 0,
+    CLIENT_CONTROL_ACTION_DETACH = 1,
+    CLIENT_CONTROL_ACTION_REPAINT = 2,
+    CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION = 3,
+    CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION = 4,
+    _,
+};
+
+pub const ClientControlTargetKind = enum(i32) {
+    CLIENT_CONTROL_TARGET_KIND_UNSPECIFIED = 0,
+    CLIENT_CONTROL_TARGET_KIND_DEFAULT = 1,
+    CLIENT_CONTROL_TARGET_KIND_ALL = 2,
+    CLIENT_CONTROL_TARGET_KIND_LAST_INPUT = 3,
+    CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID = 4,
+    _,
+};
+
 pub const SessionEndReason = enum(i32) {
     SESSION_END_REASON_UNSPECIFIED = 0,
     SESSION_END_REASON_PROCESS_EXITED = 1,
@@ -59,6 +77,10 @@ pub const Frame = struct {
         input_ack,
         session_live_state_query,
         session_live_state,
+        session_client_control_request,
+        session_client_control_response,
+        client_repaint_request,
+        client_detach_request,
     };
     pub const payload_union = union(_payload_case) {
         @"error": sessh_handshake_v1.Error,
@@ -76,6 +98,10 @@ pub const Frame = struct {
         input_ack: InputAck,
         session_live_state_query: SessionLiveStateQuery,
         session_live_state: SessionLiveState,
+        session_client_control_request: SessionClientControlRequest,
+        session_client_control_response: SessionClientControlResponse,
+        client_repaint_request: ClientRepaintRequest,
+        client_detach_request: ClientDetachRequest,
         pub const _desc_table = .{
             .@"error" = fd(10, .submessage),
             .session_create = fd(11, .submessage),
@@ -92,6 +118,10 @@ pub const Frame = struct {
             .input_ack = fd(24, .submessage),
             .session_live_state_query = fd(25, .submessage),
             .session_live_state = fd(26, .submessage),
+            .session_client_control_request = fd(27, .submessage),
+            .session_client_control_response = fd(28, .submessage),
+            .client_repaint_request = fd(29, .submessage),
+            .client_detach_request = fd(30, .submessage),
         };
     };
 
@@ -823,6 +853,141 @@ pub const RepaintRequest = struct {
 
 /// Framed payload, session agent -> client.
 ///
+/// Requests that an attached client initiate its normal repaint flow by sending
+/// a RepaintRequest back to the session agent.
+pub const ClientRepaintRequest = struct {
+    include_scrollback: bool = false,
+
+    pub const _desc_table = .{
+        .include_scrollback = fd(1, .{ .scalar = .bool }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, session agent -> client.
+///
+/// Requests that an attached client detach using its normal local detach flow.
+pub const ClientDetachRequest = struct {
+    pub const _desc_table = .{};
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, session agent -> client.
+///
 /// Confirms that a SessionCreate created the requested session.
 pub const SessionCreated = struct {
     session_guid: []const u8 = &.{},
@@ -1107,11 +1272,158 @@ pub const AttachedClient = struct {
     client_guid: []const u8 = &.{},
     terminal_size: ?TerminalSize = null,
     attached_at_unix_ms: u64 = 0,
+    last_input_at_unix_ms: ?u64 = null,
 
     pub const _desc_table = .{
         .client_guid = fd(1, .{ .scalar = .string }),
         .terminal_size = fd(2, .submessage),
         .attached_at_unix_ms = fd(3, .{ .scalar = .uint64 }),
+        .last_input_at_unix_ms = fd(4, .{ .scalar = .uint64 }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, broker/client -> session agent.
+///
+/// Applies a client-management operation to one or more attachments for this
+/// agent's live session.
+pub const SessionClientControlRequest = struct {
+    action: ClientControlAction = @enumFromInt(0),
+    target_kind: ClientControlTargetKind = @enumFromInt(0),
+    client_guid: []const u8 = &.{},
+    include_scrollback: bool = false,
+
+    pub const _desc_table = .{
+        .action = fd(1, .@"enum"),
+        .target_kind = fd(2, .@"enum"),
+        .client_guid = fd(3, .{ .scalar = .string }),
+        .include_scrollback = fd(4, .{ .scalar = .bool }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, session agent -> broker/client.
+///
+/// Confirms which attached clients were affected by a client-control request.
+pub const SessionClientControlResponse = struct {
+    affected_client_guid: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    pub const _desc_table = .{
+        .affected_client_guid = fd(1, .{ .repeated = .{ .scalar = .string } }),
     };
 
     /// Encodes the message to the writer
