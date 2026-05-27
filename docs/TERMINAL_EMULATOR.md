@@ -86,4 +86,7 @@ terminal's alternate screen.
 
 When mouse reporting is requested, we align the viewports and redraw before
 forwarding the request on to the outer terminal. That way the outer terminal
-never reports an event with pre-aligned coordinates.
+never reports an event with pre-aligned coordinates. It might be possible to
+support mouse reporting without aligning the viewports by translating the
+coordinates, but most programs that use mouse reporting also use the alternate
+screen so it doesn't seem important.
