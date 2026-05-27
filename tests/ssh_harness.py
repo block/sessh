@@ -242,6 +242,9 @@ if [ -n "${SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND:-}" ]; then
   printf 'fake ssh failed before remote command\\n' >&2
   exit "$SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"
 fi
+if [ -n "${SESSH_FAKE_SSH_STDERR_BEFORE_COMMAND:-}" ]; then
+  printf '%s\n' "$SESSH_FAKE_SSH_STDERR_BEFORE_COMMAND" >&2
+fi
 if [ -n "${SESSH_FAKE_SSH_REMOTE_PATH:-}" ]; then
   PATH=$SESSH_FAKE_SSH_REMOTE_PATH:$PATH
   export PATH
@@ -634,6 +637,10 @@ def normalized_ui_messages(text):
         if message not in messages:
             messages.append(message)
     return messages
+
+
+def strip_bootstrap_status(stderr):
+    return stderr.replace("\rsessh: bootstrapping...", "").replace("\r\x1b[K", "")
 
 
 def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, timeout=30.0):
@@ -1100,6 +1107,12 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(
             ssh_failure_diagnostics("bootstrap protocol leaked to client output", result, fake_log, fake_trace)
         )
+    status_start = result.stderr.find("sessh: bootstrapping...")
+    status_clear = result.stderr.find("\x1b[K", status_start + 1)
+    if status_start < 0 or status_clear < 0 or status_clear < status_start:
+        raise AssertionError(
+            ssh_failure_diagnostics("bootstrap status was not displayed and cleared", result, fake_log, fake_trace)
+        )
 
     artifact = remote_path_artifact()
     installed = artifact_cache_path(env, artifact)
@@ -1114,6 +1127,33 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     route = route_file(env, "s1")
     if not route.exists():
         raise AssertionError("uploaded broker did not create a session route")
+
+
+def test_ssh_pre_attach_stderr_forwards_immediately(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_PRE_ATTACH_STDERR_READY"
+    raw_ssh_error = "pre-attach ssh warning: \x1b[31mred"
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_STDERR_BEFORE_COMMAND"] = raw_ssh_error
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["test-host"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+    if raw_ssh_error not in result.stderr:
+        raise AssertionError(result)
+    if "ssh ts_ms=" in result.stderr:
+        raise AssertionError(result)
 
 
 def test_ssh_transport_pins_ipqos_to_interactive_config_value(tmp):
@@ -1928,7 +1968,7 @@ def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
         raise AssertionError(result)
     if "ssh stderr:" in result.stdout or "sessh: log" in result.stdout or "level=warn" in result.stdout:
         raise AssertionError(result)
-    if result.stderr:
+    if strip_bootstrap_status(result.stderr):
         raise AssertionError(result)
     if (Path(env["XDG_CACHE_HOME"]) / "sessh" / "clients").exists():
         raise AssertionError("client logs were written to persistent cache")
@@ -2425,6 +2465,10 @@ def main(argv=None):
         (
             "ssh transport uploads artifact and reaches broker",
             test_ssh_transport_uploads_artifact_and_reaches_broker,
+        ),
+        (
+            "ssh pre-attach stderr forwards immediately",
+            test_ssh_pre_attach_stderr_forwards_immediately,
         ),
         (
             "ssh transport pins ipqos to interactive config value",

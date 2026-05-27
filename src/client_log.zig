@@ -129,8 +129,7 @@ fn append(level: Level, comptime fmt: []const u8, args: anytype) void {
     appendMessageLocked(level, body);
 }
 
-pub fn appendSshStderr(bytes: []const u8, forwarded: bool) void {
-    _ = forwarded;
+pub fn appendSshStderr(bytes: []const u8) void {
     mutex.lock();
     defer mutex.unlock();
 
@@ -401,7 +400,7 @@ fn resetForTest() void {
 
 test "user diagnostics are sanitized and limited" {
     resetForTest();
-    appendSshStderr("one\nbad\x1b[31m\nthree\nfour", false);
+    appendSshStderr("one\nbad\x1b[31m\nthree\nfour");
 
     var lines: [3]UserDiagnosticLine = undefined;
     const seq = copyUserDiagnosticsSince(0, &lines);

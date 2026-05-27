@@ -285,7 +285,11 @@ fn stderrPumpMain(state: *SshStderrPump.State) void {
         if (n <= 0) return;
         const bytes = buf[0..@intCast(n)];
         const forward = state.forward.load(.acquire);
-        client_log.appendSshStderr(bytes, forward);
+        if (forward) {
+            io.writeAll(2, bytes) catch {};
+            continue;
+        }
+        client_log.appendSshStderr(bytes);
     }
 }
 
