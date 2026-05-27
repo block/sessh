@@ -65,7 +65,7 @@ jobs:
           echo "$RUNNER_TEMP/python/bin" >> "$GITHUB_PATH"
 
       - name: Verify
-        run: scripts/check --fast
+        run: scripts/check --ci
 
       - name: Build release archive
         run: scripts/build --dist "$RUNNER_TEMP/dist"

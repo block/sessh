@@ -77,7 +77,7 @@ jobs:
           fi
 
       - name: Verify
-        run: scripts/check --fast
+        run: scripts/check --ci
 
       - name: Build release archive
         run: scripts/build --version "${GITHUB_REF_NAME#v}"

@@ -20,7 +20,7 @@ sessh-X.Y.Z/
 
 1. Make sure the current branch is `main`.
 2. Make sure the working tree is clean.
-3. Run `scripts/check`.
+3. Run `scripts/check --ci`.
 
 The release workflow checks that the tag version matches both version fields.
 A tag `vX.Y.Z` should produce a binary whose `sessh --version` output is
@@ -64,7 +64,7 @@ publishing side effect, such as the Homebrew tap bump, needs separate follow-up.
 The GitHub release workflow triggered by the tag:
 
 1. installs Zig 0.15.2 and protobuf;
-2. runs `scripts/check --fast`;
+2. runs `scripts/check --ci`;
 3. builds `dist/sessh-X.Y.Z.tar.gz`;
 4. publishes the archive and `.sha256` file to the GitHub release;
 5. triggers `block/homebrew-tap`'s `bump-formula.yaml` workflow for `sessh`.

@@ -13,12 +13,16 @@ sessh currently requires Zig 0.15.2. On macOS, install it with:
 brew install zig@0.15
 ```
 
-Run commands from the repository root. Use the repository check script for the
-current implementation:
+Run commands from the repository root. Use the fast repository check script for
+quick local smoke coverage:
 
 ```sh
-scripts/check
+scripts/check --fast
 ```
+
+Also run the specific tests that cover the code you changed. Run
+`scripts/check --ci` before releasing or when you need the same coverage as
+continuous integration. `scripts/check --full` adds the slow Podman ssh harness.
 
 Run:
 ```

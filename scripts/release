@@ -186,7 +186,7 @@ def main() -> int:
     commit_staged(f"Release {tag}")
     release_sha = output("git", "rev-parse", "HEAD")
 
-    if run("scripts/check", "--fast", check=False).returncode != 0:
+    if run("scripts/check", "--ci", check=False).returncode != 0:
         run("git", "switch", MAIN_BRANCH)
         fail(f"local check failed for {tag}; commit fixes to {MAIN_BRANCH} and re-run scripts/release")
 

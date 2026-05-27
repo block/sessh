@@ -11,6 +11,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import termios
@@ -2331,7 +2332,10 @@ def run_test(name, fn):
     print(f"ok {name}")
 
 
-def main():
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
     tests = (
         ("fake ssh exports host to remote command", test_fake_ssh_exports_host_to_remote_command),
         (
@@ -2479,9 +2483,24 @@ def main():
             test_ssh_force_compat_ctrl_c_reaches_remote_pty,
         ),
     )
+
+    selected_name = None
+    if argv:
+        if len(argv) != 2 or argv[0] != "--case":
+            print("usage: tests/ssh_harness.py [--case NAME]", file=sys.stderr)
+            return 64
+        selected_name = argv[1]
+
+    if selected_name is not None:
+        tests = tuple((name, fn) for name, fn in tests if name == selected_name)
+        if not tests:
+            print(f"unknown ssh harness case: {selected_name}", file=sys.stderr)
+            return 64
+
     for name, fn in tests:
         run_test(name, fn)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

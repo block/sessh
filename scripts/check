@@ -3,14 +3,16 @@ set -eu
 
 usage() {
   cat <<'EOF'
-usage: scripts/check [--fast]
+usage: scripts/check [--fast|--ci|--full]
 
-Runs the sessh Zig build, Termless smoke tests, bootstrapper harness,
-fake-ssh harness, socket harness, tmux terminal harness, terminal conformance
-harness, and slow Podman ssh harness.
+Runs sessh verification. With no mode, defaults to --fast.
 
 Options:
-  --fast    Skip the slow Podman ssh harness.
+  --fast    Build sesshmux-dev and run a fake-ssh smoke connect.
+  --ci      Run the CI suite: Zig build/tests, Termless smoke tests,
+            bootstrapper harness, fake-ssh harness, socket harness,
+            tmux terminal harness, and terminal conformance harness.
+  --full    Run --ci plus the slow Podman ssh harness.
 EOF
 }
 
@@ -140,13 +142,21 @@ EOF
   fi
 }
 
-fast=0
+mode=fast
 
 case "${1-}" in
   "")
     ;;
   --fast)
-    fast=1
+    mode=fast
+    shift
+    ;;
+  --ci)
+    mode=ci
+    shift
+    ;;
+  --full)
+    mode=full
     shift
     ;;
   --help|-h)
@@ -172,27 +182,39 @@ if [ "$zig_version" != "0.15.2" ]; then
 fi
 protoc_bin=$(find_protoc)
 export SESSH_PROTOC=$protoc_bin
-check_python_protobuf
 
-run "$zig_bin" build gen-proto
-run sh -n scripts/build scripts/check scripts/check-termless scripts/download-ghostty-deps scripts/install
-run python3 -m py_compile scripts/release
-run "$zig_bin" fmt --check build.zig build.zig.zon src/*.zig
-run "$zig_bin" build
-run "$zig_bin" build install-dev
-run scripts/check-termless --no-build
-run "$zig_bin" build test
-setup_isolation
-trap cleanup_isolation EXIT
-run_isolated python3 tests/bootstrapper_harness.py
-run_isolated python3 tests/ssh_harness.py
-run_isolated python3 tests/ssh_reconnect_tmux_harness.py
-run_isolated python3 tests/socket_harness.py
-run_isolated python3 tests/tmux_harness.py
-# Tmux-only conformance catches renderer regressions without the Podman setup.
-run_isolated python3 tests/terminal_conformance_harness.py
-if [ "$fast" -eq 0 ]; then
-  printf '\n==> Slow Podman ssh harness is about to start. Run `scripts/check --fast` to skip it.\n'
-  run_isolated python3 tests/podman_ssh_harness.py
-fi
-run git diff --check
+case "$mode" in
+  fast)
+    run "$zig_bin" build install-dev
+    setup_isolation
+    trap cleanup_isolation EXIT
+    run_isolated python3 tests/ssh_harness.py --case "ssh transport uploads artifact and reaches broker"
+    run git diff --check
+    ;;
+  ci|full)
+    check_python_protobuf
+
+    run "$zig_bin" build gen-proto
+    run sh -n scripts/build scripts/check scripts/check-termless scripts/download-ghostty-deps scripts/install
+    run python3 -m py_compile scripts/release
+    run "$zig_bin" fmt --check build.zig build.zig.zon src/*.zig
+    run "$zig_bin" build
+    run "$zig_bin" build install-dev
+    run scripts/check-termless --no-build
+    run "$zig_bin" build test
+    setup_isolation
+    trap cleanup_isolation EXIT
+    run_isolated python3 tests/bootstrapper_harness.py
+    run_isolated python3 tests/ssh_harness.py
+    run_isolated python3 tests/ssh_reconnect_tmux_harness.py
+    run_isolated python3 tests/socket_harness.py
+    run_isolated python3 tests/tmux_harness.py
+    # Tmux-only conformance catches renderer regressions without the Podman setup.
+    run_isolated python3 tests/terminal_conformance_harness.py
+    if [ "$mode" = "full" ]; then
+      printf '\n==> Slow Podman ssh harness is about to start. Run `scripts/check --ci` to skip it.\n'
+      run_isolated python3 tests/podman_ssh_harness.py
+    fi
+    run git diff --check
+    ;;
+esac
