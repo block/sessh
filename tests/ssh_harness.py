@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import hashlib
 import fcntl
+import json
 import os
 import pty
 import re
@@ -847,15 +848,21 @@ def write_ssh_route(env, alias, guid, host, ssh_options=()):
     session = state_sessions_dir(env) / guid
     session.mkdir(mode=0o700, parents=True, exist_ok=True)
     remote_session_dir = runtime_root(env) / "guid" / guid
-    lines = [
-        f"guid={guid}",
-        f"primary_alias={alias}",
-        f"session_dir={remote_session_dir}",
-        f"host={host}",
-        "agent_version=cached-test",
-    ]
-    lines.extend(f"ssh_option={option}" for option in ssh_options)
-    (session / "route").write_text("\n".join(lines) + "\n")
+    (session / "route.json").write_text(
+        json.dumps(
+            {
+                "guid": guid,
+                "primary_alias": alias,
+                "session_dir": str(remote_session_dir),
+                "host": host,
+                "agent_version": "cached-test",
+                "alive": True,
+                "ssh_options": list(ssh_options),
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
     return session
 
 
@@ -871,11 +878,11 @@ def session_path(env, session_id="s1"):
 
 def route_file(env, session_id="s1"):
     if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
-        return state_sessions_dir(env) / canonical_guid(session_id) / "route"
+        return state_sessions_dir(env) / canonical_guid(session_id) / "route.json"
     alias_path = aliases_dir(env) / session_id
     if not alias_path.is_symlink():
         ensure_alias(env, session_id)
-    return state_sessions_dir(env) / canonical_guid(Path(os.readlink(alias_path)).name) / "route"
+    return state_sessions_dir(env) / canonical_guid(Path(os.readlink(alias_path)).name) / "route.json"
 
 
 def actual_socket_path(env, session_id="s1"):
@@ -944,7 +951,9 @@ def version_mismatch_frame():
 def start_version_mismatch_agent(env, session_id="s1"):
     ensure_agent_socket_link(env, session_id)
     session = session_path(env, session_id)
-    (session / "meta").write_text(f"agent_pid={os.getpid()}\nversion=0.0.0-compat-test\n")
+    (session / "meta.json").write_text(
+        json.dumps({"agent_pid": os.getpid(), "version": "0.0.0-compat-test"}, separators=(",", ":")) + "\n"
+    )
     (session / "detached").write_text("")
     sock_path = actual_socket_path(env, session_id)
     try:

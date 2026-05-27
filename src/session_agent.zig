@@ -47,6 +47,7 @@ const Session = struct {
     last_scrollback_clear_epoch: u64 = 1,
     end_reason: u8 = 0,
     attached: bool = false,
+    detached_at_unix_ms: u64 = 0,
     alive: bool = false,
     pending_plain_output: std.ArrayList(u8) = .empty,
     pending_plain_starts_at_boundary: bool = false,
@@ -90,6 +91,7 @@ const Attachment = struct {
     client_guid_len: usize = 0,
     rows: u16 = 24,
     cols: u16 = 80,
+    attached_at_unix_ms: u64 = 0,
     origin: ?TerminalOrigin = null,
     active: bool = false,
     close_after_flush: bool = false,
@@ -102,6 +104,10 @@ const Attachment = struct {
 
     fn queuedBytes(self: *const Attachment) usize {
         return self.output.items.len - self.output_offset;
+    }
+
+    fn clientGuidSlice(self: *const Attachment) []const u8 {
+        return self.client_guid[0..self.client_guid_len];
     }
 };
 
@@ -1141,7 +1147,6 @@ fn repairSessionAgentRuntime(session_agent: *SessionAgent, listen_fd: *c.fd_t) !
     try session_registry.ensureRuntimeLayout(app_allocator.allocator(), paths);
     try writeAgentCompatBinary(paths);
     try session_registry.writeMeta(paths, c.getpid(), config.version);
-    refreshRuntimeAttachmentHints(session_agent);
 
     if (socket_was_missing or !try socketPathIsSocket(paths.socket)) {
         const new_listen_fd = try socket_transport.listenSocket(paths.socket);
@@ -1150,21 +1155,6 @@ fn repairSessionAgentRuntime(session_agent: *SessionAgent, listen_fd: *c.fd_t) !
         _ = c.close(old_listen_fd);
         logSessionAgent(session_agent, "event=runtime_socket_rebound socket={s}", .{paths.socket});
     }
-}
-
-fn refreshRuntimeAttachmentHints(session_agent: *SessionAgent) void {
-    var any_live = false;
-    var any_attached = false;
-    for (&session_agent.sessions, 0..) |*session, i| {
-        if (!session.alive) continue;
-        any_live = true;
-        if (attachedCount(session_agent, i) > 0) {
-            any_attached = true;
-            break;
-        }
-    }
-    if (!any_live) return;
-    updateAttachmentHints(session_agent, any_attached);
 }
 
 fn socketPathIsSocket(path: []const u8) !bool {
@@ -1257,10 +1247,14 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                 const session = &session_agent.sessions[session_index];
                 if (session_agent.session_paths) |paths| {
                     try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), alias, paths.dir, config.version);
-                    session_registry.markDetached(paths) catch {};
+                    session.detached_at_unix_ms = nowUnixMs();
                 }
                 try sendSessionCreatedForSession(session_agent, fd, session, alias);
                 continue;
+            },
+            .session_live_state_query => {
+                try sendSessionLiveState(session_agent, fd);
+                return false;
             },
             .session_attach => {
                 var request = try readAttachRequest(frame.payload);
@@ -1521,6 +1515,33 @@ fn sendSessionCreatedForSession(session_agent: *const SessionAgent, fd: c.fd_t, 
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .session_created, payload);
+}
+
+fn sendSessionLiveState(session_agent: *SessionAgent, fd: c.fd_t) !void {
+    const session_index = findMostRecentSessionIndex(session_agent) orelse {
+        try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
+        return;
+    };
+    const session = &session_agent.sessions[session_index];
+    var response = pb.SessionLiveState{};
+    defer response.attached_clients.deinit(app_allocator.allocator());
+
+    if (session.detached_at_unix_ms != 0) response.detached_at_unix_ms = session.detached_at_unix_ms;
+    for (&session_agent.attachments) |*attachment| {
+        if (!attachment.active or attachment.close_after_flush or attachment.session_index != session_index) continue;
+        try response.attached_clients.append(app_allocator.allocator(), .{
+            .client_guid = attachment.clientGuidSlice(),
+            .terminal_size = .{
+                .terminal_rows = attachment.rows,
+                .terminal_cols = attachment.cols,
+            },
+            .attached_at_unix_ms = attachment.attached_at_unix_ms,
+        });
+    }
+
+    const payload = try protocol.encodePayload(app_allocator.allocator(), response);
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .session_live_state, payload);
 }
 
 fn sessionDirSlice(session_agent: *const SessionAgent) []const u8 {
@@ -2330,6 +2351,7 @@ fn attachSession(
             .client_guid_len = client_guid.len,
             .rows = resize.rows,
             .cols = resize.cols,
+            .attached_at_unix_ms = nowUnixMs(),
             .active = true,
             .capture_tty_transcript = capture_tty_transcript,
         };
@@ -2900,8 +2922,13 @@ fn refreshAttachedFlag(session_agent: *SessionAgent, session_index: usize) void 
 
     const count = attachedCount(session_agent, session_index);
     const now_attached = count > 0;
+    const was_attached = session_agent.sessions[session_index].attached;
     session_agent.sessions[session_index].attached = now_attached;
-    updateAttachmentHints(session_agent, now_attached);
+    if (now_attached) {
+        session_agent.sessions[session_index].detached_at_unix_ms = 0;
+    } else if (was_attached or session_agent.sessions[session_index].detached_at_unix_ms == 0) {
+        session_agent.sessions[session_index].detached_at_unix_ms = nowUnixMs();
+    }
 }
 
 fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, exit_info: ExitInfo) void {
@@ -2935,15 +2962,6 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
     session.deinit();
     session.alive = false;
     session.attached = false;
-}
-
-fn updateAttachmentHints(session_agent: *SessionAgent, attached: bool) void {
-    if (session_agent.session_paths == null) return;
-    if (attached) {
-        session_registry.markAttached(session_agent.session_paths.?) catch {};
-    } else {
-        session_registry.markDetached(session_agent.session_paths.?) catch {};
-    }
 }
 
 fn clearAttachmentHints(session_agent: *SessionAgent) void {

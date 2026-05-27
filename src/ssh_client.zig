@@ -1317,12 +1317,16 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\  canonical_session_id "$compact"
         \\}}
         \\find_latest_session_id() {{
-        \\  detached=$(ls -t "$runtime_root"/guid/*/detached 2>/dev/null | sed -n '1p')
-        \\  if [ -z "$detached" ]; then
+        \\  latest_dir=
+        \\  latest_marker=$(ls -t "$runtime_root"/guid/*/detached 2>/dev/null | sed -n '1p')
+        \\  if [ -n "$latest_marker" ]; then
+        \\    latest_dir=$(dirname "$latest_marker")
+        \\  fi
+        \\  if [ -z "$latest_dir" ]; then
         \\    printf 'sessh: no detached session is available for compat-mode\n' >&2
         \\    exit 1
         \\  fi
-        \\  basename "$(dirname "$detached")"
+        \\  basename "$latest_dir"
         \\}}
         \\exec_one_compat() {{
         \\  compat=$1

@@ -33,6 +33,8 @@ message Frame {
     RepaintResponse repaint_response = 22;
     TtyTranscriptChunk tty_transcript_chunk = 23;
     InputAck input_ack = 24;
+    SessionLiveStateQuery session_live_state_query = 25;
+    SessionLiveState session_live_state = 26;
   }
 }
 
@@ -190,6 +192,28 @@ message SessionAttached {
   string session_alias = 2;
   // Absolute path to this session's GUID directory
   string session_dir = 3;
+}
+
+// Framed payload, broker/client -> session agent.
+//
+// Queries the agent's current in-memory state for its live session.
+message SessionLiveStateQuery {
+}
+
+// Framed payload, session agent -> broker/client.
+//
+// In-memory live state for the session currently hosted by this agent.
+message SessionLiveState {
+  // Present only when the session is detached.
+  optional uint64 detached_at_unix_ms = 1;
+  repeated AttachedClient attached_clients = 2;
+}
+
+message AttachedClient {
+  // Canonical client GUID in c-prefixed hyphenated UUID form.
+  string client_guid = 1;
+  TerminalSize terminal_size = 2;
+  uint64 attached_at_unix_ms = 3;
 }
 
 enum SessionEndReason {

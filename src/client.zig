@@ -2200,7 +2200,7 @@ fn loadCachedRemoteRoutes(allocator: std.mem.Allocator, routes: *std.ArrayList(s
     var iterator = dir.iterate();
     while (try iterator.next()) |entry| {
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
-        const route_path = try std.fmt.allocPrint(allocator, "{s}/{s}/route", .{ state_sessions_dir, entry.name });
+        const route_path = try std.fmt.allocPrint(allocator, "{s}/{s}/route.json", .{ state_sessions_dir, entry.name });
         defer allocator.free(route_path);
         var route = session_registry.readRoute(allocator, route_path) catch continue;
         errdefer route.deinit(allocator);

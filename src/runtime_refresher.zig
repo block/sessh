@@ -78,7 +78,7 @@ fn refreshThreadMain(refresher: *RuntimeRefresher) void {
 }
 
 const PathSet = struct {
-    const max_paths = 9;
+    const max_paths = 8;
 
     paths: [max_paths][]u8 = undefined,
     len: usize = 0,
@@ -108,7 +108,6 @@ const PathSet = struct {
         try set.add(allocator, session_paths.socket);
         try set.add(allocator, session_paths.agent_sock_link);
         try set.add(allocator, session_paths.meta);
-        try set.add(allocator, session_paths.detached);
         try set.add(allocator, session_paths.compat);
 
         return set;
@@ -136,8 +135,6 @@ fn cloneSessionPaths(allocator: std.mem.Allocator, paths: session_registry.Sessi
     errdefer allocator.free(agent_sock_link);
     const meta = try allocator.dupe(u8, paths.meta);
     errdefer allocator.free(meta);
-    const detached = try allocator.dupe(u8, paths.detached);
-    errdefer allocator.free(detached);
     const compat = try allocator.dupe(u8, paths.compat);
     errdefer allocator.free(compat);
     const route = try allocator.dupe(u8, paths.route);
@@ -147,7 +144,6 @@ fn cloneSessionPaths(allocator: std.mem.Allocator, paths: session_registry.Sessi
         .socket = socket,
         .agent_sock_link = agent_sock_link,
         .meta = meta,
-        .detached = detached,
         .compat = compat,
         .route = route,
     };
@@ -253,8 +249,6 @@ test "refresh pass marks session runtime paths sticky without following symlinks
     socket_file.close();
     var meta_file = try std.fs.cwd().createFile(allocation.paths.meta, .{ .mode = 0o600 });
     meta_file.close();
-    var detached_file = try std.fs.cwd().createFile(allocation.paths.detached, .{ .mode = 0o600 });
-    detached_file.close();
     const target_path = try std.fmt.allocPrint(allocator, "{s}/outside-target", .{root});
     defer allocator.free(target_path);
     var target_file = try std.fs.cwd().createFile(target_path, .{ .mode = 0o600 });
@@ -276,7 +270,6 @@ test "refresh pass marks session runtime paths sticky without following symlinks
     try std.testing.expect((try statNoFollow(allocation.paths.dir)).mode & sticky_bit != 0);
     try std.testing.expect((try statNoFollow(allocation.paths.socket)).mode & sticky_bit != 0);
     try std.testing.expect((try statNoFollow(allocation.paths.meta)).mode & sticky_bit != 0);
-    try std.testing.expect((try statNoFollow(allocation.paths.detached)).mode & sticky_bit != 0);
     try std.testing.expect((try statNoFollow(allocation.paths.agent_sock_link)).mode & sticky_bit == 0);
     try std.testing.expect((try statNoFollow(allocation.paths.compat)).mode & sticky_bit == 0);
     try std.testing.expect((try statNoFollow(target_path)).mode & sticky_bit == 0);

@@ -164,7 +164,7 @@ fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
         var paths = try session_registry.pathsForSessionId(allocator, entry.name);
         defer paths.deinit(allocator);
-        var meta = readSessionMeta(allocator, paths) catch {
+        var meta = session_registry.readMeta(allocator, paths) catch {
             session_registry.removeStaleHints(paths) catch {};
             continue;
         };
@@ -199,7 +199,7 @@ fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
     };
     defer paths.deinit(allocator);
 
-    var meta = readSessionMeta(allocator, paths) catch {
+    var meta = session_registry.readMeta(allocator, paths) catch {
         session_registry.removeStaleHints(paths) catch {};
         return finishCommand(1, "", "ERROR session not found\n");
     };
@@ -246,7 +246,7 @@ fn killAllAgents(allocator: std.mem.Allocator) !void {
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
         var paths = try session_registry.pathsForSessionId(allocator, entry.name);
         defer paths.deinit(allocator);
-        var meta = readSessionMeta(allocator, paths) catch {
+        var meta = session_registry.readMeta(allocator, paths) catch {
             session_registry.removeStaleHints(paths) catch {};
             continue;
         };
@@ -281,49 +281,6 @@ fn killAllAgents(allocator: std.mem.Allocator) !void {
     waitForAgents(targets.items, 500);
     try io.writeAll(1, "KILLING_ALL\n");
     return process_exit.request(exit_status);
-}
-
-const SessionMeta = struct {
-    bytes: []u8,
-    agent_pid: c.pid_t,
-    version: []const u8,
-
-    fn deinit(self: *SessionMeta, allocator: std.mem.Allocator) void {
-        allocator.free(self.bytes);
-        self.* = undefined;
-    }
-};
-
-fn readSessionMeta(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !SessionMeta {
-    const file = try std.fs.openFileAbsolute(paths.meta, .{});
-    defer file.close();
-    const bytes = try file.readToEndAlloc(allocator, 4096);
-    errdefer allocator.free(bytes);
-
-    var agent_pid: ?c.pid_t = null;
-    var version: ?[]const u8 = null;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = line[0..eq];
-        const value = line[eq + 1 ..];
-        if (std.mem.eql(u8, key, "agent_pid")) {
-            agent_pid = try parsePid(value);
-        } else if (std.mem.eql(u8, key, "version")) {
-            version = value;
-        }
-    }
-    return .{
-        .bytes = bytes,
-        .agent_pid = agent_pid orelse return error.InvalidSessionMeta,
-        .version = version orelse return error.InvalidSessionMeta,
-    };
-}
-
-fn parsePid(value: []const u8) !c.pid_t {
-    const parsed = try std.fmt.parseInt(i64, value, 10);
-    if (parsed <= 0 or parsed > std.math.maxInt(c.pid_t)) return error.InvalidSessionMeta;
-    return @intCast(parsed);
 }
 
 fn processExists(pid: c.pid_t) bool {
@@ -449,7 +406,7 @@ fn mostRecentAgent(allocator: std.mem.Allocator) !?session_registry.SessionPaths
     defer dir.close();
 
     var selected: ?session_registry.SessionPaths = null;
-    var selected_mtime: i128 = std.math.minInt(i128);
+    var selected_detached_ts: u64 = 0;
     var iterator = dir.iterate();
     while (try iterator.next()) |entry| {
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
@@ -462,26 +419,67 @@ fn mostRecentAgent(allocator: std.mem.Allocator) !?session_registry.SessionPaths
             },
             else => return err,
         };
-        _ = statAbsolute(paths.detached) catch |err| switch (err) {
-            error.FileNotFound => {
-                paths.deinit(allocator);
-                continue;
-            },
-            else => return err,
-        };
-        const stat = statAbsolute(paths.meta) catch {
+        var meta = session_registry.readMeta(allocator, paths) catch {
+            session_registry.removeStaleHints(paths) catch {};
             paths.deinit(allocator);
             continue;
         };
-        if (selected == null or stat.mtime > selected_mtime) {
+        defer meta.deinit(allocator);
+        if (!processExists(meta.agent_pid)) {
+            session_registry.removeStaleHints(paths) catch {};
+            paths.deinit(allocator);
+            continue;
+        }
+        const maybe_detached_ts: ?u64 = querySessionLiveStateDetachedAt(allocator, paths) catch blk: {
+            break :blk legacyDetachedMarkerTimestampMs(allocator, paths) catch null;
+        };
+        const detached_ts = maybe_detached_ts orelse {
+            paths.deinit(allocator);
+            continue;
+        };
+        if (selected == null or detached_ts > selected_detached_ts) {
             if (selected) |*old| old.deinit(allocator);
             selected = paths;
-            selected_mtime = stat.mtime;
+            selected_detached_ts = detached_ts;
         } else {
             paths.deinit(allocator);
         }
     }
     return selected;
+}
+
+fn querySessionLiveStateDetachedAt(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !?u64 {
+    const fd = try socket_transport.connectSocket(paths.socket);
+    defer _ = c.close(fd);
+
+    try initiateRuntimeHandshake(allocator, fd);
+
+    const query_payload = try protocol.encodePayload(allocator, pb.SessionLiveStateQuery{});
+    defer allocator.free(query_payload);
+    try protocol.sendFrame(fd, .session_live_state_query, query_payload);
+
+    var frame = try protocol.readFrameAlloc(allocator, fd);
+    defer frame.deinit(allocator);
+    switch (frame.message_type) {
+        .session_live_state => {
+            var state = try protocol.decodePayload(pb.SessionLiveState, allocator, frame.payload);
+            defer state.deinit(allocator);
+            return state.detached_at_unix_ms;
+        },
+        .error_message => return error.SessionLiveStateUnavailable,
+        else => return error.UnexpectedFrame,
+    }
+}
+
+fn legacyDetachedMarkerTimestampMs(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !?u64 {
+    const marker = try std.fmt.allocPrint(allocator, "{s}/detached", .{paths.dir});
+    defer allocator.free(marker);
+    const stat = std.fs.cwd().statFile(marker) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    if (stat.mtime <= 0) return 0;
+    return @intCast(@divTrunc(stat.mtime, std.time.ns_per_ms));
 }
 
 fn statAbsolute(path: []const u8) !std.fs.File.Stat {

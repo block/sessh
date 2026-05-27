@@ -13,3 +13,19 @@ scripts/check --fast
 Also run the specific tests that cover the code paths you changed. Do not run
 `scripts/check --ci` unless the user asks for it. If `--ci` seems warranted,
 tell the user why and ask before running it.
+
+## Docs
+
+Detailed documentation should live alongside the implementation in comments.
+Comments should not duplicate the source code unless esoteric language
+features are used. Comments should be used to:
+
+1. Provide higher-level overviews
+2. Explain why the code does what it does
+
+Truly high-level documentation lives in the `docs` folder in `.md` files. These
+files are NOT detailed specs. They should be entertaining reads of interesting
+design choices and requirements. Compare the contents of these files to the
+actual source code. If you notice discrepancies, determine whether the problem
+is in the code or the doc and address it. Don't make additions to these docs
+unless you are confident your additions fit the spirit.

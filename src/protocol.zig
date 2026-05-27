@@ -25,6 +25,8 @@ pub const MessageType = enum {
     repaint_response,
     tty_transcript_chunk,
     input_ack,
+    session_live_state_query,
+    session_live_state,
 };
 
 pub const frame_header_len = 4;
@@ -116,6 +118,8 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .repaint_response => |message| ownedFrameFromMessage(allocator, .repaint_response, message),
             .tty_transcript_chunk => |message| ownedFrameFromMessage(allocator, .tty_transcript_chunk, message),
             .input_ack => |message| ownedFrameFromMessage(allocator, .input_ack, message),
+            .session_live_state_query => |message| ownedFrameFromMessage(allocator, .session_live_state_query, message),
+            .session_live_state => |message| ownedFrameFromMessage(allocator, .session_live_state, message),
         };
     }
 
@@ -223,6 +227,16 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.InputAck, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .input_ack = message } });
+        },
+        .session_live_state_query => blk: {
+            var message = try decodePayload(pb.SessionLiveStateQuery, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_live_state_query = message } });
+        },
+        .session_live_state => blk: {
+            var message = try decodePayload(pb.SessionLiveState, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_live_state = message } });
         },
     };
 }

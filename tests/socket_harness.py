@@ -50,6 +50,8 @@ SESSION_ENDED = "session_ended"
 DRAW = "draw"
 REPAINT_RESPONSE = "repaint_response"
 INPUT_ACK = "input_ack"
+SESSION_LIVE_STATE_QUERY = "session_live_state_query"
+SESSION_LIVE_STATE = "session_live_state"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -69,6 +71,8 @@ _FRAME_FIELDS = {
     DRAW: DRAW,
     REPAINT_RESPONSE: REPAINT_RESPONSE,
     INPUT_ACK: INPUT_ACK,
+    SESSION_LIVE_STATE_QUERY: SESSION_LIVE_STATE_QUERY,
+    SESSION_LIVE_STATE: SESSION_LIVE_STATE,
 }
 
 
@@ -399,6 +403,12 @@ def assert_session_created(payload):
     return message
 
 
+def parse_session_live_state(payload):
+    message = sessh_pb().SessionLiveState()
+    message.ParseFromString(payload)
+    return message
+
+
 def create_and_attach_session(conn, shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", initial_scrollback=None, command_argv=None):
     send_frame(conn, SESSION_CREATE, pack_session_create(shell, scrollback=scrollback, fg=fg, bg=bg, session_id=session_id, command_argv=command_argv))
     assert_session_created(recv_until_message(conn, SESSION_CREATED))
@@ -605,15 +615,21 @@ def write_cached_remote_route(env, alias, host, guid=None, alive=True, agent_ver
     route_dir = state_sessions_dir(env) / guid
     route_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     remote_session_dir = f"/tmp/sessh-remote/guid/{guid}"
-    lines = [
-        f"guid={guid}",
-        f"primary_alias={alias}",
-        f"session_dir={remote_session_dir}",
-        f"host={host}",
-        f"agent_version={agent_version}",
-        f"alive={1 if alive else 0}",
-    ]
-    (route_dir / "route").write_text("\n".join(lines) + "\n")
+    (route_dir / "route.json").write_text(
+        json.dumps(
+            {
+                "guid": guid,
+                "primary_alias": alias,
+                "session_dir": remote_session_dir,
+                "host": host,
+                "agent_version": agent_version,
+                "alive": alive,
+                "ssh_options": [],
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
 
 
 def assert_runtime_dir_symlink(env, expected_runtime_root):
@@ -637,12 +653,57 @@ def session_dir(env, session_id="s1"):
 
 def route_file(env, session_id="s1"):
     if is_guid_ref(session_id):
-        return state_sessions_dir(env) / guid_for_ref(session_id) / "route"
+        return state_sessions_dir(env) / guid_for_ref(session_id) / "route.json"
     ensure_alias(env, session_id)
     alias_path = aliases_dir(env) / session_id
     if alias_path.is_symlink():
-        return state_sessions_dir(env) / guid_for_ref(Path(os.readlink(alias_path)).name) / "route"
-    return state_sessions_dir(env) / guid_for_ref(session_id) / "route"
+        return state_sessions_dir(env) / guid_for_ref(Path(os.readlink(alias_path)).name) / "route.json"
+    return state_sessions_dir(env) / guid_for_ref(session_id) / "route.json"
+
+
+def query_session_live_state(env, session_id="s1"):
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(5.0)
+    try:
+        conn.connect(str(socket_path(env, session_id)))
+        send_hello(conn)
+        send_frame(conn, SESSION_LIVE_STATE_QUERY, sessh_pb().SessionLiveStateQuery().SerializeToString())
+        message_type, payload = recv_frame(conn)
+        if message_type != SESSION_LIVE_STATE:
+            raise AssertionError(f"expected SESSION_LIVE_STATE, got {message_type}")
+        return parse_session_live_state(payload)
+    finally:
+        conn.close()
+
+
+def wait_session_detached(env, session_id="s1", timeout=5.0):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            state = query_session_live_state(env, session_id)
+            last = state
+            if state.HasField("detached_at_unix_ms") and not state.attached_clients:
+                return state
+        except (AssertionError, FileNotFoundError, ConnectionRefusedError, OSError, TimeoutError):
+            pass
+        time.sleep(0.02)
+    raise AssertionError(f"session did not become detached: {session_id}: {last!r}")
+
+
+def wait_session_attached(env, session_id="s1", timeout=5.0):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            state = query_session_live_state(env, session_id)
+            last = state
+            if not state.HasField("detached_at_unix_ms") and state.attached_clients:
+                return state
+        except (AssertionError, FileNotFoundError, ConnectionRefusedError, OSError, TimeoutError):
+            pass
+        time.sleep(0.02)
+    raise AssertionError(f"session did not become attached: {session_id}: {last!r}")
 
 
 def agent_log_file(env, session_id="s1"):
@@ -692,7 +753,16 @@ def start_session_agent(env, session_id="s1"):
 def write_session_meta(env, session_id, agent_pid, version=None):
     ensure_agent_socket_link(env, session_id)
     path = session_dir(env, session_id)
-    (path / "meta").write_text(f"agent_pid={agent_pid}\nversion={version or sessh_version()}\n")
+    (path / "meta.json").write_text(
+        json.dumps(
+            {
+                "agent_pid": agent_pid,
+                "version": version or sessh_version(),
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
     return path
 
 
@@ -2296,8 +2366,7 @@ def run_session_agent_registry_test(base_env):
         ensure_agent_socket_link(env, "s42")
         socket_file = socket_path(env, "s42")
         socket_link = agent_sock_link_path(env, "s42")
-        meta_file = session_path / "meta"
-        detached_file = session_path / "detached"
+        meta_file = session_path / "meta.json"
         compat_file = session_path / "compat"
 
         proc = subprocess.Popen(
@@ -2320,8 +2389,8 @@ def run_session_agent_registry_test(base_env):
             wait_sticky(meta_file)
             if not socket_link.is_symlink():
                 raise AssertionError("session agent socket link is not a symlink")
-            meta = meta_file.read_text()
-            if f"agent_pid={proc.pid}\n" not in meta or f"version={sessh_version()}\n" not in meta:
+            meta = json.loads(meta_file.read_text())
+            if meta.get("agent_pid") != proc.pid or meta.get("version") != sessh_version():
                 raise AssertionError(meta)
             if not os.path.islink(compat_file):
                 raise AssertionError("session compat path is not a symlink")
@@ -2336,8 +2405,14 @@ def run_session_agent_registry_test(base_env):
             if message_type != SESSION_ATTACHED:
                 raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
             assert_session_attached(payload)
-            if detached_file.exists():
-                raise AssertionError("detached marker exists while attached")
+            live_state = wait_session_attached(env, "s42")
+            client = live_state.attached_clients[0]
+            if not client.client_guid:
+                raise AssertionError(live_state)
+            if not client.HasField("terminal_size") or client.terminal_size.terminal_rows != 4 or client.terminal_size.terminal_cols != 40:
+                raise AssertionError(live_state)
+            if client.attached_at_unix_ms <= 0:
+                raise AssertionError(live_state)
             recv_draw_until(conn, b"AGENT_READY")
 
             shutil.rmtree(runtime_root(env))
@@ -2355,8 +2430,9 @@ def run_session_agent_registry_test(base_env):
             wait_sticky(meta_file, timeout=10.0)
             if not socket_link.is_symlink():
                 raise AssertionError("session agent did not recreate socket link")
-            if detached_file.exists():
-                raise AssertionError("detached marker was recreated while an attachment was active")
+            live_state = wait_session_attached(env, "s42", timeout=10.0)
+            if live_state.HasField("detached_at_unix_ms"):
+                raise AssertionError(f"live state became detached while an attachment was active: {live_state}")
 
             rescued_attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             rescued_attach.settimeout(5.0)
@@ -2375,7 +2451,7 @@ def run_session_agent_registry_test(base_env):
 
             conn.close()
             conn = None
-            wait_file(detached_file)
+            wait_session_detached(env, "s42")
 
             attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             attach.settimeout(5.0)
@@ -2387,8 +2463,9 @@ def run_session_agent_registry_test(base_env):
             if message_type != SESSION_ATTACHED:
                 raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
             assert_session_attached(payload)
-            if detached_file.exists():
-                raise AssertionError("detached marker survived reattach")
+            live_state = wait_session_attached(env, "s42")
+            if live_state.HasField("detached_at_unix_ms"):
+                raise AssertionError("live detached state survived reattach")
 
             send_frame(attach, INPUT, pack_bytes(b"exit\n"))
             recv_until_message(attach, SESSION_ENDED)
@@ -2396,7 +2473,6 @@ def run_session_agent_registry_test(base_env):
             wait_missing(socket_file)
             wait_missing(socket_link)
             wait_missing(compat_file)
-            wait_missing(detached_file)
             wait_missing(session_path)
         finally:
             if conn is not None:
@@ -2511,7 +2587,7 @@ def run_broker_registry_commands_test(base_env):
             recv_draw_until(conn, b"BROKER_COMMAND_READY")
             proc.stdin.close()
             proc.wait(timeout=5.0)
-            wait_file(session_path / "detached")
+            wait_session_detached(env, "s1")
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -2538,8 +2614,9 @@ def run_broker_registry_commands_test(base_env):
             if message_type != SESSION_ATTACHED:
                 raise AssertionError((message_type, payload))
             assert_session_attached(payload)
-            if (session_path / "detached").exists():
-                raise AssertionError("broker attach did not remove detached marker")
+            live_state = wait_session_attached(env, "s1")
+            if live_state.HasField("detached_at_unix_ms"):
+                raise AssertionError("broker attach did not clear detached live state")
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
             recv_until_message(conn, SESSION_ENDED)
             proc.stdin.close()
@@ -2576,7 +2653,7 @@ def run_broker_registry_commands_test(base_env):
             recv_draw_until(conn, b"BROKER_COMMAND_READY")
             proc.stdin.close()
             proc.wait(timeout=5.0)
-            wait_file(session_dir(env, "s2") / "detached")
+            wait_session_detached(env, "s2")
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -2611,7 +2688,7 @@ def run_broker_registry_commands_test(base_env):
                 recv_draw_until(conn, b"BROKER_COMMAND_READY")
                 proc.stdin.close()
                 proc.wait(timeout=5.0)
-                wait_file(session_dir(env, expected_id) / "detached")
+                wait_session_detached(env, expected_id)
             finally:
                 if proc.poll() is None:
                     proc.terminate()
@@ -2670,12 +2747,13 @@ def run_broker_attach_without_id_uses_latest_detached_test(base_env):
             s1_proc.stdin.close()
             s1_proc.wait(timeout=5.0)
             attached = [(proc, conn) for proc, conn in attached if proc is not s1_proc]
-            wait_file(session_dir(env, "s1") / "detached")
+            wait_session_detached(env, "s1")
 
             time.sleep(0.02)
             s2_proc, s2_conn = start_attached_session("s2")
-            if (session_dir(env, "s2") / "detached").exists():
-                raise AssertionError("newer attached session has detached marker")
+            live_state = wait_session_attached(env, "s2")
+            if live_state.HasField("detached_at_unix_ms"):
+                raise AssertionError("newer attached session has detached live state")
 
             attach_proc = subprocess.Popen(
                 [str(BIN), ":internal-broker:"],
