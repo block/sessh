@@ -41,7 +41,7 @@ def write_executable(path, data):
 
 
 def artifact_path(env, artifact_hash):
-    return Path(env["XDG_CACHE_HOME"]) / "sessh" / "bin" / "test-set" / artifact_hash
+    return Path(env["XDG_CACHE_HOME"]) / "sessh" / "bin" / "test-set" / artifact_hash / "sesshmux"
 
 
 def write_fake_uname(path):
@@ -120,7 +120,7 @@ def test_invalid_artifact_set_is_rejected(tmp):
         raise AssertionError(result.stdout)
 
 
-def test_cache_hit_trusts_hash_named_executable(tmp):
+def test_cache_hit_trusts_cached_executable(tmp):
     env = isolated_env(tmp)
     expected = b"#!/bin/sh\nprintf 'EXPECTED\\n'\n"
     wrong = b"#!/bin/sh\nprintf 'WRONG\\n'\n"
@@ -215,7 +215,7 @@ def main():
         ("cache hit execs without platform or tool probe", test_cache_hit_execs_without_platform_or_tool_probe),
         ("upload installs and execs", test_upload_installs_and_execs),
         ("invalid artifact set is rejected", test_invalid_artifact_set_is_rejected),
-        ("cache hit trusts hash-named executable", test_cache_hit_trusts_hash_named_executable),
+        ("cache hit trusts cached executable", test_cache_hit_trusts_cached_executable),
         ("cache miss reports platform before tool probe", test_cache_miss_reports_platform_before_tool_probe),
         ("platform strings are canonicalized", test_platform_strings_are_canonicalized),
         ("unsupported platform is structured error", test_unsupported_platform_is_structured_error),

@@ -66,7 +66,7 @@ pub fn cacheRoot(allocator: std.mem.Allocator) ![]u8 {
 pub fn cachedArtifactPath(allocator: std.mem.Allocator, artifact_set_id: []const u8, hash_hex: []const u8) ![]u8 {
     const root = try cacheRoot(allocator);
     defer allocator.free(root);
-    return std.fmt.allocPrint(allocator, "{s}/bin/{s}/{s}", .{ root, artifact_set_id, hash_hex });
+    return std.fmt.allocPrint(allocator, "{s}/bin/{s}/{s}/sesshmux", .{ root, artifact_set_id, hash_hex });
 }
 
 pub fn publishRuntimeRootSymlinkOnce(allocator: std.mem.Allocator) void {

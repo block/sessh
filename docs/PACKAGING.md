@@ -3,7 +3,7 @@ client. For example, a macOS `aarch64` client may need to upload a Linux
 `x86_64` binary.
 
 Each release archive contains binaries for all of the OS/architectures that we
-support, in `libexec/sessh/sessh-<os>-<arch>`.
+support, in `libexec/sessh/sesshmux-<os>-<arch>`.
 
 In order to benefit from Zig's runtime safety checks, we ship ReleaseSafe binaries.
 

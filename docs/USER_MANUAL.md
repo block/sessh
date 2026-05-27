@@ -130,6 +130,10 @@ Each sessh session has a stable `s-`-prefixed GUID, stored in the environment
 variable `$SESSH_GUID`. This lets shells, prompts, and scripts tell whether
 they are running inside `sessh` and which session they are in.
 
+The session also exports `$SESSH_PATH`, the directory containing the `sesshmux`
+binary used by the session agent. `sessh` appends that directory to `$PATH` so
+commands inside the session can invoke `sesshmux`.
+
 Each attached client uses a `c-`-prefixed GUID.
 
 When creating a new session, you can specify a custom alias with `--alias`. Any

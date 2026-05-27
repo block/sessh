@@ -754,7 +754,7 @@ def remote_path_artifact():
 
 
 def artifact_cache_path(env, artifact):
-    return Path(env["XDG_CACHE_HOME"]) / "sessh" / "bin" / sessh_version() / sha256(artifact)
+    return Path(env["XDG_CACHE_HOME"]) / "sessh" / "bin" / sessh_version() / sha256(artifact) / "sesshmux"
 
 
 def sessh_version():
@@ -1041,7 +1041,12 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     remote_shell = tmp / "remote-shell"
     marker = "SSH_ATTACH_READY"
     fake_config.write_text("Host test-host\n")
-    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
+    remote_shell.write_text(
+        f"#!/bin/sh\n"
+        f"printf '{marker}\\n'\n"
+        "printf 'SESSH_PATH=%s\\n' \"$SESSH_PATH\"\n"
+        "printf 'SESSHMUX_BIN=%s\\n' \"$(command -v sesshmux || true)\"\n"
+    )
     remote_shell.chmod(0o700)
     write_fake_ssh(fake_bin / "ssh")
     env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
@@ -1084,6 +1089,10 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError("uploaded artifact was not installed")
     if not os.access(installed, os.X_OK):
         raise AssertionError("uploaded artifact is not executable")
+    if f"SESSH_PATH={installed.parent.resolve()}" not in result.stdout:
+        raise AssertionError(result)
+    if f"SESSHMUX_BIN={installed.resolve()}" not in result.stdout:
+        raise AssertionError(result)
     route = route_file(env, "s1")
     if not route.exists():
         raise AssertionError("uploaded broker did not create a session route")

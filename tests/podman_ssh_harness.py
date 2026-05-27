@@ -384,7 +384,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         artifact_path = prefix / "libexec" / "sessh" / f"sesshmux-{os_name}-{arch}"
         if not artifact_path.exists():
             raise AssertionError(f"missing packaged artifact: {artifact_path}")
-        remote_artifact = f"/root/.cache/sessh/bin/{sessh_version()}/{sha256(artifact_path)}"
+        remote_artifact = f"/root/.cache/sessh/bin/{sessh_version()}/{sha256(artifact_path)}/sesshmux"
         installed = run(
             ["podman", "exec", container, "test", "-x", remote_artifact],
             timeout=10.0,

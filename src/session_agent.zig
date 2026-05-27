@@ -2205,6 +2205,10 @@ fn createSession(
         const shell_path = session_environment.shell orelse defaultShellPath();
         const shell_z = try app_allocator.allocator().dupeZ(u8, shell_path);
         defer app_allocator.allocator().free(shell_z);
+        const sessh_path_z = try sesshPathForEnvironment(app_allocator.allocator());
+        defer app_allocator.allocator().free(sessh_path_z);
+        const path_z = try pathWithSesshPathForEnvironment(app_allocator.allocator(), sessh_path_z);
+        defer app_allocator.allocator().free(path_z);
         const shell_argv0 = try loginShellArg0(app_allocator.allocator(), shell_path);
         defer app_allocator.allocator().free(shell_argv0);
         var prepared_command: ?PreparedCommand = if (command_argv.len > 0)
@@ -2222,6 +2226,8 @@ fn createSession(
             _ = setenv("TERM", "xterm-256color", 1);
             _ = setenv("SHELL", shell_z.ptr, 1);
             _ = setenv("SESSH_GUID", session_guid_z.ptr, 1);
+            _ = setenv("SESSH_PATH", sessh_path_z.ptr, 1);
+            _ = setenv("PATH", path_z.ptr, 1);
             if (prepared_command) |command| {
                 posix.execvpeZ(command.argv[0].?, command.argv.ptr, @ptrCast(c.environ)) catch {};
             } else {
@@ -2318,6 +2324,25 @@ fn chooseDefaultShell(env_shell: ?[]const u8, passwd_shell: ?[]const u8) []const
         if (shell.len > 0) return shell;
     }
     return "/bin/sh";
+}
+
+fn sesshPathForEnvironment(allocator: std.mem.Allocator) ![:0]u8 {
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.InvalidExecutablePath;
+    return allocator.dupeZ(u8, exe_dir);
+}
+
+fn pathWithSesshPathForEnvironment(allocator: std.mem.Allocator, sessh_path: []const u8) ![:0]u8 {
+    if (c.getenv("PATH")) |path_z| {
+        const path = std.mem.span(path_z);
+        if (path.len > 0) {
+            const combined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ path, sessh_path });
+            defer allocator.free(combined);
+            return allocator.dupeZ(u8, combined);
+        }
+    }
+    return allocator.dupeZ(u8, sessh_path);
 }
 
 test "login shell argv0 uses dash-prefixed basename" {
