@@ -313,7 +313,7 @@ const TranslatedMuxArgs = struct {
     }
 };
 
-pub fn runMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
+pub fn runMux(allocator: std.mem.Allocator, args: []const []const u8, strict_command: bool) !void {
     if (args.len >= 2 and isMuxSubcommand(args[1])) {
         var translated = translateMuxArgs(allocator, args) catch |err| {
             if (shouldUsePlainSshFallbackForMuxNewArgError(args, err)) {
@@ -324,6 +324,11 @@ pub fn runMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
         };
         defer translated.deinit();
         return run(allocator, translated.args.items);
+    }
+
+    if (strict_command) {
+        try printSshArgError(error.UnsupportedMuxCommand);
+        return process_exit.request(64);
     }
 
     return run(allocator, args);

@@ -50,7 +50,7 @@ fn runMain() !void {
     if (entrypoint == .sessh) {
         const sessh_args = try sesshArgsFromInternal(allocator, args);
         defer allocator.free(sessh_args);
-        return ssh_client.runMux(allocator, sessh_args);
+        return ssh_client.runMux(allocator, sessh_args, false);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-session-agent:")) {
@@ -69,7 +69,7 @@ fn runMain() !void {
         return client.run(allocator, args);
     }
 
-    return ssh_client.runMux(allocator, args);
+    return ssh_client.runMux(allocator, args, true);
 }
 
 const EntryPoint = enum {

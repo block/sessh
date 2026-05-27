@@ -31,6 +31,12 @@ GUID_RE = re.compile(r"^s-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-
 COMPACT_GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
+def sessh_argv(args):
+    if BIN.name == "sesshmux-dev":
+        return [str(BIN), ":internal-sessh:", *args]
+    return [str(BIN), *args]
+
+
 FAKE_SSH = """#!/bin/sh
 set -eu
 
@@ -333,7 +339,7 @@ def write_fake_uname(path, os_name, arch):
 
 def run_sessh(args, env, timeout=5.0):
     return subprocess.run(
-        [str(BIN), *args],
+        sessh_argv(args),
         cwd=ROOT,
         env=env,
         text=True,
@@ -424,8 +430,9 @@ def wait_for_path(path, timeout=10.0):
 
 
 def run_sessh_until_stdout(args, env, needle, timeout=10.0):
+    argv = sessh_argv(args)
     proc = subprocess.Popen(
-        [str(BIN), *args],
+        argv,
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -438,7 +445,7 @@ def run_sessh_until_stdout(args, env, needle, timeout=10.0):
     stdout += proc.stdout.read()
     stderr = proc.stderr.read()
     return subprocess.CompletedProcess(
-        [str(BIN), *args],
+        argv,
         returncode,
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
@@ -572,8 +579,9 @@ def run_sessh_reconnect_probe(
     expect_countdown=False,
     expect_reconnecting=False,
 ):
+    argv = sessh_argv(args)
     proc = subprocess.Popen(
-        [str(BIN), *args],
+        argv,
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -605,7 +613,7 @@ def run_sessh_reconnect_probe(
     stdout += proc.stdout.read()
     stderr = proc.stderr.read()
     return subprocess.CompletedProcess(
-        [str(BIN), *args],
+        argv,
         returncode,
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
@@ -629,8 +637,9 @@ def normalized_ui_messages(text):
 
 
 def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, timeout=30.0):
+    argv = sessh_argv(args)
     proc = subprocess.Popen(
-        [str(BIN), *args],
+        argv,
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -655,7 +664,7 @@ def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, tim
             returncode = proc.wait(timeout=timeout)
     stderr = proc.stderr.read()
     return subprocess.CompletedProcess(
-        [str(BIN), *args],
+        argv,
         returncode,
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
@@ -663,8 +672,9 @@ def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, tim
 
 
 def run_sessh_detach_reconnect_probe(args, env, ready, detach_bytes=b"\x03", timeout=10.0):
+    argv = sessh_argv(args)
     proc = subprocess.Popen(
-        [str(BIN), *args],
+        argv,
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -682,7 +692,7 @@ def run_sessh_detach_reconnect_probe(args, env, ready, detach_bytes=b"\x03", tim
     stdout += proc.stdout.read()
     stderr = proc.stderr.read()
     return subprocess.CompletedProcess(
-        [str(BIN), *args],
+        argv,
         returncode,
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
@@ -690,8 +700,9 @@ def run_sessh_detach_reconnect_probe(args, env, ready, detach_bytes=b"\x03", tim
 
 
 def run_sessh_detach_probe(args, env, ready, timeout=10.0):
+    argv = sessh_argv(args)
     proc = subprocess.Popen(
-        [str(BIN), *args],
+        argv,
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -706,7 +717,7 @@ def run_sessh_detach_probe(args, env, ready, timeout=10.0):
     stdout += proc.stdout.read()
     stderr = proc.stderr.read()
     return subprocess.CompletedProcess(
-        [str(BIN), *args],
+        argv,
         returncode,
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
@@ -1328,6 +1339,27 @@ def test_ssh_remote_command_falls_back_to_plain_ssh(tmp):
         raise AssertionError(log_text)
 
 
+def test_sesshmux_unknown_command_does_not_fallback_to_plain_ssh(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+
+    result = run_sesshmux(["work.blox", "list"], env, timeout=5.0)
+
+    if result.returncode != 64:
+        raise AssertionError(result)
+    if "sesshmux: unsupported command" not in result.stderr:
+        raise AssertionError(result)
+    if "fallback to plain-ssh" in result.stderr or "PLAIN_SSH" in result.stdout:
+        raise AssertionError(result)
+    if fake_log.exists():
+        raise AssertionError(fake_log.read_text())
+
+
 def test_ssh_unsupported_option_does_not_fallback_for_sessh_action(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1647,8 +1679,9 @@ def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
+    argv = sessh_argv(["--leader", "CTRL-B", "test-host"])
     proc = subprocess.Popen(
-        [str(BIN), "--leader", "CTRL-B", "test-host"],
+        argv,
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -1691,7 +1724,7 @@ def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
             proc.wait(timeout=5.0)
 
     result = subprocess.CompletedProcess(
-        [str(BIN), "--leader", "CTRL-B", "test-host"],
+        argv,
         returncode,
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
@@ -1726,8 +1759,9 @@ def test_ssh_retry_elapsed_without_input_switches_automatically(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
+    argv = sessh_argv(["--leader", "CTRL-B", "test-host"])
     proc = subprocess.Popen(
-        [str(BIN), "--leader", "CTRL-B", "test-host"],
+        argv,
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -1755,7 +1789,7 @@ def test_ssh_retry_elapsed_without_input_switches_automatically(tmp):
             proc.wait(timeout=5.0)
 
     result = subprocess.CompletedProcess(
-        [str(BIN), "--leader", "CTRL-B", "test-host"],
+        argv,
         returncode,
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
@@ -1804,8 +1838,9 @@ done
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
-        [str(BIN), "test-host"],
+        argv,
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -1830,7 +1865,7 @@ done
             proc.wait(timeout=5.0)
 
     result = subprocess.CompletedProcess(
-        [str(BIN), "test-host"],
+        argv,
         returncode,
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
@@ -1953,8 +1988,9 @@ def test_ssh_session_buffers_and_displays_stderr_after_attach(tmp):
     env["SESSH_FAKE_SSH_STDERR_DONE_FILE"] = str(done_file)
     env["SHELL"] = str(remote_shell)
 
+    argv = sessh_argv(["--leader", "CTRL-B", "test-host"])
     proc = subprocess.Popen(
-        [str(BIN), "--leader", "CTRL-B", "test-host"],
+        argv,
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -1976,7 +2012,7 @@ def test_ssh_session_buffers_and_displays_stderr_after_attach(tmp):
     stdout += proc.stdout.read()
     stderr = proc.stderr.read()
     result = subprocess.CompletedProcess(
-        [str(BIN), "--leader", "CTRL-B", "test-host"],
+        argv,
         returncode,
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
@@ -2425,6 +2461,10 @@ def main(argv=None):
         (
             "ssh remote command falls back to plain ssh",
             test_ssh_remote_command_falls_back_to_plain_ssh,
+        ),
+        (
+            "sesshmux unknown command does not fallback to plain ssh",
+            test_sesshmux_unknown_command_does_not_fallback_to_plain_ssh,
         ),
         (
             "ssh unsupported option does not fallback for sessh action",
