@@ -110,6 +110,7 @@ pub fn listenSocket(path: []const u8) !c.fd_t {
     const fd = socket(c.AF.UNIX, c.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
     errdefer _ = c.close(fd);
+    try setCloseOnExec(fd);
 
     var addr = unixAddr(path) catch return error.SocketPathTooLong;
     const len = sockaddrLen(@TypeOf(addr), path.len);
@@ -124,6 +125,7 @@ pub fn connectSocket(path: []const u8) !c.fd_t {
     const fd = socket(c.AF.UNIX, c.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
     errdefer _ = c.close(fd);
+    try setCloseOnExec(fd);
 
     var addr = try unixAddr(path);
     const len = sockaddrLen(@TypeOf(addr), path.len);
@@ -136,6 +138,14 @@ pub fn connectSocket(path: []const u8) !c.fd_t {
         return error.ConnectFailed;
     }
     return fd;
+}
+
+pub fn setCloseOnExec(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFD, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const close_on_exec_flag = @as(c_int, @intCast(c.FD_CLOEXEC));
+    if ((flags & close_on_exec_flag) != 0) return;
+    if (c.fcntl(fd, c.F.SETFD, flags | close_on_exec_flag) < 0) return error.FcntlFailed;
 }
 
 fn ensureSocketDir(allocator: std.mem.Allocator, socket_path: []const u8) !void {

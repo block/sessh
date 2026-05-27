@@ -923,6 +923,7 @@ fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
 /// reuses the session agent's terminal and attachment machinery, but it fixes the
 /// session id to the registry directory name and exits after that session ends.
 pub fn runSessionAgent(session_dir: []const u8) !void {
+    closeInheritedFileDescriptorsForSessionAgent();
     socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
 
     const paths = try session_registry.pathsForSessionDir(app_allocator.allocator(), session_dir);
@@ -978,6 +979,27 @@ fn runtimeRefreshIntervalMs() u64 {
     const parsed = std.fmt.parseInt(u64, value, 10) catch return runtime_refresher.default_refresh_interval_ms;
     if (parsed == 0) return runtime_refresher.default_refresh_interval_ms;
     return parsed;
+}
+
+fn closeInheritedFileDescriptorsForSessionAgent() void {
+    // The broker runs behind ssh stdio and may inherit bootstrapper helper fds
+    // such as fd 3 pointing at protocol stdout. A session agent must not keep
+    // those pipes open after the broker exits, or transport EOF will be hidden
+    // from the local client.
+    const limit = inheritedFdCloseLimit();
+    var fd: c.fd_t = 3;
+    while (fd < limit) : (fd += 1) {
+        _ = c.close(fd);
+    }
+}
+
+fn inheritedFdCloseLimit() c.fd_t {
+    const fallback: c.fd_t = 1024;
+    const max_reasonable: u64 = 65_536;
+    const limits = posix.getrlimit(.NOFILE) catch return fallback;
+    if (limits.cur <= 3) return 3;
+    const capped = @min(limits.cur, max_reasonable);
+    return @intCast(capped);
 }
 
 fn installShutdownSignalHandler(write_fd: c.fd_t) void {
@@ -1195,6 +1217,10 @@ fn handleAttachmentEvents(session_agent: *SessionAgent, attachment_index: usize,
 fn acceptSessionAgentClient(session_agent: *SessionAgent, listen_fd: c.fd_t) void {
     const client_fd = c.accept(listen_fd, null, null);
     if (client_fd < 0) return;
+    socket_transport.setCloseOnExec(client_fd) catch {
+        _ = c.close(client_fd);
+        return;
+    };
 
     const keep_open = handleSessionAgentClient(session_agent, client_fd) catch |err| blk: {
         logSessionAgent(session_agent, "event=client_error error={t}", .{err});

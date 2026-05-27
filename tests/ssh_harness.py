@@ -1703,6 +1703,73 @@ def test_ssh_leader_sever_reconnects(tmp):
         raise AssertionError("reconnect did not force ssh BatchMode=yes")
 
 
+def test_ssh_debug_sever_reconnects_twice(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_DEBUG_SEVER_READY"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    argv = sessh_argv(["--alias", "s1", "test-host"])
+    proc = subprocess.Popen(
+        argv,
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = b""
+    stderr = b""
+    try:
+        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+        for after in ("after-debug-sever-1", "after-debug-sever-2"):
+            severed = run_sesshmux(["debug", "sever-connection", "--host", "test-host", "s1"], env, timeout=30.0)
+            if severed.returncode != 0:
+                raise AssertionError(severed)
+            if not severed.stdout.startswith("SEVERED "):
+                raise AssertionError(severed)
+
+            stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", 30.0)
+            proc.stdin.write(b"\x12")
+            proc.stdin.flush()
+            stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Reconnecting... Ctrl-C detach", 30.0)
+            stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+            proc.stdin.write(after.encode("utf-8") + b"\n")
+            proc.stdin.flush()
+            stdout += read_until_pipe(proc.stdout, f"REMOTE:{after}".encode("utf-8"), 30.0)
+
+        proc.stdin.close()
+        returncode = proc.wait(timeout=30.0)
+        stdout += proc.stdout.read()
+        stderr = proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+    result = subprocess.CompletedProcess(
+        argv,
+        returncode,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "REMOTE:after-debug-sever-1" not in result.stdout or "REMOTE:after-debug-sever-2" not in result.stdout:
+        raise AssertionError(result)
+    if "batch_mode=1" not in fake_log.read_text():
+        raise AssertionError("debug sever reconnect did not force ssh BatchMode=yes")
+
+
 def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -2549,6 +2616,10 @@ def main(argv=None):
         (
             "ssh leader sever reconnects",
             test_ssh_leader_sever_reconnects,
+        ),
+        (
+            "ssh debug sever reconnects twice",
+            test_ssh_debug_sever_reconnects_twice,
         ),
         (
             "ssh retry elapsed with input waits before switch",
