@@ -178,6 +178,7 @@ test {
     _ = @import("broker.zig");
     _ = @import("client_renderer.zig");
     _ = @import("process_exit.zig");
+    _ = @import("runtime_refresher.zig");
     _ = @import("session_agent.zig");
     _ = @import("relay.zig");
     _ = @import("session_registry.zig");

@@ -1008,21 +1008,30 @@ pub fn markAttached(paths: SessionPaths) !void {
     try unlinkIfExists(paths.detached);
 }
 
-/// Remove stale discovery hints after the caller has already decided the
-/// socket is stale. Keep the session directory as the id tombstone.
+/// Remove stale runtime files after the caller has already decided the session
+/// is not alive.
 pub fn removeStaleHints(paths: SessionPaths) !void {
-    try unlinkIfExists(paths.socket);
-    try unlinkIfExists(paths.agent_sock_link);
-    try unlinkIfExists(paths.compat);
+    try removeRuntimeSessionFiles(paths);
 }
 
-/// Clean shutdown removes live discovery hints while preserving the session
-/// directory as the id tombstone.
+/// Clean shutdown removes runtime files. Durable routes/aliases live in the
+/// state directory, not in XDG_RUNTIME_DIR.
 pub fn removeEndedHints(paths: SessionPaths) !void {
+    try removeRuntimeSessionFiles(paths);
+}
+
+fn removeRuntimeSessionFiles(paths: SessionPaths) !void {
     try unlinkIfExists(paths.socket);
     try unlinkIfExists(paths.agent_sock_link);
     try unlinkIfExists(paths.compat);
     try unlinkIfExists(paths.detached);
+    try unlinkIfExists(paths.meta);
+
+    const agent_log = try std.fmt.allocPrint(app_allocator.allocator(), "{s}/agent.log", .{paths.dir});
+    defer app_allocator.allocator().free(agent_log);
+    try unlinkIfExists(agent_log);
+
+    try removeDirIfEmpty(paths.dir);
 }
 
 const MkdirSessionResult = enum { created, exists };
@@ -1074,7 +1083,17 @@ fn unlinkIfExists(path: []const u8) !void {
     }
 }
 
-test "allocates GUID session directories without reusing tombstones" {
+fn removeDirIfEmpty(path: []const u8) !void {
+    const path_z = try app_allocator.allocator().dupeZ(u8, path);
+    defer app_allocator.allocator().free(path_z);
+    switch (posix.errno(c.rmdir(path_z.ptr))) {
+        .SUCCESS, .NOENT => return,
+        .NOTEMPTY => return error.DirNotEmpty,
+        else => return error.RemoveDirFailed,
+    }
+}
+
+test "refuses GUID session directories with live metadata" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(
         allocator,
@@ -1319,7 +1338,7 @@ test "registry writes meta and tracks detached marker" {
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.detached));
 }
 
-test "stale hint cleanup leaves session tombstone" {
+test "stale cleanup removes runtime session directory" {
     const allocator = std.testing.allocator;
     const root = "zig-cache/session-registry-stale-test";
     std.fs.cwd().deleteTree(root) catch {};
@@ -1332,14 +1351,18 @@ test "stale hint cleanup leaves session tombstone" {
     socket_file.close();
     var compat_file = try std.fs.cwd().createFile(allocation.paths.compat, .{});
     compat_file.close();
+    try writeMeta(allocation.paths, 12345, "0.5.0-dev");
+    try markDetached(allocation.paths);
 
     try removeStaleHints(allocation.paths);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.socket));
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.compat));
-    _ = try std.fs.cwd().statFile(allocation.paths.dir);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.detached));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.meta));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.dir));
 }
 
-test "ended hint cleanup removes detached marker and leaves tombstone" {
+test "ended cleanup removes runtime session directory" {
     const allocator = std.testing.allocator;
     const root = "zig-cache/session-registry-ended-test";
     std.fs.cwd().deleteTree(root) catch {};
@@ -1352,11 +1375,18 @@ test "ended hint cleanup removes detached marker and leaves tombstone" {
     socket_file.close();
     var compat_file = try std.fs.cwd().createFile(allocation.paths.compat, .{});
     compat_file.close();
+    try writeMeta(allocation.paths, 12345, "0.5.0-dev");
     try markDetached(allocation.paths);
+    const agent_log = try std.fmt.allocPrint(allocator, "{s}/agent.log", .{allocation.paths.dir});
+    defer allocator.free(agent_log);
+    var log_file = try std.fs.cwd().createFile(agent_log, .{});
+    log_file.close();
 
     try removeEndedHints(allocation.paths);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.socket));
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.compat));
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.detached));
-    _ = try std.fs.cwd().statFile(allocation.paths.dir);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.meta));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(agent_log));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(allocation.paths.dir));
 }

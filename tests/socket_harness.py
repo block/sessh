@@ -5,6 +5,7 @@ import re
 import select
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -213,6 +214,18 @@ def wait_file(path, timeout=5.0):
             return
         time.sleep(0.05)
     raise AssertionError(f"file was not created: {path}")
+
+
+def wait_sticky(path, timeout=5.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            if os.lstat(path).st_mode & stat.S_ISVTX:
+                return
+        except FileNotFoundError:
+            pass
+        time.sleep(0.05)
+    raise AssertionError(f"sticky bit was not set: {path}")
 
 
 def wait_missing(path, timeout=5.0):
@@ -629,6 +642,10 @@ def route_file(env, session_id="s1"):
     if alias_path.is_symlink():
         return state_sessions_dir(env) / guid_for_ref(Path(os.readlink(alias_path)).name) / "route"
     return state_sessions_dir(env) / guid_for_ref(session_id) / "route"
+
+
+def agent_log_file(env, session_id="s1"):
+    return route_file(env, session_id).parent / "agent.log"
 
 
 def socket_path(env, session_id="s1"):
@@ -2295,6 +2312,9 @@ def run_session_agent_registry_test(base_env):
             wait_file(socket_file)
             wait_file(meta_file)
             wait_file(compat_file)
+            wait_sticky(session_path)
+            wait_sticky(socket_file)
+            wait_sticky(meta_file)
             if not socket_link.is_symlink():
                 raise AssertionError("session agent socket link is not a symlink")
             meta = meta_file.read_text()
@@ -2341,8 +2361,7 @@ def run_session_agent_registry_test(base_env):
             wait_missing(socket_link)
             wait_missing(compat_file)
             wait_missing(detached_file)
-            if not session_path.exists():
-                raise AssertionError("session tombstone was removed")
+            wait_missing(session_path)
         finally:
             if conn is not None:
                 conn.close()
@@ -2408,8 +2427,7 @@ def run_broker_starts_session_agent_test(base_env):
             wait_missing(socket_path(env, "s1"))
             wait_missing(agent_sock_link_path(env, "s1"))
             wait_missing(session_path / "compat")
-            if not session_path.exists():
-                raise AssertionError("broker removed session tombstone")
+            wait_missing(session_path)
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -2488,7 +2506,8 @@ def run_broker_registry_commands_test(base_env):
             recv_until_message(conn, SESSION_ENDED)
             proc.stdin.close()
             proc.wait(timeout=5.0)
-            wait_missing(session_path / "s")
+            wait_missing(socket_path(env, "s1"))
+            wait_missing(agent_sock_link_path(env, "s1"))
             wait_missing(session_path / "compat")
         finally:
             if proc.poll() is None:
@@ -2529,7 +2548,8 @@ def run_broker_registry_commands_test(base_env):
         if "ENDED s2" not in killed.stdout or killed.stderr:
             raise AssertionError(killed)
         s2_dir = session_dir(env, "s2")
-        wait_missing(s2_dir / "s")
+        wait_missing(socket_path(env, "s2"))
+        wait_missing(agent_sock_link_path(env, "s2"))
         wait_missing(s2_dir / "compat")
 
         for expected_id in ("s3", "s4"):
@@ -2564,7 +2584,8 @@ def run_broker_registry_commands_test(base_env):
             raise AssertionError(stopped)
         for expected_id in ("s3", "s4"):
             path = session_dir(env, expected_id)
-            wait_missing(path / "s")
+            wait_missing(socket_path(env, expected_id))
+            wait_missing(agent_sock_link_path(env, expected_id))
             wait_missing(path / "compat")
 
 
@@ -2811,7 +2832,7 @@ def run_env_config_client_test(tmp_root):
         finally:
             close_client(pid, fd)
 
-        wait_log_contains(session_dir(env, "s1") / "agent.log", "scrollback_rows=80")
+        wait_log_contains(agent_log_file(env, "s1"), "scrollback_rows=80")
 
         pid, fd = spawn_client(env, ["--attach"])
         try:
@@ -3226,7 +3247,7 @@ def main():
             if "ENDED s6" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
-            log_path = session_dir(env, "s6") / "agent.log"
+            log_path = agent_log_file(env, "s6")
             log_text = wait_log_contains(log_path, "event=session_agent_stop")
             for needle in (
                 "event=session_agent_start",

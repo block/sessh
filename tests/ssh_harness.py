@@ -868,6 +868,15 @@ def session_path(env, session_id="s1"):
     return sessions_dir(env) / canonical_guid(Path(os.readlink(alias_path)).name)
 
 
+def route_file(env, session_id="s1"):
+    if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
+        return state_sessions_dir(env) / canonical_guid(session_id) / "route"
+    alias_path = aliases_dir(env) / session_id
+    if not alias_path.is_symlink():
+        ensure_alias(env, session_id)
+    return state_sessions_dir(env) / canonical_guid(Path(os.readlink(alias_path)).name) / "route"
+
+
 def actual_socket_path(env, session_id="s1"):
     if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
         guid = canonical_guid(session_id)
@@ -1065,9 +1074,9 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError("uploaded artifact was not installed")
     if not os.access(installed, os.X_OK):
         raise AssertionError("uploaded artifact is not executable")
-    session_meta = session_path(env, "s1") / "meta"
-    if not session_meta.exists():
-        raise AssertionError("uploaded broker did not create a session agent")
+    route = route_file(env, "s1")
+    if not route.exists():
+        raise AssertionError("uploaded broker did not create a session route")
 
 
 def test_ssh_transport_pins_ipqos_to_interactive_config_value(tmp):
