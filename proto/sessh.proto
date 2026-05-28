@@ -268,6 +268,9 @@ message SessionClientControlRequest {
   // client clears outer terminal scrollback and requests retained inner
   // scrollback plus the current screen.
   bool include_scrollback = 4;
+  // Only used for CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION. Omitted
+  // or zero asks the receiver to use its default debug-unresponsive duration.
+  uint32 debug_unresponsive_seconds = 5;
 }
 
 // Framed payload, session agent -> broker/client.

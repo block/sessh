@@ -146,6 +146,7 @@ const ClientControlOptions = struct {
     target_kind: pb.ClientControlTargetKind,
     client_guid: []const u8 = "",
     include_scrollback: bool = false,
+    debug_unresponsive_seconds: u32 = config.default_debug_unresponsive_seconds,
 };
 
 fn parseListOptions(args: []const []const u8) !ListOptions {
@@ -217,6 +218,7 @@ fn parseClientControlOptions(args: []const []const u8) !ClientControlOptions {
     var explicit_target = false;
     var client_guid: []const u8 = "";
     var include_scrollback = false;
+    var debug_unresponsive_seconds: u32 = config.default_debug_unresponsive_seconds;
     var session_ref: ?[]const u8 = null;
 
     while (i < args.len) {
@@ -242,6 +244,12 @@ fn parseClientControlOptions(args: []const []const u8) !ClientControlOptions {
             if (action != .CLIENT_CONTROL_ACTION_REPAINT) return error.UnsupportedClientControlArgs;
             include_scrollback = true;
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--seconds")) {
+            if (action != .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION) return error.UnsupportedClientControlArgs;
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingDebugSeconds;
+            debug_unresponsive_seconds = try parseDebugUnresponsiveSeconds(args[i]);
+            i += 1;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             return error.InvalidClientControlArgs;
         } else if (session_ref == null) {
@@ -258,7 +266,14 @@ fn parseClientControlOptions(args: []const []const u8) !ClientControlOptions {
         .target_kind = target_kind,
         .client_guid = client_guid,
         .include_scrollback = include_scrollback,
+        .debug_unresponsive_seconds = debug_unresponsive_seconds,
     };
+}
+
+fn parseDebugUnresponsiveSeconds(value: []const u8) !u32 {
+    const seconds = std.fmt.parseInt(u32, value, 10) catch return error.InvalidDebugSeconds;
+    if (seconds == 0) return error.InvalidDebugSeconds;
+    return seconds;
 }
 
 fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
@@ -533,6 +548,7 @@ fn sendSessionClientControlRequest(
         .target_kind = options.target_kind,
         .client_guid = options.client_guid,
         .include_scrollback = options.include_scrollback,
+        .debug_unresponsive_seconds = options.debug_unresponsive_seconds,
     });
     defer allocator.free(payload);
     try protocol.sendFrame(fd, .session_client_control_request, payload);

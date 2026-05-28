@@ -2877,7 +2877,7 @@ def run_client_control_commands_test(base_env):
             if missing_last_input.returncode == 0 or "no attached client has sent user input" not in missing_last_input.stderr:
                 raise AssertionError(missing_last_input)
 
-            unresponsive = run([".", "--debug-client", "unresponsive-connection", "--client", client_two, "s1"], env, check=True, timeout=5.0)
+            unresponsive = run([".", "--debug-client", "unresponsive-connection", "--seconds", "1", "--client", client_two, "s1"], env, check=True, timeout=5.0)
             if f"UNRESPONSIVE {client_two}" not in unresponsive.stdout:
                 raise AssertionError(unresponsive)
             send_frame(conn2, INPUT, pack_input(b"ignored\n", input_seq=23))
@@ -2886,6 +2886,8 @@ def run_client_control_commands_test(base_env):
                 raise AssertionError("unresponsive debug client still acknowledged input")
             except TimeoutError:
                 pass
+            if parse_input_ack(recv_until_message(conn2, INPUT_ACK, timeout=2.0)) != 23:
+                raise AssertionError("unresponsive debug client did not recover after --seconds")
 
             replacement = attach_existing(client_two)
             clients = clients_by_guid()

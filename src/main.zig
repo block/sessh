@@ -145,7 +145,7 @@ fn usage(code: u8, entrypoint: EntryPoint) !void {
         \\  sesshmux list-clients [--jsonl] [ID]
         \\  sesshmux detach [--all|--last-input|CLIENT_GUID] [ID]
         \\  sesshmux repaint [--scrollback] [--last-input|CLIENT_GUID] [ID]
-        \\  sesshmux debug sever-connection|unresponsive-connection [--all|--last-input|CLIENT_GUID] [ID]
+        \\  sesshmux debug sever-connection|unresponsive-connection [--seconds N] [--all|--last-input|CLIENT_GUID] [ID]
         \\
         \\local target:
         \\  Use . as HOST to operate on local sessions.

@@ -1351,12 +1351,14 @@ pub const SessionClientControlRequest = struct {
     target_kind: ClientControlTargetKind = @enumFromInt(0),
     client_guid: []const u8 = &.{},
     include_scrollback: bool = false,
+    debug_unresponsive_seconds: u32 = 0,
 
     pub const _desc_table = .{
         .action = fd(1, .@"enum"),
         .target_kind = fd(2, .@"enum"),
         .client_guid = fd(3, .{ .scalar = .string }),
         .include_scrollback = fd(4, .{ .scalar = .bool }),
+        .debug_unresponsive_seconds = fd(5, .{ .scalar = .uint32 }),
     };
 
     /// Encodes the message to the writer

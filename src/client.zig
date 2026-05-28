@@ -64,6 +64,7 @@ const LocalOptions = struct {
     client_jsonl: bool = false,
     client_repaint_scrollback: bool = false,
     debug_client_action: ?DebugClientAction = null,
+    debug_unresponsive_seconds: ?u32 = null,
     leader: Leader = .none,
     leader_set: bool = false,
     banner_args: DetachBannerArgs = .{},
@@ -657,7 +658,7 @@ pub const ReconnectUi = struct {
     }
 
     pub fn showConnectionUnresponsive(self: *ReconnectUi) !void {
-        try self.drawStaticBanner("--- sessh: disconnected: Unresponsive. Reconnecting... Ctrl-C detach ---");
+        try self.drawStaticBanner("--- sessh: unresponsive: Reconnecting... Ctrl-C detach ---");
     }
 
     pub fn showReconnectReady(self: *ReconnectUi, disposition: ReconnectSwitchDisposition) !void {
@@ -2301,6 +2302,8 @@ fn runLocalClientControlCommand(
 ) !u8 {
     const session_ref = try resolveClientSessionRef(allocator, options.client_session_ref);
     defer allocator.free(session_ref);
+    var debug_seconds_arg: ?[]u8 = null;
+    defer if (debug_seconds_arg) |arg| allocator.free(arg);
 
     var command_args: std.ArrayList([]const u8) = .empty;
     defer command_args.deinit(allocator);
@@ -2327,6 +2330,12 @@ fn runLocalClientControlCommand(
         },
     }
     if (options.client_repaint_scrollback) try command_args.append(allocator, "--scrollback");
+    if (options.debug_unresponsive_seconds) |seconds| {
+        const seconds_arg = try std.fmt.allocPrint(allocator, "{d}", .{seconds});
+        debug_seconds_arg = seconds_arg;
+        try command_args.append(allocator, "--seconds");
+        try command_args.append(allocator, seconds_arg);
+    }
     try command_args.append(allocator, session_ref);
     return runLocalBrokerCommand(allocator, exe, command_args.items);
 }
@@ -2776,6 +2785,12 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
         } else if (std.mem.eql(u8, arg, "--scrollback")) {
             options.client_repaint_scrollback = true;
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--seconds")) {
+            if (options.action != .debug_client or options.debug_client_action != .unresponsive_connection) return error.UnsupportedDebugSeconds;
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingDebugSeconds;
+            options.debug_unresponsive_seconds = try parseDebugUnresponsiveSeconds(args[i]);
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--leader")) {
             i += 1;
             if (i >= args.len) return error.MissingLeader;
@@ -2833,7 +2848,15 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
     if (options.client_repaint_scrollback and options.action != .repaint_client) return error.UnsupportedClientTarget;
     if (options.debug_client_action != null and options.action != .debug_client) return error.UnsupportedDebugAction;
     if (options.action == .debug_client and options.debug_client_action == null) return error.MissingDebugAction;
+    if (options.debug_unresponsive_seconds != null and
+        (options.action != .debug_client or options.debug_client_action != .unresponsive_connection)) return error.UnsupportedDebugSeconds;
     return options;
+}
+
+fn parseDebugUnresponsiveSeconds(value: []const u8) !u32 {
+    const seconds = std.fmt.parseInt(u32, value, 10) catch return error.InvalidDebugSeconds;
+    if (seconds == 0) return error.InvalidDebugSeconds;
+    return seconds;
 }
 
 fn actionSupportsClientSessionRef(action: LocalAction) bool {
@@ -2995,6 +3018,23 @@ pub fn reconnectSessionOnRuntimeCancellable(
     try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, cancelled, false);
 }
 
+pub fn prepareReconnectRuntimeCancellable(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    cancelled: *const std.atomic.Value(bool),
+) !void {
+    try runtimeHandshakeInner(read_fd, write_fd, cancelled);
+}
+
+pub fn attachPreparedReconnectRuntimeCancellable(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    session: *RuntimeSession,
+    cancelled: *const std.atomic.Value(bool),
+) !void {
+    try attachReconnectRuntimeInner(read_fd, write_fd, session, cancelled, false);
+}
+
 fn reconnectSessionOnRuntimeInner(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
@@ -3003,6 +3043,16 @@ fn reconnectSessionOnRuntimeInner(
     wait_for_repaint: bool,
 ) !void {
     try runtimeHandshakeInner(read_fd, write_fd, cancelled);
+    try attachReconnectRuntimeInner(read_fd, write_fd, session, cancelled, wait_for_repaint);
+}
+
+fn attachReconnectRuntimeInner(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    session: *RuntimeSession,
+    cancelled: ?*const std.atomic.Value(bool),
+    wait_for_repaint: bool,
+) !void {
     const client_guid = try session.ensureClientGuid();
     session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice(), client_guid, session.sessionDirSlice());
     try readSessionAttachedInner(read_fd, cancelled);

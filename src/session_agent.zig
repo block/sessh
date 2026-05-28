@@ -97,7 +97,7 @@ const Attachment = struct {
     origin: ?TerminalOrigin = null,
     active: bool = false,
     close_after_flush: bool = false,
-    debug_unresponsive: bool = false,
+    debug_unresponsive_until_ms: i64 = 0,
     presentation: PresentationState = .{},
     output: std.ArrayList(u8) = .empty,
     output_offset: usize = 0,
@@ -121,6 +121,7 @@ const SessionAgent = struct {
     running: bool = true,
     shutting_down: bool = false,
     log_file: ?std.fs.File = null,
+    monotonic_clock: ?std.time.Timer = null,
     fixed_session_id: ?[]const u8 = null,
     session_paths: ?session_registry.SessionPaths = null,
     started_session: bool = false,
@@ -1105,6 +1106,9 @@ fn chmodPath(path: []const u8, mode: c.mode_t) !void {
 }
 
 fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdown_signal_fd: c.fd_t, runtime_repair_fd: c.fd_t) !void {
+    const now_ms = sessionAgentMonotonicMs(session_agent);
+    clearExpiredDebugUnresponsiveAttachments(session_agent, now_ms);
+
     var pollfds: [3 + max_sessions + max_attachments]posix.pollfd = undefined;
     var kinds: [3 + max_sessions + max_attachments]PollKind = undefined;
     var count: usize = 0;
@@ -1132,14 +1136,16 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
 
     for (&session_agent.attachments, 0..) |*attachment, i| {
         if (!attachment.active) continue;
-        var events: i16 = if (attachment.close_after_flush or attachment.debug_unresponsive) 0 else posix.POLL.IN;
-        if (!attachment.debug_unresponsive and attachment.queuedBytes() > 0) events |= posix.POLL.OUT;
+        const debug_unresponsive = attachment.debug_unresponsive_until_ms > now_ms;
+        var events: i16 = if (attachment.close_after_flush or debug_unresponsive) 0 else posix.POLL.IN;
+        if (!debug_unresponsive and attachment.queuedBytes() > 0) events |= posix.POLL.OUT;
         pollfds[count] = .{ .fd = attachment.fd, .events = events, .revents = 0 };
         kinds[count] = .{ .attachment = i };
         count += 1;
     }
 
-    _ = try posix.poll(pollfds[0..count], -1);
+    _ = try posix.poll(pollfds[0..count], debugUnresponsivePollTimeoutMs(session_agent, now_ms));
+    clearExpiredDebugUnresponsiveAttachments(session_agent, sessionAgentMonotonicMs(session_agent));
 
     for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
         if (pollfd.revents == 0) continue;
@@ -1151,6 +1157,36 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
             .attachment => |attachment_index| handleAttachmentEvents(session_agent, attachment_index, pollfd.revents),
         }
     }
+}
+
+fn sessionAgentMonotonicMs(session_agent: *SessionAgent) i64 {
+    if (session_agent.monotonic_clock == null) {
+        session_agent.monotonic_clock = std.time.Timer.start() catch return std.time.milliTimestamp();
+    }
+    return if (session_agent.monotonic_clock) |*timer|
+        @intCast(timer.read() / std.time.ns_per_ms)
+    else
+        std.time.milliTimestamp();
+}
+
+fn clearExpiredDebugUnresponsiveAttachments(session_agent: *SessionAgent, now_ms: i64) void {
+    for (&session_agent.attachments) |*attachment| {
+        if (!attachment.active) continue;
+        if (attachment.debug_unresponsive_until_ms != 0 and attachment.debug_unresponsive_until_ms <= now_ms) {
+            attachment.debug_unresponsive_until_ms = 0;
+        }
+    }
+}
+
+fn debugUnresponsivePollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64) i32 {
+    var timeout_ms: ?i64 = null;
+    for (&session_agent.attachments) |*attachment| {
+        if (!attachment.active or attachment.debug_unresponsive_until_ms <= now_ms) continue;
+        const remaining_ms = attachment.debug_unresponsive_until_ms - now_ms;
+        if (timeout_ms == null or remaining_ms < timeout_ms.?) timeout_ms = remaining_ms;
+    }
+    const ms = timeout_ms orelse return -1;
+    return @intCast(@min(ms, std.math.maxInt(i32)));
 }
 
 fn handleRuntimeRepairEvent(session_agent: *SessionAgent, listen_fd: *c.fd_t, runtime_repair_fd: c.fd_t) void {
@@ -1496,7 +1532,11 @@ fn compactAttachmentOutput(attachment: *Attachment) void {
 fn flushAttachmentOutput(session_agent: *SessionAgent, attachment_index: usize) void {
     const attachment = &session_agent.attachments[attachment_index];
     if (!attachment.active) return;
-    if (attachment.debug_unresponsive) return;
+    if (attachment.debug_unresponsive_until_ms != 0) {
+        const now_ms = sessionAgentMonotonicMs(session_agent);
+        if (attachment.debug_unresponsive_until_ms > now_ms) return;
+        attachment.debug_unresponsive_until_ms = 0;
+    }
 
     while (attachment.output_offset < attachment.output.items.len) {
         const result = io.writeSomeNonBlocking(attachment.fd, attachment.output.items[attachment.output_offset..]) catch {
@@ -1641,9 +1681,14 @@ fn handleSessionClientControlRequest(session_agent: *SessionAgent, fd: c.fd_t, p
             }
         },
         .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION => {
+            const seconds = if (request.debug_unresponsive_seconds == 0)
+                config.default_debug_unresponsive_seconds
+            else
+                request.debug_unresponsive_seconds;
+            const until_ms = sessionAgentMonotonicMs(session_agent) + @as(i64, seconds) * std.time.ms_per_s;
             for (selected[0..selected_count]) |attachment_index| {
                 if (attachment_index < session_agent.attachments.len and session_agent.attachments[attachment_index].active) {
-                    session_agent.attachments[attachment_index].debug_unresponsive = true;
+                    session_agent.attachments[attachment_index].debug_unresponsive_until_ms = until_ms;
                 }
             }
         },

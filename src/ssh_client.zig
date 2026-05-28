@@ -129,6 +129,7 @@ const ParsedSshArgs = struct {
     client_guid: ?[]const u8 = null,
     client_repaint_scrollback: bool = false,
     debug_client_action: ?DebugClientAction = null,
+    debug_unresponsive_seconds: ?[]const u8 = null,
     command_argv: []const []const u8 = &.{},
     alias: ?[]const u8 = null,
     runtime_dir: ?[]const u8 = null,
@@ -448,7 +449,7 @@ fn translateMuxAttach(translated: *TranslatedMuxArgs, args: []const []const u8) 
     defer positional.deinit(translated.allocator);
     var host_option: ?[]const u8 = null;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, null, null, null, null);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, null, null, null, null, null);
 
     if (host_option) |host| {
         if (positional.items.len > 1) return error.TooManyMuxArguments;
@@ -482,7 +483,7 @@ fn translateMuxList(translated: *TranslatedMuxArgs, args: []const []const u8) !v
     var host_option: ?[]const u8 = null;
     var refresh = false;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, &refresh, null, null, null, null);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, &refresh, null, null, null, null, null);
     if (host_option) |host| {
         if (positional.items.len != 0) return error.TooManyMuxArguments;
         try appendMany(translated, ssh_options.items);
@@ -524,7 +525,7 @@ fn translateMuxKill(translated: *TranslatedMuxArgs, args: []const []const u8) !v
     var host_option: ?[]const u8 = null;
     var all = false;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, &all, null, null, null);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, &all, null, null, null, null);
 
     if (all) {
         if (host_option) |host| {
@@ -582,7 +583,7 @@ fn translateMuxListClients(translated: *TranslatedMuxArgs, args: []const []const
     var host_option: ?[]const u8 = null;
     var jsonl = false;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, null, null, null, null);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, null, null, null, null, null);
     var filtered_positionals = positional.items;
     for (positional.items, 0..) |arg, i| {
         if (std.mem.eql(u8, arg, "--jsonl")) {
@@ -636,6 +637,7 @@ fn translateMuxClientControl(
     var all = false;
     var last_input = false;
     var include_scrollback = false;
+    var seconds_arg: ?[]const u8 = null;
     var client_guid: ?[]const u8 = null;
 
     try parseMuxCommandOptions(
@@ -651,6 +653,7 @@ fn translateMuxClientControl(
         &last_input,
         &client_guid,
         if (repaint_defaults_to_all) &include_scrollback else null,
+        if (debug_action != null and std.mem.eql(u8, debug_action.?, "unresponsive-connection")) &seconds_arg else null,
     );
 
     var explicit_targets: u8 = 0;
@@ -692,6 +695,10 @@ fn translateMuxClientControl(
         try translated.append(guid);
     }
     if (include_scrollback) try translated.append("--scrollback");
+    if (seconds_arg) |seconds| {
+        try translated.append("--seconds");
+        try translated.append(seconds);
+    }
     if (session_ref) |ref| try translated.append(ref);
     try appendMany(translated, sessh_options.items);
 }
@@ -713,6 +720,7 @@ fn parseMuxCommandOptions(
     last_input_option: ?*bool,
     client_guid_option: ?*?[]const u8,
     scrollback_option: ?*bool,
+    seconds_option: ?*?[]const u8,
 ) !void {
     var i: usize = 0;
     while (i < args.len) {
@@ -753,6 +761,16 @@ fn parseMuxCommandOptions(
         } else if (std.mem.eql(u8, arg, "--scrollback")) {
             if (scrollback_option) |scrollback| {
                 scrollback.* = true;
+                i += 1;
+            } else {
+                return error.UnsupportedMuxOption;
+            }
+        } else if (std.mem.eql(u8, arg, "--seconds")) {
+            if (seconds_option) |seconds| {
+                i += 1;
+                if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingDebugSeconds;
+                _ = try parseDebugUnresponsiveSeconds(args[i]);
+                seconds.* = args[i];
                 i += 1;
             } else {
                 return error.UnsupportedMuxOption;
@@ -823,6 +841,12 @@ fn appendSesshOption(
 
 fn appendMany(translated: *TranslatedMuxArgs, args: []const []const u8) !void {
     for (args) |arg| try translated.append(arg);
+}
+
+fn parseDebugUnresponsiveSeconds(value: []const u8) !u32 {
+    const seconds = std.fmt.parseInt(u32, value, 10) catch return error.InvalidDebugSeconds;
+    if (seconds == 0) return error.InvalidDebugSeconds;
+    return seconds;
 }
 
 fn appendShellSplitWords(
@@ -1459,6 +1483,12 @@ fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[12][]const u8) []c
                 buf[len] = "--scrollback";
                 len += 1;
             }
+            if (parsed_ssh_args.debug_unresponsive_seconds) |seconds| {
+                buf[len] = "--seconds";
+                len += 1;
+                buf[len] = seconds;
+                len += 1;
+            }
             buf[len] = parsed_ssh_args.client_session_ref orelse "";
             len += 1;
         },
@@ -1821,6 +1851,108 @@ fn raceExistingConnectionWithReconnect(
     pending_input_at_disconnect: bool,
     pending_paste_like_input_at_disconnect: bool,
 ) !ReconnectRaceOutcome {
+    var reconnect_attempt: usize = 0;
+    try reconnect_ui.showConnectionUnresponsive();
+    while (true) {
+        const outcome = try raceExistingConnectionWithReconnectAttempt(
+            parsed_ssh_args,
+            artifacts,
+            remote_command,
+            broker_args,
+            old_child,
+            session,
+            reconnect_ui,
+            pending_input_at_disconnect,
+            pending_paste_like_input_at_disconnect,
+        );
+        switch (outcome) {
+            .failed => |err| {
+                client_log.debug("event=reconnect_failed stage=parallel host={s} session={s} attempt={} error={t}", .{
+                    parsed_ssh_args.host,
+                    session.idSlice(),
+                    reconnect_attempt,
+                    err,
+                });
+                client_log.userDiagnosticInfo("reconnect failed: parallel: {t}", .{err});
+                reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, reconnect_ui);
+                const delay_ms = reconnectDelayMs(reconnect_attempt);
+                client_log.debug("event=reconnect_wait_unresponsive host={s} session={s} attempt={} delay_ms={}", .{
+                    parsed_ssh_args.host,
+                    session.idSlice(),
+                    reconnect_attempt,
+                    delay_ms,
+                });
+                if (try waitForUnresponsiveReconnectRetry(
+                    old_child,
+                    session,
+                    parsed_ssh_args.leader,
+                    reconnect_ui,
+                    delay_ms,
+                )) |retry_outcome| return retry_outcome;
+            },
+            else => return outcome,
+        }
+    }
+}
+
+fn waitForUnresponsiveReconnectRetry(
+    old_child: *RuntimeConnection,
+    session: *client.RuntimeSession,
+    leader: terminal.Leader,
+    reconnect_ui: *client.ReconnectUi,
+    delay_ms: u64,
+) !?ReconnectRaceOutcome {
+    var timer = try std.time.Timer.start();
+    while (true) {
+        const elapsed_ms = @divTrunc(timer.read(), std.time.ns_per_ms);
+        if (elapsed_ms >= delay_ms) return null;
+
+        if (try client.pollRuntimeRecovery(old_child.child.stdout.?.handle, session, 0)) |recovery| {
+            switch (recovery) {
+                .recovered => return .recovered,
+                .session_ended => return .session_ended,
+                .detach => return .detach,
+                .transport_closed => {
+                    old_child.closeStdin();
+                    _ = old_child.wait() catch {};
+                    return .{ .failed = error.TransportClosed };
+                },
+            }
+        }
+
+        const remaining_ms = delay_ms - elapsed_ms;
+        const poll_ms: i32 = @intCast(@min(remaining_ms, @as(u64, 50)));
+        switch (try client.pollAndForwardReconnectInput(
+            old_child.child.stdout.?.handle,
+            old_child.child.stdin.?.handle,
+            session,
+            leader,
+            reconnect_ui,
+            poll_ms,
+        )) {
+            .wait_elapsed => {},
+            .detach => return .detach,
+            .reconnect_now => return null,
+            .transport_closed => {
+                old_child.closeStdin();
+                _ = old_child.wait() catch {};
+                return .{ .failed = error.TransportClosed };
+            },
+        }
+    }
+}
+
+fn raceExistingConnectionWithReconnectAttempt(
+    parsed_ssh_args: ParsedSshArgs,
+    artifacts: ?*const ArtifactSet,
+    remote_command: []const u8,
+    broker_args: []const []const u8,
+    old_child: *RuntimeConnection,
+    session: *client.RuntimeSession,
+    reconnect_ui: *client.ReconnectUi,
+    pending_input_at_disconnect: bool,
+    pending_paste_like_input_at_disconnect: bool,
+) !ReconnectRaceOutcome {
     session.viewport_offset = reconnect_ui.currentViewportOffset();
     var state = ParallelReconnectState{
         .parsed_ssh_args = parsed_ssh_args,
@@ -1850,17 +1982,19 @@ fn raceExistingConnectionWithReconnect(
             switch (state.take().?) {
                 .connected => |connection| {
                     ready_connection = connection;
-                    ready_session = state.session;
+                    ready_session = session.*;
                     const disposition = reconnect_ui.reconnectSwitchDisposition(
                         pending_input_at_disconnect,
                         pending_paste_like_input_at_disconnect,
                         true,
                     );
                     if (reconnect_ui.hasReconnectAcknowledgement() or disposition == .automatic) {
-                        session.adoptReconnectState(&ready_session);
-                        const result = ready_connection.?;
-                        ready_connection = null;
-                        return .{ .reconnected = result };
+                        return try attachReadyReconnectConnection(
+                            &ready_connection,
+                            &ready_session,
+                            session,
+                            reconnect_ui,
+                        );
                     }
                     try reconnect_ui.showReconnectReady(disposition);
                 },
@@ -1925,10 +2059,13 @@ fn raceExistingConnectionWithReconnect(
                         return .detach;
                     },
                     .reconnect_now => {
-                        if (ready_connection) |connection| {
-                            session.adoptReconnectState(&ready_session);
-                            ready_connection = null;
-                            return .{ .reconnected = connection };
+                        if (ready_connection != null) {
+                            return try attachReadyReconnectConnection(
+                                &ready_connection,
+                                &ready_session,
+                                session,
+                                reconnect_ui,
+                            );
                         }
                     },
                     .transport_closed => {
@@ -1962,6 +2099,28 @@ fn raceExistingConnectionWithReconnect(
     }
 }
 
+fn attachReadyReconnectConnection(
+    ready_connection: *?RuntimeConnection,
+    ready_session: *client.RuntimeSession,
+    session: *client.RuntimeSession,
+    reconnect_ui: *client.ReconnectUi,
+) !ReconnectRaceOutcome {
+    var connection = ready_connection.* orelse return .{ .failed = error.ReconnectNotReady };
+    ready_connection.* = null;
+
+    client.attachPreparedReconnectRuntimeCancellable(
+        connection.child.stdout.?.handle,
+        connection.child.stdin.?.handle,
+        ready_session,
+        reconnect_ui.cancellationFlag(),
+    ) catch |err| {
+        connection.terminate();
+        return .{ .failed = err };
+    };
+    session.adoptReconnectState(ready_session);
+    return .{ .reconnected = connection };
+}
+
 fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allocator) void {
     var connection = startRuntimeConnection(
         allocator,
@@ -1977,11 +2136,12 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
         return;
     };
 
-    state.session.viewport_offset = state.reconnect_ui.currentViewportOffset();
-    client.reconnectSessionOnRuntimeCancellable(
+    // Stop after Hello while racing an unresponsive transport. SessionAttach
+    // would replace the still-visible old attachment before the user presses
+    // Ctrl-R to switch.
+    client.prepareReconnectRuntimeCancellable(
         connection.child.stdout.?.handle,
         connection.child.stdin.?.handle,
-        &state.session,
         state.reconnect_ui.cancellationFlag(),
     ) catch |err| {
         if (err == error.ReconnectDetached) {
@@ -2910,6 +3070,13 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             } else {
                 return error.InvalidDebugAction;
             }
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--seconds")) {
+            if (parsed.action != .debug_client or parsed.debug_client_action != .unresponsive_connection) return error.UnsupportedSesshOption;
+            index.* += 1;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingDebugSeconds;
+            _ = try parseDebugUnresponsiveSeconds(args[index.*]);
+            parsed.debug_unresponsive_seconds = args[index.*];
             index.* += 1;
         } else if (std.mem.eql(u8, arg, "--all")) {
             try setParsedClientTarget(parsed, .all, null);
@@ -3914,6 +4081,16 @@ test "brokerArgsForAction uses broker subcommands" {
         .client_session_ref = "s1",
     }, &buf));
 
+    try expectArgvEqual(&.{ "debug-client", "unresponsive-connection", "--last-input", "--seconds", "3", "s1" }, brokerArgsForAction(.{
+        .options = &.{},
+        .host = "example.com",
+        .action = .debug_client,
+        .debug_client_action = .unresponsive_connection,
+        .debug_unresponsive_seconds = "3",
+        .client_target = .last_input,
+        .client_session_ref = "s1",
+    }, &buf));
+
     try expectArgvEqual(&.{ "repaint-client", "--last-input", "--scrollback", "s1" }, brokerArgsForAction(.{
         .options = &.{},
         .host = "example.com",
@@ -4225,6 +4402,28 @@ test "translateMuxArgs maps client management commands" {
     });
     defer remote_debug.deinit();
     try expectArgvEqual(&.{ "sesshmux", "example.com", "--debug-client", "sever-connection", "--last-input", "s1" }, remote_debug.args.items);
+
+    var remote_debug_unresponsive_seconds = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "debug",
+        "unresponsive-connection",
+        "--host",
+        "example.com",
+        "--seconds",
+        "3",
+        "--last-input",
+        "s1",
+    });
+    defer remote_debug_unresponsive_seconds.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "--debug-client", "unresponsive-connection", "--last-input", "--seconds", "3", "s1" }, remote_debug_unresponsive_seconds.args.items);
+
+    try std.testing.expectError(error.UnsupportedMuxOption, translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "debug",
+        "sever-connection",
+        "--seconds",
+        "3",
+    }));
 }
 
 fn expectArgvEqual(expected: []const []const u8, actual: []const []const u8) !void {
