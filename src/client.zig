@@ -3876,8 +3876,17 @@ fn relayInteractive(
     return end;
 }
 
+var cached_initial_kitty_keyboard_flags: ?u5 = null;
+
 fn queryInitialKittyKeyboardFlags() u5 {
-    return (terminal.queryKittyKeyboardFlags(0, 1) catch null) orelse 0;
+    if (cached_initial_kitty_keyboard_flags) |flags| return flags;
+
+    // Reconnects keep using the same outer terminal. Querying it again after
+    // the reconnect banner clears can race with typed-ahead input and consume
+    // those bytes as probe responses.
+    const flags = (terminal.queryKittyKeyboardFlags(0, 1) catch null) orelse 0;
+    cached_initial_kitty_keyboard_flags = flags;
+    return flags;
 }
 
 fn relayTerminal(

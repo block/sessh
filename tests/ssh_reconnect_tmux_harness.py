@@ -21,6 +21,16 @@ TMUX_ARGS = [TMUX, "-L", f"sessh-ssh-reconnect-{os.getpid()}"] if TMUX else []
 PROMPT = "OUTER_TEST>"
 
 
+def sessh_argv(args):
+    if BIN.name == "sesshmux-dev":
+        return [str(BIN), ":internal-sessh:", *args]
+    return [str(BIN), *args]
+
+
+def shell_join(args):
+    return " ".join(shlex.quote(str(arg)) for arg in args)
+
+
 FAKE_SSH = """#!/bin/sh
 set -eu
 
@@ -256,7 +266,7 @@ def main():
             "  shift\n"
             f"  exec {shlex.quote(str(MUX_BIN))} attach --host test-host \"$@\"\n"
             "fi\n"
-            f"exec {shlex.quote(str(BIN))} test-host \"$@\"\n"
+            f"exec {shell_join(sessh_argv(['test-host']))} \"$@\"\n"
         )
         sessh_wrapper.chmod(sessh_wrapper.stat().st_mode | stat.S_IXUSR)
 

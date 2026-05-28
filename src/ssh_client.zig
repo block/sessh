@@ -2693,7 +2693,9 @@ fn isPlainShellArg(arg: []const u8) bool {
 /// bootstrapper one shell contract to implement and test instead of inheriting
 /// every possible remote login shell's behavior.
 fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
-    return shCommand(allocator, bootstrapper_script);
+    const script = try std.fmt.allocPrint(allocator, "SESSH_SHOW_BOOTSTRAP_STATUS=1\n{s}", .{bootstrapper_script});
+    defer allocator.free(script);
+    return shCommand(allocator, script);
 }
 
 fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []const u8) ![]u8 {

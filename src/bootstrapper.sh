@@ -6,6 +6,7 @@ exec 3>&1
 bootstrapping_status_visible=0
 
 show_bootstrapping_status() {
+  [ "${SESSH_SHOW_BOOTSTRAP_STATUS:-0}" = "1" ] || return 0
   bootstrapping_status_visible=1
   printf '\rsessh: bootstrapping...' >&2
 }

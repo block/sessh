@@ -3753,11 +3753,11 @@ def main():
                 close_client(pid, fd)
             wait_file(drain_done)
 
+            log_path = agent_log_file(env, "s6")
             killed = run([".", "--kill", "s6"], env, check=True, timeout=5.0)
             if "ENDED s6" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
-            log_path = agent_log_file(env, "s6")
             log_text = wait_log_contains(log_path, "event=session_agent_stop")
             for needle in (
                 "event=session_agent_start",

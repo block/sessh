@@ -143,8 +143,20 @@ def run_reconnect_probe(cmd, env, ready, after, timeout=60.0):
 def skip(message):
     if os.environ.get("SESSH_REQUIRE_PODMAN") == "1":
         raise AssertionError(message)
+    cleanup_podman_probe_runtime()
     print(f"skip {message}")
     raise SystemExit(0)
+
+
+def cleanup_podman_probe_runtime():
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_dir:
+        return
+    runtime_path = Path(runtime_dir)
+    if not runtime_path.parent.name.startswith("sessh-check."):
+        return
+    for name in ("containers", "libpod", "podman"):
+        shutil.rmtree(runtime_path / name, ignore_errors=True)
 
 
 def find_zig():
