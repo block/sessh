@@ -406,6 +406,16 @@ def send_resize(conn, rows=24, cols=80, repaint=None, viewport_offset=None):
     send_frame(conn, RESIZE, message.SerializeToString())
 
 
+def send_resize_screen_repaint(conn, rows, cols, repaint_request_seq, viewport_offset=None):
+    global _LAST_RESIZE
+    _LAST_RESIZE = (rows, cols)
+    message = sessh_pb().Resize(terminal_rows=rows, terminal_cols=cols)
+    if viewport_offset is not None:
+        message.viewport_offset = viewport_offset
+    message.repaint_request.repaint_request_seq = repaint_request_seq
+    send_frame(conn, RESIZE, message.SerializeToString())
+
+
 def pack_repaint(repaint_request_seq, scrollback_cursor=None, scrollback_epoch=0):
     message = sessh_pb().RepaintRequest(repaint_request_seq=repaint_request_seq)
     if scrollback_cursor is not None:
@@ -2362,6 +2372,48 @@ def run_resize_epoch_does_not_clear_reconnect_scrollback_test(base_env):
             cleanup_runtime(env)
 
 
+def run_screen_repaint_after_presentation_reset_clears_rows_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-screen-repaint-reset-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        env["SHELL"] = "/bin/sh"
+        shell = Path(tmp) / "screen-repaint-reset-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "printf 'OK\\r\\n'\n"
+            "sleep 30\n"
+        )
+        shell.chmod(0o700)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn, 3, 40)
+                create_and_attach_session(conn, shell)
+
+                message_type, payload = recv_frame(conn)
+                if message_type != SESSION_ATTACHED:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                assert_session_attached(payload)
+                recv_draw_until(conn, b"OK")
+
+                send_resize_screen_repaint(conn, 3, 40, 77)
+                response_id, repaint = recv_repaint_response(conn)
+                if response_id != 77:
+                    raise AssertionError(f"unexpected screen repaint seq: {response_id}")
+                output = repaint["draw_bytes"]
+                if b"\x1b[2K\x1b[0mOK" not in output:
+                    raise AssertionError(f"screen repaint did not clear row before redrawing short content: {output!r}")
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
 def run_slow_attachment_does_not_block_commands_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-slow-attachment-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
@@ -2727,7 +2779,7 @@ def run_broker_registry_commands_test(base_env):
                 proc.wait(timeout=2.0)
 
         missing = run([":internal-broker:", "kill", "s1"], env, timeout=5.0)
-        if missing.returncode != 1 or "session not found" not in missing.stderr:
+        if missing.returncode != 1 or "session already exited" not in missing.stderr:
             raise AssertionError(missing)
 
         proc = subprocess.Popen(
@@ -3493,6 +3545,7 @@ def main():
             run_scrollback_clear_protocol_test(env)
             run_reconnect_scrollback_gap_protocol_test(env)
             run_resize_epoch_does_not_clear_reconnect_scrollback_test(env)
+            run_screen_repaint_after_presentation_reset_clears_rows_test(env)
             run_slow_attachment_does_not_block_commands_test(env)
             run_env_config_client_test(tmp)
             run_tty_transcript_capture_test(tmp)
