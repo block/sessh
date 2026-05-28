@@ -177,12 +177,14 @@ fn artifactExecutable(
 ) *std.Build.Step.Compile {
     // Ship runtime safety checks in packaged binaries. sessh handles terminal
     // input, remote output, and network frames; catching bounds/overflow bugs at
-    // runtime is worth the size tradeoff.
+    // runtime is worth the size tradeoff. We still strip symbols/debug info from
+    // these bootstrapped artifacts because that does not disable safety checks.
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = .ReleaseSafe,
         .link_libc = true,
+        .strip = true,
     });
     const protobuf_dep = b.dependency("protobuf", .{
         .target = target,
