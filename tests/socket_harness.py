@@ -3261,8 +3261,8 @@ def run_env_config_client_test(tmp_root):
         if "ENDED s1" not in killed.stdout:
             raise AssertionError(killed.stdout)
 
-        (config_dir / "sessh.env").write_text("leader=None\n")
-        pid, fd = spawn_client(env, ["--alias", "s2", "--leader", "CTRL-B"])
+        (config_dir / "sessh.env").write_text("leader=CTRL-B\n")
+        pid, fd = spawn_client(env, ["--alias", "s2"])
         try:
             read_until(fd, b"$ ")
             os.write(fd, b"\x02d")
@@ -3583,7 +3583,10 @@ def main():
                 if not closed:
                     close_client(pid, fd)
 
-            pid, fd = spawn_client(env, ["--alias", "s2", "--scrollback-limit", "7"])
+            config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "sessh.env").write_text("scrollback-limit=7\n")
+            pid, fd = spawn_client(env, ["--alias", "s2"])
             try:
                 read_until(fd, b"$ ")
                 os.write(fd, b"~.")
@@ -3607,7 +3610,8 @@ def main():
             if missing.returncode != 1 or "ERROR session not found" not in missing.stderr:
                 raise AssertionError(missing)
 
-            pid, fd = spawn_client(env, ["--alias", "s3", "--leader", "CTRL-B"])
+            (config_dir / "sessh.env").write_text("leader=CTRL-B\n")
+            pid, fd = spawn_client(env, ["--alias", "s3"])
             try:
                 read_until(fd, b"$ ")
                 os.write(fd, b"\x02d")
@@ -3634,7 +3638,8 @@ def main():
             if "ENDED s3" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
-            pid, fd = spawn_client(env, ["--alias", "s4", "--leader", "CTRL-B"])
+            (config_dir / "sessh.env").write_text("leader=CTRL-B\n")
+            pid, fd = spawn_client(env, ["--alias", "s4"])
             try:
                 read_until(fd, b"$ ")
                 os.write(fd, b"echo sessh_before_sever\n")

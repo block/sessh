@@ -152,8 +152,6 @@ fn usage(code: u8, entrypoint: EntryPoint) !void {
         \\
         \\common options:
         \\  --alias NAME
-        \\  --leader CTRL-KEY|None
-        \\  --runtime-dir DIR
         \\  --ssh-options "SSH_ARGS"
         \\
         \\See the user manual for advanced usage:

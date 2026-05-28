@@ -236,6 +236,9 @@ def main():
         child_env["PATH"] = f"{fake_bin}{os.pathsep}{child_env['PATH']}"
         child_env["SHELL"] = str(remote_shell)
         child_env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "1"
+        config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "sessh.env").write_text("leader=CTRL-A\nscrollback-limit=321\n")
         sessh_wrapper = tmp / "run-sessh"
         sessh_wrapper.write_text(
             "#!/bin/sh\n"
@@ -251,9 +254,9 @@ def main():
             f"export SESSH_FAKE_SSH_FAIL_BATCH_COUNT_FILE={shlex.quote(str(fail_batch_count_file))}\n"
             "if [ \"${1-}\" = attach ]; then\n"
             "  shift\n"
-            f"  exec {shlex.quote(str(MUX_BIN))} attach --leader CTRL-A --scrollback-limit 321 --host test-host \"$@\"\n"
+            f"  exec {shlex.quote(str(MUX_BIN))} attach --host test-host \"$@\"\n"
             "fi\n"
-            f"exec {shlex.quote(str(BIN))} --leader CTRL-A --scrollback-limit 321 test-host \"$@\"\n"
+            f"exec {shlex.quote(str(BIN))} test-host \"$@\"\n"
         )
         sessh_wrapper.chmod(sessh_wrapper.stat().st_mode | stat.S_IXUSR)
 

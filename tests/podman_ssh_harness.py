@@ -364,9 +364,12 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             timeout=10.0,
         )
         env["SHELL"] = remote_shell
+        config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "sessh.env").write_text("leader=CTRL-B\n")
 
         reconnected = run_reconnect_probe(
-            [str(prefix / "bin" / "sessh"), "--leader", "CTRL-B", "-F", str(config), host_alias],
+            [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias],
             env,
             reconnect_marker,
             f"after-reconnect-{arch}",
@@ -417,8 +420,9 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         if started.returncode != 0:
             raise AssertionError(started)
 
+        ssh_options = f"-F {config}"
         listed = run(
-            [str(prefix / "bin" / "sesshmux"), "list", "-F", str(config), host_alias],
+            [str(prefix / "bin" / "sesshmux"), "list", "--ssh-options", ssh_options, host_alias],
             env=env,
             timeout=60.0,
             check=False,
@@ -445,7 +449,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(f"remote session compat symlink was not installed at {compat_path}")
 
         killed = run(
-            [str(prefix / "bin" / "sesshmux"), "kill", "-F", str(config), host_alias, session_id],
+            [str(prefix / "bin" / "sesshmux"), "kill", "--ssh-options", ssh_options, host_alias, session_id],
             env=env,
             timeout=60.0,
             check=False,
@@ -456,7 +460,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(killed)
 
         stopped = run(
-            [str(prefix / "bin" / "sesshmux"), "kill", "--all", "-F", str(config), host_alias],
+            [str(prefix / "bin" / "sesshmux"), "kill", "--all", "--ssh-options", ssh_options, host_alias],
             env=env,
             timeout=60.0,
             check=False,
@@ -467,7 +471,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(stopped)
 
         stopped_again = run(
-            [str(prefix / "bin" / "sesshmux"), "kill", "--all", "-F", str(config), host_alias],
+            [str(prefix / "bin" / "sesshmux"), "kill", "--all", "--ssh-options", ssh_options, host_alias],
             env=env,
             timeout=60.0,
             check=False,

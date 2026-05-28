@@ -1079,7 +1079,10 @@ def main():
             repaint_preamble = "for i in $(seq 1 100); do printf 'repaint_pre_%03d\\n' \"$i\"; done"
             run([*TMUX_ARGS, "send-keys", "-t", repaint_session, repaint_preamble, "Enter"])
             wait_capture(repaint_session, "repaint_pre_100")
-            repaint_command = home_shell_command(COMMAND_SHELL_NAME, "--leader", "CTRL-A")
+            config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "sessh.env").write_text("leader=CTRL-A\n")
+            repaint_command = home_shell_command(COMMAND_SHELL_NAME)
             prompt_count = capture(repaint_session).count(HARNESS_PROMPT)
             run([*TMUX_ARGS, "send-keys", "-t", repaint_session, repaint_command, "Enter"])
             wait_capture_count(repaint_session, HARNESS_PROMPT, prompt_count + 1)

@@ -19,10 +19,9 @@ const command_timeout_ms: i64 = 2_000;
 const command_poll_ms: u64 = 20;
 
 pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
-    const command_args = try applyBrokerOptions(args);
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
 
-    if (command_args.len > 0) return runCommandArgs(allocator, command_args);
+    if (args.len > 0) return runCommandArgs(allocator, args);
 
     const handshake_result = try acceptRuntimeHandshake(allocator, 0, 1);
     if (handshake_result == .mismatch) return;
@@ -74,22 +73,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
             },
         }
     }
-}
-
-fn applyBrokerOptions(args: []const []const u8) ![]const []const u8 {
-    var i: usize = 0;
-    while (i < args.len) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--runtime-dir")) {
-            i += 1;
-            if (i >= args.len) return error.MissingRuntimeDir;
-            socket_transport.setRuntimeRootOverride(args[i]);
-            i += 1;
-            continue;
-        }
-        break;
-    }
-    return args[i..];
 }
 
 fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {

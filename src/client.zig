@@ -54,7 +54,6 @@ const LocalOptions = struct {
     attach_id: ?[]const u8 = null,
     kill_id: ?[]const u8 = null,
     alias: ?[]const u8 = null,
-    runtime_dir: ?[]const u8 = null,
     list_refresh: bool = false,
     list_include_cached_routes: bool = true,
     list_jsonl: bool = false,
@@ -2074,7 +2073,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return process_exit.request(64);
     };
     client_log.setLevel(options.client_log_level);
-    if (options.runtime_dir) |dir| socket_transport.setRuntimeRootOverride(dir);
 
     return runBrokerClient(allocator, args, options);
 }
@@ -2085,8 +2083,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         return process_exit.request(64);
     }
 
-    var broker_arg_buf: [2][]const u8 = undefined;
-    const runtime_broker_args = brokerRuntimeArgs(options, &broker_arg_buf);
+    const runtime_broker_args: []const []const u8 = &.{};
     switch (options.action) {
         .list => {
             const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl);
@@ -2250,15 +2247,6 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             return process_exit.request(1);
         };
     }
-}
-
-fn brokerRuntimeArgs(options: LocalOptions, buf: *[2][]const u8) []const []const u8 {
-    if (options.runtime_dir) |dir| {
-        buf[0] = "--runtime-dir";
-        buf[1] = dir;
-        return buf[0..2];
-    }
-    return buf[0..0];
 }
 
 fn appendBrokerCommand(
@@ -2756,11 +2744,6 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             if (!session_registry.isValidCustomAlias(args[i])) return error.InvalidAlias;
             options.alias = args[i];
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--runtime-dir")) {
-            i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingRuntimeDir;
-            options.runtime_dir = args[i];
-            i += 1;
         } else if (std.mem.eql(u8, arg, "--refresh")) {
             options.list_refresh = true;
             i += 1;
@@ -2792,6 +2775,7 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             options.debug_unresponsive_seconds = try parseDebugUnresponsiveSeconds(args[i]);
             i += 1;
         } else if (std.mem.eql(u8, arg, "--leader")) {
+            if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
             i += 1;
             if (i >= args.len) return error.MissingLeader;
             options.leader = try parseLeader(args[i]);
@@ -2800,6 +2784,7 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             try options.banner_args.append(args[i]);
             i += 1;
         } else if (std.mem.eql(u8, arg, "--scrollback-limit")) {
+            if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
             i += 1;
             if (i >= args.len) return error.MissingScrollbackRowCount;
             options.scrollback_row_count = try parseScrollbackRowCount(args[i]);
@@ -2808,6 +2793,7 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             try options.banner_args.append(args[i]);
             i += 1;
         } else if (std.mem.eql(u8, arg, "--initial-scrollback")) {
+            if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
             i += 1;
             if (i >= args.len) return error.MissingInitialScrollback;
             options.initial_scrollback_row_count = try parseInitialScrollbackRowCount(args[i]);

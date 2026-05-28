@@ -358,6 +358,16 @@ def run_sessh(args, env, timeout=5.0):
     )
 
 
+def write_sessh_config(env, text):
+    config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "sessh.env").write_text(text)
+
+
+def configure_ctrl_b_leader(env):
+    write_sessh_config(env, "leader=CTRL-B\n")
+
+
 def optional_text(path):
     return path.read_text() if path.exists() else "<missing>"
 
@@ -1435,71 +1445,29 @@ def test_ssh_unsupported_option_does_not_fallback_for_sessh_action(tmp):
         raise AssertionError(fake_log.read_text())
 
 
-def test_ssh_bootstrap_overrides_config_false_and_uploads(tmp):
+def test_ssh_config_only_cli_options_are_rejected(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
-    remote_shell = tmp / "remote-shell"
-    marker = "SSH_BOOTSTRAP_FLAG_READY"
-    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
-    remote_shell.chmod(0o700)
-    config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "sessh.env").write_text("bootstrap=false\n")
     write_fake_ssh(fake_bin / "ssh")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["--bootstrap", "test-host"], env, timeout=30.0)
-
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if marker not in result.stdout:
-        raise AssertionError(result)
-    log_text = fake_log.read_text()
-    if "direct_broker=1" in log_text:
-        raise AssertionError(log_text)
-    artifact = remote_path_artifact()
-    installed = artifact_cache_path(env, artifact)
-    if installed.read_bytes() != artifact.read_bytes():
-        raise AssertionError("bootstrap flag did not upload artifact")
-
-
-def test_ssh_no_bootstrap_uses_remote_path_sesshmux(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    remote_shell = tmp / "remote-shell"
-    marker = "SSH_NO_BOOTSTRAP_FLAG_READY"
-    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
-    remote_shell.chmod(0o700)
-    config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "sessh.env").write_text("bootstrap=true\n")
-    write_fake_ssh(fake_bin / "ssh")
-    (fake_bin / "sesshmux").write_text(
-        "#!/bin/sh\n"
-        "printf 'direct_broker=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
-        f"exec {shlex.quote(str(MUX_BIN))} \"$@\"\n"
-    )
-    (fake_bin / "sesshmux").chmod(0o700)
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SHELL"] = str(remote_shell)
-
-    result = run_sessh(["--no-bootstrap", "test-host"], env, timeout=30.0)
-
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if marker not in result.stdout:
-        raise AssertionError(result)
-    log_text = fake_log.read_text()
-    if "direct_broker=1" not in log_text:
-        raise AssertionError(log_text)
-    if "bootstrapper=1" in log_text:
-        raise AssertionError(log_text)
-    assert_cached_artifact(env, remote_path_artifact(), "--no-bootstrap")
+    for args in (
+        ["--leader", "CTRL-B", "test-host"],
+        ["--scrollback-limit", "100", "test-host"],
+        ["--initial-scrollback", "0", "test-host"],
+        ["--bootstrap", "test-host"],
+        ["--no-bootstrap", "test-host"],
+        ["--ssh-options", "-F cfg", "test-host"],
+    ):
+        result = run_sessh(args, env, timeout=5.0)
+        if result.returncode != 64:
+            raise AssertionError((args, result))
+        if "unsupported sessh option" not in result.stderr:
+            raise AssertionError((args, result.stderr))
+    if fake_log.exists():
+        raise AssertionError(fake_log.read_text())
 
 
 def test_ssh_bootstrap_false_config_uses_remote_path_sesshmux(tmp):
@@ -1689,9 +1657,10 @@ def test_ssh_leader_sever_reconnects(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "1"
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
     result = run_sessh_reconnect_probe(
-        ["--leader", "CTRL-B", "test-host"],
+        ["test-host"],
         env,
         marker,
         "after-reconnect",
@@ -1950,8 +1919,9 @@ def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
-    argv = sessh_argv(["--leader", "CTRL-B", "test-host"])
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -2030,8 +2000,9 @@ def test_ssh_retry_elapsed_without_input_switches_automatically(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
-    argv = sessh_argv(["--leader", "CTRL-B", "test-host"])
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -2171,9 +2142,10 @@ def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_STDERR_ON_BATCH"] = raw_ssh_error
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
     result = run_sessh_reconnect_probe(
-        ["--leader", "CTRL-B", "test-host"],
+        ["test-host"],
         env,
         marker,
         "after-reconnect",
@@ -2222,9 +2194,10 @@ def test_ssh_log_level_quiet_suppresses_buffered_stderr_display(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_STDERR_ON_BATCH"] = raw_ssh_error
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
     result = run_sessh_reconnect_probe(
-        ["--leader", "CTRL-B", "--log-level", "quiet", "test-host"],
+        ["--log-level", "quiet", "test-host"],
         env,
         marker,
         "after-reconnect",
@@ -2259,8 +2232,9 @@ def test_ssh_session_buffers_and_displays_stderr_after_attach(tmp):
     env["SESSH_FAKE_SSH_STDERR_SIGNAL_FILE"] = str(signal_file)
     env["SESSH_FAKE_SSH_STDERR_DONE_FILE"] = str(done_file)
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
-    argv = sessh_argv(["--leader", "CTRL-B", "test-host"])
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -2323,9 +2297,10 @@ def test_ssh_reconnect_does_not_apply_active_screen_cleanup(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "1"
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
     result = run_sessh_enter_alt_then_reconnect_banner(
-        ["--leader", "CTRL-B", "test-host"],
+        ["test-host"],
         env,
         primary_marker,
         alt_marker,
@@ -2353,9 +2328,10 @@ def test_ssh_reconnect_can_detach_while_bootstrapping(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "20"
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
     result = run_sessh_detach_reconnect_probe(
-        ["--leader", "CTRL-B", "test-host"],
+        ["test-host"],
         env,
         marker,
         timeout=10.0,
@@ -2384,9 +2360,10 @@ def test_ssh_reconnect_can_detach_with_ctrl_c(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "20"
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
     result = run_sessh_detach_reconnect_probe(
-        ["--leader", "CTRL-B", "test-host"],
+        ["test-host"],
         env,
         marker,
         detach_bytes=b"\x03",
@@ -2421,9 +2398,10 @@ def test_ssh_leader_detach_exits_while_remote_output_is_flowing(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
     result = run_sessh_detach_probe(
-        ["--leader", "CTRL-B", "test-host"],
+        ["test-host"],
         env,
         marker,
         timeout=30.0,
@@ -2448,7 +2426,7 @@ def test_ssh_unsupported_remote_platform_falls_back_to_plain_ssh(tmp):
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
     env["SESSH_FAKE_SSH_REMOTE_PATH"] = str(remote_bin)
 
-    result = run_sessh(["--leader", "CTRL-B", "test-host"], env, timeout=30.0)
+    result = run_sessh(["test-host"], env, timeout=30.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -2563,9 +2541,10 @@ def test_ssh_version_mismatch_uses_compat_path(tmp):
     server, thread, observed = start_version_mismatch_agent(env, "s1")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    configure_ctrl_b_leader(env)
 
     try:
-        result = run_sesshmux(["attach", "--leader", "CTRL-B", "--host", "test-host"], env, timeout=30.0)
+        result = run_sesshmux(["attach", "--host", "test-host", "s1"], env, timeout=30.0)
     finally:
         server.close()
         thread.join(timeout=5.0)
@@ -2589,7 +2568,7 @@ def test_ssh_version_mismatch_uses_compat_path(tmp):
         raise AssertionError(log_text)
     expected_args = (
         f"compat_args=. --compat-version {sessh_version()} "
-        "--attach --leader CTRL-B --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
+        "--attach s1 --leader CTRL-B --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
     )
     if expected_args not in log_text:
         raise AssertionError(log_text)
@@ -2603,14 +2582,14 @@ def test_ssh_force_compat_uses_compat_path(tmp):
     config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "sessh.env").write_text(
-        "leader=None\nscrollback-limit=77\ninitial-scrollback=0\n"
+        "leader=CTRL-B\nscrollback-limit=77\ninitial-scrollback=0\n"
     )
     write_fake_ssh(fake_bin / "ssh")
     write_compat_marker(session_compat_path(env, "s1"), marker)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    result = run_sesshmux(["attach", "--force-compat", "--leader", "CTRL-B", "--host", "test-host", "s1"], env, timeout=30.0)
+    result = run_sesshmux(["attach", "--force-compat", "--host", "test-host", "s1"], env, timeout=30.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -2653,6 +2632,7 @@ def test_ssh_force_compat_ctrl_c_reaches_remote_pty(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_SIMULATE_NO_PTY"] = "1"
     env["SHELL"] = str(remote_shell)
+    configure_ctrl_b_leader(env)
 
     first = run_sessh_until_stdout(["--alias", "s1", "test-host"], env, marker, timeout=30.0)
     if first.returncode != 0:
@@ -2660,7 +2640,7 @@ def test_ssh_force_compat_ctrl_c_reaches_remote_pty(tmp):
     assert_session_compat_points_to_cached_artifact(env, remote_path_artifact(), "s1", "force compat signal")
 
     result = run_sesshmux_in_pty(
-        ["attach", "--force-compat", "--leader", "CTRL-B", "--host", "test-host", "s1"],
+        ["attach", "--force-compat", "--host", "test-host", "s1"],
         env,
         (
             (b"REMOTE_PROMPT$", b"\x03"),
@@ -2747,12 +2727,8 @@ def main(argv=None):
             test_ssh_unsupported_option_does_not_fallback_for_sessh_action,
         ),
         (
-            "ssh bootstrap overrides config false and uploads",
-            test_ssh_bootstrap_overrides_config_false_and_uploads,
-        ),
-        (
-            "ssh no-bootstrap uses remote path sesshmux",
-            test_ssh_no_bootstrap_uses_remote_path_sesshmux,
+            "ssh config-only cli options are rejected",
+            test_ssh_config_only_cli_options_are_rejected,
         ),
         (
             "ssh bootstrap false config uses remote path sesshmux",

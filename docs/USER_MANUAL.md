@@ -1,9 +1,8 @@
 # Basic Usage
 
 `sessh` is a drop-in replacement for `ssh` with seamless connection recovery. 
-The command-line interface is the same as `ssh`. Extra parameters are
-available, but they are for advanced use. You can use `sessh` exactly like
-`ssh`:
+The command-line interface is the same as `ssh`. You can use `sessh` exactly
+like `ssh`:
 
 ```text
 sessh [ssh-option ...] destination [command [argument ...]]
@@ -37,10 +36,52 @@ You may re-attach or kill the session with `sesshmux`, documented below.
 You may provide extra parameters for advanced usage:
 
 ```text
-sessh [sessh-options] [ssh-options] HOST [-- cmd arg...]
+sessh [[ssh-option|sessh-option] ...] destination [command [argument ...]]
+```
+- `--alias NAME`: choose the alias for a new session. Remote sessions register
+  the alias on the remote host and cache a local route after the first attach.
+- `--log-level quiet|error|warn|info|debug|verbose`: override
+  `client-log-level` for the local client.
+- `--force-compat`: run the compat-fallback path immediately, without first
+  trying the normal bootstrap/runtime path.
+
+Sessh-specific behavior is configured in the config file documented below.
+
+## Config file
+
+The config file uses `.env` syntax. It can specify sessh-specific options, but
+not arbitrary ssh options. `client-log-level` can be overridden with
+`--log-level`; the other keys are config-only.
+
+The default config path follows the XDG spec. If `$XDG_CONFIG_HOME` is defined:
+`$XDG_CONFIG_HOME/sessh/sessh.env`. Otherwise: `~/.config/sessh/sessh.env`
+
+See [FILESYSTEM LAYOUT](FILESYSTEM_LAYOUT.md) for details about other
+directories used by sessh.
+
+Config keys are case-insensitive. Supported keys with their default values:
+
+```dotenv
+leader=None
+scrollback-limit=2000
+initial-scrollback=-1
+client-log-level=warn
+bootstrap=true
 ```
 
-All sessh-specific options must appear before `HOST`.
+- `leader`: set the leader key for client commands or disable with `None`. The
+  leader key is must be in the form `CTRL-<letter>`.
+- `scrollback-limit`: set the maximum number of retained scrollback lines.
+- `initial-scrollback`: set how many retained scrollback lines are drawn when
+  attaching to an existing session. `-1` means all retained scrollback, `0`
+  means draw only the current screen.
+- `client-log-level`: configure client logging level. Supported values
+  are `quiet`, `error`, `warn`, `info`, `debug`, and `verbose`. If unset, sessh
+  infers `info`, `debug`, or `verbose` from `-v`, `-vv`, or
+  `-vvv`; otherwise it defaults to `warn`. Client logs will be buffered while
+  attached and displayed upon detach.
+- `bootstrap`: enable or disable loading the `sessh` binary onto hosts. If
+  disabled, `sessh` will attempt to find itself remotely in `$PATH`.
 
 ## Mux Commands
 
@@ -60,59 +101,8 @@ Use `sesshmux` for session management:
 - `sesshmux kill --all [HOST]`: terminate all local sessions or all sessions on
   `HOST`.
 
-For remote commands, pass ssh options before the host or through
-`--ssh-options "..."`, for example `sesshmux list --ssh-options "-F cfg" HOST`.
-
-## Config file
-
-The config file uses `.env` syntax. It can specify defaults for sessh-specific
-options, but not arbitrary ssh options. Command-line arguments always win over
-config values.
-
-The default config path follows the XDG spec. If `$XDG_CONFIG_HOME` is defined:
-`$XDG_CONFIG_HOME/sessh/sessh.env`. Otherwise: `~/.config/sessh/sessh.env`
-
-Config keys are case-insensitive, and underscores may be used instead of
-hyphens. Supported keys with their default values:
-
-```dotenv
-leader=None
-scrollback-limit=2000
-initial-scrollback=-1
-client-log-level=warn
-bootstrap=true
-```
-
-- `leader`: set the leader key for client commands or disable with `None`. The leader key is must be in the form `CTRL-<letter>`.
-- `scrollback-limit`: set the maximum number of retained scrollback lines.
-- `initial-scrollback`: set how many retained scrollback lines are drawn when
-  attaching to an existing session. `-1` means all retained scrollback, `0`
-  means draw only the current screen.
-- `client-log-level`: configure client logging level. Supported values
-  are `quiet`, `error`, `warn`, `info`, `debug`, and `verbose`. If unset, the
-  ssh transport infers `info`, `debug`, or `verbose` from `-v`, `-vv`, or
-  `-vvv`; otherwise it defaults to `warn`. Client logs will be buffered while
-  attached and displayed upon detach.
-- `bootstrap`: enable or disable loading the `sessh` binary onto hosts. If
-  disabled, `sessh` will attempt to find itself remotely in `$PATH`.
-
-## Option-type parameters
-
-The options in the config file can be overridden on the command-line:
-
-- `--leader`
-- `--scrollback-limit`
-- `--initial-scrollback`
-- `--log-level`
-- `--bootstrap` or `--no-bootstrap`
-- `--alias NAME`: choose the alias for a new session. Remote sessions register
-  the alias on the remote host and cache a local route after the first attach.
-- `--runtime-dir DIR`: choose the runtime directory for live sockets and agent
-  files. The default is `$XDG_RUNTIME_DIR` if set, otherwise
-  `/tmp/sessh-<uid>`.
-
-Persistent client aliases and attach routes are stored under XDG state:
-`$XDG_STATE_HOME/sessh`, or `~/.local/state/sessh` if `XDG_STATE_HOME` is unset.
+For remote commands, pass ssh options through `--ssh-options "..."`, for
+example `sesshmux list --ssh-options "-F cfg" HOST`.
 
 ## Diagnostics
 
@@ -138,9 +128,13 @@ commands inside the session can invoke `sesshmux`.
 Each attached client uses a `c-`-prefixed GUID.
 
 When creating a new session, you can specify a custom alias with `--alias`. Any
-value is allowed as long as `-` isn't one of the first two characters. If you
-don't specify one, `sessh` generates a 10-character alias such as
-`s-550e8400`.
+valid filename is allowed except
+
+1. Neither of the first two characters can be `-`
+2. `/` is not allowed.
+
+If you don't specify one, `sessh` generates a 10-character alias
+such as `s-550e8400`.
 
 After you attach to a remote session, sessh caches a local route so later
 `sesshmux attach ALIAS` can reconnect without restating the host. If
