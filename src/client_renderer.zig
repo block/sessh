@@ -55,6 +55,7 @@ pub const TerminalModes = struct {
     mode_flags: u32 = 0,
     mouse_tracking: MouseTracking = .disabled,
     mouse_sgr: bool = false,
+    kitty_keyboard_flags: u5 = 0,
 
     pub const insert_mode: u32 = 1 << 0;
     pub const origin_mode: u32 = 1 << 1;
@@ -66,7 +67,8 @@ pub const TerminalModes = struct {
     pub fn eql(self: TerminalModes, other: TerminalModes) bool {
         return self.mode_flags == other.mode_flags and
             self.mouse_tracking == other.mouse_tracking and
-            self.mouse_sgr == other.mouse_sgr;
+            self.mouse_sgr == other.mouse_sgr and
+            self.kitty_keyboard_flags == other.kitty_keyboard_flags;
     }
 };
 
@@ -161,13 +163,14 @@ pub const Renderer = struct {
         return .{ .output = .{ .buffer = buffer }, .caps = caps };
     }
 
-    pub fn restorePresentation(self: Renderer) !void {
+    pub fn restorePresentation(self: Renderer, kitty_keyboard_flags: u5) !void {
         if (!self.caps.supportsRendering()) return;
         try self.restoreBannerPresentation();
         try self.disableMouseTracking();
         try self.setPrivateMode(1, false);
         try self.write("\x1b[?1004l");
         try self.write("\x1b[?2004l");
+        try self.setKittyKeyboardFlags(kitty_keyboard_flags);
         try self.write("\x1b[?25h");
         try self.setCursorStyle(.default);
     }
@@ -399,6 +402,7 @@ pub const Renderer = struct {
         try self.setPrivateMode(1, (modes.mode_flags & TerminalModes.application_cursor_keys) != 0);
         try self.setPrivateMode(1004, (modes.mode_flags & TerminalModes.focus_reporting) != 0);
         try self.setPrivateMode(2004, (modes.mode_flags & TerminalModes.bracketed_paste) != 0);
+        try self.setKittyKeyboardFlags(modes.kitty_keyboard_flags);
     }
 
     fn disableMouseTracking(self: Renderer) !void {
@@ -412,6 +416,12 @@ pub const Renderer = struct {
     fn setPrivateMode(self: Renderer, mode: u16, enabled: bool) !void {
         var buf: [32]u8 = undefined;
         const seq = try std.fmt.bufPrint(&buf, "\x1b[?{}{s}", .{ mode, if (enabled) "h" else "l" });
+        try self.write(seq);
+    }
+
+    fn setKittyKeyboardFlags(self: Renderer, flags: u5) !void {
+        var buf: [16]u8 = undefined;
+        const seq = try std.fmt.bufPrint(&buf, "\x1b[={}u", .{flags});
         try self.write(seq);
     }
 
@@ -530,6 +540,7 @@ pub const Renderer = struct {
 pub const PresentationGuard = struct {
     renderer: Renderer,
     cleanup_title: ?[]const u8 = null,
+    initial_kitty_keyboard_flags: u5 = 0,
     alternate_screen_active: bool = false,
     active: bool = true,
 
@@ -537,12 +548,39 @@ pub const PresentationGuard = struct {
         return .{ .renderer = Renderer.init(fd) };
     }
 
+    pub fn initWithInitialKittyKeyboardFlags(fd: c.fd_t, initial_kitty_keyboard_flags: u5) PresentationGuard {
+        return .{ .renderer = Renderer.init(fd), .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags };
+    }
+
     pub fn initWithCleanupTitle(fd: c.fd_t, cleanup_title: []const u8) PresentationGuard {
         return .{ .renderer = Renderer.init(fd), .cleanup_title = cleanup_title };
     }
 
+    pub fn initWithCleanupTitleAndInitialKittyKeyboardFlags(
+        fd: c.fd_t,
+        cleanup_title: []const u8,
+        initial_kitty_keyboard_flags: u5,
+    ) PresentationGuard {
+        return .{
+            .renderer = Renderer.init(fd),
+            .cleanup_title = cleanup_title,
+            .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags,
+        };
+    }
+
     pub fn withCapabilities(fd: c.fd_t, caps: Capabilities) PresentationGuard {
         return .{ .renderer = Renderer.withCapabilities(fd, caps) };
+    }
+
+    pub fn withCapabilitiesAndInitialKittyKeyboardFlags(
+        fd: c.fd_t,
+        caps: Capabilities,
+        initial_kitty_keyboard_flags: u5,
+    ) PresentationGuard {
+        return .{
+            .renderer = Renderer.withCapabilities(fd, caps),
+            .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags,
+        };
     }
 
     pub fn withCapabilitiesAndCleanupTitle(fd: c.fd_t, caps: Capabilities, cleanup_title: []const u8) PresentationGuard {
@@ -567,7 +605,7 @@ pub const PresentationGuard = struct {
     pub fn restore(self: *PresentationGuard) void {
         if (!self.active) return;
         self.leaveAlternateScreen() catch {};
-        self.renderer.restorePresentation() catch {};
+        self.renderer.restorePresentation(self.initial_kitty_keyboard_flags) catch {};
         if (self.cleanup_title) |title| self.renderer.setTitle(title) catch {};
         self.active = false;
     }
@@ -726,7 +764,7 @@ test "restore presentation does not clear or swap the screen" {
     defer posix.close(fds[1]);
 
     const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
-    try renderer.restorePresentation();
+    try renderer.restorePresentation(0);
 
     var buf: [512]u8 = undefined;
     const len = try posix.read(fds[0], &buf);
@@ -742,7 +780,7 @@ test "restore presentation resets every modeled local terminal side effect" {
     defer posix.close(fds[1]);
 
     const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
-    try renderer.restorePresentation();
+    try renderer.restorePresentation(0);
 
     var buf: [512]u8 = undefined;
     const len = try posix.read(fds[0], &buf);
@@ -757,8 +795,24 @@ test "restore presentation resets every modeled local terminal side effect" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1l") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1004l") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?2004l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[=0u") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?25h") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[0 q") != null);
+}
+
+test "restore presentation restores initial kitty keyboard flags" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    try renderer.restorePresentation(7);
+
+    var buf: [512]u8 = undefined;
+    const len = try posix.read(fds[0], &buf);
+    const bytes = buf[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[=7u") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[=0u") == null);
 }
 
 test "restore banner presentation preserves input and event modes" {
@@ -781,6 +835,7 @@ test "restore banner presentation preserves input and event modes" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1l") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1004l") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?2004l") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[=0u") == null);
 }
 
 test "presentation guard restores cleanup title" {
@@ -799,6 +854,24 @@ test "presentation guard restores cleanup title" {
     const len = try posix.read(fds[0], &buf);
     const bytes = buf[0..len];
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b]2;/Users/tomm/Development/sessh\x1b\\") != null);
+}
+
+test "presentation guard restores captured kitty keyboard flags" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var guard = PresentationGuard.withCapabilitiesAndInitialKittyKeyboardFlags(
+        fds[1],
+        .{ .kind = .xterm_compatible },
+        3,
+    );
+    guard.restore();
+
+    var buf: [512]u8 = undefined;
+    const len = try posix.read(fds[0], &buf);
+    const bytes = buf[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[=3u") != null);
 }
 
 test "presentation guard leaves alternate screen only when it entered it" {
@@ -842,6 +915,7 @@ test "apply terminal modes enables input and event modes" {
             TerminalModes.bracketed_paste,
         .mouse_tracking = .normal,
         .mouse_sgr = true,
+        .kitty_keyboard_flags = 7,
     });
     posix.close(fds[1]);
 
@@ -853,6 +927,7 @@ test "apply terminal modes enables input and event modes" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1h") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1004h") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?2004h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[=7u") != null);
 }
 
 test "apply terminal modes disables input and event modes" {
@@ -873,4 +948,5 @@ test "apply terminal modes disables input and event modes" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1l") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?1004l") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?2004l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[=0u") != null);
 }

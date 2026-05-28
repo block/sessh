@@ -3750,14 +3750,19 @@ fn relayInteractive(
     paste_like_input_classifier: *PasteLikeInputClassifier,
     options: RelayOptions,
 ) !RelayEnd {
+    const initial_kitty_keyboard_flags = queryInitialKittyKeyboardFlags();
     var mode_guard = try terminal.TerminalModeGuard.enable(0);
     defer mode_guard.restore();
     const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
     defer if (cleanup_title) |title| app_allocator.allocator().free(title);
     var presentation_guard = if (cleanup_title) |title|
-        client_renderer.PresentationGuard.initWithCleanupTitle(1, title)
+        client_renderer.PresentationGuard.initWithCleanupTitleAndInitialKittyKeyboardFlags(
+            1,
+            title,
+            initial_kitty_keyboard_flags,
+        )
     else
-        client_renderer.PresentationGuard.init(1);
+        client_renderer.PresentationGuard.initWithInitialKittyKeyboardFlags(1, initial_kitty_keyboard_flags);
     defer presentation_guard.restore();
 
     const end = try relayTerminal(
@@ -3776,6 +3781,10 @@ fn relayInteractive(
     );
     if (end == .detach) writeDetachBoundary();
     return end;
+}
+
+fn queryInitialKittyKeyboardFlags() u5 {
+    return (terminal.queryKittyKeyboardFlags(0, 1) catch null) orelse 0;
 }
 
 fn relayTerminal(

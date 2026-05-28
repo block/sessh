@@ -82,6 +82,7 @@ pub const TerminalModes = struct {
     mode_flags: u32 = 0,
     mouse_tracking: u8 = 0,
     mouse_sgr: bool = false,
+    kitty_keyboard_flags: u5 = 0,
 
     pub const insert_mode: u32 = 1 << 0;
     pub const origin_mode: u32 = 1 << 1;
@@ -93,7 +94,8 @@ pub const TerminalModes = struct {
     pub fn eql(self: TerminalModes, other: TerminalModes) bool {
         return self.mode_flags == other.mode_flags and
             self.mouse_tracking == other.mouse_tracking and
-            self.mouse_sgr == other.mouse_sgr;
+            self.mouse_sgr == other.mouse_sgr and
+            self.kitty_keyboard_flags == other.kitty_keyboard_flags;
     }
 };
 
@@ -403,6 +405,7 @@ pub const SessionTerminal = struct {
             .mode_flags = mode_flags,
             .mouse_tracking = mouse_tracking,
             .mouse_sgr = self.terminal.modes.get(.mouse_format_sgr),
+            .kitty_keyboard_flags = self.terminal.screens.active.kitty_keyboard.current().int(),
         };
     }
 
@@ -1585,7 +1588,7 @@ test "rendered screen exposes terminal modes" {
     const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
     defer terminal.destroy();
 
-    try terminal.feed("\x1b[?1;1003;1004;1006;2004h");
+    try terminal.feed("\x1b[?1;1003;1004;1006;2004h\x1b[>7u");
     var screen = try terminal.renderedScreen(std.testing.allocator);
     defer screen.deinit(std.testing.allocator);
 
@@ -1594,6 +1597,17 @@ test "rendered screen exposes terminal modes" {
     try std.testing.expect((screen.modes.mode_flags & TerminalModes.bracketed_paste) != 0);
     try std.testing.expectEqual(@as(u8, 3), screen.modes.mouse_tracking);
     try std.testing.expect(screen.modes.mouse_sgr);
+    try std.testing.expectEqual(@as(u5, 7), screen.modes.kitty_keyboard_flags);
+}
+
+test "session terminal answers kitty keyboard query from current flags" {
+    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    defer terminal.destroy();
+
+    try terminal.feed("\x1b[>7u\x1b[?u");
+
+    const responses = terminal.pendingInputResponses();
+    try std.testing.expect(std.mem.indexOf(u8, responses, "\x1b[?7u") != null);
 }
 
 test "session terminal answers basic terminal queries to the PTY" {

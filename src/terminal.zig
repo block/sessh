@@ -30,6 +30,7 @@ pub const CursorPosition = struct {
 
 const terminal_query_timeout_ms: i64 = 150;
 const terminal_query_poll_ms: i64 = 25;
+const kitty_keyboard_query = "\x1b[?u";
 const terminal_probe_request =
     "\x1b]60;?\x1b\\" ++
     "\x1b[6n" ++
@@ -39,6 +40,7 @@ const terminal_probe_request =
 pub const TerminalProbe = struct {
     cursor_position: ?CursorPosition = null,
     default_colors: DefaultColorQuery = .{},
+    kitty_keyboard_flags: ?u5 = null,
     allowed_features_answered: bool = false,
     color_ops_allowed: ?bool = null,
 
@@ -190,6 +192,27 @@ pub fn queryCursorPosition(input_fd: c.fd_t, output_fd: c.fd_t) !?CursorPosition
     return (try queryTerminalProbe(input_fd, output_fd)).cursor_position;
 }
 
+pub fn queryKittyKeyboardFlags(input_fd: c.fd_t, output_fd: c.fd_t) !?u5 {
+    if (cached_probe != null and
+        cached_probe_input_fd == input_fd and
+        cached_probe_output_fd == output_fd and
+        cached_probe.?.kitty_keyboard_flags != null)
+    {
+        return cached_probe.?.kitty_keyboard_flags;
+    }
+
+    var probe = TerminalProbe{};
+    if (c.isatty(input_fd) == 0 or c.isatty(output_fd) == 0) return null;
+
+    var guard = try TerminalModeGuard.enable(input_fd);
+    defer guard.restore();
+
+    try io.writeAll(output_fd, kitty_keyboard_query);
+    try readTerminalProbeResponses(input_fd, &probe, .kitty_keyboard_flags);
+    mergeCachedProbe(input_fd, output_fd, probe);
+    return probe.kitty_keyboard_flags;
+}
+
 pub fn queryTerminalProbe(input_fd: c.fd_t, output_fd: c.fd_t) !TerminalProbe {
     if (cached_probe != null and cached_probe_input_fd == input_fd and cached_probe_output_fd == output_fd) return cached_probe.?;
     var probe = TerminalProbe{};
@@ -200,6 +223,20 @@ pub fn queryTerminalProbe(input_fd: c.fd_t, output_fd: c.fd_t) !TerminalProbe {
 
     try io.writeAll(output_fd, terminal_probe_request);
 
+    try readTerminalProbeResponses(input_fd, &probe, .complete);
+
+    cached_probe = probe;
+    cached_probe_input_fd = input_fd;
+    cached_probe_output_fd = output_fd;
+    return probe;
+}
+
+const ProbeReadTarget = enum {
+    complete,
+    kitty_keyboard_flags,
+};
+
+fn readTerminalProbeResponses(input_fd: c.fd_t, probe: *TerminalProbe, target: ProbeReadTarget) !void {
     var bytes: [512]u8 = undefined;
     var len: usize = 0;
     const deadline = std.time.milliTimestamp() + terminal_query_timeout_ms;
@@ -226,14 +263,43 @@ pub fn queryTerminalProbe(input_fd: c.fd_t, output_fd: c.fd_t) !TerminalProbe {
         if (n == 0) break;
         io.noteRead(input_fd, bytes[len..][0..n]);
         len += n;
-        parseTerminalProbeResponses(bytes[0..len], &probe);
-        if (probe.complete()) break;
+        parseTerminalProbeResponses(bytes[0..len], probe);
+        switch (target) {
+            .complete => if (probe.complete()) break,
+            .kitty_keyboard_flags => if (probe.kitty_keyboard_flags != null) break,
+        }
+    }
+}
+
+fn mergeCachedProbe(input_fd: c.fd_t, output_fd: c.fd_t, probe: TerminalProbe) void {
+    if (!probeHasData(probe)) return;
+    if (cached_probe == null or
+        cached_probe_input_fd != input_fd or
+        cached_probe_output_fd != output_fd)
+    {
+        cached_probe = probe;
+        cached_probe_input_fd = input_fd;
+        cached_probe_output_fd = output_fd;
+        return;
     }
 
-    cached_probe = probe;
-    cached_probe_input_fd = input_fd;
-    cached_probe_output_fd = output_fd;
-    return probe;
+    var merged = cached_probe.?;
+    if (probe.cursor_position != null) merged.cursor_position = probe.cursor_position;
+    if (probe.default_colors.foreground != null) merged.default_colors.foreground = probe.default_colors.foreground;
+    if (probe.default_colors.background != null) merged.default_colors.background = probe.default_colors.background;
+    if (probe.kitty_keyboard_flags != null) merged.kitty_keyboard_flags = probe.kitty_keyboard_flags;
+    if (probe.allowed_features_answered) merged.allowed_features_answered = true;
+    if (probe.color_ops_allowed != null) merged.color_ops_allowed = probe.color_ops_allowed;
+    cached_probe = merged;
+}
+
+fn probeHasData(probe: TerminalProbe) bool {
+    return probe.cursor_position != null or
+        probe.default_colors.foreground != null or
+        probe.default_colors.background != null or
+        probe.kitty_keyboard_flags != null or
+        probe.allowed_features_answered or
+        probe.color_ops_allowed != null;
 }
 
 pub fn setPtySize(fd: c.fd_t, rows: u16, cols: u16) bool {
@@ -286,22 +352,29 @@ fn ioctlSetWinszRequest() ?c_ulong {
     };
 }
 
+fn csiFinalIndex(bytes: []const u8) ?usize {
+    for (bytes, 0..) |byte, index| {
+        if (byte >= 0x40 and byte <= 0x7e) return index;
+    }
+    return null;
+}
+
 fn parseCursorPositionResponse(bytes: []const u8) ?CursorPosition {
     var rest = bytes;
     while (std.mem.indexOf(u8, rest, "\x1b[")) |start| {
         const response = rest[start + 2 ..];
-        const end = std.mem.indexOfScalar(u8, response, 'R') orelse return null;
+        const end = csiFinalIndex(response) orelse return null;
+        const final = response[end];
         const body = response[0..end];
+        rest = response[end + 1 ..];
+        if (final != 'R') continue;
         const semi = std.mem.indexOfScalar(u8, body, ';') orelse {
-            rest = response[end + 1 ..];
             continue;
         };
         const row = std.fmt.parseInt(u16, body[0..semi], 10) catch {
-            rest = response[end + 1 ..];
             continue;
         };
         const col = std.fmt.parseInt(u16, body[semi + 1 ..], 10) catch {
-            rest = response[end + 1 ..];
             continue;
         };
         if (row == 0 or col == 0) return null;
@@ -312,7 +385,23 @@ fn parseCursorPositionResponse(bytes: []const u8) ?CursorPosition {
 
 fn parseTerminalProbeResponses(bytes: []const u8, probe: *TerminalProbe) void {
     if (probe.cursor_position == null) probe.cursor_position = parseCursorPositionResponse(bytes);
+    if (probe.kitty_keyboard_flags == null) probe.kitty_keyboard_flags = parseKittyKeyboardFlagsResponse(bytes);
     parseOscProbeResponses(bytes, probe);
+}
+
+fn parseKittyKeyboardFlagsResponse(bytes: []const u8) ?u5 {
+    var rest = bytes;
+    while (std.mem.indexOf(u8, rest, "\x1b[")) |start| {
+        const response = rest[start + 2 ..];
+        const end = csiFinalIndex(response) orelse return null;
+        const final = response[end];
+        const body = response[0..end];
+        rest = response[end + 1 ..];
+        if (final != 'u' or !std.mem.startsWith(u8, body, "?")) continue;
+        const value = std.fmt.parseInt(u8, body[1..], 10) catch continue;
+        if (value <= std.math.maxInt(u5)) return @intCast(value);
+    }
+    return null;
 }
 
 fn parseOscProbeResponses(bytes: []const u8, probe: *TerminalProbe) void {
@@ -394,6 +483,7 @@ test "terminal probe parser handles batched allowed features, cursor, and color 
     var probe = TerminalProbe{};
     parseTerminalProbeResponses(
         "\x1b]60;allowTitleOps,allowColorOps\x1b\\" ++
+            "\x1b[?7u" ++
             "\x1b[7;9R" ++
             "\x1b]10;rgb:0a/0b/0c\x1b\\" ++
             "\x1b]11;rgb:0d/0e/0f\x1b\\",
@@ -402,10 +492,18 @@ test "terminal probe parser handles batched allowed features, cursor, and color 
 
     try std.testing.expect(probe.allowed_features_answered);
     try std.testing.expect(probe.color_ops_allowed.?);
+    try std.testing.expectEqual(@as(u5, 7), probe.kitty_keyboard_flags.?);
     try std.testing.expectEqual(CursorPosition{ .row = 6, .col = 8 }, probe.cursor_position.?);
     try std.testing.expectEqual(Rgb{ .r = 10, .g = 11, .b = 12 }, probe.default_colors.foreground.?);
     try std.testing.expectEqual(Rgb{ .r = 13, .g = 14, .b = 15 }, probe.default_colors.background.?);
     try std.testing.expect(probe.complete());
+}
+
+test "terminal probe parser ignores invalid kitty keyboard flags" {
+    var probe = TerminalProbe{};
+    parseTerminalProbeResponses("\x1b[?64u\x1b[?abcu\x1b[?31u", &probe);
+
+    try std.testing.expectEqual(@as(u5, 31), probe.kitty_keyboard_flags.?);
 }
 
 test "terminal probe parser treats answered allowed features without color ops as complete after cursor" {

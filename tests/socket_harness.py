@@ -150,6 +150,18 @@ def sessh_version():
     raise AssertionError("could not find sessh version")
 
 
+KITTY_KEYBOARD_QUERY = b"\x1b[?u"
+KITTY_KEYBOARD_STATUS_RESPONSE = b"\x1b[?0u"
+kitty_keyboard_status_response = KITTY_KEYBOARD_STATUS_RESPONSE
+
+
+def read_pty_chunk(fd):
+    chunk = os.read(fd, 4096)
+    for _ in range(chunk.count(KITTY_KEYBOARD_QUERY)):
+        os.write(fd, kitty_keyboard_status_response)
+    return chunk
+
+
 def read_until(fd, needle, timeout=5.0):
     end = time.monotonic() + timeout
     data = b""
@@ -157,7 +169,7 @@ def read_until(fd, needle, timeout=5.0):
         ready, _, _ = select.select([fd], [], [], 0.1)
         if not ready:
             continue
-        chunk = os.read(fd, 4096)
+        chunk = read_pty_chunk(fd)
         if not chunk:
             break
         data += chunk
@@ -173,7 +185,7 @@ def read_until_count(fd, needle, count, timeout=5.0):
         ready, _, _ = select.select([fd], [], [], 0.1)
         if not ready:
             continue
-        chunk = os.read(fd, 4096)
+        chunk = read_pty_chunk(fd)
         if not chunk:
             break
         data += chunk
@@ -189,7 +201,7 @@ def read_available(fd, timeout=0.2):
         ready, _, _ = select.select([fd], [], [], 0.02)
         if not ready:
             continue
-        chunk = os.read(fd, 4096)
+        chunk = read_pty_chunk(fd)
         if not chunk:
             break
         data += chunk
@@ -214,7 +226,7 @@ def wait_child_draining_fd(pid, fd, timeout=5.0):
             ready, _, _ = select.select([fd], [], [], 0.05)
             if ready:
                 try:
-                    if not os.read(fd, 4096):
+                    if not read_pty_chunk(fd):
                         fd_open = False
                 except OSError:
                     fd_open = False
@@ -1479,7 +1491,7 @@ def run_terminal_modes_protocol_test(base_env):
         shell.write_text(
             "#!/bin/sh\n"
             "while IFS= read -r line; do\n"
-            "  printf '\\033[?1;1000;1004;1006;2004hMODES_READY'\n"
+            "  printf '\\033[?1;1000;1004;1006;2004h\\033[>7uMODES_READY'\n"
             "  sleep 1\n"
             "done\n"
         )
@@ -1504,7 +1516,7 @@ def run_terminal_modes_protocol_test(base_env):
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
                 draw, draws = recv_draw_until(conn, b"MODES_READY")
                 output = b"".join(item["draw_bytes"] for item in draws)
-                for seq in (b"\x1b[?1h", b"\x1b[?1000h", b"\x1b[?1006h", b"\x1b[?1004h", b"\x1b[?2004h"):
+                for seq in (b"\x1b[?1h", b"\x1b[?1000h", b"\x1b[?1006h", b"\x1b[?1004h", b"\x1b[?2004h", b"\x1b[=7u"):
                     if seq not in output:
                         raise AssertionError(f"missing terminal mode sequence {seq!r}: {output!r}, last={draw!r}")
                 if b"\x1b[6n" in output:
@@ -1519,6 +1531,7 @@ def run_terminal_modes_protocol_test(base_env):
                     (b"\x1b[?1h", b"\x1b[?1l"),
                     (b"\x1b[?1004h", b"\x1b[?1004l"),
                     (b"\x1b[?2004h", b"\x1b[?2004l"),
+                    (b"\x1b[=7u", b"\x1b[=0u"),
                 ):
                     if output.rfind(disabled) > output.rfind(enabled):
                         raise AssertionError(f"terminal mode was disabled by DRAW cleanup: {output!r}")
@@ -3259,6 +3272,33 @@ def run_tty_transcript_capture_test(tmp_root):
         cleanup_runtime(env)
 
 
+def run_initial_kitty_keyboard_restore_test(tmp_root):
+    global kitty_keyboard_status_response
+
+    env = isolated_env(Path(tmp_root) / "kitty-keyboard-restore")
+    env["SHELL"] = "/bin/sh"
+    cleanup_runtime(env)
+
+    previous_response = kitty_keyboard_status_response
+    kitty_keyboard_status_response = b"\x1b[?7u"
+    try:
+        pid, fd = spawn_client(env, ["--alias", "s1"])
+        try:
+            read_until(fd, b"$ ")
+            os.write(fd, b"~.")
+            output = read_until(fd, b"sessh: detached")
+            output += read_available(fd, timeout=0.5)
+            if b"\x1b[=7u" not in output:
+                raise AssertionError(f"missing kitty keyboard restore sequence: {output!r}")
+            if b"\x1b[=0u" in output:
+                raise AssertionError(f"restored default kitty keyboard flags instead of initial flags: {output!r}")
+        finally:
+            close_client(pid, fd)
+    finally:
+        kitty_keyboard_status_response = previous_response
+        cleanup_runtime(env)
+
+
 def main():
     if not BIN.exists():
         raise SystemExit(f"missing binary: {BIN}")
@@ -3391,6 +3431,7 @@ def main():
             run_slow_attachment_does_not_block_commands_test(env)
             run_env_config_client_test(tmp)
             run_tty_transcript_capture_test(tmp)
+            run_initial_kitty_keyboard_restore_test(tmp)
 
             listed = run([".", "--list"], env, check=True, timeout=5.0)
             assert_list_header(listed.stdout)

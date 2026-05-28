@@ -693,6 +693,7 @@ fn vtModesToClient(modes: vt.TerminalModes) client_renderer.TerminalModes {
             else => .disabled,
         },
         .mouse_sgr = modes.mouse_sgr,
+        .kitty_keyboard_flags = modes.kitty_keyboard_flags,
     };
 }
 
@@ -2979,6 +2980,18 @@ const SgrMouseParse = union(enum) {
     complete: SgrMouseReport,
 };
 
+const XtermModifiedKey = struct {
+    modifier: u32,
+    key_code: u32,
+    end: usize,
+};
+
+const XtermModifiedKeyParse = union(enum) {
+    not_modified,
+    incomplete,
+    complete: XtermModifiedKey,
+};
+
 fn translateAttachmentInput(
     attachment: *Attachment,
     session: *const Session,
@@ -3010,37 +3023,52 @@ fn translateAttachmentInput(
             continue;
         }
 
-        if (!attachmentSgrMouseActive(attachment)) {
-            try out.append(app_allocator.allocator(), input.items[index]);
-            index += 1;
-            continue;
+        if (attachmentSgrMouseActive(attachment)) {
+            switch (parseSgrMouseReport(input.items, index)) {
+                .complete => |report| {
+                    try appendTranslatedSgrMouseReport(attachment, session, report, out);
+                    index = report.end;
+                    continue;
+                },
+                .incomplete => {
+                    try savePendingAttachmentInput(attachment, input.items[index..], out);
+                    return;
+                },
+                .not_mouse => {},
+            }
         }
 
-        switch (parseSgrMouseReport(input.items, index)) {
-            .complete => |report| {
-                try appendTranslatedSgrMouseReport(attachment, session, report, out);
-                index = report.end;
-            },
-            .incomplete => {
-                const pending = input.items[index..];
-                if (pending.len <= attachment.input_pending.len) {
-                    @memcpy(attachment.input_pending[0..pending.len], pending);
-                    attachment.input_pending_len = pending.len;
-                } else {
-                    try out.appendSlice(app_allocator.allocator(), pending);
-                }
-                return;
-            },
-            .not_mouse => {
-                try out.append(app_allocator.allocator(), input.items[index]);
-                index += 1;
-            },
+        if (attachmentKittyKeyboardActive(attachment)) {
+            switch (parseXtermModifiedKey(input.items, index)) {
+                .complete => |key| {
+                    try appendKittyKeyboardKey(key, out);
+                    index = key.end;
+                    continue;
+                },
+                .incomplete => {
+                    try savePendingAttachmentInput(attachment, input.items[index..], out);
+                    return;
+                },
+                .not_modified => {},
+            }
         }
+
+        try out.append(app_allocator.allocator(), input.items[index]);
+        index += 1;
+    }
+}
+
+fn savePendingAttachmentInput(attachment: *Attachment, pending: []const u8, out: *std.ArrayList(u8)) !void {
+    if (pending.len <= attachment.input_pending.len) {
+        @memcpy(attachment.input_pending[0..pending.len], pending);
+        attachment.input_pending_len = pending.len;
+    } else {
+        try out.appendSlice(app_allocator.allocator(), pending);
     }
 }
 
 fn attachmentLocalInputParserActive(attachment: *const Attachment) bool {
-    return attachmentSgrMouseActive(attachment);
+    return attachmentSgrMouseActive(attachment) or attachmentKittyKeyboardActive(attachment);
 }
 
 fn attachmentSgrMouseActive(attachment: *const Attachment) bool {
@@ -3049,24 +3077,73 @@ fn attachmentSgrMouseActive(attachment: *const Attachment) bool {
         attachment.presentation.terminal_modes.mouse_sgr;
 }
 
+fn attachmentKittyKeyboardActive(attachment: *const Attachment) bool {
+    return attachment.presentation.terminal_modes_initialized and
+        attachment.presentation.terminal_modes.kitty_keyboard_flags != 0;
+}
+
+fn parseXtermModifiedKey(input: []const u8, start: usize) XtermModifiedKeyParse {
+    const prefix = "\x1b[27;";
+    if (input.len - start < prefix.len) {
+        const available = input[start..];
+        if (available.len >= 3 and std.mem.eql(u8, available, prefix[0..available.len])) return .incomplete;
+        return .not_modified;
+    }
+    if (!std.mem.eql(u8, input[start .. start + prefix.len], prefix)) return .not_modified;
+
+    var index = start + prefix.len;
+    const modifier = parseCsiNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_modified;
+    if (index >= input.len) return .incomplete;
+    if (input[index] != ';') return .not_modified;
+    index += 1;
+
+    const key_code = parseCsiNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_modified;
+    if (index >= input.len) return .incomplete;
+    if (input[index] != '~') return .not_modified;
+
+    return .{ .complete = .{
+        .modifier = modifier,
+        .key_code = key_code,
+        .end = index + 1,
+    } };
+}
+
+fn parseCsiNumber(input: []const u8, index: *usize) ?u32 {
+    var value: u32 = 0;
+    var digits: usize = 0;
+    while (index.* < input.len) : (index.* += 1) {
+        const byte = input[index.*];
+        if (byte < '0' or byte > '9') break;
+        if (value > 1_000_000) return null;
+        value = value * 10 + @as(u32, byte - '0');
+        digits += 1;
+    }
+    if (digits == 0) return null;
+    return value;
+}
+
+fn appendKittyKeyboardKey(key: XtermModifiedKey, out: *std.ArrayList(u8)) !void {
+    var buf: [32]u8 = undefined;
+    const encoded = try std.fmt.bufPrint(&buf, "\x1b[{};{}u", .{ key.key_code, key.modifier });
+    try out.appendSlice(app_allocator.allocator(), encoded);
+}
+
 fn parseSgrMouseReport(input: []const u8, start: usize) SgrMouseParse {
     if (input[start] != 0x1b) return .not_mouse;
     if (start + 1 >= input.len) return .incomplete;
     if (input[start + 1] != '[') return .not_mouse;
     if (start + 2 >= input.len) return .incomplete;
     if (input[start + 2] != '<') return .not_mouse;
-
     var index = start + 3;
+
     const button = parseSgrMouseNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_mouse;
     if (index >= input.len) return .incomplete;
     if (input[index] != ';') return .not_mouse;
     index += 1;
-
     const col = parseSgrMouseNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_mouse;
     if (index >= input.len) return .incomplete;
     if (input[index] != ';') return .not_mouse;
     index += 1;
-
     const row = parseSgrMouseNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_mouse;
     if (index >= input.len) return .incomplete;
     const suffix = input[index];
@@ -3212,6 +3289,96 @@ test "SGR mouse input is translated from outer to inner coordinates" {
     out.clearRetainingCapacity();
     try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;3M", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "xterm modified key input is translated to kitty when kitty keyboard is active" {
+    var attachment = Attachment{
+        .presentation = .{
+            .terminal_modes = .{ .kitty_keyboard_flags = 7 },
+            .terminal_modes_initialized = true,
+        },
+    };
+    const session = Session{ .rows = 24, .cols = 80 };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(app_allocator.allocator());
+
+    try translateAttachmentInput(&attachment, &session, "\x1b[27;2;13~", &out);
+    try std.testing.expectEqualStrings("\x1b[13;2u", out.items);
+}
+
+test "split xterm modified key input is held and translated after completion" {
+    var attachment = Attachment{
+        .presentation = .{
+            .terminal_modes = .{ .kitty_keyboard_flags = 7 },
+            .terminal_modes_initialized = true,
+        },
+    };
+    const session = Session{ .rows = 24, .cols = 80 };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(app_allocator.allocator());
+
+    try translateAttachmentInput(&attachment, &session, "\x1b[27;2;", &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    try std.testing.expect(attachment.input_pending_len > 0);
+
+    try translateAttachmentInput(&attachment, &session, "13~", &out);
+    try std.testing.expectEqualStrings("\x1b[13;2u", out.items);
+}
+
+test "xterm modified key input passes through when kitty keyboard is inactive" {
+    var attachment = Attachment{};
+    const session = Session{ .rows = 24, .cols = 80 };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(app_allocator.allocator());
+
+    try translateAttachmentInput(&attachment, &session, "\x1b[27;2;13~", &out);
+    try std.testing.expectEqualStrings("\x1b[27;2;13~", out.items);
+}
+
+test "non-xterm CSI input passes through when kitty keyboard is active" {
+    var attachment = Attachment{
+        .presentation = .{
+            .terminal_modes = .{ .kitty_keyboard_flags = 7 },
+            .terminal_modes_initialized = true,
+        },
+    };
+    const session = Session{ .rows = 24, .cols = 80 };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(app_allocator.allocator());
+
+    try translateAttachmentInput(&attachment, &session, "\x1b[A", &out);
+    try std.testing.expectEqualStrings("\x1b[A", out.items);
+}
+
+test "plain enter input is not synthesized as kitty when kitty keyboard is active" {
+    var attachment = Attachment{
+        .presentation = .{
+            .terminal_modes = .{ .kitty_keyboard_flags = 7 },
+            .terminal_modes_initialized = true,
+        },
+    };
+    const session = Session{ .rows = 24, .cols = 80 };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(app_allocator.allocator());
+
+    try translateAttachmentInput(&attachment, &session, "\r", &out);
+    try std.testing.expectEqualStrings("\r", out.items);
+}
+
+test "bare escape is not held by kitty keyboard translation" {
+    var attachment = Attachment{
+        .presentation = .{
+            .terminal_modes = .{ .kitty_keyboard_flags = 7 },
+            .terminal_modes_initialized = true,
+        },
+    };
+    const session = Session{ .rows = 24, .cols = 80 };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(app_allocator.allocator());
+
+    try translateAttachmentInput(&attachment, &session, "\x1b", &out);
+    try std.testing.expectEqualStrings("\x1b", out.items);
+    try std.testing.expectEqual(@as(usize, 0), attachment.input_pending_len);
 }
 
 test "last input classifier ignores terminal generated responses" {
