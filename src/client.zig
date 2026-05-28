@@ -57,6 +57,7 @@ const LocalOptions = struct {
     list_refresh: bool = false,
     list_include_cached_routes: bool = true,
     list_jsonl: bool = false,
+    list_exited: bool = false,
     client_session_ref: ?[]const u8 = null,
     client_target: ClientTarget = .default,
     client_guid: ?[]const u8 = null,
@@ -2086,7 +2087,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     const runtime_broker_args: []const []const u8 = &.{};
     switch (options.action) {
         .list => {
-            const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl);
+            const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl, options.list_exited);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
@@ -2376,18 +2377,33 @@ fn runLocalListCommand(
     refresh: bool,
     include_cached_routes: bool,
     jsonl: bool,
+    exited: bool,
 ) !u8 {
     if (include_cached_routes and refresh) try refreshCachedRemoteRoutes(allocator, exe);
 
-    var command_args_buf: [4][]const u8 = undefined;
+    var command_args_buf: [8][]const u8 = undefined;
     const command_args = appendBrokerCommand(runtime_broker_args, "list", null, &command_args_buf);
-    const extra_args: usize = if (jsonl) 1 else 0;
+    const extra_args: usize = (if (jsonl) @as(usize, 1) else 0) +
+        (if (exited) @as(usize, 1) else 0) +
+        (if (exited and !include_cached_routes) @as(usize, 1) else 0);
     const argv = try allocator.alloc([]const u8, 2 + command_args.len + extra_args);
     defer allocator.free(argv);
     argv[0] = exe;
     argv[1] = ":internal-broker:";
     @memcpy(argv[2 .. 2 + command_args.len], command_args);
-    if (jsonl) argv[2 + command_args.len] = "--jsonl";
+    var arg_index = 2 + command_args.len;
+    if (jsonl) {
+        argv[arg_index] = "--jsonl";
+        arg_index += 1;
+    }
+    if (exited) {
+        argv[arg_index] = "--exited";
+        arg_index += 1;
+    }
+    if (exited and !include_cached_routes) {
+        argv[arg_index] = "--local-only";
+        arg_index += 1;
+    }
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
@@ -2403,7 +2419,7 @@ fn runLocalListCommand(
         else => 1,
     };
     if (exit_status != 0) return exit_status;
-    if (include_cached_routes) {
+    if (include_cached_routes and !exited) {
         const appended_cached_routes = try appendCachedRemoteRouteRows(allocator, jsonl);
         if (appended_cached_routes and !refresh) {
             try io_helpers.writeAll(2, "sessh: cached remote session status may be out of date; run `sesshmux list --refresh` to update\n");
@@ -2507,24 +2523,43 @@ fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !voi
 
     for (routes.items, 0..) |*route, i| {
         if (routeConnectionWasAlreadyRefreshed(routes.items[0..i], route)) continue;
-        const stdout = queryRemoteRouteList(allocator, exe, route) catch |err| {
+        const stdout = queryRemoteRouteList(allocator, exe, route, false) catch |err| {
             try io_helpers.stderrPrint("sessh: list refresh failed for {s}: {t}\n", .{ route.host, err });
             continue;
         };
         defer allocator.free(stdout);
+        const exited_stdout = queryRemoteRouteList(allocator, exe, route, true) catch null;
+        defer if (exited_stdout) |value| allocator.free(value);
         for (routes.items) |*candidate| {
             if (!sameRouteConnection(route, candidate)) continue;
             const remote_status = try remoteListStatusForGuid(allocator, stdout, candidate.guid);
             defer if (remote_status) |status| allocator.free(status.version);
-            try session_registry.updateRouteStatus(
+            if (remote_status) |status| {
+                try session_registry.updateRouteStatus(
+                    allocator,
+                    candidate.guid,
+                    true,
+                    status.version,
+                    .{
+                        .attached_count = status.attached_count,
+                        .last_input_at_unix_ms = status.last_input_at_unix_ms,
+                    },
+                );
+                continue;
+            }
+
+            const remote_tombstone = if (exited_stdout) |value|
+                try remoteTombstoneForGuid(allocator, value, candidate.guid)
+            else
+                null;
+            try session_registry.writeTombstoneForRoute(
                 allocator,
-                candidate.guid,
-                remote_status != null,
-                if (remote_status) |status| status.version else null,
-                if (remote_status) |status| .{
-                    .attached_count = status.attached_count,
-                    .last_input_at_unix_ms = status.last_input_at_unix_ms,
-                } else null,
+                candidate,
+                remote_tombstone orelse .{
+                    .ended_at_unix_ms = nowUnixMs(),
+                    .end_reason = .unknown,
+                    .exit_status = null,
+                },
             );
         }
     }
@@ -2546,14 +2581,16 @@ fn sameRouteConnection(a: *const session_registry.Route, b: *const session_regis
     return true;
 }
 
-fn queryRemoteRouteList(allocator: std.mem.Allocator, exe: []const u8, route: *const session_registry.Route) ![]u8 {
-    const argv = try allocator.alloc([]const u8, 2 + route.ssh_options.len + 2);
+fn queryRemoteRouteList(allocator: std.mem.Allocator, exe: []const u8, route: *const session_registry.Route, exited: bool) ![]u8 {
+    const extra_args: usize = if (exited) 1 else 0;
+    const argv = try allocator.alloc([]const u8, 2 + route.ssh_options.len + 2 + extra_args);
     defer allocator.free(argv);
     argv[0] = exe;
-    @memcpy(argv[1 .. 1 + route.ssh_options.len], route.ssh_options);
-    argv[1 + route.ssh_options.len] = route.host;
-    argv[2 + route.ssh_options.len] = "--list";
+    argv[1] = "list";
+    @memcpy(argv[2 .. 2 + route.ssh_options.len], route.ssh_options);
+    argv[2 + route.ssh_options.len] = route.host;
     argv[3 + route.ssh_options.len] = "--jsonl";
+    if (exited) argv[4 + route.ssh_options.len] = "--exited";
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
@@ -2605,6 +2642,29 @@ fn remoteListStatusForGuid(allocator: std.mem.Allocator, stdout: []const u8, gui
     return null;
 }
 
+fn remoteTombstoneForGuid(allocator: std.mem.Allocator, stdout: []const u8, guid: []const u8) !?session_registry.TombstoneDetails {
+    var lines = std.mem.splitScalar(u8, stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |object| object,
+            else => continue,
+        };
+        const row_guid = jsonStringField(object, "guid") orelse continue;
+        if (!std.mem.eql(u8, row_guid, guid)) continue;
+        const ended_at_unix_ms = (try jsonU64Field(object, "ended_at_unix_ms")) orelse return null;
+        const end_reason = session_registry.tombstoneEndReasonFromName(jsonStringField(object, "end_reason") orelse "unknown") catch .unknown;
+        return .{
+            .ended_at_unix_ms = ended_at_unix_ms,
+            .end_reason = end_reason,
+            .exit_status = try jsonTombstoneExitStatusField(object, "exit_status"),
+        };
+    }
+    return null;
+}
+
 fn remoteListVersionForGuid(allocator: std.mem.Allocator, stdout: []const u8, guid: []const u8) !?[]u8 {
     const status = try remoteListStatusForGuid(allocator, stdout, guid);
     if (status) |value| return value.version;
@@ -2631,6 +2691,34 @@ fn jsonU64Field(object: std.json.ObjectMap, key: []const u8) !?u64 {
     };
 }
 
+fn jsonI32Field(object: std.json.ObjectMap, key: []const u8) !?i32 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |integer| blk: {
+            if (integer < std.math.minInt(i32) or integer > std.math.maxInt(i32)) return error.InvalidJson;
+            break :blk @as(i32, @intCast(integer));
+        },
+        else => null,
+    };
+}
+
+fn jsonTombstoneExitStatusField(object: std.json.ObjectMap, key: []const u8) !?session_registry.TombstoneExitStatus {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .null => null,
+        .object => |status_object| blk: {
+            const kind_name = jsonStringField(status_object, "kind") orelse return error.InvalidJson;
+            const status = (try jsonI32Field(status_object, "status")) orelse return error.InvalidJson;
+            break :blk .{
+                .kind = try session_registry.tombstoneExitStatusKindFromName(kind_name),
+                .status = status,
+            };
+        },
+        else => null,
+    };
+}
+
 test "remoteListVersionForGuid reads jsonl rows" {
     const guid = "s-550e8400-e29b-41d4-a716-446655440000";
     const stdout =
@@ -2647,6 +2735,21 @@ test "remoteListVersionForGuid reads jsonl rows" {
     try std.testing.expectEqual(@as(?u32, 2), status.attached_count);
     try std.testing.expectEqual(@as(?u64, 1234), status.last_input_at_unix_ms);
     try std.testing.expect(try remoteListVersionForGuid(std.testing.allocator, stdout, "s-00000000-0000-4000-8000-000000000000") == null);
+}
+
+test "remoteTombstoneForGuid reads exited jsonl rows" {
+    const guid = "s-550e8400-e29b-41d4-a716-446655440000";
+    const stdout =
+        \\{"id":"s-550e8400","aliases":["s-550e8400"],"host":"work.blox","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000","ended_at_unix_ms":1234,"end_reason":"process_exited","exit_status":{"kind":"exited","status":7}}
+        \\
+    ;
+
+    const tombstone = (try remoteTombstoneForGuid(std.testing.allocator, stdout, guid)) orelse return error.MissingTombstone;
+    try std.testing.expectEqual(@as(u64, 1234), tombstone.ended_at_unix_ms);
+    try std.testing.expectEqual(session_registry.TombstoneEndReason.process_exited, tombstone.end_reason);
+    try std.testing.expectEqual(session_registry.TombstoneExitStatusKind.exited, tombstone.exit_status.?.kind);
+    try std.testing.expectEqual(@as(i32, 7), tombstone.exit_status.?.status);
+    try std.testing.expect(try remoteTombstoneForGuid(std.testing.allocator, stdout, "s-00000000-0000-4000-8000-000000000000") == null);
 }
 
 fn anySessionExistsViaBroker(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8) bool {
@@ -2754,6 +2857,9 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             options.list_jsonl = true;
             options.client_jsonl = true;
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--exited")) {
+            options.list_exited = true;
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--all")) {
             try setClientTarget(&options, .all, null);
             i += 1;
@@ -2829,6 +2935,7 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
     if (options.list_refresh and options.action != .list) return error.UnsupportedListRefresh;
     if (!options.list_include_cached_routes and options.action != .list) return error.UnsupportedListLocalOnly;
     if (options.list_jsonl and options.action != .list and options.action != .list_clients) return error.UnsupportedListJsonl;
+    if (options.list_exited and options.action != .list) return error.UnsupportedListExited;
     if (options.client_target != .default and !actionSupportsClientTarget(options.action)) return error.UnsupportedClientTarget;
     if (options.client_guid != null and options.client_target != .client_guid) return error.UnsupportedClientTarget;
     if (options.client_repaint_scrollback and options.action != .repaint_client) return error.UnsupportedClientTarget;

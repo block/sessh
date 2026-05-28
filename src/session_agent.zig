@@ -3700,6 +3700,7 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
         });
     }
     sendSessionEndedToAttachments(session_agent, session_index, reason, exit_info);
+    writeEndedSessionTombstone(session_agent, session, reason, exit_info);
     if (session.pty_fd >= 0) _ = c.close(session.pty_fd);
     if (session.terminal_model) |model| {
         model.destroy();
@@ -3709,6 +3710,32 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
     session.deinit();
     session.alive = false;
     session.attached = false;
+}
+
+fn writeEndedSessionTombstone(session_agent: *SessionAgent, session: *const Session, reason: u8, exit_info: ExitInfo) void {
+    const allocator = app_allocator.allocator();
+    var route = session_registry.readRouteForRef(allocator, session.idSlice()) catch |err| {
+        logSessionAgent(session_agent, "event=tombstone_route_missing id={s} error={t}", .{ session.idSlice(), err });
+        return;
+    };
+    defer route.deinit(allocator);
+
+    const exit_status: ?session_registry.TombstoneExitStatus = switch (exit_info.kind) {
+        1 => .{ .kind = .exited, .status = exit_info.status },
+        2 => .{ .kind = .signalled, .status = exit_info.status },
+        else => null,
+    };
+    session_registry.writeTombstoneForRoute(allocator, &route, .{
+        .ended_at_unix_ms = if (exit_info.ended_at_unix_ms == 0) nowUnixMs() else exit_info.ended_at_unix_ms,
+        .end_reason = switch (reason) {
+            1 => .killed_by_request,
+            2 => .agent_shutdown,
+            else => .process_exited,
+        },
+        .exit_status = exit_status,
+    }) catch |err| {
+        logSessionAgent(session_agent, "event=tombstone_write_failed id={s} error={t}", .{ session.idSlice(), err });
+    };
 }
 
 fn clearAttachmentHints(session_agent: *SessionAgent) void {

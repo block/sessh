@@ -91,12 +91,16 @@ Use `sesshmux` for session management:
   GUID, or unique `s-` GUID prefix.
 - `sesshmux attach --host HOST [ID]`: attach by resolving `ID` on `HOST`, or
   attach to the most recent attachable session on `HOST` if `ID` is omitted.
-- `sesshmux list [--refresh] [--jsonl] [HOST]`: list attachable sessions locally or on
+- `sesshmux list [--refresh] [--exited] [--jsonl] [HOST]`: list attachable sessions locally or on
   `HOST`. Without `HOST`, local sessions and cached remote routes are shown.
   Use `sesshmux list .` to show only local sessions. `--refresh` checks cached
   remote routes that were alive the last time sessh checked them. Without
   `--refresh`, cached remote status such as attached count and input time may be
-  stale. `--jsonl` emits one JSON object per session.
+  stale. `--exited` shows recently exited sessions instead of live sessions,
+  including exit code, signal, or kill status when sessh observed it. Exited
+  sessions are retained for one week and cleaned up by `list`; with `--refresh`,
+  remote tombstones are cleaned up too. `--jsonl` emits one JSON object per
+  session in the selected live/exited mode.
 - `sesshmux kill [HOST] ID`: terminate the specified local or remote session.
 - `sesshmux kill --all [HOST]`: terminate all local sessions or all sessions on
   `HOST`.

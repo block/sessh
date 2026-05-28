@@ -5,6 +5,8 @@ pub const attached_width = 8;
 pub const input_width = 8;
 pub const host_width = 24;
 pub const version_width = 12;
+pub const ended_width = 8;
+pub const status_width = 10;
 
 pub fn writeHeader(writer: anytype) !void {
     try writePadded(writer, "ID", id_width);
@@ -18,6 +20,18 @@ pub fn writeHeader(writer: anytype) !void {
     try writer.writeAll("VERSION\n");
 }
 
+pub fn writeExitedHeader(writer: anytype) !void {
+    try writePadded(writer, "ID", id_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, "ENDED", ended_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, "HOST", host_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, "STATUS", status_width);
+    try writer.writeAll("  ");
+    try writer.writeAll("VERSION\n");
+}
+
 pub fn writeRow(writer: anytype, id: []const u8, attached: []const u8, input: []const u8, host: []const u8, version: []const u8) !void {
     try writePadded(writer, id, id_width);
     try writer.writeAll("  ");
@@ -26,6 +40,19 @@ pub fn writeRow(writer: anytype, id: []const u8, attached: []const u8, input: []
     try writePadded(writer, input, input_width);
     try writer.writeAll("  ");
     try writePadded(writer, host, host_width);
+    try writer.writeAll("  ");
+    try writer.writeAll(if (version.len == 0) "???" else version);
+    try writer.writeAll("\n");
+}
+
+pub fn writeExitedRow(writer: anytype, id: []const u8, ended: []const u8, host: []const u8, status: []const u8, version: []const u8) !void {
+    try writePadded(writer, id, id_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, ended, ended_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, host, host_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, status, status_width);
     try writer.writeAll("  ");
     try writer.writeAll(if (version.len == 0) "???" else version);
     try writer.writeAll("\n");
@@ -49,6 +76,52 @@ pub fn writeJsonlRow(writer: anytype, id: []const u8, host: []const u8, version:
     try writer.writeAll(",\"last_input_at_unix_ms\":");
     if (last_input_at_unix_ms) |ts| {
         try writer.print("{}", .{ts});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll("}\n");
+}
+
+pub const JsonExitStatus = struct {
+    kind: []const u8,
+    status: i32,
+};
+
+pub fn writeExitedJsonlRow(
+    writer: anytype,
+    id: []const u8,
+    aliases: []const []const u8,
+    host: []const u8,
+    version: []const u8,
+    guid: []const u8,
+    ended_at_unix_ms: u64,
+    end_reason: []const u8,
+    exit_status: ?JsonExitStatus,
+) !void {
+    try writer.writeAll("{\"id\":");
+    try writeJsonString(writer, id);
+    try writer.writeAll(",\"aliases\":[");
+    for (aliases, 0..) |alias, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writeJsonString(writer, alias);
+    }
+    try writer.writeAll("],\"host\":");
+    try writeJsonString(writer, host);
+    try writer.writeAll(",\"version\":");
+    try writeJsonString(writer, version);
+    try writer.writeAll(",\"guid\":");
+    try writeJsonString(writer, guid);
+    try writer.writeAll(",\"ended_at_unix_ms\":");
+    try writer.print("{}", .{ended_at_unix_ms});
+    try writer.writeAll(",\"end_reason\":");
+    try writeJsonString(writer, end_reason);
+    try writer.writeAll(",\"exit_status\":");
+    if (exit_status) |status| {
+        try writer.writeAll("{\"kind\":");
+        try writeJsonString(writer, status.kind);
+        try writer.writeAll(",\"status\":");
+        try writer.print("{}", .{status.status});
+        try writer.writeAll("}");
     } else {
         try writer.writeAll("null");
     }
@@ -118,6 +191,27 @@ test "writeJsonlRow escapes fields" {
     try writeJsonlRow(out.writer(std.testing.allocator), "s1", "work\\host", "0.5\nx", "s-guid", 2, 1234);
     try std.testing.expectEqualStrings(
         "{\"id\":\"s1\",\"host\":\"work\\\\host\",\"version\":\"0.5\\nx\",\"guid\":\"s-guid\",\"attached_count\":2,\"last_input_at_unix_ms\":1234}\n",
+        out.items,
+    );
+}
+
+test "writeExitedJsonlRow writes tombstone fields" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    try writeExitedJsonlRow(
+        out.writer(std.testing.allocator),
+        "s1",
+        &.{ "s1", "old" },
+        "work\\host",
+        "0.5\nx",
+        "s-guid",
+        1234,
+        "process_exited",
+        .{ .kind = "exited", .status = 7 },
+    );
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"s1\",\"aliases\":[\"s1\",\"old\"],\"host\":\"work\\\\host\",\"version\":\"0.5\\nx\",\"guid\":\"s-guid\",\"ended_at_unix_ms\":1234,\"end_reason\":\"process_exited\",\"exit_status\":{\"kind\":\"exited\",\"status\":7}}\n",
         out.items,
     );
 }

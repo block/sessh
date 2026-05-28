@@ -51,3 +51,9 @@ target) once per hour. We set the sticky bit too.
 Client routes and session-agent logs live under `guid/<session-guid>/`.
 `route.json` stores the durable route. `agent.log` stores session-agent
 diagnostics.
+
+Exited sessions move out of `guid/` into `tombstone/<session-guid>.json`.
+Tombstones keep the display route, aliases that pointed at the session, end
+time, end reason, and exit or signal status when available. `sesshmux list`
+keeps them around for one week, which is long enough to answer "what happened
+to that session?" without turning state into a junk drawer.

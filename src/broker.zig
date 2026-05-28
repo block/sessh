@@ -41,6 +41,10 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                         try sendError(1, "SESSION_REF_NOT_LOCAL", "session reference resolves to another host", "");
                         return;
                     },
+                    error.SessionAlreadyExited => {
+                        try sendError(1, "SESSION_ALREADY_EXITED", "session already exited", "");
+                        return;
+                    },
                     error.InvalidSessionId, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
                         try sendError(1, "SESSION_NOT_FOUND", "session not found", "");
                         return;
@@ -78,7 +82,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const command = args[0];
     if (std.mem.eql(u8, command, "list")) {
-        const options = parseListOptions(args) catch return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl]\n");
+        const options = parseListOptions(args) catch return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl] [--exited] [--local-only]\n");
         const exit_status = try listAgents(allocator, options);
         return process_exit.request(exit_status);
     }
@@ -113,9 +117,16 @@ const ListFormat = enum {
     jsonl,
 };
 
+const ListMode = enum {
+    live,
+    exited,
+};
+
 const ListOptions = struct {
     host_display: []const u8 = ".",
     format: ListFormat = .table,
+    mode: ListMode = .live,
+    local_only: bool = false,
 };
 
 const ListClientsOptions = struct {
@@ -190,6 +201,12 @@ fn parseListOptions(args: []const []const u8) !ListOptions {
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--jsonl")) {
             options.format = .jsonl;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--exited")) {
+            options.mode = .exited;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--local-only")) {
+            options.local_only = true;
             i += 1;
         } else {
             return error.InvalidListArgs;
@@ -325,6 +342,9 @@ fn parseDebugUnresponsiveSeconds(value: []const u8) !u32 {
 }
 
 fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
+    try session_registry.cleanupExpiredTombstones(allocator, nowUnixMs());
+    if (options.mode == .exited) return listExitedAgents(allocator, options);
+
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
     const writer = stdout.writer(allocator);
@@ -353,6 +373,7 @@ fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
         };
         defer meta.deinit(allocator);
         if (!processExists(meta.agent_pid)) {
+            tombstoneRouteForDeadLocalSession(allocator, paths, now_ms) catch {};
             session_registry.removeStaleHints(paths) catch {};
             continue;
         }
@@ -389,6 +410,92 @@ fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
     return 0;
 }
 
+fn tombstoneRouteForDeadLocalSession(allocator: std.mem.Allocator, paths: session_registry.SessionPaths, now_ms: u64) !void {
+    var route = session_registry.readRoute(allocator, paths.route) catch return;
+    defer route.deinit(allocator);
+    try session_registry.writeTombstoneForRoute(allocator, &route, .{
+        .ended_at_unix_ms = now_ms,
+        .end_reason = .unknown,
+        .exit_status = null,
+    });
+}
+
+fn listExitedAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    const writer = stdout.writer(allocator);
+    if (options.format == .table) try list_format.writeExitedHeader(writer);
+    const now_ms = nowUnixMs();
+
+    const tombstones_dir = try session_registry.tombstonesDir(allocator);
+    defer allocator.free(tombstones_dir);
+    var dir = std.fs.openDirAbsolute(tombstones_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try io.writeAll(1, stdout.items);
+            return 0;
+        },
+        else => return err,
+    };
+    defer dir.close();
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tombstones_dir, entry.name });
+        defer allocator.free(path);
+        var tombstone = session_registry.readTombstone(allocator, path) catch continue;
+        defer tombstone.deinit(allocator);
+        if (options.local_only and tombstone.host.len > 0 and !std.mem.eql(u8, tombstone.host, ".")) continue;
+
+        const display_id = try tombstoneDisplayId(allocator, &tombstone);
+        defer allocator.free(display_id);
+
+        switch (options.format) {
+            .table => {
+                var ended_buf: [32]u8 = undefined;
+                var status_buf: [32]u8 = undefined;
+                const ended = try formatRelativeUnixMs(&ended_buf, now_ms, tombstone.ended_at_unix_ms);
+                const status = formatTombstoneStatus(&status_buf, &tombstone);
+                try list_format.writeExitedRow(writer, display_id, ended, tombstone.host, status, tombstone.agent_version);
+            },
+            .jsonl => try list_format.writeExitedJsonlRow(
+                writer,
+                display_id,
+                tombstone.aliases,
+                tombstone.host,
+                tombstone.agent_version,
+                tombstone.guid,
+                tombstone.ended_at_unix_ms,
+                session_registry.tombstoneEndReasonName(tombstone.end_reason),
+                if (tombstone.exit_status) |status| .{
+                    .kind = session_registry.tombstoneExitStatusKindName(status.kind),
+                    .status = status.status,
+                } else null,
+            ),
+        }
+    }
+
+    try io.writeAll(1, stdout.items);
+    return 0;
+}
+
+fn tombstoneDisplayId(allocator: std.mem.Allocator, tombstone: *const session_registry.Tombstone) ![]u8 {
+    if (tombstone.primary_alias.len > 0) return allocator.dupe(u8, tombstone.primary_alias);
+    if (tombstone.aliases.len > 0) return allocator.dupe(u8, tombstone.aliases[0]);
+    return session_registry.shortSessionGuid(allocator, tombstone.guid);
+}
+
+fn formatTombstoneStatus(buf: []u8, tombstone: *const session_registry.Tombstone) []const u8 {
+    if (tombstone.end_reason == .killed_by_request) return "KILLED";
+    if (tombstone.exit_status) |status| {
+        return switch (status.kind) {
+            .exited => std.fmt.bufPrint(buf, "EXIT {}", .{status.status}) catch "UNKNOWN",
+            .signalled => std.fmt.bufPrint(buf, "SIGNAL {}", .{status.status}) catch "UNKNOWN",
+        };
+    }
+    return "UNKNOWN";
+}
+
 fn querySessionListLiveStatus(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !session_registry.RouteLiveStatus {
     var state = try querySessionLiveState(allocator, paths);
     defer state.deinit(allocator);
@@ -400,6 +507,10 @@ fn querySessionListLiveStatus(allocator: std.mem.Allocator, paths: session_regis
 
 fn listClients(allocator: std.mem.Allocator, options: ListClientsOptions) !u8 {
     var paths = pathsForLocalSessionRef(allocator, options.session_ref) catch |err| switch (err) {
+        error.SessionAlreadyExited => {
+            try io.writeAll(2, "ERROR session already exited\n");
+            return 1;
+        },
         error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
             try io.writeAll(2, "ERROR session not found\n");
             return 1;
@@ -440,6 +551,9 @@ fn listClients(allocator: std.mem.Allocator, options: ListClientsOptions) !u8 {
 
 fn runClientControlCommand(allocator: std.mem.Allocator, command: ClientControlCommand) !void {
     var paths = pathsForLocalSessionRef(allocator, command.sessionRef()) catch |err| switch (err) {
+        error.SessionAlreadyExited => {
+            return finishCommand(1, "", "ERROR session already exited\n");
+        },
         error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
             return finishCommand(1, "", "ERROR session not found\n");
         },
@@ -657,6 +771,9 @@ fn writeCommandErrorForAgentFailure(err: anyerror) !void {
 
 fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
     var paths = pathsForLocalSessionRef(allocator, session_id) catch |err| switch (err) {
+        error.SessionAlreadyExited => {
+            return finishCommand(1, "", "ERROR session already exited\n");
+        },
         error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
             return finishCommand(1, "", "ERROR session not found\n");
         },
@@ -717,6 +834,7 @@ fn killAllAgents(allocator: std.mem.Allocator) !void {
         };
         defer meta.deinit(allocator);
         if (!processExists(meta.agent_pid)) {
+            tombstoneRouteForDeadLocalSession(allocator, paths, nowUnixMs()) catch {};
             session_registry.removeStaleHints(paths) catch {};
             continue;
         }
@@ -832,11 +950,21 @@ fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.f
 
 fn pathsForLocalSessionRef(allocator: std.mem.Allocator, ref: []const u8) !session_registry.SessionPaths {
     if (!session_registry.isValidSessionRef(ref)) return error.InvalidSessionId;
-    const guid = try session_registry.resolveRefToGuid(allocator, ref);
+    const guid = session_registry.resolveRefToGuid(allocator, ref) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (session_registry.tombstoneExistsForRef(allocator, ref)) return error.SessionAlreadyExited;
+            return err;
+        },
+        else => return err,
+    };
     defer allocator.free(guid);
 
     var route = session_registry.readRouteForRef(allocator, ref) catch |err| switch (err) {
-        error.FileNotFound => null,
+        error.FileNotFound => blk: {
+            if (session_registry.tombstoneExistsForRef(allocator, ref) or
+                session_registry.tombstoneExistsForRef(allocator, guid)) return error.SessionAlreadyExited;
+            break :blk null;
+        },
         else => return err,
     };
     if (route) |*value| {

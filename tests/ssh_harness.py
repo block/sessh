@@ -820,6 +820,10 @@ def state_sessions_dir(env):
     return state_root(env) / "guid"
 
 
+def tombstones_dir(env):
+    return state_root(env) / "tombstone"
+
+
 def runtime_root(env):
     return Path(env["XDG_RUNTIME_DIR"])
 
@@ -1150,9 +1154,19 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(result)
     if f"SESSHMUX_BIN={installed.resolve()}" not in result.stdout:
         raise AssertionError(result)
-    route = route_file(env, "s1")
-    if not route.exists():
-        raise AssertionError("uploaded broker did not create a session route")
+    tombstones = list(tombstones_dir(env).glob("*.json"))
+    if len(tombstones) != 1:
+        raise AssertionError("uploaded broker did not create a session tombstone")
+    tombstone = tombstones[0]
+    tombstone_json = json.loads(tombstone.read_text())
+    if tombstone_json.get("primary_alias") != "s1" or "s1" not in tombstone_json.get("aliases", []):
+        raise AssertionError(tombstone_json)
+    if tombstone_json.get("end_reason") != "process_exited":
+        raise AssertionError(tombstone_json)
+    if tombstone_json.get("exit_status") != {"kind": "exited", "status": 0}:
+        raise AssertionError(tombstone_json)
+    if (aliases_dir(env) / "s1").exists() or (aliases_dir(env) / "s1").is_symlink():
+        raise AssertionError("ended session alias was not released")
 
 
 def test_ssh_pre_attach_stderr_forwards_immediately(tmp):
@@ -1590,6 +1604,46 @@ def test_ssh_no_host_list_clients_uses_remote_route(tmp):
             f"fake ssh log:\n{log_text}\n"
             f"sesshmux result:\n{process_diagnostics(result)}"
         )
+
+
+def test_ssh_list_refresh_tombstones_missing_remote_route(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    alias = "remote-dead"
+    guid = guid_for_alias(alias)
+    write_ssh_route(env, alias, guid, "test-host")
+
+    result = run_sesshmux(["list", "--refresh", "--exited", "--jsonl"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    matches = [row for row in rows if row.get("guid") == guid]
+    if len(matches) != 1:
+        raise AssertionError(process_diagnostics(result))
+    row = matches[0]
+    if row.get("id") != alias or alias not in row.get("aliases", []):
+        raise AssertionError(row)
+    if row.get("host") != "test-host" or row.get("end_reason") != "unknown":
+        raise AssertionError(row)
+    if row.get("exit_status") is not None:
+        raise AssertionError(row)
+    if (state_sessions_dir(env) / guid / "route.json").exists():
+        raise AssertionError("remote route was not moved to a tombstone")
+    if (aliases_dir(env) / alias).exists() or (aliases_dir(env) / alias).is_symlink():
+        raise AssertionError("remote route alias was not released")
+    tombstone = tombstones_dir(env) / f"{guid}.json"
+    if not tombstone.exists():
+        raise AssertionError("tombstone file was not written")
+
+    attached = run_sesshmux(["attach", alias], env, timeout=5.0)
+    if attached.returncode == 0 or "session already exited" not in attached.stderr:
+        raise AssertionError(attached)
 
 
 def test_ssh_remote_default_alias_is_remote_generated(tmp):
@@ -2745,6 +2799,10 @@ def main(argv=None):
         (
             "ssh no-host list-clients uses remote route",
             test_ssh_no_host_list_clients_uses_remote_route,
+        ),
+        (
+            "ssh list refresh tombstones missing remote route",
+            test_ssh_list_refresh_tombstones_missing_remote_route,
         ),
         (
             "ssh remote default alias is remote generated",
