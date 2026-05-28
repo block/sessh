@@ -35,10 +35,13 @@ message Frame {
     InputAck input_ack = 24;
     SessionLiveStateQuery session_live_state_query = 25;
     SessionLiveState session_live_state = 26;
-    SessionClientControlRequest session_client_control_request = 27;
     SessionClientControlResponse session_client_control_response = 28;
     ClientRepaintRequest client_repaint_request = 29;
     ClientDetachRequest client_detach_request = 30;
+    SessionClientDetachRequest session_client_detach_request = 27;
+    SessionClientRepaintRequest session_client_repaint_request = 31;
+    SessionClientDebugSeverConnectionRequest session_client_debug_sever_connection_request = 32;
+    SessionClientDebugUnresponsiveConnectionRequest session_client_debug_unresponsive_connection_request = 33;
   }
 }
 
@@ -240,14 +243,6 @@ message AttachedClient {
   optional uint64 last_input_at_unix_ms = 4;
 }
 
-enum ClientControlAction {
-  CLIENT_CONTROL_ACTION_UNSPECIFIED = 0;
-  CLIENT_CONTROL_ACTION_DETACH = 1;
-  CLIENT_CONTROL_ACTION_REPAINT = 2;
-  CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION = 3;
-  CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION = 4;
-}
-
 enum ClientControlTargetKind {
   CLIENT_CONTROL_TARGET_KIND_UNSPECIFIED = 0;
   CLIENT_CONTROL_TARGET_KIND_DEFAULT = 1;
@@ -256,21 +251,44 @@ enum ClientControlTargetKind {
   CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID = 4;
 }
 
+// Embedded in session-client-management requests.
+message ClientControlTarget {
+  ClientControlTargetKind target_kind = 1;
+  string client_guid = 2;
+}
+
 // Framed payload, broker/client -> session agent.
 //
-// Applies a client-management operation to one or more attachments for this
-// agent's live session.
-message SessionClientControlRequest {
-  ClientControlAction action = 1;
-  ClientControlTargetKind target_kind = 2;
-  string client_guid = 3;
-  // Only used for CLIENT_CONTROL_ACTION_REPAINT. When true, the selected
-  // client clears outer terminal scrollback and requests retained inner
-  // scrollback plus the current screen.
-  bool include_scrollback = 4;
-  // Only used for CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION. Omitted
-  // or zero asks the receiver to use its default debug-unresponsive duration.
-  uint32 debug_unresponsive_seconds = 5;
+// Requests normal detach behavior on one or more attached clients.
+message SessionClientDetachRequest {
+  ClientControlTarget target = 1;
+}
+
+// Framed payload, broker/client -> session agent.
+//
+// Requests repaint behavior on one or more attached clients.
+message SessionClientRepaintRequest {
+  ClientControlTarget target = 1;
+  // When true, the selected client clears outer terminal scrollback and
+  // requests retained inner scrollback plus the current screen.
+  bool include_scrollback = 2;
+}
+
+// Framed payload, broker/client -> session agent.
+//
+// Debug-only request that severs one or more attached client connections.
+message SessionClientDebugSeverConnectionRequest {
+  ClientControlTarget target = 1;
+}
+
+// Framed payload, broker/client -> session agent.
+//
+// Debug-only request that makes one or more attached client connections stop
+// responding for a bounded duration. Omitted or zero seconds asks the receiver
+// to use its default debug-unresponsive duration.
+message SessionClientDebugUnresponsiveConnectionRequest {
+  ClientControlTarget target = 1;
+  uint32 seconds = 2;
 }
 
 // Framed payload, session agent -> broker/client.

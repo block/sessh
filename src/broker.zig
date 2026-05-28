@@ -113,8 +113,8 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
         std.mem.eql(u8, command, "repaint-client") or
         std.mem.eql(u8, command, "debug-client"))
     {
-        const options = parseClientControlOptions(args) catch return finishCommand(64, "", "ERROR usage: detach-client|repaint-client|debug-client [options] ID\n");
-        return runClientControlCommand(allocator, options);
+        const client_command = parseClientControlCommand(args) catch return finishCommand(64, "", "ERROR usage: detach-client|repaint-client|debug-client [options] ID\n");
+        return runClientControlCommand(allocator, client_command);
     }
     return finishCommand(64, "", "ERROR unknown broker command\n");
 }
@@ -140,13 +140,60 @@ const ListClientsOptions = struct {
     format: ListFormat = .table,
 };
 
-const ClientControlOptions = struct {
-    session_ref: []const u8,
-    action: pb.ClientControlAction,
-    target_kind: pb.ClientControlTargetKind,
+const ClientControlTarget = struct {
+    kind: pb.ClientControlTargetKind,
     client_guid: []const u8 = "",
+
+    fn proto(self: ClientControlTarget) pb.ClientControlTarget {
+        return .{
+            .target_kind = self.kind,
+            .client_guid = self.client_guid,
+        };
+    }
+};
+
+const ClientDetachCommand = struct {
+    session_ref: []const u8,
+    target: ClientControlTarget,
+};
+
+const ClientRepaintCommand = struct {
+    session_ref: []const u8,
+    target: ClientControlTarget,
     include_scrollback: bool = false,
-    debug_unresponsive_seconds: u32 = config.default_debug_unresponsive_seconds,
+};
+
+const ClientDebugSeverConnectionCommand = struct {
+    session_ref: []const u8,
+    target: ClientControlTarget,
+};
+
+const ClientDebugUnresponsiveConnectionCommand = struct {
+    session_ref: []const u8,
+    target: ClientControlTarget,
+    seconds: u32 = config.default_debug_unresponsive_seconds,
+};
+
+const ClientControlCommand = union(enum) {
+    detach: ClientDetachCommand,
+    repaint: ClientRepaintCommand,
+    debug_sever_connection: ClientDebugSeverConnectionCommand,
+    debug_unresponsive_connection: ClientDebugUnresponsiveConnectionCommand,
+
+    fn sessionRef(self: ClientControlCommand) []const u8 {
+        return switch (self) {
+            inline else => |command| command.session_ref,
+        };
+    }
+
+    fn resultVerb(self: ClientControlCommand) []const u8 {
+        return switch (self) {
+            .detach => "DETACHED",
+            .repaint => "REPAINTED",
+            .debug_sever_connection => "SEVERED",
+            .debug_unresponsive_connection => "UNRESPONSIVE",
+        };
+    }
 };
 
 fn parseListOptions(args: []const []const u8) !ListOptions {
@@ -191,27 +238,28 @@ fn parseListClientsOptions(args: []const []const u8) !ListClientsOptions {
     };
 }
 
-fn parseClientControlOptions(args: []const []const u8) !ClientControlOptions {
+fn parseClientControlCommand(args: []const []const u8) !ClientControlCommand {
     const command = args[0];
     var i: usize = 1;
-    const action: pb.ClientControlAction = if (std.mem.eql(u8, command, "detach-client"))
-        .CLIENT_CONTROL_ACTION_DETACH
-    else if (std.mem.eql(u8, command, "repaint-client"))
-        .CLIENT_CONTROL_ACTION_REPAINT
-    else if (std.mem.eql(u8, command, "debug-client")) blk: {
-        if (i >= args.len) return error.MissingDebugAction;
-        const debug_action = args[i];
-        i += 1;
-        if (std.mem.eql(u8, debug_action, "sever-connection")) {
-            break :blk .CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION;
-        } else if (std.mem.eql(u8, debug_action, "unresponsive-connection")) {
-            break :blk .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION;
-        } else {
-            return error.InvalidDebugAction;
-        }
-    } else return error.InvalidClientControlCommand;
+    const command_kind: enum { detach, repaint, debug_sever_connection, debug_unresponsive_connection } =
+        if (std.mem.eql(u8, command, "detach-client"))
+            .detach
+        else if (std.mem.eql(u8, command, "repaint-client"))
+            .repaint
+        else if (std.mem.eql(u8, command, "debug-client")) blk: {
+            if (i >= args.len) return error.MissingDebugAction;
+            const debug_action = args[i];
+            i += 1;
+            if (std.mem.eql(u8, debug_action, "sever-connection")) {
+                break :blk .debug_sever_connection;
+            } else if (std.mem.eql(u8, debug_action, "unresponsive-connection")) {
+                break :blk .debug_unresponsive_connection;
+            } else {
+                return error.InvalidDebugAction;
+            }
+        } else return error.InvalidClientControlCommand;
 
-    var target_kind: pb.ClientControlTargetKind = if (action == .CLIENT_CONTROL_ACTION_REPAINT)
+    var target_kind: pb.ClientControlTargetKind = if (command_kind == .repaint)
         .CLIENT_CONTROL_TARGET_KIND_ALL
     else
         .CLIENT_CONTROL_TARGET_KIND_DEFAULT;
@@ -241,11 +289,11 @@ fn parseClientControlOptions(args: []const []const u8) !ClientControlOptions {
             target_kind = .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID;
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--scrollback")) {
-            if (action != .CLIENT_CONTROL_ACTION_REPAINT) return error.UnsupportedClientControlArgs;
+            if (command_kind != .repaint) return error.UnsupportedClientControlArgs;
             include_scrollback = true;
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--seconds")) {
-            if (action != .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION) return error.UnsupportedClientControlArgs;
+            if (command_kind != .debug_unresponsive_connection) return error.UnsupportedClientControlArgs;
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingDebugSeconds;
             debug_unresponsive_seconds = try parseDebugUnresponsiveSeconds(args[i]);
@@ -260,13 +308,30 @@ fn parseClientControlOptions(args: []const []const u8) !ClientControlOptions {
         }
     }
 
-    return .{
-        .session_ref = session_ref orelse return error.MissingSessionRef,
-        .action = action,
-        .target_kind = target_kind,
+    const resolved_session_ref = session_ref orelse return error.MissingSessionRef;
+    const target = ClientControlTarget{
+        .kind = target_kind,
         .client_guid = client_guid,
-        .include_scrollback = include_scrollback,
-        .debug_unresponsive_seconds = debug_unresponsive_seconds,
+    };
+    return switch (command_kind) {
+        .detach => .{ .detach = .{
+            .session_ref = resolved_session_ref,
+            .target = target,
+        } },
+        .repaint => .{ .repaint = .{
+            .session_ref = resolved_session_ref,
+            .target = target,
+            .include_scrollback = include_scrollback,
+        } },
+        .debug_sever_connection => .{ .debug_sever_connection = .{
+            .session_ref = resolved_session_ref,
+            .target = target,
+        } },
+        .debug_unresponsive_connection => .{ .debug_unresponsive_connection = .{
+            .session_ref = resolved_session_ref,
+            .target = target,
+            .seconds = debug_unresponsive_seconds,
+        } },
     };
 }
 
@@ -390,8 +455,8 @@ fn listClients(allocator: std.mem.Allocator, options: ListClientsOptions) !u8 {
     return 0;
 }
 
-fn runClientControlCommand(allocator: std.mem.Allocator, options: ClientControlOptions) !void {
-    var paths = pathsForLocalSessionRef(allocator, options.session_ref) catch |err| switch (err) {
+fn runClientControlCommand(allocator: std.mem.Allocator, command: ClientControlCommand) !void {
+    var paths = pathsForLocalSessionRef(allocator, command.sessionRef()) catch |err| switch (err) {
         error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
             return finishCommand(1, "", "ERROR session not found\n");
         },
@@ -409,7 +474,7 @@ fn runClientControlCommand(allocator: std.mem.Allocator, options: ClientControlO
         return finishCommand(1, "", "ERROR session not found\n");
     }
 
-    var response = sendSessionClientControlRequest(allocator, paths, options) catch |err| {
+    var response = sendSessionClientControlRequest(allocator, paths, command) catch |err| {
         try writeCommandErrorForAgentFailure(err);
         return process_exit.request(1);
     };
@@ -418,7 +483,7 @@ fn runClientControlCommand(allocator: std.mem.Allocator, options: ClientControlO
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
     const writer = stdout.writer(allocator);
-    const verb = clientControlResultVerb(options.action);
+    const verb = command.resultVerb();
     for (response.affected_client_guid.items) |client_guid| {
         try writer.print("{s} {s}\n", .{ verb, client_guid });
     }
@@ -537,21 +602,15 @@ fn nowUnixMs() u64 {
 fn sendSessionClientControlRequest(
     allocator: std.mem.Allocator,
     paths: session_registry.SessionPaths,
-    options: ClientControlOptions,
+    command: ClientControlCommand,
 ) !pb.SessionClientControlResponse {
     const fd = try socket_transport.connectSocket(paths.socket);
     defer _ = c.close(fd);
 
     try initiateRuntimeHandshake(allocator, fd);
-    const payload = try protocol.encodePayload(allocator, pb.SessionClientControlRequest{
-        .action = options.action,
-        .target_kind = options.target_kind,
-        .client_guid = options.client_guid,
-        .include_scrollback = options.include_scrollback,
-        .debug_unresponsive_seconds = options.debug_unresponsive_seconds,
-    });
+    const frame_type, const payload = try encodeClientControlRequest(allocator, command);
     defer allocator.free(payload);
-    try protocol.sendFrame(fd, .session_client_control_request, payload);
+    try protocol.sendFrame(fd, frame_type, payload);
 
     var frame = try protocol.readFrameAlloc(allocator, fd);
     defer frame.deinit(allocator);
@@ -567,13 +626,37 @@ fn sendSessionClientControlRequest(
     }
 }
 
-fn clientControlResultVerb(action: pb.ClientControlAction) []const u8 {
-    return switch (action) {
-        .CLIENT_CONTROL_ACTION_DETACH => "DETACHED",
-        .CLIENT_CONTROL_ACTION_REPAINT => "REPAINTED",
-        .CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION => "SEVERED",
-        .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION => "UNRESPONSIVE",
-        else => "UPDATED",
+fn encodeClientControlRequest(
+    allocator: std.mem.Allocator,
+    command: ClientControlCommand,
+) !struct { protocol.MessageType, []u8 } {
+    return switch (command) {
+        .detach => |detach| .{
+            .session_client_detach_request,
+            try protocol.encodePayload(allocator, pb.SessionClientDetachRequest{
+                .target = detach.target.proto(),
+            }),
+        },
+        .repaint => |repaint| .{
+            .session_client_repaint_request,
+            try protocol.encodePayload(allocator, pb.SessionClientRepaintRequest{
+                .target = repaint.target.proto(),
+                .include_scrollback = repaint.include_scrollback,
+            }),
+        },
+        .debug_sever_connection => |debug| .{
+            .session_client_debug_sever_connection_request,
+            try protocol.encodePayload(allocator, pb.SessionClientDebugSeverConnectionRequest{
+                .target = debug.target.proto(),
+            }),
+        },
+        .debug_unresponsive_connection => |debug| .{
+            .session_client_debug_unresponsive_connection_request,
+            try protocol.encodePayload(allocator, pb.SessionClientDebugUnresponsiveConnectionRequest{
+                .target = debug.target.proto(),
+                .seconds = debug.seconds,
+            }),
+        },
     };
 }
 

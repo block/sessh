@@ -1321,8 +1321,20 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                 try sendSessionLiveState(session_agent, fd);
                 return false;
             },
-            .session_client_control_request => {
-                try handleSessionClientControlRequest(session_agent, fd, frame.payload);
+            .session_client_detach_request => {
+                try handleSessionClientDetachRequest(session_agent, fd, frame.payload);
+                return false;
+            },
+            .session_client_repaint_request => {
+                try handleSessionClientRepaintRequest(session_agent, fd, frame.payload);
+                return false;
+            },
+            .session_client_debug_sever_connection_request => {
+                try handleSessionClientDebugSeverConnectionRequest(session_agent, fd, frame.payload);
+                return false;
+            },
+            .session_client_debug_unresponsive_connection_request => {
+                try handleSessionClientDebugUnresponsiveConnectionRequest(session_agent, fd, frame.payload);
                 return false;
             },
             .session_attach => {
@@ -1620,17 +1632,86 @@ fn sendSessionLiveState(session_agent: *SessionAgent, fd: c.fd_t) !void {
     try protocol.sendFrame(fd, .session_live_state, payload);
 }
 
-fn handleSessionClientControlRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.SessionClientControlRequest, app_allocator.allocator(), payload);
-    defer request.deinit(app_allocator.allocator());
+const CapturedClientControlGuids = struct {
+    bufs: [max_attachments][session_registry.client_guid_len]u8 = undefined,
+    lens: [max_attachments]usize = undefined,
+    count: usize = 0,
+};
 
+fn handleSessionClientDetachRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
+    var request = try protocol.decodePayload(pb.SessionClientDetachRequest, app_allocator.allocator(), payload);
+    defer request.deinit(app_allocator.allocator());
+    var selected: [max_attachments]usize = undefined;
+    const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
+    const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
+
+    for (selected[0..selected_count]) |attachment_index| {
+        requestClientDetachFromControl(session_agent, attachment_index);
+    }
+    try sendClientControlResponse(fd, captured);
+}
+
+fn handleSessionClientRepaintRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
+    var request = try protocol.decodePayload(pb.SessionClientRepaintRequest, app_allocator.allocator(), payload);
+    defer request.deinit(app_allocator.allocator());
+    var selected: [max_attachments]usize = undefined;
+    const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
+    const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
+
+    for (selected[0..selected_count]) |attachment_index| {
+        requestClientRepaintFromControl(session_agent, attachment_index, request.include_scrollback);
+    }
+    try sendClientControlResponse(fd, captured);
+}
+
+fn handleSessionClientDebugSeverConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
+    var request = try protocol.decodePayload(pb.SessionClientDebugSeverConnectionRequest, app_allocator.allocator(), payload);
+    defer request.deinit(app_allocator.allocator());
+    var selected: [max_attachments]usize = undefined;
+    const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
+    const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
+
+    for (selected[0..selected_count]) |attachment_index| {
+        detachAttachment(session_agent, attachment_index);
+    }
+    try sendClientControlResponse(fd, captured);
+}
+
+fn handleSessionClientDebugUnresponsiveConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
+    var request = try protocol.decodePayload(pb.SessionClientDebugUnresponsiveConnectionRequest, app_allocator.allocator(), payload);
+    defer request.deinit(app_allocator.allocator());
+    var selected: [max_attachments]usize = undefined;
+    const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
+    const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
+
+    const seconds = if (request.seconds == 0)
+        config.default_debug_unresponsive_seconds
+    else
+        request.seconds;
+    const until_ms = sessionAgentMonotonicMs(session_agent) + @as(i64, seconds) * std.time.ms_per_s;
+    for (selected[0..selected_count]) |attachment_index| {
+        if (attachment_index < session_agent.attachments.len and session_agent.attachments[attachment_index].active) {
+            session_agent.attachments[attachment_index].debug_unresponsive_until_ms = until_ms;
+        }
+    }
+    try sendClientControlResponse(fd, captured);
+}
+
+fn resolveClientControlTargetsOrSend(
+    session_agent: *SessionAgent,
+    fd: c.fd_t,
+    maybe_target: ?pb.ClientControlTarget,
+    selected: *[max_attachments]usize,
+) !?usize {
     const session_index = findMostRecentSessionIndex(session_agent) orelse {
         try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
-        return;
+        return null;
     };
-
-    var selected: [max_attachments]usize = undefined;
-    const selected_count = resolveClientControlTargets(session_agent, session_index, request, &selected) catch |err| {
+    const target = maybe_target orelse {
+        try sendError(session_agent, fd, "INVALID_TARGET", "invalid client target", "");
+        return null;
+    };
+    return resolveClientControlTargets(session_agent, session_index, target, selected) catch |err| {
         switch (err) {
             error.NoAttachedClients => try sendError(session_agent, fd, "NO_ATTACHED_CLIENTS", "no attached clients", ""),
             error.MultipleAttachedClients => try sendError(session_agent, fd, "MULTIPLE_ATTACHED_CLIENTS", "multiple clients are attached", "Pass --all, --last-input, or a client GUID"),
@@ -1640,64 +1721,24 @@ fn handleSessionClientControlRequest(session_agent: *SessionAgent, fd: c.fd_t, p
             error.InvalidClientControlTarget => try sendError(session_agent, fd, "INVALID_TARGET", "invalid client target", ""),
             else => return err,
         }
-        return;
+        return null;
     };
+}
 
-    const action = request.action;
-    switch (action) {
-        .CLIENT_CONTROL_ACTION_DETACH,
-        .CLIENT_CONTROL_ACTION_REPAINT,
-        .CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION,
-        .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION,
-        => {},
-        else => {
-            try sendError(session_agent, fd, "INVALID_ACTION", "invalid client control action", "");
-            return;
-        },
-    }
-
-    var guid_bufs: [max_attachments][session_registry.client_guid_len]u8 = undefined;
-    var guid_lens: [max_attachments]usize = undefined;
-    for (selected[0..selected_count], 0..) |attachment_index, i| {
+fn captureSelectedClientControlGuids(session_agent: *const SessionAgent, selected: []const usize) CapturedClientControlGuids {
+    var captured = CapturedClientControlGuids{ .count = selected.len };
+    for (selected, 0..) |attachment_index, i| {
         const client_guid = session_agent.attachments[attachment_index].clientGuidSlice();
-        @memcpy(guid_bufs[i][0..client_guid.len], client_guid);
-        guid_lens[i] = client_guid.len;
+        @memcpy(captured.bufs[i][0..client_guid.len], client_guid);
+        captured.lens[i] = client_guid.len;
     }
+    return captured;
+}
 
-    switch (action) {
-        .CLIENT_CONTROL_ACTION_DETACH => {
-            for (selected[0..selected_count]) |attachment_index| {
-                requestClientDetachFromControl(session_agent, attachment_index);
-            }
-        },
-        .CLIENT_CONTROL_ACTION_DEBUG_SEVER_CONNECTION => {
-            for (selected[0..selected_count]) |attachment_index| {
-                detachAttachment(session_agent, attachment_index);
-            }
-        },
-        .CLIENT_CONTROL_ACTION_REPAINT => {
-            for (selected[0..selected_count]) |attachment_index| {
-                requestClientRepaintFromControl(session_agent, attachment_index, request.include_scrollback);
-            }
-        },
-        .CLIENT_CONTROL_ACTION_DEBUG_UNRESPONSIVE_CONNECTION => {
-            const seconds = if (request.debug_unresponsive_seconds == 0)
-                config.default_debug_unresponsive_seconds
-            else
-                request.debug_unresponsive_seconds;
-            const until_ms = sessionAgentMonotonicMs(session_agent) + @as(i64, seconds) * std.time.ms_per_s;
-            for (selected[0..selected_count]) |attachment_index| {
-                if (attachment_index < session_agent.attachments.len and session_agent.attachments[attachment_index].active) {
-                    session_agent.attachments[attachment_index].debug_unresponsive_until_ms = until_ms;
-                }
-            }
-        },
-        else => unreachable,
-    }
-
+fn sendClientControlResponse(fd: c.fd_t, captured: CapturedClientControlGuids) !void {
     var response = pb.SessionClientControlResponse{};
     defer response.affected_client_guid.deinit(app_allocator.allocator());
-    for (guid_bufs[0..selected_count], guid_lens[0..selected_count]) |*buf, len| {
+    for (captured.bufs[0..captured.count], captured.lens[0..captured.count]) |*buf, len| {
         try response.affected_client_guid.append(app_allocator.allocator(), buf[0..len]);
     }
     const response_payload = try protocol.encodePayload(app_allocator.allocator(), response);
@@ -1708,14 +1749,14 @@ fn handleSessionClientControlRequest(session_agent: *SessionAgent, fd: c.fd_t, p
 fn resolveClientControlTargets(
     session_agent: *const SessionAgent,
     session_index: usize,
-    request: pb.SessionClientControlRequest,
+    target: pb.ClientControlTarget,
     selected: *[max_attachments]usize,
 ) !usize {
-    return switch (request.target_kind) {
+    return switch (target.target_kind) {
         .CLIENT_CONTROL_TARGET_KIND_DEFAULT => resolveDefaultClientTarget(session_agent, session_index, selected),
         .CLIENT_CONTROL_TARGET_KIND_ALL => resolveAllClientTargets(session_agent, session_index, selected),
         .CLIENT_CONTROL_TARGET_KIND_LAST_INPUT => resolveLastInputClientTarget(session_agent, session_index, selected),
-        .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID => resolveClientGuidTarget(session_agent, session_index, request.client_guid, selected),
+        .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID => resolveClientGuidTarget(session_agent, session_index, target.client_guid, selected),
         else => error.InvalidClientControlTarget,
     };
 }

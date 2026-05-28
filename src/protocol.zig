@@ -27,10 +27,13 @@ pub const MessageType = enum {
     input_ack,
     session_live_state_query,
     session_live_state,
-    session_client_control_request,
     session_client_control_response,
     client_repaint_request,
     client_detach_request,
+    session_client_detach_request,
+    session_client_repaint_request,
+    session_client_debug_sever_connection_request,
+    session_client_debug_unresponsive_connection_request,
 };
 
 pub const frame_header_len = 4;
@@ -124,10 +127,13 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .input_ack => |message| ownedFrameFromMessage(allocator, .input_ack, message),
             .session_live_state_query => |message| ownedFrameFromMessage(allocator, .session_live_state_query, message),
             .session_live_state => |message| ownedFrameFromMessage(allocator, .session_live_state, message),
-            .session_client_control_request => |message| ownedFrameFromMessage(allocator, .session_client_control_request, message),
             .session_client_control_response => |message| ownedFrameFromMessage(allocator, .session_client_control_response, message),
             .client_repaint_request => |message| ownedFrameFromMessage(allocator, .client_repaint_request, message),
             .client_detach_request => |message| ownedFrameFromMessage(allocator, .client_detach_request, message),
+            .session_client_detach_request => |message| ownedFrameFromMessage(allocator, .session_client_detach_request, message),
+            .session_client_repaint_request => |message| ownedFrameFromMessage(allocator, .session_client_repaint_request, message),
+            .session_client_debug_sever_connection_request => |message| ownedFrameFromMessage(allocator, .session_client_debug_sever_connection_request, message),
+            .session_client_debug_unresponsive_connection_request => |message| ownedFrameFromMessage(allocator, .session_client_debug_unresponsive_connection_request, message),
         };
     }
 
@@ -246,11 +252,6 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_live_state = message } });
         },
-        .session_client_control_request => blk: {
-            var message = try decodePayload(pb.SessionClientControlRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_control_request = message } });
-        },
         .session_client_control_response => blk: {
             var message = try decodePayload(pb.SessionClientControlResponse, allocator, payload);
             defer message.deinit(allocator);
@@ -265,6 +266,26 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.ClientDetachRequest, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_detach_request = message } });
+        },
+        .session_client_detach_request => blk: {
+            var message = try decodePayload(pb.SessionClientDetachRequest, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_detach_request = message } });
+        },
+        .session_client_repaint_request => blk: {
+            var message = try decodePayload(pb.SessionClientRepaintRequest, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_repaint_request = message } });
+        },
+        .session_client_debug_sever_connection_request => blk: {
+            var message = try decodePayload(pb.SessionClientDebugSeverConnectionRequest, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_debug_sever_connection_request = message } });
+        },
+        .session_client_debug_unresponsive_connection_request => blk: {
+            var message = try decodePayload(pb.SessionClientDebugUnresponsiveConnectionRequest, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_debug_unresponsive_connection_request = message } });
         },
     };
 }
