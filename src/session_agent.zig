@@ -18,6 +18,7 @@ const max_attachments = 128;
 const max_attachment_output_queue_bytes = 64 * 1024 * 1024;
 const preferred_live_output_batch_bytes = 1024;
 const max_live_output_reads_per_batch = 64;
+const synchronized_output_max_hold_ms: i64 = 1000;
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
@@ -52,6 +53,7 @@ const Session = struct {
     alive: bool = false,
     pending_plain_output: std.ArrayList(u8) = .empty,
     pending_plain_starts_at_boundary: bool = false,
+    synchronized_output_since_ms: i64 = 0,
 
     fn idSlice(self: *const Session) []const u8 {
         return self.id[0..self.id_len];
@@ -82,6 +84,7 @@ const Session = struct {
         self.pending_plain_output.deinit(app_allocator.allocator());
         self.pending_plain_output = .empty;
         self.pending_plain_starts_at_boundary = false;
+        self.synchronized_output_since_ms = 0;
     }
 };
 
@@ -1145,8 +1148,10 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
         count += 1;
     }
 
-    _ = try posix.poll(pollfds[0..count], debugUnresponsivePollTimeoutMs(session_agent, now_ms));
-    clearExpiredDebugUnresponsiveAttachments(session_agent, sessionAgentMonotonicMs(session_agent));
+    _ = try posix.poll(pollfds[0..count], sessionAgentPollTimeoutMs(session_agent, now_ms));
+    const after_poll_ms = sessionAgentMonotonicMs(session_agent);
+    clearExpiredDebugUnresponsiveAttachments(session_agent, after_poll_ms);
+    flushExpiredSynchronizedOutputSessions(session_agent, after_poll_ms);
 
     for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
         if (pollfd.revents == 0) continue;
@@ -1179,15 +1184,34 @@ fn clearExpiredDebugUnresponsiveAttachments(session_agent: *SessionAgent, now_ms
     }
 }
 
-fn debugUnresponsivePollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64) i32 {
+fn sessionAgentPollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64) i32 {
     var timeout_ms: ?i64 = null;
     for (&session_agent.attachments) |*attachment| {
         if (!attachment.active or attachment.debug_unresponsive_until_ms <= now_ms) continue;
         const remaining_ms = attachment.debug_unresponsive_until_ms - now_ms;
         if (timeout_ms == null or remaining_ms < timeout_ms.?) timeout_ms = remaining_ms;
     }
+    for (&session_agent.sessions) |*session| {
+        if (!session.alive or session.synchronized_output_since_ms == 0) continue;
+        const elapsed_ms = now_ms - session.synchronized_output_since_ms;
+        const remaining_ms = synchronized_output_max_hold_ms - elapsed_ms;
+        const clamped_remaining_ms = @max(remaining_ms, 0);
+        if (timeout_ms == null or clamped_remaining_ms < timeout_ms.?) timeout_ms = clamped_remaining_ms;
+    }
     const ms = timeout_ms orelse return -1;
     return @intCast(@min(ms, std.math.maxInt(i32)));
+}
+
+fn flushExpiredSynchronizedOutputSessions(session_agent: *SessionAgent, now_ms: i64) void {
+    for (&session_agent.sessions, 0..) |*session, session_index| {
+        if (!session.alive or session.synchronized_output_since_ms == 0) continue;
+        if (now_ms - session.synchronized_output_since_ms < synchronized_output_max_hold_ms) continue;
+        broadcastSessionPatch(session_agent, session_index);
+        if (session.alive) {
+            session.clearPendingPlainOutput();
+            session.synchronized_output_since_ms = now_ms;
+        }
+    }
 }
 
 fn handleRuntimeRepairEvent(session_agent: *SessionAgent, listen_fd: *c.fd_t, runtime_repair_fd: c.fd_t) void {
@@ -2043,6 +2067,12 @@ fn appendDrawCleanup(draw_bytes: *std.ArrayList(u8)) !void {
     try renderer.restoreBannerPresentation();
 }
 
+fn wrapDrawInSynchronizedUpdate(draw_bytes: *std.ArrayList(u8)) !void {
+    if (draw_bytes.items.len == 0) return;
+    try draw_bytes.insertSlice(app_allocator.allocator(), 0, "\x1b[?2026h");
+    try draw_bytes.appendSlice(app_allocator.allocator(), "\x1b[?2026l");
+}
+
 fn appendRelayEndRestoreBytes(
     attachment: *const Attachment,
     session: *const Session,
@@ -2072,6 +2102,7 @@ fn queueScrollbackRowsDraw(
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
+    try wrapDrawInSynchronizedUpdate(&bytes);
     try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null);
 }
 
@@ -2120,6 +2151,7 @@ fn queueScrollbackRowsAndScreenDraw(
     if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
     updateMouseOriginAfterDraw(attachment, screen);
     try appendDrawCleanup(&bytes);
+    try wrapDrawInSynchronizedUpdate(&bytes);
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
     const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
@@ -2137,6 +2169,7 @@ fn queueScrollbackTruncatedDraw(
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
+    try wrapDrawInSynchronizedUpdate(&bytes);
     try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null);
 }
 
@@ -2211,6 +2244,7 @@ fn queueScreenDraw(
     updateMouseOriginAfterDraw(attachment, screen);
     if (bytes.items.len > 0) {
         try appendDrawCleanup(&bytes);
+        try wrapDrawInSynchronizedUpdate(&bytes);
         var restore_bytes = std.ArrayList(u8).empty;
         defer restore_bytes.deinit(app_allocator.allocator());
         const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
@@ -2235,6 +2269,7 @@ fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session) 
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try renderer.clearScrollback();
+    try wrapDrawInSynchronizedUpdate(&bytes);
     try queueDrawFrame(attachment, session, 0, bytes.items, null);
 }
 
@@ -2292,6 +2327,7 @@ fn queueRepaintResponseDraw(
     if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
     updateMouseOriginAfterDraw(attachment, screen);
     try appendDrawCleanup(&bytes);
+    try wrapDrawInSynchronizedUpdate(&bytes);
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
     const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
@@ -2794,6 +2830,28 @@ fn detachExistingAttachmentWithClientGuid(session_agent: *SessionAgent, session_
     }
 }
 
+fn updateSynchronizedOutputState(session_agent: *SessionAgent, session_index: usize, now_ms: i64) bool {
+    const session = &session_agent.sessions[session_index];
+    const model = session.terminal_model orelse {
+        session.synchronized_output_since_ms = 0;
+        return false;
+    };
+    if (!model.synchronizedOutputActive()) {
+        session.synchronized_output_since_ms = 0;
+        return false;
+    }
+    if (session.synchronized_output_since_ms == 0) {
+        session.synchronized_output_since_ms = now_ms;
+    }
+    return true;
+}
+
+fn shouldDeferSynchronizedOutput(session_agent: *SessionAgent, session_index: usize, now_ms: i64) bool {
+    const session = &session_agent.sessions[session_index];
+    if (!updateSynchronizedOutputState(session_agent, session_index, now_ms)) return false;
+    return now_ms - session.synchronized_output_since_ms < synchronized_output_max_hold_ms;
+}
+
 fn drainSessionOutput(session_agent: *SessionAgent, session_index: usize) void {
     if (!session_agent.sessions[session_index].alive) return;
 
@@ -2841,8 +2899,15 @@ fn drainSessionOutput(session_agent: *SessionAgent, session_index: usize) void {
         const ready = posix.poll(&next, 0) catch 0;
         if (ready == 0 or (next[0].revents & posix.POLL.IN) == 0) break;
     }
+    const now_ms = sessionAgentMonotonicMs(session_agent);
+    if (shouldDeferSynchronizedOutput(session_agent, session_index, now_ms)) return;
     broadcastSessionPatch(session_agent, session_index);
-    session_agent.sessions[session_index].clearPendingPlainOutput();
+    if (session_agent.sessions[session_index].alive) {
+        session_agent.sessions[session_index].clearPendingPlainOutput();
+        if (session_agent.sessions[session_index].synchronized_output_since_ms != 0) {
+            session_agent.sessions[session_index].synchronized_output_since_ms = now_ms;
+        }
+    }
 }
 
 fn drainSessionOutputBeforeEnd(session_agent: *SessionAgent, session_index: usize) void {
@@ -3612,6 +3677,10 @@ fn refreshAttachedFlag(session_agent: *SessionAgent, session_index: usize) void 
 fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, exit_info: ExitInfo) void {
     const session = &session_agent.sessions[session_index];
     if (!session.alive) return;
+
+    broadcastSessionPatch(session_agent, session_index);
+    session.clearPendingPlainOutput();
+    session.synchronized_output_since_ms = 0;
 
     if (exit_info.kind != 0) {
         logSessionAgent(session_agent, "event=session_end id={s} pid={} reason={} exit_kind={} status={} ended_at_ms={}", .{

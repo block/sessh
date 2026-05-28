@@ -152,6 +152,8 @@ def sessh_version():
 
 KITTY_KEYBOARD_QUERY = b"\x1b[?u"
 KITTY_KEYBOARD_STATUS_RESPONSE = b"\x1b[?0u"
+SYNCHRONIZED_UPDATE_START = b"\x1b[?2026h"
+SYNCHRONIZED_UPDATE_END = b"\x1b[?2026l"
 kitty_keyboard_status_response = KITTY_KEYBOARD_STATUS_RESPONSE
 
 
@@ -160,6 +162,12 @@ def read_pty_chunk(fd):
     for _ in range(chunk.count(KITTY_KEYBOARD_QUERY)):
         os.write(fd, kitty_keyboard_status_response)
     return chunk
+
+
+def synchronized_draw_body(output):
+    if output.startswith(SYNCHRONIZED_UPDATE_START) and output.endswith(SYNCHRONIZED_UPDATE_END):
+        return output[len(SYNCHRONIZED_UPDATE_START) : -len(SYNCHRONIZED_UPDATE_END)]
+    return output
 
 
 def read_until(fd, needle, timeout=5.0):
@@ -1108,7 +1116,7 @@ def run_live_draw_protocol_test(base_env):
                 assert_session_attached(payload)
 
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
-                _, draws = recv_draw_until(conn, b"PATCH_LINK")
+                draw, draws = recv_draw_until(conn, b"PATCH_LINK")
                 output = b"".join(draw["draw_bytes"] for draw in draws)
                 if b"PATCH_MARKER" not in output:
                     raise AssertionError(f"live DRAW did not include updated text: {output!r}")
@@ -1117,6 +1125,62 @@ def run_live_draw_protocol_test(base_env):
                         raise AssertionError(f"missing style sequence {seq!r}: {output!r}")
                 if b"\x1b]8;;https://example.test/\x1b\\" not in output:
                     raise AssertionError(f"missing hyperlink sequence: {output!r}")
+                if not draw["draw_bytes"].startswith(SYNCHRONIZED_UPDATE_START):
+                    raise AssertionError(f"generated draw was not synchronized: {draw!r}")
+                if not draw["draw_bytes"].endswith(SYNCHRONIZED_UPDATE_END):
+                    raise AssertionError(f"generated draw did not end synchronized update: {draw!r}")
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
+def run_synchronized_output_protocol_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-sync-output-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        env["SHELL"] = "/bin/sh"
+        shell = Path(tmp) / "sync-output-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "while IFS= read -r line; do\n"
+            "  printf '\\033[?2026hSYNC_PARTIAL'\n"
+            "  sleep 1\n"
+            "  printf '_READY\\033[?2026l\\n'\n"
+            "  sleep 1\n"
+            "  exit 0\n"
+            "done\n"
+        )
+        shell.chmod(0o700)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn)
+                create_and_attach_session(conn, shell)
+
+                message_type, payload = recv_frame(conn)
+                if message_type != SESSION_ATTACHED:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                assert_session_attached(payload)
+
+                send_frame(conn, INPUT, pack_bytes(b"go\n"))
+                try:
+                    early = recv_draw(conn, timeout=0.2)
+                except (TimeoutError, socket.timeout):
+                    early = None
+                if early is not None and b"SYNC_PARTIAL" in early["draw_bytes"]:
+                    raise AssertionError(f"synchronized output leaked before end marker: {early!r}")
+                draw, _ = recv_draw_until(conn, b"SYNC_PARTIAL_READY")
+                output = draw["draw_bytes"]
+                if output.count(SYNCHRONIZED_UPDATE_START) != 1 or output.count(SYNCHRONIZED_UPDATE_END) != 1:
+                    raise AssertionError(f"expected one synchronized draw wrapper: {output!r}")
+                if not output.startswith(SYNCHRONIZED_UPDATE_START) or not output.endswith(SYNCHRONIZED_UPDATE_END):
+                    raise AssertionError(f"synchronized wrapper did not cover full draw: {output!r}")
             finally:
                 conn.close()
         finally:
@@ -1705,7 +1769,7 @@ def run_complete_display_clear_protocol_test(base_env):
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
                 draw, _ = recv_draw_until(conn, b"AFTER_FULL_CLEAR$")
                 output = draw["draw_bytes"]
-                if not output.startswith(b"\x1b[2J\x1b[1;1H"):
+                if not synchronized_draw_body(output).startswith(b"\x1b[2J\x1b[1;1H"):
                     raise AssertionError(f"complete display clear did not clear physical screen first: {output!r}")
             finally:
                 conn.close()
@@ -3409,6 +3473,7 @@ def main():
             run_minor_version_compatibility_test(env)
             run_session_create_without_attach_protocol_test(env)
             run_live_draw_protocol_test(env)
+            run_synchronized_output_protocol_test(env)
             run_input_ack_protocol_test(env)
             run_session_ended_payload_protocol_test(env)
             run_plain_scroll_protocol_test(env)

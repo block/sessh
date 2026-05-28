@@ -409,6 +409,10 @@ pub const SessionTerminal = struct {
         };
     }
 
+    pub fn synchronizedOutputActive(self: *const SessionTerminal) bool {
+        return self.terminal.modes.get(.synchronized_output);
+    }
+
     fn queueInputResponse(self: *SessionTerminal, bytes: []const u8) !void {
         try self.pending_input_responses.appendSlice(self.allocator, bytes);
     }
@@ -1608,6 +1612,17 @@ test "session terminal answers kitty keyboard query from current flags" {
 
     const responses = terminal.pendingInputResponses();
     try std.testing.expect(std.mem.indexOf(u8, responses, "\x1b[?7u") != null);
+}
+
+test "session terminal exposes synchronized output mode" {
+    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    defer terminal.destroy();
+
+    try std.testing.expect(!terminal.synchronizedOutputActive());
+    try terminal.feed("\x1b[?2026h");
+    try std.testing.expect(terminal.synchronizedOutputActive());
+    try terminal.feed("\x1b[?2026l");
+    try std.testing.expect(!terminal.synchronizedOutputActive());
 }
 
 test "session terminal answers basic terminal queries to the PTY" {
