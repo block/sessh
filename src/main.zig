@@ -50,7 +50,7 @@ fn runMain() !void {
     if (entrypoint == .sessh) {
         const sessh_args = try sesshArgsFromInternal(allocator, args);
         defer allocator.free(sessh_args);
-        return ssh_client.runMux(allocator, sessh_args, false);
+        return ssh_client.run(allocator, sessh_args);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-session-agent:")) {
@@ -63,10 +63,6 @@ fn runMain() !void {
 
     if (std.mem.eql(u8, args[1], ":internal-broker:")) {
         return broker.run(allocator, args[0], args[2..]);
-    }
-
-    if (std.mem.eql(u8, args[1], ".")) {
-        return client.run(allocator, args);
     }
 
     return ssh_client.runMux(allocator, args, true);
@@ -88,10 +84,9 @@ fn sesshArgsFromInternal(allocator: std.mem.Allocator, args: []const []const u8)
     std.debug.assert(args.len >= 2);
     std.debug.assert(std.mem.eql(u8, args[1], ":internal-sessh:"));
 
-    const sessh_args = try allocator.alloc([]const u8, args.len);
+    const sessh_args = try allocator.alloc([]const u8, args.len - 1);
     sessh_args[0] = args[0];
-    sessh_args[1] = "new";
-    @memcpy(sessh_args[2..], args[2..]);
+    @memcpy(sessh_args[1..], args[2..]);
     return sessh_args;
 }
 
@@ -100,7 +95,7 @@ test "version label follows entrypoint" {
     try std.testing.expectEqualStrings("sesshmux", entrypointName(.sesshmux));
 }
 
-test "internal sessh modality maps to mux new command" {
+test "internal sessh modality removes sentinel" {
     const rewritten = try sesshArgsFromInternal(std.testing.allocator, &.{
         "sesshmux-macos-aarch64",
         ":internal-sessh:",
@@ -109,11 +104,10 @@ test "internal sessh modality maps to mux new command" {
     });
     defer std.testing.allocator.free(rewritten);
 
-    try std.testing.expectEqual(@as(usize, 4), rewritten.len);
+    try std.testing.expectEqual(@as(usize, 3), rewritten.len);
     try std.testing.expectEqualStrings("sesshmux-macos-aarch64", rewritten[0]);
-    try std.testing.expectEqualStrings("new", rewritten[1]);
-    try std.testing.expectEqualStrings("-v", rewritten[2]);
-    try std.testing.expectEqualStrings("example.com", rewritten[3]);
+    try std.testing.expectEqualStrings("-v", rewritten[1]);
+    try std.testing.expectEqualStrings("example.com", rewritten[2]);
 }
 
 fn usage(code: u8, entrypoint: EntryPoint) !void {

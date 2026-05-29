@@ -131,7 +131,7 @@ class FdConn:
         return os.read(self.read_fd, length)
 
 
-def run(args, env, **kwargs):
+def run_public(args, env, **kwargs):
     return subprocess.run(
         [str(BIN), *args],
         cwd=ROOT,
@@ -141,6 +141,12 @@ def run(args, env, **kwargs):
         stderr=subprocess.PIPE,
         **kwargs,
     )
+
+
+def run(args, env, **kwargs):
+    if args and args[0] == ".":
+        args = [":internal-sessh:", *args]
+    return run_public(args, env, **kwargs)
 
 
 def sessh_version():
@@ -3274,7 +3280,7 @@ def spawn_bin(env, args):
 
 def spawn_client(env, extra_args=None):
     extra_args = extra_args or []
-    return spawn_bin(env, [".", *extra_args])
+    return spawn_bin(env, [":internal-sessh:", ".", *extra_args])
 
 
 def close_client(pid, fd):
@@ -3504,6 +3510,15 @@ def main():
             internal_sessh_version = run([":internal-sessh:", "--version"], env, timeout=5.0)
             if internal_sessh_version.returncode != 0 or internal_sessh_version.stdout != f"sessh {sessh_version()}\n":
                 raise AssertionError(internal_sessh_version)
+            internal_local_env = isolated_env(Path(tmp) / "internal-sessh-local")
+            internal_shell = Path(tmp) / "internal-sessh-shell"
+            internal_shell.write_text("#!/bin/sh\nprintf 'internal-sessh-local-ok\\n'\n")
+            internal_shell.chmod(0o700)
+            internal_local_env["SHELL"] = str(internal_shell)
+            cleanup_runtime(internal_local_env)
+            internal_sessh_local = run([":internal-sessh:", "."], internal_local_env, timeout=5.0)
+            if internal_sessh_local.returncode != 0 or "internal-sessh-local-ok" not in internal_sessh_local.stdout:
+                raise AssertionError(internal_sessh_local)
             sessh_wrapper = ROOT / "zig-out" / "bin" / "sessh"
             if sessh_wrapper.exists():
                 sessh_help = subprocess.run(
@@ -3553,6 +3568,13 @@ def main():
             bad = run([".", "/tmp/not-a-socket-path"], env, timeout=5.0)
             if bad.returncode != 64:
                 raise AssertionError(bad)
+
+            bare_local = run_public(["."], env, timeout=5.0)
+            if bare_local.returncode != 64 or "unsupported command" not in bare_local.stderr:
+                raise AssertionError(bare_local)
+            public_dot_list = run_public([".", "list"], env, timeout=5.0)
+            if public_dot_list.returncode != 64 or "unsupported command" not in public_dot_list.stderr:
+                raise AssertionError(public_dot_list)
 
             listed = run([".", "list"], env, check=True, timeout=5.0)
             assert_list_header(listed.stdout)
