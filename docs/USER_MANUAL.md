@@ -42,8 +42,6 @@ sessh [[ssh-option|sessh-option] ...] destination [command [argument ...]]
   the alias on the remote host and cache a local route after the first attach.
 - `--log-level quiet|error|warn|info|debug|verbose`: override
   `client-log-level` for the local client.
-- `--force-compat`: run the compat-fallback path immediately, without first
-  trying the normal bootstrap/runtime path.
 
 Sessh-specific behavior is configured in the config file documented below.
 
@@ -91,6 +89,8 @@ Use `sesshmux` for session management:
   GUID, or unique `s-` GUID prefix.
 - `sesshmux attach --host HOST [ID]`: attach by resolving `ID` on `HOST`, or
   attach to the most recent attachable session on `HOST` if `ID` is omitted.
+- `sesshmux attach --force-compat ...`: attach through the session's compat
+  binary without first trying the normal bootstrap/runtime path.
 - `sesshmux list [--refresh] [--exited] [--jsonl] [HOST]`: list attachable sessions locally or on
   `HOST`. Without `HOST`, local sessions and cached remote routes are shown.
   Use `sesshmux list .` to show only local sessions. `--refresh` checks cached
@@ -187,8 +187,8 @@ and that remote sessh client talks to the agent with the protocol it knows. If
 doing that automatically would require another interactive ssh authentication
 prompt, sessh exits instead of prompting through the session stream.
 
-`--force-compat` runs the compat-fallback path immediately, without first
-trying the normal bootstrap/runtime path.
+`sesshmux attach --force-compat` runs the compat-fallback path immediately,
+without first trying the normal bootstrap/runtime path.
 
 ## Local mode
 
