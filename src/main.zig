@@ -140,7 +140,7 @@ fn usage(code: u8, entrypoint: EntryPoint) !void {
         \\  sesshmux new [options] [--ssh-options "ssh args"] HOST [-- cmd arg...]
         \\  sesshmux attach [options] [[--ssh-options "ssh args"] --host HOST] [ID]
         \\  sesshmux list [--refresh] [--exited] [--jsonl] [[--ssh-options "ssh args"] HOST]
-        \\  sesshmux list --client=incoming|outgoing|session|ID [--jsonl] [[--ssh-options "ssh args"] HOST]
+        \\  sesshmux list --client incoming|outgoing|session|ID [--jsonl] [[--ssh-options "ssh args"] HOST]
         \\  sesshmux kill [[--ssh-options "ssh args"] HOST] ID
         \\  sesshmux kill --all [[--ssh-options "ssh args"] HOST]
         \\  sesshmux detach [--all|--last-input|CLIENT_GUID] [ID]

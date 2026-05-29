@@ -2973,7 +2973,7 @@ def run_client_control_commands_test(base_env):
 
             session_env = dict(env)
             session_env["SESSH_GUID"] = guid_for_ref("s1")
-            listed_current = run([".", "list", "--client=session", "--jsonl"], session_env, check=True, timeout=5.0)
+            listed_current = run([".", "list", "--client", "session", "--jsonl"], session_env, check=True, timeout=5.0)
             current_rows = [json.loads(line) for line in listed_current.stdout.splitlines()]
             if [row["client_guid"] for row in current_rows] != [client_one, client_two]:
                 raise AssertionError(listed_current.stdout)

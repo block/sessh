@@ -82,7 +82,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const command = args[0];
     if (std.mem.eql(u8, command, "list")) {
-        const options = parseListOptions(args) catch return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl] [--exited] [--local-only] [--client=incoming|outgoing|session|ID]\n");
+        const options = parseListOptions(args) catch return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl] [--exited] [--local-only] [--client incoming|outgoing|session|ID]\n");
         const exit_status = if (options.client_selector == .none)
             try listAgents(allocator, options)
         else
@@ -225,6 +225,12 @@ fn parseListOptions(args: []const []const u8) !ListOptions {
             const value = args[i]["--client=".len..];
             if (value.len == 0) return error.MissingClientListTarget;
             options.client_selector = parseClientListSelector(value);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--client")) {
+            if (options.client_selector != .none) return error.InvalidListArgs;
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingClientListTarget;
+            options.client_selector = parseClientListSelector(args[i]);
             i += 1;
         } else {
             return error.InvalidListArgs;

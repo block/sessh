@@ -3076,6 +3076,13 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             if (options.list_client_target != null) return error.MultipleTargets;
             options.list_client_target = value;
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--client")) {
+            if (options.action != .list) return error.UnsupportedClientTarget;
+            if (options.list_client_target != null) return error.MultipleTargets;
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingClientListTarget;
+            options.list_client_target = args[i];
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--exited")) {
             options.list_exited = true;
             i += 1;

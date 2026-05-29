@@ -1685,7 +1685,7 @@ def test_ssh_no_host_list_client_uses_remote_route(tmp):
     env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "42"
     write_ssh_route(env, "remote-clients", guid_for_alias("remote-clients"), "test-host")
 
-    result = run_sesshmux(["list", "--client=remote-clients"], env, timeout=30.0)
+    result = run_sesshmux(["list", "--client", "remote-clients"], env, timeout=30.0)
 
     if result.returncode == 0:
         raise AssertionError(result)
