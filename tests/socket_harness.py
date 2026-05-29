@@ -3,7 +3,6 @@ import os
 import pty
 import re
 import select
-import shutil
 import signal
 import socket
 import stat
@@ -280,6 +279,13 @@ def wait_missing(path, timeout=5.0):
             return
         time.sleep(0.05)
     raise AssertionError(f"file still exists: {path}")
+
+
+def unlink_existing(path):
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        raise AssertionError(f"expected file to exist before deletion: {path}")
 
 
 def wait_log_contains(path, needle, timeout=5.0):
@@ -2633,9 +2639,12 @@ def run_session_agent_registry_test(base_env):
                 raise AssertionError(live_state)
             recv_draw_until(conn, b"AGENT_READY")
 
-            shutil.rmtree(runtime_root(env))
-            if socket_file.exists() or socket_link.exists() or socket_link.is_symlink():
-                raise AssertionError("runtime session files survived test deletion")
+            # Remove only the runtime artifacts the agent is responsible for
+            # recreating. Recursively deleting the runtime root races the
+            # repair thread: it can recreate a child while the test is still
+            # walking the parent directory.
+            for path in (socket_file, socket_link, meta_file, compat_file):
+                unlink_existing(path)
 
             send_frame(conn, INPUT, pack_bytes(b"old-client\n"))
             recv_draw_until(conn, b"AGENT:old-client")
