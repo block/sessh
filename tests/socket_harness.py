@@ -483,6 +483,7 @@ def parse_draw(payload):
         "scrollback_cursor_bytes": message.scrollback_cursor,
         "viewport_offset": message.viewport_offset if message.HasField("viewport_offset") else 0,
         "draw_bytes": message.draw_bytes,
+        "relay_end_restore_bytes": message.relay_end_restore_bytes if message.HasField("relay_end_restore_bytes") else None,
     }
 
 
@@ -1562,9 +1563,63 @@ def run_active_screen_protocol_test(base_env):
                 assert_session_attached(payload)
 
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
-                draw, _ = recv_draw_until(conn, b"ALT_SCREEN")
-                if b"\x1b[?1049h" in draw["draw_bytes"] or b"\x1b[?1049l" in draw["draw_bytes"]:
-                    raise AssertionError(f"DRAW should not enter outer alternate screen: {draw!r}")
+                draw, draws = recv_draw_until(conn, b"ALT_SCREEN")
+                output = b"".join(item["draw_bytes"] for item in draws)
+                if b"\x1b[?1049h" not in output:
+                    raise AssertionError(f"DRAW should enter outer alternate screen: {draws!r}")
+                if b"\x1b[?1049l" in output:
+                    raise AssertionError(f"DRAW should not leave outer alternate screen immediately: {draws!r}")
+                restore = draw["relay_end_restore_bytes"]
+                if restore is None or b"\x1b[?1049l" not in restore:
+                    raise AssertionError(f"DRAW should include alternate-screen cleanup: {draw!r}")
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
+def run_active_screen_barrier_protocol_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-active-screen-barrier-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        env["SHELL"] = "/bin/sh"
+        shell = Path(tmp) / "active-screen-barrier-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "printf 'BARRIER_READY$ '\n"
+            "while IFS= read -r line; do\n"
+            "  printf 'PRIMARY_BEFORE\\033[?1049hALT_BEFORE\\033[?1049lPRIMARY_AFTER'\n"
+            "  sleep 1\n"
+            "done\n"
+        )
+        shell.chmod(0o700)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn)
+                create_and_attach_session(conn, shell)
+
+                message_type, payload = recv_frame(conn)
+                if message_type != SESSION_ATTACHED:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                assert_session_attached(payload)
+
+                recv_draw_until(conn, b"BARRIER_READY$ ")
+                send_frame(conn, INPUT, pack_bytes(b"go\n"))
+                _, draws = recv_draw_until(conn, b"PRIMARY_AFTER")
+                output = b"".join(item["draw_bytes"] for item in draws)
+                enter = output.index(b"\x1b[?1049h")
+                leave = output.index(b"\x1b[?1049l")
+                primary_before = output.index(b"PRIMARY_BEFORE")
+                alt_before = output.index(b"ALT_BEFORE")
+                primary_after = output.rindex(b"PRIMARY_AFTER")
+                if not (primary_before < enter < alt_before < leave < primary_after):
+                    raise AssertionError(f"alternate-screen barriers were not ordered: {output!r}")
             finally:
                 conn.close()
         finally:
@@ -3616,6 +3671,7 @@ def main():
             run_plain_screen_protocol_test(env)
             run_split_escape_tail_is_not_passthrough_test(env)
             run_active_screen_protocol_test(env)
+            run_active_screen_barrier_protocol_test(env)
             run_terminal_modes_protocol_test(env)
             run_cursor_shape_protocol_test(env)
             run_state_only_client_render_test(env)

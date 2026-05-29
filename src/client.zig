@@ -487,6 +487,10 @@ pub const RuntimeSession = struct {
         self.input_ack_tracker.discardPending();
     }
 
+    pub fn restoreRelayEndPresentation(self: *RuntimeSession) void {
+        restoreRelayEndPresentationBytes(&self.relay_end_restore);
+    }
+
     pub fn deinit(self: *RuntimeSession) void {
         self.relay_end_restore.deinit(app_allocator.allocator());
         self.relay_end_restore = .empty;
@@ -1776,6 +1780,46 @@ test "relay treats input write failure as transport closed" {
     );
 }
 
+test "relay keeps relay-end restore bytes while reconnecting" {
+    var relay_end_restore = std.ArrayList(u8).empty;
+    defer relay_end_restore.deinit(app_allocator.allocator());
+    try relay_end_restore.appendSlice(app_allocator.allocator(), "restore-primary");
+
+    try std.testing.expectEqual(RelayEnd.transport_closed, finishRelay(.transport_closed, &relay_end_restore));
+    try std.testing.expectEqualStrings("restore-primary", relay_end_restore.items);
+
+    try std.testing.expectEqual(RelayEnd.unresponsive, finishRelay(.unresponsive, &relay_end_restore));
+    try std.testing.expectEqualStrings("restore-primary", relay_end_restore.items);
+
+    try std.testing.expectEqual(RelayEnd.reconnect, finishRelay(.reconnect, &relay_end_restore));
+    try std.testing.expectEqualStrings("restore-primary", relay_end_restore.items);
+}
+
+test "final relay-end restore writes and clears saved cleanup bytes" {
+    const output = try posix.pipe();
+    defer posix.close(output[0]);
+    defer posix.close(output[1]);
+
+    var relay_end_restore = std.ArrayList(u8).empty;
+    defer relay_end_restore.deinit(app_allocator.allocator());
+    try relay_end_restore.appendSlice(app_allocator.allocator(), "restore-primary");
+
+    restoreRelayEndPresentationBytesToFd(output[1], &relay_end_restore);
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = output[0],
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 1000));
+
+    var buf: [64]u8 = undefined;
+    const n = c.read(output[0], &buf, buf.len);
+    if (n < 0) return error.ReadFailed;
+    try std.testing.expectEqualStrings("restore-primary", buf[0..@intCast(n)]);
+    try std.testing.expectEqual(@as(usize, 0), relay_end_restore.items.len);
+}
+
 test "cancelled reconnect frame read returns without input" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
@@ -2252,12 +2296,14 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
 
         switch (end) {
             .detach => {
+                session.restoreRelayEndPresentation();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 writeDetachBannerForTarget(&.{}, ".", options.banner_args.slice(), session.idSlice());
                 return;
             },
             .session_ended => {
+                session.restoreRelayEndPresentation();
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
                 try tty_transcript.finishActiveOrReport();
@@ -2273,6 +2319,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
                 if (!anySessionExistsViaBroker(allocator, args[0], runtime_broker_args)) {
+                    session.restoreRelayEndPresentation();
                     try io_helpers.writeAll(2, "\r\nsessh: session agent crashed\r\n");
                     return process_exit.request(1);
                 }
@@ -2281,6 +2328,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
 
         try io_helpers.writeAll(2, "\r\nsessh: disconnected: Reconnecting... Ctrl-C detach\r\n");
         child = startLocalBroker(allocator, args[0], runtime_broker_args) catch |err| {
+            session.restoreRelayEndPresentation();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -2288,6 +2336,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             if (process_exit.is(err)) return err;
             terminateChild(&child);
             if (local_alias_created) session_registry.removeAlias(allocator, session.idSlice()) catch {};
+            session.restoreRelayEndPresentation();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -4403,13 +4452,22 @@ fn handleRelayRuntimeFrame(
     }
 }
 
-fn finishRelay(end: RelayEnd, relay_end_restore: ?*const std.ArrayList(u8)) RelayEnd {
+fn finishRelay(end: RelayEnd, relay_end_restore: ?*std.ArrayList(u8)) RelayEnd {
     if (end == .detach or end == .session_ended) {
-        if (relay_end_restore) |restore| {
-            if (restore.items.len > 0) io_helpers.writeAll(1, restore.items) catch {};
-        }
+        restoreRelayEndPresentationBytes(relay_end_restore);
     }
     return end;
+}
+
+fn restoreRelayEndPresentationBytes(relay_end_restore: ?*std.ArrayList(u8)) void {
+    restoreRelayEndPresentationBytesToFd(1, relay_end_restore);
+}
+
+fn restoreRelayEndPresentationBytesToFd(fd: c.fd_t, relay_end_restore: ?*std.ArrayList(u8)) void {
+    const restore = relay_end_restore orelse return;
+    if (restore.items.len == 0) return;
+    io_helpers.writeAll(fd, restore.items) catch {};
+    restore.clearRetainingCapacity();
 }
 
 fn requestSessionDetach(read_fd: c.fd_t, write_fd: c.fd_t) RelayEnd {

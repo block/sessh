@@ -209,6 +209,7 @@ def main():
     detach_session = f"{session}-detach"
     reconnect_detach_session = f"{session}-reconnect-detach"
     alt_detach_session = f"{session}-alt-detach"
+    alt_reconnect_detach_session = f"{session}-alt-reconnect-detach"
     bottom_session = f"{session}-bottom"
     bottom_failure_session = f"{session}-bottom-failure"
     with tempfile.TemporaryDirectory(prefix="sessh-ssh-reconnect-tmux-", dir="/tmp") as tmp_text:
@@ -475,8 +476,37 @@ def main():
                 raise AssertionError(f"detach left alternate-screen contents visible:\n{alt_after}")
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "printf 'OUTER_ALT_DETACHED\\n'", "Enter"])
             wait_capture(env, alt_detach_session, "OUTER_ALT_DETACHED")
+
+            new_tmux_session(env, alt_reconnect_detach_session, 140, 24)
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", alt_reconnect_detach_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, alt_reconnect_detach_session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, sessh_cmd, "Enter"])
+            wait_capture(env, alt_reconnect_detach_session, "REMOTE_PROMPT$")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, "enter-alt", "Enter"])
+            wait_capture(env, alt_reconnect_detach_session, "ALT_SCREEN_READY")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, "C-a", "s"])
+            wait_capture(env, alt_reconnect_detach_session, "sessh: disconnected: Retry connecting 10sec")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, "C-c"])
+            alt_reconnect_detached = wait_capture(env, alt_reconnect_detach_session, "sessh: detached", timeout=5.0)
+            if "Re-attach: `sesshmux attach" not in alt_reconnect_detached or "Kill: `sesshmux kill" not in alt_reconnect_detached:
+                raise AssertionError(f"alternate reconnect detach did not print attach/kill commands:\n{alt_reconnect_detached}")
+            alt_reconnect_after = capture_visible(env, alt_reconnect_detach_session)
+            if "ALT_SCREEN_READY" in alt_reconnect_after:
+                raise AssertionError(f"reconnect detach left alternate-screen contents visible:\n{alt_reconnect_after}")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, "printf 'OUTER_ALT_RECONNECT_DETACHED\\n'", "Enter"])
+            wait_capture(env, alt_reconnect_detach_session, "OUTER_ALT_RECONNECT_DETACHED")
         finally:
-            for tmux_session in (session, detach_session, reconnect_detach_session, f"{detach_session}-idle", alt_detach_session, bottom_session, bottom_failure_session):
+            for tmux_session in (
+                session,
+                detach_session,
+                reconnect_detach_session,
+                f"{detach_session}-idle",
+                alt_detach_session,
+                alt_reconnect_detach_session,
+                bottom_session,
+                bottom_failure_session,
+            ):
                 subprocess.run(
                     [*TMUX_ARGS, "kill-session", "-t", tmux_session],
                     cwd=ROOT,

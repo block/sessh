@@ -27,6 +27,21 @@ pub const DisplayClear = struct {
     protected: bool,
 };
 
+// A render barrier is an ordered terminal transition that the session agent
+// must see before libghostty-vt mutates the model. The current use is
+// alternate-screen enter/exit: output before the transition belongs to one
+// screen buffer, and output after it belongs to another.
+pub const RenderBarrier = enum {
+    enter_alternate_screen,
+    leave_alternate_screen,
+};
+
+pub const RenderBarrierCallback = *const fn (
+    context: *anyopaque,
+    terminal: *SessionTerminal,
+    barrier: RenderBarrier,
+) anyerror!void;
+
 pub const PlainSnapshot = struct {
     rows: u16,
     cols: u16,
@@ -173,6 +188,9 @@ pub const SessionTerminal = struct {
     title_dirty: bool = false,
     retained_scrollback_clear_dirty: bool = false,
     display_clear: ?DisplayClear = null,
+    render_barrier_context: ?*anyopaque = null,
+    render_barrier_callback: ?RenderBarrierCallback = null,
+    render_barrier_seen: bool = false,
 
     pub fn create(allocator: std.mem.Allocator, rows: u16, cols: u16, scrollback_rows: u32) !*SessionTerminal {
         return createWithDefaultColors(allocator, rows, cols, scrollback_rows, .{});
@@ -226,6 +244,9 @@ pub const SessionTerminal = struct {
         self.title_dirty = false;
         self.retained_scrollback_clear_dirty = false;
         self.display_clear = null;
+        self.render_barrier_context = null;
+        self.render_barrier_callback = null;
+        self.render_barrier_seen = false;
         return self;
     }
 
@@ -243,6 +264,48 @@ pub const SessionTerminal = struct {
 
     pub fn feed(self: *SessionTerminal, bytes: []const u8) !void {
         try self.stream.nextSlice(bytes);
+    }
+
+    pub fn feedWithRenderBarriers(
+        self: *SessionTerminal,
+        bytes: []const u8,
+        context: *anyopaque,
+        callback: RenderBarrierCallback,
+    ) !bool {
+        std.debug.assert(self.render_barrier_context == null);
+        std.debug.assert(self.render_barrier_callback == null);
+
+        self.render_barrier_context = context;
+        self.render_barrier_callback = callback;
+        self.render_barrier_seen = false;
+        defer {
+            self.render_barrier_context = null;
+            self.render_barrier_callback = null;
+        }
+
+        try self.stream.nextSlice(bytes);
+        return self.render_barrier_seen;
+    }
+
+    fn emitRenderBarrier(self: *SessionTerminal, barrier: RenderBarrier) !void {
+        self.render_barrier_seen = true;
+        const callback = self.render_barrier_callback orelse return;
+        const context = self.render_barrier_context orelse return;
+        try callback(context, self, barrier);
+    }
+
+    fn renderBarrierForMode(self: *const SessionTerminal, mode: ghostty_vt.Mode, enabled: bool) ?RenderBarrier {
+        switch (mode) {
+            .alt_screen_legacy,
+            .alt_screen,
+            .alt_screen_save_cursor_clear_enter,
+            => {},
+            else => return null,
+        }
+
+        const target_active_screen: u8 = if (enabled) 1 else 0;
+        if (self.activeScreenId() == target_active_screen) return null;
+        return if (enabled) .enter_alternate_screen else .leave_alternate_screen;
     }
 
     pub fn isPlainTextParserBoundary(self: *const SessionTerminal) bool {
@@ -1048,6 +1111,15 @@ const ModelTrackingHandler = struct {
         value: ghostty_vt.StreamAction.Value(action),
     ) !void {
         switch (action) {
+            .set_mode => if (self.session.renderBarrierForMode(value.mode, true)) |barrier| {
+                try self.session.emitRenderBarrier(barrier);
+            },
+            .reset_mode => if (self.session.renderBarrierForMode(value.mode, false)) |barrier| {
+                try self.session.emitRenderBarrier(barrier);
+            },
+            else => {},
+        }
+        switch (action) {
             .window_title => try self.session.setTitleFromTerminal(value.title),
             .color_operation => try self.session.colorOperation(value),
             .erase_display_below => try self.session.noteDisplayClear(.below, value),
@@ -1452,6 +1524,47 @@ test "session terminal parses VT streams" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot.text, "alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.text, "beta") != null);
     try std.testing.expectEqual(@as(u16, 1), snapshot.cursor_row);
+}
+
+const TestRenderBarrierContext = struct {
+    count: usize = 0,
+    barrier: ?RenderBarrier = null,
+    active_screen_before_barrier: ?u8 = null,
+    saw_primary_before_barrier: bool = false,
+};
+
+fn testRenderBarrierCallback(context: *anyopaque, terminal: *SessionTerminal, barrier: RenderBarrier) anyerror!void {
+    const barrier_context: *TestRenderBarrierContext = @ptrCast(@alignCast(context));
+    const snapshot = try terminal.plainSnapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot.text);
+
+    barrier_context.count += 1;
+    barrier_context.barrier = barrier;
+    barrier_context.active_screen_before_barrier = terminal.activeScreenId();
+    barrier_context.saw_primary_before_barrier = std.mem.indexOf(u8, snapshot.text, "primary") != null;
+}
+
+test "render barrier fires before alternate screen mode mutates the model" {
+    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    defer terminal.destroy();
+
+    var context = TestRenderBarrierContext{};
+    const saw_barrier = try terminal.feedWithRenderBarriers(
+        "primary\x1b[?1049halt",
+        &context,
+        testRenderBarrierCallback,
+    );
+
+    try std.testing.expect(saw_barrier);
+    try std.testing.expectEqual(@as(usize, 1), context.count);
+    try std.testing.expectEqual(RenderBarrier.enter_alternate_screen, context.barrier.?);
+    try std.testing.expectEqual(@as(u8, 0), context.active_screen_before_barrier.?);
+    try std.testing.expect(context.saw_primary_before_barrier);
+    try std.testing.expectEqual(@as(u8, 1), terminal.activeScreenId());
+
+    const snapshot = try terminal.plainSnapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot.text);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.text, "alt") != null);
 }
 
 test "plain text parser boundary is false inside split CSI" {

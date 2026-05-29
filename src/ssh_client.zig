@@ -1385,7 +1385,8 @@ fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) v
     io.stderrPrint("sessh: ssh runtime ended after attach {s} failure: {t}\n", .{ stage, term }) catch {};
 }
 
-fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, session: *const client.RuntimeSession) !void {
+fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, session: *client.RuntimeSession) !void {
+    session.restoreRelayEndPresentation();
     client.removeClientRouteHintForRemoteSession(allocator, session);
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
@@ -1395,8 +1396,9 @@ fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: Parse
 fn finishEndedRemoteSession(
     allocator: std.mem.Allocator,
     child: *RuntimeConnection,
-    session: *const client.RuntimeSession,
+    session: *client.RuntimeSession,
 ) !void {
+    session.restoreRelayEndPresentation();
     client.removeClientRouteHintForRemoteSession(allocator, session);
     client.tombstoneLocalRouteForRemoteSession(allocator, session) catch |err| {
         client_log.debug("event=local_tombstone_failed session={s} error={t}", .{ session.idSlice(), err });

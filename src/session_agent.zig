@@ -164,6 +164,7 @@ const SessionEnvironment = struct {
 const PresentationState = struct {
     initialized: bool = false,
     active_screen: u8 = 0,
+    saved_primary: ?ScreenBufferState = null,
     rendered_rows: u16 = 0,
     cursor_row: u16 = 0,
     cursor_col: u16 = 0,
@@ -186,8 +187,14 @@ const PresentationState = struct {
     // cached cursor, mode, and color state is no longer trustworthy. The old
     // height is kept only so the next draw can clear stale rows.
     fn resetForScreenRepaint(self: *PresentationState) void {
+        const active_screen = self.active_screen;
+        const saved_primary = self.saved_primary;
         const rendered_rows = self.rendered_rows;
-        self.* = .{ .rendered_rows = rendered_rows };
+        self.* = .{
+            .active_screen = active_screen,
+            .saved_primary = saved_primary,
+            .rendered_rows = rendered_rows,
+        };
     }
 
     // Paint one terminal screen snapshot onto this client. This chooses between
@@ -200,12 +207,15 @@ const PresentationState = struct {
         force_redraw: bool,
         align_viewport: bool,
     ) !void {
-        try self.setActiveScreen(screen.active_screen);
+        try self.switchActiveScreen(renderer, screen.active_screen);
 
         const desired_modes = vtModesToClient(screen.modes);
         const mouse_requested = desired_modes.mouse_tracking != .disabled;
+        if (screen.active_screen == 1 and mouse_requested) {
+            self.full_height_rendering = true;
+        }
 
-        if (align_viewport) {
+        if (align_viewport and screen.active_screen == 0) {
             try self.alignViewportTop(renderer, session_rows);
             if (mouse_requested) self.full_height_rendering = true;
         }
@@ -274,7 +284,7 @@ const PresentationState = struct {
         session_rows: u16,
         screen: *const vt.RenderedScreen,
     ) !void {
-        try self.setActiveScreen(screen.active_screen);
+        try self.switchActiveScreen(renderer, screen.active_screen);
         try self.render(
             renderer,
             screen.rows,
@@ -311,6 +321,7 @@ const PresentationState = struct {
     // The inner terminal cleared its display. Clear the outer visible area too,
     // then forget our old row/cursor position.
     fn clearOuterVisibleForScreen(self: *PresentationState, renderer: client_renderer.Renderer, screen: *const vt.RenderedScreen) !void {
+        try self.switchActiveScreen(renderer, screen.active_screen);
         try renderer.clearVisible();
         self.initialized = false;
         self.rendered_rows = 0;
@@ -434,11 +445,53 @@ const PresentationState = struct {
         try moveToSnapshotCursor(renderer, redraw_rows, cursor_row, cursor_col);
     }
 
-    fn setActiveScreen(self: *PresentationState, active_screen: u8) !void {
+    // Switch the real terminal buffer to match the inner terminal. We save the
+    // primary-buffer cursor/grid state before entering the outer alternate
+    // screen, because the terminal restores that primary cursor when we leave.
+    fn switchActiveScreen(self: *PresentationState, renderer: client_renderer.Renderer, active_screen: u8) !void {
         if (active_screen > 1) return error.InvalidActiveScreen;
         if (self.active_screen == active_screen) return;
 
+        if (active_screen == 1) {
+            self.saved_primary = self.captureScreenBufferState();
+            try renderer.enterAlternateScreen();
+            try renderer.clearVisible();
+            self.restoreScreenBufferState(.{ .full_height_rendering = true });
+        } else {
+            try renderer.leaveAlternateScreen();
+            if (self.saved_primary) |primary| {
+                self.restoreScreenBufferState(primary);
+                self.saved_primary = null;
+            } else {
+                self.restoreScreenBufferState(.{});
+            }
+        }
+
         self.active_screen = active_screen;
+    }
+
+    fn captureScreenBufferState(self: *const PresentationState) ScreenBufferState {
+        return .{
+            .initialized = self.initialized,
+            .rendered_rows = self.rendered_rows,
+            .cursor_row = self.cursor_row,
+            .cursor_col = self.cursor_col,
+            .cursor_visible = self.cursor_visible,
+            .cursor_style = self.cursor_style,
+            .full_height_rendering = self.full_height_rendering,
+            .viewport_offset = self.viewport_offset,
+        };
+    }
+
+    fn restoreScreenBufferState(self: *PresentationState, state: ScreenBufferState) void {
+        self.initialized = state.initialized;
+        self.rendered_rows = state.rendered_rows;
+        self.cursor_row = state.cursor_row;
+        self.cursor_col = state.cursor_col;
+        self.cursor_visible = state.cursor_visible;
+        self.cursor_style = state.cursor_style;
+        self.full_height_rendering = state.full_height_rendering;
+        self.viewport_offset = state.viewport_offset;
     }
 
     // Terminal modes are global settings on the outer terminal. Emit the full
@@ -507,7 +560,8 @@ const PresentationState = struct {
 
     // Update our cache after raw output was passed through successfully.
     fn assumePlainPassthroughScreen(self: *PresentationState, session_rows: u16, screen: *const vt.RenderedScreen) !void {
-        try self.setActiveScreen(screen.active_screen);
+        if (screen.active_screen > 1) return error.InvalidActiveScreen;
+        if (self.active_screen != screen.active_screen) return error.ActiveScreenSwitchRequiresDraw;
         self.initialized = true;
         const row_count: u16 = @intCast(screen.rows.len);
         const cursor_row_count = screen.cursor_row +| 1;
@@ -524,6 +578,14 @@ const PresentationState = struct {
             self.full_height_rendering = false;
         }
         self.updateViewportOffset(session_rows);
+    }
+
+    // Retained scrollback belongs to the primary buffer. If the outer terminal
+    // is currently showing the alternate buffer, switch back before appending
+    // scrollback rows; the following screen draw can switch to alternate again
+    // if the inner terminal is still there.
+    fn preparePrimaryForScrollback(self: *PresentationState, renderer: client_renderer.Renderer) !void {
+        try self.switchActiveScreen(renderer, 0);
     }
 
     fn setViewportOffset(self: *PresentationState, viewport_offset: ?i32) void {
@@ -597,6 +659,17 @@ const PresentationState = struct {
 const TerminalOrigin = struct {
     row: u16,
     col: u16,
+};
+
+const ScreenBufferState = struct {
+    initialized: bool = false,
+    rendered_rows: u16 = 0,
+    cursor_row: u16 = 0,
+    cursor_col: u16 = 0,
+    cursor_visible: bool = true,
+    cursor_style: client_renderer.CursorStyle = .default,
+    full_height_rendering: bool = false,
+    viewport_offset: i32 = 0,
 };
 
 const AttachRequest = struct {
@@ -807,10 +880,23 @@ test "full-height redraw pads blank rows without indexing past VT rows" {
     try std.testing.expectEqual(@as(u16, 3), presentation.rendered_rows);
 }
 
-test "active-screen change redraw starts at previous rendered top" {
+test "active-screen change uses outer alternate screen" {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+
+    var first_primary = try testRenderedScreen(
+        std.testing.allocator,
+        0,
+        2,
+        &.{ "PRIMARY0", "PRIMARY1", "PRIMARY2" },
+    );
+    defer first_primary.deinit(std.testing.allocator);
+
+    var presentation = PresentationState{};
+    try presentation.applyScreen(renderer, 4, &first_primary, true, false);
+
+    bytes.clearRetainingCapacity();
 
     var alt_screen = try testRenderedScreen(
         std.testing.allocator,
@@ -820,8 +906,8 @@ test "active-screen change redraw starts at previous rendered top" {
     );
     defer alt_screen.deinit(std.testing.allocator);
 
-    var presentation = PresentationState{};
     try presentation.applyScreen(renderer, 4, &alt_screen, true, false);
+    try std.testing.expect(std.mem.indexOf(u8, bytes.items, "\x1b[?1049h") != null);
     try std.testing.expectEqual(@as(u16, 3), presentation.cursor_row);
 
     bytes.clearRetainingCapacity();
@@ -835,11 +921,11 @@ test "active-screen change redraw starts at previous rendered top" {
     defer primary_screen.deinit(std.testing.allocator);
 
     try presentation.applyScreen(renderer, 4, &primary_screen, true, false);
-    try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[3A\r"));
+    try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[?1049l\x1b[2A\r"));
     try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
 }
 
-test "relay-end restore moves to rendered top only once" {
+test "relay-end restore leaves outer alternate screen" {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
@@ -866,8 +952,7 @@ test "relay-end restore moves to rendered top only once" {
     defer primary_screen.deinit(std.testing.allocator);
 
     try presentation.applyRelayEndRestoreScreen(renderer, 4, &primary_screen);
-    try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[3A\r"));
-    try std.testing.expect(!std.mem.startsWith(u8, bytes.items, "\x1b[3A\r\x1b[3A\r"));
+    try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[?1049l"));
     try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
 }
 
@@ -2194,6 +2279,45 @@ fn appendRelayEndRestoreBytes(
     return null;
 }
 
+fn renderBarrierTargetActiveScreen(barrier: vt.RenderBarrier) u8 {
+    return switch (barrier) {
+        .enter_alternate_screen => 1,
+        .leave_alternate_screen => 0,
+    };
+}
+
+fn renderBarrierRelayEndRestoreBytes(barrier: vt.RenderBarrier) []const u8 {
+    return switch (barrier) {
+        // The primary screen was flushed immediately before this barrier, so
+        // leaving the outer alternate screen is enough to get relay cleanup
+        // back to the user's normal terminal buffer.
+        .enter_alternate_screen => "\x1b[?1049l",
+        .leave_alternate_screen => "",
+    };
+}
+
+fn queueRenderBarrierDraw(
+    attachment: *Attachment,
+    session: *const Session,
+    barrier: vt.RenderBarrier,
+    scrollback_cursor: u64,
+) !void {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(app_allocator.allocator());
+    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+    try attachment.presentation.switchActiveScreen(renderer, renderBarrierTargetActiveScreen(barrier));
+    if (bytes.items.len == 0) return;
+    try appendDrawCleanup(&bytes);
+    try wrapDrawInSynchronizedUpdate(&bytes);
+    try queueDrawFrame(
+        attachment,
+        session,
+        scrollback_cursor,
+        bytes.items,
+        renderBarrierRelayEndRestoreBytes(barrier),
+    );
+}
+
 fn queueScrollbackRowsDraw(
     attachment: *Attachment,
     session: *const Session,
@@ -2205,6 +2329,7 @@ fn queueScrollbackRowsDraw(
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+    try attachment.presentation.preparePrimaryForScrollback(renderer);
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
     try wrapDrawInSynchronizedUpdate(&bytes);
     try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null);
@@ -2245,6 +2370,7 @@ fn queueScrollbackRowsAndScreenDraw(
     if (shouldClearOuterVisibleForDisplayClear(screen)) {
         effective_align_viewport = false;
     }
+    try attachment.presentation.preparePrimaryForScrollback(renderer);
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
     if (shouldClearOuterVisibleForDisplayClear(screen)) {
         // Full-screen clears must happen after copying the old rows. Clearing
@@ -2272,6 +2398,7 @@ fn queueScrollbackTruncatedDraw(
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+    try attachment.presentation.preparePrimaryForScrollback(renderer);
     try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
     try wrapDrawInSynchronizedUpdate(&bytes);
     try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null);
@@ -2304,6 +2431,7 @@ fn screenWantsMouseReporting(screen: *const vt.RenderedScreen) bool {
 }
 
 fn shouldAlignViewportForDraw(attachment: *const Attachment, screen: *const vt.RenderedScreen, requested: bool) bool {
+    if (screen.active_screen == 1) return false;
     return requested or
         attachment.presentation.viewportOffsetUnknown() or
         (screenWantsMouseReporting(screen) and !attachment.presentation.full_height_rendering);
@@ -2372,8 +2500,8 @@ fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session) 
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+    try attachment.presentation.preparePrimaryForScrollback(renderer);
     try renderer.clearScrollback();
-    try wrapDrawInSynchronizedUpdate(&bytes);
     try queueDrawFrame(attachment, session, 0, bytes.items, null);
 }
 
@@ -2418,11 +2546,13 @@ fn queueRepaintResponseDraw(
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     if (clear_for_replace) {
+        try attachment.presentation.preparePrimaryForScrollback(renderer);
         try renderer.clearForReplace();
         attachment.presentation.reset();
     } else if (clear_visible_for_replace) {
         // initial-scrollback=N replaces the visible screen, not scrollback.
         // Clear stale viewport cells without sending 3J.
+        try attachment.presentation.preparePrimaryForScrollback(renderer);
         try renderer.clearVisible();
         attachment.presentation.reset();
     }
@@ -2430,6 +2560,9 @@ fn queueRepaintResponseDraw(
     if (!clear_for_replace and shouldClearOuterVisibleForDisplayClear(screen)) {
         try attachment.presentation.clearOuterVisibleForScreen(renderer, screen);
         effective_align_viewport = false;
+    }
+    if (truncated_rows > 0 or rows.len > 0) {
+        try attachment.presentation.preparePrimaryForScrollback(renderer);
     }
     if (truncated_rows > 0) try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
@@ -3069,13 +3202,58 @@ fn drainSessionOutputBeforeEnd(session_agent: *SessionAgent, session_index: usiz
     }
 }
 
+const RenderBarrierContext = struct {
+    session_agent: *SessionAgent,
+    session_index: usize,
+};
+
+fn handleSessionRenderBarrier(context: *anyopaque, model: *vt.SessionTerminal, barrier: vt.RenderBarrier) anyerror!void {
+    _ = model;
+    const barrier_context: *RenderBarrierContext = @ptrCast(@alignCast(context));
+    try flushSessionRenderBarrier(barrier_context.session_agent, barrier_context.session_index, barrier);
+}
+
+fn flushSessionRenderBarrier(session_agent: *SessionAgent, session_index: usize, barrier: vt.RenderBarrier) !void {
+    const session = &session_agent.sessions[session_index];
+    if (!session.alive) return;
+    const model = session.terminal_model orelse return;
+
+    // A render barrier means the current VT state must be queued before the
+    // following terminal transition is applied. Raw passthrough cannot cross
+    // this boundary because the bytes before the barrier are already inside
+    // the VT model and may not match the bytes currently buffered here.
+    session.clearPendingPlainOutput();
+    broadcastSessionPatch(session_agent, session_index);
+    session.clearPendingPlainOutput();
+
+    if (!session.alive) return;
+    const scrollback_cursor = try model.scrollbackCursor();
+    for (&session_agent.attachments, 0..) |*attachment, i| {
+        if (!attachment.active or attachment.session_index != session_index) continue;
+        if (attachment.close_after_flush) continue;
+        queueRenderBarrierDraw(attachment, session, barrier, scrollback_cursor) catch {
+            detachAttachment(session_agent, i);
+            continue;
+        };
+        flushAttachmentOutput(session_agent, i);
+    }
+}
+
 fn feedSessionOutputBytes(session_agent: *SessionAgent, session_index: usize, bytes: []const u8) !void {
     const session = &session_agent.sessions[session_index];
     queueTtyTranscriptChunkForSession(session_agent, session_index, .TTY_TRANSCRIPT_STREAM_INNER_OUT, bytes);
     if (session.terminal_model) |model| {
         const starts_at_boundary = model.isPlainTextParserBoundary();
-        try model.feed(bytes);
-        if (hasActiveAttachment(session_agent, session_index)) {
+        var barrier_context = RenderBarrierContext{
+            .session_agent = session_agent,
+            .session_index = session_index,
+        };
+        const saw_render_barrier = try model.feedWithRenderBarriers(
+            bytes,
+            &barrier_context,
+            handleSessionRenderBarrier,
+        );
+        if (!saw_render_barrier and hasActiveAttachment(session_agent, session_index)) {
             try session.appendPendingPlainOutput(bytes, starts_at_boundary);
         }
     }
@@ -3221,19 +3399,40 @@ fn translateAttachmentInput(
             continue;
         }
 
-        if (attachmentSgrMouseActive(attachment)) {
+        if (attachment.presentation.terminal_modes_initialized) {
             switch (parseSgrMouseReport(input.items, index)) {
                 .complete => |report| {
-                    try appendTranslatedSgrMouseReport(attachment, session, report, out);
+                    if (attachmentSgrMouseActive(attachment)) {
+                        try appendTranslatedSgrMouseReport(attachment, session, report, out);
+                    }
                     index = report.end;
                     continue;
                 },
                 .incomplete => {
-                    try savePendingAttachmentInput(attachment, input.items[index..], out);
-                    return;
+                    if (attachmentSgrMouseActive(attachment)) {
+                        try savePendingAttachmentInput(attachment, input.items[index..], out);
+                        return;
+                    }
                 },
                 .not_mouse => {},
             }
+        }
+
+        switch (parseFocusReport(input.items, index)) {
+            .complete => |report| {
+                if (attachmentFocusReportingActive(attachment)) {
+                    try out.appendSlice(app_allocator.allocator(), input.items[index..report.end]);
+                }
+                index = report.end;
+                continue;
+            },
+            .incomplete => {
+                if (attachmentFocusReportingActive(attachment)) {
+                    try savePendingAttachmentInput(attachment, input.items[index..], out);
+                    return;
+                }
+            },
+            .not_focus => {},
         }
 
         if (attachmentKittyKeyboardActive(attachment)) {
@@ -3266,7 +3465,7 @@ fn savePendingAttachmentInput(attachment: *Attachment, pending: []const u8, out:
 }
 
 fn attachmentLocalInputParserActive(attachment: *const Attachment) bool {
-    return attachmentSgrMouseActive(attachment) or attachmentKittyKeyboardActive(attachment);
+    return attachment.presentation.terminal_modes_initialized;
 }
 
 fn attachmentSgrMouseActive(attachment: *const Attachment) bool {
@@ -3278,6 +3477,35 @@ fn attachmentSgrMouseActive(attachment: *const Attachment) bool {
 fn attachmentKittyKeyboardActive(attachment: *const Attachment) bool {
     return attachment.presentation.terminal_modes_initialized and
         attachment.presentation.terminal_modes.kitty_keyboard_flags != 0;
+}
+
+fn attachmentFocusReportingActive(attachment: *const Attachment) bool {
+    return attachment.presentation.terminal_modes_initialized and
+        (attachment.presentation.terminal_modes.mode_flags & client_renderer.TerminalModes.focus_reporting) != 0;
+}
+
+const FocusReport = struct {
+    end: usize,
+};
+
+const FocusReportParse = union(enum) {
+    not_focus,
+    incomplete,
+    complete: FocusReport,
+};
+
+fn parseFocusReport(input: []const u8, start: usize) FocusReportParse {
+    const prefix = "\x1b[";
+    if (input.len - start < prefix.len) {
+        const available = input[start..];
+        if (available.len >= 1 and std.mem.eql(u8, available, prefix[0..available.len])) return .incomplete;
+        return .not_focus;
+    }
+    if (!std.mem.eql(u8, input[start .. start + prefix.len], prefix)) return .not_focus;
+    if (input.len - start == prefix.len) return .incomplete;
+    const final = input[start + prefix.len];
+    if (final != 'I' and final != 'O') return .not_focus;
+    return .{ .complete = .{ .end = start + prefix.len + 1 } };
 }
 
 fn parseXtermModifiedKey(input: []const u8, start: usize) XtermModifiedKeyParse {
@@ -3487,6 +3715,41 @@ test "SGR mouse input is translated from outer to inner coordinates" {
     out.clearRetainingCapacity();
     try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;3M", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "SGR mouse input is dropped when mouse reporting is inactive" {
+    var attachment = Attachment{
+        .origin = .{ .row = 4, .col = 0 },
+        .presentation = .{
+            .terminal_modes = .{},
+            .terminal_modes_initialized = true,
+        },
+    };
+    const session = Session{ .rows = 24, .cols = 80 };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(app_allocator.allocator());
+
+    try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;5M", &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "focus reports are forwarded only while focus reporting is active" {
+    var attachment = Attachment{
+        .presentation = .{
+            .terminal_modes = .{},
+            .terminal_modes_initialized = true,
+        },
+    };
+    const session = Session{ .rows = 24, .cols = 80 };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(app_allocator.allocator());
+
+    try translateAttachmentInput(&attachment, &session, "\x1b[I", &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+
+    attachment.presentation.terminal_modes.mode_flags = client_renderer.TerminalModes.focus_reporting;
+    try translateAttachmentInput(&attachment, &session, "\x1b[O", &out);
+    try std.testing.expectEqualStrings("\x1b[O", out.items);
 }
 
 test "xterm modified key input is translated to kitty when kitty keyboard is active" {

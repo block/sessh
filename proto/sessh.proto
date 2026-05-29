@@ -342,10 +342,10 @@ message Draw {
   // Self-contained terminal bytes to write to the outer terminal in protocol
   // order. A Draw must apply and clean up any temporary terminal state it uses.
   bytes draw_bytes = 3;
-  // Terminal bytes the client keeps in memory and writes only when this relay
-  // ends by detach or session-end. Present empty clears a previous restore.
-  // This lets alternate-screen sessions restore the modeled primary screen on
-  // detach without applying that cleanup during reconnect.
+  // Terminal bytes the client keeps in memory until it really leaves the
+  // session view. Transport loss starts reconnect, so the client keeps this
+  // payload active; detach or session-end writes it. Present empty clears a
+  // previous restore.
   optional bytes relay_end_restore_bytes = 4;
 }
 

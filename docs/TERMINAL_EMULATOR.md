@@ -2,9 +2,9 @@ The headless terminal emulator is implemented on top of libghostty-vt.
 
 ## Viewport misalignment
 
-Unlike tmux/screen, we don't use the alternate screen (aka `smcup`/`rmcup`).
-This allows for a seamless experience, but it means that our viewport might be
-offset from the outer terminals viewport.
+While the inner terminal is on its primary screen, we also use the
+outer-terminal primary screen. This allows for a seamless experience, but it
+means that our viewport might be offset from the outer terminal's viewport.
 
 ```
   outer terminal representation   inner terminal representation
@@ -70,23 +70,24 @@ outer terminal screen into scrollback (which aligns our viewports) and repaint.
 
 ## Alternate screen handling
 
-We don't use the outer-terminal's alternate screen, even when the
-inner-terminal enters the alternate screen. Instead we let libghostty-vt tell
-us how to render the current viewport, without concerning ourselves with
-whether or not we're in the alternate screen. The only special handling we do
-is aligning our viewports prior to entering the alternate screen. This is
-necessary because otherwise the synthetic scrollback (the section of inner
-terminal scrollback that is in the outer terminal's viewport) would be lost
-when we render the alternate screen.
+When the inner terminal enters the alternate screen, we enter the
+outer-terminal alternate screen too. That gives full-screen apps the terminal's
+native behavior: primary scrollback is hidden, wheel scrolling does not browse
+the primary history, and alternate-screen contents do not become primary
+scrollback.
 
-Perhaps it would be possible to avoid forced alignment by leveraging the outer
-terminal's alternate screen.
+We still keep our own model of both screens. The session agent saves the
+outer-primary cursor/grid state before switching buffers, draws the modeled
+alternate screen in the outer alternate buffer, and sends the client a cleanup
+payload that leaves the outer alternate screen and restores the modeled primary
+screen on detach or session exit. A reconnecting client keeps that cleanup
+payload in memory but does not apply it while it is still trying to recover the
+session.
 
 ## Mouse reporting
 
 When mouse reporting is requested, we align the viewports and redraw before
 forwarding the request on to the outer terminal. That way the outer terminal
-never reports an event with pre-aligned coordinates. It might be possible to
-support mouse reporting without aligning the viewports by translating the
-coordinates, but most programs that use mouse reporting also use the alternate
-screen so it doesn't seem important.
+never reports an event with pre-aligned coordinates. Alternate-screen apps do
+not need this alignment step because the outer alternate screen starts at the
+same top-left origin as the inner alternate screen.

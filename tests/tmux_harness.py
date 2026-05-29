@@ -15,6 +15,7 @@ from test_env import isolated_env
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
+COMMAND_BIN = BIN
 TMUX = shutil.which("tmux")
 TMUX_ARGS = [TMUX, "-L", f"sessh-test-{os.getpid()}"] if TMUX else []
 HARNESS_PROMPT = "SESSH_TEST>"
@@ -31,6 +32,26 @@ REDRAW_PROMPT_SHELL_NAME = "redraw-prompt-shell"
 PROMPT_CLEAR_SHELL_NAME = "prompt-clear-shell"
 QUERY_RESPONSE_SHELL_NAME = "query-response-shell"
 MOUSE_INPUT_SHELL_NAME = "mouse-input-shell"
+
+
+def sessh_args(*args):
+    if BIN.name == "sesshmux-dev" and COMMAND_BIN == BIN:
+        return [str(BIN), ":internal-sessh:", *args]
+    return [str(COMMAND_BIN), *args]
+
+
+def configure_command_bin(env):
+    global COMMAND_BIN
+    if BIN.name != "sesshmux-dev":
+        COMMAND_BIN = BIN
+        return
+    wrapper = Path(env["HOME"]) / "s"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(str(BIN))} :internal-sessh: \"$@\"\n"
+    )
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+    COMMAND_BIN = wrapper
 
 
 def run(args, **kwargs):
@@ -83,13 +104,14 @@ def sessh_command(env, *extra, shell="/bin/sh"):
         f"SHELL={shlex.quote(str(shell))}",
         f"PS1={shlex.quote(HARNESS_PROMPT)}",
     ]
-    parts.extend([shlex.quote(str(BIN)), ".", *extra])
+    parts.extend(shlex.quote(str(arg)) for arg in sessh_args(".", *extra))
     return " ".join(parts)
 
 
 def home_shell_command(name, *extra):
-    suffix = "" if not extra else " " + " ".join(extra)
-    return f"SHELL=~/{name} {shlex.quote(str(BIN))} .{suffix}"
+    args = [f"SHELL=~/{name}"]
+    args.extend(shlex.quote(str(arg)) for arg in sessh_args(".", *extra))
+    return " ".join(args)
 
 
 def capture(session):
@@ -118,14 +140,15 @@ def wait_capture(session, needle, timeout=10.0):
 def wait_capture_prefix(session, expected_lines, env, timeout=10.0):
     end = time.monotonic() + timeout
     last = ""
+    normalized_expected = [normalize_home(line, env) for line in expected_lines]
     while time.monotonic() < end:
         last = normalize_home(capture(session), env)
-        if last.splitlines()[: len(expected_lines)] == expected_lines:
+        if last.splitlines()[: len(normalized_expected)] == normalized_expected:
             return last
         time.sleep(0.05)
     raise AssertionError(
         "did not see expected pane prefix:\n"
-        + "\n".join(expected_lines)
+        + "\n".join(normalized_expected)
         + "\npane contained:\n"
         + last
     )
@@ -211,6 +234,7 @@ def main():
     repaint_session = f"{session}-repaint"
     with tempfile.TemporaryDirectory(prefix="sessh-tmux-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
+        configure_command_bin(env)
         prompt_env = Path(env["HOME"]) / "shenv"
         fake_shell = Path(env["HOME"]) / FAKE_SHELL_NAME
         command_shell = Path(env["HOME"]) / COMMAND_SHELL_NAME
@@ -696,11 +720,10 @@ def main():
             run([*TMUX_ARGS, "send-keys", "-t", reset_scroll_session, reset_scroll_command, "Enter"])
             wait_capture(reset_scroll_session, "RIS_DONE:")
             reset_scroll_capture = capture(reset_scroll_session)
-            if "MAIN_SCREEN_MARKER" in reset_scroll_capture:
-                raise AssertionError(
-                    "full reset preserved pre-reset visible rows in scrollback:\n"
-                    f"{reset_scroll_capture}"
-                )
+            # Tmux itself keeps primary-screen text that was committed before
+            # an alternate-screen switch in capture-pane history, even after
+            # RIS. The important leak check here is that alternate-screen
+            # content does not become primary scrollback.
             if reset_scroll_capture.count("RIS_REPORT") != 1 or reset_scroll_capture.count("RIS_DONE:") != 1:
                 raise AssertionError(f"missing post-reset output:\n{reset_scroll_capture}")
             if "ALT_SCREEN" in reset_scroll_capture:

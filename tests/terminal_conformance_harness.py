@@ -544,14 +544,19 @@ def quoted_env_assignments(env):
     return [f"{key}={shlex.quote(env[key])}" for key in XDG_ENV_KEYS]
 
 
+def sessh_args(*args):
+    if BIN.name == "sesshmux-dev":
+        return [str(BIN), ":internal-sessh:", *args]
+    return [str(BIN), *args]
+
+
 def sessh_command(env, shell):
     parts = [
         "env",
         *quoted_env_assignments(env),
         f"SHELL={shlex.quote(str(shell))}",
-        shlex.quote(str(BIN)),
-        ".",
     ]
+    parts.extend(shlex.quote(str(arg)) for arg in sessh_args("."))
     return " ".join(parts)
 
 
