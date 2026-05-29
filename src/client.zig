@@ -657,8 +657,8 @@ pub const ReconnectUi = struct {
         }
     }
 
-    pub fn showConnectionUnresponsive(self: *ReconnectUi) !void {
-        try self.drawStaticBanner("--- sessh: unresponsive: Reconnecting... Ctrl-C detach ---");
+    pub fn showDisconnectedReconnectInProgress(self: *ReconnectUi) !void {
+        try self.drawStaticBanner("--- sessh: disconnected: Reconnecting... Ctrl-C detach ---");
     }
 
     pub fn showReconnectReady(self: *ReconnectUi, disposition: ReconnectSwitchDisposition) !void {

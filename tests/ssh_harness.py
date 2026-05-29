@@ -1849,10 +1849,13 @@ def test_ssh_unresponsive_reconnect_failure_keeps_input_on_old_connection_withou
         batch_fail_file.touch()
         proc.stdin.write(b"trigger-unresponsive\n")
         proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, b"sessh: unresponsive: Reconnecting", 15.0)
         wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 1, timeout=15.0)
         time.sleep(0.5)
         stdout += read_available_pipe(proc.stdout, 0.2)
+        if b"sessh: unresponsive: Reconnecting" in stdout:
+            raise AssertionError(f"unresponsive reconnect showed a reconnecting banner:\n{stdout!r}")
+        if b"sessh: disconnected: Reconnecting" in stdout:
+            raise AssertionError(f"recoverable unresponsive connection showed a disconnected banner:\n{stdout!r}")
 
         proc.stdin.write(b"input-after-failed-reconnect\n")
         proc.stdin.flush()
@@ -1882,7 +1885,95 @@ def test_ssh_unresponsive_reconnect_failure_keeps_input_on_old_connection_withou
         raise AssertionError(result)
     if "\x07" in result.stdout:
         raise AssertionError(result)
+    if "sessh: unresponsive: Reconnecting" in result.stdout:
+        raise AssertionError(result)
+    if "sessh: disconnected: Reconnecting" in result.stdout:
+        raise AssertionError(result)
     if "sessh: disconnected: Retry connecting" in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_unresponsive_reconnect_retries_after_prepare_failure(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    batch_fail_file = tmp / "fail-batch-reconnect"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_UNRESPONSIVE_RETRY_READY"
+    after = "after-unresponsive-retry"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_EXIT_ON_BATCH_FILE"] = str(batch_fail_file)
+    env["SHELL"] = str(remote_shell)
+
+    argv = sessh_argv(["--alias", "s1", "test-host"])
+    proc = subprocess.Popen(
+        argv,
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = b""
+    stderr = b""
+    try:
+        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+        before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
+
+        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "30", "--host", "test-host", "s1"], env, timeout=30.0)
+        if unresponsive.returncode != 0:
+            raise AssertionError(unresponsive)
+        if not unresponsive.stdout.startswith("UNRESPONSIVE "):
+            raise AssertionError(unresponsive)
+
+        batch_fail_file.touch()
+        proc.stdin.write(b"trigger-unresponsive\n")
+        proc.stdin.flush()
+        wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 1, timeout=15.0)
+        batch_fail_file.unlink()
+        wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 2, timeout=25.0)
+        stdout += read_until_pipe(proc.stdout, b"sessh: unresponsive: Connection ready", 15.0)
+        if b"sessh: unresponsive: Reconnecting" in stdout:
+            raise AssertionError(f"unresponsive retry showed reconnecting banner:\n{stdout!r}")
+        if b"sessh: disconnected: Reconnecting" in stdout:
+            raise AssertionError(f"unresponsive retry showed disconnected banner:\n{stdout!r}")
+
+        proc.stdin.write(b"\x12")
+        proc.stdin.flush()
+        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 15.0)
+        proc.stdin.write(after.encode("utf-8") + b"\n")
+        proc.stdin.flush()
+        stdout += read_until_pipe(proc.stdout, f"REMOTE:{after}".encode("utf-8"), 15.0)
+        proc.stdin.close()
+        returncode = proc.wait(timeout=10.0)
+        stdout += proc.stdout.read()
+        stderr = proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+    result = subprocess.CompletedProcess(
+        argv,
+        returncode,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "sessh: unresponsive: Reconnecting" in result.stdout:
+        raise AssertionError(result)
+    if "sessh: disconnected: Reconnecting" in result.stdout:
+        raise AssertionError(result)
+    if "sessh: unresponsive: Connection ready" not in result.stdout:
+        raise AssertionError(result)
+    if f"REMOTE:{after}" not in result.stdout:
         raise AssertionError(result)
 
 
@@ -1924,8 +2015,12 @@ def test_ssh_unresponsive_old_connection_recovers_without_switch_or_bell(tmp):
 
         proc.stdin.write(b"trigger-unresponsive\n")
         proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, b"sessh: unresponsive: Reconnecting", 15.0)
         wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 1, timeout=15.0)
+        stdout += read_available_pipe(proc.stdout, 0.2)
+        if b"sessh: unresponsive: Reconnecting" in stdout:
+            raise AssertionError(f"unresponsive reconnect showed a reconnecting banner:\n{stdout!r}")
+        if b"sessh: disconnected: Reconnecting" in stdout:
+            raise AssertionError(f"recoverable unresponsive connection showed a disconnected banner:\n{stdout!r}")
 
         proc.stdin.write(b"input-after-banner\n")
         proc.stdin.flush()
@@ -1954,7 +2049,95 @@ def test_ssh_unresponsive_old_connection_recovers_without_switch_or_bell(tmp):
         raise AssertionError(result)
     if "\x07" in result.stdout:
         raise AssertionError(result)
+    if "sessh: unresponsive: Reconnecting" in result.stdout:
+        raise AssertionError(result)
+    if "sessh: disconnected: Reconnecting" in result.stdout:
+        raise AssertionError(result)
     if "sessh: disconnected: Retry connecting" in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_UNRESPONSIVE_CLOSE_READY"
+    after = "after-unresponsive-close"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    argv = sessh_argv(["--alias", "s1", "test-host"])
+    proc = subprocess.Popen(
+        argv,
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = b""
+    stderr = b""
+    try:
+        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+        before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
+
+        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "30", "--host", "test-host", "s1"], env, timeout=30.0)
+        if unresponsive.returncode != 0:
+            raise AssertionError(unresponsive)
+        if not unresponsive.stdout.startswith("UNRESPONSIVE "):
+            raise AssertionError(unresponsive)
+
+        proc.stdin.write(b"trigger-unresponsive\n")
+        proc.stdin.flush()
+        wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 1, timeout=15.0)
+        stdout += read_until_pipe(proc.stdout, b"sessh: unresponsive: Connection ready", 15.0)
+        if b"sessh: disconnected: Reconnecting" in stdout:
+            raise AssertionError(f"unresponsive connection showed disconnected before transport close:\n{stdout!r}")
+
+        severed = run_sesshmux(["debug", "sever-connection", "--host", "test-host", "s1"], env, timeout=30.0)
+        if severed.returncode != 0:
+            raise AssertionError(severed)
+        if not severed.stdout.startswith("SEVERED "):
+            raise AssertionError(severed)
+
+        stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Connection ready", 15.0)
+        proc.stdin.write(b"\x12")
+        proc.stdin.flush()
+        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 15.0)
+        proc.stdin.write(after.encode("utf-8") + b"\n")
+        proc.stdin.flush()
+        stdout += read_until_pipe(proc.stdout, f"REMOTE:{after}".encode("utf-8"), 15.0)
+        proc.stdin.close()
+        returncode = proc.wait(timeout=10.0)
+        stdout += proc.stdout.read()
+        stderr = proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+    result = subprocess.CompletedProcess(
+        argv,
+        returncode,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "sessh: unresponsive: Reconnecting" in result.stdout:
+        raise AssertionError(result)
+    if "sessh: disconnected: Reconnecting" in result.stdout:
+        raise AssertionError(result)
+    if "sessh: disconnected: Connection ready" not in result.stdout:
+        raise AssertionError(result)
+    if f"REMOTE:{after}" not in result.stdout:
         raise AssertionError(result)
 
 
@@ -2825,8 +3008,16 @@ def main(argv=None):
             test_ssh_unresponsive_reconnect_failure_keeps_input_on_old_connection_without_bell,
         ),
         (
+            "ssh unresponsive reconnect retries after prepare failure",
+            test_ssh_unresponsive_reconnect_retries_after_prepare_failure,
+        ),
+        (
             "ssh unresponsive old connection recovers without switch or bell",
             test_ssh_unresponsive_old_connection_recovers_without_switch_or_bell,
+        ),
+        (
+            "ssh unresponsive transport close uses disconnected ready banner",
+            test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner,
         ),
         (
             "ssh retry elapsed with input waits before switch",

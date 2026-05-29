@@ -240,6 +240,7 @@ const ReconnectRaceOutcome = union(enum) {
     reconnected: RuntimeConnection,
     session_ended,
     failed: anyerror,
+    disconnected: anyerror,
     detach,
 };
 
@@ -1228,6 +1229,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                     client_log.userDiagnosticInfo("reconnect failed: parallel: {t}", .{err});
                     child.terminate();
                 },
+                .disconnected => |err| {
+                    client_log.debug("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
+                        parsed_ssh_args.host,
+                        session.idSlice(),
+                        err,
+                    });
+                    client_log.userDiagnosticInfo("reconnect failed: parallel: {t}", .{err});
+                },
             }
         }
 
@@ -1889,7 +1898,6 @@ fn raceExistingConnectionWithReconnect(
     pending_paste_like_input_at_disconnect: bool,
 ) !ReconnectRaceOutcome {
     var reconnect_attempt: usize = 0;
-    try reconnect_ui.showConnectionUnresponsive();
     while (true) {
         const outcome = try raceExistingConnectionWithReconnectAttempt(
             parsed_ssh_args,
@@ -1911,8 +1919,8 @@ fn raceExistingConnectionWithReconnect(
                     err,
                 });
                 client_log.userDiagnosticInfo("reconnect failed: parallel: {t}", .{err});
-                reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, reconnect_ui);
                 const delay_ms = reconnectDelayMs(reconnect_attempt);
+                reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, reconnect_ui);
                 client_log.debug("event=reconnect_wait_unresponsive host={s} session={s} attempt={} delay_ms={}", .{
                     parsed_ssh_args.host,
                     session.idSlice(),
@@ -1927,6 +1935,7 @@ fn raceExistingConnectionWithReconnect(
                     delay_ms,
                 )) |retry_outcome| return retry_outcome;
             },
+            .disconnected => return outcome,
             else => return outcome,
         }
     }
@@ -1952,7 +1961,7 @@ fn waitForUnresponsiveReconnectRetry(
                 .transport_closed => {
                     old_child.closeStdin();
                     _ = old_child.wait() catch {};
-                    return .{ .failed = error.TransportClosed };
+                    return .{ .disconnected = error.TransportClosed };
                 },
             }
         }
@@ -1973,7 +1982,7 @@ fn waitForUnresponsiveReconnectRetry(
             .transport_closed => {
                 old_child.closeStdin();
                 _ = old_child.wait() catch {};
-                return .{ .failed = error.TransportClosed };
+                return .{ .disconnected = error.TransportClosed };
             },
         }
     }
@@ -2020,6 +2029,16 @@ fn raceExistingConnectionWithReconnectAttempt(
                 .connected => |connection| {
                     ready_connection = connection;
                     ready_session = session.*;
+                    if (!old_available) {
+                        return try attachReadyReconnectConnectionAfterTransportClosed(
+                            &ready_connection,
+                            &ready_session,
+                            session,
+                            reconnect_ui,
+                            pending_input_at_disconnect,
+                            pending_paste_like_input_at_disconnect,
+                        );
+                    }
                     const disposition = reconnect_ui.reconnectSwitchDisposition(
                         pending_input_at_disconnect,
                         pending_paste_like_input_at_disconnect,
@@ -2035,7 +2054,10 @@ fn raceExistingConnectionWithReconnectAttempt(
                     }
                     try reconnect_ui.showReconnectReady(disposition);
                 },
-                .failed => |err| return .{ .failed = err },
+                .failed => |err| {
+                    if (!old_available) return .{ .disconnected = err };
+                    return .{ .failed = err };
+                },
             }
         }
 
@@ -2073,6 +2095,17 @@ fn raceExistingConnectionWithReconnectAttempt(
                         old_child.closeStdin();
                         _ = old_child.wait() catch {};
                         old_available = false;
+                        if (ready_connection != null) {
+                            return try attachReadyReconnectConnectionAfterTransportClosed(
+                                &ready_connection,
+                                &ready_session,
+                                session,
+                                reconnect_ui,
+                                pending_input_at_disconnect,
+                                pending_paste_like_input_at_disconnect,
+                            );
+                        }
+                        try reconnect_ui.showDisconnectedReconnectInProgress();
                     },
                 }
             }
@@ -2109,6 +2142,17 @@ fn raceExistingConnectionWithReconnectAttempt(
                         old_child.closeStdin();
                         _ = old_child.wait() catch {};
                         old_available = false;
+                        if (ready_connection != null) {
+                            return try attachReadyReconnectConnectionAfterTransportClosed(
+                                &ready_connection,
+                                &ready_session,
+                                session,
+                                reconnect_ui,
+                                pending_input_at_disconnect,
+                                pending_paste_like_input_at_disconnect,
+                            );
+                        }
+                        try reconnect_ui.showDisconnectedReconnectInProgress();
                     },
                 }
             }
@@ -2134,6 +2178,26 @@ fn raceExistingConnectionWithReconnectAttempt(
             }
         }
     }
+}
+
+fn attachReadyReconnectConnectionAfterTransportClosed(
+    ready_connection: *?RuntimeConnection,
+    ready_session: *client.RuntimeSession,
+    session: *client.RuntimeSession,
+    reconnect_ui: *client.ReconnectUi,
+    pending_input_at_disconnect: bool,
+    pending_paste_like_input_at_disconnect: bool,
+) !ReconnectRaceOutcome {
+    switch (try waitForReconnectSwitchIfNeeded(
+        reconnect_ui,
+        pending_input_at_disconnect,
+        pending_paste_like_input_at_disconnect,
+        false,
+    )) {
+        .detach => return .detach,
+        .reconnect_now, .wait_elapsed => {},
+    }
+    return attachReadyReconnectConnection(ready_connection, ready_session, session, reconnect_ui);
 }
 
 fn attachReadyReconnectConnection(
