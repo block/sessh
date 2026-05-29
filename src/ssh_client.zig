@@ -459,7 +459,8 @@ fn isConfigOrEnvOnlySesshOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--bootstrap") or
-        std.mem.eql(u8, arg, "--no-bootstrap");
+        std.mem.eql(u8, arg, "--no-bootstrap") or
+        std.mem.eql(u8, arg, "--ssh-options");
 }
 
 fn translateMuxAttach(translated: *TranslatedMuxArgs, args: []const []const u8) !void {
@@ -1701,7 +1702,25 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    printf 'sessh: session compat binary is unavailable\n' >&2
         \\    exit 1
         \\  fi
-        \\  XDG_RUNTIME_DIR=$runtime_root exec "$compat" . --compat-version {s}{s}
+        \\  compat_target=$compat
+        \\  if [ -L "$compat" ]; then
+        \\    compat_target=$(readlink "$compat") || exit 1
+        \\  fi
+        \\  case "$(basename "$compat_target")" in
+        \\    sesshmux*) XDG_RUNTIME_DIR=$runtime_root exec "$compat" :internal-sessh: . --compat-version {s}{s} ;;
+        \\    *) XDG_RUNTIME_DIR=$runtime_root exec "$compat" . --compat-version {s}{s} ;;
+        \\  esac
+        \\}}
+        \\run_one_compat() {{
+        \\  compat=$1
+        \\  compat_target=$compat
+        \\  if [ -L "$compat" ]; then
+        \\    compat_target=$(readlink "$compat") || exit 1
+        \\  fi
+        \\  case "$(basename "$compat_target")" in
+        \\    sesshmux*) XDG_RUNTIME_DIR=$runtime_root "$compat" :internal-sessh: . --compat-version {s}{s} ;;
+        \\    *) XDG_RUNTIME_DIR=$runtime_root "$compat" . --compat-version {s}{s} ;;
+        \\  esac
         \\}}
         \\run_each_compat() {{
         \\  found=0
@@ -1709,7 +1728,7 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\  for compat in "$runtime_root"/guid/*/compat; do
         \\    [ -e "$compat" ] || continue
         \\    found=1
-        \\    XDG_RUNTIME_DIR=$runtime_root "$compat" . --compat-version {s}{s}
+        \\    run_one_compat "$compat"
         \\    code=$?
         \\    if [ "$code" -ne 0 ]; then
         \\      status=$code
@@ -1745,6 +1764,10 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
     , .{
         action_quoted,
         session_id_quoted,
+        compat_version,
+        local_args,
+        compat_version,
+        local_args,
         compat_version,
         local_args,
         compat_version,
@@ -3017,6 +3040,7 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
     while (index.* < args.len) {
         const arg = args[index.*];
         if (!isSesshLongOption(arg) and !(parse_options.allow_force_compat and std.mem.eql(u8, arg, "--force-compat"))) return;
+        if (isConfigOrEnvOnlySesshOption(arg)) return error.UnsupportedSesshOption;
 
         if (std.mem.eql(u8, arg, "--leader")) {
             index.* += 1;
@@ -3085,6 +3109,7 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
 fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *ParsedSshArgs, parse_options: CliParseOptions) !void {
     while (index.* < args.len) {
         const arg = args[index.*];
+        if (isConfigOrEnvOnlySesshOption(arg) and !parse_options.allow_mux_command_words) return error.UnsupportedSesshOption;
         if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "attach")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.action = .attach;
@@ -3264,6 +3289,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--alias") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
+        std.mem.eql(u8, arg, "--ssh-options") or
         std.mem.eql(u8, arg, "--capture-tty-transcript") or
         std.mem.eql(u8, arg, "--refresh") or
         std.mem.eql(u8, arg, "--exited") or
@@ -3938,13 +3964,13 @@ test "parseSshArgs passes through ssh options before host" {
     try std.testing.expectEqualStrings("-vvC", parsed.options[5]);
 }
 
-test "parseSshArgs accepts sessh options before ssh options and host" {
+test "parseSshArgs accepts public sessh options before ssh options and host" {
     const parsed = try parseSshArgs(&.{
         "sessh",
         "--alias",
         "work",
-        "--leader",
-        "CTRL-B",
+        "--log-level",
+        "debug",
         "-F",
         "ssh_config",
         "example.com",
@@ -3952,13 +3978,47 @@ test "parseSshArgs accepts sessh options before ssh options and host" {
 
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqualStrings("work", parsed.alias.?);
-    switch (parsed.leader) {
-        .ctrl => |byte| try std.testing.expectEqual(@as(u8, 'B'), byte),
-        .none => return error.ExpectedLeader,
-    }
+    try std.testing.expectEqual(client_log.Level.debug, parsed.client_log_level);
     try std.testing.expectEqual(@as(usize, 2), parsed.options.len);
     try std.testing.expectEqualStrings("-F", parsed.options[0]);
     try std.testing.expectEqualStrings("ssh_config", parsed.options[1]);
+}
+
+test "parseSshArgs rejects config-only sessh options on direct ssh transport" {
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+        "sessh",
+        "--leader",
+        "CTRL-B",
+        "example.com",
+    }, .{}));
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+        "sessh",
+        "--scrollback-limit",
+        "100",
+        "example.com",
+    }, .{}));
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+        "sessh",
+        "--initial-scrollback",
+        "0",
+        "example.com",
+    }, .{}));
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+        "sessh",
+        "--bootstrap",
+        "example.com",
+    }, .{}));
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+        "sessh",
+        "--no-bootstrap",
+        "example.com",
+    }, .{}));
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+        "sessh",
+        "--ssh-options",
+        "-F cfg",
+        "example.com",
+    }, .{}));
 }
 
 test "ssh verbosity maps to inferred client log level" {

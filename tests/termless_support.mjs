@@ -1,5 +1,5 @@
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 
 import { createTerminal, encodeKeyToAnsi } from "@termless/core";
 import xterm from "@xterm/headless";
@@ -8,6 +8,13 @@ const { Terminal: XtermTerminal } = xterm;
 
 export const REPO_ROOT = resolve(import.meta.dirname, "..");
 export const SESSH_BIN = process.env.SESSH_BIN || join(REPO_ROOT, "zig-out", "bin", "sesshmux-dev");
+
+export function sesshArgs(...args) {
+  if (basename(SESSH_BIN) === "sesshmux-dev") {
+    return [SESSH_BIN, ":internal-sessh:", ...args];
+  }
+  return [SESSH_BIN, ...args];
+}
 
 const COLOR_MODE_DEFAULT = 0;
 const COLOR_MODE_PALETTE = 0x01000000;

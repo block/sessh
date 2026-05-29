@@ -9,6 +9,7 @@ import {
   makeTermlessTempRoot,
   REPO_ROOT,
   SESSH_BIN,
+  sesshArgs,
   screenCells,
   waitForText,
   waitForTitle,
@@ -58,7 +59,7 @@ test("sessh local transport renders child pty output", async () => {
 
   try {
     term = createTestTerminal({ cols: 80, rows: 24 });
-    await term.spawn([SESSH_BIN, "."], {
+    await term.spawn(sesshArgs("."), {
       cwd: REPO_ROOT,
       env: makeIsolatedEnv(testRoot, emitter),
     });
@@ -86,7 +87,7 @@ test("sessh initial-scrollback=0 attach clears stale outer row tails", async () 
 
   try {
     starter = createTestTerminal({ cols: 40, rows: 8 });
-    await starter.spawn([SESSH_BIN, ".", "--alias", "stale-tail"], {
+    await starter.spawn(sesshArgs(".", "--alias", "stale-tail"), {
       cwd: REPO_ROOT,
       env,
     });
@@ -98,7 +99,7 @@ test("sessh initial-scrollback=0 attach clears stale outer row tails", async () 
 
     attach = createTestTerminal({ cols: 40, rows: 8 });
     attach.feed(staleVisibleRows(8));
-    await attach.spawn([SESSH_BIN, ".", "attach", "stale-tail"], {
+    await attach.spawn(sesshArgs(".", "attach", "stale-tail"), {
       cwd: REPO_ROOT,
       env,
     });
@@ -145,7 +146,7 @@ test("sessh starts when the outer terminal does not answer terminal queries", as
 
   try {
     term = createTestTerminal({ cols: 80, rows: 24, respondToQueries: false });
-    await term.spawn([SESSH_BIN, "."], {
+    await term.spawn(sesshArgs("."), {
       cwd: REPO_ROOT,
       env: makeIsolatedEnv(testRoot, emitter),
     });
