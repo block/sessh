@@ -3567,13 +3567,33 @@ def main():
                 raise AssertionError(internal_sessh_version)
             internal_local_env = isolated_env(Path(tmp) / "internal-sessh-local")
             internal_shell = Path(tmp) / "internal-sessh-shell"
-            internal_shell.write_text("#!/bin/sh\nprintf 'internal-sessh-local-ok\\n'\n")
+            # Keep the shell alive until the harness has observed the marker.
+            # If it exits immediately after printing, session cleanup can race
+            # final draw delivery and leave the client with only cleanup bytes.
+            internal_shell.write_text(
+                "#!/bin/sh\n"
+                "printf 'internal-sessh-local-ok\\n'\n"
+                "while IFS= read -r line; do\n"
+                "  [ \"$line\" = exit ] && exit 0\n"
+                "done\n"
+            )
             internal_shell.chmod(0o700)
             internal_local_env["SHELL"] = str(internal_shell)
             cleanup_runtime(internal_local_env)
-            internal_sessh_local = run([":internal-sessh:", "."], internal_local_env, timeout=5.0)
-            if internal_sessh_local.returncode != 0 or "internal-sessh-local-ok" not in internal_sessh_local.stdout:
-                raise AssertionError(internal_sessh_local)
+            pid, fd = spawn_bin(internal_local_env, [":internal-sessh:", "."])
+            child_exited = False
+            try:
+                read_until(fd, b"internal-sessh-local-ok", timeout=5.0)
+                os.write(fd, b"exit\n")
+                status = wait_child_draining_fd(pid, fd, timeout=5.0)
+                child_exited = True
+                if status != 0:
+                    raise AssertionError(f"internal sessh local exited with status {status}")
+            finally:
+                if child_exited:
+                    os.close(fd)
+                else:
+                    close_client(pid, fd)
             sessh_wrapper = ROOT / "zig-out" / "bin" / "sessh"
             if sessh_wrapper.exists():
                 sessh_help = subprocess.run(
