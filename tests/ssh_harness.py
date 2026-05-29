@@ -1160,6 +1160,8 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(
             ssh_failure_diagnostics("bootstrap status was not displayed and cleared", result, fake_log, fake_trace)
         )
+    if "ssh ts_ms=" in result.stderr:
+        raise AssertionError(ssh_failure_diagnostics("bootstrap status was captured as ssh stderr", result, fake_log, fake_trace))
 
     artifact = remote_path_artifact()
     installed = artifact_cache_path(env, artifact)

@@ -1584,6 +1584,18 @@ fn runRemoteBrokerCommandAndForward(connection: *RuntimeConnection) !u8 {
     };
 }
 
+fn showClientBootstrapStatus(visible: *bool, reconnect_ui: ?*client.ReconnectUi) !void {
+    if (reconnect_ui != null or visible.*) return;
+    try io.writeAll(2, "\rsessh: bootstrapping...");
+    visible.* = true;
+}
+
+fn clearClientBootstrapStatus(visible: *bool) void {
+    if (!visible.*) return;
+    io.writeAll(2, "\r\x1b[K") catch {};
+    visible.* = false;
+}
+
 fn tombstoneLocalRouteForRemoteKill(allocator: std.mem.Allocator, route: *const session_registry.Route) !void {
     try session_registry.writeTombstoneForRoute(allocator, route, .{
         .ended_at_unix_ms = nowUnixMs(),
@@ -2440,6 +2452,10 @@ fn startRuntimeConnection(
             return process_exit.request(1);
         };
 
+        var bootstrap_status_visible = false;
+        defer clearClientBootstrapStatus(&bootstrap_status_visible);
+        try showClientBootstrapStatus(&bootstrap_status_visible, reconnect_ui);
+
         sendUpload(allocator, connection.child.stdin.?.handle, artifact, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
             if (err == error.ReconnectDetached) {
@@ -2793,9 +2809,7 @@ fn isPlainShellArg(arg: []const u8) bool {
 /// bootstrapper one shell contract to implement and test instead of inheriting
 /// every possible remote login shell's behavior.
 fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
-    const script = try std.fmt.allocPrint(allocator, "SESSH_SHOW_BOOTSTRAP_STATUS=1\n{s}", .{bootstrapper_script});
-    defer allocator.free(script);
-    return shCommand(allocator, script);
+    return shCommand(allocator, bootstrapper_script);
 }
 
 fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []const u8) ![]u8 {

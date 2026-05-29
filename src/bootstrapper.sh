@@ -3,25 +3,9 @@
 set -u
 exec 3>&1
 
-bootstrapping_status_visible=0
-
-show_bootstrapping_status() {
-  [ "${SESSH_SHOW_BOOTSTRAP_STATUS:-0}" = "1" ] || return 0
-  bootstrapping_status_visible=1
-  printf '\rsessh: bootstrapping...' >&2
-}
-
-clear_bootstrapping_status() {
-  if [ "$bootstrapping_status_visible" -eq 1 ]; then
-    printf '\r\033[K' >&2
-    bootstrapping_status_visible=0
-  fi
-}
-
 err() {
   code=$1
   shift
-  clear_bootstrapping_status
   printf 'ERR %s %s\n' "$code" "$*" >&3
   exit 1
 }
@@ -196,7 +180,6 @@ done
 
 platform=$(canonical_platform)
 printf 'MISSING %s\n' "$platform"
-show_bootstrapping_status
 
 IFS= read -r upload_line || err MISSING_UPLOAD expected_upload
 set -- $upload_line
@@ -221,7 +204,6 @@ actual=$(sha256_file "$tmp") || err INSTALL_FAILED sha256_failed
 chmod 700 "$tmp" || err INSTALL_FAILED chmod
 mv "$tmp" "$artifact_dir/sesshmux" || err INSTALL_FAILED rename
 trap - EXIT HUP INT TERM
-clear_bootstrapping_status
 
 printf 'OK\n'
 exec "$artifact_dir/sesshmux" :internal-broker: $broker_args
