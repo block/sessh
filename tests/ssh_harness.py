@@ -929,6 +929,15 @@ def write_ssh_route(env, alias, guid, host, ssh_options=()):
     return session
 
 
+def write_client_route_hint(env, client_guid, session_id):
+    hint = runtime_root(env) / "client" / client_guid / "route.json"
+    hint.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if hint.exists() or hint.is_symlink():
+        hint.unlink()
+    hint.symlink_to(route_file(env, session_id))
+    return hint
+
+
 def session_path(env, session_id="s1"):
     if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
         return sessions_dir(env) / canonical_guid(session_id)
@@ -1684,6 +1693,33 @@ def test_ssh_no_host_list_clients_uses_remote_route(tmp):
     if "invoked=1" not in log_text:
         raise AssertionError(
             "list-clients did not delegate to ssh for a remote route\n"
+            f"fake ssh log:\n{log_text}\n"
+            f"sesshmux result:\n{process_diagnostics(result)}"
+        )
+
+
+def test_ssh_no_host_detach_client_uses_client_route_hint(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "42"
+    alias = "remote-client-detach"
+    guid = guid_for_alias(alias)
+    client_guid = "c-33333333-3333-4333-8333-333333333333"
+    write_ssh_route(env, alias, guid, "test-host")
+    write_client_route_hint(env, client_guid, guid)
+
+    result = run_sesshmux(["detach", client_guid], env, timeout=30.0)
+
+    if result.returncode == 0:
+        raise AssertionError(result)
+    log_text = optional_text(fake_log)
+    if "invoked=1" not in log_text:
+        raise AssertionError(
+            "detach did not delegate to ssh for a remote client route hint\n"
             f"fake ssh log:\n{log_text}\n"
             f"sesshmux result:\n{process_diagnostics(result)}"
         )
@@ -3105,6 +3141,10 @@ def main(argv=None):
         (
             "ssh no-host list-clients uses remote route",
             test_ssh_no_host_list_clients_uses_remote_route,
+        ),
+        (
+            "ssh no-host detach client uses client route hint",
+            test_ssh_no_host_detach_client_uses_client_route_hint,
         ),
         (
             "ssh list refresh tombstones missing remote route",

@@ -155,6 +155,10 @@ pub fn sessionSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) !
     return std.fmt.allocPrint(allocator, "{s}/s", .{root});
 }
 
+pub fn clientRoutesDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/client", .{root});
+}
+
 pub fn ensureRuntimeLayout(allocator: std.mem.Allocator, paths: SessionPaths) !void {
     const sessions_dir = std.fs.path.dirname(paths.dir) orelse return error.InvalidSessionDir;
     const runtime_root = std.fs.path.dirname(sessions_dir) orelse return error.InvalidSessionDir;
@@ -886,6 +890,120 @@ pub fn readRouteForRef(allocator: std.mem.Allocator, ref: []const u8) !Route {
     var paths = try pathsForRef(allocator, ref);
     defer paths.deinit(allocator);
     return readRoute(allocator, paths.route);
+}
+
+/// Runtime-only lookup from a client id to the durable route for the session it
+/// is attached to. This is intentionally not durable: after a client detaches,
+/// the client id should stop resolving so it can be reused without ambiguity.
+pub fn writeClientRouteHint(allocator: std.mem.Allocator, client_guid: []const u8, session_guid: []const u8) !void {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    const state_root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(state_root);
+    return writeClientRouteHintInRoots(allocator, runtime_root, state_root, client_guid, session_guid);
+}
+
+fn writeClientRouteHintInRoots(
+    allocator: std.mem.Allocator,
+    runtime_root: []const u8,
+    state_root: []const u8,
+    client_guid: []const u8,
+    session_guid: []const u8,
+) !void {
+    try ensureRegistryRoot(allocator, runtime_root);
+
+    const client_root = try clientRoutesDirInRoot(allocator, runtime_root);
+    defer allocator.free(client_root);
+    try mkdirIgnoreExists(allocator, client_root);
+
+    const canonical_client = try canonicalClientGuid(allocator, client_guid);
+    defer allocator.free(canonical_client);
+    const client_dir = try clientRouteHintDirInRoot(allocator, runtime_root, canonical_client);
+    defer allocator.free(client_dir);
+    try mkdirIgnoreExists(allocator, client_dir);
+
+    const canonical_session = try canonicalGuid(allocator, session_guid);
+    defer allocator.free(canonical_session);
+    const route_path = try routePathForGuidInStateRoot(allocator, state_root, canonical_session);
+    defer allocator.free(route_path);
+
+    const link_path = try clientRouteHintPathInRoot(allocator, runtime_root, canonical_client);
+    defer allocator.free(link_path);
+    try installSymlinkReplacing(allocator, link_path, route_path);
+}
+
+pub fn removeClientRouteHint(allocator: std.mem.Allocator, client_guid: []const u8) !void {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    return removeClientRouteHintInRoot(allocator, runtime_root, client_guid);
+}
+
+fn removeClientRouteHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_guid: []const u8) !void {
+    const canonical_client = try canonicalClientGuid(allocator, client_guid);
+    defer allocator.free(canonical_client);
+    const link_path = try clientRouteHintPathInRoot(allocator, runtime_root, canonical_client);
+    defer allocator.free(link_path);
+    try unlinkIfExists(link_path);
+
+    const client_dir = try clientRouteHintDirInRoot(allocator, runtime_root, canonical_client);
+    defer allocator.free(client_dir);
+    removeDirIfEmpty(client_dir) catch |err| switch (err) {
+        error.DirNotEmpty => {},
+        else => return err,
+    };
+}
+
+pub fn readRouteForClientGuid(allocator: std.mem.Allocator, client_ref: []const u8) !Route {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    return readRouteForClientGuidInRoot(allocator, runtime_root, client_ref);
+}
+
+fn readRouteForClientGuidInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_ref: []const u8) !Route {
+    const client_guid = try resolveClientGuidRefInRoot(allocator, runtime_root, client_ref);
+    defer allocator.free(client_guid);
+    const hint_path = try clientRouteHintPathInRoot(allocator, runtime_root, client_guid);
+    defer allocator.free(hint_path);
+    return readRoute(allocator, hint_path);
+}
+
+fn resolveClientGuidRefInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_ref: []const u8) ![]u8 {
+    if (isValidClientGuid(client_ref)) return canonicalClientGuid(allocator, client_ref);
+    if (compactGuidPrefix(client_ref, client_guid_prefix)) |prefix| {
+        return resolveClientGuidPrefixInRoot(allocator, runtime_root, prefix.slice());
+    }
+    return error.InvalidClientId;
+}
+
+fn resolveClientGuidPrefixInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, prefix: []const u8) ![]u8 {
+    const client_root = try clientRoutesDirInRoot(allocator, runtime_root);
+    defer allocator.free(client_root);
+    var dir = std.fs.openDirAbsolute(client_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+    defer dir.close();
+
+    var match: ?[]u8 = null;
+    errdefer if (match) |guid| allocator.free(guid);
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .directory or !isValidClientGuid(entry.name)) continue;
+        const compact = try compactClientGuid(allocator, entry.name);
+        defer allocator.free(compact);
+        if (!std.mem.startsWith(u8, compact, prefix)) continue;
+        if (match != null) return error.AmbiguousClientId;
+        match = try canonicalClientGuid(allocator, entry.name);
+    }
+    return match orelse error.FileNotFound;
+}
+
+fn clientRouteHintDirInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_guid: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/client/{s}", .{ runtime_root, client_guid });
+}
+
+fn clientRouteHintPathInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_guid: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/client/{s}/route.json", .{ runtime_root, client_guid });
 }
 
 fn routePathForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
@@ -1669,6 +1787,10 @@ fn agentSocketLinkPath(allocator: std.mem.Allocator, dir: []const u8) ![]u8 {
 fn installAgentSocketLink(allocator: std.mem.Allocator, link_path: []const u8, socket_name: []const u8) !void {
     const target = try std.fmt.allocPrint(allocator, "../../s/{s}", .{socket_name});
     defer allocator.free(target);
+    return installSymlinkReplacing(allocator, link_path, target);
+}
+
+fn installSymlinkReplacing(allocator: std.mem.Allocator, link_path: []const u8, target: []const u8) !void {
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ link_path, c.getpid() });
     defer allocator.free(tmp_path);
 
@@ -2072,6 +2194,54 @@ test "route json persists absolute session directories" {
     try std.testing.expectEqual(@as(?u64, 1234), route.last_input_at_unix_ms);
     try std.testing.expectEqual(@as(usize, 1), route.ssh_options.len);
     try std.testing.expectEqualStrings("-F", route.ssh_options[0]);
+}
+
+test "runtime client route hints point client guids at session routes" {
+    const allocator = std.testing.allocator;
+    const runtime_root = try std.fmt.allocPrint(allocator, "/tmp/sessh-client-hint-runtime-test-{}", .{c.getpid()});
+    defer allocator.free(runtime_root);
+    const state_root = try std.fmt.allocPrint(allocator, "/tmp/sessh-client-hint-state-test-{}", .{c.getpid()});
+    defer allocator.free(state_root);
+    std.fs.cwd().deleteTree(runtime_root) catch {};
+    std.fs.cwd().deleteTree(state_root) catch {};
+    defer std.fs.cwd().deleteTree(runtime_root) catch {};
+    defer std.fs.cwd().deleteTree(state_root) catch {};
+
+    const session_guid = "s-550e8400-e29b-41d4-a716-446655440000";
+    const client_guid = "c-550e8400-e29b-41d4-a716-446655440000";
+    const second_client_guid = "c-550e8400-0000-4000-8000-000000000000";
+    const route_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ state_root, session_guid });
+    defer allocator.free(route_dir);
+    try std.fs.cwd().makePath(route_dir);
+    const route_path = try routePathForGuidInStateRoot(allocator, state_root, session_guid);
+    defer allocator.free(route_path);
+    const session_dir = "/tmp/sessh-runtime-test/guid/s-550e8400-e29b-41d4-a716-446655440000";
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.writer(allocator).print(
+        "{{\"guid\":\"s-550e8400-e29b-41d4-a716-446655440000\",\"primary_alias\":\"s-550e8400\",\"session_dir\":{f},\"host\":\"work.example\",\"agent_version\":\"0.5.0-test\",\"alive\":true,\"attached_count\":1,\"last_input_at_unix_ms\":null,\"ssh_options\":[]}}\n",
+        .{std.json.fmt(session_dir, .{})},
+    );
+    var route_file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
+    try route_file.writeAll(text.items);
+    route_file.close();
+
+    try writeClientRouteHintInRoots(allocator, runtime_root, state_root, client_guid, session_guid);
+    const hint_path = try clientRouteHintPathInRoot(allocator, runtime_root, client_guid);
+    defer allocator.free(hint_path);
+    const target = try readLinkAlloc(allocator, hint_path, 4096);
+    defer allocator.free(target);
+    try std.testing.expectEqualStrings(route_path, target);
+
+    var route = try readRouteForClientGuidInRoot(allocator, runtime_root, "c-550e8400e");
+    defer route.deinit(allocator);
+    try std.testing.expectEqualStrings(session_guid, route.guid);
+
+    try writeClientRouteHintInRoots(allocator, runtime_root, state_root, second_client_guid, session_guid);
+    try std.testing.expectError(error.AmbiguousClientId, readRouteForClientGuidInRoot(allocator, runtime_root, "c-550e8400"));
+
+    try removeClientRouteHintInRoot(allocator, runtime_root, client_guid);
+    try std.testing.expectError(error.FileNotFound, readRouteForClientGuidInRoot(allocator, runtime_root, client_guid));
 }
 
 test "tombstone snapshots aliases, removes route, and releases aliases" {

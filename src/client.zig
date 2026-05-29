@@ -2151,6 +2151,18 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                     try io_helpers.writeAll(2, "sessh: client command requires an ID outside a sessh session\n");
                     return process_exit.request(64);
                 },
+                error.ClientSessionNotFound => {
+                    try io_helpers.writeAll(2, "sessh: client session not found\n");
+                    return process_exit.request(1);
+                },
+                error.AmbiguousClientId => {
+                    try io_helpers.writeAll(2, "sessh: client id is ambiguous\n");
+                    return process_exit.request(1);
+                },
+                error.InvalidClientId => {
+                    try io_helpers.writeAll(2, "sessh: invalid client id\n");
+                    return process_exit.request(64);
+                },
                 else => return err,
             };
             if (exit_status != 0) return process_exit.request(exit_status);
@@ -2294,6 +2306,17 @@ fn appendBrokerCommand(
     return buf[0 .. runtime_args.len + 1];
 }
 
+const ClientSessionResolution = struct {
+    session_ref: []u8,
+    client_route: ?session_registry.Route = null,
+
+    fn deinit(self: *ClientSessionResolution, allocator: std.mem.Allocator) void {
+        if (self.client_route) |*route| route.deinit(allocator);
+        allocator.free(self.session_ref);
+        self.* = undefined;
+    }
+};
+
 fn runLocalClientListCommand(
     allocator: std.mem.Allocator,
     exe: []const u8,
@@ -2318,8 +2341,13 @@ fn runLocalClientControlCommand(
     runtime_broker_args: []const []const u8,
     options: LocalOptions,
 ) !u8 {
-    const session_ref = try resolveClientSessionRef(allocator, options.client_session_ref);
-    defer allocator.free(session_ref);
+    var session_resolution = try resolveClientControlSessionRef(allocator, options.client_session_ref, options.client_guid);
+    defer session_resolution.deinit(allocator);
+    if (session_resolution.client_route) |*route| {
+        if (routeIsRemote(route)) {
+            return runRemoteClientControlCommand(allocator, exe, route, options);
+        }
+    }
     var debug_seconds_arg: ?[]u8 = null;
     defer if (debug_seconds_arg) |arg| allocator.free(arg);
 
@@ -2354,7 +2382,7 @@ fn runLocalClientControlCommand(
         try command_args.append(allocator, "--seconds");
         try command_args.append(allocator, seconds_arg);
     }
-    try command_args.append(allocator, session_ref);
+    try command_args.append(allocator, session_resolution.session_ref);
     return runLocalBrokerCommand(allocator, exe, command_args.items);
 }
 
@@ -2363,6 +2391,99 @@ fn resolveClientSessionRef(allocator: std.mem.Allocator, explicit_ref: ?[]const 
     return std.process.getEnvVarOwned(allocator, "SESSH_GUID") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => error.MissingSessionRef,
         else => err,
+    };
+}
+
+fn resolveClientControlSessionRef(allocator: std.mem.Allocator, explicit_ref: ?[]const u8, client_guid: ?[]const u8) !ClientSessionResolution {
+    if (explicit_ref) |ref| {
+        return .{ .session_ref = try allocator.dupe(u8, ref) };
+    }
+
+    if (client_guid) |guid| {
+        var route = session_registry.readRouteForClientGuid(allocator, guid) catch |err| switch (err) {
+            error.FileNotFound => {
+                const env_ref = resolveClientSessionRef(allocator, null) catch |env_err| switch (env_err) {
+                    error.MissingSessionRef => return error.ClientSessionNotFound,
+                    else => return env_err,
+                };
+                return .{ .session_ref = env_ref };
+            },
+            else => return err,
+        };
+        errdefer route.deinit(allocator);
+        return .{
+            .session_ref = try allocator.dupe(u8, route.guid),
+            .client_route = route,
+        };
+    }
+
+    return .{ .session_ref = try resolveClientSessionRef(allocator, null) };
+}
+
+fn routeIsRemote(route: *const session_registry.Route) bool {
+    return route.host.len > 0 and !std.mem.eql(u8, route.host, ".");
+}
+
+// A client-id lookup can resolve to a cached remote route. Re-enter the mux CLI
+// with that host so the existing ssh transport path runs the broker command.
+fn runRemoteClientControlCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    route: *const session_registry.Route,
+    options: LocalOptions,
+) !u8 {
+    var debug_seconds_arg: ?[]u8 = null;
+    defer if (debug_seconds_arg) |arg| allocator.free(arg);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe);
+    switch (options.action) {
+        .detach_client => try argv.append(allocator, "detach"),
+        .repaint_client => try argv.append(allocator, "repaint"),
+        .debug_client => {
+            try argv.append(allocator, "debug");
+            try argv.append(allocator, switch (options.debug_client_action.?) {
+                .sever_connection => "sever-connection",
+                .unresponsive_connection => "unresponsive-connection",
+            });
+        },
+        else => unreachable,
+    }
+    try argv.appendSlice(allocator, route.ssh_options);
+    try argv.append(allocator, "--host");
+    try argv.append(allocator, route.host);
+    switch (options.client_target) {
+        .default => {},
+        .all => try argv.append(allocator, "--all"),
+        .last_input => try argv.append(allocator, "--last-input"),
+        .client_guid => {
+            try argv.append(allocator, "--client");
+            try argv.append(allocator, options.client_guid.?);
+        },
+    }
+    if (options.client_repaint_scrollback) try argv.append(allocator, "--scrollback");
+    if (options.debug_unresponsive_seconds) |seconds| {
+        const seconds_arg = try std.fmt.allocPrint(allocator, "{d}", .{seconds});
+        debug_seconds_arg = seconds_arg;
+        try argv.append(allocator, "--seconds");
+        try argv.append(allocator, seconds_arg);
+    }
+    try argv.append(allocator, route.guid);
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv.items,
+        .max_output_bytes = 1024 * 1024,
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.stdout.len > 0) try io_helpers.writeAll(1, result.stdout);
+    if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
+    return switch (result.term) {
+        .Exited => |code| @intCast(@min(code, std.math.maxInt(u8))),
+        else => 1,
     };
 }
 
@@ -3105,6 +3226,26 @@ pub fn ensureLocalRouteForRemoteSession(
         ssh_options,
         config.version,
     );
+    if (session.clientGuidSlice().len > 0) {
+        session_registry.writeClientRouteHint(allocator, session.clientGuidSlice(), session.guidSlice()) catch |err| {
+            client_log.debug("event=client_route_hint_write_failed session={s} client={s} error={t}", .{
+                session.guidSlice(),
+                session.clientGuidSlice(),
+                err,
+            });
+        };
+    }
+}
+
+pub fn removeClientRouteHintForRemoteSession(allocator: std.mem.Allocator, session: *const RuntimeSession) void {
+    if (session.clientGuidSlice().len == 0) return;
+    session_registry.removeClientRouteHint(allocator, session.clientGuidSlice()) catch |err| {
+        client_log.debug("event=client_route_hint_remove_failed session={s} client={s} error={t}", .{
+            session.guidSlice(),
+            session.clientGuidSlice(),
+            err,
+        });
+    };
 }
 
 pub fn tombstoneLocalRouteForRemoteSession(allocator: std.mem.Allocator, session: *const RuntimeSession) !void {

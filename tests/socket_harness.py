@@ -610,6 +610,10 @@ def runtime_root(env):
     return Path(env["XDG_RUNTIME_DIR"])
 
 
+def client_route_hint_file(env, client_guid):
+    return runtime_root(env) / "client" / client_guid / "route.json"
+
+
 def aliases_dir(env):
     return state_root(env) / "alias"
 
@@ -2867,6 +2871,7 @@ def run_client_control_commands_test(base_env):
         shell.chmod(0o700)
         client_one = "c-11111111-1111-1111-1111-111111111111"
         client_two = "c-22222222-2222-2222-2222-222222222222"
+        client_three = "c-33333333-3333-4333-8333-333333333333"
         proc = None
         conns = []
 
@@ -3011,6 +3016,28 @@ def run_client_control_commands_test(base_env):
             missing_last_input = run([".", "--detach-client", "--last-input", "s1"], env, timeout=5.0)
             if missing_last_input.returncode == 0 or "no attached client has sent user input" not in missing_last_input.stderr:
                 raise AssertionError(missing_last_input)
+
+            conn3 = attach_existing(client_three)
+            hint = client_route_hint_file(env, client_three)
+            if not hint.is_symlink():
+                raise AssertionError(f"client route hint is missing: {hint}")
+            if Path(os.readlink(hint)) != route_file(env, "s1"):
+                raise AssertionError(f"client route hint target mismatch: {os.readlink(hint)}")
+            detached_by_client_guid = run([".", "--detach-client", "--client", client_three], env, check=True, timeout=5.0)
+            if f"DETACHED {client_three}" not in detached_by_client_guid.stdout:
+                raise AssertionError(detached_by_client_guid)
+            recv_until_message(conn3, CLIENT_DETACH_REQUEST)
+            conn3.close()
+            deadline = time.time() + 5.0
+            while True:
+                state = query_session_live_state(env)
+                if [client.client_guid for client in state.attached_clients] == [client_two]:
+                    break
+                if time.time() > deadline:
+                    raise AssertionError(state)
+                time.sleep(0.02)
+            if hint.exists() or hint.is_symlink():
+                raise AssertionError(f"client route hint was not removed: {hint}")
 
             unresponsive = run([".", "--debug-client", "unresponsive-connection", "--seconds", "1", "--client", client_two, "s1"], env, check=True, timeout=5.0)
             if f"UNRESPONSIVE {client_two}" not in unresponsive.stdout:

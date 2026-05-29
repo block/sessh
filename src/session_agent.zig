@@ -2919,6 +2919,7 @@ fn attachSession(
         } else {
             try sendSessionSnapshot(attachment, session);
         }
+        writeClientRouteHintForAttachment(session_agent, session, attachment);
         refreshAttachedFlag(session_agent, session_index);
         logSessionAgent(session_agent, "event=attach id={s} client={s} rows={} cols={} attachments={}", .{
             session.idSlice(),
@@ -2932,6 +2933,26 @@ fn attachSession(
     }
 
     return error.TooManyAttachments;
+}
+
+fn writeClientRouteHintForAttachment(session_agent: *SessionAgent, session: *const Session, attachment: *const Attachment) void {
+    session_registry.writeClientRouteHint(app_allocator.allocator(), attachment.clientGuidSlice(), session.idSlice()) catch |err| {
+        logSessionAgent(session_agent, "event=client_route_hint_write_failed id={s} client={s} error={t}", .{
+            session.idSlice(),
+            attachment.clientGuidSlice(),
+            err,
+        });
+    };
+}
+
+fn removeClientRouteHintForAttachment(session_agent: *SessionAgent, session: *const Session, attachment: *const Attachment) void {
+    session_registry.removeClientRouteHint(app_allocator.allocator(), attachment.clientGuidSlice()) catch |err| {
+        logSessionAgent(session_agent, "event=client_route_hint_remove_failed id={s} client={s} error={t}", .{
+            session.idSlice(),
+            attachment.clientGuidSlice(),
+            err,
+        });
+    };
 }
 
 fn detachExistingAttachmentWithClientGuid(session_agent: *SessionAgent, session_index: usize, client_guid: []const u8) void {
@@ -3755,6 +3776,7 @@ fn detachAttachment(session_agent: *SessionAgent, attachment_index: usize) void 
     if (session_index < session_agent.sessions.len) {
         const session = &session_agent.sessions[session_index];
         logSessionAgent(session_agent, "event=detach id={s} rows={} cols={}", .{ session.idSlice(), attachment.rows, attachment.cols });
+        removeClientRouteHintForAttachment(session_agent, session, attachment);
     }
     _ = c.close(attachment.fd);
     attachment.output.deinit(app_allocator.allocator());
@@ -3812,6 +3834,7 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
         });
     }
     sendSessionEndedToAttachments(session_agent, session_index, reason, exit_info);
+    removeClientRouteHintsForSession(session_agent, session_index);
     writeEndedSessionTombstone(session_agent, session, reason, exit_info);
     if (session.pty_fd >= 0) _ = c.close(session.pty_fd);
     if (session.terminal_model) |model| {
@@ -3852,6 +3875,15 @@ fn writeEndedSessionTombstone(session_agent: *SessionAgent, session: *const Sess
 
 fn clearAttachmentHints(session_agent: *SessionAgent) void {
     if (session_agent.session_paths) |paths| session_registry.removeEndedHints(paths) catch {};
+}
+
+fn removeClientRouteHintsForSession(session_agent: *SessionAgent, session_index: usize) void {
+    if (session_index >= session_agent.sessions.len) return;
+    const session = &session_agent.sessions[session_index];
+    for (&session_agent.attachments) |*attachment| {
+        if (!attachment.active or attachment.session_index != session_index) continue;
+        removeClientRouteHintForAttachment(session_agent, session, attachment);
+    }
 }
 
 fn stopSessionAgentIfComplete(session_agent: *SessionAgent) void {

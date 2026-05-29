@@ -1153,7 +1153,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             .detach => {
                 client_log.debug("event=detach host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 child.terminate();
-                try finishDetachedSshSession(parsed_ssh_args, &session);
+                try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
                 return;
             },
             .session_ended => {
@@ -1246,7 +1246,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                 .detach => {
                     child.terminate();
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(parsed_ssh_args, &session);
+                    try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
                     return;
                 },
                 .failed => |err| {
@@ -1286,7 +1286,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                         reconnect_attempt,
                     });
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(parsed_ssh_args, &session);
+                    try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
                     return;
                 },
                 .reconnect_now, .wait_elapsed => {
@@ -1311,7 +1311,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                 error.ExitRequested => return err,
                 error.ReconnectDetached => {
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(parsed_ssh_args, &session);
+                    try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
                     return;
                 },
                 error.OutOfMemory => return err,
@@ -1362,7 +1362,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                 .detach => {
                     child.terminate();
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(parsed_ssh_args, &session);
+                    try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
                     return;
                 },
                 .reconnect_now, .wait_elapsed => {},
@@ -1415,7 +1415,8 @@ fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) v
     io.stderrPrint("sessh: ssh runtime ended after attach {s} failure: {t}\n", .{ stage, term }) catch {};
 }
 
-fn finishDetachedSshSession(parsed_ssh_args: ParsedSshArgs, session: *const client.RuntimeSession) !void {
+fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, session: *const client.RuntimeSession) !void {
+    client.removeClientRouteHintForRemoteSession(allocator, session);
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
     client.writeDetachBannerForSessionRef(parsed_ssh_args.banner_args.slice(), session.idSlice());
@@ -1426,6 +1427,7 @@ fn finishEndedRemoteSession(
     child: *RuntimeConnection,
     session: *const client.RuntimeSession,
 ) !void {
+    client.removeClientRouteHintForRemoteSession(allocator, session);
     client.tombstoneLocalRouteForRemoteSession(allocator, session) catch |err| {
         client_log.debug("event=local_tombstone_failed session={s} error={t}", .{ session.idSlice(), err });
     };
@@ -4673,6 +4675,14 @@ test "translateMuxArgs maps client management commands" {
     });
     defer detach_client.deinit();
     try expectArgvEqual(&.{ "sesshmux", ".", "--detach-client", "--client", client_guid, "s1" }, detach_client.args.items);
+
+    var detach_client_without_session = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "detach",
+        client_guid,
+    });
+    defer detach_client_without_session.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "--detach-client", "--client", client_guid }, detach_client_without_session.args.items);
 
     var repaint_all = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",

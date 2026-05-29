@@ -32,6 +32,11 @@ The actual socket path lives under `s/` followed by a compact representation of
 the guid (or random hex bytes if `XDG_RUNTIME_DIR` is too long to allow the
 full guid to fit).
 
+Client attachments also get runtime hints under `client/<client-guid>/`. Each
+hint contains a `route.json` symlink to the session's durable route in
+`XDG_STATE_HOME`. This lets commands like `sesshmux detach c-...` find the
+session from a client id alone. The hint is removed when that client detaches.
+
 The XDG spec explicitly permits periodic cleanup of files in `XDG_RUNTIME_DIR`,
 and says runtime files should either have their access time updated at least
 every 6 hours of monotonic time or have the sticky bit set:
