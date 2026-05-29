@@ -1009,6 +1009,13 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             return process_exit.request(1);
         };
         if (exit_status != 0) return process_exit.request(exit_status);
+        if (parsed_ssh_args.action == .kill) {
+            if (route_storage) |*route| {
+                tombstoneLocalRouteForRemoteKill(allocator, route) catch |err| {
+                    client_log.debug("event=local_kill_tombstone_failed session={s} error={t}", .{ route.guid, err });
+                };
+            }
+        }
         return;
     }
 
@@ -1575,6 +1582,20 @@ fn runRemoteBrokerCommandAndForward(connection: *RuntimeConnection) !u8 {
         .Exited => |code| @intCast(@min(code, std.math.maxInt(u8))),
         else => 1,
     };
+}
+
+fn tombstoneLocalRouteForRemoteKill(allocator: std.mem.Allocator, route: *const session_registry.Route) !void {
+    try session_registry.writeTombstoneForRoute(allocator, route, .{
+        .ended_at_unix_ms = nowUnixMs(),
+        .end_reason = .killed_by_request,
+        .exit_status = null,
+    });
+}
+
+fn nowUnixMs() u64 {
+    const ms = std.time.milliTimestamp();
+    if (ms <= 0) return 0;
+    return @intCast(ms);
 }
 
 fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs) ![]u8 {

@@ -1670,6 +1670,23 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
         raise AssertionError(killed)
     if not killed.stdout.startswith("ENDED "):
         raise AssertionError(killed)
+    listed_exited = run_sesshmux(["list", "--exited", "--jsonl"], changed_runtime_env, timeout=30.0)
+    if listed_exited.returncode != 0:
+        raise AssertionError(listed_exited)
+    rows = [json.loads(line) for line in listed_exited.stdout.splitlines() if line.strip()]
+    matches = [row for row in rows if row.get("id") == "route-alias"]
+    if len(matches) != 1:
+        raise AssertionError(process_diagnostics(listed_exited))
+    row = matches[0]
+    if row.get("host") != "test-host" or row.get("end_reason") != "killed_by_request" or row.get("exit_status") is not None:
+        raise AssertionError(row)
+    guid = row.get("guid")
+    if not guid:
+        raise AssertionError(row)
+    if (state_sessions_dir(changed_runtime_env) / guid / "route.json").exists():
+        raise AssertionError("local cached route was not tombstoned after remote kill")
+    if (aliases_dir(changed_runtime_env) / "route-alias").exists() or (aliases_dir(changed_runtime_env) / "route-alias").is_symlink():
+        raise AssertionError("local cached route alias was not released after remote kill")
     log_text = fake_log.read_text()
     if log_text.splitlines().count("invoked=1") < 2:
         raise AssertionError(log_text)
