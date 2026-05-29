@@ -930,7 +930,7 @@ def write_ssh_route(env, alias, guid, host, ssh_options=()):
 
 
 def write_client_route_hint(env, client_guid, session_id):
-    hint = runtime_root(env) / "client" / client_guid / "route.json"
+    hint = runtime_root(env) / "guid" / client_guid / "route.json"
     hint.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if hint.exists() or hint.is_symlink():
         hint.unlink()
@@ -2924,7 +2924,7 @@ def test_ssh_version_mismatch_uses_compat_path(tmp):
         raise AssertionError(log_text)
     expected_args = (
         f"compat_args=. --compat-version {sessh_version()} "
-        "--attach s1 --leader CTRL-B --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
+        "attach s1 --leader CTRL-B --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
     )
     if expected_args not in log_text:
         raise AssertionError(log_text)
@@ -2960,7 +2960,7 @@ def test_ssh_force_compat_uses_compat_path(tmp):
         raise AssertionError(log_text)
     expected_args = (
         f"compat_args=. --compat-version {sessh_version()} "
-        "--attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
+        "attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
     )
     if expected_args not in log_text:
         raise AssertionError(log_text)
@@ -2992,7 +2992,7 @@ def test_ssh_force_compat_uses_cached_route(tmp):
         raise AssertionError(log_text)
     expected_args = (
         f"compat_args=. --compat-version {sessh_version()} "
-        f"--attach {route_guid} --leader None --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
+        f"attach {route_guid} --leader None --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
     )
     if expected_args not in log_text:
         raise AssertionError(log_text)

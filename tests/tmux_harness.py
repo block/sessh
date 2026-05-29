@@ -444,7 +444,7 @@ def main():
                     "-k",
                     "-t",
                     session,
-                    sessh_command(env, "--attach", shell=command_shell),
+                    sessh_command(env, "attach", shell=command_shell),
                 ]
             )
             wait_capture(session, detached_marker)

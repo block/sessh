@@ -98,7 +98,7 @@ test("sessh initial-scrollback=0 attach clears stale outer row tails", async () 
 
     attach = createTestTerminal({ cols: 40, rows: 8 });
     attach.feed(staleVisibleRows(8));
-    await attach.spawn([SESSH_BIN, ".", "--attach", "stale-tail"], {
+    await attach.spawn([SESSH_BIN, ".", "attach", "stale-tail"], {
       cwd: REPO_ROOT,
       env,
     });

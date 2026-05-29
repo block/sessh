@@ -324,6 +324,7 @@ pub fn runMux(allocator: std.mem.Allocator, args: []const []const u8, strict_com
         const invocation: MuxInvocation = if (strict_command) .sesshmux else .sessh;
         const parse_options = CliParseOptions{
             .allow_force_compat = invocation == .sesshmux and std.mem.eql(u8, args[1], "attach"),
+            .allow_mux_command_words = true,
         };
         var translated = translateMuxArgsForInvocation(allocator, args, invocation) catch |err| {
             if (invocation == .sessh and shouldUsePlainSshFallbackForMuxNewArgError(args, err)) {
@@ -385,15 +386,15 @@ fn translateMuxArgsForInvocation(
     } else if (std.mem.eql(u8, command, "list-clients")) {
         try translateMuxListClients(&translated, args[2..]);
     } else if (std.mem.eql(u8, command, "detach")) {
-        try translateMuxClientControl(&translated, "--detach-client", null, args[2..], false);
+        try translateMuxClientControl(&translated, "detach", null, args[2..], false);
     } else if (std.mem.eql(u8, command, "repaint")) {
-        try translateMuxClientControl(&translated, "--repaint-client", null, args[2..], true);
+        try translateMuxClientControl(&translated, "repaint", null, args[2..], true);
     } else if (std.mem.eql(u8, command, "debug")) {
         if (args.len < 3) return error.MissingDebugAction;
         const debug_action = args[2];
         if (!std.mem.eql(u8, debug_action, "sever-connection") and
             !std.mem.eql(u8, debug_action, "unresponsive-connection")) return error.InvalidDebugAction;
-        try translateMuxClientControl(&translated, "--debug-client", debug_action, args[3..], false);
+        try translateMuxClientControl(&translated, "debug", debug_action, args[3..], false);
     } else {
         return error.UnsupportedMuxCommand;
     }
@@ -428,13 +429,6 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
         } else if (isSesshLongOption(arg)) {
             if (host != null) return error.SesshOptionAfterHost;
             if (isConfigOrEnvOnlySesshOption(arg)) return error.UnsupportedSesshCliOption;
-            if (std.mem.eql(u8, arg, "--list") or
-                std.mem.eql(u8, arg, "--attach") or
-                std.mem.eql(u8, arg, "--kill") or
-                std.mem.eql(u8, arg, "--kill-all"))
-            {
-                return error.UnsupportedMuxOption;
-            }
             try appendSesshOption(translated.allocator, args, &i, &sessh_options);
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.UnsupportedMuxOption;
@@ -479,24 +473,24 @@ fn translateMuxAttach(translated: *TranslatedMuxArgs, args: []const []const u8) 
     var host_option: ?[]const u8 = null;
     var force_compat = false;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, &force_compat, null, null, null, null, null, null, null);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, &force_compat, null, null, null, null, null, null);
 
     if (host_option) |host| {
         if (positional.items.len > 1) return error.TooManyMuxArguments;
         try appendMany(translated, ssh_options.items);
         try translated.append(host);
-        try translated.append("--attach");
+        try translated.append("attach");
         if (positional.items.len == 1) try translated.append(positional.items[0]);
         try appendMany(translated, sessh_options.items);
     } else if (positional.items.len == 1) {
         if (ssh_options.items.len > 0) return error.MissingHost;
-        try translated.append("--attach");
+        try translated.append("attach");
         try translated.append(positional.items[0]);
         try appendMany(translated, sessh_options.items);
     } else if (positional.items.len == 0) {
         if (ssh_options.items.len > 0) return error.MissingHost;
         try translated.append(".");
-        try translated.append("--attach");
+        try translated.append("attach");
         try appendMany(translated, sessh_options.items);
     } else {
         return error.TooManyMuxArguments;
@@ -514,26 +508,26 @@ fn translateMuxList(translated: *TranslatedMuxArgs, args: []const []const u8) !v
     var refresh = false;
     var exited = false;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, &refresh, null, null, null, null, null, &exited);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, &refresh, null, null, null, null, &exited);
     if (host_option) |host| {
         if (positional.items.len != 0) return error.TooManyMuxArguments;
         try appendMany(translated, ssh_options.items);
         try translated.append(host);
-        try translated.append("--list");
+        try translated.append("list");
         if (refresh) try translated.append("--refresh");
         if (exited) try translated.append("--exited");
         try appendMany(translated, sessh_options.items);
     } else if (positional.items.len == 0) {
         if (ssh_options.items.len > 0) return error.MissingHost;
         try translated.append(".");
-        try translated.append("--list");
+        try translated.append("list");
         if (refresh) try translated.append("--refresh");
         if (exited) try translated.append("--exited");
         try appendMany(translated, sessh_options.items);
     } else if (positional.items.len == 1 and std.mem.eql(u8, positional.items[0], ".")) {
         if (ssh_options.items.len > 0) return error.MissingHost;
         try translated.append(".");
-        try translated.append("--list");
+        try translated.append("list");
         try translated.append("--local-only");
         if (refresh) try translated.append("--refresh");
         if (exited) try translated.append("--exited");
@@ -541,7 +535,7 @@ fn translateMuxList(translated: *TranslatedMuxArgs, args: []const []const u8) !v
     } else if (positional.items.len == 1) {
         try appendMany(translated, ssh_options.items);
         try translated.append(positional.items[0]);
-        try translated.append("--list");
+        try translated.append("list");
         if (refresh) try translated.append("--refresh");
         if (exited) try translated.append("--exited");
         try appendMany(translated, sessh_options.items);
@@ -560,24 +554,27 @@ fn translateMuxKill(translated: *TranslatedMuxArgs, args: []const []const u8) !v
     var host_option: ?[]const u8 = null;
     var all = false;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, null, &all, null, null, null, null, null);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, null, &all, null, null, null, null);
 
     if (all) {
         if (host_option) |host| {
             if (positional.items.len != 0) return error.TooManyMuxArguments;
             try appendMany(translated, ssh_options.items);
             try translated.append(host);
-            try translated.append("--kill-all");
+            try translated.append("kill");
+            try translated.append("--all");
             try appendMany(translated, sessh_options.items);
         } else if (positional.items.len == 0) {
             if (ssh_options.items.len > 0) return error.MissingHost;
             try translated.append(".");
-            try translated.append("--kill-all");
+            try translated.append("kill");
+            try translated.append("--all");
             try appendMany(translated, sessh_options.items);
         } else if (positional.items.len == 1) {
             try appendMany(translated, ssh_options.items);
             try translated.append(positional.items[0]);
-            try translated.append("--kill-all");
+            try translated.append("kill");
+            try translated.append("--all");
             try appendMany(translated, sessh_options.items);
         } else {
             return error.TooManyMuxArguments;
@@ -589,18 +586,18 @@ fn translateMuxKill(translated: *TranslatedMuxArgs, args: []const []const u8) !v
         if (positional.items.len != 1) return error.TooManyMuxArguments;
         try appendMany(translated, ssh_options.items);
         try translated.append(host);
-        try translated.append("--kill");
+        try translated.append("kill");
         try translated.append(positional.items[0]);
         try appendMany(translated, sessh_options.items);
     } else if (positional.items.len == 2) {
         try appendMany(translated, ssh_options.items);
         try translated.append(positional.items[0]);
-        try translated.append("--kill");
+        try translated.append("kill");
         try translated.append(positional.items[1]);
         try appendMany(translated, sessh_options.items);
     } else if (positional.items.len == 1) {
         if (ssh_options.items.len > 0) return error.MissingHost;
-        try translated.append("--kill");
+        try translated.append("kill");
         try translated.append(positional.items[0]);
         try appendMany(translated, sessh_options.items);
     } else {
@@ -618,7 +615,7 @@ fn translateMuxListClients(translated: *TranslatedMuxArgs, args: []const []const
     var host_option: ?[]const u8 = null;
     var jsonl = false;
 
-    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, null, null, null, null, null, null, null);
+    try parseMuxCommandOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, false, null, null, null, null, null, null, null);
     var filtered_positionals = positional.items;
     for (positional.items, 0..) |arg, i| {
         if (std.mem.eql(u8, arg, "--jsonl")) {
@@ -633,7 +630,7 @@ fn translateMuxListClients(translated: *TranslatedMuxArgs, args: []const []const
         if (filtered_positionals.len > 1) return error.TooManyMuxArguments;
         try appendMany(translated, ssh_options.items);
         try translated.append(host);
-        try translated.append("--list-clients");
+        try translated.append("list-clients");
         if (jsonl) try translated.append("--jsonl");
         if (filtered_positionals.len == 1) try translated.append(filtered_positionals[0]);
         try appendMany(translated, sessh_options.items);
@@ -641,11 +638,11 @@ fn translateMuxListClients(translated: *TranslatedMuxArgs, args: []const []const
         if (ssh_options.items.len > 0) return error.MissingHost;
         if (filtered_positionals.len == 0) {
             try translated.append(".");
-            try translated.append("--list-clients");
+            try translated.append("list-clients");
             if (jsonl) try translated.append("--jsonl");
             try appendMany(translated, sessh_options.items);
         } else if (filtered_positionals.len == 1) {
-            try translated.append("--list-clients");
+            try translated.append("list-clients");
             try translated.append(filtered_positionals[0]);
             if (jsonl) try translated.append("--jsonl");
             try appendMany(translated, sessh_options.items);
@@ -657,7 +654,7 @@ fn translateMuxListClients(translated: *TranslatedMuxArgs, args: []const []const
 
 fn translateMuxClientControl(
     translated: *TranslatedMuxArgs,
-    internal_option: []const u8,
+    command: []const u8,
     debug_action: ?[]const u8,
     args: []const []const u8,
     repaint_defaults_to_all: bool,
@@ -687,7 +684,6 @@ fn translateMuxClientControl(
         null,
         &all,
         &last_input,
-        &client_guid,
         if (repaint_defaults_to_all) &include_scrollback else null,
         if (debug_action != null and std.mem.eql(u8, debug_action.?, "unresponsive-connection")) &seconds_arg else null,
         null,
@@ -721,14 +717,13 @@ fn translateMuxClientControl(
         if (ssh_options.items.len > 0) return error.MissingHost;
         try translated.append(".");
     }
-    try translated.append(internal_option);
+    try translated.append(command);
     if (debug_action) |action| try translated.append(action);
     if (all or (repaint_defaults_to_all and client_guid == null and !last_input)) {
         try translated.append("--all");
     } else if (last_input) {
         try translated.append("--last-input");
     } else if (client_guid) |guid| {
-        try translated.append("--client");
         try translated.append(guid);
     }
     if (include_scrollback) try translated.append("--scrollback");
@@ -756,7 +751,6 @@ fn parseMuxCommandOptions(
     refresh_option: ?*bool,
     all_option: ?*bool,
     last_input_option: ?*bool,
-    client_guid_option: ?*?[]const u8,
     scrollback_option: ?*bool,
     seconds_option: ?*?[]const u8,
     exited_option: ?*bool,
@@ -803,15 +797,6 @@ fn parseMuxCommandOptions(
             } else {
                 return error.UnsupportedMuxOption;
             }
-        } else if (std.mem.eql(u8, arg, "--client")) {
-            if (client_guid_option) |client_guid| {
-                i += 1;
-                if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingClientGuid;
-                client_guid.* = args[i];
-                i += 1;
-            } else {
-                return error.UnsupportedMuxOption;
-            }
         } else if (std.mem.eql(u8, arg, "--scrollback")) {
             if (scrollback_option) |scrollback| {
                 scrollback.* = true;
@@ -841,16 +826,7 @@ fn parseMuxCommandOptions(
             i += 1;
         } else if (isSesshLongOption(arg)) {
             if (isConfigOrEnvOnlySesshOption(arg)) return error.UnsupportedSesshCliOption;
-            if (std.mem.eql(u8, arg, "--alias") or
-                std.mem.eql(u8, arg, "--attach") or
-                std.mem.eql(u8, arg, "--list") or
-                std.mem.eql(u8, arg, "--kill") or
-                std.mem.eql(u8, arg, "--kill-all") or
-                std.mem.eql(u8, arg, "--list-clients") or
-                std.mem.eql(u8, arg, "--detach-client") or
-                std.mem.eql(u8, arg, "--repaint-client") or
-                std.mem.eql(u8, arg, "--debug-client"))
-            {
+            if (std.mem.eql(u8, arg, "--alias")) {
                 return error.UnsupportedMuxOption;
             }
             try appendSesshOption(translated.allocator, args, &i, sessh_options);
@@ -925,8 +901,7 @@ fn sesshLongOptionRequiresValue(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--alias") or
-        std.mem.eql(u8, arg, "--capture-tty-transcript") or
-        std.mem.eql(u8, arg, "--kill");
+        std.mem.eql(u8, arg, "--capture-tty-transcript");
 }
 
 fn sesshLongOptionMissingValueError(arg: []const u8) anyerror {
@@ -936,7 +911,6 @@ fn sesshLongOptionMissingValueError(arg: []const u8) anyerror {
     if (std.mem.eql(u8, arg, "--log-level")) return error.MissingClientLogLevel;
     if (std.mem.eql(u8, arg, "--alias")) return error.MissingAlias;
     if (std.mem.eql(u8, arg, "--capture-tty-transcript")) return error.MissingTtyTranscriptPath;
-    if (std.mem.eql(u8, arg, "--kill")) return error.MissingKillId;
     return error.UnsupportedMuxOption;
 }
 
@@ -953,6 +927,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
 const CliParseOptions = struct {
     allow_force_compat: bool = false,
+    allow_mux_command_words: bool = false,
 };
 
 fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, parse_options: CliParseOptions) !void {
@@ -1546,9 +1521,9 @@ fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[12][]const u8) []c
         },
         .detach_client, .repaint_client, .debug_client => {
             buf[len] = switch (parsed_ssh_args.action) {
-                .detach_client => "detach-client",
-                .repaint_client => "repaint-client",
-                .debug_client => "debug-client",
+                .detach_client => "detach",
+                .repaint_client => "repaint",
+                .debug_client => "debug",
                 else => unreachable,
             };
             len += 1;
@@ -1570,8 +1545,6 @@ fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[12][]const u8) []c
                     len += 1;
                 },
                 .client_guid => {
-                    buf[len] = "--client";
-                    len += 1;
                     buf[len] = parsed_ssh_args.client_guid.?;
                     len += 1;
                 },
@@ -1586,8 +1559,10 @@ fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[12][]const u8) []c
                 buf[len] = seconds;
                 len += 1;
             }
-            buf[len] = parsed_ssh_args.client_session_ref orelse "";
-            len += 1;
+            if (parsed_ssh_args.client_session_ref) |session_ref| {
+                buf[len] = session_ref;
+                len += 1;
+            }
         },
     }
     return buf[0..len];
@@ -1775,15 +1750,18 @@ fn localCompatArgs(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs)
     switch (parsed_ssh_args.action) {
         .new => {},
         .attach => {
-            try appendCompatArg(allocator, &out, "--attach");
+            try appendCompatArg(allocator, &out, "attach");
             if (parsed_ssh_args.attach_id) |id| try appendCompatArg(allocator, &out, id);
         },
-        .list => try appendCompatArg(allocator, &out, "--list"),
+        .list => try appendCompatArg(allocator, &out, "list"),
         .kill => {
-            try appendCompatArg(allocator, &out, "--kill");
+            try appendCompatArg(allocator, &out, "kill");
             try appendCompatArg(allocator, &out, parsed_ssh_args.kill_id.?);
         },
-        .kill_all => try appendCompatArg(allocator, &out, "--kill-all"),
+        .kill_all => {
+            try appendCompatArg(allocator, &out, "kill");
+            try appendCompatArg(allocator, &out, "--all");
+        },
         .list_clients, .detach_client, .repaint_client, .debug_client => return error.UnsupportedCompatCommand,
     }
 
@@ -2856,21 +2834,21 @@ fn parseRouteRefArgs(
     var i: usize = 1;
     while (i < args.len) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--attach")) {
+        if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "attach")) {
             if (action != null) return error.ConflictingSesshAction;
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingAttachId;
             action = .attach;
             ref = args[i];
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--kill")) {
+        } else if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "kill")) {
             if (action != null) return error.ConflictingSesshAction;
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingKillId;
             action = .kill;
             ref = args[i];
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--list-clients")) {
+        } else if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "list-clients")) {
             if (action != null) return error.ConflictingSesshAction;
             action = .list_clients;
             i += 1;
@@ -3092,7 +3070,7 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
 fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *ParsedSshArgs, parse_options: CliParseOptions) !void {
     while (index.* < args.len) {
         const arg = args[index.*];
-        if (std.mem.eql(u8, arg, "--attach")) {
+        if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "attach")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.action = .attach;
             index.* += 1;
@@ -3158,7 +3136,7 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingTtyTranscriptPath;
             parsed.capture_tty_transcript = args[index.*];
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--list")) {
+        } else if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "list")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.action = .list;
             index.* += 1;
@@ -3179,18 +3157,19 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
                 return error.UnsupportedSesshOption;
             }
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--kill")) {
+        } else if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "kill")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             index.* += 1;
-            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingKillId;
-            parsed.action = .kill;
-            parsed.kill_id = args[index.*];
-            index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--kill-all")) {
-            if (parsed.action != .new) return error.ConflictingSesshAction;
-            parsed.action = .kill_all;
-            index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--list-clients")) {
+            if (index.* < args.len and std.mem.eql(u8, args[index.*], "--all")) {
+                parsed.action = .kill_all;
+                index.* += 1;
+            } else {
+                if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingKillId;
+                parsed.action = .kill;
+                parsed.kill_id = args[index.*];
+                index.* += 1;
+            }
+        } else if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "list-clients")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.action = .list_clients;
             index.* += 1;
@@ -3198,15 +3177,15 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
                 parsed.client_session_ref = args[index.*];
                 index.* += 1;
             }
-        } else if (std.mem.eql(u8, arg, "--detach-client")) {
+        } else if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "detach")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.action = .detach_client;
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--repaint-client")) {
+        } else if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "repaint")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.action = .repaint_client;
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--debug-client")) {
+        } else if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "debug")) {
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.action = .debug_client;
             index.* += 1;
@@ -3232,11 +3211,6 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
         } else if (std.mem.eql(u8, arg, "--last-input")) {
             try setParsedClientTarget(parsed, .last_input, null);
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--client")) {
-            index.* += 1;
-            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingClientGuid;
-            try setParsedClientTarget(parsed, .client_guid, args[index.*]);
-            index.* += 1;
         } else if (std.mem.eql(u8, arg, "--scrollback")) {
             if (parsed.action != .repaint_client) return error.UnsupportedSesshOption;
             parsed.client_repaint_scrollback = true;
@@ -3249,6 +3223,9 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             index.* = args.len;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.UnsupportedSesshOption;
+        } else if (actionSupportsParsedClientTarget(parsed.action) and parsed.client_target == .default and std.mem.startsWith(u8, arg, session_registry.client_guid_prefix)) {
+            try setParsedClientTarget(parsed, .client_guid, arg);
+            index.* += 1;
         } else if (actionSupportsParsedClientSessionRef(parsed.action) and parsed.client_session_ref == null) {
             parsed.client_session_ref = arg;
             index.* += 1;
@@ -3259,8 +3236,7 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
 }
 
 fn isSesshLongOption(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--attach") or
-        std.mem.eql(u8, arg, "--leader") or
+    return std.mem.eql(u8, arg, "--leader") or
         std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
@@ -3268,19 +3244,11 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
         std.mem.eql(u8, arg, "--capture-tty-transcript") or
-        std.mem.eql(u8, arg, "--list") or
         std.mem.eql(u8, arg, "--refresh") or
         std.mem.eql(u8, arg, "--exited") or
         std.mem.eql(u8, arg, "--jsonl") or
-        std.mem.eql(u8, arg, "--kill") or
-        std.mem.eql(u8, arg, "--kill-all") or
-        std.mem.eql(u8, arg, "--list-clients") or
-        std.mem.eql(u8, arg, "--detach-client") or
-        std.mem.eql(u8, arg, "--repaint-client") or
-        std.mem.eql(u8, arg, "--debug-client") or
         std.mem.eql(u8, arg, "--all") or
         std.mem.eql(u8, arg, "--last-input") or
-        std.mem.eql(u8, arg, "--client") or
         std.mem.eql(u8, arg, "--scrollback");
 }
 
@@ -3420,7 +3388,7 @@ fn sshConfigValueIs(raw_option: []const u8, key_len: usize, expected: []const u8
 fn printSshArgError(err: anyerror) !void {
     switch (err) {
         error.MissingHost => try io.writeAll(2, "sessh: missing host\n"),
-        error.MissingAttachId => try io.writeAll(2, "sesshmux: --attach requires an id in this form\n"),
+        error.MissingAttachId => try io.writeAll(2, "sesshmux: attach requires an id in this form\n"),
         error.MissingKillId => try io.writeAll(2, "sesshmux: kill requires an id\n"),
         error.MissingAlias => try io.writeAll(2, "sessh: --alias requires a value\n"),
         error.MissingLeader => try io.writeAll(2, "sessh: --leader requires a value\n"),
@@ -4101,7 +4069,7 @@ test "parseSshArgs accepts translated attach options after host" {
         "-F",
         "ssh_config",
         "example.com",
-        "--attach",
+        "attach",
         "s12",
         "--leader",
         "CTRL-B",
@@ -4112,7 +4080,7 @@ test "parseSshArgs accepts translated attach options after host" {
         "--log-level",
         "debug",
         "--bootstrap",
-    }, .{});
+    }, .{ .allow_mux_command_words = true });
 
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqual(@as(usize, 2), parsed.options.len);
@@ -4144,18 +4112,18 @@ test "parseSshArgs accepts force compat only for translated mux attach" {
     try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
         "sesshmux",
         "example.com",
-        "--attach",
+        "attach",
         "s12",
         "--force-compat",
-    }, .{}));
+    }, .{ .allow_mux_command_words = true }));
 
     const parsed = try parseSshArgs(&.{
         "sesshmux",
         "example.com",
-        "--attach",
+        "attach",
         "s12",
         "--force-compat",
-    }, .{ .allow_force_compat = true });
+    }, .{ .allow_force_compat = true, .allow_mux_command_words = true });
 
     try std.testing.expectEqual(SshAction.attach, parsed.action);
     try std.testing.expect(parsed.force_compat);
@@ -4167,10 +4135,10 @@ test "parseSshArgs accepts no bootstrap shorthand after host" {
     const parsed = try parseSshArgs(&.{
         "sesshmux",
         "example.com",
-        "--attach",
+        "attach",
         "s12",
         "--no-bootstrap",
-    }, .{});
+    }, .{ .allow_mux_command_words = true });
 
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqual(SshAction.attach, parsed.action);
@@ -4185,10 +4153,10 @@ test "parseSshArgs accepts attach without an id after host" {
     const parsed = try parseSshArgs(&.{
         "sesshmux",
         "example.com",
-        "--attach",
+        "attach",
         "--scrollback-limit",
         "100",
-    }, .{});
+    }, .{ .allow_mux_command_words = true });
 
     try std.testing.expectEqual(SshAction.attach, parsed.action);
     try std.testing.expectEqual(@as(?[]const u8, null), parsed.attach_id);
@@ -4196,23 +4164,23 @@ test "parseSshArgs accepts attach without an id after host" {
 }
 
 test "parseSshArgs accepts translated remote session commands after host" {
-    const list = try parseSshArgs(&.{ "sesshmux", "example.com", "--list" }, .{});
+    const list = try parseSshArgs(&.{ "sesshmux", "example.com", "list" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.list, list.action);
 
-    const refresh_list = try parseSshArgs(&.{ "sesshmux", "example.com", "--list", "--refresh" }, .{});
+    const refresh_list = try parseSshArgs(&.{ "sesshmux", "example.com", "list", "--refresh" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.list, refresh_list.action);
     try std.testing.expect(refresh_list.list_refresh);
 
-    const exited_list = try parseSshArgs(&.{ "sesshmux", "example.com", "--list", "--exited", "--jsonl" }, .{});
+    const exited_list = try parseSshArgs(&.{ "sesshmux", "example.com", "list", "--exited", "--jsonl" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.list, exited_list.action);
     try std.testing.expect(exited_list.list_exited);
     try std.testing.expect(exited_list.list_jsonl);
 
-    const kill = try parseSshArgs(&.{ "sesshmux", "example.com", "--kill", "s1" }, .{});
+    const kill = try parseSshArgs(&.{ "sesshmux", "example.com", "kill", "s1" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.kill, kill.action);
     try std.testing.expectEqualStrings("s1", kill.kill_id.?);
 
-    const kill_all = try parseSshArgs(&.{ "sesshmux", "example.com", "--kill-all" }, .{});
+    const kill_all = try parseSshArgs(&.{ "sesshmux", "example.com", "kill", "--all" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.kill_all, kill_all.action);
 }
 
@@ -4259,7 +4227,7 @@ test "brokerArgsForAction uses broker subcommands" {
         .client_session_ref = "s1",
     }, &buf));
 
-    try expectArgvEqual(&.{ "debug-client", "unresponsive-connection", "--client", "c1", "s1" }, brokerArgsForAction(.{
+    try expectArgvEqual(&.{ "debug", "unresponsive-connection", "c1", "s1" }, brokerArgsForAction(.{
         .options = &.{},
         .host = "example.com",
         .action = .debug_client,
@@ -4269,7 +4237,15 @@ test "brokerArgsForAction uses broker subcommands" {
         .client_session_ref = "s1",
     }, &buf));
 
-    try expectArgvEqual(&.{ "debug-client", "unresponsive-connection", "--last-input", "--seconds", "3", "s1" }, brokerArgsForAction(.{
+    try expectArgvEqual(&.{ "detach", "c1" }, brokerArgsForAction(.{
+        .options = &.{},
+        .host = "example.com",
+        .action = .detach_client,
+        .client_target = .client_guid,
+        .client_guid = "c1",
+    }, &buf));
+
+    try expectArgvEqual(&.{ "debug", "unresponsive-connection", "--last-input", "--seconds", "3", "s1" }, brokerArgsForAction(.{
         .options = &.{},
         .host = "example.com",
         .action = .debug_client,
@@ -4279,7 +4255,7 @@ test "brokerArgsForAction uses broker subcommands" {
         .client_session_ref = "s1",
     }, &buf));
 
-    try expectArgvEqual(&.{ "repaint-client", "--last-input", "--scrollback", "s1" }, brokerArgsForAction(.{
+    try expectArgvEqual(&.{ "repaint", "--last-input", "--scrollback", "s1" }, brokerArgsForAction(.{
         .options = &.{},
         .host = "example.com",
         .action = .repaint_client,
@@ -4455,7 +4431,7 @@ test "translateMuxArgs maps local and host-qualified attach" {
         "attach",
     });
     defer latest_local.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--attach" }, latest_local.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "attach" }, latest_local.args.items);
 
     var local = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4463,7 +4439,7 @@ test "translateMuxArgs maps local and host-qualified attach" {
         "s1",
     });
     defer local.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "--attach", "s1" }, local.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "attach", "s1" }, local.args.items);
 
     var remote = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4475,7 +4451,7 @@ test "translateMuxArgs maps local and host-qualified attach" {
         "s1",
     });
     defer remote.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "-F", "cfg", "example.com", "--attach", "s1" }, remote.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "-F", "cfg", "example.com", "attach", "s1" }, remote.args.items);
 
     var remote_latest = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4484,7 +4460,7 @@ test "translateMuxArgs maps local and host-qualified attach" {
         "example.com",
     });
     defer remote_latest.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "example.com", "--attach" }, remote_latest.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "attach" }, remote_latest.args.items);
 
     var remote_force_compat = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4495,7 +4471,7 @@ test "translateMuxArgs maps local and host-qualified attach" {
         "s1",
     });
     defer remote_force_compat.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "example.com", "--attach", "s1", "--force-compat" }, remote_force_compat.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "attach", "s1", "--force-compat" }, remote_force_compat.args.items);
 
     try std.testing.expectError(error.TooManyMuxArguments, translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4518,7 +4494,7 @@ test "translateMuxArgs maps explicit local list" {
         "list",
     });
     defer default_local_list.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--list" }, default_local_list.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "list" }, default_local_list.args.items);
 
     var local_list = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4526,7 +4502,7 @@ test "translateMuxArgs maps explicit local list" {
         ".",
     });
     defer local_list.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--list", "--local-only" }, local_list.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "list", "--local-only" }, local_list.args.items);
 
     var refresh_local_list = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4534,7 +4510,7 @@ test "translateMuxArgs maps explicit local list" {
         "--refresh",
     });
     defer refresh_local_list.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--list", "--refresh" }, refresh_local_list.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "list", "--refresh" }, refresh_local_list.args.items);
 
     var refresh_explicit_local_list = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4543,7 +4519,7 @@ test "translateMuxArgs maps explicit local list" {
         ".",
     });
     defer refresh_explicit_local_list.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--list", "--local-only", "--refresh" }, refresh_explicit_local_list.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "list", "--local-only", "--refresh" }, refresh_explicit_local_list.args.items);
 
     var refresh_remote_list = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4552,7 +4528,7 @@ test "translateMuxArgs maps explicit local list" {
         "example.com",
     });
     defer refresh_remote_list.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "example.com", "--list", "--refresh" }, refresh_remote_list.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "list", "--refresh" }, refresh_remote_list.args.items);
 
     var jsonl_local_list = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4560,7 +4536,7 @@ test "translateMuxArgs maps explicit local list" {
         "--jsonl",
     });
     defer jsonl_local_list.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--list", "--jsonl" }, jsonl_local_list.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "list", "--jsonl" }, jsonl_local_list.args.items);
 
     var jsonl_remote_list = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4570,7 +4546,7 @@ test "translateMuxArgs maps explicit local list" {
         "example.com",
     });
     defer jsonl_remote_list.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "example.com", "--list", "--refresh", "--jsonl" }, jsonl_remote_list.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "list", "--refresh", "--jsonl" }, jsonl_remote_list.args.items);
 
     var exited_local_list = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4579,7 +4555,7 @@ test "translateMuxArgs maps explicit local list" {
         "--jsonl",
     });
     defer exited_local_list.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--list", "--exited", "--jsonl" }, exited_local_list.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "list", "--exited", "--jsonl" }, exited_local_list.args.items);
 
     var exited_explicit_local_list = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4588,7 +4564,7 @@ test "translateMuxArgs maps explicit local list" {
         ".",
     });
     defer exited_explicit_local_list.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--list", "--local-only", "--exited" }, exited_explicit_local_list.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "list", "--local-only", "--exited" }, exited_explicit_local_list.args.items);
 }
 
 test "translateMuxArgs maps kill and kill all" {
@@ -4598,7 +4574,7 @@ test "translateMuxArgs maps kill and kill all" {
         "s1",
     });
     defer local_kill.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "--kill", "s1" }, local_kill.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "kill", "s1" }, local_kill.args.items);
 
     var kill = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4608,7 +4584,7 @@ test "translateMuxArgs maps kill and kill all" {
         "s1",
     });
     defer kill.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "example.com", "--kill", "s1" }, kill.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "kill", "s1" }, kill.args.items);
 
     var kill_all = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4619,7 +4595,7 @@ test "translateMuxArgs maps kill and kill all" {
         "example.com",
     });
     defer kill_all.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "-F", "cfg", "example.com", "--kill-all" }, kill_all.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "-F", "cfg", "example.com", "kill", "--all" }, kill_all.args.items);
 
     var default_local_kill_all = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4627,7 +4603,7 @@ test "translateMuxArgs maps kill and kill all" {
         "--all",
     });
     defer default_local_kill_all.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--kill-all" }, default_local_kill_all.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "kill", "--all" }, default_local_kill_all.args.items);
 
     var local_kill_all = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4636,7 +4612,7 @@ test "translateMuxArgs maps kill and kill all" {
         ".",
     });
     defer local_kill_all.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--kill-all" }, local_kill_all.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "kill", "--all" }, local_kill_all.args.items);
 }
 
 test "translateMuxArgs maps client management commands" {
@@ -4649,7 +4625,7 @@ test "translateMuxArgs maps client management commands" {
         "s1",
     });
     defer list_clients.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "--list-clients", "s1", "--jsonl" }, list_clients.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "list-clients", "s1", "--jsonl" }, list_clients.args.items);
 
     var list_current_clients = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4657,7 +4633,7 @@ test "translateMuxArgs maps client management commands" {
         "--jsonl",
     });
     defer list_current_clients.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--list-clients", "--jsonl" }, list_current_clients.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "list-clients", "--jsonl" }, list_current_clients.args.items);
 
     var detach_last = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4665,7 +4641,7 @@ test "translateMuxArgs maps client management commands" {
         "--last-input",
     });
     defer detach_last.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--detach-client", "--last-input" }, detach_last.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "detach", "--last-input" }, detach_last.args.items);
 
     var detach_client = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4674,7 +4650,7 @@ test "translateMuxArgs maps client management commands" {
         "s1",
     });
     defer detach_client.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--detach-client", "--client", client_guid, "s1" }, detach_client.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "detach", client_guid, "s1" }, detach_client.args.items);
 
     var detach_client_without_session = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4682,14 +4658,14 @@ test "translateMuxArgs maps client management commands" {
         client_guid,
     });
     defer detach_client_without_session.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--detach-client", "--client", client_guid }, detach_client_without_session.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "detach", client_guid }, detach_client_without_session.args.items);
 
     var repaint_all = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
         "repaint",
     });
     defer repaint_all.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--repaint-client", "--all" }, repaint_all.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "repaint", "--all" }, repaint_all.args.items);
 
     var repaint_scrollback = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4699,7 +4675,7 @@ test "translateMuxArgs maps client management commands" {
         "s1",
     });
     defer repaint_scrollback.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "--repaint-client", "--last-input", "--scrollback", "s1" }, repaint_scrollback.args.items);
+    try expectArgvEqual(&.{ "sesshmux", ".", "repaint", "--last-input", "--scrollback", "s1" }, repaint_scrollback.args.items);
 
     var remote_debug = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4711,7 +4687,7 @@ test "translateMuxArgs maps client management commands" {
         "s1",
     });
     defer remote_debug.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "example.com", "--debug-client", "sever-connection", "--last-input", "s1" }, remote_debug.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "debug", "sever-connection", "--last-input", "s1" }, remote_debug.args.items);
 
     var remote_debug_unresponsive_seconds = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -4725,7 +4701,7 @@ test "translateMuxArgs maps client management commands" {
         "s1",
     });
     defer remote_debug_unresponsive_seconds.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "example.com", "--debug-client", "unresponsive-connection", "--last-input", "--seconds", "3", "s1" }, remote_debug_unresponsive_seconds.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "debug", "unresponsive-connection", "--last-input", "--seconds", "3", "s1" }, remote_debug_unresponsive_seconds.args.items);
 
     try std.testing.expectError(error.UnsupportedMuxOption, translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",

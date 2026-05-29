@@ -155,8 +155,8 @@ pub fn sessionSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) !
     return std.fmt.allocPrint(allocator, "{s}/s", .{root});
 }
 
-pub fn clientRoutesDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/client", .{root});
+pub fn clientHintsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    return sessionsDirInRoot(allocator, root);
 }
 
 pub fn ensureRuntimeLayout(allocator: std.mem.Allocator, paths: SessionPaths) !void {
@@ -892,9 +892,9 @@ pub fn readRouteForRef(allocator: std.mem.Allocator, ref: []const u8) !Route {
     return readRoute(allocator, paths.route);
 }
 
-/// Runtime-only lookup from a client id to the durable route for the session it
-/// is attached to. This is intentionally not durable: after a client detaches,
-/// the client id should stop resolving so it can be reused without ambiguity.
+/// Client ids are top-level runtime entries. Client machines use `route.json`
+/// to find the session route for a client id; session hosts use `agent.sock` to
+/// send a command directly to the agent that owns the client.
 pub fn writeClientRouteHint(allocator: std.mem.Allocator, client_guid: []const u8, session_guid: []const u8) !void {
     const runtime_root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(runtime_root);
@@ -912,13 +912,13 @@ fn writeClientRouteHintInRoots(
 ) !void {
     try ensureRegistryRoot(allocator, runtime_root);
 
-    const client_root = try clientRoutesDirInRoot(allocator, runtime_root);
+    const client_root = try clientHintsDirInRoot(allocator, runtime_root);
     defer allocator.free(client_root);
     try mkdirIgnoreExists(allocator, client_root);
 
     const canonical_client = try canonicalClientGuid(allocator, client_guid);
     defer allocator.free(canonical_client);
-    const client_dir = try clientRouteHintDirInRoot(allocator, runtime_root, canonical_client);
+    const client_dir = try clientHintDirInRoot(allocator, runtime_root, canonical_client);
     defer allocator.free(client_dir);
     try mkdirIgnoreExists(allocator, client_dir);
 
@@ -930,6 +930,40 @@ fn writeClientRouteHintInRoots(
     const link_path = try clientRouteHintPathInRoot(allocator, runtime_root, canonical_client);
     defer allocator.free(link_path);
     try installSymlinkReplacing(allocator, link_path, route_path);
+}
+
+pub fn writeClientAgentSocketHint(allocator: std.mem.Allocator, client_guid: []const u8, session_guid: []const u8) !void {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    return writeClientAgentSocketHintInRoot(allocator, runtime_root, client_guid, session_guid);
+}
+
+fn writeClientAgentSocketHintInRoot(
+    allocator: std.mem.Allocator,
+    runtime_root: []const u8,
+    client_guid: []const u8,
+    session_guid: []const u8,
+) !void {
+    try ensureRegistryRoot(allocator, runtime_root);
+
+    const client_root = try clientHintsDirInRoot(allocator, runtime_root);
+    defer allocator.free(client_root);
+    try mkdirIgnoreExists(allocator, client_root);
+
+    const canonical_client = try canonicalClientGuid(allocator, client_guid);
+    defer allocator.free(canonical_client);
+    const client_dir = try clientHintDirInRoot(allocator, runtime_root, canonical_client);
+    defer allocator.free(client_dir);
+    try mkdirIgnoreExists(allocator, client_dir);
+
+    const canonical_session = try canonicalGuid(allocator, session_guid);
+    defer allocator.free(canonical_session);
+    const target = try std.fmt.allocPrint(allocator, "../{s}/agent.sock", .{canonical_session});
+    defer allocator.free(target);
+
+    const link_path = try clientAgentSocketHintPathInRoot(allocator, runtime_root, canonical_client);
+    defer allocator.free(link_path);
+    try installSymlinkReplacing(allocator, link_path, target);
 }
 
 pub fn removeClientRouteHint(allocator: std.mem.Allocator, client_guid: []const u8) !void {
@@ -945,7 +979,28 @@ fn removeClientRouteHintInRoot(allocator: std.mem.Allocator, runtime_root: []con
     defer allocator.free(link_path);
     try unlinkIfExists(link_path);
 
-    const client_dir = try clientRouteHintDirInRoot(allocator, runtime_root, canonical_client);
+    const client_dir = try clientHintDirInRoot(allocator, runtime_root, canonical_client);
+    defer allocator.free(client_dir);
+    removeDirIfEmpty(client_dir) catch |err| switch (err) {
+        error.DirNotEmpty => {},
+        else => return err,
+    };
+}
+
+pub fn removeClientAgentSocketHint(allocator: std.mem.Allocator, client_guid: []const u8) !void {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    return removeClientAgentSocketHintInRoot(allocator, runtime_root, client_guid);
+}
+
+fn removeClientAgentSocketHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_guid: []const u8) !void {
+    const canonical_client = try canonicalClientGuid(allocator, client_guid);
+    defer allocator.free(canonical_client);
+    const link_path = try clientAgentSocketHintPathInRoot(allocator, runtime_root, canonical_client);
+    defer allocator.free(link_path);
+    try unlinkIfExists(link_path);
+
+    const client_dir = try clientHintDirInRoot(allocator, runtime_root, canonical_client);
     defer allocator.free(client_dir);
     removeDirIfEmpty(client_dir) catch |err| switch (err) {
         error.DirNotEmpty => {},
@@ -967,6 +1022,22 @@ fn readRouteForClientGuidInRoot(allocator: std.mem.Allocator, runtime_root: []co
     return readRoute(allocator, hint_path);
 }
 
+pub fn clientAgentSocketPathForClientGuid(allocator: std.mem.Allocator, client_ref: []const u8) ![]u8 {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    return clientAgentSocketPathForClientGuidInRoot(allocator, runtime_root, client_ref);
+}
+
+fn clientAgentSocketPathForClientGuidInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_ref: []const u8) ![]u8 {
+    const client_guid = try resolveClientGuidRefInRoot(allocator, runtime_root, client_ref);
+    defer allocator.free(client_guid);
+    const path = try clientAgentSocketHintPathInRoot(allocator, runtime_root, client_guid);
+    errdefer allocator.free(path);
+    const target = try readLinkAlloc(allocator, path, 4096);
+    defer allocator.free(target);
+    return path;
+}
+
 fn resolveClientGuidRefInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_ref: []const u8) ![]u8 {
     if (isValidClientGuid(client_ref)) return canonicalClientGuid(allocator, client_ref);
     if (compactGuidPrefix(client_ref, client_guid_prefix)) |prefix| {
@@ -976,7 +1047,7 @@ fn resolveClientGuidRefInRoot(allocator: std.mem.Allocator, runtime_root: []cons
 }
 
 fn resolveClientGuidPrefixInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, prefix: []const u8) ![]u8 {
-    const client_root = try clientRoutesDirInRoot(allocator, runtime_root);
+    const client_root = try clientHintsDirInRoot(allocator, runtime_root);
     defer allocator.free(client_root);
     var dir = std.fs.openDirAbsolute(client_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
@@ -998,12 +1069,16 @@ fn resolveClientGuidPrefixInRoot(allocator: std.mem.Allocator, runtime_root: []c
     return match orelse error.FileNotFound;
 }
 
-fn clientRouteHintDirInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_guid: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/client/{s}", .{ runtime_root, client_guid });
+fn clientHintDirInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_guid: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, client_guid });
 }
 
 fn clientRouteHintPathInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_guid: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/client/{s}/route.json", .{ runtime_root, client_guid });
+    return std.fmt.allocPrint(allocator, "{s}/guid/{s}/route.json", .{ runtime_root, client_guid });
+}
+
+fn clientAgentSocketHintPathInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_guid: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/guid/{s}/agent.sock", .{ runtime_root, client_guid });
 }
 
 fn routePathForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
@@ -2233,6 +2308,17 @@ test "runtime client route hints point client guids at session routes" {
     defer allocator.free(target);
     try std.testing.expectEqualStrings(route_path, target);
 
+    try writeClientAgentSocketHintInRoot(allocator, runtime_root, client_guid, session_guid);
+    const socket_hint_path = try clientAgentSocketHintPathInRoot(allocator, runtime_root, client_guid);
+    defer allocator.free(socket_hint_path);
+    const socket_target = try readLinkAlloc(allocator, socket_hint_path, 4096);
+    defer allocator.free(socket_target);
+    try std.testing.expectEqualStrings("../s-550e8400-e29b-41d4-a716-446655440000/agent.sock", socket_target);
+
+    const socket_hint_from_prefix = try clientAgentSocketPathForClientGuidInRoot(allocator, runtime_root, "c-550e8400e");
+    defer allocator.free(socket_hint_from_prefix);
+    try std.testing.expectEqualStrings(socket_hint_path, socket_hint_from_prefix);
+
     var route = try readRouteForClientGuidInRoot(allocator, runtime_root, "c-550e8400e");
     defer route.deinit(allocator);
     try std.testing.expectEqualStrings(session_guid, route.guid);
@@ -2242,6 +2328,8 @@ test "runtime client route hints point client guids at session routes" {
 
     try removeClientRouteHintInRoot(allocator, runtime_root, client_guid);
     try std.testing.expectError(error.FileNotFound, readRouteForClientGuidInRoot(allocator, runtime_root, client_guid));
+    try removeClientAgentSocketHintInRoot(allocator, runtime_root, client_guid);
+    try std.testing.expectError(error.FileNotFound, clientAgentSocketPathForClientGuidInRoot(allocator, runtime_root, client_guid));
 }
 
 test "tombstone snapshots aliases, removes route, and releases aliases" {

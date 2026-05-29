@@ -2151,10 +2151,6 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                     try io_helpers.writeAll(2, "sessh: client command requires an ID outside a sessh session\n");
                     return process_exit.request(64);
                 },
-                error.ClientSessionNotFound => {
-                    try io_helpers.writeAll(2, "sessh: client session not found\n");
-                    return process_exit.request(1);
-                },
                 error.AmbiguousClientId => {
                     try io_helpers.writeAll(2, "sessh: client id is ambiguous\n");
                     return process_exit.request(1);
@@ -2307,12 +2303,12 @@ fn appendBrokerCommand(
 }
 
 const ClientSessionResolution = struct {
-    session_ref: []u8,
+    session_ref: ?[]u8 = null,
     client_route: ?session_registry.Route = null,
 
     fn deinit(self: *ClientSessionResolution, allocator: std.mem.Allocator) void {
         if (self.client_route) |*route| route.deinit(allocator);
-        allocator.free(self.session_ref);
+        if (self.session_ref) |ref| allocator.free(ref);
         self.* = undefined;
     }
 };
@@ -2355,10 +2351,10 @@ fn runLocalClientControlCommand(
     defer command_args.deinit(allocator);
     try command_args.appendSlice(allocator, runtime_broker_args);
     switch (options.action) {
-        .detach_client => try command_args.append(allocator, "detach-client"),
-        .repaint_client => try command_args.append(allocator, "repaint-client"),
+        .detach_client => try command_args.append(allocator, "detach"),
+        .repaint_client => try command_args.append(allocator, "repaint"),
         .debug_client => {
-            try command_args.append(allocator, "debug-client");
+            try command_args.append(allocator, "debug");
             try command_args.append(allocator, switch (options.debug_client_action.?) {
                 .sever_connection => "sever-connection",
                 .unresponsive_connection => "unresponsive-connection",
@@ -2371,7 +2367,6 @@ fn runLocalClientControlCommand(
         .all => try command_args.append(allocator, "--all"),
         .last_input => try command_args.append(allocator, "--last-input"),
         .client_guid => {
-            try command_args.append(allocator, "--client");
             try command_args.append(allocator, options.client_guid.?);
         },
     }
@@ -2382,7 +2377,7 @@ fn runLocalClientControlCommand(
         try command_args.append(allocator, "--seconds");
         try command_args.append(allocator, seconds_arg);
     }
-    try command_args.append(allocator, session_resolution.session_ref);
+    if (session_resolution.session_ref) |session_ref| try command_args.append(allocator, session_ref);
     return runLocalBrokerCommand(allocator, exe, command_args.items);
 }
 
@@ -2400,14 +2395,17 @@ fn resolveClientControlSessionRef(allocator: std.mem.Allocator, explicit_ref: ?[
     }
 
     if (client_guid) |guid| {
+        const socket_path = session_registry.clientAgentSocketPathForClientGuid(allocator, guid) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (socket_path) |path| {
+            allocator.free(path);
+            return .{};
+        }
+
         var route = session_registry.readRouteForClientGuid(allocator, guid) catch |err| switch (err) {
-            error.FileNotFound => {
-                const env_ref = resolveClientSessionRef(allocator, null) catch |env_err| switch (env_err) {
-                    error.MissingSessionRef => return error.ClientSessionNotFound,
-                    else => return env_err,
-                };
-                return .{ .session_ref = env_ref };
-            },
+            error.FileNotFound => return .{},
             else => return err,
         };
         errdefer route.deinit(allocator);
@@ -2458,7 +2456,6 @@ fn runRemoteClientControlCommand(
         .all => try argv.append(allocator, "--all"),
         .last_input => try argv.append(allocator, "--last-input"),
         .client_guid => {
-            try argv.append(allocator, "--client");
             try argv.append(allocator, options.client_guid.?);
         },
     }
@@ -2947,23 +2944,23 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
     var i: usize = 2;
     while (i < args.len) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--list")) {
+        if (!options.action_set and std.mem.eql(u8, arg, "list")) {
             try setAction(&options, .list);
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--list-clients")) {
+        } else if (!options.action_set and std.mem.eql(u8, arg, "list-clients")) {
             try setAction(&options, .list_clients);
             i += 1;
             if (i < args.len and !std.mem.startsWith(u8, args[i], "--")) {
                 options.client_session_ref = args[i];
                 i += 1;
             }
-        } else if (std.mem.eql(u8, arg, "--detach-client")) {
+        } else if (!options.action_set and std.mem.eql(u8, arg, "detach")) {
             try setAction(&options, .detach_client);
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--repaint-client")) {
+        } else if (!options.action_set and std.mem.eql(u8, arg, "repaint")) {
             try setAction(&options, .repaint_client);
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--debug-client")) {
+        } else if (!options.action_set and std.mem.eql(u8, arg, "debug")) {
             try setAction(&options, .debug_client);
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingDebugAction;
@@ -2975,22 +2972,24 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
                 return error.InvalidDebugAction;
             }
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--kill-all")) {
-            try setAction(&options, .kill_all);
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--attach")) {
+        } else if (!options.action_set and std.mem.eql(u8, arg, "attach")) {
             try setAction(&options, .attach);
             i += 1;
             if (i < args.len and !std.mem.startsWith(u8, args[i], "--")) {
                 options.attach_id = args[i];
                 i += 1;
             }
-        } else if (std.mem.eql(u8, arg, "--kill")) {
-            try setAction(&options, .kill);
+        } else if (!options.action_set and std.mem.eql(u8, arg, "kill")) {
             i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingKillId;
-            options.kill_id = args[i];
-            i += 1;
+            if (i < args.len and std.mem.eql(u8, args[i], "--all")) {
+                try setAction(&options, .kill_all);
+                i += 1;
+            } else {
+                try setAction(&options, .kill);
+                if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingKillId;
+                options.kill_id = args[i];
+                i += 1;
+            }
         } else if (std.mem.eql(u8, arg, "--alias")) {
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingAlias;
@@ -3015,11 +3014,6 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--last-input")) {
             try setClientTarget(&options, .last_input, null);
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--client")) {
-            i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingClientGuid;
-            try setClientTarget(&options, .client_guid, args[i]);
             i += 1;
         } else if (std.mem.eql(u8, arg, "--scrollback")) {
             options.client_repaint_scrollback = true;
@@ -3074,6 +3068,9 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingTtyTranscriptPath;
             options.capture_tty_transcript = args[i];
+            i += 1;
+        } else if (!std.mem.startsWith(u8, arg, "--") and actionSupportsClientTarget(options.action) and options.client_target == .default and std.mem.startsWith(u8, arg, session_registry.client_guid_prefix)) {
+            try setClientTarget(&options, .client_guid, arg);
             i += 1;
         } else if (!std.mem.startsWith(u8, arg, "--") and actionSupportsClientSessionRef(options.action) and options.client_session_ref == null) {
             options.client_session_ref = arg;

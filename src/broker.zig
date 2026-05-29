@@ -96,14 +96,17 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
         const exit_status = try listClients(allocator, options);
         return process_exit.request(exit_status);
     }
-    if (std.mem.eql(u8, command, "detach-client") or
-        std.mem.eql(u8, command, "repaint-client") or
-        std.mem.eql(u8, command, "debug-client"))
-    {
-        const client_command = parseClientControlCommand(args) catch return finishCommand(64, "", "ERROR usage: detach-client|repaint-client|debug-client [options] ID\n");
+    if (isClientControlCommandName(command)) {
+        const client_command = parseClientControlCommand(args) catch return finishCommand(64, "", "ERROR usage: detach|repaint|debug [options] ID\n");
         return runClientControlCommand(allocator, client_command);
     }
     return finishCommand(64, "", "ERROR unknown broker command\n");
+}
+
+fn isClientControlCommandName(command: []const u8) bool {
+    return std.mem.eql(u8, command, "detach") or
+        std.mem.eql(u8, command, "repaint") or
+        std.mem.eql(u8, command, "debug");
 }
 
 fn finishCommand(exit_status: u8, stdout: []const u8, stderr: []const u8) !void {
@@ -147,23 +150,23 @@ const ClientControlTarget = struct {
 };
 
 const ClientDetachCommand = struct {
-    session_ref: []const u8,
+    session_ref: ?[]const u8,
     target: ClientControlTarget,
 };
 
 const ClientRepaintCommand = struct {
-    session_ref: []const u8,
+    session_ref: ?[]const u8,
     target: ClientControlTarget,
     include_scrollback: bool = false,
 };
 
 const ClientDebugSeverConnectionCommand = struct {
-    session_ref: []const u8,
+    session_ref: ?[]const u8,
     target: ClientControlTarget,
 };
 
 const ClientDebugUnresponsiveConnectionCommand = struct {
-    session_ref: []const u8,
+    session_ref: ?[]const u8,
     target: ClientControlTarget,
     seconds: u32 = config.default_debug_unresponsive_seconds,
 };
@@ -174,9 +177,15 @@ const ClientControlCommand = union(enum) {
     debug_sever_connection: ClientDebugSeverConnectionCommand,
     debug_unresponsive_connection: ClientDebugUnresponsiveConnectionCommand,
 
-    fn sessionRef(self: ClientControlCommand) []const u8 {
+    fn sessionRef(self: ClientControlCommand) ?[]const u8 {
         return switch (self) {
             inline else => |command| command.session_ref,
+        };
+    }
+
+    fn target(self: ClientControlCommand) ClientControlTarget {
+        return switch (self) {
+            inline else => |command| command.target,
         };
     }
 
@@ -242,11 +251,11 @@ fn parseClientControlCommand(args: []const []const u8) !ClientControlCommand {
     const command = args[0];
     var i: usize = 1;
     const command_kind: enum { detach, repaint, debug_sever_connection, debug_unresponsive_connection } =
-        if (std.mem.eql(u8, command, "detach-client"))
+        if (std.mem.eql(u8, command, "detach"))
             .detach
-        else if (std.mem.eql(u8, command, "repaint-client"))
+        else if (std.mem.eql(u8, command, "repaint"))
             .repaint
-        else if (std.mem.eql(u8, command, "debug-client")) blk: {
+        else if (std.mem.eql(u8, command, "debug")) blk: {
             if (i >= args.len) return error.MissingDebugAction;
             const debug_action = args[i];
             i += 1;
@@ -280,14 +289,6 @@ fn parseClientControlCommand(args: []const []const u8) !ClientControlCommand {
             explicit_target = true;
             target_kind = .CLIENT_CONTROL_TARGET_KIND_LAST_INPUT;
             i += 1;
-        } else if (std.mem.eql(u8, args[i], "--client")) {
-            if (explicit_target) return error.MultipleTargets;
-            explicit_target = true;
-            i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingClientGuid;
-            client_guid = args[i];
-            target_kind = .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID;
-            i += 1;
         } else if (std.mem.eql(u8, args[i], "--scrollback")) {
             if (command_kind != .repaint) return error.UnsupportedClientControlArgs;
             include_scrollback = true;
@@ -300,6 +301,11 @@ fn parseClientControlCommand(args: []const []const u8) !ClientControlCommand {
             i += 1;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             return error.InvalidClientControlArgs;
+        } else if (!explicit_target and std.mem.startsWith(u8, args[i], session_registry.client_guid_prefix)) {
+            explicit_target = true;
+            client_guid = args[i];
+            target_kind = .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID;
+            i += 1;
         } else if (session_ref == null) {
             session_ref = args[i];
             i += 1;
@@ -308,10 +314,13 @@ fn parseClientControlCommand(args: []const []const u8) !ClientControlCommand {
         }
     }
 
-    const resolved_session_ref = session_ref orelse return error.MissingSessionRef;
     const target = ClientControlTarget{
         .kind = target_kind,
         .client_guid = client_guid,
+    };
+    const resolved_session_ref = session_ref orelse blk: {
+        if (target.kind == .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID) break :blk null;
+        return error.MissingSessionRef;
     };
     return switch (command_kind) {
         .detach => .{ .detach = .{
@@ -550,31 +559,10 @@ fn listClients(allocator: std.mem.Allocator, options: ListClientsOptions) !u8 {
 }
 
 fn runClientControlCommand(allocator: std.mem.Allocator, command: ClientControlCommand) !void {
-    var paths = pathsForLocalSessionRef(allocator, command.sessionRef()) catch |err| switch (err) {
-        error.SessionAlreadyExited => {
-            return finishCommand(1, "", "ERROR session already exited\n");
-        },
-        error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
-            return finishCommand(1, "", "ERROR session not found\n");
-        },
-        else => return err,
-    };
-    defer paths.deinit(allocator);
-
-    var meta = session_registry.readMeta(allocator, paths) catch {
-        session_registry.removeStaleHints(paths) catch {};
-        return finishCommand(1, "", "ERROR session not found\n");
-    };
-    defer meta.deinit(allocator);
-    if (!processExists(meta.agent_pid)) {
-        session_registry.removeStaleHints(paths) catch {};
-        return finishCommand(1, "", "ERROR session not found\n");
-    }
-
-    var response = sendSessionClientControlRequest(allocator, paths, command) catch |err| {
-        try writeCommandErrorForAgentFailure(err);
-        return process_exit.request(1);
-    };
+    var response = if (command.sessionRef()) |session_ref|
+        try runClientControlCommandForSessionRef(allocator, session_ref, command)
+    else
+        try runClientControlCommandForClientGuid(allocator, command);
     defer response.deinit(allocator);
 
     var stdout: std.ArrayList(u8) = .empty;
@@ -585,6 +573,68 @@ fn runClientControlCommand(allocator: std.mem.Allocator, command: ClientControlC
         try writer.print("{s} {s}\n", .{ verb, client_guid });
     }
     return finishCommand(0, stdout.items, "");
+}
+
+fn runClientControlCommandForSessionRef(
+    allocator: std.mem.Allocator,
+    session_ref: []const u8,
+    command: ClientControlCommand,
+) !pb.SessionClientControlResponse {
+    var paths = pathsForLocalSessionRef(allocator, session_ref) catch |err| switch (err) {
+        error.SessionAlreadyExited => {
+            return finishClientControlCommand(1, "", "ERROR session already exited\n");
+        },
+        error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
+            return finishClientControlCommand(1, "", "ERROR session not found\n");
+        },
+        else => return err,
+    };
+    defer paths.deinit(allocator);
+
+    var meta = session_registry.readMeta(allocator, paths) catch {
+        session_registry.removeStaleHints(paths) catch {};
+        return finishClientControlCommand(1, "", "ERROR session not found\n");
+    };
+    defer meta.deinit(allocator);
+    if (!processExists(meta.agent_pid)) {
+        session_registry.removeStaleHints(paths) catch {};
+        return finishClientControlCommand(1, "", "ERROR session not found\n");
+    }
+
+    return sendSessionClientControlRequest(allocator, paths, command) catch |err| {
+        try writeCommandErrorForAgentFailure(err);
+        return process_exit.request(1);
+    };
+}
+
+fn runClientControlCommandForClientGuid(
+    allocator: std.mem.Allocator,
+    command: ClientControlCommand,
+) !pb.SessionClientControlResponse {
+    const target = command.target();
+    if (target.kind != .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID) return finishClientControlCommand(1, "", "ERROR invalid client target\n");
+    const socket_path = session_registry.clientAgentSocketPathForClientGuid(allocator, target.client_guid) catch |err| switch (err) {
+        error.InvalidClientId => return finishClientControlCommand(1, "", "ERROR invalid client target\n"),
+        error.AmbiguousClientId => return finishClientControlCommand(1, "", "ERROR client target is ambiguous\n"),
+        error.FileNotFound => return finishClientControlCommand(1, "", "ERROR client not found\n"),
+        else => return err,
+    };
+    defer allocator.free(socket_path);
+
+    return sendSessionClientControlRequestToSocketPath(allocator, socket_path, command) catch |err| switch (err) {
+        error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
+            return finishClientControlCommand(1, "", "ERROR client not found\n");
+        },
+        else => {
+            try writeCommandErrorForAgentFailure(err);
+            return process_exit.request(1);
+        },
+    };
+}
+
+fn finishClientControlCommand(exit_status: u8, stdout: []const u8, stderr: []const u8) !pb.SessionClientControlResponse {
+    try finishCommand(exit_status, stdout, stderr);
+    unreachable;
 }
 
 fn attachedClientSortLessThan(_: void, a: pb.AttachedClient, b: pb.AttachedClient) bool {
@@ -701,7 +751,15 @@ fn sendSessionClientControlRequest(
     paths: session_registry.SessionPaths,
     command: ClientControlCommand,
 ) !pb.SessionClientControlResponse {
-    const fd = try socket_transport.connectSocket(paths.socket);
+    return sendSessionClientControlRequestToSocketPath(allocator, paths.socket, command);
+}
+
+fn sendSessionClientControlRequestToSocketPath(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    command: ClientControlCommand,
+) !pb.SessionClientControlResponse {
+    const fd = try socket_transport.connectSocket(socket_path);
     defer _ = c.close(fd);
 
     try initiateRuntimeHandshake(allocator, fd);
@@ -791,7 +849,7 @@ fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
         return finishCommand(1, "", "ERROR session not found\n");
     }
     if (!std.mem.eql(u8, meta.version, config.version)) {
-        const exit_status = try runCompatCommand(allocator, paths, &.{ "--kill", session_id });
+        const exit_status = try runCompatCommand(allocator, paths, &.{ "kill", session_id });
         return process_exit.request(exit_status);
     }
     if (!terminateAgent(meta.agent_pid)) {
@@ -839,7 +897,7 @@ fn killAllAgents(allocator: std.mem.Allocator) !void {
             continue;
         }
         if (!std.mem.eql(u8, meta.version, config.version)) {
-            const compat_status = try runCompatCommand(allocator, paths, &.{ "--kill", entry.name });
+            const compat_status = try runCompatCommand(allocator, paths, &.{ "kill", entry.name });
             if (compat_status != 0) exit_status = compat_status;
             continue;
         }
