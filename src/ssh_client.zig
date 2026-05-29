@@ -1158,10 +1158,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             },
             .session_ended => {
                 client_log.debug("event=session_ended host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
-                child.closeStdin();
-                _ = child.wait() catch {};
-                client_log.flush(2);
-                try tty_transcript.finishActiveOrReport();
+                try finishEndedRemoteSession(allocator, &child, &session);
                 return;
             },
             .reconnect => {
@@ -1207,11 +1204,17 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                     session.noteUnresponsiveRecovery();
                     session.discardPendingInputAcks();
                     session.viewport_offset = try reconnect_ui.clearBanner();
-                    try client.repaintRuntimeSession(
+                    client.repaintRuntimeSession(
                         child.child.stdout.?.handle,
                         child.child.stdin.?.handle,
                         &session,
-                    );
+                    ) catch |err| switch (err) {
+                        error.SessionEnded => {
+                            try finishEndedRemoteSession(allocator, &child, &session);
+                            return;
+                        },
+                        else => return err,
+                    };
                     reconnect_ui.deinit();
                     reconnect_ui_active = false;
                     continue;
@@ -1221,7 +1224,13 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                     child = new_child;
                     session.discardPendingInputAcks();
                     session.viewport_offset = try reconnect_ui.clearBanner();
-                    try client.finishReconnectRepaint(child.child.stdout.?.handle, &session);
+                    client.finishReconnectRepaint(child.child.stdout.?.handle, &session) catch |err| switch (err) {
+                        error.SessionEnded => {
+                            try finishEndedRemoteSession(allocator, &child, &session);
+                            return;
+                        },
+                        else => return err,
+                    };
                     client_log.debug("event=reconnect_success host={s} session={s} attempt=0", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
@@ -1231,9 +1240,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                     continue;
                 },
                 .session_ended => {
-                    child.closeStdin();
-                    _ = child.wait() catch {};
-                    try tty_transcript.finishActiveOrReport();
+                    try finishEndedRemoteSession(allocator, &child, &session);
                     return;
                 },
                 .detach => {
@@ -1412,6 +1419,20 @@ fn finishDetachedSshSession(parsed_ssh_args: ParsedSshArgs, session: *const clie
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
     client.writeDetachBannerForSessionRef(parsed_ssh_args.banner_args.slice(), session.idSlice());
+}
+
+fn finishEndedRemoteSession(
+    allocator: std.mem.Allocator,
+    child: *RuntimeConnection,
+    session: *const client.RuntimeSession,
+) !void {
+    client.tombstoneLocalRouteForRemoteSession(allocator, session) catch |err| {
+        client_log.debug("event=local_tombstone_failed session={s} error={t}", .{ session.idSlice(), err });
+    };
+    child.closeStdin();
+    _ = child.wait() catch {};
+    client_log.flush(2);
+    try tty_transcript.finishActiveOrReport();
 }
 
 fn finishReconnectUiForDetach(reconnect_ui: *client.ReconnectUi, active: *bool) void {

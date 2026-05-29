@@ -253,6 +253,14 @@ if [ -n "${SESSH_FAKE_SSH_REMOTE_PATH:-}" ]; then
   PATH=$SESSH_FAKE_SSH_REMOTE_PATH:$PATH
   export PATH
 fi
+if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR:-}" ]; then
+  XDG_RUNTIME_DIR=$SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR
+  export XDG_RUNTIME_DIR
+fi
+if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME:-}" ]; then
+  XDG_STATE_HOME=$SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME
+  export XDG_STATE_HOME
+fi
 if [ -n "${SESSH_FAKE_SSH_REMOTE_SHELL:-}" ]; then
   SHELL=$SESSH_FAKE_SSH_REMOTE_SHELL
   export SHELL
@@ -1167,6 +1175,59 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(tombstone_json)
     if (aliases_dir(env) / "s1").exists() or (aliases_dir(env) / "s1").is_symlink():
         raise AssertionError("ended session alias was not released")
+
+
+def test_ssh_clean_remote_exit_tombstones_local_route(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_runtime = tmp / "remote-runtime"
+    remote_state = tmp / "remote-state"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_REMOTE_EXIT_READY"
+    alias = "remote-exit"
+    remote_runtime.mkdir(mode=0o700)
+    remote_state.mkdir(mode=0o700)
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\nexit 7\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"] = str(remote_runtime)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"] = str(remote_state)
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["--alias", alias, "test-host"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout:
+        raise AssertionError(result)
+
+    listed = run_sesshmux(["list", "--exited", "--jsonl"], env, timeout=30.0)
+    if listed.returncode != 0:
+        raise AssertionError(listed)
+    rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
+    matches = [row for row in rows if row.get("id") == alias]
+    if len(matches) != 1:
+        raise AssertionError(process_diagnostics(listed))
+    row = matches[0]
+    if row.get("host") != "test-host" or alias not in row.get("aliases", []):
+        raise AssertionError(row)
+    if row.get("end_reason") != "process_exited":
+        raise AssertionError(row)
+    if row.get("exit_status") != {"kind": "exited", "status": 7}:
+        raise AssertionError(row)
+
+    guid = row.get("guid")
+    if not guid:
+        raise AssertionError(row)
+    if (state_sessions_dir(env) / guid / "route.json").exists():
+        raise AssertionError("local cached route was not tombstoned")
+    if (aliases_dir(env) / alias).exists() or (aliases_dir(env) / alias).is_symlink():
+        raise AssertionError("local cached route alias was not released")
+    if not (remote_state / "sessh" / "tombstone" / f"{guid}.json").exists():
+        raise AssertionError("remote session did not write its own tombstone")
 
 
 def test_ssh_pre_attach_stderr_forwards_immediately(tmp):
@@ -2968,6 +3029,10 @@ def main(argv=None):
         (
             "ssh transport uploads artifact and reaches broker",
             test_ssh_transport_uploads_artifact_and_reaches_broker,
+        ),
+        (
+            "ssh clean remote exit tombstones local route",
+            test_ssh_clean_remote_exit_tombstones_local_route,
         ),
         (
             "ssh pre-attach stderr forwards immediately",

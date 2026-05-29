@@ -462,6 +462,7 @@ pub const RuntimeSession = struct {
     input_ack_tracker: InputAckTracker = .{},
     input_escape_filter: terminal.EscapeFilter = .{},
     paste_like_input_classifier: PasteLikeInputClassifier = .{},
+    ended_tombstone_details: ?session_registry.TombstoneDetails = null,
 
     pub fn adoptReconnectState(self: *RuntimeSession, reconnected: *const RuntimeSession) void {
         self.pending_repaint = reconnected.pending_repaint;
@@ -561,7 +562,30 @@ pub const RuntimeSession = struct {
         @memcpy(self.primary_alias[0..alias.len], alias);
         self.primary_alias_len = alias.len;
     }
+
+    fn recordSessionEndedPayload(self: *RuntimeSession, payload: []const u8) !void {
+        var ended = try protocol.decodePayload(pb.SessionEnded, app_allocator.allocator(), payload);
+        defer ended.deinit(app_allocator.allocator());
+        self.ended_tombstone_details = tombstoneDetailsFromSessionEnded(ended);
+    }
 };
+
+fn tombstoneDetailsFromSessionEnded(ended: pb.SessionEnded) session_registry.TombstoneDetails {
+    return .{
+        .ended_at_unix_ms = ended.ended_at_unix_ms orelse nowUnixMs(),
+        .end_reason = switch (ended.reason) {
+            .SESSION_END_REASON_PROCESS_EXITED => .process_exited,
+            .SESSION_END_REASON_KILLED_BY_REQUEST => .killed_by_request,
+            .SESSION_END_REASON_AGENT_SHUTDOWN => .agent_shutdown,
+            else => .unknown,
+        },
+        .exit_status = if (ended.exit_status) |status| switch (status.kind) {
+            .EXIT_STATUS_KIND_EXITED => .{ .kind = .exited, .status = status.status },
+            .EXIT_STATUS_KIND_SIGNALLED => .{ .kind = .signalled, .status = status.status },
+            else => null,
+        } else null,
+    };
+}
 
 pub const ReconnectUi = struct {
     const max_diagnostic_banner_lines = 3;
@@ -1706,6 +1730,7 @@ test "relay drains pending session end before monitor timeout" {
             &relay_end_restore,
             &input_ack_tracker,
             &paste_like_input_classifier,
+            null,
             .{ .monitor_connection = true },
         ),
     );
@@ -1745,6 +1770,7 @@ test "relay treats input write failure as transport closed" {
             &relay_end_restore,
             &input_ack_tracker,
             &paste_like_input_classifier,
+            null,
             .{ .monitor_connection = true },
         ),
     );
@@ -1961,6 +1987,7 @@ test "client repaint request sends screen-only repaint request" {
             &pending_repaint,
             &relay_end_restore,
             &input_ack_tracker,
+            null,
         ),
     );
 
@@ -2011,6 +2038,7 @@ test "client repaint request can request retained scrollback" {
             &pending_repaint,
             &relay_end_restore,
             &input_ack_tracker,
+            null,
         ),
     );
 
@@ -2058,6 +2086,7 @@ test "client detach request uses normal detach relay end" {
             &pending_repaint,
             &relay_end_restore,
             &input_ack_tracker,
+            null,
         )).?,
     );
 }
@@ -3078,6 +3107,13 @@ pub fn ensureLocalRouteForRemoteSession(
     );
 }
 
+pub fn tombstoneLocalRouteForRemoteSession(allocator: std.mem.Allocator, session: *const RuntimeSession) !void {
+    const details = session.ended_tombstone_details orelse return;
+    var route = session_registry.readRouteForRef(allocator, session.guidSlice()) catch return;
+    defer route.deinit(allocator);
+    try session_registry.writeTombstoneForRoute(allocator, &route, details);
+}
+
 fn localAliasForRemoteSession(allocator: std.mem.Allocator, session: *const RuntimeSession, requested_ref: []const u8) ![]u8 {
     if (requested_ref.len > 0 and
         !session_registry.isValidSessionId(requested_ref) and
@@ -3192,7 +3228,10 @@ fn finishReconnectRepaintInner(
             },
             .client_repaint_request => {},
             .tty_transcript_chunk => try handleTtyTranscriptChunkFrame(frame.payload),
-            .session_ended => return error.SessionEnded,
+            .session_ended => {
+                try session.recordSessionEndedPayload(frame.payload);
+                return error.SessionEnded;
+            },
             .error_message => {
                 try printErrorPayload(frame.payload);
                 return error.RemoteError;
@@ -3220,6 +3259,7 @@ pub fn relayRuntimeSession(
         &session.relay_end_restore,
         &session.input_ack_tracker,
         &session.paste_like_input_classifier,
+        &session.ended_tombstone_details,
         .{
             .monitor_connection = options.monitor_connection,
             .responsiveness_timeout_floor_ms = @max(options.responsiveness_timeout_floor_ms, session.unresponsive_timeout_floor_ms),
@@ -3280,6 +3320,7 @@ pub fn pollRuntimeRecovery(
             return .recovered;
         },
         .session_ended => {
+            try session.recordSessionEndedPayload(frame.payload);
             _ = finishRelay(.session_ended, &session.relay_end_restore);
             return .session_ended;
         },
@@ -3841,6 +3882,7 @@ fn relayInteractive(
     relay_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
+    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     options: RelayOptions,
 ) !RelayEnd {
     const initial_kitty_keyboard_flags = queryInitialKittyKeyboardFlags();
@@ -3870,6 +3912,7 @@ fn relayInteractive(
         relay_end_restore,
         input_ack_tracker,
         paste_like_input_classifier,
+        ended_tombstone_details,
         options,
     );
     if (end == .detach) writeDetachBoundary();
@@ -3901,6 +3944,7 @@ fn relayTerminal(
     relay_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
+    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     options: RelayOptions,
 ) !RelayEnd {
     var pollfds = [_]posix.pollfd{
@@ -3929,6 +3973,7 @@ fn relayTerminal(
                 pending_repaint,
                 relay_end_restore,
                 input_ack_tracker,
+                ended_tombstone_details,
             )) |end| return finishRelay(end, relay_end_restore);
         }
 
@@ -3948,6 +3993,7 @@ fn relayTerminal(
                         pending_repaint,
                         relay_end_restore,
                         input_ack_tracker,
+                        ended_tombstone_details,
                     ),
                     else => return err,
                 };
@@ -3964,6 +4010,7 @@ fn relayTerminal(
                         pending_repaint,
                         relay_end_restore,
                         input_ack_tracker,
+                        ended_tombstone_details,
                     ),
                     else => return err,
                 },
@@ -3980,6 +4027,7 @@ fn relayTerminal(
                 pending_repaint,
                 relay_end_restore,
                 input_ack_tracker,
+                ended_tombstone_details,
             ),
             else => return err,
         };
@@ -3999,6 +4047,7 @@ fn drainRelayRuntimeFrames(
     pending_repaint: *PendingRepaint,
     relay_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
+    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
 ) !?RelayEnd {
     while (true) {
         var runtime_poll = [_]posix.pollfd{.{
@@ -4024,6 +4073,7 @@ fn drainRelayRuntimeFrames(
             pending_repaint,
             relay_end_restore,
             input_ack_tracker,
+            ended_tombstone_details,
         )) |end| return end;
     }
 }
@@ -4036,6 +4086,7 @@ fn finishRelayAfterRuntimeWriteFailed(
     pending_repaint: *PendingRepaint,
     relay_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
+    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
 ) !RelayEnd {
     if (try drainRelayRuntimeFrames(
         read_fd,
@@ -4046,6 +4097,7 @@ fn finishRelayAfterRuntimeWriteFailed(
         pending_repaint,
         relay_end_restore,
         input_ack_tracker,
+        ended_tombstone_details,
     )) |end| return finishRelay(end, relay_end_restore);
     return .transport_closed;
 }
@@ -4059,6 +4111,7 @@ fn handleRelayRuntimeFrame(
     pending_repaint: *PendingRepaint,
     relay_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
+    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
 ) !?RelayEnd {
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
@@ -4110,6 +4163,11 @@ fn handleRelayRuntimeFrame(
             return null;
         },
         .session_ended => {
+            if (ended_tombstone_details) |details| {
+                var ended = try protocol.decodePayload(pb.SessionEnded, app_allocator.allocator(), frame.payload);
+                defer ended.deinit(app_allocator.allocator());
+                details.* = tombstoneDetailsFromSessionEnded(ended);
+            }
             return .session_ended;
         },
         .error_message => {
