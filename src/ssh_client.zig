@@ -19,6 +19,7 @@ const max_artifact_manifest_bytes = 16 * 1024;
 const artifact_manifest_filename = "artifacts.manifest";
 const default_ipqos_option_prefix = "-oIPQoS=";
 const ssh_config_query_max_output_bytes = 256 * 1024;
+const client_list_target_help = "incoming, outgoing, session, or a guid/alias";
 
 const ArtifactSet = struct {
     allocator: std.mem.Allocator,
@@ -3381,7 +3382,7 @@ fn printSshArgError(err: anyerror) !void {
         error.MissingTtyTranscriptPath => try io.writeAll(2, "sessh: --capture-tty-transcript requires a path\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: ssh option is missing its value\n"),
         error.MissingSshOptions => try io.writeAll(2, "sesshmux: --ssh-options requires a value\n"),
-        error.MissingClientListTarget => try io.writeAll(2, "sesshmux: --client requires a value\n"),
+        error.MissingClientListTarget => try io.writeAll(2, "sesshmux: --client requires a value: " ++ client_list_target_help ++ "\n"),
         error.MissingCommandArgv => try io.writeAll(2, "sesshmux: -- requires a command argv\n"),
         error.SesshOptionAfterHost => try io.writeAll(2, "sessh: sessh options must appear before HOST\n"),
         error.TooManyMuxArguments => try io.writeAll(2, "sesshmux: too many arguments\n"),

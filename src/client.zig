@@ -23,6 +23,7 @@ const Leader = terminal.Leader;
 var next_repaint_request_seq: u64 = 1;
 
 const unknown_viewport_offset: i32 = -1;
+const client_list_target_help = "incoming, outgoing, session, or a guid/alias";
 
 const LocalAction = enum {
     new,
@@ -2094,7 +2095,7 @@ test "client detach request uses normal detach relay end" {
 /// transport and the same broker/agent flow used by ssh after bootstrap.
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var options = parseLocalOptions(args) catch |err| {
-        try io_helpers.stderrPrint("sessh: invalid . arguments: {t}\n", .{err});
+        try writeLocalArgError(err);
         return process_exit.request(64);
     };
     applyFileConfigToLocal(allocator, &options) catch |err| {
@@ -2104,6 +2105,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     client_log.setLevel(options.client_log_level);
 
     return runBrokerClient(allocator, args, options);
+}
+
+fn writeLocalArgError(err: anyerror) !void {
+    switch (err) {
+        error.MissingClientListTarget => try io_helpers.writeAll(2, "sessh: --client requires a value: " ++ client_list_target_help ++ "\n"),
+        else => try io_helpers.stderrPrint("sessh: invalid . arguments: {t}\n", .{err}),
+    }
 }
 
 fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, options: LocalOptions) !void {

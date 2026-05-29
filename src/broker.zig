@@ -17,6 +17,7 @@ const hpb = protocol.hpb;
 
 const command_timeout_ms: i64 = 2_000;
 const command_poll_ms: u64 = 20;
+const client_list_target_help = "incoming, outgoing, session, or a guid/alias";
 
 pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
@@ -82,7 +83,12 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const command = args[0];
     if (std.mem.eql(u8, command, "list")) {
-        const options = parseListOptions(args) catch return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl] [--exited] [--local-only] [--client incoming|outgoing|session|ID]\n");
+        const options = parseListOptions(args) catch |err| {
+            if (err == error.MissingClientListTarget) {
+                return finishCommand(64, "", "ERROR --client requires a value: " ++ client_list_target_help ++ "\n");
+            }
+            return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl] [--exited] [--local-only] [--client incoming|outgoing|session|ID]\n");
+        };
         const exit_status = if (options.client_selector == .none)
             try listAgents(allocator, options)
         else
@@ -528,7 +534,7 @@ fn listClients(allocator: std.mem.Allocator, options: ListOptions) !u8 {
         .session => blk: {
             const session_ref = std.process.getEnvVarOwned(allocator, "SESSH_GUID") catch |err| switch (err) {
                 error.EnvironmentVariableNotFound => {
-                    try io.writeAll(2, "ERROR session not found\n");
+                    try io.writeAll(2, "ERROR --client=session requires $SESSH_GUID\n");
                     return 1;
                 },
                 else => return err,
@@ -539,7 +545,7 @@ fn listClients(allocator: std.mem.Allocator, options: ListOptions) !u8 {
         .session_ref => |session_ref| try listClientsForSessionRef(allocator, writer, options, session_ref),
         .client_ref => |client_ref| try listClientByRef(allocator, writer, options, client_ref),
     };
-    if (stdout.items.len > 0) try io.writeAll(1, stdout.items);
+    if (exit_status == 0 and stdout.items.len > 0) try io.writeAll(1, stdout.items);
     return exit_status;
 }
 
@@ -550,7 +556,7 @@ fn listClientsForSessionRef(allocator: std.mem.Allocator, writer: anytype, optio
             return 1;
         },
         error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
-            try io.writeAll(2, "ERROR session not found\n");
+            try writeClientListSessionNotFound(session_ref);
             return 1;
         },
         else => return err,
@@ -558,6 +564,13 @@ fn listClientsForSessionRef(allocator: std.mem.Allocator, writer: anytype, optio
     defer paths.deinit(allocator);
 
     return listClientsForSessionPaths(allocator, writer, options, paths);
+}
+
+fn writeClientListSessionNotFound(session_ref: []const u8) !void {
+    try io.stderrPrint(
+        "ERROR session not found for --client {s}; expected: {s}\n",
+        .{ session_ref, client_list_target_help },
+    );
 }
 
 fn listClientsForSessionPaths(allocator: std.mem.Allocator, writer: anytype, options: ListOptions, paths: session_registry.SessionPaths) !u8 {

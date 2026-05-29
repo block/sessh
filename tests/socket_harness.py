@@ -2978,6 +2978,14 @@ def run_client_control_commands_test(base_env):
             if [row["client_guid"] for row in current_rows] != [client_one, client_two]:
                 raise AssertionError(listed_current.stdout)
 
+            missing_target = run([".", "list", "--client"], env, timeout=5.0)
+            if missing_target.returncode != 64 or "incoming, outgoing, session" not in missing_target.stderr:
+                raise AssertionError(missing_target)
+
+            missing_session_ref = run([".", "list", "--client", "does-not-exist"], env, timeout=5.0)
+            if missing_session_ref.returncode != 1 or "expected: incoming, outgoing, session, or a guid/alias" not in missing_session_ref.stderr:
+                raise AssertionError(missing_session_ref)
+
             listed_incoming = run([".", "list", "--client=incoming", "--jsonl"], env, check=True, timeout=5.0)
             incoming_rows = [json.loads(line) for line in listed_incoming.stdout.splitlines()]
             if [row["client_guid"] for row in incoming_rows] != [client_one, client_two]:
