@@ -2957,7 +2957,7 @@ def run_client_control_commands_test(base_env):
             if session_rows["s1"].get("input") == "never":
                 raise AssertionError(listed_sessions.stdout)
 
-            listed = run([".", "list-clients", "--jsonl", "s1"], env, check=True, timeout=5.0)
+            listed = run([".", "list", "--client=s1", "--jsonl"], env, check=True, timeout=5.0)
             rows = [json.loads(line) for line in listed.stdout.splitlines()]
             if [row["client_guid"] for row in rows] != [client_one, client_two]:
                 raise AssertionError(listed.stdout)
@@ -2966,7 +2966,24 @@ def run_client_control_commands_test(base_env):
             if rows[0]["terminal_size"] != {"terminal_rows": 8, "terminal_cols": 60}:
                 raise AssertionError(rows)
 
-            listed_clients = run([".", "list-clients", "s1"], env, check=True, timeout=5.0)
+            listed_one = run([".", "list", f"--client={client_one}", "--jsonl"], env, check=True, timeout=5.0)
+            one_rows = [json.loads(line) for line in listed_one.stdout.splitlines()]
+            if [row["client_guid"] for row in one_rows] != [client_one]:
+                raise AssertionError(listed_one.stdout)
+
+            session_env = dict(env)
+            session_env["SESSH_GUID"] = guid_for_ref("s1")
+            listed_current = run([".", "list", "--client=session", "--jsonl"], session_env, check=True, timeout=5.0)
+            current_rows = [json.loads(line) for line in listed_current.stdout.splitlines()]
+            if [row["client_guid"] for row in current_rows] != [client_one, client_two]:
+                raise AssertionError(listed_current.stdout)
+
+            listed_incoming = run([".", "list", "--client=incoming", "--jsonl"], env, check=True, timeout=5.0)
+            incoming_rows = [json.loads(line) for line in listed_incoming.stdout.splitlines()]
+            if [row["client_guid"] for row in incoming_rows] != [client_one, client_two]:
+                raise AssertionError(listed_incoming.stdout)
+
+            listed_clients = run([".", "list", "--client=s1"], env, check=True, timeout=5.0)
             if client_one in listed_clients.stdout or "c-11111111" not in listed_clients.stdout:
                 raise AssertionError(listed_clients.stdout)
 

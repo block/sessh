@@ -1675,7 +1675,7 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_no_host_list_clients_uses_remote_route(tmp):
+def test_ssh_no_host_list_client_uses_remote_route(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1685,14 +1685,14 @@ def test_ssh_no_host_list_clients_uses_remote_route(tmp):
     env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "42"
     write_ssh_route(env, "remote-clients", guid_for_alias("remote-clients"), "test-host")
 
-    result = run_sesshmux(["list-clients", "remote-clients"], env, timeout=30.0)
+    result = run_sesshmux(["list", "--client=remote-clients"], env, timeout=30.0)
 
     if result.returncode == 0:
         raise AssertionError(result)
     log_text = optional_text(fake_log)
     if "invoked=1" not in log_text:
         raise AssertionError(
-            "list-clients did not delegate to ssh for a remote route\n"
+            "list --client did not delegate to ssh for a remote route\n"
             f"fake ssh log:\n{log_text}\n"
             f"sesshmux result:\n{process_diagnostics(result)}"
         )
@@ -3139,8 +3139,8 @@ def main(argv=None):
             test_ssh_no_host_attach_uses_local_route,
         ),
         (
-            "ssh no-host list-clients uses remote route",
-            test_ssh_no_host_list_clients_uses_remote_route,
+            "ssh no-host list --client uses remote route",
+            test_ssh_no_host_list_client_uses_remote_route,
         ),
         (
             "ssh no-host detach client uses client route hint",

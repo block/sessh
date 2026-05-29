@@ -82,19 +82,17 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const command = args[0];
     if (std.mem.eql(u8, command, "list")) {
-        const options = parseListOptions(args) catch return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl] [--exited] [--local-only]\n");
-        const exit_status = try listAgents(allocator, options);
+        const options = parseListOptions(args) catch return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl] [--exited] [--local-only] [--client=incoming|outgoing|session|ID]\n");
+        const exit_status = if (options.client_selector == .none)
+            try listAgents(allocator, options)
+        else
+            try listClients(allocator, options);
         return process_exit.request(exit_status);
     }
     if (std.mem.eql(u8, command, "kill")) {
         if (args.len != 2) return finishCommand(64, "", "ERROR usage: kill ID | kill --all\n");
         if (std.mem.eql(u8, args[1], "--all")) return killAllAgents(allocator);
         return killOneAgent(allocator, args[1]);
-    }
-    if (std.mem.eql(u8, command, "list-clients")) {
-        const options = parseListClientsOptions(args) catch return finishCommand(64, "", "ERROR usage: list-clients [--jsonl] ID\n");
-        const exit_status = try listClients(allocator, options);
-        return process_exit.request(exit_status);
     }
     if (isClientControlCommandName(command)) {
         const client_command = parseClientControlCommand(args) catch return finishCommand(64, "", "ERROR usage: detach|repaint|debug [options] ID\n");
@@ -125,16 +123,21 @@ const ListMode = enum {
     exited,
 };
 
+const ClientListSelector = union(enum) {
+    none,
+    incoming,
+    outgoing,
+    session,
+    session_ref: []const u8,
+    client_ref: []const u8,
+};
+
 const ListOptions = struct {
     host_display: []const u8 = ".",
     format: ListFormat = .table,
     mode: ListMode = .live,
     local_only: bool = false,
-};
-
-const ListClientsOptions = struct {
-    session_ref: []const u8,
-    format: ListFormat = .table,
+    client_selector: ClientListSelector = .none,
 };
 
 const ClientControlTarget = struct {
@@ -217,34 +220,26 @@ fn parseListOptions(args: []const []const u8) !ListOptions {
         } else if (std.mem.eql(u8, args[i], "--local-only")) {
             options.local_only = true;
             i += 1;
+        } else if (std.mem.startsWith(u8, args[i], "--client=")) {
+            if (options.client_selector != .none) return error.InvalidListArgs;
+            const value = args[i]["--client=".len..];
+            if (value.len == 0) return error.MissingClientListTarget;
+            options.client_selector = parseClientListSelector(value);
+            i += 1;
         } else {
             return error.InvalidListArgs;
         }
     }
+    if (options.client_selector != .none and (options.mode == .exited or options.local_only)) return error.InvalidListArgs;
     return options;
 }
 
-fn parseListClientsOptions(args: []const []const u8) !ListClientsOptions {
-    var format: ListFormat = .table;
-    var session_ref: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) {
-        if (std.mem.eql(u8, args[i], "--jsonl")) {
-            format = .jsonl;
-            i += 1;
-        } else if (std.mem.startsWith(u8, args[i], "--")) {
-            return error.InvalidListClientsArgs;
-        } else if (session_ref == null) {
-            session_ref = args[i];
-            i += 1;
-        } else {
-            return error.InvalidListClientsArgs;
-        }
-    }
-    return .{
-        .session_ref = session_ref orelse return error.MissingSessionRef,
-        .format = format,
-    };
+fn parseClientListSelector(value: []const u8) ClientListSelector {
+    if (std.mem.eql(u8, value, "incoming")) return .incoming;
+    if (std.mem.eql(u8, value, "outgoing")) return .outgoing;
+    if (std.mem.eql(u8, value, "session")) return .session;
+    if (std.mem.startsWith(u8, value, session_registry.client_guid_prefix)) return .{ .client_ref = value };
+    return .{ .session_ref = value };
 }
 
 fn parseClientControlCommand(args: []const []const u8) !ClientControlCommand {
@@ -514,8 +509,36 @@ fn querySessionListLiveStatus(allocator: std.mem.Allocator, paths: session_regis
     };
 }
 
-fn listClients(allocator: std.mem.Allocator, options: ListClientsOptions) !u8 {
-    var paths = pathsForLocalSessionRef(allocator, options.session_ref) catch |err| switch (err) {
+fn listClients(allocator: std.mem.Allocator, options: ListOptions) !u8 {
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    const writer = stdout.writer(allocator);
+    if (options.format == .table) try writeClientTableHeader(writer);
+
+    const exit_status = switch (options.client_selector) {
+        .none => unreachable,
+        .incoming => try listIncomingClients(allocator, writer, options),
+        .outgoing => try listOutgoingClients(allocator, writer, options),
+        .session => blk: {
+            const session_ref = std.process.getEnvVarOwned(allocator, "SESSH_GUID") catch |err| switch (err) {
+                error.EnvironmentVariableNotFound => {
+                    try io.writeAll(2, "ERROR session not found\n");
+                    return 1;
+                },
+                else => return err,
+            };
+            defer allocator.free(session_ref);
+            break :blk try listClientsForSessionRef(allocator, writer, options, session_ref);
+        },
+        .session_ref => |session_ref| try listClientsForSessionRef(allocator, writer, options, session_ref),
+        .client_ref => |client_ref| try listClientByRef(allocator, writer, options, client_ref),
+    };
+    if (stdout.items.len > 0) try io.writeAll(1, stdout.items);
+    return exit_status;
+}
+
+fn listClientsForSessionRef(allocator: std.mem.Allocator, writer: anytype, options: ListOptions, session_ref: []const u8) !u8 {
+    var paths = pathsForLocalSessionRef(allocator, session_ref) catch |err| switch (err) {
         error.SessionAlreadyExited => {
             try io.writeAll(2, "ERROR session already exited\n");
             return 1;
@@ -528,6 +551,10 @@ fn listClients(allocator: std.mem.Allocator, options: ListClientsOptions) !u8 {
     };
     defer paths.deinit(allocator);
 
+    return listClientsForSessionPaths(allocator, writer, options, paths);
+}
+
+fn listClientsForSessionPaths(allocator: std.mem.Allocator, writer: anytype, options: ListOptions, paths: session_registry.SessionPaths) !u8 {
     var meta = session_registry.readMeta(allocator, paths) catch {
         session_registry.removeStaleHints(paths) catch {};
         try io.writeAll(2, "ERROR session not found\n");
@@ -547,15 +574,279 @@ fn listClients(allocator: std.mem.Allocator, options: ListClientsOptions) !u8 {
     defer state.deinit(allocator);
     std.mem.sort(pb.AttachedClient, state.attached_clients.items, {}, attachedClientSortLessThan);
 
-    var stdout: std.ArrayList(u8) = .empty;
-    defer stdout.deinit(allocator);
-    const writer = stdout.writer(allocator);
-    switch (options.format) {
-        .table => try writeClientTable(writer, state.attached_clients.items),
-        .jsonl => try writeClientJsonlRows(writer, state.attached_clients.items),
-    }
-    try io.writeAll(1, stdout.items);
+    const session_guid = std.fs.path.basename(paths.dir);
+    const display_id = (try session_registry.primaryAliasForGuid(allocator, session_guid)) orelse try session_registry.shortSessionGuid(allocator, session_guid);
+    defer allocator.free(display_id);
+    try writeClientRows(writer, options.format, display_id, session_guid, options.host_display, state.attached_clients.items, null);
     return 0;
+}
+
+fn listIncomingClients(allocator: std.mem.Allocator, writer: anytype, options: ListOptions) !u8 {
+    const sessions_dir = try session_registry.sessionsDir(allocator);
+    defer allocator.free(sessions_dir);
+    var dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close();
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
+        var paths = try session_registry.pathsForSessionId(allocator, entry.name);
+        defer paths.deinit(allocator);
+        _ = try listClientsForSessionPaths(allocator, writer, options, paths);
+    }
+    return 0;
+}
+
+fn listClientByRef(allocator: std.mem.Allocator, writer: anytype, options: ListOptions, client_ref: []const u8) !u8 {
+    const socket_path = session_registry.clientAgentSocketPathForClientGuid(allocator, client_ref) catch |err| switch (err) {
+        error.InvalidClientId => {
+            try io.writeAll(2, "ERROR invalid client target\n");
+            return 64;
+        },
+        error.AmbiguousClientId => {
+            try io.writeAll(2, "ERROR client target is ambiguous\n");
+            return 1;
+        },
+        error.FileNotFound => {
+            try io.writeAll(2, "ERROR client not found\n");
+            return 1;
+        },
+        else => return err,
+    };
+    defer allocator.free(socket_path);
+
+    var state = querySessionLiveStateFromSocketPath(allocator, socket_path) catch |err| {
+        try writeCommandErrorForAgentFailure(err);
+        return 1;
+    };
+    defer state.deinit(allocator);
+    std.mem.sort(pb.AttachedClient, state.attached_clients.items, {}, attachedClientSortLessThan);
+
+    const session_guid = try sessionGuidFromClientAgentSocketHint(allocator, socket_path);
+    defer allocator.free(session_guid);
+    const display_id = (try session_registry.primaryAliasForGuid(allocator, session_guid)) orelse try session_registry.shortSessionGuid(allocator, session_guid);
+    defer allocator.free(display_id);
+    try writeClientRows(writer, options.format, display_id, session_guid, options.host_display, state.attached_clients.items, client_ref);
+    return 0;
+}
+
+fn listOutgoingClients(allocator: std.mem.Allocator, writer: anytype, options: ListOptions) !u8 {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    const client_root = try session_registry.clientHintsDirInRoot(allocator, runtime_root);
+    defer allocator.free(client_root);
+    var dir = std.fs.openDirAbsolute(client_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close();
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .directory or !session_registry.isValidClientGuid(entry.name)) continue;
+        const route_path = try std.fmt.allocPrint(allocator, "{s}/{s}/route.json", .{ client_root, entry.name });
+        defer allocator.free(route_path);
+        var route = session_registry.readRoute(allocator, route_path) catch continue;
+        defer route.deinit(allocator);
+        try writeCachedClientRow(writer, options.format, route.primary_alias, route.guid, route.host, entry.name, route.agent_version);
+    }
+    return 0;
+}
+
+fn writeClientTableHeader(writer: anytype) !void {
+    try writePadded(writer, "CLIENT", list_format.id_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, "SESSION", list_format.id_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, "HOST", list_format.host_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, "ATTACHED", list_format.attached_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, "INPUT", list_format.input_width);
+    try writer.writeAll("  ");
+    try writer.writeAll("SIZE\n");
+}
+
+fn writeClientRows(
+    writer: anytype,
+    format: ListFormat,
+    session_display_id: []const u8,
+    session_guid: []const u8,
+    host_display: []const u8,
+    clients: []const pb.AttachedClient,
+    client_filter_ref: ?[]const u8,
+) !void {
+    switch (format) {
+        .table => {
+            const now_ms = nowUnixMs();
+            for (clients) |client_info| {
+                if (client_filter_ref) |ref| {
+                    if (!(try clientRefMatchesGuid(ref, client_info.client_guid))) continue;
+                }
+                try writeClientTableRow(writer, now_ms, session_display_id, host_display, client_info);
+            }
+        },
+        .jsonl => {
+            for (clients) |client_info| {
+                if (client_filter_ref) |ref| {
+                    if (!(try clientRefMatchesGuid(ref, client_info.client_guid))) continue;
+                }
+                try writeClientJsonlRow(writer, session_display_id, session_guid, host_display, client_info);
+            }
+        },
+    }
+}
+
+fn writeClientTableRow(
+    writer: anytype,
+    now_ms: u64,
+    session_display_id: []const u8,
+    host_display: []const u8,
+    client_info: pb.AttachedClient,
+) !void {
+    const client_id = try session_registry.shortClientGuid(app_allocator.allocator(), client_info.client_guid);
+    defer app_allocator.allocator().free(client_id);
+    var attached_buf: [32]u8 = undefined;
+    var input_buf: [32]u8 = undefined;
+    var size_buf: [24]u8 = undefined;
+    const attached = try formatRelativeUnixMs(&attached_buf, now_ms, client_info.attached_at_unix_ms);
+    const input = try formatOptionalRelativeUnixMs(&input_buf, now_ms, client_info.last_input_at_unix_ms);
+    const size = if (client_info.terminal_size) |size_value|
+        try std.fmt.bufPrint(&size_buf, "{}x{}", .{ size_value.terminal_rows, size_value.terminal_cols })
+    else
+        "unknown";
+    try writePadded(writer, client_id, list_format.id_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, session_display_id, list_format.id_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, host_display, list_format.host_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, attached, list_format.attached_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, input, list_format.input_width);
+    try writer.writeAll("  ");
+    try writer.writeAll(size);
+    try writer.writeAll("\n");
+}
+
+fn writeClientJsonlRow(
+    writer: anytype,
+    session_display_id: []const u8,
+    session_guid: []const u8,
+    host_display: []const u8,
+    client_info: pb.AttachedClient,
+) !void {
+    try writer.writeAll("{\"client_guid\":");
+    try writeJsonString(writer, client_info.client_guid);
+    try writer.writeAll(",\"session_id\":");
+    try writeJsonString(writer, session_display_id);
+    try writer.writeAll(",\"session_guid\":");
+    try writeJsonString(writer, session_guid);
+    try writer.writeAll(",\"host\":");
+    try writeJsonString(writer, host_display);
+    try writer.print(",\"attached_at_unix_ms\":{}", .{client_info.attached_at_unix_ms});
+    try writer.writeAll(",\"last_input_at_unix_ms\":");
+    if (client_info.last_input_at_unix_ms) |ts| {
+        try writer.print("{}", .{ts});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"terminal_size\":");
+    if (client_info.terminal_size) |size_value| {
+        try writer.print(
+            "{{\"terminal_rows\":{},\"terminal_cols\":{}}}",
+            .{ size_value.terminal_rows, size_value.terminal_cols },
+        );
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll("}\n");
+}
+
+fn writeCachedClientRow(
+    writer: anytype,
+    format: ListFormat,
+    session_display_id: []const u8,
+    session_guid: []const u8,
+    host: []const u8,
+    client_guid: []const u8,
+    version: []const u8,
+) !void {
+    switch (format) {
+        .table => {
+            const client_id = try session_registry.shortClientGuid(app_allocator.allocator(), client_guid);
+            defer app_allocator.allocator().free(client_id);
+            try writePadded(writer, client_id, list_format.id_width);
+            try writer.writeAll("  ");
+            try writePadded(writer, session_display_id, list_format.id_width);
+            try writer.writeAll("  ");
+            try writePadded(writer, host, list_format.host_width);
+            try writer.writeAll("  ");
+            try writePadded(writer, "???", list_format.attached_width);
+            try writer.writeAll("  ");
+            try writePadded(writer, "???", list_format.input_width);
+            try writer.writeAll("  ");
+            try writer.writeAll("unknown");
+            try writer.writeAll("\n");
+        },
+        .jsonl => {
+            try writer.writeAll("{\"client_guid\":");
+            try writeJsonString(writer, client_guid);
+            try writer.writeAll(",\"session_id\":");
+            try writeJsonString(writer, session_display_id);
+            try writer.writeAll(",\"session_guid\":");
+            try writeJsonString(writer, session_guid);
+            try writer.writeAll(",\"host\":");
+            try writeJsonString(writer, host);
+            try writer.writeAll(",\"attached_at_unix_ms\":null,\"last_input_at_unix_ms\":null,\"terminal_size\":null");
+            try writer.writeAll(",\"version\":");
+            try writeJsonString(writer, version);
+            try writer.writeAll("}\n");
+        },
+    }
+}
+
+fn clientRefMatchesGuid(ref: []const u8, guid: []const u8) !bool {
+    if (std.mem.eql(u8, ref, guid)) return true;
+    if (!std.mem.startsWith(u8, ref, session_registry.client_guid_prefix)) return false;
+    const compact = try session_registry.compactClientGuid(app_allocator.allocator(), guid);
+    defer app_allocator.allocator().free(compact);
+    var ref_compact_buf: [session_registry.compact_guid_len]u8 = undefined;
+    var ref_compact_len: usize = 0;
+    for (ref[session_registry.client_guid_prefix.len..]) |byte| {
+        if (byte == '-') continue;
+        if (!std.ascii.isHex(byte) or ref_compact_len >= ref_compact_buf.len) return false;
+        ref_compact_buf[ref_compact_len] = std.ascii.toLower(byte);
+        ref_compact_len += 1;
+    }
+    if (ref_compact_len == 0) return false;
+    return std.mem.startsWith(u8, compact, ref_compact_buf[0..ref_compact_len]);
+}
+
+fn sessionGuidFromClientAgentSocketHint(allocator: std.mem.Allocator, socket_path: []const u8) ![]u8 {
+    const target = try readLinkAlloc(allocator, socket_path, 4096);
+    defer allocator.free(target);
+    const dirname = std.fs.path.dirname(target) orelse return error.InvalidSocketPath;
+    const basename = std.fs.path.basename(dirname);
+    return session_registry.canonicalGuid(allocator, basename);
+}
+
+fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8, max_len: usize) ![]u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const buf = try allocator.alloc(u8, max_len);
+    defer allocator.free(buf);
+    const n = c.readlink(path_z.ptr, buf.ptr, buf.len);
+    if (n < 0) {
+        return switch (posix.errno(n)) {
+            .NOENT, .NOTDIR => error.FileNotFound,
+            else => error.ReadLinkFailed,
+        };
+    }
+    return allocator.dupe(u8, buf[0..@intCast(n)]);
 }
 
 fn runClientControlCommand(allocator: std.mem.Allocator, command: ClientControlCommand) !void {
@@ -643,56 +934,6 @@ fn attachedClientSortLessThan(_: void, a: pb.AttachedClient, b: pb.AttachedClien
     if (a_input != b_input) return a_input > b_input;
     if (a.attached_at_unix_ms != b.attached_at_unix_ms) return a.attached_at_unix_ms > b.attached_at_unix_ms;
     return std.mem.lessThan(u8, a.client_guid, b.client_guid);
-}
-
-fn writeClientTable(writer: anytype, clients: []const pb.AttachedClient) !void {
-    try writer.writeAll("CLIENT      ATTACHED  INPUT     SIZE\n");
-    const now_ms = nowUnixMs();
-    for (clients) |client_info| {
-        const client_id = try session_registry.shortClientGuid(app_allocator.allocator(), client_info.client_guid);
-        defer app_allocator.allocator().free(client_id);
-        var attached_buf: [32]u8 = undefined;
-        var input_buf: [32]u8 = undefined;
-        var size_buf: [24]u8 = undefined;
-        const attached = try formatRelativeUnixMs(&attached_buf, now_ms, client_info.attached_at_unix_ms);
-        const input = try formatOptionalRelativeUnixMs(&input_buf, now_ms, client_info.last_input_at_unix_ms);
-        const size = if (client_info.terminal_size) |size_value|
-            try std.fmt.bufPrint(&size_buf, "{}x{}", .{ size_value.terminal_rows, size_value.terminal_cols })
-        else
-            "unknown";
-        try writePadded(writer, client_id, session_registry.generated_alias_len);
-        try writer.writeAll("  ");
-        try writePadded(writer, attached, 8);
-        try writer.writeAll("  ");
-        try writePadded(writer, input, 8);
-        try writer.writeAll("  ");
-        try writer.writeAll(size);
-        try writer.writeAll("\n");
-    }
-}
-
-fn writeClientJsonlRows(writer: anytype, clients: []const pb.AttachedClient) !void {
-    for (clients) |client_info| {
-        try writer.writeAll("{\"client_guid\":");
-        try writeJsonString(writer, client_info.client_guid);
-        try writer.print(",\"attached_at_unix_ms\":{}", .{client_info.attached_at_unix_ms});
-        try writer.writeAll(",\"last_input_at_unix_ms\":");
-        if (client_info.last_input_at_unix_ms) |ts| {
-            try writer.print("{}", .{ts});
-        } else {
-            try writer.writeAll("null");
-        }
-        try writer.writeAll(",\"terminal_size\":");
-        if (client_info.terminal_size) |size_value| {
-            try writer.print(
-                "{{\"terminal_rows\":{},\"terminal_cols\":{}}}",
-                .{ size_value.terminal_rows, size_value.terminal_cols },
-            );
-        } else {
-            try writer.writeAll("null");
-        }
-        try writer.writeAll("}\n");
-    }
 }
 
 fn formatAttachedCount(buf: []u8, attached_count: ?u32) []const u8 {
@@ -1106,7 +1347,11 @@ fn querySessionLiveStateDetachedAt(allocator: std.mem.Allocator, paths: session_
 }
 
 fn querySessionLiveState(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !pb.SessionLiveState {
-    const fd = try socket_transport.connectSocket(paths.socket);
+    return querySessionLiveStateFromSocketPath(allocator, paths.socket);
+}
+
+fn querySessionLiveStateFromSocketPath(allocator: std.mem.Allocator, socket_path: []const u8) !pb.SessionLiveState {
+    const fd = try socket_transport.connectSocket(socket_path);
     defer _ = c.close(fd);
 
     try initiateRuntimeHandshake(allocator, fd);

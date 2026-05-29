@@ -30,7 +30,6 @@ const LocalAction = enum {
     list,
     kill,
     kill_all,
-    list_clients,
     detach_client,
     repaint_client,
     debug_client,
@@ -58,10 +57,10 @@ const LocalOptions = struct {
     list_include_cached_routes: bool = true,
     list_jsonl: bool = false,
     list_exited: bool = false,
+    list_client_target: ?[]const u8 = null,
     client_session_ref: ?[]const u8 = null,
     client_target: ClientTarget = .default,
     client_guid: ?[]const u8 = null,
-    client_jsonl: bool = false,
     client_repaint_scrollback: bool = false,
     debug_client_action: ?DebugClientAction = null,
     debug_unresponsive_seconds: ?u32 = null,
@@ -2116,6 +2115,17 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     const runtime_broker_args: []const []const u8 = &.{};
     switch (options.action) {
         .list => {
+            if (options.list_client_target != null) {
+                const exit_status = runLocalClientListCommand(allocator, args[0], runtime_broker_args, options) catch |err| switch (err) {
+                    error.MissingSessionRef => {
+                        try io_helpers.writeAll(2, "sessh: list --client=session requires $SESSH_GUID\n");
+                        return process_exit.request(64);
+                    },
+                    else => return err,
+                };
+                if (exit_status != 0) return process_exit.request(exit_status);
+                return;
+            }
             const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl, options.list_exited);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
@@ -2131,17 +2141,6 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             var command_args_buf: [4][]const u8 = undefined;
             const command_args = appendBrokerCommand(runtime_broker_args, "kill", "--all", &command_args_buf);
             const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
-            if (exit_status != 0) return process_exit.request(exit_status);
-            return;
-        },
-        .list_clients => {
-            const exit_status = runLocalClientListCommand(allocator, args[0], runtime_broker_args, options) catch |err| switch (err) {
-                error.MissingSessionRef => {
-                    try io_helpers.writeAll(2, "sessh: list-clients requires an ID outside a sessh session\n");
-                    return process_exit.request(64);
-                },
-                else => return err,
-            };
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
@@ -2214,7 +2213,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             "",
             options.initial_scrollback_row_count,
         ),
-        .list, .kill, .kill_all, .list_clients, .detach_client, .repaint_client, .debug_client => unreachable,
+        .list, .kill, .kill_all, .detach_client, .repaint_client, .debug_client => unreachable,
     }) catch |err| {
         if (process_exit.is(err)) return err;
         terminateChild(&child);
@@ -2319,16 +2318,88 @@ fn runLocalClientListCommand(
     runtime_broker_args: []const []const u8,
     options: LocalOptions,
 ) !u8 {
-    const session_ref = try resolveClientSessionRef(allocator, options.client_session_ref);
-    defer allocator.free(session_ref);
+    const target = options.list_client_target orelse return error.MissingSessionRef;
+    if (try remoteRouteForClientListTarget(allocator, target)) |route| {
+        var route_copy = route;
+        defer route_copy.deinit(allocator);
+        const remote_target = if (std.mem.startsWith(u8, target, session_registry.client_guid_prefix)) target else route_copy.guid;
+        return runRemoteClientListCommand(allocator, exe, &route_copy, remote_target, options.list_jsonl);
+    }
 
     var command_args: std.ArrayList([]const u8) = .empty;
     defer command_args.deinit(allocator);
+    var client_arg: ?[]u8 = null;
+    defer if (client_arg) |arg| allocator.free(arg);
     try command_args.appendSlice(allocator, runtime_broker_args);
-    try command_args.append(allocator, "list-clients");
-    if (options.client_jsonl) try command_args.append(allocator, "--jsonl");
-    try command_args.append(allocator, session_ref);
+    try command_args.append(allocator, "list");
+    client_arg = try std.fmt.allocPrint(allocator, "--client={s}", .{target});
+    try command_args.append(allocator, client_arg.?);
+    if (options.list_jsonl) try command_args.append(allocator, "--jsonl");
     return runLocalBrokerCommand(allocator, exe, command_args.items);
+}
+
+fn remoteRouteForClientListTarget(allocator: std.mem.Allocator, target: []const u8) !?session_registry.Route {
+    if (std.mem.eql(u8, target, "incoming") or
+        std.mem.eql(u8, target, "outgoing") or
+        std.mem.eql(u8, target, "session"))
+    {
+        return null;
+    }
+    if (std.mem.startsWith(u8, target, session_registry.client_guid_prefix)) {
+        var route = session_registry.readRouteForClientGuid(allocator, target) catch |err| switch (err) {
+            error.FileNotFound, error.InvalidClientId, error.AmbiguousClientId => return null,
+            else => return err,
+        };
+        errdefer route.deinit(allocator);
+        if (routeIsRemote(&route)) return route;
+        route.deinit(allocator);
+        return null;
+    }
+    var route = session_registry.readRouteForRef(allocator, target) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    errdefer route.deinit(allocator);
+    if (routeIsRemote(&route)) return route;
+    route.deinit(allocator);
+    return null;
+}
+
+fn runRemoteClientListCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    route: *const session_registry.Route,
+    target: []const u8,
+    jsonl: bool,
+) !u8 {
+    var client_arg: ?[]u8 = null;
+    defer if (client_arg) |arg| allocator.free(arg);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe);
+    try argv.append(allocator, "list");
+    try argv.appendSlice(allocator, route.ssh_options);
+    try argv.append(allocator, "--host");
+    try argv.append(allocator, route.host);
+    client_arg = try std.fmt.allocPrint(allocator, "--client={s}", .{target});
+    try argv.append(allocator, client_arg.?);
+    if (jsonl) try argv.append(allocator, "--jsonl");
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv.items,
+        .max_output_bytes = 1024 * 1024,
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.stdout.len > 0) try io_helpers.writeAll(1, result.stdout);
+    if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
+    return switch (result.term) {
+        .Exited => |code| @intCast(@min(code, std.math.maxInt(u8))),
+        else => 1,
+    };
 }
 
 fn runLocalClientControlCommand(
@@ -2947,13 +3018,6 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
         if (!options.action_set and std.mem.eql(u8, arg, "list")) {
             try setAction(&options, .list);
             i += 1;
-        } else if (!options.action_set and std.mem.eql(u8, arg, "list-clients")) {
-            try setAction(&options, .list_clients);
-            i += 1;
-            if (i < args.len and !std.mem.startsWith(u8, args[i], "--")) {
-                options.client_session_ref = args[i];
-                i += 1;
-            }
         } else if (!options.action_set and std.mem.eql(u8, arg, "detach")) {
             try setAction(&options, .detach_client);
             i += 1;
@@ -3004,7 +3068,13 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--jsonl")) {
             options.list_jsonl = true;
-            options.client_jsonl = true;
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "--client=")) {
+            if (options.action != .list) return error.UnsupportedClientTarget;
+            const value = arg["--client=".len..];
+            if (value.len == 0) return error.MissingClientListTarget;
+            if (options.list_client_target != null) return error.MultipleTargets;
+            options.list_client_target = value;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--exited")) {
             options.list_exited = true;
@@ -3081,8 +3151,10 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
     }
     if (options.list_refresh and options.action != .list) return error.UnsupportedListRefresh;
     if (!options.list_include_cached_routes and options.action != .list) return error.UnsupportedListLocalOnly;
-    if (options.list_jsonl and options.action != .list and options.action != .list_clients) return error.UnsupportedListJsonl;
+    if (options.list_jsonl and options.action != .list) return error.UnsupportedListJsonl;
     if (options.list_exited and options.action != .list) return error.UnsupportedListExited;
+    if (options.list_client_target != null and options.action != .list) return error.UnsupportedClientTarget;
+    if (options.list_client_target != null and (options.list_refresh or !options.list_include_cached_routes or options.list_exited)) return error.UnsupportedClientTarget;
     if (options.client_target != .default and !actionSupportsClientTarget(options.action)) return error.UnsupportedClientTarget;
     if (options.client_guid != null and options.client_target != .client_guid) return error.UnsupportedClientTarget;
     if (options.client_repaint_scrollback and options.action != .repaint_client) return error.UnsupportedClientTarget;
@@ -3100,7 +3172,7 @@ fn parseDebugUnresponsiveSeconds(value: []const u8) !u32 {
 }
 
 fn actionSupportsClientSessionRef(action: LocalAction) bool {
-    return action == .list_clients or actionSupportsClientTarget(action);
+    return actionSupportsClientTarget(action);
 }
 
 fn actionSupportsClientTarget(action: LocalAction) bool {
