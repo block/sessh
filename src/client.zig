@@ -3070,149 +3070,270 @@ fn terminateChild(child: *std.process.Child) void {
 fn parseLocalOptions(args: []const []const u8) !LocalOptions {
     var options = LocalOptions{};
     var i: usize = 2;
+
+    // Compatibility fallbacks invoke the local client as
+    // `. --compat-version VERSION <command> ...`. Parse only those truly global
+    // knobs before deciding which command owns the remaining arguments.
     while (i < args.len) {
-        const arg = args[i];
-        if (!options.action_set and std.mem.eql(u8, arg, "list")) {
-            try setAction(&options, .list);
-            i += 1;
-        } else if (!options.action_set and std.mem.eql(u8, arg, "detach")) {
-            try setAction(&options, .detach_client);
-            i += 1;
-        } else if (!options.action_set and std.mem.eql(u8, arg, "repaint")) {
-            try setAction(&options, .repaint_client);
-            i += 1;
-        } else if (!options.action_set and std.mem.eql(u8, arg, "debug")) {
-            try setAction(&options, .debug_client);
-            i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingDebugAction;
-            if (std.mem.eql(u8, args[i], "sever-connection")) {
-                options.debug_client_action = .sever_connection;
-            } else if (std.mem.eql(u8, args[i], "unresponsive-connection")) {
-                options.debug_client_action = .unresponsive_connection;
-            } else {
-                return error.InvalidDebugAction;
-            }
-            i += 1;
-        } else if (!options.action_set and std.mem.eql(u8, arg, "attach")) {
-            try setAction(&options, .attach);
-            i += 1;
-            if (i < args.len and !std.mem.startsWith(u8, args[i], "--")) {
-                options.attach_id = args[i];
-                i += 1;
-            }
-        } else if (!options.action_set and std.mem.eql(u8, arg, "kill")) {
-            i += 1;
-            if (i < args.len and std.mem.eql(u8, args[i], "--all")) {
-                try setAction(&options, .kill_all);
-                i += 1;
-            } else {
-                try setAction(&options, .kill);
-                if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingKillId;
-                options.kill_id = args[i];
-                i += 1;
-            }
-        } else if (std.mem.eql(u8, arg, "--alias")) {
-            i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingAlias;
-            if (!session_registry.isValidCustomAlias(args[i])) return error.InvalidAlias;
-            options.alias = args[i];
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--refresh")) {
-            options.list_refresh = true;
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--local-only")) {
-            options.list_include_cached_routes = false;
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--jsonl")) {
-            options.list_jsonl = true;
-            i += 1;
-        } else if (std.mem.startsWith(u8, arg, "--client=")) {
-            if (options.action != .list) return error.UnsupportedClientTarget;
-            const value = arg["--client=".len..];
-            if (value.len == 0) return error.MissingClientListTarget;
-            if (options.list_client_target != null) return error.MultipleTargets;
-            options.list_client_target = value;
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--client")) {
-            if (options.action != .list) return error.UnsupportedClientTarget;
-            if (options.list_client_target != null) return error.MultipleTargets;
-            i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingClientListTarget;
-            options.list_client_target = args[i];
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--exited")) {
-            options.list_exited = true;
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--all")) {
-            try setClientTarget(&options, .all, null);
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--last-input")) {
-            try setClientTarget(&options, .last_input, null);
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--scrollback")) {
-            options.client_repaint_scrollback = true;
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--seconds")) {
-            if (options.action != .debug_client or options.debug_client_action != .unresponsive_connection) return error.UnsupportedDebugSeconds;
-            i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingDebugSeconds;
-            options.debug_unresponsive_seconds = try parseDebugUnresponsiveSeconds(args[i]);
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--leader")) {
-            if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
-            i += 1;
-            if (i >= args.len) return error.MissingLeader;
-            options.leader = try parseLeader(args[i]);
-            options.leader_set = true;
-            try options.banner_args.append(arg);
-            try options.banner_args.append(args[i]);
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--scrollback-limit")) {
-            if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
-            i += 1;
-            if (i >= args.len) return error.MissingScrollbackRowCount;
-            options.scrollback_row_count = try parseScrollbackRowCount(args[i]);
-            options.scrollback_row_count_set = true;
-            try options.banner_args.append(arg);
-            try options.banner_args.append(args[i]);
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--initial-scrollback")) {
-            if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
-            i += 1;
-            if (i >= args.len) return error.MissingInitialScrollback;
-            options.initial_scrollback_row_count = try parseInitialScrollbackRowCount(args[i]);
-            options.initial_scrollback_row_count_set = true;
-            try options.banner_args.append(arg);
-            try options.banner_args.append(args[i]);
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--log-level")) {
-            i += 1;
-            if (i >= args.len) return error.MissingClientLogLevel;
-            options.client_log_level = try client_log.parseLevel(args[i]);
-            options.client_log_level_set = true;
-            try options.banner_args.append(arg);
-            try options.banner_args.append(args[i]);
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--compat-version")) {
-            i += 1;
-            if (i >= args.len) return error.MissingCompatVersion;
-            options.compat_version = args[i];
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
-            i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingTtyTranscriptPath;
-            options.capture_tty_transcript = args[i];
-            i += 1;
-        } else if (!std.mem.startsWith(u8, arg, "--") and actionSupportsClientTarget(options.action) and options.client_target == .default and std.mem.startsWith(u8, arg, session_registry.client_guid_prefix)) {
-            try setClientTarget(&options, .client_guid, arg);
-            i += 1;
-        } else if (!std.mem.startsWith(u8, arg, "--") and actionSupportsClientSessionRef(options.action) and options.client_session_ref == null) {
-            options.client_session_ref = arg;
-            i += 1;
+        if (try parseLocalPreCommandOption(args, &i, &options)) continue;
+        break;
+    }
+
+    if (i >= args.len) return try validateLocalOptions(options);
+
+    // Pick the command before parsing command flags. This keeps options such as
+    // `--all` scoped to the commands that actually understand them.
+    const command = args[i];
+    if (std.mem.eql(u8, command, "list")) {
+        try setAction(&options, .list);
+        i += 1;
+        try parseLocalListOptions(args, &i, &options);
+    } else if (std.mem.eql(u8, command, "detach")) {
+        try setAction(&options, .detach_client);
+        i += 1;
+        try parseLocalClientControlOptions(args, &i, &options);
+    } else if (std.mem.eql(u8, command, "repaint")) {
+        try setAction(&options, .repaint_client);
+        i += 1;
+        try parseLocalClientControlOptions(args, &i, &options);
+    } else if (std.mem.eql(u8, command, "debug")) {
+        try setAction(&options, .debug_client);
+        i += 1;
+        try parseLocalDebugOptions(args, &i, &options);
+    } else if (std.mem.eql(u8, command, "attach")) {
+        try setAction(&options, .attach);
+        i += 1;
+        try parseLocalAttachOptions(args, &i, &options);
+    } else if (std.mem.eql(u8, command, "kill")) {
+        i += 1;
+        try parseLocalKillOptions(args, &i, &options);
+    } else {
+        try parseLocalNewOptions(args, &i, &options);
+    }
+
+    return try validateLocalOptions(options);
+}
+
+fn parseLocalPreCommandOption(args: []const []const u8, index: *usize, options: *LocalOptions) !bool {
+    const arg = args[index.*];
+    if (std.mem.eql(u8, arg, "--compat-version")) {
+        index.* += 1;
+        if (index.* >= args.len) return error.MissingCompatVersion;
+        options.compat_version = args[index.*];
+        index.* += 1;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--log-level")) {
+        try parseLocalLogLevel(args, index, options);
+        return true;
+    }
+    return false;
+}
+
+fn parseLocalNewOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
+    while (index.* < args.len) {
+        const arg = args[index.*];
+        if (std.mem.eql(u8, arg, "--alias")) {
+            index.* += 1;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingAlias;
+            if (!session_registry.isValidCustomAlias(args[index.*])) return error.InvalidAlias;
+            options.alias = args[index.*];
+            index.* += 1;
+        } else if (try parseLocalCommonSessionOption(args, index, options)) {
+            continue;
         } else {
             return error.UnknownArgument;
         }
     }
+}
+
+fn parseLocalAttachOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
+    if (index.* < args.len and !std.mem.startsWith(u8, args[index.*], "--")) {
+        options.attach_id = args[index.*];
+        index.* += 1;
+    }
+    while (index.* < args.len) {
+        if (try parseLocalCommonSessionOption(args, index, options)) continue;
+        return error.UnknownArgument;
+    }
+}
+
+fn parseLocalListOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
+    while (index.* < args.len) {
+        const arg = args[index.*];
+        if (std.mem.eql(u8, arg, "--refresh")) {
+            options.list_refresh = true;
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--local-only")) {
+            options.list_include_cached_routes = false;
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--jsonl")) {
+            options.list_jsonl = true;
+            index.* += 1;
+        } else if (std.mem.startsWith(u8, arg, "--client=")) {
+            const value = arg["--client=".len..];
+            if (value.len == 0) return error.MissingClientListTarget;
+            if (options.list_client_target != null) return error.MultipleTargets;
+            options.list_client_target = value;
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--client")) {
+            if (options.list_client_target != null) return error.MultipleTargets;
+            index.* += 1;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingClientListTarget;
+            options.list_client_target = args[index.*];
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--exited")) {
+            options.list_exited = true;
+            index.* += 1;
+        } else if (try parseLocalCommonSessionOption(args, index, options)) {
+            continue;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+}
+
+fn parseLocalKillOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
+    if (index.* < args.len and std.mem.eql(u8, args[index.*], "--all")) {
+        try setAction(options, .kill_all);
+        index.* += 1;
+    } else {
+        try setAction(options, .kill);
+        if (index.* >= args.len) return error.MissingKillId;
+        if (std.mem.startsWith(u8, args[index.*], "--")) return error.UnknownArgument;
+        options.kill_id = args[index.*];
+        index.* += 1;
+    }
+    while (index.* < args.len) {
+        if (try parseLocalCommonSessionOption(args, index, options)) continue;
+        return error.UnknownArgument;
+    }
+}
+
+fn parseLocalDebugOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
+    if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingDebugAction;
+    if (std.mem.eql(u8, args[index.*], "sever-connection")) {
+        options.debug_client_action = .sever_connection;
+    } else if (std.mem.eql(u8, args[index.*], "unresponsive-connection")) {
+        options.debug_client_action = .unresponsive_connection;
+    } else {
+        return error.InvalidDebugAction;
+    }
+    index.* += 1;
+    try parseLocalClientControlOptions(args, index, options);
+}
+
+fn parseLocalClientControlOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
+    while (index.* < args.len) {
+        const arg = args[index.*];
+        if (std.mem.eql(u8, arg, "--all")) {
+            try setClientTarget(options, .all, null);
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--last-input")) {
+            try setClientTarget(options, .last_input, null);
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--scrollback")) {
+            if (options.action != .repaint_client) return error.UnsupportedClientTarget;
+            options.client_repaint_scrollback = true;
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--seconds")) {
+            if (options.action != .debug_client or options.debug_client_action != .unresponsive_connection) return error.UnsupportedDebugSeconds;
+            index.* += 1;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingDebugSeconds;
+            options.debug_unresponsive_seconds = try parseDebugUnresponsiveSeconds(args[index.*]);
+            index.* += 1;
+        } else if (try parseLocalCommonSessionOption(args, index, options)) {
+            continue;
+        } else if (!std.mem.startsWith(u8, arg, "--") and options.client_target == .default and std.mem.startsWith(u8, arg, session_registry.client_guid_prefix)) {
+            try setClientTarget(options, .client_guid, arg);
+            index.* += 1;
+        } else if (!std.mem.startsWith(u8, arg, "--") and options.client_session_ref == null) {
+            options.client_session_ref = arg;
+            index.* += 1;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+}
+
+fn parseLocalCommonSessionOption(args: []const []const u8, index: *usize, options: *LocalOptions) !bool {
+    if (try parseLocalCommonProcessOption(args, index, options)) return true;
+    const arg = args[index.*];
+
+    // Compat-mode delegates every command to an older local client and appends
+    // these session-presentation options after the command. They are accepted
+    // only after `--compat-version` has made that compatibility path explicit.
+    if (std.mem.eql(u8, arg, "--leader")) {
+        if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
+        index.* += 1;
+        if (index.* >= args.len) return error.MissingLeader;
+        options.leader = try parseLeader(args[index.*]);
+        options.leader_set = true;
+        try options.banner_args.append(arg);
+        try options.banner_args.append(args[index.*]);
+        index.* += 1;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--scrollback-limit")) {
+        if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
+        index.* += 1;
+        if (index.* >= args.len) return error.MissingScrollbackRowCount;
+        options.scrollback_row_count = try parseScrollbackRowCount(args[index.*]);
+        options.scrollback_row_count_set = true;
+        try options.banner_args.append(arg);
+        try options.banner_args.append(args[index.*]);
+        index.* += 1;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--initial-scrollback")) {
+        if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
+        index.* += 1;
+        if (index.* >= args.len) return error.MissingInitialScrollback;
+        options.initial_scrollback_row_count = try parseInitialScrollbackRowCount(args[index.*]);
+        options.initial_scrollback_row_count_set = true;
+        try options.banner_args.append(arg);
+        try options.banner_args.append(args[index.*]);
+        index.* += 1;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
+        index.* += 1;
+        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingTtyTranscriptPath;
+        options.capture_tty_transcript = args[index.*];
+        index.* += 1;
+        return true;
+    }
+    return false;
+}
+
+fn parseLocalCommonProcessOption(args: []const []const u8, index: *usize, options: *LocalOptions) !bool {
+    const arg = args[index.*];
+    if (std.mem.eql(u8, arg, "--log-level")) {
+        try parseLocalLogLevel(args, index, options);
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--compat-version")) {
+        index.* += 1;
+        if (index.* >= args.len) return error.MissingCompatVersion;
+        options.compat_version = args[index.*];
+        index.* += 1;
+        return true;
+    }
+    return false;
+}
+
+fn parseLocalLogLevel(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
+    const arg = args[index.*];
+    index.* += 1;
+    if (index.* >= args.len) return error.MissingClientLogLevel;
+    options.client_log_level = try client_log.parseLevel(args[index.*]);
+    options.client_log_level_set = true;
+    try options.banner_args.append(arg);
+    try options.banner_args.append(args[index.*]);
+    index.* += 1;
+}
+
+fn validateLocalOptions(options: LocalOptions) !LocalOptions {
     if (options.list_refresh and options.action != .list) return error.UnsupportedListRefresh;
     if (!options.list_include_cached_routes and options.action != .list) return error.UnsupportedListLocalOnly;
     if (options.list_jsonl and options.action != .list) return error.UnsupportedListJsonl;
@@ -3233,10 +3354,6 @@ fn parseDebugUnresponsiveSeconds(value: []const u8) !u32 {
     const seconds = std.fmt.parseInt(u32, value, 10) catch return error.InvalidDebugSeconds;
     if (seconds == 0) return error.InvalidDebugSeconds;
     return seconds;
-}
-
-fn actionSupportsClientSessionRef(action: LocalAction) bool {
-    return actionSupportsClientTarget(action);
 }
 
 fn actionSupportsClientTarget(action: LocalAction) bool {
@@ -3295,6 +3412,68 @@ test "parseLeader accepts case-insensitive spelling" {
     }
 
     try std.testing.expectEqual(Leader.none, try parseLeader("none"));
+}
+
+test "parseLocalOptions keeps command flags command-specific" {
+    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
+        "sesshmux",
+        ".",
+        "list",
+        "--all",
+    }));
+    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
+        "sesshmux",
+        ".",
+        "kill",
+        "--refresh",
+    }));
+    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
+        "sesshmux",
+        ".",
+        "attach",
+        "s1",
+        "--exited",
+    }));
+    try std.testing.expectError(error.UnsupportedClientTarget, parseLocalOptions(&.{
+        "sesshmux",
+        ".",
+        "detach",
+        "--scrollback",
+    }));
+}
+
+test "parseLocalOptions supports compatibility options before local commands" {
+    const attach = try parseLocalOptions(&.{
+        "sesshmux",
+        ".",
+        "--compat-version",
+        "0.6.0",
+        "attach",
+        "s1",
+        "--leader",
+        "CTRL-B",
+    });
+
+    try std.testing.expectEqual(LocalAction.attach, attach.action);
+    try std.testing.expectEqualStrings("0.6.0", attach.compat_version.?);
+    try std.testing.expectEqualStrings("s1", attach.attach_id.?);
+    switch (attach.leader) {
+        .ctrl => |byte| try std.testing.expectEqual(@as(u8, 'B'), byte),
+        .none => return error.ExpectedLeader,
+    }
+
+    const list = try parseLocalOptions(&.{
+        "sesshmux",
+        ".",
+        "--compat-version",
+        "0.6.0",
+        "list",
+        "--leader",
+        "CTRL-B",
+    });
+
+    try std.testing.expectEqual(LocalAction.list, list.action);
+    try std.testing.expect(list.leader_set);
 }
 
 pub fn startNewSessionOnRuntime(
