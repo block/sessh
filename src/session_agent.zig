@@ -698,12 +698,14 @@ const SessionCreateRequest = struct {
     session_guid: []u8,
     session_alias: []u8,
     command_argv: [][]u8,
+    shell_command: ?[]u8,
 
     fn deinit(self: *SessionCreateRequest) void {
         app_allocator.allocator().free(self.session_alias);
         app_allocator.allocator().free(self.session_guid);
         for (self.command_argv) |arg| app_allocator.allocator().free(arg);
         app_allocator.allocator().free(self.command_argv);
+        if (self.shell_command) |shell_command| app_allocator.allocator().free(shell_command);
         self.environment.deinit();
         self.* = undefined;
     }
@@ -1519,6 +1521,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.query_default_colors,
                     request.session_guid,
                     request.command_argv,
+                    request.shell_command,
                 ) catch |err| {
                     session_registry.removeAlias(app_allocator.allocator(), alias) catch {};
                     return err;
@@ -2721,13 +2724,22 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
     if (message.query_default_colors) |colors| {
         query_default_colors = try readDefaultColors(colors);
     }
-    const command_argv = try app_allocator.allocator().alloc([]u8, message.command_argv.items.len);
+    if (message.legacy_command_argv.items.len > 0 and message.command != null) return error.InvalidCommandArgv;
+
+    var source_argv: []const []const u8 = message.legacy_command_argv.items;
+    var shell_command: ?[]const u8 = null;
+    if (message.command) |command| switch (command) {
+        .exec_command => |exec| source_argv = exec.argv.items,
+        .shell_command => |shell| shell_command = shell.command,
+    };
+
+    const command_argv = try app_allocator.allocator().alloc([]u8, source_argv.len);
     var command_argv_initialized: usize = 0;
     errdefer {
         for (command_argv[0..command_argv_initialized]) |arg| app_allocator.allocator().free(arg);
         app_allocator.allocator().free(command_argv);
     }
-    for (message.command_argv.items, 0..) |arg, i| {
+    for (source_argv, 0..) |arg, i| {
         if (arg.len == 0) return error.InvalidCommandArgv;
         command_argv[i] = try app_allocator.allocator().dupe(u8, arg);
         command_argv_initialized += 1;
@@ -2741,6 +2753,10 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
         .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
         .session_alias = try app_allocator.allocator().dupe(u8, message.session_alias),
         .command_argv = command_argv,
+        .shell_command = if (shell_command) |command|
+            try app_allocator.allocator().dupe(u8, command)
+        else
+            null,
     };
 }
 
@@ -2842,6 +2858,7 @@ fn createSession(
     query_default_colors: vt.DefaultColors,
     session_guid: []const u8,
     command_argv: []const []const u8,
+    shell_command: ?[]const u8,
 ) !usize {
     if (session_agent.fixed_session_id != null and session_agent.started_session) return error.TooManySessions;
 
@@ -2870,7 +2887,9 @@ fn createSession(
         defer app_allocator.allocator().free(path_z);
         const shell_argv0 = try loginShellArg0(app_allocator.allocator(), shell_path);
         defer app_allocator.allocator().free(shell_argv0);
-        var prepared_command: ?PreparedCommand = if (command_argv.len > 0)
+        var prepared_command: ?PreparedCommand = if (shell_command) |command|
+            try prepareShellCommand(app_allocator.allocator(), shell_path, command)
+        else if (command_argv.len > 0)
             try prepareCommandArgv(app_allocator.allocator(), command_argv)
         else
             null;
@@ -2910,7 +2929,7 @@ fn createSession(
         session.id_len = session_guid.len;
         session_agent.started_session = true;
         if (session_agent.fixed_session_id == null) session_agent.next_id += 1;
-        logSessionAgent(session_agent, "event=session_create id={s} pid={} rows={} cols={} scrollback_rows={} shell={s} command_argc={}", .{
+        logSessionAgent(session_agent, "event=session_create id={s} pid={} rows={} cols={} scrollback_rows={} shell={s} command_argc={} shell_command={}", .{
             session.idSlice(),
             pid,
             rows,
@@ -2918,6 +2937,7 @@ fn createSession(
             scrollback_row_count,
             shell_path,
             command_argv.len,
+            shell_command != null,
         });
         return session_index;
     }
@@ -2938,6 +2958,10 @@ const PreparedCommand = struct {
 
 fn prepareCommandArgv(allocator: std.mem.Allocator, command_argv: []const []const u8) !PreparedCommand {
     if (command_argv.len == 0) return error.InvalidCommandArgv;
+    return prepareCommandArgvInner(allocator, command_argv, false);
+}
+
+fn prepareCommandArgvInner(allocator: std.mem.Allocator, command_argv: []const []const u8, allow_empty_args: bool) !PreparedCommand {
     var owned_args = try allocator.alloc([:0]u8, command_argv.len);
     var initialized: usize = 0;
     errdefer {
@@ -2949,12 +2973,26 @@ fn prepareCommandArgv(allocator: std.mem.Allocator, command_argv: []const []cons
     errdefer allocator.free(argv);
 
     for (command_argv, 0..) |arg, i| {
-        if (arg.len == 0) return error.InvalidCommandArgv;
+        if (!allow_empty_args and arg.len == 0) return error.InvalidCommandArgv;
         owned_args[i] = try allocator.dupeZ(u8, arg);
         initialized += 1;
         argv[i] = owned_args[i].ptr;
     }
     return .{ .argv = argv, .owned_args = owned_args };
+}
+
+fn prepareShellCommand(allocator: std.mem.Allocator, shell_path: []const u8, shell_command: []const u8) !PreparedCommand {
+    const shell_dash_c = [_][]const u8{ shell_path, "-c", shell_command };
+    return prepareCommandArgvInner(allocator, &shell_dash_c, true);
+}
+
+test "prepareShellCommand preserves an explicit empty command" {
+    var command = try prepareShellCommand(std.testing.allocator, "/bin/sh", "");
+    defer command.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/bin/sh", std.mem.span(command.argv[0].?));
+    try std.testing.expectEqualStrings("-c", std.mem.span(command.argv[1].?));
+    try std.testing.expectEqualStrings("", std.mem.span(command.argv[2].?));
 }
 
 fn loginShellArg0(allocator: std.mem.Allocator, shell_path: []const u8) ![:0]u8 {

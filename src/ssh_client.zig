@@ -21,6 +21,12 @@ const default_ipqos_option_prefix = "-oIPQoS=";
 const ssh_config_query_max_output_bytes = 256 * 1024;
 const client_list_target_help = "incoming, outgoing, session, or a guid/alias";
 
+const SshTtyRequest = enum {
+    none,
+    requested,
+    forced,
+};
+
 const ArtifactSet = struct {
     allocator: std.mem.Allocator,
     artifact_set_id: []u8,
@@ -135,6 +141,8 @@ const ParsedSshArgs = struct {
     debug_client_action: ?DebugClientAction = null,
     debug_unresponsive_seconds: ?[]const u8 = null,
     command_argv: []const []const u8 = &.{},
+    shell_command_args: []const []const u8 = &.{},
+    tty_request: SshTtyRequest = .none,
     alias: ?[]const u8 = null,
     leader: terminal.Leader = .none,
     leader_set: bool = false,
@@ -410,6 +418,9 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
 
     var host: ?[]const u8 = null;
     var command_argv: []const []const u8 = &.{};
+    var command_from_delimiter = false;
+    var eval_args = false;
+    var tty_request: SshTtyRequest = .none;
     var i: usize = 0;
     while (i < args.len) {
         const arg = args[i];
@@ -418,6 +429,7 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
             i += 1;
             if (i >= args.len) return error.MissingCommandArgv;
             command_argv = args[i..];
+            command_from_delimiter = true;
             i = args.len;
         } else if (std.mem.eql(u8, arg, "--ssh-options")) {
             if (invocation == .sessh) return error.UnsupportedSesshCliOption;
@@ -425,6 +437,10 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
             i += 1;
             if (i >= args.len) return error.MissingSshOptions;
             try appendShellSplitWords(translated, &ssh_options, args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--eval-args")) {
+            if (host != null) return error.SesshOptionAfterHost;
+            eval_args = true;
             i += 1;
         } else if (isSesshLongOption(arg)) {
             if (host != null) return error.SesshOptionAfterHost;
@@ -435,14 +451,19 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
         } else if (host == null and std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "-")) {
             if (invocation == .sesshmux) return error.UnsupportedMuxOption;
             const start = i;
-            try consumeSshOption(args, &i);
+            try consumeSshOption(args, &i, &tty_request);
             try ssh_options.appendSlice(translated.allocator, args[start..i]);
         } else if (host == null) {
             host = arg;
             i += 1;
         } else {
-            return error.RemoteCommandUnsupported;
+            command_argv = args[i..];
+            i = args.len;
         }
+    }
+    if (eval_args and command_argv.len == 0) return error.MissingEvalArgs;
+    if (invocation == .sessh and command_argv.len > 0 and !eval_args and tty_request == .none) {
+        return error.RemoteCommandUnsupported;
     }
 
     const resolved_host = host orelse return error.MissingHost;
@@ -450,7 +471,12 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
     try translated.append(resolved_host);
     try appendMany(translated, sessh_options.items);
     if (command_argv.len > 0) {
-        try translated.append("--");
+        if (eval_args) {
+            try translated.append("--eval-args");
+            try translated.append("--");
+        } else if (invocation == .sesshmux or command_from_delimiter) {
+            try translated.append("--");
+        }
         try appendMany(translated, command_argv);
     }
 }
@@ -748,7 +774,8 @@ const MuxCommandParser = struct {
             !std.mem.startsWith(u8, current, "--"))
         {
             const start = self.index;
-            try consumeSshOption(self.args, &self.index);
+            var tty_request: SshTtyRequest = .none;
+            try consumeSshOption(self.args, &self.index, &tty_request);
             try self.ssh_options.appendSlice(self.translated.allocator, self.args[start..self.index]);
             return true;
         }
@@ -1060,6 +1087,13 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
     {
         return runLocalRouteCommand(allocator, args);
     }
+    if (shouldUsePlainSshFallbackForUnforcedTtyCommand(parsed_ssh_args, c.isatty(0) != 0)) {
+        if (!hasSesshSpecificRequest(args)) {
+            try runPlainSshFallbackForUnsupportedArgs(allocator, args, error.RemoteCommandUnsupported);
+        }
+        try io.writeAll(2, "sessh: remote commands with redirected stdin require -tt for persistent sessions\n");
+        return process_exit.request(64);
+    }
     applyFileConfigToSsh(allocator, &parsed_ssh_args) catch |err| {
         try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
         return process_exit.request(64);
@@ -1078,8 +1112,11 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
     parsed_ssh_args.default_ipqos_option = try resolveDefaultIpQosOption(allocator, parsed_ssh_args.options, parsed_ssh_args.host);
     defer if (parsed_ssh_args.default_ipqos_option) |option| allocator.free(option);
 
+    const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
+    defer if (shell_command) |command| allocator.free(command);
+
     if (parsed_ssh_args.force_compat) {
-        if (parsed_ssh_args.command_argv.len > 0) {
+        if (parsed_ssh_args.command_argv.len > 0 or shell_command != null) {
             try io.writeAll(2, "sessh: persistent command sessions are not supported with --force-compat\n");
             return process_exit.request(64);
         }
@@ -1177,6 +1214,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             new_guid.?,
             new_alias.?,
             parsed_ssh_args.command_argv,
+            shell_command,
         ),
         .attach => client.startAttachSessionOnRuntime(
             child.child.stdout.?.handle,
@@ -1194,7 +1232,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                 try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with compat-fallback\n");
                 return process_exit.request(1);
             }
-            if (parsed_ssh_args.command_argv.len > 0) {
+            if (parsed_ssh_args.command_argv.len > 0 or shell_command != null) {
                 try io.writeAll(2, "sessh: persistent command sessions require a compatible sesshmux agent\n");
                 return process_exit.request(1);
             }
@@ -1542,7 +1580,8 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
     const batch_mode = reason == .version_mismatch;
     const extra_options: usize = if (batch_mode) 1 else 0;
     const default_options = defaultSshOptionsLen(parsed_ssh_args);
-    const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + extra_options + default_options + 4);
+    const transport_options = transportSshOptionsLen(parsed_ssh_args.options);
+    const ssh_argv = try allocator.alloc([]const u8, transport_options + extra_options + default_options + 4);
     defer allocator.free(ssh_argv);
     ssh_argv[0] = "ssh";
     var arg_index: usize = 1;
@@ -1551,8 +1590,7 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
         arg_index += 1;
     }
     appendDefaultSshOptions(ssh_argv, &arg_index, parsed_ssh_args.default_ipqos_option);
-    @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.options.len], parsed_ssh_args.options);
-    arg_index += parsed_ssh_args.options.len;
+    appendTransportSshOptions(ssh_argv, &arg_index, parsed_ssh_args.options);
     ssh_argv[arg_index] = compatSshTtyOption(parsed_ssh_args, c.isatty(0) != 0, c.isatty(1) != 0);
     ssh_argv[arg_index + 1] = parsed_ssh_args.host;
     ssh_argv[ssh_argv.len - 1] = remote_command;
@@ -2052,12 +2090,14 @@ fn resolveDefaultIpQosOption(allocator: std.mem.Allocator, ssh_options: []const 
 }
 
 fn queryInteractiveIpQos(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) ![]u8 {
-    const argv = try allocator.alloc([]const u8, ssh_options.len + 3);
+    const transport_options = transportSshOptionsLen(ssh_options);
+    const argv = try allocator.alloc([]const u8, transport_options + 3);
     defer allocator.free(argv);
     argv[0] = "ssh";
-    @memcpy(argv[1 .. 1 + ssh_options.len], ssh_options);
-    argv[1 + ssh_options.len] = "-G";
-    argv[2 + ssh_options.len] = host;
+    var arg_index: usize = 1;
+    appendTransportSshOptions(argv, &arg_index, ssh_options);
+    argv[arg_index] = "-G";
+    argv[arg_index + 1] = host;
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
@@ -2514,6 +2554,51 @@ fn appendDefaultSshOptions(ssh_argv: [][]const u8, arg_index: *usize, default_ip
     }
 }
 
+fn transportSshOptionsLen(options: []const []const u8) usize {
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < options.len) : (i += 1) {
+        const option = options[i];
+        if (isSshTtyRequestOption(option)) continue;
+        len += 1;
+        if (sshOptionSeparateValueIndex(options, i)) |value_index| {
+            len += 1;
+            i = value_index;
+        }
+    }
+    return len;
+}
+
+// The runtime transport always uses `ssh -T` because sessh owns the PTY
+// protocol. User-provided `-t`/`-tt` only decides whether ssh-shaped remote
+// command args are accepted, so those options must not be forwarded to the
+// transport ssh invocation.
+fn appendTransportSshOptions(ssh_argv: [][]const u8, arg_index: *usize, options: []const []const u8) void {
+    var i: usize = 0;
+    while (i < options.len) : (i += 1) {
+        const option = options[i];
+        if (isSshTtyRequestOption(option)) continue;
+        ssh_argv[arg_index.*] = option;
+        arg_index.* += 1;
+        if (sshOptionSeparateValueIndex(options, i)) |value_index| {
+            ssh_argv[arg_index.*] = options[value_index];
+            arg_index.* += 1;
+            i = value_index;
+        }
+    }
+}
+
+fn sshOptionSeparateValueIndex(options: []const []const u8, index: usize) ?usize {
+    const arg = options[index];
+    if (arg.len < 2 or arg[0] != '-' or std.mem.startsWith(u8, arg, "--")) return null;
+    var pos: usize = 1;
+    while (pos < arg.len) : (pos += 1) {
+        if (!sshOptionConsumesValueForHostScan(arg[pos])) continue;
+        return if (pos + 1 < arg.len or index + 1 >= options.len) null else index + 1;
+    }
+    return null;
+}
+
 fn startRuntimeConnection(
     allocator: std.mem.Allocator,
     parsed_ssh_args: ParsedSshArgs,
@@ -2526,7 +2611,8 @@ fn startRuntimeConnection(
 ) !RuntimeConnection {
     const reconnect_options: usize = if (batch_mode) 1 else 0;
     const default_options = defaultSshOptionsLen(parsed_ssh_args);
-    const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + reconnect_options + default_options + 4);
+    const transport_options = transportSshOptionsLen(parsed_ssh_args.options);
+    const ssh_argv = try allocator.alloc([]const u8, transport_options + reconnect_options + default_options + 4);
     defer allocator.free(ssh_argv);
     ssh_argv[0] = "ssh";
     var arg_index: usize = 1;
@@ -2538,8 +2624,7 @@ fn startRuntimeConnection(
         arg_index += 1;
     }
     appendDefaultSshOptions(ssh_argv, &arg_index, parsed_ssh_args.default_ipqos_option);
-    @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.options.len], parsed_ssh_args.options);
-    arg_index += parsed_ssh_args.options.len;
+    appendTransportSshOptions(ssh_argv, &arg_index, parsed_ssh_args.options);
     ssh_argv[arg_index] = "-T";
     ssh_argv[arg_index + 1] = parsed_ssh_args.host;
     ssh_argv[ssh_argv.len - 1] = remote_command;
@@ -2667,7 +2752,23 @@ fn canUsePlainSshFallback(
     batch_mode: bool,
     reconnect_ui: ?*client.ReconnectUi,
 ) bool {
-    return parsed_ssh_args.action == .new and !batch_mode and reconnect_ui == null;
+    return parsed_ssh_args.action == .new and
+        parsed_ssh_args.command_argv.len == 0 and
+        parsed_ssh_args.shell_command_args.len == 0 and
+        !batch_mode and
+        reconnect_ui == null;
+}
+
+fn shouldUsePlainSshFallbackForUnforcedTtyCommand(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
+    // OpenSSH's single `-t` requests a remote pty only when local stdin is a
+    // tty. `-tt` is the force form that requests one even with redirected
+    // stdin. A sessh command session always has a pty, so single `-t` plus
+    // non-tty stdin must fall back to plain ssh to preserve that distinction.
+    return parsed_ssh_args.action == .new and
+        parsed_ssh_args.command_argv.len == 0 and
+        parsed_ssh_args.shell_command_args.len > 0 and
+        parsed_ssh_args.tty_request == .requested and
+        !stdin_is_tty;
 }
 
 fn shouldUsePlainSshFallbackForArgError(args: []const []const u8, err: anyerror) bool {
@@ -2956,6 +3057,33 @@ fn isPlainShellArg(arg: []const u8) bool {
     return true;
 }
 
+// OpenSSH does not preserve argv for `ssh HOST cmd args...`; it joins the
+// remaining local argv with spaces and lets the remote login shell interpret
+// the result. The caller is responsible for only using this for that ssh-shaped
+// command form. `sesshmux new HOST cmd args...` uses command_argv instead.
+fn joinRemoteShellCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (args, 0..) |arg, i| {
+        if (i > 0) try out.append(allocator, ' ');
+        try out.appendSlice(allocator, arg);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn shellCommandFromRemoteArgs(allocator: std.mem.Allocator, args: []const []const u8) !?[]u8 {
+    if (args.len == 0) return null;
+    const command = try joinRemoteShellCommandArgs(allocator, args);
+    if (command.len == 0) {
+        // OpenSSH treats an empty remote command as no command at all. That is
+        // different from a non-empty command string such as `""`, which the
+        // remote shell evaluates and typically fails to execute.
+        allocator.free(command);
+        return null;
+    }
+    return command;
+}
+
 /// ssh remote commands are evaluated by the remote account's login shell. Wrap
 /// the embedded script so that shell only execs POSIX sh. This gives the
 /// bootstrapper one shell contract to implement and test instead of inheriting
@@ -3161,7 +3289,7 @@ fn parseSshArgs(args: []const []const u8, parse_options: CliParseOptions) !Parse
         }
 
         if (isSesshLongOption(arg)) return error.MissingHost;
-        try consumeSshOption(args, &i);
+        try consumeSshOption(args, &i, &pre_host.tty_request);
     }
 
     return error.MissingHost;
@@ -3255,6 +3383,9 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.command_argv = args[index.*..];
             index.* = args.len;
+        } else if (parsed.action == .new and parsed.tty_request != .none) {
+            parsed.shell_command_args = args[index.*..];
+            index.* = args.len;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.UnsupportedSesshOption;
         } else if (actionSupportsParsedClientTarget(parsed.action) and parsed.client_target == .default and std.mem.startsWith(u8, arg, session_registry.client_guid_prefix)) {
@@ -3302,6 +3433,15 @@ fn parseCommonSesshOptionAfterHost(args: []const []const u8, index: *usize, pars
     const arg = args[index.*];
     if (isConfigOrEnvOnlySesshOption(arg) and !parse_options.allow_mux_command_words) return error.UnsupportedSesshOption;
 
+    if (std.mem.eql(u8, arg, "--eval-args")) {
+        if (!parse_options.allow_mux_command_words or parsed.action != .new) return error.UnsupportedSesshOption;
+        index.* += 1;
+        if (index.* < args.len and std.mem.eql(u8, args[index.*], "--")) index.* += 1;
+        if (index.* >= args.len) return error.MissingEvalArgs;
+        parsed.shell_command_args = args[index.*..];
+        index.* = args.len;
+        return true;
+    }
     if (std.mem.eql(u8, arg, "--leader")) {
         index.* += 1;
         if (index.* >= args.len) return error.MissingLeader;
@@ -3561,9 +3701,15 @@ fn setParsedClientTarget(parsed: *ParsedSshArgs, target: ClientTarget, client_gu
     parsed.client_guid = client_guid;
 }
 
-fn consumeSshOption(args: []const []const u8, index: *usize) !void {
+fn consumeSshOption(args: []const []const u8, index: *usize, tty_request: *SshTtyRequest) !void {
     const arg = args[index.*];
     if (std.mem.startsWith(u8, arg, "--")) return error.UnsupportedSshOption;
+
+    if (sshTtyRequestCount(arg)) |count| {
+        noteSshTtyRequest(tty_request, count);
+        index.* += 1;
+        return;
+    }
 
     var pos: usize = 1;
     while (pos < arg.len) {
@@ -3588,6 +3734,26 @@ fn consumeSshOption(args: []const []const u8, index: *usize) !void {
     }
 
     index.* += 1;
+}
+
+fn isSshTtyRequestOption(arg: []const u8) bool {
+    return sshTtyRequestCount(arg) != null;
+}
+
+fn sshTtyRequestCount(arg: []const u8) ?usize {
+    if (arg.len < 2 or arg[0] != '-') return null;
+    for (arg[1..]) |byte| {
+        if (byte != 't') return null;
+    }
+    return arg.len - 1;
+}
+
+fn noteSshTtyRequest(tty_request: *SshTtyRequest, count: usize) void {
+    if (count >= 2 or tty_request.* == .requested) {
+        tty_request.* = .forced;
+    } else if (count == 1 and tty_request.* == .none) {
+        tty_request.* = .requested;
+    }
 }
 
 fn optionValue(args: []const []const u8, index: *usize, option_pos: usize) ![]const u8 {
@@ -3688,6 +3854,7 @@ fn printSshArgError(err: anyerror) !void {
         error.MissingSshOptions => try io.writeAll(2, "sesshmux: --ssh-options requires a value\n"),
         error.MissingClientListTarget => try io.writeAll(2, "sesshmux: --client requires a value: " ++ client_list_target_help ++ "\n"),
         error.MissingCommandArgv => try io.writeAll(2, "sesshmux: -- requires a command argv\n"),
+        error.MissingEvalArgs => try io.writeAll(2, "sesshmux: --eval-args requires command args\n"),
         error.SesshOptionAfterHost => try io.writeAll(2, "sessh: sessh options must appear before HOST\n"),
         error.TooManyMuxArguments => try io.writeAll(2, "sesshmux: too many arguments\n"),
         error.UnsupportedMuxCommand => try io.writeAll(2, "sesshmux: unsupported command\n"),
@@ -3700,7 +3867,7 @@ fn printSshArgError(err: anyerror) !void {
         error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
         error.InvalidAlias => try io.writeAll(2, "sessh: invalid alias\n"),
         error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
-        error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands are not supported yet\n"),
+        error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands require -t or -tt for persistent sessions\n"),
         error.UnsafeSshOption => try io.writeAll(2, "sessh: ssh option is not safe for sessh transport\n"),
         error.UnsupportedSesshOption => try io.writeAll(2, "sessh: unsupported sessh option for ssh transport\n"),
         error.UnsupportedSesshCliOption => try io.writeAll(2, "sessh: unsupported sessh option\n"),
@@ -4181,6 +4348,35 @@ test "shellQuote produces single-quoted shell words" {
     try std.testing.expectEqualStrings("'alpha '\\'' beta'", quoted);
 }
 
+test "joinRemoteShellCommandArgs matches ssh remote command joining" {
+    const joined = try joinRemoteShellCommandArgs(std.testing.allocator, &.{ "echo", "$SESSH_TEST_HOST" });
+    defer std.testing.allocator.free(joined);
+
+    try std.testing.expectEqualStrings("echo $SESSH_TEST_HOST", joined);
+
+    const empty = try joinRemoteShellCommandArgs(std.testing.allocator, &.{""});
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqualStrings("", empty);
+
+    const no_command = try shellCommandFromRemoteArgs(std.testing.allocator, &.{""});
+    try std.testing.expectEqual(@as(?[]u8, null), no_command);
+
+    const quoted_empty_command = try shellCommandFromRemoteArgs(std.testing.allocator, &.{"\"\""});
+    defer std.testing.allocator.free(quoted_empty_command.?);
+    try std.testing.expectEqualStrings("\"\"", quoted_empty_command.?);
+}
+
+test "transport ssh option filtering only removes tty request options" {
+    const options = &.{ "-F", "-tt", "-t", "-p2222", "-o", "BatchMode=yes" };
+    var out: [5][]const u8 = undefined;
+    var index: usize = 0;
+
+    try std.testing.expectEqual(@as(usize, 5), transportSshOptionsLen(options));
+    appendTransportSshOptions(out[0..], &index, options);
+
+    try expectArgvEqual(&.{ "-F", "-tt", "-p2222", "-o", "BatchMode=yes" }, out[0..index]);
+}
+
 test "parseSshArgs passes through ssh options before host" {
     const args = [_][]const u8{
         "sessh",
@@ -4273,11 +4469,6 @@ test "ssh verbosity maps to inferred client log level" {
 test "parseSshArgs rejects protocol-breaking ssh options" {
     try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(&.{
         "sessh",
-        "-tt",
-        "example.com",
-    }, .{}));
-    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(&.{
-        "sessh",
         "-n",
         "example.com",
     }, .{}));
@@ -4293,6 +4484,70 @@ test "parseSshArgs rejects protocol-breaking ssh options" {
         "RequestTTY=force",
         "example.com",
     }, .{}));
+}
+
+test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
+    const single = try parseSshArgs(&.{
+        "sessh",
+        "-t",
+        "example.com",
+        "echo",
+        "$SESSH_TEST_HOST",
+    }, .{});
+    try std.testing.expectEqual(SshTtyRequest.requested, single.tty_request);
+    try std.testing.expectEqual(@as(usize, 2), single.shell_command_args.len);
+    try std.testing.expectEqualStrings("echo", single.shell_command_args[0]);
+    try std.testing.expectEqualStrings("$SESSH_TEST_HOST", single.shell_command_args[1]);
+
+    const forced = try parseSshArgs(&.{
+        "sessh",
+        "-tt",
+        "example.com",
+        "uname",
+        "-a",
+    }, .{});
+    try std.testing.expectEqual(SshTtyRequest.forced, forced.tty_request);
+    try std.testing.expectEqual(@as(usize, 2), forced.shell_command_args.len);
+    try std.testing.expectEqualStrings("uname", forced.shell_command_args[0]);
+    try std.testing.expectEqualStrings("-a", forced.shell_command_args[1]);
+
+    const repeated = try parseSshArgs(&.{
+        "sessh",
+        "-t",
+        "-t",
+        "example.com",
+        "tty",
+    }, .{});
+    try std.testing.expectEqual(SshTtyRequest.forced, repeated.tty_request);
+
+    const empty = try parseSshArgs(&.{
+        "sessh",
+        "-t",
+        "example.com",
+        "",
+    }, .{});
+    try std.testing.expectEqual(SshTtyRequest.requested, empty.tty_request);
+    try std.testing.expectEqual(@as(usize, 1), empty.shell_command_args.len);
+    try std.testing.expectEqualStrings("", empty.shell_command_args[0]);
+}
+
+test "single tty request falls back to plain ssh when stdin is not a tty" {
+    const single = try parseSshArgs(&.{
+        "sessh",
+        "-t",
+        "example.com",
+        "tty",
+    }, .{});
+    try std.testing.expect(shouldUsePlainSshFallbackForUnforcedTtyCommand(single, false));
+    try std.testing.expect(!shouldUsePlainSshFallbackForUnforcedTtyCommand(single, true));
+
+    const forced = try parseSshArgs(&.{
+        "sessh",
+        "-tt",
+        "example.com",
+        "tty",
+    }, .{});
+    try std.testing.expect(!shouldUsePlainSshFallbackForUnforcedTtyCommand(forced, false));
 }
 
 test "plain ssh fallback is allowed for transport-incompatible plain ssh invocations" {
@@ -4674,6 +4929,22 @@ test "parseSshArgs accepts persistent command argv after delimiter" {
     try std.testing.expectEqualStrings("-H", parsed.command_argv[1]);
 }
 
+test "parseSshArgs accepts translated eval args for persistent commands" {
+    const parsed = try parseSshArgs(&.{
+        "sesshmux",
+        "example.com",
+        "--eval-args",
+        "--",
+        "echo",
+        "$SESSH_TEST_HOST",
+    }, .{ .allow_mux_command_words = true });
+
+    try std.testing.expectEqual(SshAction.new, parsed.action);
+    try std.testing.expectEqual(@as(usize, 2), parsed.shell_command_args.len);
+    try std.testing.expectEqualStrings("echo", parsed.shell_command_args[0]);
+    try std.testing.expectEqualStrings("$SESSH_TEST_HOST", parsed.shell_command_args[1]);
+}
+
 test "parseSshArgs rejects custom aliases with reserved typed prefix shape" {
     try std.testing.expectError(error.InvalidAlias, parseSshArgs(&.{
         "sessh",
@@ -4718,6 +4989,34 @@ test "translateMuxArgs maps new command to ssh-shaped invocation" {
         "-H",
     }, translated.args.items);
 
+    var preserved_without_delimiter = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "new",
+        "example.com",
+        "top",
+        "-H",
+    });
+    defer preserved_without_delimiter.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "--", "top", "-H" }, preserved_without_delimiter.args.items);
+
+    var eval_args = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "new",
+        "--eval-args",
+        "example.com",
+        "echo",
+        "$SESSH_TEST_HOST",
+    });
+    defer eval_args.deinit();
+    try expectArgvEqual(&.{
+        "sesshmux",
+        "example.com",
+        "--eval-args",
+        "--",
+        "echo",
+        "$SESSH_TEST_HOST",
+    }, eval_args.args.items);
+
     try std.testing.expectError(error.UnsupportedMuxOption, translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
         "new",
@@ -4753,6 +5052,17 @@ test "translateMuxArgs allows ssh-style options only for sessh invocation" {
         "ProxyJump bastion",
         "example.com",
     }, translated.args.items);
+
+    var shell_command = try translateMuxArgsForInvocation(std.testing.allocator, &.{
+        "sessh",
+        "new",
+        "-t",
+        "example.com",
+        "echo",
+        "$SESSH_TEST_HOST",
+    }, .sessh);
+    defer shell_command.deinit();
+    try expectArgvEqual(&.{ "sessh", "-t", "example.com", "echo", "$SESSH_TEST_HOST" }, shell_command.args.items);
 
     try std.testing.expectError(error.UnsupportedSesshCliOption, translateMuxArgsForInvocation(std.testing.allocator, &.{
         "sessh",
@@ -5198,7 +5508,7 @@ test "reconnectDelayMs follows the documented backoff schedule" {
     try std.testing.expectEqual(@as(u64, 600_000), reconnectDelayMs(7));
 }
 
-test "parseSshArgs rejects remote commands for now" {
+test "parseSshArgs rejects ssh-style remote commands without a tty request" {
     try std.testing.expectError(error.RemoteCommandUnsupported, parseSshArgs(&.{
         "sessh",
         "example.com",

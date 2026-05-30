@@ -1516,6 +1516,109 @@ def test_ssh_remote_command_falls_back_to_plain_ssh(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_forced_tty_remote_command_uses_persistent_session(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SHELL"] = "/bin/sh"
+
+    result = run_sessh(["-tt", "test-host", "echo", "$SESSH_TEST_HOST"], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "test-host" not in result.stdout:
+        raise AssertionError(result)
+    if "fallback to plain-ssh" in result.stderr:
+        raise AssertionError(result.stderr)
+    log_text = fake_log.read_text()
+    if "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+    trace_text = fake_trace.read_text()
+    runtime_invocation = re.search(r"event=parsed .*config_query=0 .*saw_t=1 request_tty=0", trace_text)
+    if runtime_invocation is None:
+        raise AssertionError(trace_text)
+
+
+def test_ssh_single_tty_remote_command_with_stdin_null_falls_back_to_plain_ssh(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+
+    result = run_sessh(["-t", "test-host", "tty"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "fallback to plain-ssh due to non-interactive invocation" not in result.stderr:
+        raise AssertionError(result.stderr)
+    log_text = fake_log.read_text()
+    if "plain_ssh=1" not in log_text or "plain_option=-t" not in log_text or "plain_remote_command=tty" not in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_tty_empty_remote_command_starts_interactive_session(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "INTERACTIVE_EMPTY_COMMAND_READY"
+    remote_shell.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1-}\" = -c ]; then\n"
+        "  printf 'UNEXPECTED_SHELL_COMMAND:%s\\n' \"${2-}\"\n"
+        "  exit 9\n"
+        "fi\n"
+        f"printf '{marker}\\n'\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["-tt", "test-host", ""], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if marker not in result.stdout or "UNEXPECTED_SHELL_COMMAND" in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_tty_quoted_empty_remote_command_uses_shell_eval(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    remote_shell.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1-}\" = -c ]; then\n"
+        "  printf 'SHELL_COMMAND:%s\\n' \"${2-}\"\n"
+        "  exit 7\n"
+        "fi\n"
+        "printf 'UNEXPECTED_INTERACTIVE\\n'\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh(["-tt", "test-host", '""'], env, timeout=30.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if 'SHELL_COMMAND:""' not in result.stdout or "UNEXPECTED_INTERACTIVE" in result.stdout:
+        raise AssertionError(result)
+
+
 def test_sesshmux_unknown_command_does_not_fallback_to_plain_ssh(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1525,7 +1628,7 @@ def test_sesshmux_unknown_command_does_not_fallback_to_plain_ssh(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
 
-    result = run_sesshmux(["work.blox", "list"], env, timeout=5.0)
+    result = run_sesshmux(["example.com", "list"], env, timeout=5.0)
 
     if result.returncode != 64:
         raise AssertionError(result)
@@ -3154,6 +3257,22 @@ def main(argv=None):
         (
             "ssh remote command falls back to plain ssh",
             test_ssh_remote_command_falls_back_to_plain_ssh,
+        ),
+        (
+            "ssh forced tty remote command uses persistent session",
+            test_ssh_forced_tty_remote_command_uses_persistent_session,
+        ),
+        (
+            "ssh single tty remote command with stdin null falls back to plain ssh",
+            test_ssh_single_tty_remote_command_with_stdin_null_falls_back_to_plain_ssh,
+        ),
+        (
+            "ssh tty empty remote command starts interactive session",
+            test_ssh_tty_empty_remote_command_starts_interactive_session,
+        ),
+        (
+            "ssh tty quoted empty remote command uses shell eval",
+            test_ssh_tty_quoted_empty_remote_command_uses_shell_eval,
         ),
         (
             "sesshmux unknown command does not fallback to plain ssh",

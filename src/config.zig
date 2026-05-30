@@ -8,6 +8,6 @@ pub const client_version_env = "SESSH_CLIENT_VERSION";
 pub const compat_env = "SESSH_COMPAT";
 
 pub const protocol_major = 2;
-pub const protocol_minor = 0;
+pub const protocol_minor = 1;
 pub const min_protocol_major = 2;
 pub const min_protocol_minor = 0;

@@ -354,7 +354,16 @@ def pack_bytes(value):
     return pack_input(value)
 
 
-def pack_session_create(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", command_argv=None):
+def pack_session_create(
+    shell,
+    scrollback=2000,
+    fg=0xFFFFFFFF,
+    bg=0xFFFFFFFF,
+    session_id="s1",
+    command_argv=None,
+    legacy_command_argv=None,
+    shell_command=None,
+):
     pb = sessh_pb()
     message = pb.SessionCreate(scrollback_row_limit=scrollback)
     message.session_guid = guid_for_ref(session_id)
@@ -367,7 +376,11 @@ def pack_session_create(shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, se
     entry.name = "SHELL"
     entry.value = str(shell)
     if command_argv:
-        message.command_argv.extend(str(arg) for arg in command_argv)
+        message.exec_command.argv.extend(str(arg) for arg in command_argv)
+    if legacy_command_argv:
+        message.legacy_command_argv.extend(str(arg) for arg in legacy_command_argv)
+    if shell_command is not None:
+        message.shell_command.command = str(shell_command)
     message.query_default_colors.foreground_color = fg
     message.query_default_colors.background_color = bg
     return message.SerializeToString()
@@ -471,8 +484,33 @@ def parse_client_repaint_request(payload):
     return message
 
 
-def create_and_attach_session(conn, shell, scrollback=2000, fg=0xFFFFFFFF, bg=0xFFFFFFFF, session_id="s1", initial_scrollback=None, command_argv=None, client_guid=None):
-    send_frame(conn, SESSION_CREATE, pack_session_create(shell, scrollback=scrollback, fg=fg, bg=bg, session_id=session_id, command_argv=command_argv))
+def create_and_attach_session(
+    conn,
+    shell,
+    scrollback=2000,
+    fg=0xFFFFFFFF,
+    bg=0xFFFFFFFF,
+    session_id="s1",
+    initial_scrollback=None,
+    command_argv=None,
+    legacy_command_argv=None,
+    shell_command=None,
+    client_guid=None,
+):
+    send_frame(
+        conn,
+        SESSION_CREATE,
+        pack_session_create(
+            shell,
+            scrollback=scrollback,
+            fg=fg,
+            bg=bg,
+            session_id=session_id,
+            command_argv=command_argv,
+            legacy_command_argv=legacy_command_argv,
+            shell_command=shell_command,
+        ),
+    )
     assert_session_created(recv_until_message(conn, SESSION_CREATED))
     send_frame(conn, SESSION_ATTACH, pack_session_attach(initial_scrollback=initial_scrollback, client_guid=client_guid))
 
@@ -978,9 +1016,95 @@ def run_session_create_command_argv_test(_base_env):
                 message_type, _payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
                     raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                draw = recv_draw_until(conn, b"COMMAND_ARGV_READY:arg-one")
-                if b"UNEXPECTED_SHELL" in draw:
-                    raise AssertionError(draw)
+                _matched, draws = recv_draw_until(conn, b"COMMAND_ARGV_READY:arg-one")
+                draw_bytes = b"".join(draw["draw_bytes"] for draw in draws)
+                if b"UNEXPECTED_SHELL" in draw_bytes:
+                    raise AssertionError(draws)
+                send_frame(conn, INPUT, pack_bytes(b"exit\n"))
+                recv_until_message(conn, SESSION_ENDED)
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
+def run_session_create_legacy_command_argv_test(_base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-legacy-command-argv-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "shell-should-not-run"
+        command = Path(tmp) / "legacy-command-child"
+        shell.write_text("#!/bin/sh\nprintf 'UNEXPECTED_SHELL\\n'\nexit 1\n")
+        shell.chmod(0o700)
+        command.write_text(
+            "#!/bin/sh\n"
+            "printf 'LEGACY_COMMAND_ARGV_READY:%s\\n' \"$1\"\n"
+            "while IFS= read -r line; do\n"
+            "  [ \"$line\" = exit ] && exit 0\n"
+            "done\n"
+        )
+        command.chmod(0o700)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn)
+                create_and_attach_session(conn, shell, legacy_command_argv=[command, "arg-one"])
+                message_type, _payload = recv_frame(conn)
+                if message_type != SESSION_ATTACHED:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                _matched, draws = recv_draw_until(conn, b"LEGACY_COMMAND_ARGV_READY:arg-one")
+                draw_bytes = b"".join(draw["draw_bytes"] for draw in draws)
+                if b"UNEXPECTED_SHELL" in draw_bytes:
+                    raise AssertionError(draws)
+                send_frame(conn, INPUT, pack_bytes(b"exit\n"))
+                recv_until_message(conn, SESSION_ENDED)
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
+def run_session_create_shell_command_test(_base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-command-shell-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "remote-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" != -c ]; then\n"
+            "  printf 'UNEXPECTED_SHELL_ARG:%s\\n' \"$1\"\n"
+            "  exit 1\n"
+            "fi\n"
+            "printf 'SHELL_EVAL_USED\\n'\n"
+            "exec /bin/sh -c \"$2\"\n"
+        )
+        shell.chmod(0o700)
+        shell_command = (
+            "printf 'COMMAND_SHELL_READY:%s\\n' \"$SESSH_GUID\"; "
+            "while IFS= read -r line; do [ \"$line\" = exit ] && exit 0; done"
+        )
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn)
+                create_and_attach_session(conn, shell, shell_command=shell_command)
+                message_type, _payload = recv_frame(conn)
+                if message_type != SESSION_ATTACHED:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                _matched, draws = recv_draw_until(conn, b"COMMAND_SHELL_READY:s-")
+                draw_bytes = b"".join(draw["draw_bytes"] for draw in draws)
+                if b"SHELL_EVAL_USED" not in draw_bytes:
+                    raise AssertionError(draws)
+                if b"UNEXPECTED_SHELL_ARG" in draw_bytes:
+                    raise AssertionError(draws)
                 send_frame(conn, INPUT, pack_bytes(b"exit\n"))
                 recv_until_message(conn, SESSION_ENDED)
             finally:
@@ -3700,6 +3824,8 @@ def main():
 
             run_login_shell_profile_test(env)
             run_session_create_command_argv_test(env)
+            run_session_create_legacy_command_argv_test(env)
+            run_session_create_shell_command_test(env)
             run_session_agent_crash_client_error_test(env)
             run_session_agent_registry_test(env)
             run_broker_starts_session_agent_test(env)
@@ -3741,7 +3867,7 @@ def main():
             assert_list_header(listed.stdout)
 
             remote_guid = guid_for_ref("s7")
-            write_cached_remote_route(env, "remote8", "work.blox", remote_guid)
+            write_cached_remote_route(env, "remote8", "example.com", remote_guid)
             listed = run([".", "list"], env, check=True, timeout=5.0)
             if "cached remote session status may be out of date" not in listed.stderr:
                 raise AssertionError(listed)
@@ -3750,7 +3876,7 @@ def main():
             if remote_route is None:
                 raise AssertionError(listed.stdout)
             if (
-                remote_route.get("host") != "work.blox"
+                remote_route.get("host") != "example.com"
                 or remote_route.get("version") != "cached-test"
                 or remote_route.get("attached") != "???"
                 or remote_route.get("input") != "???"
@@ -3761,7 +3887,7 @@ def main():
                 raise AssertionError(listed_jsonl)
             jsonl_route = jsonl_sessions(listed_jsonl.stdout).get("remote8")
             if jsonl_route != {
-                "host": "work.blox",
+                "host": "example.com",
                 "version": "cached-test",
                 "guid": remote_guid,
                 "attached_count": None,

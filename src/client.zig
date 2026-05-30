@@ -2272,6 +2272,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             generated_guid.?,
             generated_alias.?,
             &.{},
+            null,
         ),
         .attach => startAttachSessionOnRuntime(
             child.stdout.?.handle,
@@ -3028,8 +3029,8 @@ fn jsonTombstoneExitStatusField(object: std.json.ObjectMap, key: []const u8) !?s
 test "remoteListVersionForGuid reads jsonl rows" {
     const guid = "s-550e8400-e29b-41d4-a716-446655440000";
     const stdout =
-        \\{"id":"s-550e8400","host":"work.blox","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000","attached_count":2,"last_input_at_unix_ms":1234}
-        \\s-550e8400  2         0s ago    work.blox                 0.5.0-dev
+        \\{"id":"s-550e8400","host":"example.com","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000","attached_count":2,"last_input_at_unix_ms":1234}
+        \\s-550e8400  2         0s ago    example.com                 0.5.0-dev
         \\
     ;
 
@@ -3046,7 +3047,7 @@ test "remoteListVersionForGuid reads jsonl rows" {
 test "remoteTombstoneForGuid reads exited jsonl rows" {
     const guid = "s-550e8400-e29b-41d4-a716-446655440000";
     const stdout =
-        \\{"id":"s-550e8400","aliases":["s-550e8400"],"host":"work.blox","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000","ended_at_unix_ms":1234,"end_reason":"process_exited","exit_status":{"kind":"exited","status":7}}
+        \\{"id":"s-550e8400","aliases":["s-550e8400"],"host":"example.com","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000","ended_at_unix_ms":1234,"end_reason":"process_exited","exit_status":{"kind":"exited","status":7}}
         \\
     ;
 
@@ -3539,11 +3540,24 @@ pub fn startNewSessionOnRuntime(
     session_guid: []const u8,
     session_alias: []const u8,
     command_argv: []const []const u8,
+    shell_command: ?[]const u8,
 ) !RuntimeSession {
     const viewport_offset = queryInitialViewportOffset();
-    try runtimeHandshake(read_fd, write_fd);
+    const peer_protocol = try runtimeHandshakeWithPeerProtocol(read_fd, write_fd);
+    const peer_supports_command_oneof = peerSupportsSessionCreateCommandOneof(peer_protocol);
+    if (shell_command != null and !peer_supports_command_oneof) return error.VersionMismatch;
     const size = terminal.currentWindowSize();
-    var created = try sendSessionCreateAndReadCreated(read_fd, write_fd, size, scrollback_row_count, session_guid, session_alias, command_argv);
+    var created = try sendSessionCreateAndReadCreated(
+        read_fd,
+        write_fd,
+        size,
+        scrollback_row_count,
+        session_guid,
+        session_alias,
+        command_argv,
+        shell_command,
+        peer_supports_command_oneof,
+    );
     defer created.deinit(app_allocator.allocator());
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
     defer app_allocator.allocator().free(client_guid);
@@ -3661,7 +3675,7 @@ pub fn prepareReconnectRuntimeCancellable(
     write_fd: c.fd_t,
     cancelled: *const std.atomic.Value(bool),
 ) !void {
-    try runtimeHandshakeInner(read_fd, write_fd, cancelled);
+    _ = try runtimeHandshakeInner(read_fd, write_fd, cancelled);
 }
 
 pub fn attachPreparedReconnectRuntimeCancellable(
@@ -3680,7 +3694,7 @@ fn reconnectSessionOnRuntimeInner(
     cancelled: ?*const std.atomic.Value(bool),
     wait_for_repaint: bool,
 ) !void {
-    try runtimeHandshakeInner(read_fd, write_fd, cancelled);
+    _ = try runtimeHandshakeInner(read_fd, write_fd, cancelled);
     try attachReconnectRuntimeInner(read_fd, write_fd, session, cancelled, wait_for_repaint);
 }
 
@@ -4096,15 +4110,24 @@ fn readFrameAllocMaybeCancelled(
     }
 }
 
+const PeerProtocol = struct {
+    major: u32,
+    minor: u32,
+};
+
 pub fn runtimeHandshake(read_fd: c.fd_t, write_fd: c.fd_t) !void {
-    try runtimeHandshakeInner(read_fd, write_fd, null);
+    _ = try runtimeHandshakeInner(read_fd, write_fd, null);
+}
+
+fn runtimeHandshakeWithPeerProtocol(read_fd: c.fd_t, write_fd: c.fd_t) !PeerProtocol {
+    return runtimeHandshakeInner(read_fd, write_fd, null);
 }
 
 fn runtimeHandshakeInner(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     cancelled: ?*const std.atomic.Value(bool),
-) !void {
+) !PeerProtocol {
     try sendHelloRequest(write_fd);
     var hello_error = try readHelloReply(read_fd, cancelled);
     defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
@@ -4117,12 +4140,25 @@ fn runtimeHandshakeInner(
 
     var peer_hello = try readHelloRequest(read_fd, write_fd, cancelled);
     defer peer_hello.deinit(app_allocator.allocator());
+    const peer_protocol = PeerProtocol{
+        .major = peer_hello.protocol_major,
+        .minor = peer_hello.protocol_minor,
+    };
     if (helloRequestIsCompatible(peer_hello)) {
         try sendHelloOk(write_fd);
     } else {
         try sendHelloError(write_fd, "VERSION_MISMATCH", "existing remote sessh is incompatible with this client", "");
         return error.VersionMismatch;
     }
+    return peer_protocol;
+}
+
+fn peerSupportsSessionCreateCommandOneof(peer: PeerProtocol) bool {
+    // Older peers understand field 7, but they do not know the newer command
+    // fields. Use the legacy field for argv-preserving commands and reject
+    // shell-eval commands before SessionCreate so `sessh -t HOST cmd...` never
+    // turns into an accidental interactive shell on an older broker.
+    return peer.major > 2 or (peer.major == 2 and peer.minor >= 1);
 }
 
 fn sendHelloRequest(fd: c.fd_t) !void {
@@ -4211,8 +4247,10 @@ fn sendSessionCreateAndReadCreated(
     session_guid: []const u8,
     session_alias: []const u8,
     command_argv: []const []const u8,
+    shell_command: ?[]const u8,
+    peer_supports_command_oneof: bool,
 ) !CreatedSession {
-    try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid, session_alias, command_argv);
+    try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid, session_alias, command_argv, shell_command, peer_supports_command_oneof);
     return readSessionCreated(read_fd);
 }
 
@@ -4223,7 +4261,10 @@ fn sendSessionCreate(
     session_guid: []const u8,
     session_alias: []const u8,
     command_argv: []const []const u8,
+    shell_command: ?[]const u8,
+    peer_supports_command_oneof: bool,
 ) !void {
+    if (command_argv.len > 0 and shell_command != null) return error.InvalidSessionCommand;
     var message = pb.SessionCreate{
         .terminal_size = .{
             .terminal_rows = size.rows,
@@ -4234,8 +4275,17 @@ fn sendSessionCreate(
         .session_alias = session_alias,
     };
     defer message.environment.deinit(app_allocator.allocator());
-    defer message.command_argv.deinit(app_allocator.allocator());
-    try message.command_argv.appendSlice(app_allocator.allocator(), command_argv);
+    defer message.legacy_command_argv.deinit(app_allocator.allocator());
+    var exec_command = pb.ExecCommand{};
+    defer exec_command.argv.deinit(app_allocator.allocator());
+    if (shell_command) |command| {
+        message.command = .{ .shell_command = .{ .command = command } };
+    } else if (command_argv.len > 0 and peer_supports_command_oneof) {
+        try exec_command.argv.appendSlice(app_allocator.allocator(), command_argv);
+        message.command = .{ .exec_command = exec_command };
+    } else {
+        try message.legacy_command_argv.appendSlice(app_allocator.allocator(), command_argv);
+    }
     const default_colors = queryDefaultColorsForSession();
     message.query_default_colors = .{
         .foreground_color = default_colors.foreground_color,

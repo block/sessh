@@ -73,6 +73,23 @@ message DefaultColors {
   uint32 background_color = 2;
 }
 
+// Embedded in SessionCreate.
+//
+// Execs a program directly, preserving argv boundaries. Empty argv is treated
+// the same as no command.
+message ExecCommand {
+  repeated string argv = 1;
+}
+
+// Embedded in SessionCreate.
+//
+// Evaluates a command string with the remote account's shell. An empty command
+// is still a command; clients that want an interactive login shell must leave
+// SessionCreate.command unset.
+message ShellCommand {
+  string command = 1;
+}
+
 // Framed payload, client -> session agent.
 //
 // Creates a new interactive PTY session without attaching this client. A
@@ -94,9 +111,17 @@ message SessionCreate {
   // Alias to register for this session in the session agent's namespace. Empty
   // asks the receiver to generate an alias.
   string session_alias = 6;
-  // Optional argv to exec inside the PTY. Empty starts the user's interactive
-  // login shell.
-  repeated string command_argv = 7;
+  // Deprecated wire-compatible field for older clients. It is illegal to set
+  // both legacy_command_argv and command. New clients must use command instead.
+  repeated string legacy_command_argv = 7;
+  // At most one command form may be present. When command is unset, the agent
+  // starts the user's interactive login shell. The shell_command variant
+  // mirrors ssh's `ssh HOST cmd args...` behavior after the local argv has
+  // been joined into a command string for the remote shell.
+  oneof command {
+    ExecCommand exec_command = 8;
+    ShellCommand shell_command = 9;
+  }
 }
 
 // Framed payload, client -> session agent.
