@@ -841,6 +841,9 @@ def write_compat_script(path, log_path, exit_status=0):
     path.write_text(
         "#!/bin/sh\n"
         f"printf '%s\\n' \"$*\" >>{str(log_path)!r}\n"
+        f"printf 'env_guid=%s\\n' \"${{SESSH_GUID-unset}}\" >>{str(log_path)!r}\n"
+        f"printf 'env_client_version=%s\\n' \"${{SESSH_CLIENT_VERSION-unset}}\" >>{str(log_path)!r}\n"
+        f"printf 'env_compat=%s\\n' \"${{SESSH_COMPAT-unset}}\" >>{str(log_path)!r}\n"
         f"exit {exit_status}\n"
     )
     path.chmod(0o700)
@@ -2532,7 +2535,10 @@ def run_slow_attachment_does_not_block_commands_test(base_env):
             time.sleep(0.5)
 
             try:
-                listed = run([".", "--compat-version", sessh_version(), "list"], env, check=True, timeout=2.0)
+                compat_env = dict(env)
+                compat_env["SESSH_CLIENT_VERSION"] = sessh_version()
+                compat_env["SESSH_COMPAT"] = "1"
+                listed = run([".", "list"], compat_env, check=True, timeout=2.0)
             except subprocess.TimeoutExpired as exc:
                 raise AssertionError("management command path blocked behind a slow attachment") from exc
             assert_list_header(listed.stdout)
@@ -3292,9 +3298,15 @@ def run_broker_kill_edge_cases_test(base_env):
             killed = run([":internal-broker:", "kill", "s1"], env, check=True, timeout=5.0)
             if killed.stdout or killed.stderr:
                 raise AssertionError(killed)
-            expected = f". --compat-version {sessh_version()} kill s1"
-            if expected not in compat_log.read_text().splitlines():
-                raise AssertionError(compat_log.read_text())
+            lines = compat_log.read_text().splitlines()
+            if f". kill {guid_for_ref('s1')}" not in lines:
+                raise AssertionError(lines)
+            if f"env_guid={guid_for_ref('s1')}" not in lines:
+                raise AssertionError(lines)
+            if f"env_client_version={sessh_version()}" not in lines:
+                raise AssertionError(lines)
+            if "env_compat=1" not in lines:
+                raise AssertionError(lines)
             if sleeper.poll() is not None:
                 raise AssertionError("broker killed a mismatched-version agent instead of delegating to compat")
         finally:
@@ -3321,9 +3333,14 @@ def run_broker_kill_edge_cases_test(base_env):
                 raise AssertionError(stopped)
             lines = compat_log.read_text().splitlines()
             for session_id in ("s1", "s2"):
-                expected = f". --compat-version {sessh_version()} kill {guid_for_ref(session_id)}"
-                if expected not in lines:
+                if f". kill {guid_for_ref(session_id)}" not in lines:
                     raise AssertionError(lines)
+                if f"env_guid={guid_for_ref(session_id)}" not in lines:
+                    raise AssertionError(lines)
+            if lines.count(f"env_client_version={sessh_version()}") != 2:
+                raise AssertionError(lines)
+            if lines.count("env_compat=1") != 2:
+                raise AssertionError(lines)
             if any(proc.poll() is not None for proc in sleepers):
                 raise AssertionError("broker killed a mismatched-version agent during kill-all")
         finally:

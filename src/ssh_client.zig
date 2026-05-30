@@ -122,6 +122,7 @@ const ParsedSshArgs = struct {
     attach_id: ?[]const u8 = null,
     attach_session_dir: []const u8 = "",
     kill_id: ?[]const u8 = null,
+    kill_current: bool = false,
     list_refresh: bool = false,
     list_jsonl: bool = false,
     list_exited: bool = false,
@@ -568,28 +569,31 @@ fn translateMuxKill(translated: *TranslatedMuxArgs, args: []const []const u8) !v
     defer positional.deinit(translated.allocator);
     var host_option: ?[]const u8 = null;
     var all = false;
+    var current = false;
 
-    try parseMuxKillOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, &all);
+    try parseMuxKillOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, &all, &current);
+    if (all and current) return error.MultipleTargets;
 
-    if (all) {
+    if (all or current) {
+        const target_arg = if (all) "--all" else "--current";
         if (host_option) |host| {
             if (positional.items.len != 0) return error.TooManyMuxArguments;
             try appendMany(translated, ssh_options.items);
             try translated.append(host);
             try translated.append("kill");
-            try translated.append("--all");
+            try translated.append(target_arg);
             try appendMany(translated, sessh_options.items);
         } else if (positional.items.len == 0) {
             if (ssh_options.items.len > 0) return error.MissingHost;
             try translated.append(".");
             try translated.append("kill");
-            try translated.append("--all");
+            try translated.append(target_arg);
             try appendMany(translated, sessh_options.items);
         } else if (positional.items.len == 1) {
             try appendMany(translated, ssh_options.items);
             try translated.append(positional.items[0]);
             try translated.append("kill");
-            try translated.append("--all");
+            try translated.append(target_arg);
             try appendMany(translated, sessh_options.items);
         } else {
             return error.TooManyMuxArguments;
@@ -616,7 +620,7 @@ fn translateMuxKill(translated: *TranslatedMuxArgs, args: []const []const u8) !v
         try translated.append(positional.items[0]);
         try appendMany(translated, sessh_options.items);
     } else {
-        return error.MissingKillId;
+        return error.MissingKillTarget;
     }
 }
 
@@ -855,6 +859,7 @@ fn parseMuxKillOptions(
     positional: *std.ArrayList([]const u8),
     host_option: *?[]const u8,
     all: *bool,
+    current: *bool,
 ) !void {
     var parser = MuxCommandParser{
         .translated = translated,
@@ -869,6 +874,9 @@ fn parseMuxKillOptions(
         if (std.mem.eql(u8, arg, "--")) return error.UnsupportedMuxOption;
         if (std.mem.eql(u8, arg, "--all")) {
             all.* = true;
+            parser.index += 1;
+        } else if (std.mem.eql(u8, arg, "--current")) {
+            current.* = true;
             parser.index += 1;
         } else if (try parser.parseSharedOption()) {
             continue;
@@ -1617,7 +1625,7 @@ fn brokerArgsForAction(parsed_ssh_args: ParsedSshArgs, buf: *[12][]const u8) []c
         .kill => {
             buf[len] = "kill";
             len += 1;
-            buf[len] = parsed_ssh_args.kill_id.?;
+            buf[len] = if (parsed_ssh_args.kill_current) "--current" else parsed_ssh_args.kill_id.?;
             len += 1;
         },
         .kill_all => {
@@ -1720,8 +1728,8 @@ fn nowUnixMs() u64 {
 fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs) ![]u8 {
     const local_args = try localCompatArgs(allocator, parsed_ssh_args);
     defer allocator.free(local_args);
-    const compat_version = try shellQuote(allocator, config.version);
-    defer allocator.free(compat_version);
+    const client_version = try shellQuote(allocator, config.version);
+    defer allocator.free(client_version);
     const action = compatActionName(parsed_ssh_args.action);
     const action_quoted = try shellQuote(allocator, action);
     defer allocator.free(action_quoted);
@@ -1806,24 +1814,26 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    printf 'sessh: session compat binary is unavailable\n' >&2
         \\    exit 1
         \\  fi
+        \\  session_guid=$(basename "$(dirname "$compat")")
         \\  compat_target=$compat
         \\  if [ -L "$compat" ]; then
         \\    compat_target=$(readlink "$compat") || exit 1
         \\  fi
         \\  case "$(basename "$compat_target")" in
-        \\    sesshmux*) XDG_RUNTIME_DIR=$runtime_root exec "$compat" :internal-sessh: . --compat-version {s}{s} ;;
-        \\    *) XDG_RUNTIME_DIR=$runtime_root exec "$compat" . --compat-version {s}{s} ;;
+        \\    sesshmux*) XDG_RUNTIME_DIR=$runtime_root SESSH_GUID="$session_guid" SESSH_CLIENT_VERSION={s} SESSH_COMPAT=1 exec "$compat" :internal-sessh: .{s} ;;
+        \\    *) XDG_RUNTIME_DIR=$runtime_root SESSH_GUID="$session_guid" SESSH_CLIENT_VERSION={s} SESSH_COMPAT=1 exec "$compat" .{s} ;;
         \\  esac
         \\}}
         \\run_one_compat() {{
         \\  compat=$1
+        \\  session_guid=$(basename "$(dirname "$compat")")
         \\  compat_target=$compat
         \\  if [ -L "$compat" ]; then
         \\    compat_target=$(readlink "$compat") || exit 1
         \\  fi
         \\  case "$(basename "$compat_target")" in
-        \\    sesshmux*) XDG_RUNTIME_DIR=$runtime_root "$compat" :internal-sessh: . --compat-version {s}{s} ;;
-        \\    *) XDG_RUNTIME_DIR=$runtime_root "$compat" . --compat-version {s}{s} ;;
+        \\    sesshmux*) XDG_RUNTIME_DIR=$runtime_root SESSH_GUID="$session_guid" SESSH_CLIENT_VERSION={s} SESSH_COMPAT=1 "$compat" :internal-sessh: .{s} ;;
+        \\    *) XDG_RUNTIME_DIR=$runtime_root SESSH_GUID="$session_guid" SESSH_CLIENT_VERSION={s} SESSH_COMPAT=1 "$compat" .{s} ;;
         \\  esac
         \\}}
         \\run_each_compat() {{
@@ -1853,6 +1863,13 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\    exec_one_compat "$runtime_root/guid/$compat_session_id/compat"
         \\    ;;
         \\  kill)
+        \\    if [ -z "$compat_session_id" ]; then
+        \\      compat_session_id=${{SESSH_GUID:-}}
+        \\    fi
+        \\    if [ -z "$compat_session_id" ]; then
+        \\      printf 'sesshmux: --current requires $SESSH_GUID\n' >&2
+        \\      exit 64
+        \\    fi
         \\    compat_session_id=$(resolve_session_ref "$compat_session_id")
         \\    exec_one_compat "$runtime_root/guid/$compat_session_id/compat"
         \\    ;;
@@ -1868,13 +1885,13 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
     , .{
         action_quoted,
         session_id_quoted,
-        compat_version,
+        client_version,
         local_args,
-        compat_version,
+        client_version,
         local_args,
-        compat_version,
+        client_version,
         local_args,
-        compat_version,
+        client_version,
         local_args,
     });
 }
@@ -1911,7 +1928,13 @@ fn localCompatArgs(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs)
         .list => try appendCompatArg(allocator, &out, "list"),
         .kill => {
             try appendCompatArg(allocator, &out, "kill");
-            try appendCompatArg(allocator, &out, parsed_ssh_args.kill_id.?);
+            if (parsed_ssh_args.kill_id) |id| {
+                try appendCompatArg(allocator, &out, id);
+            } else if (parsed_ssh_args.kill_current) {
+                try appendCompatArg(allocator, &out, "--current");
+            } else {
+                return error.MissingKillTarget;
+            }
         },
         .kill_all => {
             try appendCompatArg(allocator, &out, "kill");
@@ -2944,7 +2967,11 @@ fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
 fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []const u8) ![]u8 {
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(allocator);
-    try script.appendSlice(allocator, "exec sesshmux :internal-broker:");
+    const client_version = try shellQuote(allocator, config.version);
+    defer allocator.free(client_version);
+    try script.appendSlice(allocator, "SESSH_CLIENT_VERSION=");
+    try script.appendSlice(allocator, client_version);
+    try script.appendSlice(allocator, " exec sesshmux :internal-broker:");
     for (broker_args) |arg| {
         const quoted = try shellQuote(allocator, arg);
         defer allocator.free(quoted);
@@ -3000,7 +3027,7 @@ fn parseRouteRefArgs(
         } else if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "kill")) {
             if (action != null) return error.ConflictingSesshAction;
             i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingKillId;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingKillTarget;
             action = .kill;
             ref = args[i];
             i += 1;
@@ -3413,8 +3440,12 @@ fn parseTranslatedKillCommand(args: []const []const u8, index: *usize, parsed: *
     if (index.* < args.len and std.mem.eql(u8, args[index.*], "--all")) {
         parsed.action = .kill_all;
         index.* += 1;
+    } else if (index.* < args.len and std.mem.eql(u8, args[index.*], "--current")) {
+        parsed.action = .kill;
+        parsed.kill_current = true;
+        index.* += 1;
     } else {
-        if (index.* >= args.len) return error.MissingKillId;
+        if (index.* >= args.len) return error.MissingKillTarget;
         if (std.mem.startsWith(u8, args[index.*], "--")) return error.UnsupportedSesshOption;
         parsed.action = .kill;
         parsed.kill_id = args[index.*];
@@ -3503,6 +3534,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--exited") or
         std.mem.eql(u8, arg, "--jsonl") or
         std.mem.eql(u8, arg, "--all") or
+        std.mem.eql(u8, arg, "--current") or
         std.mem.eql(u8, arg, "--last-input") or
         std.mem.eql(u8, arg, "--scrollback");
 }
@@ -3644,6 +3676,7 @@ fn printSshArgError(err: anyerror) !void {
     switch (err) {
         error.MissingHost => try io.writeAll(2, "sessh: missing host\n"),
         error.MissingAttachId => try io.writeAll(2, "sesshmux: attach requires an id in this form\n"),
+        error.MissingKillTarget => try io.writeAll(2, "sesshmux: kill requires --all, a guid, or --current\n"),
         error.MissingKillId => try io.writeAll(2, "sesshmux: kill requires an id\n"),
         error.MissingAlias => try io.writeAll(2, "sessh: --alias requires a value\n"),
         error.MissingLeader => try io.writeAll(2, "sessh: --leader requires a value\n"),
@@ -4484,6 +4517,10 @@ test "parseSshArgs accepts translated remote session commands after host" {
 
     const kill_all = try parseSshArgs(&.{ "sesshmux", "example.com", "kill", "--all" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.kill_all, kill_all.action);
+
+    const kill_current = try parseSshArgs(&.{ "sesshmux", "example.com", "kill", "--current" }, .{ .allow_mux_command_words = true });
+    try std.testing.expectEqual(SshAction.kill, kill_current.action);
+    try std.testing.expect(kill_current.kill_current);
 }
 
 test "parseSshArgs rejects translated flags outside their command grammar" {
@@ -4548,6 +4585,13 @@ test "brokerArgsForAction uses broker subcommands" {
         .host = "example.com",
         .action = .kill,
         .kill_id = "s1",
+    }, &buf));
+
+    try expectArgvEqual(&.{ "kill", "--current" }, brokerArgsForAction(.{
+        .options = &.{},
+        .host = "example.com",
+        .action = .kill,
+        .kill_current = true,
     }, &buf));
 
     try expectArgvEqual(&.{ "kill", "--all" }, brokerArgsForAction(.{
@@ -4960,6 +5004,29 @@ test "translateMuxArgs maps kill and kill all" {
     });
     defer local_kill_all.deinit();
     try expectArgvEqual(&.{ "sesshmux", ".", "kill", "--all" }, local_kill_all.args.items);
+
+    var current = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "kill",
+        "--current",
+    });
+    defer current.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "kill", "--current" }, current.args.items);
+
+    var remote_current = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "kill",
+        "--current",
+        "--host",
+        "example.com",
+    });
+    defer remote_current.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "kill", "--current" }, remote_current.args.items);
+
+    try std.testing.expectError(error.MissingKillTarget, translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "kill",
+    }));
 }
 
 test "translateMuxArgs maps client management commands" {

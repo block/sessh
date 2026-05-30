@@ -96,8 +96,13 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
         return process_exit.request(exit_status);
     }
     if (std.mem.eql(u8, command, "kill")) {
-        if (args.len != 2) return finishCommand(64, "", "ERROR usage: kill ID | kill --all\n");
+        if (args.len == 1) {
+            return finishCommand(64, "", "ERROR kill requires --all, a guid, or --current\n");
+        }
+        if (args.len != 2) return finishCommand(64, "", "ERROR usage: kill --all | kill ID | kill --current\n");
         if (std.mem.eql(u8, args[1], "--all")) return killAllAgents(allocator);
+        if (std.mem.eql(u8, args[1], "--current")) return killCurrentAgent(allocator);
+        if (std.mem.startsWith(u8, args[1], "--")) return finishCommand(64, "", "ERROR usage: kill --all | kill ID | kill --current\n");
         return killOneAgent(allocator, args[1]);
     }
     if (isClientControlCommandName(command)) {
@@ -1109,7 +1114,8 @@ fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
         return finishCommand(1, "", "ERROR session not found\n");
     }
     if (!std.mem.eql(u8, meta.version, config.version)) {
-        const exit_status = try runCompatCommand(allocator, paths, &.{ "kill", session_id });
+        const session_guid = std.fs.path.basename(paths.dir);
+        const exit_status = try runCompatCommand(allocator, paths, session_guid, &.{ "kill", session_guid });
         return process_exit.request(exit_status);
     }
     if (!terminateAgent(meta.agent_pid)) {
@@ -1118,6 +1124,15 @@ fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
     var stdout_buf: [128]u8 = undefined;
     const stdout = try std.fmt.bufPrint(&stdout_buf, "ENDED {s}\n", .{session_id});
     return finishCommand(0, stdout, "");
+}
+
+fn killCurrentAgent(allocator: std.mem.Allocator) !void {
+    const session_id = std.process.getEnvVarOwned(allocator, config.session_guid_env) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return finishCommand(64, "", "ERROR --current requires $SESSH_GUID\n"),
+        else => return err,
+    };
+    defer allocator.free(session_id);
+    return killOneAgent(allocator, session_id);
 }
 
 const KillTarget = struct {
@@ -1157,7 +1172,7 @@ fn killAllAgents(allocator: std.mem.Allocator) !void {
             continue;
         }
         if (!std.mem.eql(u8, meta.version, config.version)) {
-            const compat_status = try runCompatCommand(allocator, paths, &.{ "kill", entry.name });
+            const compat_status = try runCompatCommand(allocator, paths, entry.name, &.{ "kill", entry.name });
             if (compat_status != 0) exit_status = compat_status;
             continue;
         }
@@ -1231,16 +1246,21 @@ fn waitForAgentExit(pid: c.pid_t, timeout_ms: i64) bool {
     return true;
 }
 
-fn runCompatCommand(allocator: std.mem.Allocator, paths: session_registry.SessionPaths, args: []const []const u8) !u8 {
-    const argv = try allocator.alloc([]const u8, 4 + args.len);
+fn runCompatCommand(allocator: std.mem.Allocator, paths: session_registry.SessionPaths, session_id: []const u8, args: []const []const u8) !u8 {
+    const argv = try allocator.alloc([]const u8, 2 + args.len);
     defer allocator.free(argv);
     argv[0] = paths.compat;
     argv[1] = ".";
-    argv[2] = "--compat-version";
-    argv[3] = config.version;
-    @memcpy(argv[4..], args);
+    @memcpy(argv[2..], args);
+
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put(config.session_guid_env, session_id);
+    try env_map.put(config.client_version_env, config.version);
+    try env_map.put(config.compat_env, "1");
 
     var child = std.process.Child.init(argv, allocator);
+    child.env_map = &env_map;
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;

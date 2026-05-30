@@ -53,6 +53,7 @@ const LocalOptions = struct {
     action_set: bool = false,
     attach_id: ?[]const u8 = null,
     kill_id: ?[]const u8 = null,
+    kill_current: bool = false,
     alias: ?[]const u8 = null,
     list_refresh: bool = false,
     list_include_cached_routes: bool = true,
@@ -74,7 +75,7 @@ const LocalOptions = struct {
     initial_scrollback_row_count_set: bool = false,
     client_log_level: client_log.Level = .warn,
     client_log_level_set: bool = false,
-    compat_version: ?[]const u8 = null,
+    compat_mode: bool = false,
     capture_tty_transcript: ?[]const u8 = null,
 };
 
@@ -2154,6 +2155,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 fn writeLocalArgError(err: anyerror) !void {
     switch (err) {
         error.MissingClientListTarget => try io_helpers.writeAll(2, "sessh: --client requires a value: " ++ client_list_target_help ++ "\n"),
+        error.MissingKillTarget => try io_helpers.writeAll(2, "sesshmux: kill requires --all, a guid, or --current\n"),
+        error.MissingCurrentSession => try io_helpers.writeAll(2, "sesshmux: --current requires $SESSH_GUID\n"),
         else => try io_helpers.stderrPrint("sessh: invalid . arguments: {t}\n", .{err}),
     }
 }
@@ -2183,8 +2186,20 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             return;
         },
         .kill => {
+            const kill_ref = resolveLocalKillRef(allocator, options) catch |err| switch (err) {
+                error.MissingCurrentSession => {
+                    try writeLocalArgError(err);
+                    return process_exit.request(64);
+                },
+                error.MissingKillTarget => {
+                    try writeLocalArgError(err);
+                    return process_exit.request(64);
+                },
+                else => return err,
+            };
+            defer allocator.free(kill_ref);
             var command_args_buf: [4][]const u8 = undefined;
-            const command_args = appendBrokerCommand(runtime_broker_args, "kill", options.kill_id.?, &command_args_buf);
+            const command_args = appendBrokerCommand(runtime_broker_args, "kill", kill_ref, &command_args_buf);
             const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
@@ -2511,10 +2526,21 @@ fn runLocalClientControlCommand(
 
 fn resolveClientSessionRef(allocator: std.mem.Allocator, explicit_ref: ?[]const u8) ![]u8 {
     if (explicit_ref) |ref| return allocator.dupe(u8, ref);
-    return std.process.getEnvVarOwned(allocator, "SESSH_GUID") catch |err| switch (err) {
+    return std.process.getEnvVarOwned(allocator, config.session_guid_env) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => error.MissingSessionRef,
         else => err,
     };
+}
+
+fn resolveLocalKillRef(allocator: std.mem.Allocator, options: LocalOptions) ![]u8 {
+    if (options.kill_id) |id| return allocator.dupe(u8, id);
+    if (options.kill_current) {
+        return resolveClientSessionRef(allocator, null) catch |err| switch (err) {
+            error.MissingSessionRef => error.MissingCurrentSession,
+            else => err,
+        };
+    }
+    return error.MissingKillTarget;
 }
 
 fn resolveClientControlSessionRef(allocator: std.mem.Allocator, explicit_ref: ?[]const u8, client_guid: ?[]const u8) !ClientSessionResolution {
@@ -2633,7 +2659,12 @@ fn runLocalBrokerCommand(allocator: std.mem.Allocator, exe: []const u8, broker_a
     argv[1] = ":internal-broker:";
     @memcpy(argv[2..], broker_args);
 
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put(config.client_version_env, config.version);
+
     var child = std.process.Child.init(argv, allocator);
+    child.env_map = &env_map;
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
@@ -3068,12 +3099,22 @@ fn terminateChild(child: *std.process.Child) void {
 }
 
 fn parseLocalOptions(args: []const []const u8) !LocalOptions {
+    return parseLocalOptionsWithCompatMode(args, compatModeFromEnv());
+}
+
+fn compatModeFromEnv() bool {
+    const value_z = c.getenv(config.compat_env) orelse return false;
+    return std.mem.eql(u8, std.mem.span(value_z), "1");
+}
+
+fn parseLocalOptionsWithCompatMode(args: []const []const u8, compat_mode: bool) !LocalOptions {
     var options = LocalOptions{};
+    options.compat_mode = compat_mode;
     var i: usize = 2;
 
-    // Compatibility fallbacks invoke the local client as
-    // `. --compat-version VERSION <command> ...`. Parse only those truly global
-    // knobs before deciding which command owns the remaining arguments.
+    // Process-wide options may appear before the command word. Command flags
+    // are parsed only after the command is known, so one command's flags do not
+    // accidentally become valid for another command.
     while (i < args.len) {
         if (try parseLocalPreCommandOption(args, &i, &options)) continue;
         break;
@@ -3116,13 +3157,6 @@ fn parseLocalOptions(args: []const []const u8) !LocalOptions {
 
 fn parseLocalPreCommandOption(args: []const []const u8, index: *usize, options: *LocalOptions) !bool {
     const arg = args[index.*];
-    if (std.mem.eql(u8, arg, "--compat-version")) {
-        index.* += 1;
-        if (index.* >= args.len) return error.MissingCompatVersion;
-        options.compat_version = args[index.*];
-        index.* += 1;
-        return true;
-    }
     if (std.mem.eql(u8, arg, "--log-level")) {
         try parseLocalLogLevel(args, index, options);
         return true;
@@ -3199,10 +3233,16 @@ fn parseLocalKillOptions(args: []const []const u8, index: *usize, options: *Loca
         index.* += 1;
     } else {
         try setAction(options, .kill);
-        if (index.* >= args.len) return error.MissingKillId;
-        if (std.mem.startsWith(u8, args[index.*], "--")) return error.UnknownArgument;
-        options.kill_id = args[index.*];
-        index.* += 1;
+        if (index.* >= args.len) {
+            return error.MissingKillTarget;
+        } else if (std.mem.eql(u8, args[index.*], "--current")) {
+            options.kill_current = true;
+            index.* += 1;
+        } else {
+            if (std.mem.startsWith(u8, args[index.*], "--")) return error.UnknownArgument;
+            options.kill_id = args[index.*];
+            index.* += 1;
+        }
     }
     while (index.* < args.len) {
         if (try parseLocalCommonSessionOption(args, index, options)) continue;
@@ -3261,10 +3301,10 @@ fn parseLocalCommonSessionOption(args: []const []const u8, index: *usize, option
     const arg = args[index.*];
 
     // Compat-mode delegates every command to an older local client and appends
-    // these session-presentation options after the command. They are accepted
-    // only after `--compat-version` has made that compatibility path explicit.
+    // these session-presentation options after the command. SESSH_COMPAT is the
+    // behavior switch; SESSH_CLIENT_VERSION is only metadata for diagnostics.
     if (std.mem.eql(u8, arg, "--leader")) {
-        if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
+        if (!options.compat_mode) return error.UnsupportedConfigOrEnvOnlyOption;
         index.* += 1;
         if (index.* >= args.len) return error.MissingLeader;
         options.leader = try parseLeader(args[index.*]);
@@ -3275,7 +3315,7 @@ fn parseLocalCommonSessionOption(args: []const []const u8, index: *usize, option
         return true;
     }
     if (std.mem.eql(u8, arg, "--scrollback-limit")) {
-        if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
+        if (!options.compat_mode) return error.UnsupportedConfigOrEnvOnlyOption;
         index.* += 1;
         if (index.* >= args.len) return error.MissingScrollbackRowCount;
         options.scrollback_row_count = try parseScrollbackRowCount(args[index.*]);
@@ -3286,7 +3326,7 @@ fn parseLocalCommonSessionOption(args: []const []const u8, index: *usize, option
         return true;
     }
     if (std.mem.eql(u8, arg, "--initial-scrollback")) {
-        if (options.compat_version == null) return error.UnsupportedConfigOrEnvOnlyOption;
+        if (!options.compat_mode) return error.UnsupportedConfigOrEnvOnlyOption;
         index.* += 1;
         if (index.* >= args.len) return error.MissingInitialScrollback;
         options.initial_scrollback_row_count = try parseInitialScrollbackRowCount(args[index.*]);
@@ -3310,13 +3350,6 @@ fn parseLocalCommonProcessOption(args: []const []const u8, index: *usize, option
     const arg = args[index.*];
     if (std.mem.eql(u8, arg, "--log-level")) {
         try parseLocalLogLevel(args, index, options);
-        return true;
-    }
-    if (std.mem.eql(u8, arg, "--compat-version")) {
-        index.* += 1;
-        if (index.* >= args.len) return error.MissingCompatVersion;
-        options.compat_version = args[index.*];
-        index.* += 1;
         return true;
     }
     return false;
@@ -3347,6 +3380,10 @@ fn validateLocalOptions(options: LocalOptions) !LocalOptions {
     if (options.action == .debug_client and options.debug_client_action == null) return error.MissingDebugAction;
     if (options.debug_unresponsive_seconds != null and
         (options.action != .debug_client or options.debug_client_action != .unresponsive_connection)) return error.UnsupportedDebugSeconds;
+    if (options.action == .kill) {
+        if (options.kill_id != null and options.kill_current) return error.MultipleTargets;
+        if (options.kill_id == null and !options.kill_current) return error.MissingKillTarget;
+    }
     return options;
 }
 
@@ -3443,37 +3480,56 @@ test "parseLocalOptions keeps command flags command-specific" {
 }
 
 test "parseLocalOptions supports compatibility options before local commands" {
-    const attach = try parseLocalOptions(&.{
+    const attach = try parseLocalOptionsWithCompatMode(&.{
         "sesshmux",
         ".",
-        "--compat-version",
-        "0.6.0",
         "attach",
         "s1",
         "--leader",
         "CTRL-B",
-    });
+    }, true);
 
     try std.testing.expectEqual(LocalAction.attach, attach.action);
-    try std.testing.expectEqualStrings("0.6.0", attach.compat_version.?);
+    try std.testing.expect(attach.compat_mode);
     try std.testing.expectEqualStrings("s1", attach.attach_id.?);
     switch (attach.leader) {
         .ctrl => |byte| try std.testing.expectEqual(@as(u8, 'B'), byte),
         .none => return error.ExpectedLeader,
     }
 
-    const list = try parseLocalOptions(&.{
+    const list = try parseLocalOptionsWithCompatMode(&.{
         "sesshmux",
         ".",
-        "--compat-version",
-        "0.6.0",
         "list",
         "--leader",
         "CTRL-B",
-    });
+    }, true);
 
     try std.testing.expectEqual(LocalAction.list, list.action);
     try std.testing.expect(list.leader_set);
+}
+
+test "parseLocalOptions uses current session only when explicit" {
+    try std.testing.expectError(error.MissingKillTarget, parseLocalOptionsWithCompatMode(&.{
+        "sesshmux",
+        ".",
+        "kill",
+    }, false));
+
+    const current = try parseLocalOptionsWithCompatMode(&.{
+        "sesshmux",
+        ".",
+        "kill",
+        "--current",
+    }, false);
+    try std.testing.expectEqual(LocalAction.kill, current.action);
+    try std.testing.expect(current.kill_current);
+
+    try std.testing.expectError(error.MissingKillTarget, parseLocalOptionsWithCompatMode(&.{
+        "sesshmux",
+        ".",
+        "kill",
+    }, true));
 }
 
 pub fn startNewSessionOnRuntime(

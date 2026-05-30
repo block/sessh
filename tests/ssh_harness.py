@@ -1007,6 +1007,9 @@ def write_compat_marker(path, marker):
         "#!/bin/sh\n"
         "printf 'compat_invoked=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
         "printf 'compat_args=%s\\n' \"$*\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "printf 'compat_env_guid=%s\\n' \"${SESSH_GUID-unset}\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "printf 'compat_env_client_version=%s\\n' \"${SESSH_CLIENT_VERSION-unset}\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "printf 'compat_env_compat=%s\\n' \"${SESSH_COMPAT-unset}\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
         f"printf '{marker}\\n'\n"
     )
     path.chmod(0o700)
@@ -2946,10 +2949,15 @@ def test_ssh_version_mismatch_uses_compat_path(tmp):
     if "compat_invoked=1" not in log_text:
         raise AssertionError(log_text)
     expected_args = (
-        f"compat_args=. --compat-version {sessh_version()} "
-        "attach s1 --leader CTRL-B --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
+        "compat_args=. attach s1 --leader CTRL-B --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
     )
     if expected_args not in log_text:
+        raise AssertionError(log_text)
+    if f"compat_env_guid={guid_for_alias('s1')}" not in log_text:
+        raise AssertionError(log_text)
+    if f"compat_env_client_version={sessh_version()}" not in log_text:
+        raise AssertionError(log_text)
+    if "compat_env_compat=1" not in log_text:
         raise AssertionError(log_text)
 
 
@@ -2982,10 +2990,15 @@ def test_ssh_force_compat_uses_compat_path(tmp):
     if "batch_mode=1" in log_text:
         raise AssertionError(log_text)
     expected_args = (
-        f"compat_args=. --compat-version {sessh_version()} "
-        "attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
+        "compat_args=. attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
     )
     if expected_args not in log_text:
+        raise AssertionError(log_text)
+    if f"compat_env_guid={guid_for_alias('s1')}" not in log_text:
+        raise AssertionError(log_text)
+    if f"compat_env_client_version={sessh_version()}" not in log_text:
+        raise AssertionError(log_text)
+    if "compat_env_compat=1" not in log_text:
         raise AssertionError(log_text)
 
 
@@ -3014,10 +3027,15 @@ def test_ssh_force_compat_uses_cached_route(tmp):
     if "batch_mode=1" in log_text:
         raise AssertionError(log_text)
     expected_args = (
-        f"compat_args=. --compat-version {sessh_version()} "
-        f"attach {route_guid} --leader None --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
+        f"compat_args=. attach {route_guid} --leader None --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
     )
     if expected_args not in log_text:
+        raise AssertionError(log_text)
+    if f"compat_env_guid={route_guid}" not in log_text:
+        raise AssertionError(log_text)
+    if f"compat_env_client_version={sessh_version()}" not in log_text:
+        raise AssertionError(log_text)
+    if "compat_env_compat=1" not in log_text:
         raise AssertionError(log_text)
 
 
