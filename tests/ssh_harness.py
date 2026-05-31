@@ -51,6 +51,7 @@ verbose=
 plain_option=
 ipqos_option=
 proxy_command=
+port=22
 
 trace_fake_ssh_start() {
   if [ -n "${SESSH_FAKE_SSH_TRACE:-}" ]; then
@@ -143,6 +144,15 @@ while [ "$#" -gt 0 ]; do
       config=$1
       shift
       ;;
+    -p)
+      shift
+      if [ "$#" -eq 0 ]; then
+        printf 'fake ssh: missing -p argument\\n' >&2
+        exit 97
+      fi
+      port=$1
+      shift
+      ;;
     -v*)
       verbose=${1#-}
       case "$verbose" in
@@ -195,6 +205,86 @@ if [ "$config_query" -eq 1 ]; then
     printf 'ipqos %s\\n' "${SESSH_FAKE_SSH_G_IPQOS:-af21 cs1}"
   fi
   exit 0
+fi
+
+if [ "$saw_t" -ne 1 ] && [ -n "${SESSH_FAKE_SSH_RUN_RAW_PROXYCOMMAND:-}" ] && [ -n "$proxy_command" ]; then
+  printf 'invoked=1\\n' >>"$SESSH_FAKE_SSH_LOG"
+  printf 'raw_proxy=1\\n' >>"$SESSH_FAKE_SSH_LOG"
+  printf 'plain_host=%s\\n' "$host" >>"$SESSH_FAKE_SSH_LOG"
+  if [ -n "$plain_option" ]; then
+    printf 'plain_option=%s\\n' "$plain_option" >>"$SESSH_FAKE_SSH_LOG"
+  fi
+  if [ "$#" -gt 0 ]; then
+    printf 'plain_remote_command=%s\\n' "$*" >>"$SESSH_FAKE_SSH_LOG"
+  fi
+  if [ -n "${SESSH_FAKE_SSH_LOG_PROXYCOMMAND:-}" ]; then
+    printf 'proxy_command=%s\\n' "$proxy_command" >>"$SESSH_FAKE_SSH_LOG"
+  fi
+  export SESSH_FAKE_PROXY_COMMAND=$proxy_command
+  export SESSH_FAKE_PROXY_PORT=$port
+  exec 3<&0
+  exec python3 <<'PY'
+import os
+import select
+import subprocess
+import sys
+
+command = os.environ["SESSH_FAKE_PROXY_COMMAND"].replace("%p", os.environ["SESSH_FAKE_PROXY_PORT"])
+proc = subprocess.Popen(
+    ["sh", "-c", command],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+)
+stdin_open = True
+proxy_stdin_open = True
+proxy_stdout_open = True
+stdin_fd = 3
+try:
+    while proxy_stdout_open:
+        fds = []
+        if stdin_open and proxy_stdin_open:
+            fds.append(stdin_fd)
+        if proxy_stdout_open:
+            fds.append(proc.stdout.fileno())
+        if not fds:
+            break
+        ready, _, _ = select.select(fds, [], [], 0.05)
+        if stdin_open and proxy_stdin_open and stdin_fd in ready:
+            try:
+                data = os.read(stdin_fd, 4096)
+            except OSError:
+                data = b""
+            if data:
+                try:
+                    proc.stdin.write(data)
+                    proc.stdin.flush()
+                except BrokenPipeError:
+                    proxy_stdin_open = False
+                    proc.stdin.close()
+            else:
+                stdin_open = False
+                proxy_stdin_open = False
+                proc.stdin.close()
+        if proxy_stdout_open and proc.stdout.fileno() in ready:
+            data = os.read(proc.stdout.fileno(), 4096)
+            if data:
+                os.write(1, data)
+            else:
+                proxy_stdout_open = False
+                proc.stdout.close()
+        if proc.poll() is not None and not proxy_stdout_open:
+            break
+    if proxy_stdin_open:
+        proc.stdin.close()
+finally:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+sys.exit(proc.wait())
+PY
 fi
 
 if [ "$saw_t" -ne 1 ]; then
@@ -342,6 +432,55 @@ finally:
     if stdout_open:
         proc.stdout.close()
 sys.exit(proc.wait())
+PY
+fi
+if [ "$saw_t" -eq 1 ] && [ "$batch_mode" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_KILL_BATCH_ONCE_FILE:-}" ]; then
+  printf 'kill_batch_wrapper=1\\n' >>"$SESSH_FAKE_SSH_LOG"
+  exec 3<&0
+  python3 - "$1" "$SESSH_FAKE_SSH_KILL_BATCH_ONCE_FILE" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+command = sys.argv[1]
+kill_file = sys.argv[2]
+log_path = os.environ.get("SESSH_FAKE_SSH_LOG")
+stdin_file = os.fdopen(os.dup(3), "rb", closefd=True)
+proc = subprocess.Popen(["sh", "-c", command], stdin=stdin_file, start_new_session=True)
+if log_path:
+    with open(log_path, "a") as log:
+        log.write(f"kill_batch_pid={proc.pid}\\n")
+try:
+    while proc.poll() is None:
+        if os.path.exists(kill_file):
+            if log_path:
+                with open(log_path, "a") as log:
+                    log.write("kill_batch_triggered=1\\n")
+            try:
+                os.unlink(kill_file)
+            except FileNotFoundError:
+                pass
+            # Killing only the shell wrapper can leave the stream-remote child
+            # alive with the transport fds open. Kill the command's process
+            # group so the fake ssh channel closes the same way a lost ssh
+            # transport would close.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            if log_path:
+                with open(log_path, "a") as log:
+                    log.write(f"kill_batch_wait={proc.returncode}\\n")
+            sys.exit(255)
+        time.sleep(0.01)
+    sys.exit(proc.returncode)
+finally:
+    stdin_file.close()
+    if proc.poll() is None:
+        proc.kill()
 PY
 fi
 exec sh -c "$1"
@@ -1558,6 +1697,135 @@ def test_ssh_passthrough_forced_tty_marks_stream_as_tty(tmp):
     if "proxy_command=" not in log_text or ":internal-stream-client:" not in log_text:
         raise AssertionError(log_text)
     if "--outer-tty" not in log_text:
+        raise AssertionError(log_text)
+    if "--title-status-path" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_passthrough_tty_enables_title_status_path(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_LOG_PROXYCOMMAND"] = "1"
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "-tt", "test-host", "tty"],
+        env,
+        ((b"PLAIN_SSH host=test-host", None),),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "--outer-tty" not in log_text or "--title-status-path" not in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_passthrough_tty_restores_remote_title_after_stream_reconnect(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    kill_once_file = tmp / "kill-inner-stream-once"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_LOG_PROXYCOMMAND"] = "1"
+    env["SESSH_FAKE_SSH_RUN_RAW_PROXYCOMMAND"] = "1"
+    env["SESSH_FAKE_SSH_KILL_BATCH_ONCE_FILE"] = str(kill_once_file)
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    server.settimeout(20.0)
+    port = server.getsockname()[1]
+    stop = threading.Event()
+    observed = {}
+
+    # This is intentionally a process-level test. The fake outer ssh runs the
+    # real ProxyCommand, the fake inner ssh kills one batch-mode transport, and
+    # the TCP server stands in for the remote sshd byte stream. That proves the
+    # parent-side title parser and ProxyCommand-side title restore work together
+    # across an actual stream reconnect.
+    def serve_title_stream():
+        try:
+            conn, _addr = server.accept()
+            conn.settimeout(0.1)
+            with conn:
+                conn.sendall(b"\x1b]2;remote-title\x07PASSTHROUGH_TITLE_READY\n")
+                while not stop.is_set():
+                    try:
+                        data = conn.recv(4096)
+                    except TimeoutError:
+                        continue
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        break
+            observed["done"] = True
+        except BaseException as exc:
+            observed["error"] = repr(exc)
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=serve_title_stream)
+    thread.start()
+
+    argv = sessh_argv(["--passthrough", "-tt", "-p", str(port), "test-host", "ignored-command"])
+    pid, fd = pty.fork()
+    output = b""
+    waited = False
+    try:
+        if pid == 0:
+            os.chdir(ROOT)
+            os.execvpe(argv[0], argv, env)
+
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        output = read_pty_until(fd, output, b"PASSTHROUGH_TITLE_READY", 20.0)
+        if b"\x1b]2;remote-title\x07" not in output:
+            raise AssertionError(f"remote title was not relayed before reconnect:\n{output!r}")
+
+        kill_once_file.write_text("")
+        retry_title = b"\x1b]2;10sec until retry connect\x1b\\"
+        try:
+            output = read_pty_until(fd, output, retry_title, 20.0)
+        except AssertionError as exc:
+            raise AssertionError(f"{exc}\nfake ssh log:\n{optional_text(fake_log)}") from exc
+        restore_title = b"\x1b]2;remote-title\x1b\\"
+        output = read_pty_until(fd, output, restore_title, 25.0)
+
+        retry_index = output.index(retry_title)
+        restore_index = output.index(restore_title, retry_index + len(retry_title))
+        if restore_index <= retry_index:
+            raise AssertionError(f"title restore did not follow retry title:\n{output!r}")
+    finally:
+        stop.set()
+        if pid != 0:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+                waited = True
+            except ChildProcessError:
+                waited = True
+            os.close(fd)
+        server.close()
+        thread.join(timeout=5.0)
+
+    if not waited:
+        raise AssertionError("passthrough title test process was not reaped")
+    if thread.is_alive():
+        raise AssertionError("title stream server did not finish")
+    if observed.get("error"):
+        raise AssertionError(observed)
+    log_text = fake_log.read_text()
+    if "raw_proxy=1" not in log_text or log_text.count("batch_mode=1") < 2:
         raise AssertionError(log_text)
 
 
@@ -3598,6 +3866,14 @@ def main(argv=None):
         (
             "ssh passthrough forced tty marks stream as tty",
             test_ssh_passthrough_forced_tty_marks_stream_as_tty,
+        ),
+        (
+            "ssh passthrough tty enables title status path",
+            test_ssh_passthrough_tty_enables_title_status_path,
+        ),
+        (
+            "ssh passthrough tty restores remote title after stream reconnect",
+            test_ssh_passthrough_tty_restores_remote_title_after_stream_reconnect,
         ),
         (
             "ssh forced tty remote command uses persistent session",

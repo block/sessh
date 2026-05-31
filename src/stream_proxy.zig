@@ -24,6 +24,7 @@ const StreamOutcome = union(enum) {
 
 pub const ClientStreamOptions = struct {
     status_enabled: bool = false,
+    title_status_path: ?[]const u8 = null,
 };
 
 // Tracks byte offsets for one side of the reconnectable stream. `outbound`
@@ -443,8 +444,11 @@ pub fn runClientStream(
 
     var state = StreamState.init(allocator);
     defer state.deinit();
-    var reconnect_status = StreamReconnectStatus.init(options.status_enabled);
-    defer reconnect_status.clear();
+    var reconnect_status = if (options.title_status_path) |path|
+        StreamReconnectStatus.initTitle(path)
+    else
+        StreamReconnectStatus.init(options.status_enabled);
+    defer reconnect_status.deinit();
 
     var attempt: usize = 0;
     var had_transport = false;
@@ -851,7 +855,10 @@ fn connectOrStartAgent(
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Inherit;
+    // The stream agent outlives a single inner ssh channel. It must not keep
+    // any of that channel's stdio fds open, or the local client can block while
+    // waiting for the dead transport's stderr pump to finish.
+    child.stderr_behavior = .Ignore;
     child.pgid = 0;
     try child.spawn();
 
@@ -895,13 +902,21 @@ fn sleepBeforeReconnect(status: *StreamReconnectStatus, delay_ms: u64) void {
 }
 
 // In ProxyCommand mode stdout is the ssh byte stream, so reconnect status must
-// never write there. If stderr is a terminal, keep one repaintable status line
-// there and clear it as soon as a replacement transport is ready.
+// never write there. Non-tty streams can use a repaintable stderr line. Tty
+// passthrough uses the window title instead, because stderr output would appear
+// inside the user's terminal session.
 const StreamReconnectStatus = struct {
     const max_diagnostic_lines = 3;
+    const Mode = enum {
+        disabled,
+        stderr_line,
+        window_title,
+    };
 
     fd: c.fd_t,
-    enabled: bool,
+    mode: Mode,
+    owned_fd: bool = false,
+    title_status_path: ?[]const u8 = null,
     visible: bool = false,
     line: [96]u8 = undefined,
     line_len: usize = 0,
@@ -913,7 +928,32 @@ const StreamReconnectStatus = struct {
         const displayed = client_log.displayedUserDiagnosticSeq();
         return .{
             .fd = 2,
-            .enabled = enabled,
+            .mode = if (enabled) .stderr_line else .disabled,
+            .diagnostic_cursor = displayed,
+            .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
+            .rendered_diagnostic_seq = displayed,
+        };
+    }
+
+    fn initTitle(title_status_path: []const u8) StreamReconnectStatus {
+        const displayed = client_log.displayedUserDiagnosticSeq();
+        // In tty passthrough the proxy's stdout is OpenSSH's byte stream, and
+        // stderr should stay quiet. Write title changes directly to the
+        // controlling terminal so reconnect UI cannot corrupt either stream.
+        const tty = std.fs.openFileAbsolute("/dev/tty", .{ .mode = .write_only }) catch {
+            return .{
+                .fd = -1,
+                .mode = .disabled,
+                .diagnostic_cursor = displayed,
+                .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
+                .rendered_diagnostic_seq = displayed,
+            };
+        };
+        return .{
+            .fd = tty.handle,
+            .mode = .window_title,
+            .owned_fd = true,
+            .title_status_path = title_status_path,
             .diagnostic_cursor = displayed,
             .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
             .rendered_diagnostic_seq = displayed,
@@ -924,16 +964,47 @@ const StreamReconnectStatus = struct {
         const displayed = client_log.displayedUserDiagnosticSeq();
         return .{
             .fd = fd,
-            .enabled = enabled,
+            .mode = if (enabled) .stderr_line else .disabled,
             .diagnostic_cursor = displayed,
             .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
             .rendered_diagnostic_seq = displayed,
         };
     }
 
+    fn initTitleForTest(fd: c.fd_t, title_status_path: []const u8) StreamReconnectStatus {
+        const displayed = client_log.displayedUserDiagnosticSeq();
+        return .{
+            .fd = fd,
+            .mode = .window_title,
+            .title_status_path = title_status_path,
+            .diagnostic_cursor = displayed,
+            .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
+            .rendered_diagnostic_seq = displayed,
+        };
+    }
+
+    fn deinit(self: *StreamReconnectStatus) void {
+        self.clear();
+        if (self.owned_fd and self.fd >= 0) {
+            _ = c.close(self.fd);
+            self.fd = -1;
+            self.owned_fd = false;
+        }
+    }
+
     fn showRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
         var delay_buf: [16]u8 = undefined;
         const delay = formatDelay(delay_ms, &delay_buf) catch return;
+        if (self.mode == .window_title) {
+            var title_buf: [48]u8 = undefined;
+            const title = std.fmt.bufPrint(
+                &title_buf,
+                "{s} until retry connect",
+                .{delay},
+            ) catch return;
+            self.setTitle(title);
+            return;
+        }
         const message = std.fmt.bufPrint(
             &self.line,
             "sessh: disconnected: Retry connecting {s}",
@@ -945,6 +1016,10 @@ const StreamReconnectStatus = struct {
     }
 
     fn showReconnecting(self: *StreamReconnectStatus) void {
+        if (self.mode == .window_title) {
+            self.setTitle("reconnecting");
+            return;
+        }
         const message = "sessh: disconnected: Reconnecting...";
         @memcpy(self.line[0..message.len], message);
         self.line_len = message.len;
@@ -953,6 +1028,10 @@ const StreamReconnectStatus = struct {
     }
 
     fn clear(self: *StreamReconnectStatus) void {
+        if (self.mode == .window_title) {
+            self.restoreTitle();
+            return;
+        }
         self.refreshDiagnostics(false);
         self.clearLine();
     }
@@ -962,13 +1041,13 @@ const StreamReconnectStatus = struct {
     }
 
     fn clearLine(self: *StreamReconnectStatus) void {
-        if (!self.enabled or !self.visible) return;
+        if (self.mode != .stderr_line or !self.visible) return;
         io.writeAll(self.fd, "\r\x1b[K") catch {};
         self.visible = false;
     }
 
     fn redrawLine(self: *StreamReconnectStatus) void {
-        if (!self.enabled) return;
+        if (self.mode != .stderr_line) return;
         const message = self.line[0..self.line_len];
         io.writeAll(self.fd, "\r") catch return;
         io.writeAll(self.fd, message) catch return;
@@ -977,7 +1056,7 @@ const StreamReconnectStatus = struct {
     }
 
     fn refreshDiagnostics(self: *StreamReconnectStatus, redraw_after: bool) void {
-        if (!self.enabled) return;
+        if (self.mode != .stderr_line) return;
         if (client_log.currentUserDiagnosticSeq() == self.rendered_diagnostic_seq) return;
 
         var diagnostics = [_]client_log.UserDiagnosticLine{.{}} ** max_diagnostic_lines;
@@ -1014,7 +1093,44 @@ const StreamReconnectStatus = struct {
         client_log.markUserDiagnosticsDisplayedThrough(new_cursor);
         if (wrote and redraw_after and self.line_len > 0) self.redrawLine();
     }
+
+    fn setTitle(self: *StreamReconnectStatus, title: []const u8) void {
+        if (self.mode != .window_title or self.fd < 0) return;
+        writeOscTitle(self.fd, title) catch return;
+        self.visible = true;
+    }
+
+    fn restoreTitle(self: *StreamReconnectStatus) void {
+        if (self.mode != .window_title or !self.visible or self.fd < 0) return;
+        var title_buf: [512]u8 = undefined;
+        const title = readTitleStatusFile(self.title_status_path orelse return, &title_buf) catch "";
+        writeOscTitle(self.fd, title) catch {};
+        self.visible = false;
+    }
 };
+
+fn writeOscTitle(fd: c.fd_t, title: []const u8) !void {
+    try io.writeAll(fd, "\x1b]2;");
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    for (title) |byte| {
+        buf[len] = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+        len += 1;
+        if (len == buf.len) {
+            try io.writeAll(fd, buf[0..len]);
+            len = 0;
+        }
+    }
+    if (len > 0) try io.writeAll(fd, buf[0..len]);
+    try io.writeAll(fd, "\x1b\\");
+}
+
+fn readTitleStatusFile(path: []const u8, buf: []u8) ![]const u8 {
+    var file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const len = try file.readAll(buf);
+    return buf[0..len];
+}
 
 fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
     const seconds = @max(@divTrunc(delay_ms + 999, 1000), 1);
@@ -1229,6 +1345,40 @@ test "stream reconnect status uses stderr-style terminal line" {
         "\rsessh: disconnected: Retry connecting 1sec\x1b[K" ++
             "\rsessh: disconnected: Reconnecting...\x1b[K" ++
             "\r\x1b[K",
+        output.items,
+    );
+}
+
+test "stream reconnect title status uses compact titles and restores latest remote title" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "title", .data = "remote-title" });
+    const title_path = try tmp.dir.realpathAlloc(std.testing.allocator, "title");
+    defer std.testing.allocator.free(title_path);
+
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var status = StreamReconnectStatus.initTitleForTest(fds[1], title_path);
+    status.showRetry(12_000);
+    status.showReconnecting();
+    status.clear();
+    posix.close(fds[1]);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    while (true) {
+        var buf: [128]u8 = undefined;
+        const n = c.read(fds[0], &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try std.testing.expectEqualStrings(
+        "\x1b]2;12sec until retry connect\x1b\\" ++
+            "\x1b]2;reconnecting\x1b\\" ++
+            "\x1b]2;remote-title\x1b\\",
         output.items,
     );
 }

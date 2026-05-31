@@ -3036,6 +3036,7 @@ pub fn runInternalStreamClient(allocator: std.mem.Allocator, args: []const []con
     var host: ?[]const u8 = null;
     var port: ?[]const u8 = null;
     var outer_tty = false;
+    var title_status_path: ?[]const u8 = null;
     var ssh_options: std.ArrayList([]const u8) = .empty;
     defer ssh_options.deinit(allocator);
 
@@ -3070,6 +3071,11 @@ pub fn runInternalStreamClient(allocator: std.mem.Allocator, args: []const []con
         } else if (std.mem.eql(u8, arg, "--outer-tty")) {
             outer_tty = true;
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--title-status-path")) {
+            i += 1;
+            if (i >= args.len) return streamClientArgError("--title-status-path requires a value");
+            title_status_path = args[i];
+            i += 1;
         } else {
             return streamClientArgError("unsupported stream client option");
         }
@@ -3098,7 +3104,10 @@ pub fn runInternalStreamClient(allocator: std.mem.Allocator, args: []const []con
         .broker_args = broker_args[0..],
         .stderr_mode = if (outer_tty) .discard else if (status_enabled) .diagnostics else .forward,
     };
-    stream_proxy.runClientStream(allocator, &starter, .{ .status_enabled = status_enabled }) catch |err| {
+    stream_proxy.runClientStream(allocator, &starter, .{
+        .status_enabled = status_enabled,
+        .title_status_path = if (outer_tty) title_status_path else null,
+    }) catch |err| {
         try starter.exitAfterInitialFailure(err);
     };
 }
@@ -3112,7 +3121,24 @@ fn runStreamProxySsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArg
     const guid = try session_registry.generateReconnectGuid(allocator);
     defer allocator.free(guid);
     const stream_uses_tty = streamProxyUsesTty(parsed_ssh_args, stdin_is_tty);
-    const proxy_command = try streamProxyCommand(allocator, guid, parsed_ssh_args, stream_uses_tty);
+    const title_status_enabled = stream_uses_tty and c.isatty(1) != 0;
+    // In passthrough mode the reconnecting process is OpenSSH's ProxyCommand.
+    // It only sees encrypted ssh transport bytes, so it cannot learn the
+    // terminal title from remote output. When we want title-based reconnect UI,
+    // the parent relays decrypted stdout and records the latest remote title in
+    // this file. The ProxyCommand reads it when the connection recovers.
+    const title_status_path = if (title_status_enabled) try streamTitleStatusPath(allocator, guid) else null;
+    defer if (title_status_path) |path| {
+        std.fs.deleteFileAbsolute(path) catch {};
+        allocator.free(path);
+    };
+    if (title_status_path) |path| {
+        const initial_title = std.process.getCwdAlloc(allocator) catch null;
+        defer if (initial_title) |title| allocator.free(title);
+        try writeWindowTitleStateFile(allocator, path, initial_title orelse "");
+    }
+
+    const proxy_command = try streamProxyCommand(allocator, guid, parsed_ssh_args, stream_uses_tty, title_status_path);
     defer allocator.free(proxy_command);
 
     const default_options = defaultSshOptionsLen(parsed_ssh_args);
@@ -3144,9 +3170,22 @@ fn runStreamProxySsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArg
     var child = std.process.Child.init(ssh_argv, allocator);
     child.expand_arg0 = .expand;
     child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
+    child.stdout_behavior = if (title_status_path != null) .Pipe else .Inherit;
     child.stderr_behavior = .Inherit;
     try child.spawn();
+
+    var relay_error: ?anyerror = null;
+    if (title_status_path) |path| {
+        if (child.stdout) |*stdout| {
+            relayStdoutAndTrackWindowTitle(allocator, stdout.handle, 1, path) catch |err| {
+                relay_error = err;
+                terminateChild(&child);
+            };
+            stdout.close();
+            child.stdout = null;
+        }
+    }
+    if (relay_error) |err| return err;
 
     const term = try child.wait();
     switch (term) {
@@ -3167,6 +3206,7 @@ fn streamProxyCommand(
     guid: []const u8,
     parsed_ssh_args: ParsedSshArgs,
     stream_uses_tty: bool,
+    title_status_path: ?[]const u8,
 ) ![]u8 {
     const exe_path = try std.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
@@ -3185,6 +3225,10 @@ fn streamProxyCommand(
     if (stream_uses_tty) {
         try appendShellToken(allocator, &out, "--outer-tty");
     }
+    if (title_status_path) |path| {
+        try appendShellToken(allocator, &out, "--title-status-path");
+        try appendShellToken(allocator, &out, path);
+    }
     if (parsed_ssh_args.default_ipqos_option) |option| {
         try appendShellToken(allocator, &out, "--ssh-option");
         try appendShellToken(allocator, &out, option);
@@ -3198,6 +3242,164 @@ fn streamProxyCommand(
     defer allocator.free(command);
     return std.fmt.allocPrint(allocator, "-oProxyCommand={s}", .{command});
 }
+
+fn streamTitleStatusPath(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    const root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(root);
+    try mkdirIgnoreExists(allocator, root);
+    const stream_dir = try std.fmt.allocPrint(allocator, "{s}/r", .{root});
+    defer allocator.free(stream_dir);
+    try mkdirIgnoreExists(allocator, stream_dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}.title", .{ stream_dir, guid });
+}
+
+fn mkdirIgnoreExists(allocator: std.mem.Allocator, path: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    switch (posix.errno(c.mkdir(path_z.ptr, 0o700))) {
+        .SUCCESS, .EXIST => return,
+        else => return error.MkdirFailed,
+    }
+}
+
+fn writeWindowTitleStateFile(allocator: std.mem.Allocator, path: []const u8, title: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ path, c.getpid() });
+    defer allocator.free(tmp_path);
+    std.fs.deleteFileAbsolute(tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    errdefer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    {
+        var file = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true, .mode = 0o600 });
+        defer file.close();
+        try file.writeAll(title);
+    }
+    try std.fs.renameAbsolute(tmp_path, path);
+}
+
+fn relayStdoutAndTrackWindowTitle(
+    allocator: std.mem.Allocator,
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    title_status_path: []const u8,
+) !void {
+    var tracker = WindowTitleTracker.init(allocator, title_status_path);
+    while (true) {
+        var buf: [16 * 1024]u8 = undefined;
+        const n = c.read(read_fd, &buf, buf.len);
+        if (n < 0) switch (posix.errno(n)) {
+            .AGAIN, .INTR => continue,
+            else => return error.ReadFailed,
+        };
+        if (n == 0) return;
+        const bytes = buf[0..@intCast(n)];
+        tracker.feed(bytes);
+        try io.writeAll(write_fd, bytes);
+    }
+}
+
+// Watches the decrypted terminal byte stream for OSC 0/2 title updates while
+// still relaying the bytes unchanged. The state file is deliberately tiny and
+// overwritten atomically because the ProxyCommand may read it at the same time
+// it is deciding which title to restore after reconnect.
+const WindowTitleTracker = struct {
+    const max_command_bytes = 8;
+    const max_title_bytes = 512;
+    const State = enum {
+        ground,
+        esc,
+        osc_command,
+        osc_text,
+        osc_text_esc,
+    };
+
+    allocator: std.mem.Allocator,
+    title_status_path: []const u8,
+    state: State = .ground,
+    command: [max_command_bytes]u8 = undefined,
+    command_len: usize = 0,
+    title: [max_title_bytes]u8 = undefined,
+    title_len: usize = 0,
+    tracking_title: bool = false,
+
+    fn init(allocator: std.mem.Allocator, title_status_path: []const u8) WindowTitleTracker {
+        return .{
+            .allocator = allocator,
+            .title_status_path = title_status_path,
+        };
+    }
+
+    fn feed(self: *WindowTitleTracker, bytes: []const u8) void {
+        for (bytes) |byte| self.feedByte(byte);
+    }
+
+    fn feedByte(self: *WindowTitleTracker, byte: u8) void {
+        switch (self.state) {
+            .ground => {
+                if (byte == 0x1b) self.state = .esc;
+            },
+            .esc => {
+                if (byte == ']') {
+                    self.command_len = 0;
+                    self.title_len = 0;
+                    self.tracking_title = false;
+                    self.state = .osc_command;
+                } else if (byte != 0x1b) {
+                    self.state = .ground;
+                }
+            },
+            .osc_command => {
+                if (byte == ';') {
+                    const command = self.command[0..self.command_len];
+                    self.tracking_title = std.mem.eql(u8, command, "0") or std.mem.eql(u8, command, "2");
+                    self.title_len = 0;
+                    self.state = .osc_text;
+                } else if (byte == 0x07) {
+                    self.state = .ground;
+                } else if (byte == 0x1b) {
+                    self.state = .ground;
+                } else if (self.command_len < self.command.len) {
+                    self.command[self.command_len] = byte;
+                    self.command_len += 1;
+                }
+            },
+            .osc_text => {
+                if (byte == 0x07) {
+                    self.finishTitle();
+                } else if (byte == 0x1b) {
+                    self.state = .osc_text_esc;
+                } else {
+                    self.appendTitleByte(byte);
+                }
+            },
+            .osc_text_esc => {
+                if (byte == '\\') {
+                    self.finishTitle();
+                } else {
+                    self.state = .ground;
+                }
+            },
+        }
+    }
+
+    fn appendTitleByte(self: *WindowTitleTracker, byte: u8) void {
+        if (!self.tracking_title or self.title_len == self.title.len) return;
+        self.title[self.title_len] = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+        self.title_len += 1;
+    }
+
+    fn finishTitle(self: *WindowTitleTracker) void {
+        if (self.tracking_title) {
+            writeWindowTitleStateFile(self.allocator, self.title_status_path, self.title[0..self.title_len]) catch {};
+        }
+        self.state = .ground;
+        self.command_len = 0;
+        self.title_len = 0;
+        self.tracking_title = false;
+    }
+};
 
 fn appendShellToken(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
     if (out.items.len > 0) try out.append(allocator, ' ');
@@ -4777,6 +4979,84 @@ test "shellQuote produces single-quoted shell words" {
     defer std.testing.allocator.free(quoted);
 
     try std.testing.expectEqualStrings("'alpha '\\'' beta'", quoted);
+}
+
+test "window title tracker records remote OSC title changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "title", .data = "initial" });
+    const title_path = try tmp.dir.realpathAlloc(std.testing.allocator, "title");
+    defer std.testing.allocator.free(title_path);
+
+    var tracker = WindowTitleTracker.init(std.testing.allocator, title_path);
+    tracker.feed("before\x1b]2;remote");
+    tracker.feed("-title\x1b\\after");
+
+    const title1 = try tmp.dir.readFileAlloc(std.testing.allocator, "title", 1024);
+    defer std.testing.allocator.free(title1);
+    try std.testing.expectEqualStrings("remote-title", title1);
+
+    tracker.feed("\x1b]1;ignored\x07");
+    const title2 = try tmp.dir.readFileAlloc(std.testing.allocator, "title", 1024);
+    defer std.testing.allocator.free(title2);
+    try std.testing.expectEqualStrings("remote-title", title2);
+
+    tracker.feed("\x1b]0;both-title\x07");
+    const title3 = try tmp.dir.readFileAlloc(std.testing.allocator, "title", 1024);
+    defer std.testing.allocator.free(title3);
+    try std.testing.expectEqualStrings("both-title", title3);
+}
+
+test "passthrough title relay parses remote output for later restore" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "title", .data = "initial" });
+    const title_path = try tmp.dir.realpathAlloc(std.testing.allocator, "title");
+    defer std.testing.allocator.free(title_path);
+
+    const input = try posix.pipe();
+    defer posix.close(input[0]);
+    const output = try posix.pipe();
+    defer posix.close(output[0]);
+
+    try io.writeAll(input[1], "plain\x1b]2;parsed-title\x07text");
+    posix.close(input[1]);
+
+    try relayStdoutAndTrackWindowTitle(std.testing.allocator, input[0], output[1], title_path);
+    posix.close(output[1]);
+
+    var relayed_buf: [64]u8 = undefined;
+    const relayed_len = try posix.read(output[0], &relayed_buf);
+    try std.testing.expectEqualStrings("plain\x1b]2;parsed-title\x07text", relayed_buf[0..relayed_len]);
+
+    const title = try tmp.dir.readFileAlloc(std.testing.allocator, "title", 1024);
+    defer std.testing.allocator.free(title);
+    try std.testing.expectEqualStrings("parsed-title", title);
+}
+
+test "stream proxy command carries title status path only for tty streams" {
+    const with_title = try streamProxyCommand(
+        std.testing.allocator,
+        "r-11111111-1111-4111-8111-111111111111",
+        .{ .options = &.{}, .host = "example.com" },
+        true,
+        "/tmp/sessh title",
+    );
+    defer std.testing.allocator.free(with_title);
+    try std.testing.expect(std.mem.indexOf(u8, with_title, "--outer-tty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_title, "--title-status-path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_title, "'/tmp/sessh title'") != null);
+
+    const without_title = try streamProxyCommand(
+        std.testing.allocator,
+        "r-11111111-1111-4111-8111-111111111111",
+        .{ .options = &.{}, .host = "example.com" },
+        false,
+        null,
+    );
+    defer std.testing.allocator.free(without_title);
+    try std.testing.expect(std.mem.indexOf(u8, without_title, "--outer-tty") == null);
+    try std.testing.expect(std.mem.indexOf(u8, without_title, "--title-status-path") == null);
 }
 
 test "joinRemoteShellCommandArgs matches ssh remote command joining" {
