@@ -2263,6 +2263,17 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         }
     }
 
+    var compat_attach_id: ?[]u8 = null;
+    defer if (compat_attach_id) |id| allocator.free(id);
+    if (options.action == .attach and options.attach_id == null and options.compat_mode) {
+        // Compat callers set SESSH_GUID when they already know the intended
+        // session. Prefer that over the older "latest detached" behavior.
+        compat_attach_id = std.process.getEnvVarOwned(allocator, config.session_guid_env) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        };
+    }
+
     var child = try startLocalBroker(allocator, args[0], runtime_broker_args);
     var session = (switch (options.action) {
         .new => startNewSessionOnRuntime(
@@ -2277,7 +2288,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         .attach => startAttachSessionOnRuntime(
             child.stdout.?.handle,
             child.stdin.?.handle,
-            options.attach_id orelse "",
+            options.attach_id orelse compat_attach_id orelse "",
             "",
             options.initial_scrollback_row_count,
         ),

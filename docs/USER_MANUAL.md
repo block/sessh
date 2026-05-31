@@ -89,8 +89,9 @@ Use `sesshmux` for session management:
   GUID, or unique `s-` GUID prefix.
 - `sesshmux attach --host HOST [ID]`: attach by resolving `ID` on `HOST`, or
   attach to the most recent attachable session on `HOST` if `ID` is omitted.
-- `sesshmux attach --force-compat ...`: attach through the session's compat
-  binary without first trying the normal bootstrap/runtime path.
+- `sesshmux force-compat --host HOST ID command ...`: run `command ...` through the
+  exact sessh binary that started `ID`. If `ID` has a cached remote route, the
+  `--host HOST` part can be omitted.
 - `sesshmux list [--refresh] [--exited] [--jsonl] [HOST]`: list attachable sessions locally or on
   `HOST`. Without `HOST`, local sessions and cached remote routes are shown.
   Use `sesshmux list .` to show only local sessions. `--refresh` checks cached
@@ -182,13 +183,13 @@ Under plain-ssh-fallback, `sessh` will print a warning to stderr and then
 delegate to ordinary `ssh`, which means there will be no session persistence.
 
 If the remote session agent is an incompatible `sessh` version, `sessh` may use
-compat-fallback: it runs the remote compat binary that started that session,
-and that remote sessh client talks to the agent with the protocol it knows. If
-doing that automatically would require another interactive ssh authentication
-prompt, sessh exits instead of prompting through the session stream.
+compat-fallback: it runs the remote compat binary that started that session
+(over plain ssh), and that remote sessh client talks to the agent with the
+protocol it knows.
 
-`sesshmux attach --force-compat` runs the compat-fallback path immediately,
-without first trying the normal bootstrap/runtime path.
+`sesshmux force-compat --host HOST ID command ...` is the manual version of
+that escape hatch. It resolves the session's `compat` binary on the remote host,
+then runs the requested mux command through that binary.
 
 ## Local mode
 

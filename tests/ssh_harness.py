@@ -1484,28 +1484,6 @@ def test_ssh_unsupported_option_falls_back_to_plain_ssh(tmp):
         raise AssertionError(log_text)
 
 
-def test_sessh_force_compat_is_not_a_sessh_option(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-
-    result = run_sessh(["--force-compat", "test-host"], env, timeout=5.0)
-
-    if result.returncode != 97:
-        raise AssertionError(result)
-    if "compat-mode requires an existing session" in result.stderr:
-        raise AssertionError(result)
-    if "fallback to plain-ssh due to unsupported ssh option" not in result.stderr:
-        raise AssertionError(result.stderr)
-    if "fake ssh: unsupported option: --force-compat" not in result.stderr:
-        raise AssertionError(result.stderr)
-    if fake_log.exists():
-        raise AssertionError(fake_log.read_text())
-
-
 def test_ssh_remote_command_uses_stream_proxy(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -3430,38 +3408,34 @@ def test_ssh_version_mismatch_uses_compat_path(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_force_compat_uses_compat_path(tmp):
+def test_sesshmux_force_compat_invokes_session_compat_path(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
-    marker = "SSH_FORCE_COMPAT_READY"
-    config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "sessh.env").write_text(
-        "leader=CTRL-B\nscrollback-limit=77\ninitial-scrollback=0\n"
-    )
+    marker = "SESSHMUX_FORCE_COMPAT_READY"
     write_fake_ssh(fake_bin / "ssh")
     write_compat_marker(session_compat_path(env, "s1"), marker)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    result = run_sesshmux(["attach", "--force-compat", "--host", "test-host", "s1"], env, timeout=30.0)
+    result = run_sesshmux(
+        ["force-compat", "--ssh-options", "-F cfg", "--host", "test-host", "s1", "attach", "--leader", "CTRL-B"],
+        env,
+        timeout=30.0,
+    )
 
     if result.returncode != 0:
         raise AssertionError(result)
     if marker not in result.stdout:
         raise AssertionError(result)
-    if "using compat-fallback" in result.stderr:
-        raise AssertionError(result)
     log_text = fake_log.read_text()
     if log_text.splitlines().count("invoked=1") != 1:
         raise AssertionError(log_text)
+    if "config=cfg" not in log_text:
+        raise AssertionError(log_text)
     if "batch_mode=1" in log_text:
         raise AssertionError(log_text)
-    expected_args = (
-        "compat_args=. attach s1 --leader CTRL-B --scrollback-limit 77 --initial-scrollback 0 --log-level warn"
-    )
-    if expected_args not in log_text:
+    if "compat_args=. attach s1 --leader CTRL-B" not in log_text:
         raise AssertionError(log_text)
     if f"compat_env_guid={guid_for_alias('s1')}" not in log_text:
         raise AssertionError(log_text)
@@ -3471,20 +3445,20 @@ def test_ssh_force_compat_uses_compat_path(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_force_compat_uses_cached_route(tmp):
+def test_sesshmux_force_compat_uses_cached_route(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
-    marker = "SSH_FORCE_COMPAT_ROUTE_READY"
-    route_alias = "route-force"
+    marker = "SESSHMUX_FORCE_COMPAT_ROUTE_READY"
+    route_alias = "route-force-compat"
     route_guid = guid_for_alias(route_alias)
     write_fake_ssh(fake_bin / "ssh")
-    write_ssh_route(env, route_alias, route_guid, "test-host")
+    write_ssh_route(env, route_alias, route_guid, "test-host", ssh_options=("-F", "cached-cfg"))
     write_compat_marker(session_compat_path(env, route_alias), marker)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    result = run_sesshmux(["attach", "--force-compat", route_alias], env, timeout=30.0)
+    result = run_sesshmux(["force-compat", route_alias, "attach"], env, timeout=30.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -3493,12 +3467,9 @@ def test_ssh_force_compat_uses_cached_route(tmp):
     log_text = fake_log.read_text()
     if log_text.splitlines().count("invoked=1") != 1:
         raise AssertionError(log_text)
-    if "batch_mode=1" in log_text:
+    if "config=cached-cfg" not in log_text:
         raise AssertionError(log_text)
-    expected_args = (
-        f"compat_args=. attach {route_guid} --leader None --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
-    )
-    if expected_args not in log_text:
+    if f"compat_args=. attach {route_guid}" not in log_text:
         raise AssertionError(log_text)
     if f"compat_env_guid={route_guid}" not in log_text:
         raise AssertionError(log_text)
@@ -3508,7 +3479,7 @@ def test_ssh_force_compat_uses_cached_route(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_force_compat_ctrl_c_reaches_remote_pty(tmp):
+def test_sesshmux_force_compat_ctrl_c_reaches_remote_pty(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -3538,7 +3509,7 @@ def test_ssh_force_compat_ctrl_c_reaches_remote_pty(tmp):
     assert_session_compat_points_to_cached_artifact(env, remote_path_artifact(), "s1", "force compat signal")
 
     result = run_sesshmux_in_pty(
-        ["attach", "--force-compat", "--host", "test-host", "s1"],
+        ["force-compat", "--host", "test-host", "s1", "attach"],
         env,
         (
             (b"REMOTE_PROMPT$", b"\x03"),
@@ -3615,10 +3586,6 @@ def main(argv=None):
         (
             "ssh unsupported option falls back to plain ssh",
             test_ssh_unsupported_option_falls_back_to_plain_ssh,
-        ),
-        (
-            "sessh force compat is not a sessh option",
-            test_sessh_force_compat_is_not_a_sessh_option,
         ),
         (
             "ssh remote command uses stream proxy",
@@ -3793,16 +3760,16 @@ def main(argv=None):
             test_ssh_version_mismatch_uses_compat_path,
         ),
         (
-            "ssh force compat uses compat path",
-            test_ssh_force_compat_uses_compat_path,
+            "sesshmux force-compat invokes session compat path",
+            test_sesshmux_force_compat_invokes_session_compat_path,
         ),
         (
-            "ssh force compat uses cached route",
-            test_ssh_force_compat_uses_cached_route,
+            "sesshmux force-compat uses cached route",
+            test_sesshmux_force_compat_uses_cached_route,
         ),
         (
-            "ssh force compat ctrl-c reaches remote pty",
-            test_ssh_force_compat_ctrl_c_reaches_remote_pty,
+            "sesshmux force-compat ctrl-c reaches remote pty",
+            test_sesshmux_force_compat_ctrl_c_reaches_remote_pty,
         ),
     )
 

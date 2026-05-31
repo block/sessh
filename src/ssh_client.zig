@@ -157,7 +157,6 @@ const ParsedSshArgs = struct {
     client_log_level_set: bool = false,
     bootstrap: bool = true,
     bootstrap_set: bool = false,
-    force_compat: bool = false,
     passthrough: bool = false,
     default_ipqos_option: ?[]const u8 = null,
     capture_tty_transcript: ?[]const u8 = null,
@@ -332,10 +331,13 @@ const TranslatedMuxArgs = struct {
 };
 
 pub fn runMux(allocator: std.mem.Allocator, args: []const []const u8, strict_command: bool) !void {
+    if (strict_command and args.len >= 2 and std.mem.eql(u8, args[1], "force-compat")) {
+        return runMuxForceCompat(allocator, args[2..]);
+    }
+
     if (args.len >= 2 and isMuxSubcommand(args[1])) {
         const invocation: MuxInvocation = if (strict_command) .sesshmux else .sessh;
         const parse_options = CliParseOptions{
-            .allow_force_compat = invocation == .sesshmux and std.mem.eql(u8, args[1], "attach"),
             .allow_mux_command_words = true,
         };
         var translated = translateMuxArgsForInvocation(allocator, args, invocation) catch |err| {
@@ -374,6 +376,113 @@ fn isMuxSubcommand(arg: []const u8) bool {
 
 fn translateMuxArgs(allocator: std.mem.Allocator, args: []const []const u8) !TranslatedMuxArgs {
     return translateMuxArgsForInvocation(allocator, args, .sesshmux);
+}
+
+fn runMuxForceCompat(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var scratch = TranslatedMuxArgs{ .allocator = allocator };
+    defer scratch.deinit();
+    var explicit_ssh_options: std.ArrayList([]const u8) = .empty;
+    defer explicit_ssh_options.deinit(allocator);
+
+    var host_option: ?[]const u8 = null;
+    var session_ref: ?[]const u8 = null;
+    var command_args: []const []const u8 = &.{};
+
+    var i: usize = 0;
+    while (i < args.len) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--host")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) {
+                try printMuxForceCompatArgError(error.MissingHost);
+                return process_exit.request(64);
+            }
+            host_option = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--ssh-options")) {
+            i += 1;
+            if (i >= args.len) {
+                try printMuxForceCompatArgError(error.MissingSshOptions);
+                return process_exit.request(64);
+            }
+            try appendShellSplitWords(&scratch, &explicit_ssh_options, args[i]);
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            try printMuxForceCompatArgError(error.UnsupportedMuxOption);
+            return process_exit.request(64);
+        } else {
+            session_ref = arg;
+            command_args = args[i + 1 ..];
+            break;
+        }
+    }
+
+    const requested_ref = session_ref orelse {
+        try printMuxForceCompatArgError(error.MissingCompatSession);
+        return process_exit.request(64);
+    };
+    if (command_args.len == 0) {
+        try printMuxForceCompatArgError(error.MissingCompatCommand);
+        return process_exit.request(64);
+    }
+
+    var route_storage: ?session_registry.Route = null;
+    defer if (route_storage) |*route| route.deinit(allocator);
+    var combined_ssh_options: std.ArrayList([]const u8) = .empty;
+    defer combined_ssh_options.deinit(allocator);
+
+    var parsed_ssh_args = ParsedSshArgs{ .options = explicit_ssh_options.items, .host = "" };
+    const remote_ref = if (host_option) |host| blk: {
+        parsed_ssh_args.host = host;
+        break :blk requested_ref;
+    } else blk: {
+        route_storage = session_registry.readRouteForRef(allocator, requested_ref) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (session_registry.tombstoneExistsForRef(allocator, requested_ref)) {
+                    try io.writeAll(2, "ERROR session already exited\n");
+                    return process_exit.request(1);
+                }
+                try printMuxForceCompatArgError(error.MissingCompatHost);
+                return process_exit.request(64);
+            },
+            else => return err,
+        };
+        const route = &route_storage.?;
+        if (route.host.len == 0 or std.mem.eql(u8, route.host, ".")) {
+            try printMuxForceCompatArgError(error.MissingCompatHost);
+            return process_exit.request(64);
+        }
+        parsed_ssh_args.host = route.host;
+        if (explicit_ssh_options.items.len == 0) {
+            parsed_ssh_args.options = route.ssh_options;
+        } else {
+            try combined_ssh_options.appendSlice(allocator, route.ssh_options);
+            try combined_ssh_options.appendSlice(allocator, explicit_ssh_options.items);
+            parsed_ssh_args.options = combined_ssh_options.items;
+        }
+        break :blk route.guid;
+    };
+
+    parsed_ssh_args.default_ipqos_option = try resolveDefaultIpQosOption(allocator, parsed_ssh_args.options, parsed_ssh_args.host);
+    defer if (parsed_ssh_args.default_ipqos_option) |option| allocator.free(option);
+
+    const local_args = try localCompatArgsForExplicitCommand(allocator, command_args, remote_ref);
+    defer allocator.free(local_args);
+    const command_script = try remoteCompatCommandScriptFor(allocator, "force-compat", remote_ref, local_args);
+    defer allocator.free(command_script);
+
+    const tty_option = compatSshTtyOptionForLocalArgs(command_args, c.isatty(0) != 0, c.isatty(1) != 0);
+    try runRemoteCompatCommandScript(allocator, parsed_ssh_args, command_script, .forced, tty_option);
+}
+
+fn printMuxForceCompatArgError(err: anyerror) !void {
+    switch (err) {
+        error.MissingHost => try io.writeAll(2, "sesshmux: --host requires a value\n"),
+        error.MissingCompatSession => try io.writeAll(2, "sesshmux: force-compat requires a session id or alias\n"),
+        error.MissingCompatCommand => try io.writeAll(2, "sesshmux: force-compat requires a command after the session id\n"),
+        error.MissingCompatHost => try io.writeAll(2, "sesshmux: force-compat requires --host HOST unless the session has a cached remote route\n"),
+        else => try printSshArgError(err),
+    }
 }
 
 fn translateMuxArgsForInvocation(
@@ -495,9 +604,8 @@ fn translateMuxAttach(translated: *TranslatedMuxArgs, args: []const []const u8) 
     var positional: std.ArrayList([]const u8) = .empty;
     defer positional.deinit(translated.allocator);
     var host_option: ?[]const u8 = null;
-    var force_compat = false;
 
-    try parseMuxAttachOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option, &force_compat);
+    try parseMuxAttachOptions(translated, args, &ssh_options, &sessh_options, &positional, &host_option);
 
     if (host_option) |host| {
         if (positional.items.len > 1) return error.TooManyMuxArguments;
@@ -796,7 +904,6 @@ fn parseMuxAttachOptions(
     sessh_options: *std.ArrayList([]const u8),
     positional: *std.ArrayList([]const u8),
     host_option: *?[]const u8,
-    force_compat: *bool,
 ) !void {
     var parser = MuxCommandParser{
         .translated = translated,
@@ -809,11 +916,7 @@ fn parseMuxAttachOptions(
     while (parser.index < args.len) {
         const arg = parser.arg();
         if (std.mem.eql(u8, arg, "--")) return error.UnsupportedMuxOption;
-        if (std.mem.eql(u8, arg, "--force-compat")) {
-            force_compat.* = true;
-            try sessh_options.append(translated.allocator, arg);
-            parser.index += 1;
-        } else if (try parser.parseSharedOption()) {
+        if (try parser.parseSharedOption()) {
             continue;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.UnsupportedMuxOption;
@@ -1051,7 +1154,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 const CliParseOptions = struct {
-    allow_force_compat: bool = false,
     allow_mux_command_words: bool = false,
 };
 
@@ -1093,10 +1195,6 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         try io.writeAll(2, "sessh: --capture-tty-transcript is only supported for new and attach sessions\n");
         return process_exit.request(64);
     }
-    if (parsed_ssh_args.capture_tty_transcript != null and parsed_ssh_args.force_compat) {
-        try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with --force-compat\n");
-        return process_exit.request(64);
-    }
     const resolved_ref_storage = try resolveLocalRefs(allocator, &parsed_ssh_args);
     defer if (resolved_ref_storage) |ref| allocator.free(ref);
     parsed_ssh_args.default_ipqos_option = try resolveDefaultIpQosOption(allocator, parsed_ssh_args.options, parsed_ssh_args.host);
@@ -1113,14 +1211,6 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
 
     const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
     defer if (shell_command) |command| allocator.free(command);
-
-    if (parsed_ssh_args.force_compat) {
-        if (parsed_ssh_args.command_argv.len > 0 or shell_command != null) {
-            try io.writeAll(2, "sessh: persistent command sessions are not supported with --force-compat\n");
-            return process_exit.request(64);
-        }
-        try runRemoteCompat(allocator, parsed_ssh_args, .forced);
-    }
 
     var artifacts_storage: ?ArtifactSet = if (parsed_ssh_args.bootstrap) try loadArtifactSet(allocator) else null;
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
@@ -1579,6 +1669,18 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
 
     const command_script = try remoteCompatCommandScript(allocator, parsed_ssh_args);
     defer allocator.free(command_script);
+
+    const tty_option = compatSshTtyOption(parsed_ssh_args, c.isatty(0) != 0, c.isatty(1) != 0);
+    try runRemoteCompatCommandScript(allocator, parsed_ssh_args, command_script, reason, tty_option);
+}
+
+fn runRemoteCompatCommandScript(
+    allocator: std.mem.Allocator,
+    parsed_ssh_args: ParsedSshArgs,
+    command_script: []const u8,
+    reason: CompatModeReason,
+    tty_option: []const u8,
+) !noreturn {
     const remote_command = try shCommand(allocator, command_script);
     defer allocator.free(remote_command);
 
@@ -1596,7 +1698,7 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
     }
     appendDefaultSshOptions(ssh_argv, &arg_index, parsed_ssh_args.default_ipqos_option);
     appendTransportSshOptions(ssh_argv, &arg_index, parsed_ssh_args.options);
-    ssh_argv[arg_index] = compatSshTtyOption(parsed_ssh_args, c.isatty(0) != 0, c.isatty(1) != 0);
+    ssh_argv[arg_index] = tty_option;
     ssh_argv[arg_index + 1] = parsed_ssh_args.host;
     ssh_argv[ssh_argv.len - 1] = remote_command;
 
@@ -1624,6 +1726,21 @@ fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs,
 fn compatSshTtyOption(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool, stdout_is_tty: bool) []const u8 {
     if (parsed_ssh_args.action == .attach and stdin_is_tty and stdout_is_tty) {
         return "-t";
+    }
+    return "-T";
+}
+
+fn compatSshTtyOptionForLocalArgs(args: []const []const u8, stdin_is_tty: bool, stdout_is_tty: bool) []const u8 {
+    if (!stdin_is_tty or !stdout_is_tty) return "-T";
+
+    var i: usize = 0;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--log-level")) {
+            i += 1;
+            if (i < args.len) i += 1;
+            continue;
+        }
+        return if (std.mem.eql(u8, args[i], "attach")) "-t" else "-T";
     }
     return "-T";
 }
@@ -1771,12 +1888,21 @@ fn nowUnixMs() u64 {
 fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs) ![]u8 {
     const local_args = try localCompatArgs(allocator, parsed_ssh_args);
     defer allocator.free(local_args);
+    const action = compatActionName(parsed_ssh_args.action);
+    const session_id = compatSessionId(parsed_ssh_args) orelse "";
+    return remoteCompatCommandScriptFor(allocator, action, session_id, local_args);
+}
+
+fn remoteCompatCommandScriptFor(
+    allocator: std.mem.Allocator,
+    action: []const u8,
+    session_id: []const u8,
+    local_args: []const u8,
+) ![]u8 {
     const client_version = try shellQuote(allocator, config.version);
     defer allocator.free(client_version);
-    const action = compatActionName(parsed_ssh_args.action);
     const action_quoted = try shellQuote(allocator, action);
     defer allocator.free(action_quoted);
-    const session_id = compatSessionId(parsed_ssh_args) orelse "";
     const session_id_quoted = try shellQuote(allocator, session_id);
     defer allocator.free(session_id_quoted);
 
@@ -1898,6 +2024,14 @@ fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: Pars
         \\  exit "$status"
         \\}}
         \\case "$compat_action" in
+        \\  force-compat)
+        \\    if [ -z "$compat_session_id" ]; then
+        \\      printf 'sesshmux: force-compat requires a session id or alias\n' >&2
+        \\      exit 64
+        \\    fi
+        \\    compat_session_id=$(resolve_session_ref "$compat_session_id")
+        \\    exec_one_compat "$runtime_root/guid/$compat_session_id/compat"
+        \\    ;;
         \\  attach)
         \\    if [ -z "$compat_session_id" ]; then
         \\      compat_session_id=$(find_latest_session_id)
@@ -2007,6 +2141,42 @@ fn localCompatArgs(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs)
     try appendCompatArg(allocator, &out, "--log-level");
     try appendCompatArg(allocator, &out, client_log.levelName(parsed_ssh_args.client_log_level));
 
+    return out.toOwnedSlice(allocator);
+}
+
+fn localCompatArgsForExplicitCommand(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    session_ref: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--log-level") and i + 1 < args.len) {
+            try appendCompatArg(allocator, &out, args[i]);
+            try appendCompatArg(allocator, &out, args[i + 1]);
+            i += 2;
+            continue;
+        }
+        break;
+    }
+
+    if (i < args.len and std.mem.eql(u8, args[i], "attach")) {
+        try appendCompatArg(allocator, &out, args[i]);
+        i += 1;
+        if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) {
+            // Older clients attach the latest detached session when no id is
+            // present. The public compat command names a specific session, so
+            // add that ref before forwarding the rest of the attach options.
+            try appendCompatArg(allocator, &out, session_ref);
+        }
+    }
+
+    while (i < args.len) : (i += 1) {
+        try appendCompatArg(allocator, &out, args[i]);
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -3426,11 +3596,6 @@ fn parseRouteRefArgs(
             i += 1;
         } else if (std.mem.eql(u8, arg, "--jsonl")) {
             return null;
-        } else if (std.mem.eql(u8, arg, "--force-compat")) {
-            if (!parse_options.allow_force_compat or action == null or action.? != .attach) return null;
-            parsed.force_compat = true;
-            try parsed.banner_args.append(arg);
-            i += 1;
         } else if (std.mem.eql(u8, arg, "--initial-scrollback")) {
             i += 1;
             if (i >= args.len) return error.MissingInitialScrollback;
@@ -3526,7 +3691,7 @@ fn parseSshArgs(args: []const []const u8, parse_options: CliParseOptions) !Parse
 
     var i: usize = 1;
     var pre_host = ParsedSshArgs{ .options = &.{}, .host = "" };
-    try parseSesshOptionsBeforeHost(args, &i, &pre_host, parse_options);
+    try parseSesshOptionsBeforeHost(args, &i, &pre_host);
     const ssh_options_start = i;
 
     while (i < args.len) {
@@ -3560,10 +3725,10 @@ fn parseSshArgs(args: []const []const u8, parse_options: CliParseOptions) !Parse
     return error.MissingHost;
 }
 
-fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: *ParsedSshArgs, parse_options: CliParseOptions) !void {
+fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: *ParsedSshArgs) !void {
     while (index.* < args.len) {
         const arg = args[index.*];
-        if (!isSesshLongOption(arg) and !(parse_options.allow_force_compat and std.mem.eql(u8, arg, "--force-compat"))) return;
+        if (!isSesshLongOption(arg)) return;
         if (isConfigOrEnvOnlySesshOption(arg)) return error.UnsupportedSesshOption;
 
         if (std.mem.eql(u8, arg, "--leader")) {
@@ -3616,11 +3781,6 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
             index.* += 1;
         } else if (std.mem.eql(u8, arg, "--passthrough")) {
             parsed.passthrough = true;
-            index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--force-compat")) {
-            if (!parse_options.allow_force_compat) return error.UnsupportedSshOption;
-            parsed.force_compat = true;
-            try parsed.banner_args.append(arg);
             index.* += 1;
         } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
             index.* += 1;
@@ -3774,13 +3934,6 @@ fn parseCommonSesshOptionAfterHost(args: []const []const u8, index: *usize, pars
     }
     if (std.mem.eql(u8, arg, "--passthrough")) {
         parsed.passthrough = true;
-        index.* += 1;
-        return true;
-    }
-    if (std.mem.eql(u8, arg, "--force-compat")) {
-        if (!parse_options.allow_force_compat) return error.UnsupportedSesshOption;
-        parsed.force_compat = true;
-        try parsed.banner_args.append(arg);
         index.* += 1;
         return true;
     }
@@ -4892,12 +5045,6 @@ test "plain ssh fallback is allowed for transport-incompatible plain ssh invocat
     try std.testing.expect(shouldUsePlainSshFallbackForMuxNewArgError(&.{
         "sessh",
         "new",
-        "--force-compat",
-        "example.com",
-    }, error.UnsupportedMuxOption));
-    try std.testing.expect(shouldUsePlainSshFallbackForMuxNewArgError(&.{
-        "sessh",
-        "new",
         "example.com",
         "echo",
         "hello",
@@ -5006,27 +5153,35 @@ test "parseSshArgs accepts translated attach options after host" {
     try std.testing.expect(parsed.bootstrap_set);
 }
 
-test "parseSshArgs accepts force compat only for translated mux attach" {
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
-        "sesshmux",
-        "example.com",
+test "explicit compat args are forwarded after local target" {
+    const local_args = try localCompatArgsForExplicitCommand(std.testing.allocator, &.{
         "attach",
-        "s12",
-        "--force-compat",
-    }, .{ .allow_mux_command_words = true }));
+        "--leader",
+        "CTRL-B",
+        "two words",
+    }, "s1");
+    defer std.testing.allocator.free(local_args);
 
-    const parsed = try parseSshArgs(&.{
-        "sesshmux",
-        "example.com",
+    try std.testing.expectEqualStrings(" 'attach' 's1' '--leader' 'CTRL-B' 'two words'", local_args);
+}
+
+test "explicit compat args keep explicit attach target" {
+    const local_args = try localCompatArgsForExplicitCommand(std.testing.allocator, &.{
+        "--log-level",
+        "debug",
         "attach",
-        "s12",
-        "--force-compat",
-    }, .{ .allow_force_compat = true, .allow_mux_command_words = true });
+        "s2",
+    }, "s1");
+    defer std.testing.allocator.free(local_args);
 
-    try std.testing.expectEqual(SshAction.attach, parsed.action);
-    try std.testing.expect(parsed.force_compat);
-    try std.testing.expectEqual(@as(usize, 1), parsed.banner_args.len);
-    try std.testing.expectEqualStrings("--force-compat", parsed.banner_args.buf[0]);
+    try std.testing.expectEqualStrings(" '--log-level' 'debug' 'attach' 's2'", local_args);
+}
+
+test "explicit compat attach requests a tty only for attach" {
+    try std.testing.expectEqualStrings("-t", compatSshTtyOptionForLocalArgs(&.{"attach"}, true, true));
+    try std.testing.expectEqualStrings("-t", compatSshTtyOptionForLocalArgs(&.{ "--log-level", "debug", "attach" }, true, true));
+    try std.testing.expectEqualStrings("-T", compatSshTtyOptionForLocalArgs(&.{"list"}, true, true));
+    try std.testing.expectEqualStrings("-T", compatSshTtyOptionForLocalArgs(&.{"attach"}, false, true));
 }
 
 test "parseSshArgs accepts no bootstrap shorthand after host" {
@@ -5483,29 +5638,11 @@ test "translateMuxArgs maps local and host-qualified attach" {
     defer remote_latest.deinit();
     try expectArgvEqual(&.{ "sesshmux", "example.com", "attach" }, remote_latest.args.items);
 
-    var remote_force_compat = try translateMuxArgs(std.testing.allocator, &.{
-        "sesshmux",
-        "attach",
-        "--force-compat",
-        "--host",
-        "example.com",
-        "s1",
-    });
-    defer remote_force_compat.deinit();
-    try expectArgvEqual(&.{ "sesshmux", "example.com", "attach", "s1", "--force-compat" }, remote_force_compat.args.items);
-
     try std.testing.expectError(error.TooManyMuxArguments, translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
         "attach",
         "example.com",
         "s1",
-    }));
-
-    try std.testing.expectError(error.UnsupportedMuxOption, translateMuxArgs(std.testing.allocator, &.{
-        "sesshmux",
-        "new",
-        "--force-compat",
-        "example.com",
     }));
 }
 

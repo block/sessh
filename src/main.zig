@@ -147,6 +147,7 @@ fn usage(code: u8, entrypoint: EntryPoint) !void {
         \\usage:
         \\  sesshmux new [options] [--ssh-options "ssh args"] HOST [-- cmd arg...]
         \\  sesshmux attach [options] [[--ssh-options "ssh args"] --host HOST] [ID]
+        \\  sesshmux force-compat [[--ssh-options "ssh args"] --host HOST] ID command [arg...]
         \\  sesshmux list [--refresh] [--exited] [--jsonl] [[--ssh-options "ssh args"] HOST]
         \\  sesshmux list --client incoming|outgoing|session|ID [--jsonl] [[--ssh-options "ssh args"] HOST]
         \\  sesshmux kill [[--ssh-options "ssh args"] HOST] ID
