@@ -10,6 +10,7 @@ const io_helpers = @import("io.zig");
 const list_format = @import("list_format.zig");
 const protocol = @import("protocol.zig");
 const process_exit = @import("process_exit.zig");
+const reconnect_title = @import("reconnect_title.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
 const terminal = @import("terminal.zig");
@@ -446,6 +447,8 @@ const PendingRepaint = struct {
 
 /// Client-side state carried across runtime transports for one attached session.
 pub const RuntimeSession = struct {
+    const max_title_fallback_bytes = 512;
+
     guid: [session_registry.session_guid_len]u8 = [_]u8{0} ** session_registry.session_guid_len,
     guid_len: usize = 0,
     client_guid: [session_registry.client_guid_len]u8 = [_]u8{0} ** session_registry.client_guid_len,
@@ -464,6 +467,15 @@ pub const RuntimeSession = struct {
     input_escape_filter: terminal.EscapeFilter = .{},
     paste_like_input_classifier: PasteLikeInputClassifier = .{},
     ended_tombstone_details: ?session_registry.TombstoneDetails = null,
+    /// Local-only fallback for the terminal title while this session is active.
+    /// For remote sessh this is the host string the user passed locally. We do
+    /// not send it to the session agent because ssh aliases can reveal local
+    /// naming that the remote machine would not otherwise know.
+    title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
+    title_fallback_len: usize = 0,
+    /// Most recent app-title presence bit from Draw/RepaintResponse. True means
+    /// the app owns the title, even if it set it to an empty string.
+    app_title_present: ?bool = null,
 
     pub fn adoptReconnectState(self: *RuntimeSession, reconnected: *const RuntimeSession) void {
         self.pending_repaint = reconnected.pending_repaint;
@@ -510,6 +522,11 @@ pub const RuntimeSession = struct {
         return self.client_guid[0..self.client_guid_len];
     }
 
+    pub fn titleFallbackSlice(self: *const RuntimeSession) []const u8 {
+        if (self.title_fallback_len > 0) return self.title_fallback[0..self.title_fallback_len];
+        return self.idSlice();
+    }
+
     pub fn sessionDirSlice(self: *const RuntimeSession) []const u8 {
         return self.session_dir[0..self.session_dir_len];
     }
@@ -539,6 +556,10 @@ pub const RuntimeSession = struct {
         if (session_dir.len > self.session_dir.len) return error.SessionDirTooLarge;
         @memcpy(self.session_dir[0..session_dir.len], session_dir);
         self.session_dir_len = session_dir.len;
+    }
+
+    pub fn setTitleFallback(self: *RuntimeSession, title: []const u8) void {
+        self.title_fallback_len = copyTitleFallback(&self.title_fallback, title);
     }
 
     pub fn setIdentity(self: *RuntimeSession, guid: []const u8) !void {
@@ -592,9 +613,16 @@ fn tombstoneDetailsFromSessionEnded(ended: pb.SessionEnded) session_registry.Tom
     };
 }
 
+fn copyTitleFallback(dest: []u8, title: []const u8) usize {
+    const len = @min(dest.len, title.len);
+    @memcpy(dest[0..len], title[0..len]);
+    return len;
+}
+
 pub const ReconnectUi = struct {
     const max_diagnostic_banner_lines = 3;
     const max_banner_message_bytes = 256;
+    const max_title_fallback_bytes = 512;
     const ctrl_c = 0x03;
     const ctrl_r = 0x12;
 
@@ -614,11 +642,26 @@ pub const ReconnectUi = struct {
     reconnect_acknowledged: bool = false,
     input_during_disconnect: bool = false,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    title_enabled: bool = false,
+    title_fd: c.fd_t = 1,
+    title_visible: bool = false,
+    cleanup_title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
+    cleanup_title_fallback_len: usize = 0,
 
     pub fn begin(viewport_offset: i32) !ReconnectUi {
-        var ui = ReconnectUi{ .mode_guard = try terminal.TerminalModeGuard.enable(0) };
+        var ui = ReconnectUi{
+            .mode_guard = try terminal.TerminalModeGuard.enable(0),
+            .title_enabled = c.isatty(1) != 0,
+        };
         errdefer ui.mode_guard.restore();
         ui.viewport_offset = if (viewport_offset > 0) @intCast(viewport_offset) else 0;
+        if (ui.title_enabled) {
+            const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
+            if (cleanup_title) |title| {
+                defer app_allocator.allocator().free(title);
+                ui.cleanup_title_fallback_len = copyTitleFallback(&ui.cleanup_title_fallback, title);
+            }
+        }
         ui.diagnostic_cursor = client_log.displayedUserDiagnosticSeq();
         ui.live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq();
         ui.rendered_diagnostic_seq = ui.diagnostic_cursor;
@@ -639,6 +682,7 @@ pub const ReconnectUi = struct {
     }
 
     pub fn deinit(self: *ReconnectUi) void {
+        self.restoreTitleForDetach();
         if (self.diagnostic_notify_write_fd >= 0) {
             client_log.unregisterUserDiagnosticNotifier(self.diagnostic_notify_write_fd);
             posix.close(self.diagnostic_notify_write_fd);
@@ -660,6 +704,7 @@ pub const ReconnectUi = struct {
         while (true) {
             const elapsed_ms = elapsedTimerMs(&timer);
             if (elapsed_ms >= delay_ms) {
+                self.showReconnectingTitle();
                 try self.drawStaticBanner("--- sessh: disconnected: Reconnecting... Ctrl-C detach ---");
                 return .wait_elapsed;
             }
@@ -671,6 +716,7 @@ pub const ReconnectUi = struct {
             switch (decision) {
                 .detach => return .detach,
                 .reconnect_now => {
+                    self.showReconnectingTitle();
                     try self.drawStaticBanner("--- sessh: disconnected: Reconnecting... Ctrl-C detach ---");
                     return .reconnect_now;
                 },
@@ -687,10 +733,12 @@ pub const ReconnectUi = struct {
     }
 
     pub fn showDisconnectedReconnectInProgress(self: *ReconnectUi) !void {
+        self.showReconnectingTitle();
         try self.drawStaticBanner("--- sessh: disconnected: Reconnecting... Ctrl-C detach ---");
     }
 
     pub fn showReconnectReady(self: *ReconnectUi, disposition: ReconnectSwitchDisposition) !void {
+        self.showConnectionReadyTitle();
         try self.drawReconnectReadyBanner(disposition, 0);
     }
 
@@ -853,6 +901,7 @@ pub const ReconnectUi = struct {
     }
 
     fn drawBanner(self: *ReconnectUi, delay_ms: u64) !void {
+        self.showRetryTitle(delay_ms);
         var delay_buf: [16]u8 = undefined;
         const delay = try formatDelay(delay_ms, &delay_buf);
         var message_buf: [96]u8 = undefined;
@@ -865,6 +914,7 @@ pub const ReconnectUi = struct {
     }
 
     fn drawReconnectReadyBanner(self: *ReconnectUi, disposition: ReconnectSwitchDisposition, delay_ms: u64) !void {
+        if (disposition == .delayed) self.showSwitchCountdownTitle(delay_ms);
         var message_buf: [128]u8 = undefined;
         const message = switch (disposition) {
             .delayed => blk: {
@@ -990,6 +1040,53 @@ pub const ReconnectUi = struct {
         if (!self.cursor_hidden) return;
         self.cursor_hidden = false;
         try io_helpers.writeAll(1, "\x1b[?25h");
+    }
+
+    pub fn restoreTitleAfterReconnect(self: *ReconnectUi, session: *const RuntimeSession) void {
+        if (!self.title_visible) return;
+        if (session.app_title_present != true) {
+            self.restoreTitleTo(session.titleFallbackSlice());
+        }
+        self.title_visible = false;
+    }
+
+    pub fn restoreTitleForDetach(self: *ReconnectUi) void {
+        if (!self.title_visible) return;
+        self.restoreTitleTo(self.cleanupTitleFallback());
+        self.title_visible = false;
+    }
+
+    fn showRetryTitle(self: *ReconnectUi, delay_ms: u64) void {
+        if (!self.title_enabled or self.title_fd < 0) return;
+        reconnect_title.writeRetryTitle(self.title_fd, delay_ms) catch return;
+        self.title_visible = true;
+    }
+
+    fn showReconnectingTitle(self: *ReconnectUi) void {
+        if (!self.title_enabled or self.title_fd < 0) return;
+        reconnect_title.writeReconnectingTitle(self.title_fd) catch return;
+        self.title_visible = true;
+    }
+
+    fn showConnectionReadyTitle(self: *ReconnectUi) void {
+        if (!self.title_enabled or self.title_fd < 0) return;
+        reconnect_title.writeConnectionReadyTitle(self.title_fd) catch return;
+        self.title_visible = true;
+    }
+
+    fn showSwitchCountdownTitle(self: *ReconnectUi, delay_ms: u64) void {
+        if (!self.title_enabled or self.title_fd < 0) return;
+        reconnect_title.writeSwitchCountdownTitle(self.title_fd, delay_ms) catch return;
+        self.title_visible = true;
+    }
+
+    fn restoreTitleTo(self: *ReconnectUi, title: []const u8) void {
+        if (!self.title_enabled or self.title_fd < 0) return;
+        reconnect_title.writeTitle(self.title_fd, title) catch {};
+    }
+
+    fn cleanupTitleFallback(self: *const ReconnectUi) []const u8 {
+        return self.cleanup_title_fallback[0..self.cleanup_title_fallback_len];
     }
 };
 
@@ -1384,10 +1481,7 @@ fn setNonBlocking(fd: c.fd_t) !void {
 }
 
 fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
-    const seconds = @max(@divTrunc(delay_ms + 999, 1000), 1);
-    if (seconds < 60) return std.fmt.bufPrint(buf, "{}sec", .{seconds});
-    const minutes = @divTrunc(seconds + 59, 60);
-    return std.fmt.bufPrint(buf, "{}min", .{minutes});
+    return reconnect_title.formatDelay(delay_ms, buf);
 }
 
 fn formatSwitchDelay(delay_ms: u64, buf: []u8) ![]const u8 {
@@ -1409,6 +1503,7 @@ const DrawPayload = struct {
     scrollback_cursor: []const u8,
     viewport_offset: i32,
     draw_bytes: []const u8,
+    app_title_present: ?bool,
     relay_end_restore_bytes: ?[]const u8,
 };
 
@@ -1448,6 +1543,78 @@ test "formatDelay uses compact reconnect labels" {
     try std.testing.expectEqualStrings("1min", try formatDelay(60_000, &buf));
     try std.testing.expectEqualStrings("10min", try formatDelay(600_000, &buf));
     try std.testing.expectEqualStrings("60sec", try formatSwitchDelay(60_000, &buf));
+}
+
+test "ReconnectUi restores remote fallback title when no app title is present" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var session = RuntimeSession{};
+    session.setTitleFallback("work.blox");
+    session.app_title_present = false;
+
+    var ui = ReconnectUi{
+        .mode_guard = undefined,
+        .title_enabled = true,
+        .title_fd = fds[1],
+    };
+    ui.showRetryTitle(5_000);
+    ui.restoreTitleAfterReconnect(&session);
+    posix.close(fds[1]);
+
+    var buf: [128]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings(
+        "\x1b]2;5sec until retry connect\x1b\\\x1b]2;work.blox\x1b\\",
+        buf[0..n],
+    );
+    try std.testing.expect(!ui.title_visible);
+}
+
+test "ReconnectUi leaves restored app title alone after reconnect repaint" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var session = RuntimeSession{};
+    session.setTitleFallback("work.blox");
+    session.app_title_present = true;
+
+    var ui = ReconnectUi{
+        .mode_guard = undefined,
+        .title_enabled = true,
+        .title_fd = fds[1],
+    };
+    ui.showRetryTitle(5_000);
+    ui.restoreTitleAfterReconnect(&session);
+    posix.close(fds[1]);
+
+    var buf: [128]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("\x1b]2;5sec until retry connect\x1b\\", buf[0..n]);
+    try std.testing.expect(!ui.title_visible);
+}
+
+test "ReconnectUi restores local cleanup title on detach" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var ui = ReconnectUi{
+        .mode_guard = undefined,
+        .title_enabled = true,
+        .title_fd = fds[1],
+    };
+    ui.cleanup_title_fallback_len = copyTitleFallback(&ui.cleanup_title_fallback, "/tmp/local");
+    ui.showRetryTitle(5_000);
+    ui.restoreTitleForDetach();
+    posix.close(fds[1]);
+
+    var buf: [128]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings(
+        "\x1b]2;5sec until retry connect\x1b\\\x1b]2;/tmp/local\x1b\\",
+        buf[0..n],
+    );
+    try std.testing.expect(!ui.title_visible);
 }
 
 test "reconnect switch disposition distinguishes typing paste and unresponsive" {
@@ -1718,6 +1885,7 @@ test "relay drains pending session end before monitor timeout" {
     var relay_end_restore = std.ArrayList(u8).empty;
     defer relay_end_restore.deinit(app_allocator.allocator());
     var input_ack_tracker = InputAckTracker{};
+    var app_title_present: ?bool = null;
     var input_escape_filter = terminal.EscapeFilter{};
     var paste_like_input_classifier = PasteLikeInputClassifier{};
 
@@ -1736,6 +1904,7 @@ test "relay drains pending session end before monitor timeout" {
             &input_ack_tracker,
             &paste_like_input_classifier,
             null,
+            &app_title_present,
             .{ .monitor_connection = true },
         ),
     );
@@ -1758,6 +1927,7 @@ test "relay treats input write failure as transport closed" {
     var input_ack_tracker = InputAckTracker{};
     var input_escape_filter = terminal.EscapeFilter{};
     var paste_like_input_classifier = PasteLikeInputClassifier{};
+    var app_title_present: ?bool = null;
 
     try io_helpers.writeAll(input[1], "typed");
 
@@ -1776,6 +1946,7 @@ test "relay treats input write failure as transport closed" {
             &input_ack_tracker,
             &paste_like_input_classifier,
             null,
+            &app_title_present,
             .{ .monitor_connection = true },
         ),
     );
@@ -1828,6 +1999,35 @@ test "cancelled reconnect frame read returns without input" {
 
     var cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.ReconnectDetached, readFrameAllocMaybeCancelled(fds[0], &cancelled));
+}
+
+test "draw payload preserves app title presence bit" {
+    const draw = try drawPayloadFromMessage(.{
+        .scrollback_cursor = "opaque-cursor",
+        .draw_bytes = "",
+        .app_title_present = false,
+    });
+    defer freeDrawPayload(draw);
+
+    try std.testing.expect(draw.app_title_present != null);
+    try std.testing.expect(!draw.app_title_present.?);
+}
+
+test "draw payload updates runtime app title presence state" {
+    var scrollback_cursor = ScrollbackCursor{};
+    var viewport_offset: i32 = 0;
+    var app_title_present: ?bool = null;
+
+    try handleDrawPayload(.{
+        .scrollback_cursor = "opaque-cursor",
+        .viewport_offset = 0,
+        .draw_bytes = "",
+        .app_title_present = false,
+        .relay_end_restore_bytes = null,
+    }, null, &scrollback_cursor, &viewport_offset, &app_title_present);
+
+    try std.testing.expect(app_title_present != null);
+    try std.testing.expect(!app_title_present.?);
 }
 
 test "recovery polling stores relay-end restore bytes from draw" {
@@ -1890,17 +2090,17 @@ test "repaint response applies only latest outstanding request" {
     var cursor = ScrollbackCursor{};
     var viewport_offset: i32 = 0;
     var no_pending = PendingRepaint{};
-    try std.testing.expect(!try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &no_pending));
+    try std.testing.expect(!try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &no_pending, null));
     try std.testing.expectEqual(@as(usize, 0), cursor.len);
     try std.testing.expectEqual(@as(i32, 0), viewport_offset);
 
     var older_pending = PendingRepaint{ .repaint_request_seq = 8 };
-    try std.testing.expect(!try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &older_pending));
+    try std.testing.expect(!try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &older_pending, null));
     try std.testing.expectEqual(@as(u64, 8), older_pending.repaint_request_seq);
     try std.testing.expectEqual(@as(usize, 0), cursor.len);
 
     var matching_pending = PendingRepaint{ .repaint_request_seq = 7 };
-    try std.testing.expect(try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &matching_pending));
+    try std.testing.expect(try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &matching_pending, null));
     try std.testing.expect(!matching_pending.active());
     try std.testing.expectEqualStrings("cursor-v7", cursor.slice());
     try std.testing.expectEqual(@as(i32, 4), viewport_offset);
@@ -2020,6 +2220,7 @@ test "client repaint request sends screen-only repaint request" {
     var relay_end_restore = std.ArrayList(u8).empty;
     defer relay_end_restore.deinit(app_allocator.allocator());
     var input_ack_tracker = InputAckTracker{};
+    var app_title_present: ?bool = null;
 
     try std.testing.expectEqual(
         @as(?RelayEnd, null),
@@ -2033,6 +2234,7 @@ test "client repaint request sends screen-only repaint request" {
             &relay_end_restore,
             &input_ack_tracker,
             null,
+            &app_title_present,
         ),
     );
 
@@ -2071,6 +2273,7 @@ test "client repaint request can request retained scrollback" {
     var relay_end_restore = std.ArrayList(u8).empty;
     defer relay_end_restore.deinit(app_allocator.allocator());
     var input_ack_tracker = InputAckTracker{};
+    var app_title_present: ?bool = null;
 
     try std.testing.expectEqual(
         @as(?RelayEnd, null),
@@ -2084,6 +2287,7 @@ test "client repaint request can request retained scrollback" {
             &relay_end_restore,
             &input_ack_tracker,
             null,
+            &app_title_present,
         ),
     );
 
@@ -2119,6 +2323,7 @@ test "client detach request uses normal detach relay end" {
     var relay_end_restore = std.ArrayList(u8).empty;
     defer relay_end_restore.deinit(app_allocator.allocator());
     var input_ack_tracker = InputAckTracker{};
+    var app_title_present: ?bool = null;
 
     try std.testing.expectEqual(
         RelayEnd.detach,
@@ -2132,6 +2337,7 @@ test "client detach request uses normal detach relay end" {
             &relay_end_restore,
             &input_ack_tracker,
             null,
+            &app_title_present,
         )).?,
     );
 }
@@ -3755,6 +3961,7 @@ fn finishReconnectRepaintInner(
                     &session.scrollback_cursor,
                     &session.viewport_offset,
                     &session.pending_repaint,
+                    &session.app_title_present,
                 );
             },
             .input_ack => {
@@ -3794,6 +4001,7 @@ pub fn relayRuntimeSession(
         &session.input_ack_tracker,
         &session.paste_like_input_classifier,
         &session.ended_tombstone_details,
+        &session.app_title_present,
         .{
             .monitor_connection = options.monitor_connection,
             .responsiveness_timeout_floor_ms = @max(options.responsiveness_timeout_floor_ms, session.unresponsive_timeout_floor_ms),
@@ -3825,7 +4033,7 @@ pub fn pollRuntimeRecovery(
     switch (frame.message_type) {
         .draw => {
             if (session.pending_repaint.active()) return null;
-            try handleDrawFrame(frame.payload, &session.relay_end_restore, &session.scrollback_cursor, &session.viewport_offset);
+            try handleDrawFrame(frame.payload, &session.relay_end_restore, &session.scrollback_cursor, &session.viewport_offset, &session.app_title_present);
             return .recovered;
         },
         .repaint_response => {
@@ -3835,6 +4043,7 @@ pub fn pollRuntimeRecovery(
                 &session.scrollback_cursor,
                 &session.viewport_offset,
                 &session.pending_repaint,
+                &session.app_title_present,
             );
             return if (applied) .recovered else null;
         },
@@ -4453,6 +4662,7 @@ fn relayInteractive(
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    app_title_present: *?bool,
     options: RelayOptions,
 ) !RelayEnd {
     const initial_kitty_keyboard_flags = queryInitialKittyKeyboardFlags();
@@ -4483,6 +4693,7 @@ fn relayInteractive(
         input_ack_tracker,
         paste_like_input_classifier,
         ended_tombstone_details,
+        app_title_present,
         options,
     );
     if (end == .detach) writeDetachBoundary();
@@ -4515,6 +4726,7 @@ fn relayTerminal(
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    app_title_present: *?bool,
     options: RelayOptions,
 ) !RelayEnd {
     var pollfds = [_]posix.pollfd{
@@ -4544,6 +4756,7 @@ fn relayTerminal(
                 relay_end_restore,
                 input_ack_tracker,
                 ended_tombstone_details,
+                app_title_present,
             )) |end| return finishRelay(end, relay_end_restore);
         }
 
@@ -4564,6 +4777,7 @@ fn relayTerminal(
                         relay_end_restore,
                         input_ack_tracker,
                         ended_tombstone_details,
+                        app_title_present,
                     ),
                     else => return err,
                 };
@@ -4581,6 +4795,7 @@ fn relayTerminal(
                         relay_end_restore,
                         input_ack_tracker,
                         ended_tombstone_details,
+                        app_title_present,
                     ),
                     else => return err,
                 },
@@ -4598,6 +4813,7 @@ fn relayTerminal(
                 relay_end_restore,
                 input_ack_tracker,
                 ended_tombstone_details,
+                app_title_present,
             ),
             else => return err,
         };
@@ -4618,6 +4834,7 @@ fn drainRelayRuntimeFrames(
     relay_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    app_title_present: *?bool,
 ) !?RelayEnd {
     while (true) {
         var runtime_poll = [_]posix.pollfd{.{
@@ -4644,6 +4861,7 @@ fn drainRelayRuntimeFrames(
             relay_end_restore,
             input_ack_tracker,
             ended_tombstone_details,
+            app_title_present,
         )) |end| return end;
     }
 }
@@ -4657,6 +4875,7 @@ fn finishRelayAfterRuntimeWriteFailed(
     relay_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    app_title_present: *?bool,
 ) !RelayEnd {
     if (try drainRelayRuntimeFrames(
         read_fd,
@@ -4668,6 +4887,7 @@ fn finishRelayAfterRuntimeWriteFailed(
         relay_end_restore,
         input_ack_tracker,
         ended_tombstone_details,
+        app_title_present,
     )) |end| return finishRelay(end, relay_end_restore);
     return .transport_closed;
 }
@@ -4682,13 +4902,14 @@ fn handleRelayRuntimeFrame(
     relay_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    app_title_present: *?bool,
 ) !?RelayEnd {
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
         .draw => {
             if (!pending_repaint.active()) {
-                try handleDrawFrame(frame.payload, relay_end_restore, scrollback_cursor, viewport_offset);
+                try handleDrawFrame(frame.payload, relay_end_restore, scrollback_cursor, viewport_offset, app_title_present);
             }
             return null;
         },
@@ -4699,6 +4920,7 @@ fn handleRelayRuntimeFrame(
                 scrollback_cursor,
                 viewport_offset,
                 pending_repaint,
+                app_title_present,
             );
             return null;
         },
@@ -4782,10 +5004,11 @@ fn handleDrawFrame(
     relay_end_restore: ?*std.ArrayList(u8),
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
+    app_title_present: ?*?bool,
 ) !void {
     const draw = try parseDrawPayload(payload);
     defer freeDrawPayload(draw);
-    try handleDrawPayload(draw, relay_end_restore, scrollback_cursor, viewport_offset);
+    try handleDrawPayload(draw, relay_end_restore, scrollback_cursor, viewport_offset, app_title_present);
 }
 
 fn handleRepaintResponseFrame(
@@ -4794,6 +5017,7 @@ fn handleRepaintResponseFrame(
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
+    app_title_present: ?*?bool,
 ) !bool {
     var response = try protocol.decodePayload(pb.RepaintResponse, app_allocator.allocator(), payload);
     defer response.deinit(app_allocator.allocator());
@@ -4801,7 +5025,7 @@ fn handleRepaintResponseFrame(
     const response_draw = response.draw orelse return error.MissingDraw;
     const draw = try drawPayloadFromMessage(response_draw);
     defer freeDrawPayload(draw);
-    try handleDrawPayload(draw, relay_end_restore, scrollback_cursor, viewport_offset);
+    try handleDrawPayload(draw, relay_end_restore, scrollback_cursor, viewport_offset, app_title_present);
     pending_repaint.clear();
     return true;
 }
@@ -4836,6 +5060,7 @@ fn handleDrawPayload(
     relay_end_restore: ?*std.ArrayList(u8),
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
+    app_title_present: ?*?bool,
 ) !void {
     try io_helpers.writeAll(1, draw.draw_bytes);
     if (relay_end_restore) |target| {
@@ -4846,6 +5071,9 @@ fn handleDrawPayload(
     }
     try scrollback_cursor.set(draw.scrollback_cursor);
     viewport_offset.* = draw.viewport_offset;
+    if (app_title_present) |target| {
+        if (draw.app_title_present) |present| target.* = present;
+    }
 }
 
 fn parseDrawPayload(payload: []const u8) !DrawPayload {
@@ -4864,6 +5092,7 @@ fn drawPayloadFromMessage(message: pb.Draw) !DrawPayload {
         .scrollback_cursor = try app_allocator.allocator().dupe(u8, message.scrollback_cursor),
         .viewport_offset = message.viewport_offset orelse 0,
         .draw_bytes = try app_allocator.allocator().dupe(u8, message.draw_bytes),
+        .app_title_present = message.app_title_present,
         .relay_end_restore_bytes = if (message.relay_end_restore_bytes) |restore|
             try app_allocator.allocator().dupe(u8, restore)
         else

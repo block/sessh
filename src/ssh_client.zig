@@ -1337,6 +1337,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         return process_exit.request(1);
     };
     defer session.deinit();
+    session.setTitleFallback(parsed_ssh_args.host);
     child.suppressSshStderr();
     if (parsed_ssh_args.action == .new or parsed_ssh_args.action == .attach) {
         try client.ensureLocalRouteForRemoteSession(
@@ -1429,6 +1430,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                         },
                         else => return err,
                     };
+                    reconnect_ui.restoreTitleAfterReconnect(&session);
                     reconnect_ui.deinit();
                     reconnect_ui_active = false;
                     continue;
@@ -1445,6 +1447,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                         },
                         else => return err,
                     };
+                    reconnect_ui.restoreTitleAfterReconnect(&session);
                     client_log.debug("event=reconnect_success host={s} session={s} attempt=0", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
@@ -1613,6 +1616,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                 session.idSlice(),
                 reconnect_attempt,
             });
+            reconnect_ui.restoreTitleAfterReconnect(&session);
             reconnect_ui.deinit();
             reconnect_ui_active = false;
             break;
@@ -1658,6 +1662,7 @@ fn finishEndedRemoteSession(
 fn finishReconnectUiForDetach(reconnect_ui: *client.ReconnectUi, active: *bool) void {
     if (!active.*) return;
     _ = reconnect_ui.clearBanner() catch {};
+    reconnect_ui.restoreTitleForDetach();
     reconnect_ui.deinit();
     active.* = false;
 }
@@ -3301,9 +3306,9 @@ fn relayStdoutAndTrackWindowTitle(
 }
 
 // Watches the decrypted terminal byte stream for OSC 0/2 title updates while
-// still relaying the bytes unchanged. The state file is deliberately tiny and
-// overwritten atomically because the ProxyCommand may read it at the same time
-// it is deciding which title to restore after reconnect.
+// still relaying the bytes unchanged. The title-status file is deliberately
+// tiny and overwritten atomically because the ProxyCommand may read it at the
+// same time it is deciding which title to restore after reconnect.
 const WindowTitleTracker = struct {
     const max_command_bytes = 8;
     const max_title_bytes = 512;

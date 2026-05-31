@@ -129,6 +129,7 @@ pub const RenderedScreen = struct {
     cols: u16,
     active_screen: u8,
     title: []const u8,
+    title_present: bool,
     title_dirty: bool,
     default_colors: DefaultColors,
     default_colors_dirty: bool,
@@ -406,6 +407,7 @@ pub const SessionTerminal = struct {
             .cols = @intCast(self.render_state.cols),
             .active_screen = active_screen,
             .title = self.titleSlice(),
+            .title_present = self.title != null,
             .title_dirty = self.title_dirty,
             .default_colors = self.default_colors,
             .default_colors_dirty = self.default_colors_dirty,
@@ -801,7 +803,9 @@ pub const SessionTerminal = struct {
     }
 
     fn setTitleFromTerminal(self: *SessionTerminal, next_title: []const u8) !void {
-        if (std.mem.eql(u8, self.titleSlice(), next_title)) return;
+        if (self.title) |title| {
+            if (std.mem.eql(u8, title, next_title)) return;
+        }
         const owned = try self.allocator.dupe(u8, next_title);
         if (self.title) |old| self.allocator.free(old);
         self.title = owned;
@@ -1807,13 +1811,32 @@ test "rendered screen exposes OSC title changes" {
     var first = try terminal.renderedScreen(std.testing.allocator);
     defer first.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("sessh-title-one", first.title);
+    try std.testing.expect(first.title_present);
     try std.testing.expect(first.title_dirty);
 
     terminal.markRendered(first.rows.len);
     var clean = try terminal.renderedScreen(std.testing.allocator);
     defer clean.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("sessh-title-one", clean.title);
+    try std.testing.expect(clean.title_present);
     try std.testing.expect(!clean.title_dirty);
+}
+
+test "rendered screen distinguishes absent title from empty app title" {
+    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    defer terminal.destroy();
+
+    var absent = try terminal.renderedScreen(std.testing.allocator);
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", absent.title);
+    try std.testing.expect(!absent.title_present);
+
+    try terminal.feed("\x1b]2;\x1b\\");
+    var empty = try terminal.renderedScreen(std.testing.allocator);
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", empty.title);
+    try std.testing.expect(empty.title_present);
+    try std.testing.expect(empty.title_dirty);
 }
 
 test "rendered screen exposes OSC 10 and OSC 11 default colors" {

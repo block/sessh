@@ -422,6 +422,15 @@ message Draw {
   // payload active; detach or session-end writes it. Present empty clears a
   // previous restore.
   optional bytes relay_end_restore_bytes = 4;
+  // Present when this draw includes the current screen title state. True means
+  // the remote app has set a terminal title, even if that title is the empty
+  // string. False means no app title is known. The client needs this bit so a
+  // temporary local title such as reconnect status can be restored correctly:
+  // use the app title when present, otherwise use a client-local fallback. Do
+  // not send that fallback to the session agent. It may contain the user's
+  // local ssh alias or other client-private naming for the remote host, which
+  // ssh does not normally reveal to the remote side.
+  optional bool app_title_present = 5;
 }
 
 // Framed payload, session agent -> client.

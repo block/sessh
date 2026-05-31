@@ -5,6 +5,7 @@ const posix = std.posix;
 const io = @import("io.zig");
 const protocol = @import("protocol.zig");
 const client_log = @import("client_log.zig");
+const reconnect_title = @import("reconnect_title.zig");
 const reconnect = @import("reconnect.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
@@ -994,15 +995,10 @@ const StreamReconnectStatus = struct {
 
     fn showRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
         var delay_buf: [16]u8 = undefined;
-        const delay = formatDelay(delay_ms, &delay_buf) catch return;
+        const delay = reconnect_title.formatDelay(delay_ms, &delay_buf) catch return;
         if (self.mode == .window_title) {
-            var title_buf: [48]u8 = undefined;
-            const title = std.fmt.bufPrint(
-                &title_buf,
-                "{s} until retry connect",
-                .{delay},
-            ) catch return;
-            self.setTitle(title);
+            reconnect_title.writeRetryTitle(self.fd, delay_ms) catch return;
+            self.visible = true;
             return;
         }
         const message = std.fmt.bufPrint(
@@ -1017,7 +1013,8 @@ const StreamReconnectStatus = struct {
 
     fn showReconnecting(self: *StreamReconnectStatus) void {
         if (self.mode == .window_title) {
-            self.setTitle("reconnecting");
+            reconnect_title.writeReconnectingTitle(self.fd) catch return;
+            self.visible = true;
             return;
         }
         const message = "sessh: disconnected: Reconnecting...";
@@ -1094,49 +1091,20 @@ const StreamReconnectStatus = struct {
         if (wrote and redraw_after and self.line_len > 0) self.redrawLine();
     }
 
-    fn setTitle(self: *StreamReconnectStatus, title: []const u8) void {
-        if (self.mode != .window_title or self.fd < 0) return;
-        writeOscTitle(self.fd, title) catch return;
-        self.visible = true;
-    }
-
     fn restoreTitle(self: *StreamReconnectStatus) void {
         if (self.mode != .window_title or !self.visible or self.fd < 0) return;
         var title_buf: [512]u8 = undefined;
         const title = readTitleStatusFile(self.title_status_path orelse return, &title_buf) catch "";
-        writeOscTitle(self.fd, title) catch {};
+        reconnect_title.writeTitle(self.fd, title) catch {};
         self.visible = false;
     }
 };
-
-fn writeOscTitle(fd: c.fd_t, title: []const u8) !void {
-    try io.writeAll(fd, "\x1b]2;");
-    var buf: [256]u8 = undefined;
-    var len: usize = 0;
-    for (title) |byte| {
-        buf[len] = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
-        len += 1;
-        if (len == buf.len) {
-            try io.writeAll(fd, buf[0..len]);
-            len = 0;
-        }
-    }
-    if (len > 0) try io.writeAll(fd, buf[0..len]);
-    try io.writeAll(fd, "\x1b\\");
-}
 
 fn readTitleStatusFile(path: []const u8, buf: []u8) ![]const u8 {
     var file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
     const len = try file.readAll(buf);
     return buf[0..len];
-}
-
-fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
-    const seconds = @max(@divTrunc(delay_ms + 999, 1000), 1);
-    if (seconds < 60) return std.fmt.bufPrint(buf, "{}sec", .{seconds});
-    const minutes = @divTrunc(seconds + 59, 60);
-    return std.fmt.bufPrint(buf, "{}min", .{minutes});
 }
 
 fn formatDiagnosticLine(

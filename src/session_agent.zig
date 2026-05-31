@@ -257,7 +257,9 @@ const PresentationState = struct {
             self.cursor_style = try cursorStyleFromVt(screen.cursor_style);
         }
 
-        if (screen.title_dirty) try renderer.setTitle(screen.title);
+        if (screen.title_dirty or (force_redraw and screen.title_present)) {
+            try renderer.setTitle(screen.title);
+        }
         const modes_to_apply = if (mouse_requested and !self.full_height_rendering)
             terminalModesWithoutMouse(desired_modes)
         else
@@ -858,6 +860,7 @@ test "full-height redraw pads blank rows without indexing past VT rows" {
         .cols = 80,
         .active_screen = 0,
         .title = "",
+        .title_present = false,
         .title_dirty = false,
         .default_colors = .{},
         .default_colors_dirty = false,
@@ -1027,6 +1030,7 @@ fn testRenderedScreen(
         .cols = 80,
         .active_screen = active_screen,
         .title = "",
+        .title_present = false,
         .title_dirty = false,
         .default_colors = .{},
         .default_colors_dirty = false,
@@ -2240,6 +2244,7 @@ fn queueDrawFrame(
     session: *const Session,
     scrollback_cursor: u64,
     draw_bytes: []const u8,
+    app_title_present: ?bool,
     relay_end_restore_bytes: ?[]const u8,
 ) !void {
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
@@ -2248,6 +2253,7 @@ fn queueDrawFrame(
         .scrollback_cursor = encoded_cursor[0..],
         .viewport_offset = attachment.presentation.protocolViewportOffset(),
         .draw_bytes = draw_bytes,
+        .app_title_present = app_title_present,
         .relay_end_restore_bytes = relay_end_restore_bytes,
     });
     defer app_allocator.allocator().free(payload);
@@ -2317,6 +2323,7 @@ fn queueRenderBarrierDraw(
         session,
         scrollback_cursor,
         bytes.items,
+        null,
         renderBarrierRelayEndRestoreBytes(barrier),
     );
 }
@@ -2335,7 +2342,7 @@ fn queueScrollbackRowsDraw(
     try attachment.presentation.preparePrimaryForScrollback(renderer);
     try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
     try wrapDrawInSynchronizedUpdate(&bytes);
-    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null);
+    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null, null);
 }
 
 fn queueScrollbackRowsAndScreenDraw(
@@ -2358,7 +2365,7 @@ fn queueScrollbackRowsAndScreenDraw(
         session.pendingPlainOutputCanReplay(),
     )) {
         try attachment.presentation.assumePlainPassthroughScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, null);
+        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, screen.title_present, null);
         return;
     }
 
@@ -2388,7 +2395,7 @@ fn queueScrollbackRowsAndScreenDraw(
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
     const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, restore);
+    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, screen.title_present, restore);
 }
 
 fn queueScrollbackTruncatedDraw(
@@ -2404,7 +2411,7 @@ fn queueScrollbackTruncatedDraw(
     try attachment.presentation.preparePrimaryForScrollback(renderer);
     try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
     try wrapDrawInSynchronizedUpdate(&bytes);
-    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null);
+    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null, null);
 }
 
 fn appendScrollbackTruncatedMarker(bytes: *std.ArrayList(u8), renderer: client_renderer.Renderer, truncated_rows: u64) !void {
@@ -2462,7 +2469,7 @@ fn queueScreenDraw(
         session.pendingPlainOutputCanReplay(),
     )) {
         try attachment.presentation.assumePlainPassthroughScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, null);
+        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, screen.title_present, null);
         return true;
     }
 
@@ -2483,7 +2490,7 @@ fn queueScreenDraw(
         var restore_bytes = std.ArrayList(u8).empty;
         defer restore_bytes.deinit(app_allocator.allocator());
         const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-        try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, restore);
+        try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, screen.title_present, restore);
         return true;
     }
     return false;
@@ -2505,7 +2512,7 @@ fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session) 
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try attachment.presentation.preparePrimaryForScrollback(renderer);
     try renderer.clearScrollback();
-    try queueDrawFrame(attachment, session, 0, bytes.items, null);
+    try queueDrawFrame(attachment, session, 0, bytes.items, null, null);
 }
 
 fn queueRepaintResponseFrame(
@@ -2514,6 +2521,7 @@ fn queueRepaintResponseFrame(
     repaint_request_seq: u64,
     scrollback_cursor: u64,
     draw_bytes: []const u8,
+    app_title_present: ?bool,
     relay_end_restore_bytes: ?[]const u8,
 ) !void {
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
@@ -2524,6 +2532,7 @@ fn queueRepaintResponseFrame(
             .scrollback_cursor = encoded_cursor[0..],
             .viewport_offset = attachment.presentation.protocolViewportOffset(),
             .draw_bytes = draw_bytes,
+            .app_title_present = app_title_present,
             .relay_end_restore_bytes = relay_end_restore_bytes,
         },
     });
@@ -2577,7 +2586,7 @@ fn queueRepaintResponseDraw(
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
     const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-    try queueRepaintResponseFrame(attachment, session, repaint_request_seq, scrollback_cursor, bytes.items, restore);
+    try queueRepaintResponseFrame(attachment, session, repaint_request_seq, scrollback_cursor, bytes.items, screen.title_present, restore);
 }
 
 fn queueRepaintSnapshot(

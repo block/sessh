@@ -2555,12 +2555,14 @@ pub const Draw = struct {
     viewport_offset: ?i32 = null,
     draw_bytes: []const u8 = &.{},
     relay_end_restore_bytes: ?[]const u8 = null,
+    app_title_present: ?bool = null,
 
     pub const _desc_table = .{
         .scrollback_cursor = fd(1, .{ .scalar = .bytes }),
         .viewport_offset = fd(2, .{ .scalar = .sint32 }),
         .draw_bytes = fd(3, .{ .scalar = .bytes }),
         .relay_end_restore_bytes = fd(4, .{ .scalar = .bytes }),
+        .app_title_present = fd(5, .{ .scalar = .bool }),
     };
 
     /// Encodes the message to the writer
