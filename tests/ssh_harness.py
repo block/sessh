@@ -7,6 +7,7 @@ import pty
 import re
 import select
 import shlex
+import shutil
 import signal
 import socket
 import stat
@@ -49,6 +50,7 @@ batch_mode=0
 verbose=
 plain_option=
 ipqos_option=
+proxy_command=
 
 trace_fake_ssh_start() {
   if [ -n "${SESSH_FAKE_SSH_TRACE:-}" ]; then
@@ -85,6 +87,12 @@ record_o_option() {
       if [ -z "$ipqos_option" ]; then
         ipqos_option=${1#* }
       fi
+      ;;
+    [Pp][Rr][Oo][Xx][Yy][Cc][Oo][Mm][Mm][Aa][Nn][Dd]=*)
+      proxy_command=${1#*=}
+      ;;
+    [Pp][Rr][Oo][Xx][Yy][Cc][Oo][Mm][Mm][Aa][Nn][Dd]\\ *)
+      proxy_command=${1#* }
       ;;
   esac
 }
@@ -200,6 +208,9 @@ if [ "$saw_t" -ne 1 ]; then
     if [ "$#" -gt 0 ]; then
       printf 'plain_remote_command=%s\\n' "$*" >>"$SESSH_FAKE_SSH_LOG"
     fi
+    if [ -n "${SESSH_FAKE_SSH_LOG_PROXYCOMMAND:-}" ] && [ -n "$proxy_command" ]; then
+      printf 'proxy_command=%s\\n' "$proxy_command" >>"$SESSH_FAKE_SSH_LOG"
+    fi
     export SESSH_TEST_HOST=$host
     printf 'PLAIN_SSH host=%s\\n' "$host"
     exit 0
@@ -230,6 +241,9 @@ if [ -n "$verbose" ]; then
 fi
 if [ -n "${SESSH_FAKE_SSH_LOG_IPQOS:-}" ] && [ -n "$ipqos_option" ]; then
   printf 'ipqos=%s\\n' "$ipqos_option" >>"$SESSH_FAKE_SSH_LOG"
+fi
+if [ -n "${SESSH_FAKE_SSH_LOG_PROXYCOMMAND:-}" ] && [ -n "$proxy_command" ]; then
+  printf 'proxy_command=%s\\n' "$proxy_command" >>"$SESSH_FAKE_SSH_LOG"
 fi
 export SESSH_TEST_HOST=$host
 if [ "$batch_mode" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_DELAY_ON_BATCH:-}" ]; then
@@ -1492,7 +1506,7 @@ def test_sessh_force_compat_is_not_a_sessh_option(tmp):
         raise AssertionError(fake_log.read_text())
 
 
-def test_ssh_remote_command_falls_back_to_plain_ssh(tmp):
+def test_ssh_remote_command_uses_stream_proxy(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1500,6 +1514,7 @@ def test_ssh_remote_command_falls_back_to_plain_ssh(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_LOG_PROXYCOMMAND"] = "1"
 
     result = run_sessh(["test-host", "echo", "hello"], env, timeout=5.0)
 
@@ -1507,12 +1522,64 @@ def test_ssh_remote_command_falls_back_to_plain_ssh(tmp):
         raise AssertionError(result)
     if "PLAIN_SSH host=test-host" not in result.stdout:
         raise AssertionError(result)
-    if "fallback to plain-ssh due to non-interactive invocation" not in result.stderr:
+    if "fallback to plain-ssh" in result.stderr:
         raise AssertionError(result.stderr)
     log_text = fake_log.read_text()
     if "plain_ssh=1" not in log_text or "plain_remote_command=echo hello" not in log_text:
         raise AssertionError(log_text)
+    if "proxy_command=" not in log_text or ":internal-stream-client:" not in log_text:
+        raise AssertionError(log_text)
     if "bootstrapper=1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_passthrough_remote_command_uses_stream_proxy(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_LOG_PROXYCOMMAND"] = "1"
+
+    result = run_sessh(["--passthrough", "test-host", "echo", "hello"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "PLAIN_SSH host=test-host" not in result.stdout:
+        raise AssertionError(result)
+    if "fallback to plain-ssh" in result.stderr:
+        raise AssertionError(result.stderr)
+    log_text = fake_log.read_text()
+    if "plain_ssh=1" not in log_text or "plain_remote_command=echo hello" not in log_text:
+        raise AssertionError(log_text)
+    if "proxy_command=" not in log_text or ":internal-stream-client:" not in log_text:
+        raise AssertionError(log_text)
+    if "--outer-tty" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_passthrough_forced_tty_marks_stream_as_tty(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_LOG_PROXYCOMMAND"] = "1"
+
+    result = run_sessh(["--passthrough", "-tt", "test-host", "tty"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "plain_option=-tt" not in log_text or "plain_remote_command=tty" not in log_text:
+        raise AssertionError(log_text)
+    if "proxy_command=" not in log_text or ":internal-stream-client:" not in log_text:
+        raise AssertionError(log_text)
+    if "--outer-tty" not in log_text:
         raise AssertionError(log_text)
 
 
@@ -1544,7 +1611,34 @@ def test_ssh_forced_tty_remote_command_uses_persistent_session(tmp):
         raise AssertionError(trace_text)
 
 
-def test_ssh_single_tty_remote_command_with_stdin_null_falls_back_to_plain_ssh(tmp):
+def test_ssh_tty_remote_command_uses_persistent_session_guid(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = "/bin/sh"
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "test-host", "printenv", "SESSH_GUID"],
+        env,
+        ((b"s-", None),),
+        timeout=30.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if re.search(r"s-[0-9a-fA-F-]{36}", result.stdout) is None:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+    if "proxy_command=" in log_text or ":internal-stream-client:" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_single_tty_remote_command_with_stdin_null_uses_stream_proxy(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1552,16 +1646,288 @@ def test_ssh_single_tty_remote_command_with_stdin_null_falls_back_to_plain_ssh(t
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_LOG_PROXYCOMMAND"] = "1"
 
     result = run_sessh(["-t", "test-host", "tty"], env, timeout=5.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if "fallback to plain-ssh due to non-interactive invocation" not in result.stderr:
+    if "fallback to plain-ssh" in result.stderr:
         raise AssertionError(result.stderr)
     log_text = fake_log.read_text()
     if "plain_ssh=1" not in log_text or "plain_option=-t" not in log_text or "plain_remote_command=tty" not in log_text:
         raise AssertionError(log_text)
+    if "proxy_command=" not in log_text or ":internal-stream-client:" not in log_text:
+        raise AssertionError(log_text)
+
+
+def test_internal_stream_client_relays_bytes_through_bootstrap(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_runtime = tmp / "remote-runtime"
+    remote_state = tmp / "remote-state"
+    remote_runtime.mkdir(mode=0o700)
+    remote_state.mkdir(mode=0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"] = str(remote_runtime)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"] = str(remote_state)
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    observed = {}
+
+    def echo_once():
+        chunks = []
+        try:
+            conn, _addr = server.accept()
+            with conn:
+                while True:
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+                    conn.sendall(data)
+                observed["data"] = b"".join(chunks)
+        except ConnectionAbortedError as exc:
+            # Darwin can report an abort instead of a clean EOF after the echo
+            # has already been delivered; the data assertion below still catches
+            # real truncation.
+            if chunks:
+                observed["data"] = b"".join(chunks)
+            else:
+                observed["error"] = repr(exc)
+        except BaseException as exc:
+            observed["error"] = repr(exc)
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=echo_once)
+    thread.start()
+    try:
+        result = subprocess.run(
+            [
+                str(MUX_BIN),
+                ":internal-stream-client:",
+                "--guid",
+                "r-00000000-0000-4000-8000-000000000001",
+                "--host",
+                "test-host",
+                "--port",
+                str(port),
+            ],
+            cwd=ROOT,
+            env=env,
+            input=b"hello over stream",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30.0,
+            check=False,
+        )
+    finally:
+        server.close()
+        thread.join(timeout=5.0)
+
+    if thread.is_alive():
+        raise AssertionError("echo server did not finish")
+    if observed.get("error"):
+        raise AssertionError(observed)
+    if result.returncode != 0:
+        raise AssertionError(process_diagnostics(result))
+    if result.stdout != b"hello over stream":
+        raise AssertionError(result)
+    if observed.get("data") != b"hello over stream":
+        raise AssertionError(observed)
+    if b"ERR " in result.stderr or b"failed" in result.stderr:
+        raise AssertionError(result.stderr)
+    log_text = fake_log.read_text()
+    if "batch_mode=1" not in log_text:
+        raise AssertionError(log_text)
+
+
+def test_internal_stream_client_uses_inner_ssh_exit_status_on_initial_failure(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "255"
+
+    result = subprocess.run(
+        [
+            str(MUX_BIN),
+            ":internal-stream-client:",
+            "--guid",
+            "r-00000000-0000-4000-8000-000000000003",
+            "--host",
+            "test-host",
+            "--port",
+            "22",
+        ],
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+
+    if result.returncode != 255:
+        raise AssertionError(process_diagnostics(result))
+    if "fake ssh failed before remote command" not in result.stderr:
+        raise AssertionError(process_diagnostics(result))
+    if "EndOfStream" in result.stderr or "\nerror:" in result.stderr or result.stderr.startswith("error:"):
+        raise AssertionError(process_diagnostics(result))
+
+
+def test_stream_proxy_carries_real_ssh_proxycommand_traffic(tmp):
+    # The fake ssh harness can check that sessh builds a ProxyCommand, but it
+    # cannot prove that OpenSSH can complete its own binary handshake over that
+    # command. A throwaway local sshd exercises the byte stream exactly the way
+    # non-tty sessh uses it in production.
+    sshd = shutil.which("sshd") or ("/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None)
+    ssh = shutil.which("ssh")
+    ssh_keygen = shutil.which("ssh-keygen")
+    if sshd is None or ssh is None or ssh_keygen is None:
+        return
+
+    env = isolated_env(tmp)
+    sshd_root = tmp / "real-sshd"
+    sshd_root.mkdir(mode=0o700)
+    host_key = sshd_root / "host_ed25519"
+    client_key = sshd_root / "client"
+    authorized_keys = sshd_root / "authorized_keys"
+    subprocess.run([ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(host_key)], check=True)
+    subprocess.run([ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(client_key)], check=True)
+    authorized_keys.write_text((client_key.with_suffix(".pub")).read_text())
+
+    port_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    port_sock.bind(("127.0.0.1", 0))
+    port = port_sock.getsockname()[1]
+    port_sock.close()
+
+    log = sshd_root / "sshd.log"
+    config = sshd_root / "sshd_config"
+    config.write_text(
+        f"""
+Port {port}
+ListenAddress 127.0.0.1
+HostKey {host_key}
+PidFile {sshd_root / "sshd.pid"}
+AuthorizedKeysFile {authorized_keys}
+PasswordAuthentication no
+PubkeyAuthentication yes
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+PermitTTY yes
+StrictModes no
+LogLevel ERROR
+AcceptEnv XDG_* TMPDIR
+"""
+    )
+
+    result = None
+    proc = subprocess.Popen([sshd, "-D", "-f", str(config), "-E", str(log)])
+    try:
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                if proc.poll() is not None:
+                    raise AssertionError(optional_text(log))
+                if time.monotonic() >= deadline:
+                    raise AssertionError(f"timed out waiting for sshd\n{optional_text(log)}")
+                time.sleep(0.05)
+
+        guid = "r-00000000-0000-4000-8000-000000000002"
+        inner_options = [
+            "--ssh-option",
+            "-F",
+            "--ssh-option",
+            "/dev/null",
+            "--ssh-option",
+            "-p",
+            "--ssh-option",
+            str(port),
+            "--ssh-option",
+            "-i",
+            "--ssh-option",
+            str(client_key),
+            "--ssh-option",
+            "-oIdentitiesOnly=yes",
+            "--ssh-option",
+            "-oStrictHostKeyChecking=no",
+            "--ssh-option",
+            "-oUserKnownHostsFile=/dev/null",
+            "--ssh-option",
+            "-oLogLevel=ERROR",
+            "--ssh-option",
+            "-oSendEnv=XDG_*",
+            "--ssh-option",
+            "-oSendEnv=TMPDIR",
+        ]
+        proxy_parts = [
+            str(MUX_BIN),
+            ":internal-stream-client:",
+            "--guid",
+            guid,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "%p",
+            *inner_options,
+        ]
+        proxy_command = " ".join(shlex.quote(part) for part in proxy_parts)
+        result = subprocess.run(
+            [
+                ssh,
+                "-F",
+                "/dev/null",
+                "-p",
+                str(port),
+                "-i",
+                str(client_key),
+                "-oBatchMode=yes",
+                "-oIdentitiesOnly=yes",
+                "-oStrictHostKeyChecking=no",
+                "-oUserKnownHostsFile=/dev/null",
+                "-oLogLevel=ERROR",
+                f"-oProxyCommand={proxy_command}",
+                "127.0.0.1",
+                "printf '%s\\n' proxied-ok",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30.0,
+            check=False,
+        )
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+    if result is None:
+        raise AssertionError("ssh proxycommand smoke did not run")
+    if result.returncode != 0 or result.stdout != "proxied-ok\n":
+        raise AssertionError(
+            f"{process_diagnostics(result)}\nsshd log:\n{optional_text(log)}"
+        )
 
 
 def test_ssh_tty_empty_remote_command_starts_interactive_session(tmp):
@@ -2613,7 +2979,7 @@ def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
     remote_shell = tmp / "remote-shell"
     marker = "SSH_RECONNECT_STDERR_READY"
     raw_ssh_error = (
-        "blox: error: looks like you are not connected to the VPN. Please connect to the VPN and try again\n"
+        "error: looks like you are not connected to the VPN. Please connect to the VPN and try again\n"
         "Connection to test-host closed by remote host.\n"
         "client_loop: send disconnect: Broken pipe\n"
         "control sequence: \x1b[31mred"
@@ -3255,16 +3621,40 @@ def main(argv=None):
             test_sessh_force_compat_is_not_a_sessh_option,
         ),
         (
-            "ssh remote command falls back to plain ssh",
-            test_ssh_remote_command_falls_back_to_plain_ssh,
+            "ssh remote command uses stream proxy",
+            test_ssh_remote_command_uses_stream_proxy,
+        ),
+        (
+            "ssh passthrough remote command uses stream proxy",
+            test_ssh_passthrough_remote_command_uses_stream_proxy,
+        ),
+        (
+            "ssh passthrough forced tty marks stream as tty",
+            test_ssh_passthrough_forced_tty_marks_stream_as_tty,
         ),
         (
             "ssh forced tty remote command uses persistent session",
             test_ssh_forced_tty_remote_command_uses_persistent_session,
         ),
         (
-            "ssh single tty remote command with stdin null falls back to plain ssh",
-            test_ssh_single_tty_remote_command_with_stdin_null_falls_back_to_plain_ssh,
+            "ssh tty remote command uses persistent session guid",
+            test_ssh_tty_remote_command_uses_persistent_session_guid,
+        ),
+        (
+            "ssh single tty remote command with stdin null uses stream proxy",
+            test_ssh_single_tty_remote_command_with_stdin_null_uses_stream_proxy,
+        ),
+        (
+            "internal stream client relays bytes through bootstrap",
+            test_internal_stream_client_relays_bytes_through_bootstrap,
+        ),
+        (
+            "internal stream client uses inner ssh exit status on initial failure",
+            test_internal_stream_client_uses_inner_ssh_exit_status_on_initial_failure,
+        ),
+        (
+            "stream proxy carries real ssh proxycommand traffic",
+            test_stream_proxy_carries_real_ssh_proxycommand_traffic,
         ),
         (
             "ssh tty empty remote command starts interactive session",

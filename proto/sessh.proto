@@ -42,7 +42,57 @@ message Frame {
     SessionClientRepaintRequest session_client_repaint_request = 31;
     SessionClientDebugSeverConnectionRequest session_client_debug_sever_connection_request = 32;
     SessionClientDebugUnresponsiveConnectionRequest session_client_debug_unresponsive_connection_request = 33;
+    StreamResume stream_resume = 34;
+    StreamData stream_data = 35;
+    StreamAck stream_ack = 36;
+    StreamEof stream_eof = 37;
+    StreamEofAck stream_eof_ack = 38;
+    StreamPing stream_ping = 39;
+    StreamPong stream_pong = 40;
   }
+}
+
+// Sent at the start of every ssh transport that carries a reconnectable byte
+// stream. The receiver uses recv_next_offset to drop bytes that the peer
+// already received and resume from the first unacknowledged byte.
+message StreamResume {
+  // Next inbound byte offset this peer expects from the other side.
+  uint64 recv_next_offset = 1;
+}
+
+// Raw bytes from this peer's outbound stream.
+message StreamData {
+  // Offset of data[0] in this peer's outbound byte stream.
+  uint64 offset = 1;
+  bytes data = 2;
+}
+
+// Acknowledges received StreamData bytes.
+message StreamAck {
+  // First byte offset not yet received from the sender.
+  uint64 offset = 1;
+}
+
+// Marks the end of this peer's outbound stream.
+message StreamEof {
+  // Offset of the end of the sender's byte stream.
+  uint64 offset = 1;
+}
+
+// Acknowledges that StreamEof was received.
+message StreamEofAck {
+  // Offset of the end of the sender's byte stream after receiving StreamEof.
+  uint64 offset = 1;
+}
+
+// A liveness probe for reconnectable byte streams. This is not an application
+// byte and does not change stream offsets; it exists so an otherwise silent
+// stream can notice an unresponsive ssh transport and start reconnecting.
+message StreamPing {
+}
+
+// Response to StreamPing.
+message StreamPong {
 }
 
 // Embedded in SessionCreate.

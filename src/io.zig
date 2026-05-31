@@ -20,11 +20,21 @@ pub fn noteRead(fd: c.fd_t, bytes: []const u8) void {
     if (read_hook) |hook| hook(fd, bytes);
 }
 
+// Some callers hand us fds whose blocking mode we did not choose. OpenSSH, for
+// example, can mark ProxyCommand pipes nonblocking. Keep these helpers
+// blocking-style by waiting and retrying when the kernel reports "try again".
 pub fn readExact(fd: c.fd_t, buf: []u8) !void {
     var offset: usize = 0;
     while (offset < buf.len) {
         const n = c.read(fd, buf[offset..].ptr, buf.len - offset);
-        if (n < 0) return error.ReadFailed;
+        if (n < 0) switch (posix.errno(n)) {
+            .AGAIN => {
+                try waitReadable(fd);
+                continue;
+            },
+            .INTR => continue,
+            else => return error.ReadFailed,
+        };
         if (n == 0) return error.EndOfStream;
         offset += @intCast(n);
     }
@@ -35,7 +45,14 @@ pub fn writeAll(fd: c.fd_t, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
         const n = c.write(fd, bytes[offset..].ptr, bytes.len - offset);
-        if (n < 0) return error.WriteFailed;
+        if (n < 0) switch (posix.errno(n)) {
+            .AGAIN => {
+                try waitWritable(fd);
+                continue;
+            },
+            .INTR => continue,
+            else => return error.WriteFailed,
+        };
         if (n == 0) return error.WriteFailed;
         offset += @intCast(n);
     }
@@ -91,4 +108,24 @@ pub fn sleepMillis(ms: u64) void {
         .nsec = @intCast((ms % 1000) * 1_000_000),
     };
     _ = c.nanosleep(&ts, null);
+}
+
+fn waitReadable(fd: c.fd_t) !void {
+    var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    while (true) {
+        pollfds[0].revents = 0;
+        _ = posix.poll(pollfds[0..], -1) catch return error.ReadFailed;
+        if ((pollfds[0].revents & posix.POLL.IN) != 0) return;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.ReadFailed;
+    }
+}
+
+fn waitWritable(fd: c.fd_t) !void {
+    var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+    while (true) {
+        pollfds[0].revents = 0;
+        _ = posix.poll(pollfds[0..], -1) catch return error.WriteFailed;
+        if ((pollfds[0].revents & posix.POLL.OUT) != 0) return;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
+    }
 }

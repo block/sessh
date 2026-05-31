@@ -9,6 +9,7 @@ const io = @import("io.zig");
 const process_exit = @import("process_exit.zig");
 const session_agent = @import("session_agent.zig");
 const ssh_client = @import("ssh_client.zig");
+const stream_proxy = @import("stream_proxy.zig");
 const terminal = @import("terminal.zig");
 
 pub fn main() !void {
@@ -21,7 +22,8 @@ pub fn main() !void {
             if (exit_code != 0) std.process.exit(exit_code);
             return;
         }
-        return err;
+        std.debug.print("sessh: error: {t}\n", .{err});
+        std.process.exit(1);
     };
     app_allocator.deinit();
 }
@@ -63,6 +65,18 @@ fn runMain() !void {
 
     if (std.mem.eql(u8, args[1], ":internal-broker:")) {
         return broker.run(allocator, args[0], args[2..]);
+    }
+
+    if (std.mem.eql(u8, args[1], ":internal-stream-client:")) {
+        return ssh_client.runInternalStreamClient(allocator, args[2..]);
+    }
+
+    if (std.mem.eql(u8, args[1], ":internal-stream-remote:")) {
+        return stream_proxy.runRemote(allocator, args[0], args[2..]);
+    }
+
+    if (std.mem.eql(u8, args[1], ":internal-stream-agent:")) {
+        return stream_proxy.runAgent(allocator, args[2..]);
     }
 
     return ssh_client.runMux(allocator, args, true);
@@ -179,6 +193,7 @@ test {
     _ = @import("relay.zig");
     _ = @import("session_registry.zig");
     _ = @import("ssh_client.zig");
+    _ = @import("stream_proxy.zig");
     _ = @import("terminal.zig");
     _ = @import("tty_transcript.zig");
     _ = @import("vt.zig");

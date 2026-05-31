@@ -154,6 +154,7 @@ is_safe_relpath "$artifact_set_id" || err INVALID_EXEC invalid_artifact_set_id
 shift 2
 
 broker_args=
+exec_args=
 hashes=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--" ]; then
@@ -166,6 +167,11 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+case "$broker_args" in
+  :internal-*) exec_args=$broker_args ;;
+  *) exec_args=":internal-broker: $broker_args" ;;
+esac
+
 cache_root=${XDG_CACHE_HOME:-${HOME:-}/.cache}/sessh/bin
 [ "$cache_root" != "/.cache/sessh/bin" ] || err INVALID_ENV missing_cache_home
 cache_dir=$cache_root/$artifact_set_id
@@ -174,7 +180,7 @@ for hash in $hashes; do
   candidate=$cache_dir/$hash/sesshmux
   if [ -f "$candidate" ] && [ -x "$candidate" ]; then
     printf 'OK\n'
-    exec "$candidate" :internal-broker: $broker_args
+    exec "$candidate" $exec_args
   fi
 done
 
@@ -206,4 +212,4 @@ mv "$tmp" "$artifact_dir/sesshmux" || err INSTALL_FAILED rename
 trap - EXIT HUP INT TERM
 
 printf 'OK\n'
-exec "$artifact_dir/sesshmux" :internal-broker: $broker_args
+exec "$artifact_dir/sesshmux" $exec_args

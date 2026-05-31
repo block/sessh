@@ -80,6 +80,26 @@ def test_cache_hit_execs_without_platform_or_tool_probe(tmp):
         raise AssertionError(result.stdout)
 
 
+def test_cache_hit_execs_explicit_internal_command(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-bin"
+    fake_bin.mkdir()
+    env["PATH"] = str(fake_bin)
+    artifact = b"#!/bin/sh\nprintf 'CACHED %s\\n' \"$*\"\n"
+    artifact_hash = sha256(artifact)
+    write_executable(artifact_path(env, artifact_hash), artifact)
+
+    result = run_bootstrapper(
+        f"EXEC test-set {artifact_hash} -- :internal-stream-remote: r-00000000-0000-4000-8000-000000000001 22\n",
+        env,
+    )
+
+    assert_ok(result)
+    expected = "OK\nCACHED :internal-stream-remote: r-00000000-0000-4000-8000-000000000001 22\n"
+    if result.stdout != expected:
+        raise AssertionError(result.stdout)
+
+
 def test_upload_installs_and_execs(tmp):
     env = isolated_env(tmp)
     artifact = b"#!/bin/sh\nprintf 'UPLOADED %s\\n' \"$*\"\n"
@@ -213,6 +233,7 @@ def run_test(name, fn):
 def main():
     tests = (
         ("cache hit execs without platform or tool probe", test_cache_hit_execs_without_platform_or_tool_probe),
+        ("cache hit execs explicit internal command", test_cache_hit_execs_explicit_internal_command),
         ("upload installs and execs", test_upload_installs_and_execs),
         ("invalid artifact set is rejected", test_invalid_artifact_set_is_rejected),
         ("cache hit trusts cached executable", test_cache_hit_trusts_cached_executable),

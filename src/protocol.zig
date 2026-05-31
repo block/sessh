@@ -34,6 +34,13 @@ pub const MessageType = enum {
     session_client_repaint_request,
     session_client_debug_sever_connection_request,
     session_client_debug_unresponsive_connection_request,
+    stream_resume,
+    stream_data,
+    stream_ack,
+    stream_eof,
+    stream_eof_ack,
+    stream_ping,
+    stream_pong,
 };
 
 pub const frame_header_len = 4;
@@ -134,6 +141,13 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .session_client_repaint_request => |message| ownedFrameFromMessage(allocator, .session_client_repaint_request, message),
             .session_client_debug_sever_connection_request => |message| ownedFrameFromMessage(allocator, .session_client_debug_sever_connection_request, message),
             .session_client_debug_unresponsive_connection_request => |message| ownedFrameFromMessage(allocator, .session_client_debug_unresponsive_connection_request, message),
+            .stream_resume => |message| ownedFrameFromMessage(allocator, .stream_resume, message),
+            .stream_data => |message| ownedFrameFromMessage(allocator, .stream_data, message),
+            .stream_ack => |message| ownedFrameFromMessage(allocator, .stream_ack, message),
+            .stream_eof => |message| ownedFrameFromMessage(allocator, .stream_eof, message),
+            .stream_eof_ack => |message| ownedFrameFromMessage(allocator, .stream_eof_ack, message),
+            .stream_ping => |message| ownedFrameFromMessage(allocator, .stream_ping, message),
+            .stream_pong => |message| ownedFrameFromMessage(allocator, .stream_pong, message),
         };
     }
 
@@ -286,6 +300,41 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.SessionClientDebugUnresponsiveConnectionRequest, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_debug_unresponsive_connection_request = message } });
+        },
+        .stream_resume => blk: {
+            var message = try decodePayload(pb.StreamResume, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_resume = message } });
+        },
+        .stream_data => blk: {
+            var message = try decodePayload(pb.StreamData, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_data = message } });
+        },
+        .stream_ack => blk: {
+            var message = try decodePayload(pb.StreamAck, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_ack = message } });
+        },
+        .stream_eof => blk: {
+            var message = try decodePayload(pb.StreamEof, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_eof = message } });
+        },
+        .stream_eof_ack => blk: {
+            var message = try decodePayload(pb.StreamEofAck, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_eof_ack = message } });
+        },
+        .stream_ping => blk: {
+            var message = try decodePayload(pb.StreamPing, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_ping = message } });
+        },
+        .stream_pong => blk: {
+            var message = try decodePayload(pb.StreamPong, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_pong = message } });
         },
     };
 }

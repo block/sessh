@@ -8,8 +8,10 @@ const client_log = @import("client_log.zig");
 const config = @import("config.zig");
 const io = @import("io.zig");
 const process_exit = @import("process_exit.zig");
+const reconnect = @import("reconnect.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
+const stream_proxy = @import("stream_proxy.zig");
 const terminal = @import("terminal.zig");
 const tty_transcript = @import("tty_transcript.zig");
 
@@ -156,6 +158,7 @@ const ParsedSshArgs = struct {
     bootstrap: bool = true,
     bootstrap_set: bool = false,
     force_compat: bool = false,
+    passthrough: bool = false,
     default_ipqos_option: ?[]const u8 = null,
     capture_tty_transcript: ?[]const u8 = null,
 };
@@ -214,35 +217,33 @@ const RuntimeConnection = struct {
     }
 };
 
-const ParallelReconnectResult = union(enum) {
-    connected: RuntimeConnection,
-    failed: anyerror,
+const SshStderrMode = enum(u8) {
+    forward,
+    diagnostics,
+    discard,
 };
 
+const ParallelReconnectResult = reconnect.AsyncResult(RuntimeConnection);
+
 const ParallelReconnectState = struct {
-    mutex: std.Thread.Mutex = .{},
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    task: reconnect.AsyncTask(RuntimeConnection) = .{},
     parsed_ssh_args: ParsedSshArgs,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
     broker_args: []const []const u8,
     reconnect_ui: *client.ReconnectUi,
     session: client.RuntimeSession,
-    result: ?ParallelReconnectResult = null,
 
     fn store(self: *ParallelReconnectState, result: ParallelReconnectResult) void {
-        self.mutex.lock();
-        self.result = result;
-        self.mutex.unlock();
-        self.done.store(true, .release);
+        self.task.store(result);
+    }
+
+    fn isDone(self: *const ParallelReconnectState) bool {
+        return self.task.isDone();
     }
 
     fn take(self: *ParallelReconnectState) ?ParallelReconnectResult {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const result = self.result orelse return null;
-        self.result = null;
-        return result;
+        return self.task.take();
     }
 };
 
@@ -264,16 +265,16 @@ const SshStderrPump = struct {
 
     const State = struct {
         fd: c.fd_t,
-        forward: std.atomic.Value(bool),
+        mode: std.atomic.Value(u8),
     };
 
-    fn start(allocator: std.mem.Allocator, file: std.fs.File, forward: bool) !SshStderrPump {
+    fn start(allocator: std.mem.Allocator, file: std.fs.File, mode: SshStderrMode) !SshStderrPump {
         errdefer file.close();
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
         state.* = .{
             .fd = file.handle,
-            .forward = std.atomic.Value(bool).init(forward),
+            .mode = std.atomic.Value(u8).init(@intFromEnum(mode)),
         };
 
         const thread = try std.Thread.spawn(.{}, stderrPumpMain, .{state});
@@ -281,7 +282,7 @@ const SshStderrPump = struct {
     }
 
     fn suppress(self: *SshStderrPump) void {
-        self.state.forward.store(false, .release);
+        self.state.mode.store(@intFromEnum(SshStderrMode.diagnostics), .release);
     }
 
     fn join(self: *SshStderrPump) void {
@@ -297,12 +298,12 @@ fn stderrPumpMain(state: *SshStderrPump.State) void {
         const n = c.read(state.fd, &buf, buf.len);
         if (n <= 0) return;
         const bytes = buf[0..@intCast(n)];
-        const forward = state.forward.load(.acquire);
-        if (forward) {
-            io.writeAll(2, bytes) catch {};
-            continue;
+        const mode: SshStderrMode = @enumFromInt(state.mode.load(.acquire));
+        switch (mode) {
+            .forward => io.writeAll(2, bytes) catch {},
+            .diagnostics => client_log.appendSshStderr(bytes),
+            .discard => {},
         }
-        client_log.appendSshStderr(bytes);
     }
 }
 
@@ -462,10 +463,6 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
         }
     }
     if (eval_args and command_argv.len == 0) return error.MissingEvalArgs;
-    if (invocation == .sessh and command_argv.len > 0 and !eval_args and tty_request == .none) {
-        return error.RemoteCommandUnsupported;
-    }
-
     const resolved_host = host orelse return error.MissingHost;
     try appendMany(translated, ssh_options.items);
     try translated.append(resolved_host);
@@ -1087,13 +1084,6 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
     {
         return runLocalRouteCommand(allocator, args);
     }
-    if (shouldUsePlainSshFallbackForUnforcedTtyCommand(parsed_ssh_args, c.isatty(0) != 0)) {
-        if (!hasSesshSpecificRequest(args)) {
-            try runPlainSshFallbackForUnsupportedArgs(allocator, args, error.RemoteCommandUnsupported);
-        }
-        try io.writeAll(2, "sessh: remote commands with redirected stdin require -tt for persistent sessions\n");
-        return process_exit.request(64);
-    }
     applyFileConfigToSsh(allocator, &parsed_ssh_args) catch |err| {
         try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
         return process_exit.request(64);
@@ -1111,6 +1101,15 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
     defer if (resolved_ref_storage) |ref| allocator.free(ref);
     parsed_ssh_args.default_ipqos_option = try resolveDefaultIpQosOption(allocator, parsed_ssh_args.options, parsed_ssh_args.host);
     defer if (parsed_ssh_args.default_ipqos_option) |option| allocator.free(option);
+
+    const stdin_is_tty = c.isatty(0) != 0;
+    if (shouldUseStreamProxy(parsed_ssh_args, stdin_is_tty)) {
+        if (parsed_ssh_args.capture_tty_transcript != null) {
+            try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with stream passthrough\n");
+            return process_exit.request(64);
+        }
+        try runStreamProxySsh(allocator, parsed_ssh_args, stdin_is_tty);
+    }
 
     const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
     defer if (shell_command) |command| allocator.free(command);
@@ -1150,6 +1149,8 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             false,
             null,
             false,
+            null,
+            null,
         );
         const exit_status = runRemoteBrokerCommandAndForward(&command_child) catch |err| {
             command_child.closeStdin();
@@ -1204,6 +1205,8 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         false,
         null,
         false,
+        null,
+        null,
     );
 
     var session = (switch (parsed_ssh_args.action) {
@@ -1392,7 +1395,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
 
         var reconnect_attempt: usize = 0;
         while (true) {
-            const delay_ms = reconnectDelayMs(reconnect_attempt);
+            const delay_ms = reconnect.delayMs(reconnect_attempt);
             client_log.debug("event=reconnect_wait host={s} session={s} attempt={} delay_ms={}", .{
                 parsed_ssh_args.host,
                 session.idSlice(),
@@ -1428,6 +1431,8 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                 true,
                 &reconnect_ui,
                 true,
+                null,
+                null,
             ) catch |err| switch (err) {
                 error.ExitRequested => return err,
                 error.ReconnectDetached => {
@@ -2160,7 +2165,7 @@ fn raceExistingConnectionWithReconnect(
                     err,
                 });
                 client_log.userDiagnosticInfo("reconnect failed: parallel: {t}", .{err});
-                const delay_ms = reconnectDelayMs(reconnect_attempt);
+                const delay_ms = reconnect.delayMs(reconnect_attempt);
                 reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, reconnect_ui);
                 client_log.debug("event=reconnect_wait_unresponsive host={s} session={s} attempt={} delay_ms={}", .{
                     parsed_ssh_args.host,
@@ -2263,11 +2268,11 @@ fn raceExistingConnectionWithReconnectAttempt(
 
     var old_available = true;
     while (true) {
-        if (ready_connection == null and state.done.load(.acquire)) {
+        if (ready_connection == null and state.isDone()) {
             joined = true;
             thread.join();
             switch (state.take().?) {
-                .connected => |connection| {
+                .ready => |connection| {
                     ready_connection = connection;
                     ready_session = session.*;
                     if (!old_available) {
@@ -2473,6 +2478,8 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
         true,
         state.reconnect_ui,
         false,
+        null,
+        null,
     ) catch |err| {
         state.store(.{ .failed = err });
         return;
@@ -2496,13 +2503,13 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
         return;
     };
 
-    state.store(.{ .connected = connection });
+    state.store(.{ .ready = connection });
 }
 
 fn cleanupParallelReconnectResult(state: *ParallelReconnectState) void {
     var result = state.take() orelse return;
     switch (result) {
-        .connected => |*connection| connection.terminate(),
+        .ready => |*connection| connection.terminate(),
         .failed => {},
     }
 }
@@ -2527,20 +2534,7 @@ fn waitForReconnectSwitchIfNeeded(
 }
 
 fn nextReconnectAttemptAfterFailure(attempt: usize, reconnect_ui: *client.ReconnectUi) usize {
-    return if (reconnect_ui.consumeReconnectAcknowledgement()) 0 else attempt + 1;
-}
-
-fn reconnectDelayMs(attempt: usize) u64 {
-    const delays = [_]u64{
-        10_000,
-        20_000,
-        40_000,
-        80_000,
-        160_000,
-        320_000,
-        600_000,
-    };
-    return if (attempt < delays.len) delays[attempt] else delays[delays.len - 1];
+    return reconnect.nextAttempt(attempt, reconnect_ui.consumeReconnectAcknowledgement());
 }
 
 fn defaultSshOptionsLen(parsed_ssh_args: ParsedSshArgs) usize {
@@ -2608,7 +2602,10 @@ fn startRuntimeConnection(
     batch_mode: bool,
     reconnect_ui: ?*client.ReconnectUi,
     poll_reconnect_input: bool,
+    stderr_mode_override: ?SshStderrMode,
+    bootstrap_failure_term: ?*?std.process.Child.Term,
 ) !RuntimeConnection {
+    if (bootstrap_failure_term) |term| term.* = null;
     const reconnect_options: usize = if (batch_mode) 1 else 0;
     const default_options = defaultSshOptionsLen(parsed_ssh_args);
     const transport_options = transportSshOptionsLen(parsed_ssh_args.options);
@@ -2633,13 +2630,13 @@ fn startRuntimeConnection(
     child.expand_arg0 = .expand;
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
-    const forward_stderr = reconnect_ui == null;
     child.stderr_behavior = .Pipe;
     try child.spawn();
     var connection = RuntimeConnection{ .child = child };
     const stderr_file = connection.child.stderr.?;
     connection.child.stderr = null;
-    connection.stderr_pump = SshStderrPump.start(allocator, stderr_file, forward_stderr) catch |err| {
+    const stderr_mode = stderr_mode_override orelse if (reconnect_ui == null) SshStderrMode.forward else SshStderrMode.diagnostics;
+    connection.stderr_pump = SshStderrPump.start(allocator, stderr_file, stderr_mode) catch |err| {
         connection.terminate();
         return err;
     };
@@ -2647,7 +2644,8 @@ fn startRuntimeConnection(
     const artifact_set = artifacts orelse return connection;
 
     artifact_set.sendExec(connection.child.stdin.?.handle, broker_args, reconnect_ui, poll_reconnect_input) catch |err| {
-        connection.terminate();
+        const term = connection.wait() catch null;
+        if (bootstrap_failure_term) |term_out| term_out.* = term;
         return err;
     };
 
@@ -2657,11 +2655,11 @@ fn startRuntimeConnection(
             connection.terminate();
             return err;
         }
+        const term = connection.wait() catch null;
+        if (bootstrap_failure_term) |term_out| term_out.* = term;
         if (batch_mode) {
-            _ = connection.wait() catch {};
             return err;
         }
-        const term = connection.wait() catch null;
         try exitAfterSshBootstrapFailure(allocator, parsed_ssh_args, term, err);
     };
     defer allocator.free(line);
@@ -2710,11 +2708,11 @@ fn startRuntimeConnection(
                 connection.terminate();
                 return err;
             }
+            const term = connection.wait() catch null;
+            if (bootstrap_failure_term) |term_out| term_out.* = term;
             if (batch_mode) {
-                _ = connection.wait() catch {};
                 return err;
             }
-            const term = connection.wait() catch null;
             try exitAfterSshBootstrapFailure(allocator, parsed_ssh_args, term, err);
         };
     }
@@ -2759,16 +2757,283 @@ fn canUsePlainSshFallback(
         reconnect_ui == null;
 }
 
-fn shouldUsePlainSshFallbackForUnforcedTtyCommand(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
-    // OpenSSH's single `-t` requests a remote pty only when local stdin is a
-    // tty. `-tt` is the force form that requests one even with redirected
-    // stdin. A sessh command session always has a pty, so single `-t` plus
-    // non-tty stdin must fall back to plain ssh to preserve that distinction.
-    return parsed_ssh_args.action == .new and
-        parsed_ssh_args.command_argv.len == 0 and
-        parsed_ssh_args.shell_command_args.len > 0 and
-        parsed_ssh_args.tty_request == .requested and
-        !stdin_is_tty;
+fn shouldUseStreamProxy(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
+    if (parsed_ssh_args.action != .new) return false;
+    if (parsed_ssh_args.command_argv.len != 0) return false;
+    if (parsed_ssh_args.passthrough) return true;
+    if (parsed_ssh_args.shell_command_args.len == 0) return false;
+
+    // With a local tty, use the normal sessh runtime so command sessions get
+    // the same remote PTY and session environment as interactive sessions.
+    // Without a local tty, stream mode preserves ssh's byte-stream command
+    // behavior. A forced `-tt` is the exception because ssh explicitly asks for
+    // a remote tty even when local stdin is not one.
+    return !stdin_is_tty and parsed_ssh_args.tty_request != .forced;
+}
+
+fn streamProxyUsesTty(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
+    return switch (parsed_ssh_args.tty_request) {
+        .forced => true,
+        .requested => stdin_is_tty,
+        .none => stdin_is_tty and parsed_ssh_args.shell_command_args.len == 0,
+    };
+}
+
+const StreamClientTransport = struct {
+    connection: RuntimeConnection,
+
+    pub fn readFd(self: *const StreamClientTransport) c.fd_t {
+        return self.connection.child.stdout.?.handle;
+    }
+
+    pub fn writeFd(self: *const StreamClientTransport) c.fd_t {
+        return self.connection.child.stdin.?.handle;
+    }
+
+    pub fn close(self: *StreamClientTransport) void {
+        self.connection.closeStdin();
+        _ = self.connection.wait() catch {};
+    }
+
+    pub fn terminate(self: *StreamClientTransport) void {
+        self.connection.terminate();
+    }
+};
+
+const StreamClientStarter = struct {
+    allocator: std.mem.Allocator,
+    parsed_ssh_args: ParsedSshArgs,
+    artifacts: *const ArtifactSet,
+    remote_command: []const u8,
+    broker_args: []const []const u8,
+    stderr_mode: SshStderrMode,
+    last_failure_mutex: std.Thread.Mutex = .{},
+    last_failure_term: ?std.process.Child.Term = null,
+
+    pub fn start(self: *StreamClientStarter) !StreamClientTransport {
+        self.recordFailureTerm(null);
+        var failure_term: ?std.process.Child.Term = null;
+        const connection = startRuntimeConnection(
+            self.allocator,
+            self.parsed_ssh_args,
+            self.artifacts,
+            self.remote_command,
+            self.broker_args,
+            true,
+            null,
+            false,
+            self.stderr_mode,
+            &failure_term,
+        ) catch |err| {
+            self.recordFailureTerm(failure_term);
+            return err;
+        };
+        return .{ .connection = connection };
+    }
+
+    pub fn exitAfterInitialFailure(self: *StreamClientStarter, err: anyerror) !void {
+        const term = self.takeFailureTerm();
+        if (term) |value| {
+            switch (value) {
+                .Exited => |code| {
+                    if (code != 0) return process_exit.request(code);
+                    return err;
+                },
+                .Signal => return process_exit.request(255),
+                else => return process_exit.request(255),
+            }
+        }
+        return err;
+    }
+
+    fn recordFailureTerm(self: *StreamClientStarter, term: ?std.process.Child.Term) void {
+        self.last_failure_mutex.lock();
+        self.last_failure_term = term;
+        self.last_failure_mutex.unlock();
+    }
+
+    fn takeFailureTerm(self: *StreamClientStarter) ?std.process.Child.Term {
+        self.last_failure_mutex.lock();
+        defer self.last_failure_mutex.unlock();
+        const term = self.last_failure_term;
+        self.last_failure_term = null;
+        return term;
+    }
+};
+
+pub fn runInternalStreamClient(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var guid: ?[]const u8 = null;
+    var host: ?[]const u8 = null;
+    var port: ?[]const u8 = null;
+    var outer_tty = false;
+    var ssh_options: std.ArrayList([]const u8) = .empty;
+    defer ssh_options.deinit(allocator);
+
+    // The stream proxy owns failure detection and reconnect. Disable ssh's
+    // keepalive timer on the inner connection so it does not race the proxy's
+    // own byte-preserving retry loop.
+    try ssh_options.append(allocator, "-oServerAliveInterval=0");
+
+    var i: usize = 0;
+    while (i < args.len) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--guid")) {
+            i += 1;
+            if (i >= args.len) return streamClientArgError("--guid requires a value");
+            guid = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--host")) {
+            i += 1;
+            if (i >= args.len) return streamClientArgError("--host requires a value");
+            host = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            i += 1;
+            if (i >= args.len) return streamClientArgError("--port requires a value");
+            port = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--ssh-option")) {
+            i += 1;
+            if (i >= args.len) return streamClientArgError("--ssh-option requires a value");
+            try ssh_options.append(allocator, args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--outer-tty")) {
+            outer_tty = true;
+            i += 1;
+        } else {
+            return streamClientArgError("unsupported stream client option");
+        }
+    }
+
+    const resolved_guid = guid orelse return streamClientArgError("--guid requires a value");
+    if (!session_registry.isValidReconnectGuid(resolved_guid)) return streamClientArgError("invalid reconnect guid");
+    const resolved_host = host orelse return streamClientArgError("--host requires a value");
+    const resolved_port = port orelse return streamClientArgError("--port requires a value");
+
+    var artifacts = try loadArtifactSet(allocator);
+    defer artifacts.deinit();
+    const remote_command = try bootstrapCommand(allocator);
+    defer allocator.free(remote_command);
+
+    const broker_args = [_][]const u8{ ":internal-stream-remote:", resolved_guid, resolved_port };
+    const status_enabled = !outer_tty and c.isatty(2) != 0;
+    var starter = StreamClientStarter{
+        .allocator = allocator,
+        .parsed_ssh_args = .{
+            .options = ssh_options.items,
+            .host = resolved_host,
+        },
+        .artifacts = &artifacts,
+        .remote_command = remote_command,
+        .broker_args = broker_args[0..],
+        .stderr_mode = if (outer_tty) .discard else if (status_enabled) .diagnostics else .forward,
+    };
+    stream_proxy.runClientStream(allocator, &starter, .{ .status_enabled = status_enabled }) catch |err| {
+        try starter.exitAfterInitialFailure(err);
+    };
+}
+
+fn streamClientArgError(message: []const u8) !void {
+    try io.stderrPrint("sessh: :internal-stream-client: {s}\n", .{message});
+    return process_exit.request(64);
+}
+
+fn runStreamProxySsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) !noreturn {
+    const guid = try session_registry.generateReconnectGuid(allocator);
+    defer allocator.free(guid);
+    const stream_uses_tty = streamProxyUsesTty(parsed_ssh_args, stdin_is_tty);
+    const proxy_command = try streamProxyCommand(allocator, guid, parsed_ssh_args, stream_uses_tty);
+    defer allocator.free(proxy_command);
+
+    const default_options = defaultSshOptionsLen(parsed_ssh_args);
+    const ssh_argv = try allocator.alloc(
+        []const u8,
+        1 + 2 + 1 + default_options + parsed_ssh_args.options.len + 1 + parsed_ssh_args.shell_command_args.len,
+    );
+    defer allocator.free(ssh_argv);
+
+    ssh_argv[0] = "ssh";
+    var arg_index: usize = 1;
+    // The stream can only reconnect automatically when both ssh layers use
+    // non-interactive authentication.
+    ssh_argv[arg_index] = "-oBatchMode=yes";
+    arg_index += 1;
+    // Keep OpenSSH's keepalive timer from killing the outer connection while
+    // the proxy is preserving and retrying the underlying byte stream.
+    ssh_argv[arg_index] = "-oServerAliveInterval=0";
+    arg_index += 1;
+    ssh_argv[arg_index] = proxy_command;
+    arg_index += 1;
+    appendDefaultSshOptions(ssh_argv, &arg_index, parsed_ssh_args.default_ipqos_option);
+    @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.options.len], parsed_ssh_args.options);
+    arg_index += parsed_ssh_args.options.len;
+    ssh_argv[arg_index] = parsed_ssh_args.host;
+    arg_index += 1;
+    @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.shell_command_args.len], parsed_ssh_args.shell_command_args);
+
+    var child = std.process.Child.init(ssh_argv, allocator);
+    child.expand_arg0 = .expand;
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| return process_exit.request(code),
+        .Signal => |signal| {
+            try io.stderrPrint("sessh: stream ssh ended by signal {}\n", .{signal});
+            return process_exit.request(255);
+        },
+        else => {
+            try io.stderrPrint("sessh: stream ssh ended unexpectedly: {t}\n", .{term});
+            return process_exit.request(255);
+        },
+    }
+}
+
+fn streamProxyCommand(
+    allocator: std.mem.Allocator,
+    guid: []const u8,
+    parsed_ssh_args: ParsedSshArgs,
+    stream_uses_tty: bool,
+) ![]u8 {
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    try appendShellToken(allocator, &out, exe_path);
+    try appendShellToken(allocator, &out, ":internal-stream-client:");
+    try appendShellToken(allocator, &out, "--guid");
+    try appendShellToken(allocator, &out, guid);
+    try appendShellToken(allocator, &out, "--host");
+    try appendShellToken(allocator, &out, parsed_ssh_args.host);
+    try appendShellToken(allocator, &out, "--port");
+    try appendShellToken(allocator, &out, "%p");
+    if (stream_uses_tty) {
+        try appendShellToken(allocator, &out, "--outer-tty");
+    }
+    if (parsed_ssh_args.default_ipqos_option) |option| {
+        try appendShellToken(allocator, &out, "--ssh-option");
+        try appendShellToken(allocator, &out, option);
+    }
+    for (parsed_ssh_args.options) |option| {
+        try appendShellToken(allocator, &out, "--ssh-option");
+        try appendShellToken(allocator, &out, option);
+    }
+
+    const command = try out.toOwnedSlice(allocator);
+    defer allocator.free(command);
+    return std.fmt.allocPrint(allocator, "-oProxyCommand={s}", .{command});
+}
+
+fn appendShellToken(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    if (out.items.len > 0) try out.append(allocator, ' ');
+    const quoted = try shellQuote(allocator, value);
+    defer allocator.free(quoted);
+    try out.appendSlice(allocator, quoted);
 }
 
 fn shouldUsePlainSshFallbackForArgError(args: []const []const u8, err: anyerror) bool {
@@ -3349,6 +3614,9 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
             parsed.bootstrap_set = true;
             try parsed.banner_args.append(arg);
             index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--passthrough")) {
+            parsed.passthrough = true;
+            index.* += 1;
         } else if (std.mem.eql(u8, arg, "--force-compat")) {
             if (!parse_options.allow_force_compat) return error.UnsupportedSshOption;
             parsed.force_compat = true;
@@ -3383,7 +3651,7 @@ fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *
             if (parsed.action != .new) return error.ConflictingSesshAction;
             parsed.command_argv = args[index.*..];
             index.* = args.len;
-        } else if (parsed.action == .new and parsed.tty_request != .none) {
+        } else if (parsed.action == .new) {
             parsed.shell_command_args = args[index.*..];
             index.* = args.len;
         } else if (std.mem.startsWith(u8, arg, "--")) {
@@ -3501,6 +3769,11 @@ fn parseCommonSesshOptionAfterHost(args: []const []const u8, index: *usize, pars
         parsed.bootstrap = false;
         parsed.bootstrap_set = true;
         try parsed.banner_args.append(arg);
+        index.* += 1;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--passthrough")) {
+        parsed.passthrough = true;
         index.* += 1;
         return true;
     }
@@ -3668,6 +3941,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--alias") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
+        std.mem.eql(u8, arg, "--passthrough") or
         std.mem.eql(u8, arg, "--ssh-options") or
         std.mem.eql(u8, arg, "--capture-tty-transcript") or
         std.mem.eql(u8, arg, "--refresh") or
@@ -4531,15 +4805,26 @@ test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
     try std.testing.expectEqualStrings("", empty.shell_command_args[0]);
 }
 
-test "single tty request falls back to plain ssh when stdin is not a tty" {
+test "stream proxy handles ssh command mode only without local tty" {
+    const command = try parseSshArgs(&.{
+        "sessh",
+        "example.com",
+        "echo",
+        "hello",
+    }, .{});
+    try std.testing.expectEqual(SshTtyRequest.none, command.tty_request);
+    try std.testing.expectEqual(@as(usize, 2), command.shell_command_args.len);
+    try std.testing.expect(shouldUseStreamProxy(command, false));
+    try std.testing.expect(!shouldUseStreamProxy(command, true));
+
     const single = try parseSshArgs(&.{
         "sessh",
         "-t",
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(shouldUsePlainSshFallbackForUnforcedTtyCommand(single, false));
-    try std.testing.expect(!shouldUsePlainSshFallbackForUnforcedTtyCommand(single, true));
+    try std.testing.expect(shouldUseStreamProxy(single, false));
+    try std.testing.expect(!shouldUseStreamProxy(single, true));
 
     const forced = try parseSshArgs(&.{
         "sessh",
@@ -4547,7 +4832,42 @@ test "single tty request falls back to plain ssh when stdin is not a tty" {
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(!shouldUsePlainSshFallbackForUnforcedTtyCommand(forced, false));
+    try std.testing.expect(!shouldUseStreamProxy(forced, false));
+}
+
+test "passthrough forces stream proxy and preserves ssh tty semantics" {
+    const interactive = try parseSshArgs(&.{
+        "sessh",
+        "--passthrough",
+        "example.com",
+    }, .{});
+    try std.testing.expect(interactive.passthrough);
+    try std.testing.expect(shouldUseStreamProxy(interactive, true));
+    try std.testing.expect(shouldUseStreamProxy(interactive, false));
+    try std.testing.expect(streamProxyUsesTty(interactive, true));
+    try std.testing.expect(!streamProxyUsesTty(interactive, false));
+
+    const command = try parseSshArgs(&.{
+        "sessh",
+        "--passthrough",
+        "example.com",
+        "echo",
+        "hello",
+    }, .{});
+    try std.testing.expect(command.passthrough);
+    try std.testing.expect(shouldUseStreamProxy(command, true));
+    try std.testing.expect(!streamProxyUsesTty(command, true));
+
+    const forced = try parseSshArgs(&.{
+        "sessh",
+        "--passthrough",
+        "-tt",
+        "example.com",
+        "tty",
+    }, .{});
+    try std.testing.expect(forced.passthrough);
+    try std.testing.expect(shouldUseStreamProxy(forced, false));
+    try std.testing.expect(streamProxyUsesTty(forced, false));
 }
 
 test "plain ssh fallback is allowed for transport-incompatible plain ssh invocations" {
@@ -5497,21 +5817,13 @@ test "sesshmux-dev uses development artifact upload" {
     try std.testing.expect(!isDevelopmentExecutable("/tmp/libexec/sessh/sesshmux-macos-aarch64"));
 }
 
-test "reconnectDelayMs follows the documented backoff schedule" {
-    try std.testing.expectEqual(@as(u64, 10_000), reconnectDelayMs(0));
-    try std.testing.expectEqual(@as(u64, 20_000), reconnectDelayMs(1));
-    try std.testing.expectEqual(@as(u64, 40_000), reconnectDelayMs(2));
-    try std.testing.expectEqual(@as(u64, 80_000), reconnectDelayMs(3));
-    try std.testing.expectEqual(@as(u64, 160_000), reconnectDelayMs(4));
-    try std.testing.expectEqual(@as(u64, 320_000), reconnectDelayMs(5));
-    try std.testing.expectEqual(@as(u64, 600_000), reconnectDelayMs(6));
-    try std.testing.expectEqual(@as(u64, 600_000), reconnectDelayMs(7));
-}
-
-test "parseSshArgs rejects ssh-style remote commands without a tty request" {
-    try std.testing.expectError(error.RemoteCommandUnsupported, parseSshArgs(&.{
+test "parseSshArgs accepts ssh-style remote commands without a tty request" {
+    const parsed = try parseSshArgs(&.{
         "sessh",
         "example.com",
         "uname",
-    }, .{}));
+    }, .{});
+    try std.testing.expectEqual(SshTtyRequest.none, parsed.tty_request);
+    try std.testing.expectEqual(@as(usize, 1), parsed.shell_command_args.len);
+    try std.testing.expectEqualStrings("uname", parsed.shell_command_args[0]);
 }

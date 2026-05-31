@@ -9,8 +9,10 @@ pub const guid_body_len = 36;
 pub const compact_guid_len = 32;
 pub const session_guid_prefix = "s-";
 pub const client_guid_prefix = "c-";
+pub const reconnect_guid_prefix = "r-";
 pub const session_guid_len = session_guid_prefix.len + guid_body_len;
 pub const client_guid_len = client_guid_prefix.len + guid_body_len;
+pub const reconnect_guid_len = reconnect_guid_prefix.len + guid_body_len;
 pub const generated_alias_hex_len = 8;
 pub const generated_alias_len = session_guid_prefix.len + generated_alias_hex_len;
 pub const tombstone_retention_ms: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -261,8 +263,13 @@ pub fn isValidClientGuid(guid: []const u8) bool {
         isValidGuidBody(guid[client_guid_prefix.len..]);
 }
 
+pub fn isValidReconnectGuid(guid: []const u8) bool {
+    return std.mem.startsWith(u8, guid, reconnect_guid_prefix) and
+        isValidGuidBody(guid[reconnect_guid_prefix.len..]);
+}
+
 pub fn isValidGuid(guid: []const u8) bool {
-    return isValidSessionGuid(guid) or isValidClientGuid(guid);
+    return isValidSessionGuid(guid) or isValidClientGuid(guid) or isValidReconnectGuid(guid);
 }
 
 pub fn isValidCompactGuid(guid: []const u8) bool {
@@ -420,6 +427,22 @@ pub fn generateClientGuid(allocator: std.mem.Allocator) ![]u8 {
     out[0] = client_guid_prefix[0];
     out[1] = client_guid_prefix[1];
     @memcpy(out[client_guid_prefix.len..], session_guid[session_guid_prefix.len..]);
+    return out;
+}
+
+pub fn generateReconnectGuid(allocator: std.mem.Allocator) ![]u8 {
+    var bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const compact = std.fmt.bytesToHex(bytes, .lower);
+    const session_guid = try canonicalGuid(allocator, &compact);
+    defer allocator.free(session_guid);
+
+    const out = try allocator.alloc(u8, reconnect_guid_len);
+    out[0] = reconnect_guid_prefix[0];
+    out[1] = reconnect_guid_prefix[1];
+    @memcpy(out[reconnect_guid_prefix.len..], session_guid[session_guid_prefix.len..]);
     return out;
 }
 
