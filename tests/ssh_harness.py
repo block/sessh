@@ -1675,6 +1675,8 @@ def test_ssh_passthrough_remote_command_uses_stream_proxy(tmp):
         raise AssertionError(log_text)
     if "--outer-tty" in log_text:
         raise AssertionError(log_text)
+    if "--title-status-path" in log_text:
+        raise AssertionError(log_text)
 
 
 def test_ssh_passthrough_forced_tty_marks_stream_as_tty(tmp):
@@ -1723,6 +1725,30 @@ def test_ssh_passthrough_tty_enables_title_status_path(tmp):
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if "--outer-tty" not in log_text or "--title-status-path" not in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_passthrough_command_in_tty_enables_title_status_path(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_LOG_PROXYCOMMAND"] = "1"
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "test-host", "echo", "hello"],
+        env,
+        ((b"PLAIN_SSH host=test-host", None),),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "--outer-tty" in log_text or "--title-status-path" not in log_text:
         raise AssertionError(log_text)
 
 
@@ -3870,6 +3896,10 @@ def main(argv=None):
         (
             "ssh passthrough tty enables title status path",
             test_ssh_passthrough_tty_enables_title_status_path,
+        ),
+        (
+            "ssh passthrough command in tty enables title status path",
+            test_ssh_passthrough_command_in_tty_enables_title_status_path,
         ),
         (
             "ssh passthrough tty restores remote title after stream reconnect",

@@ -3099,7 +3099,10 @@ pub fn runInternalStreamClient(allocator: std.mem.Allocator, args: []const []con
     defer allocator.free(remote_command);
 
     const broker_args = [_][]const u8{ ":internal-stream-remote:", resolved_guid, resolved_port };
-    const status_enabled = !outer_tty and c.isatty(2) != 0;
+    // `title_status_path` is the parent process telling this ProxyCommand that
+    // local stdout is a terminal, which tells us whether local reconnect UI
+    // can be written without corrupting stdout.
+    const use_title_status = title_status_path != null;
     var starter = StreamClientStarter{
         .allocator = allocator,
         .parsed_ssh_args = .{
@@ -3109,11 +3112,11 @@ pub fn runInternalStreamClient(allocator: std.mem.Allocator, args: []const []con
         .artifacts = &artifacts,
         .remote_command = remote_command,
         .broker_args = broker_args[0..],
-        .stderr_mode = if (outer_tty) .discard else if (status_enabled) .diagnostics else .forward,
+        .stderr_mode = if (use_title_status) (if (outer_tty) .discard else .forward) else .diagnostics,
     };
     stream_proxy.runClientStream(allocator, &starter, .{
-        .status_enabled = status_enabled,
-        .title_status_path = if (outer_tty) title_status_path else null,
+        .status_enabled = !use_title_status,
+        .title_status_path = title_status_path,
     }) catch |err| {
         try starter.exitAfterInitialFailure(err);
     };
@@ -3128,14 +3131,8 @@ fn runStreamProxySsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArg
     const guid = try session_registry.generateReconnectGuid(allocator);
     defer allocator.free(guid);
     const stream_uses_tty = streamProxyUsesTty(parsed_ssh_args, stdin_is_tty);
-    const title_status_enabled = stream_uses_tty and c.isatty(1) != 0;
-    // In passthrough mode the reconnecting process is OpenSSH's ProxyCommand.
-    // It only sees encrypted ssh transport bytes, so it cannot learn the
-    // terminal title from remote output or know whether the outer terminal is
-    // between control-sequence bytes. The parent relays decrypted stdout, tracks
-    // the latest remote title, and accepts small reconnect-status requests over
-    // this socket.
-    const title_status_path = if (title_status_enabled) try streamTitleStatusSocketPath(allocator, guid) else null;
+    const status_ui = streamReconnectStatusUi(stream_uses_tty, c.isatty(1) != 0);
+    const title_status_path = if (status_ui == .window_title) try streamTitleStatusSocketPath(allocator, guid) else null;
     defer if (title_status_path) |path| {
         std.fs.deleteFileAbsolute(path) catch {};
         allocator.free(path);
@@ -3206,6 +3203,22 @@ fn runStreamProxySsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArg
             return process_exit.request(255);
         },
     }
+}
+
+const StreamReconnectStatusUi = enum {
+    window_title,
+    stderr_plain,
+};
+
+fn streamReconnectStatusUi(stream_uses_tty: bool, client_stdout_is_tty: bool) StreamReconnectStatusUi {
+    _ = stream_uses_tty;
+    // Remote PTY allocation controls ssh's byte-stream semantics, but it is not
+    // the right signal for reconnect UI. If local stdout is a terminal, remote
+    // bytes are being displayed there, so the window title is the least invasive
+    // place for transient status. If stdout is redirected, OSC title bytes would
+    // corrupt that stream; use plain append-only stderr lines instead, even for
+    // the odd case where the remote side has a PTY.
+    return if (client_stdout_is_tty) .window_title else .stderr_plain;
 }
 
 fn streamProxyCommand(
@@ -5447,7 +5460,14 @@ test "passthrough title status suppresses updates after unsafe buffer overflow" 
     );
 }
 
-test "stream proxy command carries title status path only for tty streams" {
+test "stream reconnect status ui depends on local stdout" {
+    try std.testing.expectEqual(StreamReconnectStatusUi.window_title, streamReconnectStatusUi(true, true));
+    try std.testing.expectEqual(StreamReconnectStatusUi.stderr_plain, streamReconnectStatusUi(true, false));
+    try std.testing.expectEqual(StreamReconnectStatusUi.window_title, streamReconnectStatusUi(false, true));
+    try std.testing.expectEqual(StreamReconnectStatusUi.stderr_plain, streamReconnectStatusUi(false, false));
+}
+
+test "stream proxy command carries title status path when parent requests title ui" {
     const with_title = try streamProxyCommand(
         std.testing.allocator,
         "r-11111111-1111-4111-8111-111111111111",
@@ -5459,6 +5479,17 @@ test "stream proxy command carries title status path only for tty streams" {
     try std.testing.expect(std.mem.indexOf(u8, with_title, "--outer-tty") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_title, "--title-status-path") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_title, "'/tmp/sessh title'") != null);
+
+    const non_tty_stream_with_title = try streamProxyCommand(
+        std.testing.allocator,
+        "r-11111111-1111-4111-8111-111111111111",
+        .{ .options = &.{}, .host = "example.com" },
+        false,
+        "/tmp/sessh title",
+    );
+    defer std.testing.allocator.free(non_tty_stream_with_title);
+    try std.testing.expect(std.mem.indexOf(u8, non_tty_stream_with_title, "--outer-tty") == null);
+    try std.testing.expect(std.mem.indexOf(u8, non_tty_stream_with_title, "--title-status-path") != null);
 
     const without_title = try streamProxyCommand(
         std.testing.allocator,

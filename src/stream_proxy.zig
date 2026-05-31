@@ -903,21 +903,21 @@ fn sleepBeforeReconnect(status: *StreamReconnectStatus, delay_ms: u64) void {
 }
 
 // In ProxyCommand mode stdout is the ssh byte stream, so reconnect status must
-// never write there. Non-tty streams can use a repaintable stderr line. Tty
-// passthrough uses the window title instead, because stderr output would appear
-// inside the user's terminal session.
+// never write there. The parent process chooses window-title status when local
+// stdout is a terminal. Otherwise we write plain append-only lines to stderr so
+// redirected stdout remains byte-for-byte clean and logs do not contain cursor
+// movement or erase-line sequences.
 const StreamReconnectStatus = struct {
     const max_diagnostic_lines = 3;
     const Mode = enum {
         disabled,
-        stderr_line,
+        stderr_plain,
         window_title,
     };
 
     fd: c.fd_t,
     mode: Mode,
     owned_fd: bool = false,
-    visible: bool = false,
     line: [96]u8 = undefined,
     line_len: usize = 0,
     diagnostic_cursor: u64,
@@ -928,7 +928,7 @@ const StreamReconnectStatus = struct {
         const displayed = client_log.displayedUserDiagnosticSeq();
         return .{
             .fd = 2,
-            .mode = if (enabled) .stderr_line else .disabled,
+            .mode = if (enabled) .stderr_plain else .disabled,
             .diagnostic_cursor = displayed,
             .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
             .rendered_diagnostic_seq = displayed,
@@ -937,10 +937,9 @@ const StreamReconnectStatus = struct {
 
     fn initTitle(title_status_path: []const u8) StreamReconnectStatus {
         const displayed = client_log.displayedUserDiagnosticSeq();
-        // In tty passthrough the proxy only sees OpenSSH's ProxyCommand byte
-        // stream, not the decrypted terminal output. Send status requests to
-        // the parent relay so it can inject title changes only at safe parser
-        // boundaries.
+        // The proxy only sees OpenSSH's ProxyCommand byte stream, not the
+        // decrypted terminal output. Send status requests to the parent relay
+        // so it can inject title changes only at safe parser boundaries.
         const fd = socket_transport.connectSocket(title_status_path) catch {
             return .{
                 .fd = -1,
@@ -964,7 +963,7 @@ const StreamReconnectStatus = struct {
         const displayed = client_log.displayedUserDiagnosticSeq();
         return .{
             .fd = fd,
-            .mode = if (enabled) .stderr_line else .disabled,
+            .mode = if (enabled) .stderr_plain else .disabled,
             .diagnostic_cursor = displayed,
             .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
             .rendered_diagnostic_seq = displayed,
@@ -1004,8 +1003,8 @@ const StreamReconnectStatus = struct {
             .{delay},
         ) catch return;
         self.line_len = message.len;
-        self.refreshDiagnostics(false);
-        self.redrawLine();
+        self.refreshDiagnostics();
+        self.writePlainStatusLine();
     }
 
     fn showReconnecting(self: *StreamReconnectStatus) void {
@@ -1016,8 +1015,8 @@ const StreamReconnectStatus = struct {
         const message = "sessh: disconnected: Reconnecting...";
         @memcpy(self.line[0..message.len], message);
         self.line_len = message.len;
-        self.refreshDiagnostics(false);
-        self.redrawLine();
+        self.refreshDiagnostics();
+        self.writePlainStatusLine();
     }
 
     fn clear(self: *StreamReconnectStatus) void {
@@ -1025,31 +1024,22 @@ const StreamReconnectStatus = struct {
             self.sendTitleStatus("clear\n", .{});
             return;
         }
-        self.refreshDiagnostics(false);
-        self.clearLine();
+        self.refreshDiagnostics();
     }
 
     fn flushDiagnostics(self: *StreamReconnectStatus) void {
-        self.refreshDiagnostics(false);
+        self.refreshDiagnostics();
     }
 
-    fn clearLine(self: *StreamReconnectStatus) void {
-        if (self.mode != .stderr_line or !self.visible) return;
-        io.writeAll(self.fd, "\r\x1b[K") catch {};
-        self.visible = false;
-    }
-
-    fn redrawLine(self: *StreamReconnectStatus) void {
-        if (self.mode != .stderr_line) return;
+    fn writePlainStatusLine(self: *StreamReconnectStatus) void {
+        if (self.mode != .stderr_plain) return;
         const message = self.line[0..self.line_len];
-        io.writeAll(self.fd, "\r") catch return;
         io.writeAll(self.fd, message) catch return;
-        io.writeAll(self.fd, "\x1b[K") catch return;
-        self.visible = true;
+        io.writeAll(self.fd, "\n") catch return;
     }
 
-    fn refreshDiagnostics(self: *StreamReconnectStatus, redraw_after: bool) void {
-        if (self.mode != .stderr_line) return;
+    fn refreshDiagnostics(self: *StreamReconnectStatus) void {
+        if (self.mode != .stderr_plain) return;
         if (client_log.currentUserDiagnosticSeq() == self.rendered_diagnostic_seq) return;
 
         var diagnostics = [_]client_log.UserDiagnosticLine{.{}} ** max_diagnostic_lines;
@@ -1059,17 +1049,8 @@ const StreamReconnectStatus = struct {
             return;
         }
 
-        var wrote = false;
         for (&diagnostics) |*diagnostic| {
             if (diagnostic.seq == 0) continue;
-            if (!wrote and self.visible) {
-                // The retry countdown already owns the row the cursor is on.
-                // Reuse that row for the ssh diagnostic; writing a newline
-                // here leaves a blank row before every diagnostic.
-                io.writeAll(self.fd, "\r\x1b[K") catch return;
-                self.visible = false;
-            }
-            wrote = true;
 
             var line_buf: [client_log.max_user_diagnostic_display_bytes]u8 = undefined;
             const line = formatDiagnosticLine(
@@ -1084,7 +1065,6 @@ const StreamReconnectStatus = struct {
         self.diagnostic_cursor = new_cursor;
         self.rendered_diagnostic_seq = new_cursor;
         client_log.markUserDiagnosticsDisplayedThrough(new_cursor);
-        if (wrote and redraw_after and self.line_len > 0) self.redrawLine();
     }
 
     fn sendTitleStatus(self: *StreamReconnectStatus, comptime fmt: []const u8, args: anytype) void {
@@ -1277,7 +1257,7 @@ test "stream completion waits for eof acknowledgement" {
     try std.testing.expect(state.complete());
 }
 
-test "stream reconnect status uses stderr-style terminal line" {
+test "stream reconnect status uses plain stderr lines" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
@@ -1298,9 +1278,8 @@ test "stream reconnect status uses stderr-style terminal line" {
     }
 
     try std.testing.expectEqualStrings(
-        "\rsessh: disconnected: Retry connecting 1sec\x1b[K" ++
-            "\rsessh: disconnected: Reconnecting...\x1b[K" ++
-            "\r\x1b[K",
+        "sessh: disconnected: Retry connecting 1sec\n" ++
+            "sessh: disconnected: Reconnecting...\n",
         output.items,
     );
 }
@@ -1355,13 +1334,12 @@ test "stream reconnect status renders ssh diagnostics before status" {
 
     try std.testing.expectEqualStrings(
         "ssh: control sequence: ?[31mred\r\n" ++
-            "\rsessh: disconnected: Retry connecting 1sec\x1b[K" ++
-            "\r\x1b[K",
+            "sessh: disconnected: Retry connecting 1sec\n",
         output.items,
     );
 }
 
-test "stream reconnect status reuses visible status row for diagnostics" {
+test "stream reconnect status appends diagnostics after status line" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
@@ -1383,8 +1361,8 @@ test "stream reconnect status reuses visible status row for diagnostics" {
     }
 
     try std.testing.expectEqualStrings(
-        "\rsessh: disconnected: Retry connecting 1sec\x1b[K" ++
-            "\r\x1b[Kssh: connection failed\r\n",
+        "sessh: disconnected: Retry connecting 1sec\n" ++
+            "ssh: connection failed\r\n",
         output.items,
     );
 }
