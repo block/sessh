@@ -3847,9 +3847,11 @@ fn parseTranslatedMuxCommand(args: []const []const u8, index: *usize, parsed: *P
     } else if (std.mem.eql(u8, command, "kill")) {
         try parseTranslatedKillCommand(args, index, parsed, parse_options);
     } else if (std.mem.eql(u8, command, "detach")) {
-        try parseTranslatedClientControlCommand(args, index, parsed, parse_options, .detach_client, null);
+        index.* += 1;
+        try parseTranslatedClientControlTail(args, index, parsed, parse_options, .detach_client, null);
     } else if (std.mem.eql(u8, command, "repaint")) {
-        try parseTranslatedClientControlCommand(args, index, parsed, parse_options, .repaint_client, null);
+        index.* += 1;
+        try parseTranslatedClientControlTail(args, index, parsed, parse_options, .repaint_client, null);
     } else if (std.mem.eql(u8, command, "debug")) {
         try parseTranslatedDebugCommand(args, index, parsed, parse_options);
     } else {
@@ -4036,10 +4038,12 @@ fn parseTranslatedDebugCommand(args: []const []const u8, index: *usize, parsed: 
     else
         return error.InvalidDebugAction;
     index.* += 1;
-    try parseTranslatedClientControlCommand(args, index, parsed, parse_options, .debug_client, action);
+    try parseTranslatedClientControlTail(args, index, parsed, parse_options, .debug_client, action);
 }
 
-fn parseTranslatedClientControlCommand(
+// Parses the arguments after `detach`, `repaint`, or `debug <action>`. The
+// caller consumes those command words so one option grammar can be shared.
+fn parseTranslatedClientControlTail(
     args: []const []const u8,
     index: *usize,
     parsed: *ParsedSshArgs,
@@ -5217,6 +5221,8 @@ test "parseSshArgs accepts attach without an id after host" {
 }
 
 test "parseSshArgs accepts translated remote session commands after host" {
+    const client_guid = "c-11111111-1111-4111-8111-111111111111";
+
     const list = try parseSshArgs(&.{ "sesshmux", "example.com", "list" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.list, list.action);
 
@@ -5251,6 +5257,25 @@ test "parseSshArgs accepts translated remote session commands after host" {
     const kill_current = try parseSshArgs(&.{ "sesshmux", "example.com", "kill", "--current" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.kill, kill_current.action);
     try std.testing.expect(kill_current.kill_current);
+
+    const detach = try parseSshArgs(&.{ "sesshmux", "example.com", "detach", client_guid, "s1" }, .{ .allow_mux_command_words = true });
+    try std.testing.expectEqual(SshAction.detach_client, detach.action);
+    try std.testing.expectEqual(ClientTarget.client_guid, detach.client_target);
+    try std.testing.expectEqualStrings(client_guid, detach.client_guid.?);
+    try std.testing.expectEqualStrings("s1", detach.client_session_ref.?);
+
+    const repaint = try parseSshArgs(&.{ "sesshmux", "example.com", "repaint", "--last-input", "--scrollback", "s1" }, .{ .allow_mux_command_words = true });
+    try std.testing.expectEqual(SshAction.repaint_client, repaint.action);
+    try std.testing.expectEqual(ClientTarget.last_input, repaint.client_target);
+    try std.testing.expect(repaint.client_repaint_scrollback);
+    try std.testing.expectEqualStrings("s1", repaint.client_session_ref.?);
+
+    const debug = try parseSshArgs(&.{ "sesshmux", "example.com", "debug", "unresponsive-connection", "--seconds", "3", client_guid }, .{ .allow_mux_command_words = true });
+    try std.testing.expectEqual(SshAction.debug_client, debug.action);
+    try std.testing.expectEqual(DebugClientAction.unresponsive_connection, debug.debug_client_action.?);
+    try std.testing.expectEqualStrings("3", debug.debug_unresponsive_seconds.?);
+    try std.testing.expectEqual(ClientTarget.client_guid, debug.client_target);
+    try std.testing.expectEqualStrings(client_guid, debug.client_guid.?);
 }
 
 test "parseSshArgs rejects translated flags outside their command grammar" {
