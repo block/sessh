@@ -9,11 +9,13 @@ const config = @import("config.zig");
 const io = @import("io.zig");
 const process_exit = @import("process_exit.zig");
 const reconnect = @import("reconnect.zig");
+const reconnect_title = @import("reconnect_title.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
 const stream_proxy = @import("stream_proxy.zig");
 const terminal = @import("terminal.zig");
 const tty_transcript = @import("tty_transcript.zig");
+const vt = @import("vt.zig");
 
 const bootstrapper_script = @embedFile("bootstrapper.sh");
 const max_artifact_bytes = 64 * 1024 * 1024;
@@ -3129,18 +3131,18 @@ fn runStreamProxySsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArg
     const title_status_enabled = stream_uses_tty and c.isatty(1) != 0;
     // In passthrough mode the reconnecting process is OpenSSH's ProxyCommand.
     // It only sees encrypted ssh transport bytes, so it cannot learn the
-    // terminal title from remote output. When we want title-based reconnect UI,
-    // the parent relays decrypted stdout and records the latest remote title in
-    // this file. The ProxyCommand reads it when the connection recovers.
-    const title_status_path = if (title_status_enabled) try streamTitleStatusPath(allocator, guid) else null;
+    // terminal title from remote output or know whether the outer terminal is
+    // between control-sequence bytes. The parent relays decrypted stdout, tracks
+    // the latest remote title, and accepts small reconnect-status requests over
+    // this socket.
+    const title_status_path = if (title_status_enabled) try streamTitleStatusSocketPath(allocator, guid) else null;
     defer if (title_status_path) |path| {
         std.fs.deleteFileAbsolute(path) catch {};
         allocator.free(path);
     };
-    if (title_status_path) |path| {
-        const initial_title = std.process.getCwdAlloc(allocator) catch null;
-        defer if (initial_title) |title| allocator.free(title);
-        try writeWindowTitleStateFile(allocator, path, initial_title orelse "");
+    const title_status_listen_fd: c.fd_t = if (title_status_path) |path| try socket_transport.listenSocket(path) else -1;
+    defer {
+        if (title_status_listen_fd >= 0) _ = c.close(title_status_listen_fd);
     }
 
     const proxy_command = try streamProxyCommand(allocator, guid, parsed_ssh_args, stream_uses_tty, title_status_path);
@@ -3180,9 +3182,9 @@ fn runStreamProxySsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArg
     try child.spawn();
 
     var relay_error: ?anyerror = null;
-    if (title_status_path) |path| {
+    if (title_status_path != null) {
         if (child.stdout) |*stdout| {
-            relayStdoutAndTrackWindowTitle(allocator, stdout.handle, 1, path) catch |err| {
+            relayPassthroughStdoutWithTitleStatus(allocator, stdout.handle, 1, title_status_listen_fd) catch |err| {
                 relay_error = err;
                 terminateChild(&child);
             };
@@ -3248,14 +3250,14 @@ fn streamProxyCommand(
     return std.fmt.allocPrint(allocator, "-oProxyCommand={s}", .{command});
 }
 
-fn streamTitleStatusPath(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+fn streamTitleStatusSocketPath(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     const root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(root);
     try mkdirIgnoreExists(allocator, root);
     const stream_dir = try std.fmt.allocPrint(allocator, "{s}/r", .{root});
     defer allocator.free(stream_dir);
     try mkdirIgnoreExists(allocator, stream_dir);
-    return std.fmt.allocPrint(allocator, "{s}/{s}.title", .{ stream_dir, guid });
+    return std.fmt.allocPrint(allocator, "{s}/{s}.title.sock", .{ stream_dir, guid });
 }
 
 fn mkdirIgnoreExists(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -3267,48 +3269,373 @@ fn mkdirIgnoreExists(allocator: std.mem.Allocator, path: []const u8) !void {
     }
 }
 
-fn writeWindowTitleStateFile(allocator: std.mem.Allocator, path: []const u8, title: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ path, c.getpid() });
-    defer allocator.free(tmp_path);
-    std.fs.deleteFileAbsolute(tmp_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    errdefer std.fs.deleteFileAbsolute(tmp_path) catch {};
-
-    {
-        var file = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true, .mode = 0o600 });
-        defer file.close();
-        try file.writeAll(title);
-    }
-    try std.fs.renameAbsolute(tmp_path, path);
-}
-
-fn relayStdoutAndTrackWindowTitle(
+fn relayPassthroughStdoutWithTitleStatus(
     allocator: std.mem.Allocator,
     read_fd: c.fd_t,
     write_fd: c.fd_t,
-    title_status_path: []const u8,
+    title_status_listen_fd: c.fd_t,
 ) !void {
-    var tracker = WindowTitleTracker.init(allocator, title_status_path);
+    var relay = try PassthroughTitleRelay.init(allocator, write_fd);
+    defer relay.deinit();
+
+    var status_fd: c.fd_t = -1;
+    defer {
+        if (status_fd >= 0) _ = c.close(status_fd);
+    }
+
     while (true) {
-        var buf: [16 * 1024]u8 = undefined;
-        const n = c.read(read_fd, &buf, buf.len);
-        if (n < 0) switch (posix.errno(n)) {
-            .AGAIN, .INTR => continue,
-            else => return error.ReadFailed,
-        };
-        if (n == 0) return;
-        const bytes = buf[0..@intCast(n)];
-        tracker.feed(bytes);
-        try io.writeAll(write_fd, bytes);
+        var pollfds: [3]posix.pollfd = undefined;
+        var count: usize = 0;
+        const stdout_index = count;
+        pollfds[count] = .{ .fd = read_fd, .events = posix.POLL.IN, .revents = 0 };
+        count += 1;
+
+        var listen_index: ?usize = null;
+        if (title_status_listen_fd >= 0 and status_fd < 0) {
+            listen_index = count;
+            pollfds[count] = .{ .fd = title_status_listen_fd, .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
+        }
+
+        var status_index: ?usize = null;
+        if (status_fd >= 0) {
+            status_index = count;
+            pollfds[count] = .{ .fd = status_fd, .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
+        }
+
+        _ = try posix.poll(pollfds[0..count], -1);
+
+        if (listen_index) |index| {
+            if ((pollfds[index].revents & posix.POLL.IN) != 0) {
+                const accepted = c.accept(title_status_listen_fd, null, null);
+                if (accepted >= 0) {
+                    status_fd = accepted;
+                    socket_transport.setCloseOnExec(status_fd) catch {};
+                }
+            }
+        }
+
+        if (status_index) |index| {
+            if ((pollfds[index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+                var status_buf: [256]u8 = undefined;
+                const n = c.read(status_fd, &status_buf, status_buf.len);
+                if (n > 0) {
+                    try relay.feedStatusBytes(status_buf[0..@intCast(n)]);
+                } else {
+                    _ = c.close(status_fd);
+                    status_fd = -1;
+                }
+            }
+        }
+
+        if ((pollfds[stdout_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+            var buf: [16 * 1024]u8 = undefined;
+            const n = c.read(read_fd, &buf, buf.len);
+            if (n < 0) switch (posix.errno(n)) {
+                .AGAIN, .INTR => continue,
+                else => return error.ReadFailed,
+            };
+            if (n == 0) {
+                try relay.flushBufferedRemoteForEnd();
+                return;
+            }
+            try relay.feedRemoteBytes(buf[0..@intCast(n)]);
+        }
     }
 }
 
+// Owns all writes to the local terminal while tty passthrough is active. Remote
+// bytes are relayed unchanged, but we may need to inject a temporary reconnect
+// title between those bytes. To avoid corrupting a control sequence, bytes after
+// the last plain-text parser boundary are held in a small buffer. If that buffer
+// fills, we flush it and stop injecting local titles until the parser reaches a
+// boundary again.
+const PassthroughTitleRelay = struct {
+    // Synchronized-update applications commonly send a whole screen refresh
+    // between `CSI ? 2026 h` and `CSI ? 2026 l`. Keep enough pending bytes to
+    // handle ordinary full-screen redraws without giving up on title injection.
+    const unsafe_buffer_limit = 64 * 1024;
+    const max_status_line_bytes = 96;
+
+    output_fd: c.fd_t,
+    parser: *vt.SessionTerminal,
+    title_state: WindowTitleState = .{},
+    title_tracker: WindowTitleTracker,
+    sync_tracker: SynchronizedUpdateTracker = .{},
+    remote_buffer: [unsafe_buffer_limit]u8 = undefined,
+    remote_buffer_len: usize = 0,
+    remote_safe_prefix_len: usize = 0,
+    unsafe: bool = false,
+    status_visible: bool = false,
+    pending_clear: bool = false,
+    status_line: [max_status_line_bytes]u8 = undefined,
+    status_line_len: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, output_fd: c.fd_t) !PassthroughTitleRelay {
+        const size = terminal.currentWindowSize();
+        const parser = try vt.SessionTerminal.create(
+            allocator,
+            @max(size.rows, 1),
+            @max(size.cols, 1),
+            0,
+        );
+        errdefer parser.destroy();
+        var relay = PassthroughTitleRelay{
+            .output_fd = output_fd,
+            .parser = parser,
+            .title_tracker = undefined,
+        };
+        relay.title_tracker = WindowTitleTracker.init();
+        const fallback_title = std.process.getCwdAlloc(allocator) catch null;
+        defer if (fallback_title) |title| allocator.free(title);
+        relay.title_state.set(fallback_title orelse "");
+        return relay;
+    }
+
+    fn deinit(self: *PassthroughTitleRelay) void {
+        self.parser.destroy();
+        self.* = undefined;
+    }
+
+    fn feedStatusBytes(self: *PassthroughTitleRelay, bytes: []const u8) !void {
+        for (bytes) |byte| {
+            if (byte == '\n') {
+                try self.handleStatusLine(self.status_line[0..self.status_line_len]);
+                self.status_line_len = 0;
+                continue;
+            }
+            if (self.status_line_len == self.status_line.len) {
+                self.status_line_len = 0;
+                continue;
+            }
+            self.status_line[self.status_line_len] = byte;
+            self.status_line_len += 1;
+        }
+    }
+
+    fn handleStatusLine(self: *PassthroughTitleRelay, line: []const u8) !void {
+        if (std.mem.startsWith(u8, line, "retry ")) {
+            const delay_ms = std.fmt.parseInt(u64, line["retry ".len..], 10) catch return;
+            try self.showRetryTitle(delay_ms);
+        } else if (std.mem.eql(u8, line, "reconnecting")) {
+            try self.showReconnectingTitle();
+        } else if (std.mem.eql(u8, line, "clear")) {
+            try self.clearStatusTitle();
+        }
+    }
+
+    fn showRetryTitle(self: *PassthroughTitleRelay, delay_ms: u64) !void {
+        if (self.unsafe) return;
+        try reconnect_title.writeRetryTitle(self.output_fd, delay_ms);
+        self.status_visible = true;
+        self.pending_clear = false;
+    }
+
+    fn showReconnectingTitle(self: *PassthroughTitleRelay) !void {
+        if (self.unsafe) return;
+        try reconnect_title.writeReconnectingTitle(self.output_fd);
+        self.status_visible = true;
+        self.pending_clear = false;
+    }
+
+    fn clearStatusTitle(self: *PassthroughTitleRelay) !void {
+        if (!self.status_visible) return;
+        if (self.unsafe) {
+            self.pending_clear = true;
+            return;
+        }
+        try reconnect_title.writeTitle(self.output_fd, self.title_state.slice());
+        self.status_visible = false;
+        self.pending_clear = false;
+    }
+
+    fn feedRemoteBytes(self: *PassthroughTitleRelay, bytes: []const u8) !void {
+        var index: usize = 0;
+        while (index < bytes.len) {
+            if (self.unsafe) {
+                const start = index;
+                while (index < bytes.len) : (index += 1) {
+                    try self.feedParserByte(bytes[index]);
+                    if (self.isPassthroughInjectionSafePoint()) {
+                        index += 1;
+                        try io.writeAll(self.output_fd, bytes[start..index]);
+                        self.unsafe = false;
+                        try self.afterSafePoint();
+                        break;
+                    }
+                }
+                if (self.unsafe) {
+                    try io.writeAll(self.output_fd, bytes[start..]);
+                    return;
+                }
+                continue;
+            }
+
+            self.appendRemoteBufferByte(bytes[index]);
+            try self.feedParserByte(bytes[index]);
+            index += 1;
+
+            if (self.isPassthroughInjectionSafePoint()) {
+                self.remote_safe_prefix_len = self.remote_buffer_len;
+            }
+            if (self.remote_buffer_len == self.remote_buffer.len) {
+                try self.flushSafeRemotePrefix();
+                if (self.remote_buffer_len == self.remote_buffer.len) {
+                    try self.flushAllRemoteBuffer();
+                    self.unsafe = true;
+                }
+            }
+        }
+        try self.flushSafeRemotePrefix();
+    }
+
+    fn flushBufferedRemoteForEnd(self: *PassthroughTitleRelay) !void {
+        try self.flushAllRemoteBuffer();
+    }
+
+    fn appendRemoteBufferByte(self: *PassthroughTitleRelay, byte: u8) void {
+        self.remote_buffer[self.remote_buffer_len] = byte;
+        self.remote_buffer_len += 1;
+    }
+
+    fn flushSafeRemotePrefix(self: *PassthroughTitleRelay) !void {
+        if (self.remote_safe_prefix_len == 0) return;
+        try io.writeAll(self.output_fd, self.remote_buffer[0..self.remote_safe_prefix_len]);
+        const remaining = self.remote_buffer_len - self.remote_safe_prefix_len;
+        if (remaining > 0) {
+            std.mem.copyForwards(
+                u8,
+                self.remote_buffer[0..remaining],
+                self.remote_buffer[self.remote_safe_prefix_len..self.remote_buffer_len],
+            );
+        }
+        self.remote_buffer_len = remaining;
+        self.remote_safe_prefix_len = 0;
+        if (remaining == 0) try self.afterSafePoint();
+    }
+
+    fn flushAllRemoteBuffer(self: *PassthroughTitleRelay) !void {
+        if (self.remote_buffer_len == 0) return;
+        try io.writeAll(self.output_fd, self.remote_buffer[0..self.remote_buffer_len]);
+        self.remote_buffer_len = 0;
+        self.remote_safe_prefix_len = 0;
+    }
+
+    fn feedParserByte(self: *PassthroughTitleRelay, byte: u8) !void {
+        if (self.title_tracker.feedByte(byte)) |title| self.title_state.set(title);
+        self.sync_tracker.feedByte(byte);
+        var one = [_]u8{byte};
+        try self.parser.feed(&one);
+    }
+
+    fn isPassthroughInjectionSafePoint(self: *const PassthroughTitleRelay) bool {
+        return self.parser.isPlainTextParserBoundary() and !self.sync_tracker.active;
+    }
+
+    fn afterSafePoint(self: *PassthroughTitleRelay) !void {
+        if (self.pending_clear) try self.clearStatusTitle();
+    }
+};
+
+const WindowTitleState = struct {
+    const max_title_bytes = 512;
+
+    title: [max_title_bytes]u8 = [_]u8{0} ** max_title_bytes,
+    title_len: usize = 0,
+
+    fn set(self: *WindowTitleState, title: []const u8) void {
+        self.title_len = @min(self.title.len, title.len);
+        @memcpy(self.title[0..self.title_len], title[0..self.title_len]);
+    }
+
+    fn slice(self: *const WindowTitleState) []const u8 {
+        return self.title[0..self.title_len];
+    }
+};
+
+// Synchronized update mode is started with `CSI ? 2026 h` and ended with
+// `CSI ? 2026 l`. After the start sequence, the normal VT parser is already
+// back at a plain-text boundary, but the terminal is intentionally holding
+// presentation updates. If we injected a reconnect title then, the user would
+// not see it until the remote app ended the synchronized update. We treat the
+// terminal as not ready for local title injection until the matching end
+// sequence has passed through.
+const SynchronizedUpdateTracker = struct {
+    const max_csi_bytes = 32;
+
+    const State = enum {
+        ground,
+        esc,
+        csi,
+    };
+
+    active: bool = false,
+    state: State = .ground,
+    csi: [max_csi_bytes]u8 = undefined,
+    csi_len: usize = 0,
+
+    fn feed(self: *SynchronizedUpdateTracker, bytes: []const u8) void {
+        for (bytes) |byte| self.feedByte(byte);
+    }
+
+    fn feedByte(self: *SynchronizedUpdateTracker, byte: u8) void {
+        switch (self.state) {
+            .ground => {
+                if (byte == 0x1b) {
+                    self.state = .esc;
+                } else if (byte == 0x9b) {
+                    self.startCsi();
+                }
+            },
+            .esc => {
+                if (byte == '[') {
+                    self.startCsi();
+                } else if (byte != 0x1b) {
+                    self.state = .ground;
+                }
+            },
+            .csi => {
+                if (isCsiFinalByte(byte)) {
+                    self.finishCsi(byte);
+                    self.state = .ground;
+                } else if (self.csi_len < self.csi.len) {
+                    self.csi[self.csi_len] = byte;
+                    self.csi_len += 1;
+                }
+            },
+        }
+    }
+
+    fn startCsi(self: *SynchronizedUpdateTracker) void {
+        self.state = .csi;
+        self.csi_len = 0;
+    }
+
+    fn finishCsi(self: *SynchronizedUpdateTracker, final: u8) void {
+        const params = self.csi[0..self.csi_len];
+        if (!csiContainsPrivateMode(params, "2026")) return;
+        if (final == 'h') self.active = true;
+        if (final == 'l') self.active = false;
+    }
+};
+
+fn isCsiFinalByte(byte: u8) bool {
+    return byte >= 0x40 and byte <= 0x7e;
+}
+
+fn csiContainsPrivateMode(params: []const u8, mode: []const u8) bool {
+    if (params.len == 0 or params[0] != '?') return false;
+    var fields = std.mem.splitScalar(u8, params[1..], ';');
+    while (fields.next()) |field| {
+        if (std.mem.eql(u8, field, mode)) return true;
+    }
+    return false;
+}
+
 // Watches the decrypted terminal byte stream for OSC 0/2 title updates while
-// still relaying the bytes unchanged. The title-status file is deliberately
-// tiny and overwritten atomically because the ProxyCommand may read it at the
-// same time it is deciding which title to restore after reconnect.
+// still relaying the bytes unchanged. The passthrough reconnect UI uses this
+// remembered app title when it clears a temporary local status title.
 const WindowTitleTracker = struct {
     const max_command_bytes = 8;
     const max_title_bytes = 512;
@@ -3320,8 +3647,6 @@ const WindowTitleTracker = struct {
         osc_text_esc,
     };
 
-    allocator: std.mem.Allocator,
-    title_status_path: []const u8,
     state: State = .ground,
     command: [max_command_bytes]u8 = undefined,
     command_len: usize = 0,
@@ -3329,18 +3654,19 @@ const WindowTitleTracker = struct {
     title_len: usize = 0,
     tracking_title: bool = false,
 
-    fn init(allocator: std.mem.Allocator, title_status_path: []const u8) WindowTitleTracker {
-        return .{
-            .allocator = allocator,
-            .title_status_path = title_status_path,
-        };
+    fn init() WindowTitleTracker {
+        return .{};
     }
 
-    fn feed(self: *WindowTitleTracker, bytes: []const u8) void {
-        for (bytes) |byte| self.feedByte(byte);
+    fn feed(self: *WindowTitleTracker, bytes: []const u8) ?[]const u8 {
+        var latest_title: ?[]const u8 = null;
+        for (bytes) |byte| {
+            if (self.feedByte(byte)) |title| latest_title = title;
+        }
+        return latest_title;
     }
 
-    fn feedByte(self: *WindowTitleTracker, byte: u8) void {
+    fn feedByte(self: *WindowTitleTracker, byte: u8) ?[]const u8 {
         switch (self.state) {
             .ground => {
                 if (byte == 0x1b) self.state = .esc;
@@ -3372,7 +3698,7 @@ const WindowTitleTracker = struct {
             },
             .osc_text => {
                 if (byte == 0x07) {
-                    self.finishTitle();
+                    return self.finishTitle();
                 } else if (byte == 0x1b) {
                     self.state = .osc_text_esc;
                 } else {
@@ -3381,12 +3707,13 @@ const WindowTitleTracker = struct {
             },
             .osc_text_esc => {
                 if (byte == '\\') {
-                    self.finishTitle();
+                    return self.finishTitle();
                 } else {
                     self.state = .ground;
                 }
             },
         }
+        return null;
     }
 
     fn appendTitleByte(self: *WindowTitleTracker, byte: u8) void {
@@ -3395,14 +3722,13 @@ const WindowTitleTracker = struct {
         self.title_len += 1;
     }
 
-    fn finishTitle(self: *WindowTitleTracker) void {
-        if (self.tracking_title) {
-            writeWindowTitleStateFile(self.allocator, self.title_status_path, self.title[0..self.title_len]) catch {};
-        }
+    fn finishTitle(self: *WindowTitleTracker) ?[]const u8 {
+        const title = if (self.tracking_title) self.title[0..self.title_len] else null;
         self.state = .ground;
         self.command_len = 0;
         self.title_len = 0;
         self.tracking_title = false;
+        return title;
     }
 };
 
@@ -4987,56 +5313,138 @@ test "shellQuote produces single-quoted shell words" {
 }
 
 test "window title tracker records remote OSC title changes" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "title", .data = "initial" });
-    const title_path = try tmp.dir.realpathAlloc(std.testing.allocator, "title");
-    defer std.testing.allocator.free(title_path);
+    var title_state = WindowTitleState{};
+    title_state.set("initial");
+    var tracker = WindowTitleTracker.init();
 
-    var tracker = WindowTitleTracker.init(std.testing.allocator, title_path);
-    tracker.feed("before\x1b]2;remote");
-    tracker.feed("-title\x1b\\after");
+    try std.testing.expect(tracker.feed("before\x1b]2;remote") == null);
+    if (tracker.feed("-title\x1b\\after")) |title| title_state.set(title);
+    try std.testing.expectEqualStrings("remote-title", title_state.slice());
 
-    const title1 = try tmp.dir.readFileAlloc(std.testing.allocator, "title", 1024);
-    defer std.testing.allocator.free(title1);
-    try std.testing.expectEqualStrings("remote-title", title1);
+    if (tracker.feed("\x1b]1;ignored\x07")) |title| title_state.set(title);
+    try std.testing.expectEqualStrings("remote-title", title_state.slice());
 
-    tracker.feed("\x1b]1;ignored\x07");
-    const title2 = try tmp.dir.readFileAlloc(std.testing.allocator, "title", 1024);
-    defer std.testing.allocator.free(title2);
-    try std.testing.expectEqualStrings("remote-title", title2);
-
-    tracker.feed("\x1b]0;both-title\x07");
-    const title3 = try tmp.dir.readFileAlloc(std.testing.allocator, "title", 1024);
-    defer std.testing.allocator.free(title3);
-    try std.testing.expectEqualStrings("both-title", title3);
+    if (tracker.feed("\x1b]0;both-title\x07")) |title| title_state.set(title);
+    try std.testing.expectEqualStrings("both-title", title_state.slice());
 }
 
 test "passthrough title relay parses remote output for later restore" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "title", .data = "initial" });
-    const title_path = try tmp.dir.realpathAlloc(std.testing.allocator, "title");
-    defer std.testing.allocator.free(title_path);
-
-    const input = try posix.pipe();
-    defer posix.close(input[0]);
     const output = try posix.pipe();
     defer posix.close(output[0]);
 
-    try io.writeAll(input[1], "plain\x1b]2;parsed-title\x07text");
-    posix.close(input[1]);
+    var relay = try PassthroughTitleRelay.init(std.testing.allocator, output[1]);
+    defer relay.deinit();
+    relay.title_state.set("initial");
 
-    try relayStdoutAndTrackWindowTitle(std.testing.allocator, input[0], output[1], title_path);
+    try relay.feedRemoteBytes("plain\x1b]2;parsed-title\x07text");
     posix.close(output[1]);
 
     var relayed_buf: [64]u8 = undefined;
     const relayed_len = try posix.read(output[0], &relayed_buf);
     try std.testing.expectEqualStrings("plain\x1b]2;parsed-title\x07text", relayed_buf[0..relayed_len]);
 
-    const title = try tmp.dir.readFileAlloc(std.testing.allocator, "title", 1024);
-    defer std.testing.allocator.free(title);
-    try std.testing.expectEqualStrings("parsed-title", title);
+    try std.testing.expectEqualStrings("parsed-title", relay.title_state.slice());
+}
+
+test "passthrough title status is emitted before a buffered partial control sequence" {
+    const output = try posix.pipe();
+    defer posix.close(output[0]);
+
+    var relay = try PassthroughTitleRelay.init(std.testing.allocator, output[1]);
+    defer relay.deinit();
+    relay.title_state.set("initial");
+
+    try relay.feedRemoteBytes("plain\x1b]2;remote");
+    try relay.handleStatusLine("retry 12000");
+    try relay.feedRemoteBytes("-title\x1b\\after");
+    try relay.handleStatusLine("clear");
+    posix.close(output[1]);
+
+    var output_bytes: std.ArrayList(u8) = .empty;
+    defer output_bytes.deinit(std.testing.allocator);
+    while (true) {
+        var buf: [128]u8 = undefined;
+        const n = c.read(output[0], &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try output_bytes.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try std.testing.expectEqualStrings(
+        "plain" ++
+            "\x1b]2;12sec until retry connect\x1b\\" ++
+            "\x1b]2;remote-title\x1b\\after" ++
+            "\x1b]2;remote-title\x1b\\",
+        output_bytes.items,
+    );
+}
+
+test "passthrough title status treats synchronized update as unsafe until end marker" {
+    const output = try posix.pipe();
+    defer posix.close(output[0]);
+
+    var relay = try PassthroughTitleRelay.init(std.testing.allocator, output[1]);
+    defer relay.deinit();
+    relay.title_state.set("initial");
+
+    try relay.feedRemoteBytes("plain\x1b[?2026hdraw");
+    try relay.handleStatusLine("retry 12000");
+    try relay.feedRemoteBytes("\x1b[?2026l");
+    try relay.handleStatusLine("clear");
+    posix.close(output[1]);
+
+    var output_bytes: std.ArrayList(u8) = .empty;
+    defer output_bytes.deinit(std.testing.allocator);
+    while (true) {
+        var buf: [128]u8 = undefined;
+        const n = c.read(output[0], &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try output_bytes.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try std.testing.expectEqualStrings(
+        "plain" ++
+            "\x1b]2;12sec until retry connect\x1b\\" ++
+            "\x1b[?2026hdraw\x1b[?2026l" ++
+            "\x1b]2;initial\x1b\\",
+        output_bytes.items,
+    );
+}
+
+test "passthrough title status suppresses updates after unsafe buffer overflow" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile("output", .{ .read = true });
+    defer output.close();
+
+    var relay = try PassthroughTitleRelay.init(std.testing.allocator, output.handle);
+    defer relay.deinit();
+    relay.title_state.set("initial");
+
+    const partial = try std.testing.allocator.alloc(u8, PassthroughTitleRelay.unsafe_buffer_limit);
+    defer std.testing.allocator.free(partial);
+    @memcpy(partial[0..4], "\x1b]2;");
+    @memset(partial[4..], 'a');
+    try relay.feedRemoteBytes(partial);
+    try relay.handleStatusLine("retry 12000");
+    try std.testing.expect(relay.unsafe);
+    try std.testing.expect(!relay.status_visible);
+
+    try relay.feedRemoteBytes("\x07");
+    try std.testing.expect(!relay.unsafe);
+    try relay.handleStatusLine("retry 1000");
+    try output.seekTo(0);
+    const output_bytes = try output.readToEndAlloc(std.testing.allocator, PassthroughTitleRelay.unsafe_buffer_limit + 1024);
+    defer std.testing.allocator.free(output_bytes);
+
+    try std.testing.expectEqual(@as(usize, partial.len + 1 + "\x1b]2;1sec until retry connect\x1b\\".len), output_bytes.len);
+    try std.testing.expectEqualStrings(partial, output_bytes[0..partial.len]);
+    try std.testing.expectEqual(@as(u8, 0x07), output_bytes[partial.len]);
+    try std.testing.expectEqualStrings(
+        "\x1b]2;1sec until retry connect\x1b\\",
+        output_bytes[partial.len + 1 ..],
+    );
 }
 
 test "stream proxy command carries title status path only for tty streams" {
