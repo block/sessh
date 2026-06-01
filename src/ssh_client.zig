@@ -24,6 +24,18 @@ const default_ipqos_option_prefix = "-oIPQoS=";
 const ssh_config_query_max_output_bytes = 256 * 1024;
 const client_list_target_help = "incoming, outgoing, session, or a guid/alias";
 
+const BootstrapEntrypoint = enum {
+    session_broker,
+    stream_broker,
+
+    fn arg(self: BootstrapEntrypoint) []const u8 {
+        return switch (self) {
+            .session_broker => ":internal-session-broker:",
+            .stream_broker => ":internal-stream-broker:",
+        };
+    }
+};
+
 const SshTtyRequest = enum {
     none,
     requested,
@@ -45,6 +57,7 @@ const ArtifactSet = struct {
     fn sendExec(
         self: *const ArtifactSet,
         fd: c.fd_t,
+        entrypoint: BootstrapEntrypoint,
         broker_args: []const []const u8,
         reconnect_ui: ?*client.ReconnectUi,
         poll_reconnect_input: bool,
@@ -56,6 +69,8 @@ const ArtifactSet = struct {
             try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_ui, poll_reconnect_input);
         }
         try writeAllMaybeCancellable(fd, " --", reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, entrypoint.arg(), reconnect_ui, poll_reconnect_input);
         for (broker_args) |arg| {
             if (!isPlainShellArg(arg)) return error.UnsafeBrokerArgument;
             try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
@@ -230,6 +245,7 @@ const ParallelReconnectState = struct {
     parsed_ssh_args: ParsedSshArgs,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
+    bootstrap_entrypoint: BootstrapEntrypoint,
     broker_args: []const []const u8,
     reconnect_ui: *client.ReconnectUi,
     session: client.RuntimeSession,
@@ -1145,11 +1161,12 @@ fn sesshLongOptionMissingValueError(arg: []const u8) anyerror {
 
 /// Start the ssh transport by running the bootstrapper as the remote command.
 ///
-/// The bootstrapper eventually execs `sesshmux :internal-session-broker:`, at which
-/// point the normal framed runtime protocol can flow over ssh stdio. Installed
-/// packages keep one binary per supported platform in libexec/sessh, named
-/// `sesshmux-<os>-<arch>`. If that layout is unavailable, upload the current
-/// binary for same-platform development tests.
+/// The bootstrapper installs or finds the remote sesshmux binary, then execs
+/// the internal entrypoint we send in the EXEC line. For normal sessions that
+/// is `:internal-session-broker:`; direct streams use `:internal-stream-broker:`.
+/// Installed packages keep one binary per supported platform in libexec/sessh,
+/// named `sesshmux-<os>-<arch>`. If that layout is unavailable, upload the
+/// current binary for same-platform development tests.
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     return runWithParseOptions(allocator, args, .{});
 }
@@ -1247,6 +1264,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             parsed_ssh_args,
             artifacts,
             command_remote_command,
+            .session_broker,
             broker_args,
             false,
             null,
@@ -1303,6 +1321,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         parsed_ssh_args,
         artifacts,
         remote_command,
+        .session_broker,
         broker_args,
         false,
         null,
@@ -1532,6 +1551,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                 parsed_ssh_args,
                 artifacts,
                 remote_command,
+                .session_broker,
                 broker_args,
                 true,
                 &reconnect_ui,
@@ -2445,6 +2465,7 @@ fn raceExistingConnectionWithReconnectAttempt(
         .parsed_ssh_args = parsed_ssh_args,
         .artifacts = artifacts,
         .remote_command = remote_command,
+        .bootstrap_entrypoint = .session_broker,
         .broker_args = broker_args,
         .reconnect_ui = reconnect_ui,
         .session = session.*,
@@ -2669,6 +2690,7 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
         state.parsed_ssh_args,
         state.artifacts,
         state.remote_command,
+        state.bootstrap_entrypoint,
         state.broker_args,
         true,
         state.reconnect_ui,
@@ -2793,6 +2815,7 @@ fn startRuntimeConnection(
     parsed_ssh_args: ParsedSshArgs,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
+    bootstrap_entrypoint: BootstrapEntrypoint,
     broker_args: []const []const u8,
     batch_mode: bool,
     reconnect_ui: ?*client.ReconnectUi,
@@ -2838,7 +2861,7 @@ fn startRuntimeConnection(
 
     const artifact_set = artifacts orelse return connection;
 
-    artifact_set.sendExec(connection.child.stdin.?.handle, broker_args, reconnect_ui, poll_reconnect_input) catch |err| {
+    artifact_set.sendExec(connection.child.stdin.?.handle, bootstrap_entrypoint, broker_args, reconnect_ui, poll_reconnect_input) catch |err| {
         const term = connection.wait() catch null;
         if (bootstrap_failure_term) |term_out| term_out.* = term;
         return err;
@@ -3003,6 +3026,7 @@ const StreamClientStarter = struct {
     parsed_ssh_args: ParsedSshArgs,
     artifacts: *const ArtifactSet,
     remote_command: []const u8,
+    bootstrap_entrypoint: BootstrapEntrypoint,
     broker_args: []const []const u8,
     stderr_mode: SshStderrMode,
     last_failure_mutex: std.Thread.Mutex = .{},
@@ -3016,6 +3040,7 @@ const StreamClientStarter = struct {
             self.parsed_ssh_args,
             self.artifacts,
             self.remote_command,
+            self.bootstrap_entrypoint,
             self.broker_args,
             true,
             null,
@@ -3080,7 +3105,6 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
     defer allocator.free(cols_arg);
     const mode_arg = if (stream_uses_tty) "pty" else "pipe";
     const broker_args = [_][]const u8{
-        ":internal-stream-broker:",
         stream_guid,
         mode_arg,
         rows_arg,
@@ -3100,6 +3124,7 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
         .parsed_ssh_args = parsed_transport_args,
         .artifacts = &artifacts,
         .remote_command = remote_command,
+        .bootstrap_entrypoint = .stream_broker,
         .broker_args = broker_args[0..],
         .stderr_mode = .forward,
     };

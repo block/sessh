@@ -153,13 +153,13 @@ artifact_set_id=$2
 is_safe_relpath "$artifact_set_id" || err INVALID_EXEC invalid_artifact_set_id
 shift 2
 
-broker_args=
 exec_args=
 hashes=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--" ]; then
     shift
-    broker_args="$*"
+    [ "$#" -gt 0 ] || err INVALID_EXEC missing_exec_command
+    exec_args="$*"
     break
   fi
   is_sha256 "$1" || err INVALID_EXEC invalid_sha256
@@ -167,10 +167,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-case "$broker_args" in
-  :internal-*) exec_args=$broker_args ;;
-  *) exec_args=":internal-session-broker: $broker_args" ;;
-esac
+[ -n "$exec_args" ] || err INVALID_EXEC missing_exec_command
 
 cache_root=${XDG_CACHE_HOME:-${HOME:-}/.cache}/sessh/bin
 [ "$cache_root" != "/.cache/sessh/bin" ] || err INVALID_ENV missing_cache_home
