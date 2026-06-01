@@ -5,7 +5,7 @@ const io = @import("io.zig");
 
 /// Shared title-bar status helpers for reconnect UI.
 ///
-/// Normal sessh reconnects and stream passthrough reconnects have different
+/// Normal sessh reconnects and no-terminal-emulator reconnects have different
 /// places they can draw text, but the title-bar wording and OSC title escaping
 /// should stay identical. These helpers only write temporary local status; the
 /// caller still decides what title is safe to restore afterward.

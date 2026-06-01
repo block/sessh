@@ -140,7 +140,8 @@ message TerminalSize {
 // termios struct, because those layouts and flag values are OS-specific.
 message TtySettings {
   // TERM value from the client environment. This is only present when the
-  // remote PTY exposes the client's real terminal, such as passthrough mode.
+  // remote PTY exposes the client's real terminal, such as no-terminal-emulator
+  // mode.
   // Normal sessh sessions leave this absent so the remote advertises sessh's
   // terminal-emulator TERM instead. Empty is meaningful when the client had
   // TERM set to an empty string.

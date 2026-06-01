@@ -104,6 +104,7 @@ pub const FileConfig = struct {
     initial_scrollback_row_count_set: bool = false,
     client_log_level: ?client_log.Level = null,
     bootstrap: ?bool = null,
+    terminal_emulator: ?bool = null,
 };
 
 pub fn loadFileConfig(allocator: std.mem.Allocator) !FileConfig {
@@ -164,6 +165,8 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
             parsed.client_log_level = try client_log.parseLevel(value);
         } else if (keyMatches(key, "bootstrap")) {
             parsed.bootstrap = try parseBool(value);
+        } else if (keyMatches(key, "terminal-emulator")) {
+            parsed.terminal_emulator = try parseBool(value);
         } else {
             return error.UnknownConfigKey;
         }
@@ -1542,6 +1545,7 @@ test "parseEnvConfig accepts sessh env keys" {
         \\initial-scrollback=0
         \\client-log-level=debug
         \\bootstrap=false
+        \\terminal-emulator=no
         \\
     );
 
@@ -1554,6 +1558,7 @@ test "parseEnvConfig accepts sessh env keys" {
     try std.testing.expectEqual(@as(?u32, 0), parsed.initial_scrollback_row_count);
     try std.testing.expectEqual(@as(?client_log.Level, .debug), parsed.client_log_level);
     try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
+    try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
 }
 
 test "parseEnvConfig maps initial scrollback minus one to all retained rows" {

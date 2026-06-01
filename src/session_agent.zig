@@ -521,7 +521,7 @@ const PresentationState = struct {
     // Sometimes child output can be forwarded unchanged instead of converted
     // into a synthetic redraw. Only do that when it cannot disturb hidden
     // state that PresentationState is tracking.
-    fn canApplyPlainPassthrough(
+    fn canApplyPlainReplay(
         self: *const PresentationState,
         screen: *const vt.RenderedScreen,
         align_viewport: bool,
@@ -542,7 +542,7 @@ const PresentationState = struct {
             return false;
         }
         if (!parser_boundary_ok) return false;
-        if (!isSafePlainPassthrough(bytes)) return false;
+        if (!isSafePlainReplay(bytes)) return false;
         if (!rowsHaveOnlyDefaultPresentation(screen.rows)) return false;
         if (!self.terminal_modes_initialized or
             !self.terminal_modes.eql(vtModesToClient(screen.modes)))
@@ -559,8 +559,8 @@ const PresentationState = struct {
         return true;
     }
 
-    // Update our cache after raw output was passed through successfully.
-    fn assumePlainPassthroughScreen(self: *PresentationState, session_rows: u16, screen: *const vt.RenderedScreen) !void {
+    // Update our cache after original plain output was replayed successfully.
+    fn assumePlainReplayScreen(self: *PresentationState, session_rows: u16, screen: *const vt.RenderedScreen) !void {
         if (screen.active_screen > 1) return error.InvalidActiveScreen;
         if (self.active_screen != screen.active_screen) return error.ActiveScreenSwitchRequiresDraw;
         self.initialized = true;
@@ -772,7 +772,7 @@ fn rowsHaveOnlyDefaultPresentation(rows: []const vt.RenderedRow) bool {
     return true;
 }
 
-fn isSafePlainPassthrough(bytes: []const u8) bool {
+fn isSafePlainReplay(bytes: []const u8) bool {
     if (bytes.len == 0) return false;
     // Starting at libghostty-vt ground state plus this byte allowlist preserves
     // ground state: there is no ESC/control introducer and no partial UTF-8.
@@ -2362,15 +2362,15 @@ fn queueScrollbackRowsAndScreenDraw(
     if (rows.len == 0) return;
     if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
 
-    const passthrough = session.pending_plain_output.items;
-    if (try attachment.presentation.canApplyPlainPassthrough(
+    const plain_replay = session.pending_plain_output.items;
+    if (try attachment.presentation.canApplyPlainReplay(
         screen,
         align_viewport,
-        passthrough,
+        plain_replay,
         session.pendingPlainOutputCanReplay(),
     )) {
-        try attachment.presentation.assumePlainPassthroughScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, screen.title_present, null);
+        try attachment.presentation.assumePlainReplayScreen(session.rows, screen);
+        try queueDrawFrame(attachment, session, scrollback_cursor, plain_replay, screen.title_present, null);
         return;
     }
 
@@ -2466,15 +2466,15 @@ fn queueScreenDraw(
     align_viewport: bool,
     scrollback_cursor: u64,
 ) !bool {
-    const passthrough = session.pending_plain_output.items;
-    if (try attachment.presentation.canApplyPlainPassthrough(
+    const plain_replay = session.pending_plain_output.items;
+    if (try attachment.presentation.canApplyPlainReplay(
         screen,
         align_viewport,
-        passthrough,
+        plain_replay,
         session.pendingPlainOutputCanReplay(),
     )) {
-        try attachment.presentation.assumePlainPassthroughScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, scrollback_cursor, passthrough, screen.title_present, null);
+        try attachment.presentation.assumePlainReplayScreen(session.rows, screen);
+        try queueDrawFrame(attachment, session, scrollback_cursor, plain_replay, screen.title_present, null);
         return true;
     }
 
@@ -3246,9 +3246,9 @@ fn flushSessionRenderBarrier(session_agent: *SessionAgent, session_index: usize,
     const model = session.terminal_model orelse return;
 
     // A render barrier means the current VT state must be queued before the
-    // following terminal transition is applied. Raw passthrough cannot cross
-    // this boundary because the bytes before the barrier are already inside
-    // the VT model and may not match the bytes currently buffered here.
+    // following terminal transition is applied. Original-byte replay cannot
+    // cross this boundary because the bytes before the barrier are already
+    // inside the VT model and may not match the bytes currently buffered here.
     session.clearPendingPlainOutput();
     broadcastSessionPatch(session_agent, session_index);
     session.clearPendingPlainOutput();

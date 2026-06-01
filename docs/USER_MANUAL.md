@@ -8,9 +8,10 @@ like `ssh`:
 sessh [ssh-option ...] destination [command [argument ...]]
 ```
 
-`sessh` connection recovery is limited to interactive use cases (when no
-command is provided). Non-interactive invocation will cause `sessh` to fallback
-to plain `ssh`.
+`sessh` connection recovery is strongest for interactive sessions, but remote
+commands can also use sessh's reconnectable stream path when their stdin/stdout
+shape can be preserved. If sessh cannot safely preserve ssh behavior, it falls
+back to plain `ssh`.
 
 If the `ssh` disconnects while `sessh` is running interactively then it will
 retry the connection in the background (with exponential backoff) and reattach
@@ -42,6 +43,10 @@ sessh [[ssh-option|sessh-option] ...] destination [command [argument ...]]
   the alias on the remote host and cache a local route after the first attach.
 - `--log-level quiet|error|warn|info|debug|verbose`: override
   `client-log-level` for the local client.
+- `--terminal-emulator` / `--no-terminal-emulator`: enable or disable sessh's
+  terminal emulator for this connection. Disabling it carries bytes over the
+  reconnectable stream directly, which better preserves terminal features sessh
+  does not model. The positive form is mainly useful for overriding config.
 
 Sessh-specific behavior is configured in the config file documented below.
 
@@ -65,6 +70,7 @@ scrollback-limit=2000
 initial-scrollback=-1
 client-log-level=warn
 bootstrap=true
+terminal-emulator=true
 ```
 
 - `leader`: set the leader key for client commands or disable with `None`. The
@@ -80,6 +86,10 @@ bootstrap=true
   attached and displayed upon detach.
 - `bootstrap`: enable or disable loading the `sessh` binary onto hosts. If
   disabled, `sessh` will attempt to find itself remotely in `$PATH`.
+- `terminal-emulator`: enable or disable sessh's terminal emulator by default.
+  `false`/`no` and `true`/`yes` are accepted. Disabling it is equivalent to
+  passing `--no-terminal-emulator`; `--terminal-emulator` enables it for a
+  single invocation.
 
 ## Mux Commands
 

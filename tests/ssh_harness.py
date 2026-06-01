@@ -688,16 +688,17 @@ def run_sesshmux_in_pty(
         os.close(fd)
 
 
-def set_passthrough_tty_mode_probe(fd):
+def set_no_terminal_emulator_tty_mode_probe(fd):
     # This runs in the child side of pty.fork before sessh starts, so sessh
-    # should capture these modes and apply them to the remote passthrough PTY.
+    # should capture these modes and apply them to the remote
+    # no-terminal-emulator PTY.
     attrs = termios.tcgetattr(fd)
     attrs[0] &= ~termios.ICRNL
     attrs[3] &= ~(termios.ECHO | termios.ICANON)
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
-def set_passthrough_output_mode_probe(fd):
+def set_no_terminal_emulator_output_mode_probe(fd):
     attrs = termios.tcgetattr(fd)
     attrs[1] &= ~termios.OPOST
     if hasattr(termios, "ONLCR"):
@@ -1729,7 +1730,7 @@ def test_ssh_tty_stdin_remote_command_does_not_allocate_tty_without_t(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_non_passthrough_tty_preserves_exit_status(tmp):
+def test_ssh_terminal_emulator_tty_preserves_exit_status(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1752,7 +1753,7 @@ def test_ssh_non_passthrough_tty_preserves_exit_status(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_non_passthrough_tty_propagates_resize(tmp):
+def test_ssh_terminal_emulator_tty_propagates_resize(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1776,7 +1777,7 @@ def test_ssh_non_passthrough_tty_propagates_resize(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_passthrough_remote_command_uses_direct_stream(tmp):
+def test_ssh_no_terminal_emulator_remote_command_uses_direct_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1785,7 +1786,7 @@ def test_ssh_passthrough_remote_command_uses_direct_stream(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     seed_remote_artifact_cache(env)
 
-    result = run_sessh(["--passthrough", "test-host", "echo", "hello"], env, timeout=5.0)
+    result = run_sessh(["--no-terminal-emulator", "test-host", "echo", "hello"], env, timeout=5.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -1798,7 +1799,7 @@ def test_ssh_passthrough_remote_command_uses_direct_stream(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_passthrough_remote_command_preserves_exit_status(tmp):
+def test_ssh_no_terminal_emulator_remote_command_preserves_exit_status(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1807,13 +1808,13 @@ def test_ssh_passthrough_remote_command_preserves_exit_status(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     seed_remote_artifact_cache(env)
 
-    result = run_sessh(["--passthrough", "test-host", "exit 11"], env, timeout=5.0)
+    result = run_sessh(["--no-terminal-emulator", "test-host", "exit 11"], env, timeout=5.0)
 
     if result.returncode != 11:
         raise AssertionError(result)
 
 
-def test_ssh_passthrough_tty_preserves_exit_status(tmp):
+def test_ssh_no_terminal_emulator_tty_preserves_exit_status(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1823,7 +1824,7 @@ def test_ssh_passthrough_tty_preserves_exit_status(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "-tt", "test-host", "exit 13"],
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "exit 13"],
         env,
         (),
         timeout=10.0,
@@ -1833,7 +1834,7 @@ def test_ssh_passthrough_tty_preserves_exit_status(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_passthrough_tty_propagates_resize(tmp):
+def test_ssh_no_terminal_emulator_tty_propagates_resize(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1844,7 +1845,7 @@ def test_ssh_passthrough_tty_propagates_resize(tmp):
 
     command = "printf 'READY:%s\\n' \"$(stty size)\"; IFS= read -r _; printf 'RESIZED:%s\\n' \"$(stty size)\""
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "-tt", "test-host", command],
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", command],
         env,
         (
             (b"READY:24 100", resize_pty_then_send(32, 121, b"\n")),
@@ -1857,7 +1858,7 @@ def test_ssh_passthrough_tty_propagates_resize(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_passthrough_forced_tty_marks_stream_as_tty(tmp):
+def test_ssh_no_terminal_emulator_forced_tty_marks_stream_as_tty(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1866,7 +1867,7 @@ def test_ssh_passthrough_forced_tty_marks_stream_as_tty(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     seed_remote_artifact_cache(env)
 
-    result = run_sessh(["--passthrough", "-tt", "test-host", "tty"], env, timeout=5.0)
+    result = run_sessh(["--no-terminal-emulator", "-tt", "test-host", "tty"], env, timeout=5.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -1877,7 +1878,7 @@ def test_ssh_passthrough_forced_tty_marks_stream_as_tty(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_passthrough_requested_tty_uses_stream_path(tmp):
+def test_ssh_no_terminal_emulator_requested_tty_uses_stream_path(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1887,7 +1888,7 @@ def test_ssh_passthrough_requested_tty_uses_stream_path(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "-t", "test-host", "tty"],
+        [":internal-sessh:", "--no-terminal-emulator", "-t", "test-host", "tty"],
         env,
         ((b"/dev/", None),),
         timeout=10.0,
@@ -1900,7 +1901,55 @@ def test_ssh_passthrough_requested_tty_uses_stream_path(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_passthrough_tty_uses_single_stream_guid(tmp):
+def test_ssh_terminal_emulator_false_config_uses_stream_path(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    write_sessh_config(env, "terminal-emulator=false\n")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "-t", "test-host", "tty"],
+        env,
+        ((b"/dev/", None),),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_terminal_emulator_cli_overrides_disabled_config(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    write_sessh_config(env, "terminal-emulator=no\n")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--terminal-emulator", "-t", "test-host", "tty"],
+        env,
+        ((b"/dev/", None),),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "plain_ssh=1" in log_text or "batch_mode=1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_no_terminal_emulator_tty_uses_single_stream_guid(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1910,7 +1959,7 @@ def test_ssh_passthrough_tty_uses_single_stream_guid(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "-tt", "test-host", "tty"],
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "tty"],
         env,
         ((b"/dev/", None),),
         timeout=10.0,
@@ -1923,7 +1972,7 @@ def test_ssh_passthrough_tty_uses_single_stream_guid(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_passthrough_command_in_tty_uses_single_stream_guid(tmp):
+def test_ssh_no_terminal_emulator_command_in_tty_uses_single_stream_guid(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1933,7 +1982,7 @@ def test_ssh_passthrough_command_in_tty_uses_single_stream_guid(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "test-host", "echo", "hello"],
+        [":internal-sessh:", "--no-terminal-emulator", "test-host", "echo", "hello"],
         env,
         ((b"hello", None),),
         timeout=10.0,
@@ -1969,7 +2018,7 @@ def test_ssh_tty_uses_emulated_term_not_outer_term(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_passthrough_tty_copies_outer_term(tmp):
+def test_ssh_no_terminal_emulator_tty_copies_outer_term(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1980,7 +2029,7 @@ def test_ssh_passthrough_tty_copies_outer_term(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "-tt", "test-host", "printf '%s\\n' \"$TERM\""],
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "printf '%s\\n' \"$TERM\""],
         env,
         ((b"ansi", None),),
         timeout=10.0,
@@ -1990,7 +2039,7 @@ def test_ssh_passthrough_tty_copies_outer_term(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_passthrough_tty_copies_local_tty_modes(tmp):
+def test_ssh_no_terminal_emulator_tty_copies_local_tty_modes(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2007,18 +2056,18 @@ def test_ssh_passthrough_tty_copies_local_tty_modes(tmp):
         "printf 'REMOTE_TTY_MODES\\r\\n' || { stty -a; exit 7; }"
     )
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "-tt", "test-host", command],
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", command],
         env,
         ((b"REMOTE_TTY_MODES", None),),
         timeout=10.0,
-        child_tty_setup=set_passthrough_tty_mode_probe,
+        child_tty_setup=set_no_terminal_emulator_tty_mode_probe,
     )
 
     if result.returncode != 0:
         raise AssertionError(result)
 
 
-def test_ssh_passthrough_tty_copies_local_output_modes(tmp):
+def test_ssh_no_terminal_emulator_tty_copies_local_output_modes(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2033,18 +2082,18 @@ def test_ssh_passthrough_tty_copies_local_output_modes(tmp):
         "printf 'REMOTE_OUTPUT_MODES\\r\\n' || { stty -a; exit 7; }"
     )
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "-tt", "test-host", command],
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", command],
         env,
         ((b"REMOTE_OUTPUT_MODES", None),),
         timeout=10.0,
-        child_tty_setup=set_passthrough_output_mode_probe,
+        child_tty_setup=set_no_terminal_emulator_output_mode_probe,
     )
 
     if result.returncode != 0:
         raise AssertionError(result)
 
 
-def test_ssh_passthrough_tty_sets_ssh_tty(tmp):
+def test_ssh_no_terminal_emulator_tty_sets_ssh_tty(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2055,7 +2104,7 @@ def test_ssh_passthrough_tty_sets_ssh_tty(tmp):
 
     command = "test -n \"${SSH_TTY:-}\" && test -c \"$SSH_TTY\" && printf 'SSH_TTY_OK\\r\\n'"
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "-tt", "test-host", command],
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", command],
         env,
         ((b"SSH_TTY_OK", None),),
         timeout=10.0,
@@ -2065,7 +2114,7 @@ def test_ssh_passthrough_tty_sets_ssh_tty(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_passthrough_interactive_shell_keeps_prompt_aligned(tmp):
+def test_ssh_no_terminal_emulator_interactive_shell_keeps_prompt_aligned(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2089,7 +2138,7 @@ def test_ssh_passthrough_interactive_shell_keeps_prompt_aligned(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "test-host"],
+        [":internal-sessh:", "--no-terminal-emulator", "test-host"],
         env,
         (
             (b"REMOTE_PROMPT\r\n% ", b"echo hello\n"),
@@ -2104,7 +2153,7 @@ def test_ssh_passthrough_interactive_shell_keeps_prompt_aligned(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_passthrough_release_artifact_restores_local_tty_on_exit(tmp):
+def test_ssh_no_terminal_emulator_release_artifact_restores_local_tty_on_exit(tmp):
     artifact = local_artifact()
     if not artifact.exists():
         print(f"SKIP release artifact tty restore test; missing {artifact}", file=sys.stderr)
@@ -2132,7 +2181,7 @@ def test_ssh_passthrough_release_artifact_restores_local_tty_on_exit(tmp):
     seed_remote_artifact_cache(env, artifact)
 
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "test-host"],
+        [":internal-sessh:", "--no-terminal-emulator", "test-host"],
         env,
         ((b"REMOTE_READY\r\n% ", b"exit\n"),),
         timeout=10.0,
@@ -2144,14 +2193,14 @@ def test_ssh_passthrough_release_artifact_restores_local_tty_on_exit(tmp):
         raise AssertionError(result)
     if result.tty_attrs_before != result.tty_attrs_after:
         raise AssertionError(
-            "passthrough release artifact did not restore local tty modes\n"
+            "no-terminal-emulator release artifact did not restore local tty modes\n"
             f"before: {tty_attr_summary(result.tty_attrs_before)}\n"
             f"after:  {tty_attr_summary(result.tty_attrs_after)}\n"
             f"output: {result.stdout!r}"
         )
 
 
-def test_ssh_non_passthrough_release_artifact_restores_local_tty_on_exit(tmp):
+def test_ssh_terminal_emulator_release_artifact_restores_local_tty_on_exit(tmp):
     artifact = local_artifact()
     if not artifact.exists():
         print(f"SKIP release artifact tty restore test; missing {artifact}", file=sys.stderr)
@@ -2166,9 +2215,9 @@ def test_ssh_non_passthrough_release_artifact_restores_local_tty_on_exit(tmp):
     seed_remote_artifact_cache(env, artifact)
 
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "-t", "test-host", "printf 'NON_PASSTHROUGH_READY\\n'; exit 0"],
+        [":internal-sessh:", "-t", "test-host", "printf 'TERMINAL_EMULATOR_READY\\n'; exit 0"],
         env,
-        ((b"NON_PASSTHROUGH_READY", None),),
+        ((b"TERMINAL_EMULATOR_READY", None),),
         timeout=10.0,
         binary=artifact,
         capture_tty_attrs=True,
@@ -2178,7 +2227,7 @@ def test_ssh_non_passthrough_release_artifact_restores_local_tty_on_exit(tmp):
         raise AssertionError(result)
     if result.tty_attrs_before != result.tty_attrs_after:
         raise AssertionError(
-            "non-passthrough release artifact did not restore local tty modes\n"
+            "terminal-emulator release artifact did not restore local tty modes\n"
             f"before: {tty_attr_summary(result.tty_attrs_before)}\n"
             f"after:  {tty_attr_summary(result.tty_attrs_after)}\n"
             f"output: {result.stdout!r}"
@@ -2221,11 +2270,11 @@ def test_ssh_remote_command_stream_reconnects_after_transport_loss(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_passthrough_tty_reconnect_title_restores_app_title(tmp):
+def test_ssh_no_terminal_emulator_tty_reconnect_title_restores_app_title(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
-    kill_file = tmp / "kill-passthrough-transport"
+    kill_file = tmp / "kill-no_terminal_emulator-transport"
     write_fake_ssh(fake_bin / "ssh")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
@@ -2233,18 +2282,18 @@ def test_ssh_passthrough_tty_reconnect_title_restores_app_title(tmp):
     seed_remote_artifact_cache(env)
 
     command = (
-        "printf '\\033]2;remote-title\\033\\\\PASSTHROUGH_READY\\r\\n'; "
+        "printf '\\033]2;remote-title\\033\\\\NO_TERMINAL_EMULATOR_READY\\r\\n'; "
         f": > {shlex.quote(str(kill_file))}; "
         "sleep 0.2; "
-        "printf 'PASSTHROUGH_AFTER\\r\\n'"
+        "printf 'NO_TERMINAL_EMULATOR_AFTER\\r\\n'"
     )
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "-tt", "test-host", command],
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", command],
         env,
         (
-            (b"PASSTHROUGH_READY", None),
+            (b"NO_TERMINAL_EMULATOR_READY", None),
             (title_sequence("10sec retry CTRL-R").encode(), b"\x12"),
-            (b"PASSTHROUGH_AFTER", None),
+            (b"NO_TERMINAL_EMULATOR_AFTER", None),
         ),
         timeout=30.0,
     )
@@ -2266,7 +2315,7 @@ def test_ssh_passthrough_tty_reconnect_title_restores_app_title(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_passthrough_tty_escape_disconnects(tmp):
+def test_ssh_no_terminal_emulator_tty_escape_disconnects(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2276,7 +2325,7 @@ def test_ssh_passthrough_tty_escape_disconnects(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--passthrough", "-tt", "test-host", "printf 'ESCAPE_READY\\r\\n'; while :; do sleep 1; done"],
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "printf 'ESCAPE_READY\\r\\n'; while :; do sleep 1; done"],
         env,
         ((b"ESCAPE_READY", b"\r~."),),
         timeout=10.0,
@@ -4168,88 +4217,96 @@ def main(argv=None):
             test_ssh_tty_stdin_remote_command_does_not_allocate_tty_without_t,
         ),
         (
-            "ssh non-passthrough tty preserves exit status",
-            test_ssh_non_passthrough_tty_preserves_exit_status,
+            "ssh terminal-emulator tty preserves exit status",
+            test_ssh_terminal_emulator_tty_preserves_exit_status,
         ),
         (
-            "ssh non-passthrough tty propagates resize",
-            test_ssh_non_passthrough_tty_propagates_resize,
+            "ssh terminal-emulator tty propagates resize",
+            test_ssh_terminal_emulator_tty_propagates_resize,
         ),
         (
-            "ssh passthrough remote command uses direct stream",
-            test_ssh_passthrough_remote_command_uses_direct_stream,
+            "ssh no-terminal-emulator remote command uses direct stream",
+            test_ssh_no_terminal_emulator_remote_command_uses_direct_stream,
         ),
         (
-            "ssh passthrough remote command preserves exit status",
-            test_ssh_passthrough_remote_command_preserves_exit_status,
+            "ssh no-terminal-emulator remote command preserves exit status",
+            test_ssh_no_terminal_emulator_remote_command_preserves_exit_status,
         ),
         (
-            "ssh passthrough tty preserves exit status",
-            test_ssh_passthrough_tty_preserves_exit_status,
+            "ssh no-terminal-emulator tty preserves exit status",
+            test_ssh_no_terminal_emulator_tty_preserves_exit_status,
         ),
         (
-            "ssh passthrough tty propagates resize",
-            test_ssh_passthrough_tty_propagates_resize,
+            "ssh no-terminal-emulator tty propagates resize",
+            test_ssh_no_terminal_emulator_tty_propagates_resize,
         ),
         (
-            "ssh passthrough forced tty marks stream as tty",
-            test_ssh_passthrough_forced_tty_marks_stream_as_tty,
+            "ssh no-terminal-emulator forced tty marks stream as tty",
+            test_ssh_no_terminal_emulator_forced_tty_marks_stream_as_tty,
         ),
         (
-            "ssh passthrough requested tty uses stream path",
-            test_ssh_passthrough_requested_tty_uses_stream_path,
+            "ssh no-terminal-emulator requested tty uses stream path",
+            test_ssh_no_terminal_emulator_requested_tty_uses_stream_path,
         ),
         (
-            "ssh passthrough tty uses single stream guid",
-            test_ssh_passthrough_tty_uses_single_stream_guid,
+            "ssh terminal-emulator false config uses stream path",
+            test_ssh_terminal_emulator_false_config_uses_stream_path,
         ),
         (
-            "ssh passthrough command in tty uses single stream guid",
-            test_ssh_passthrough_command_in_tty_uses_single_stream_guid,
+            "ssh terminal-emulator cli overrides disabled config",
+            test_ssh_terminal_emulator_cli_overrides_disabled_config,
+        ),
+        (
+            "ssh no-terminal-emulator tty uses single stream guid",
+            test_ssh_no_terminal_emulator_tty_uses_single_stream_guid,
+        ),
+        (
+            "ssh no-terminal-emulator command in tty uses single stream guid",
+            test_ssh_no_terminal_emulator_command_in_tty_uses_single_stream_guid,
         ),
         (
             "ssh remote command stream reconnects after transport loss",
             test_ssh_remote_command_stream_reconnects_after_transport_loss,
         ),
         (
-            "ssh passthrough tty reconnect title restores app title",
-            test_ssh_passthrough_tty_reconnect_title_restores_app_title,
+            "ssh no-terminal-emulator tty reconnect title restores app title",
+            test_ssh_no_terminal_emulator_tty_reconnect_title_restores_app_title,
         ),
         (
-            "ssh passthrough tty escape disconnects",
-            test_ssh_passthrough_tty_escape_disconnects,
+            "ssh no-terminal-emulator tty escape disconnects",
+            test_ssh_no_terminal_emulator_tty_escape_disconnects,
         ),
         (
             "ssh tty uses emulated TERM not outer TERM",
             test_ssh_tty_uses_emulated_term_not_outer_term,
         ),
         (
-            "ssh passthrough tty copies outer TERM",
-            test_ssh_passthrough_tty_copies_outer_term,
+            "ssh no-terminal-emulator tty copies outer TERM",
+            test_ssh_no_terminal_emulator_tty_copies_outer_term,
         ),
         (
-            "ssh passthrough tty copies local tty modes",
-            test_ssh_passthrough_tty_copies_local_tty_modes,
+            "ssh no-terminal-emulator tty copies local tty modes",
+            test_ssh_no_terminal_emulator_tty_copies_local_tty_modes,
         ),
         (
-            "ssh passthrough tty copies local output modes",
-            test_ssh_passthrough_tty_copies_local_output_modes,
+            "ssh no-terminal-emulator tty copies local output modes",
+            test_ssh_no_terminal_emulator_tty_copies_local_output_modes,
         ),
         (
-            "ssh passthrough tty sets SSH_TTY",
-            test_ssh_passthrough_tty_sets_ssh_tty,
+            "ssh no-terminal-emulator tty sets SSH_TTY",
+            test_ssh_no_terminal_emulator_tty_sets_ssh_tty,
         ),
         (
-            "ssh passthrough interactive shell keeps prompt aligned",
-            test_ssh_passthrough_interactive_shell_keeps_prompt_aligned,
+            "ssh no-terminal-emulator interactive shell keeps prompt aligned",
+            test_ssh_no_terminal_emulator_interactive_shell_keeps_prompt_aligned,
         ),
         (
-            "ssh passthrough release artifact restores local tty on exit",
-            test_ssh_passthrough_release_artifact_restores_local_tty_on_exit,
+            "ssh no-terminal-emulator release artifact restores local tty on exit",
+            test_ssh_no_terminal_emulator_release_artifact_restores_local_tty_on_exit,
         ),
         (
-            "ssh non-passthrough release artifact restores local tty on exit",
-            test_ssh_non_passthrough_release_artifact_restores_local_tty_on_exit,
+            "ssh terminal-emulator release artifact restores local tty on exit",
+            test_ssh_terminal_emulator_release_artifact_restores_local_tty_on_exit,
         ),
         (
             "ssh forced tty remote command allocates pty with stdin null",

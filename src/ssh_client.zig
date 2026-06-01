@@ -174,7 +174,8 @@ const ParsedSshArgs = struct {
     client_log_level_set: bool = false,
     bootstrap: bool = true,
     bootstrap_set: bool = false,
-    passthrough: bool = false,
+    terminal_emulator: bool = true,
+    terminal_emulator_set: bool = false,
     default_ipqos_option: ?[]const u8 = null,
     capture_tty_transcript: ?[]const u8 = null,
 };
@@ -1233,7 +1234,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
     const stdin_is_tty = c.isatty(0) != 0;
     if (shouldUseDirectStream(parsed_ssh_args, stdin_is_tty)) {
         if (parsed_ssh_args.capture_tty_transcript != null) {
-            try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with stream passthrough\n");
+            try io.writeAll(2, "sessh: --capture-tty-transcript is not supported without the terminal emulator\n");
             return process_exit.request(64);
         }
         try runDirectStreamSsh(allocator, parsed_ssh_args, stdin_is_tty);
@@ -2255,6 +2256,9 @@ fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !v
     if (!parsed.bootstrap_set) {
         if (file_config.bootstrap) |enabled| parsed.bootstrap = enabled;
     }
+    if (!parsed.terminal_emulator_set) {
+        if (file_config.terminal_emulator) |enabled| parsed.terminal_emulator = enabled;
+    }
     if (!parsed.client_log_level_set) {
         if (file_config.client_log_level) |level| {
             parsed.client_log_level = level;
@@ -2981,7 +2985,7 @@ fn canUsePlainSshFallback(
 fn shouldUseDirectStream(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
     if (parsed_ssh_args.action != .new) return false;
     if (parsed_ssh_args.command_argv.len != 0) return false;
-    if (parsed_ssh_args.passthrough) return true;
+    if (!parsed_ssh_args.terminal_emulator) return true;
     if (parsed_ssh_args.shell_command_args.len == 0) return false;
 
     // Match ssh's PTY allocation rules for remote commands. Plain
@@ -3097,9 +3101,9 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
     defer if (shell_command) |command| allocator.free(command);
     const command_arg = try encodeStreamCommandArg(allocator, shell_command);
     defer allocator.free(command_arg);
-    // Passthrough PTY mode exposes the user's real terminal directly, so its
-    // TERM belongs with the portable tty modes. Non-passthrough sessions omit
-    // TERM and let the remote side advertise sessh's terminal emulator.
+    // No-terminal-emulator PTY mode exposes the user's real terminal directly,
+    // so its TERM belongs with the portable tty modes. Terminal-emulator
+    // sessions omit TERM and let the remote side advertise sessh's emulator.
     var local_tty_settings = if (stream_uses_tty)
         tty_settings.capture(allocator, 0, .{ .include_term = true }) catch |err| blk: {
             client_log.debug("event=stream_tty_settings_capture_failed error={t}", .{err});
@@ -3794,8 +3798,13 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
             parsed.bootstrap_set = true;
             try parsed.banner_args.append(arg);
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--passthrough")) {
-            parsed.passthrough = true;
+        } else if (std.mem.eql(u8, arg, "--terminal-emulator")) {
+            parsed.terminal_emulator = true;
+            parsed.terminal_emulator_set = true;
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--no-terminal-emulator")) {
+            parsed.terminal_emulator = false;
+            parsed.terminal_emulator_set = true;
             index.* += 1;
         } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
             index.* += 1;
@@ -3949,8 +3958,15 @@ fn parseCommonSesshOptionAfterHost(args: []const []const u8, index: *usize, pars
         index.* += 1;
         return true;
     }
-    if (std.mem.eql(u8, arg, "--passthrough")) {
-        parsed.passthrough = true;
+    if (std.mem.eql(u8, arg, "--terminal-emulator")) {
+        parsed.terminal_emulator = true;
+        parsed.terminal_emulator_set = true;
+        index.* += 1;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--no-terminal-emulator")) {
+        parsed.terminal_emulator = false;
+        parsed.terminal_emulator_set = true;
         index.* += 1;
         return true;
     }
@@ -4113,7 +4129,8 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--alias") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
-        std.mem.eql(u8, arg, "--passthrough") or
+        std.mem.eql(u8, arg, "--terminal-emulator") or
+        std.mem.eql(u8, arg, "--no-terminal-emulator") or
         std.mem.eql(u8, arg, "--ssh-options") or
         std.mem.eql(u8, arg, "--capture-tty-transcript") or
         std.mem.eql(u8, arg, "--refresh") or
@@ -5008,13 +5025,24 @@ test "direct stream preserves ssh remote command tty semantics" {
     try std.testing.expect(!shouldUseDirectStream(forced, true));
 }
 
-test "passthrough forces direct stream and preserves ssh tty semantics" {
-    const interactive = try parseSshArgs(&.{
+test "no terminal emulator forces direct stream and preserves ssh tty semantics" {
+    const terminal_emulator = try parseSshArgs(&.{
         "sessh",
-        "--passthrough",
+        "--terminal-emulator",
         "example.com",
     }, .{});
-    try std.testing.expect(interactive.passthrough);
+    try std.testing.expect(terminal_emulator.terminal_emulator);
+    try std.testing.expect(terminal_emulator.terminal_emulator_set);
+    try std.testing.expect(!shouldUseDirectStream(terminal_emulator, true));
+    try std.testing.expect(!shouldUseDirectStream(terminal_emulator, false));
+
+    const interactive = try parseSshArgs(&.{
+        "sessh",
+        "--no-terminal-emulator",
+        "example.com",
+    }, .{});
+    try std.testing.expect(!interactive.terminal_emulator);
+    try std.testing.expect(interactive.terminal_emulator_set);
     try std.testing.expect(shouldUseDirectStream(interactive, true));
     try std.testing.expect(shouldUseDirectStream(interactive, false));
     try std.testing.expect(directStreamUsesTty(interactive, true));
@@ -5022,40 +5050,40 @@ test "passthrough forces direct stream and preserves ssh tty semantics" {
 
     const command = try parseSshArgs(&.{
         "sessh",
-        "--passthrough",
+        "--no-terminal-emulator",
         "example.com",
         "echo",
         "hello",
     }, .{});
-    try std.testing.expect(command.passthrough);
+    try std.testing.expect(!command.terminal_emulator);
     try std.testing.expect(shouldUseDirectStream(command, true));
     try std.testing.expect(!directStreamUsesTty(command, true));
 
     const forced = try parseSshArgs(&.{
         "sessh",
-        "--passthrough",
+        "--no-terminal-emulator",
         "-tt",
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(forced.passthrough);
+    try std.testing.expect(!forced.terminal_emulator);
     try std.testing.expect(shouldUseDirectStream(forced, false));
     try std.testing.expect(directStreamUsesTty(forced, false));
 
     const requested_with_tty = try parseSshArgs(&.{
         "sessh",
-        "--passthrough",
+        "--no-terminal-emulator",
         "-t",
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(requested_with_tty.passthrough);
+    try std.testing.expect(!requested_with_tty.terminal_emulator);
     try std.testing.expect(shouldUseDirectStream(requested_with_tty, true));
     try std.testing.expect(directStreamUsesTty(requested_with_tty, true));
 
     const requested_without_tty = try parseSshArgs(&.{
         "sessh",
-        "--passthrough",
+        "--no-terminal-emulator",
         "-t",
         "example.com",
         "tty",

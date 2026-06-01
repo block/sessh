@@ -1689,7 +1689,7 @@ def run_plain_screen_protocol_test(base_env):
             cleanup_runtime(env)
 
 
-def run_split_escape_tail_is_not_passthrough_test(base_env):
+def run_split_escape_tail_is_not_replayed_as_text_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-split-escape-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         env["SHELL"] = "/bin/sh"
@@ -3920,7 +3920,7 @@ def main():
             run_session_ended_payload_protocol_test(env)
             run_plain_scroll_protocol_test(env)
             run_plain_screen_protocol_test(env)
-            run_split_escape_tail_is_not_passthrough_test(env)
+            run_split_escape_tail_is_not_replayed_as_text_test(env)
             run_active_screen_protocol_test(env)
             run_active_screen_barrier_protocol_test(env)
             run_terminal_modes_protocol_test(env)

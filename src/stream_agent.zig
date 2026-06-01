@@ -2690,7 +2690,7 @@ test "stream input control intercepts only reconnect UI controls" {
     try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
 }
 
-test "stream input control uses ssh escape to disconnect passthrough" {
+test "stream input control uses ssh escape to disconnect no-terminal-emulator streams" {
     var control = StreamInputControl{
         .enabled = true,
         .escape_enabled = true,

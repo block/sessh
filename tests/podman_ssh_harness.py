@@ -798,13 +798,13 @@ def test_openssh_oracle_matrix(prefix, config, host_alias, env):
         remote_args=("if IFS= read -r line; then printf 'LINE:%s\\n' \"$line\"; else printf 'EOF\\n'; fi",),
     )
     compare_openssh_oracle(
-        "passthrough no command without tty",
+        "no-terminal-emulator no command without tty",
         prefix,
         config,
         host_alias,
         env,
         ssh_options=("-T",),
-        sessh_options=("--passthrough",),
+        sessh_options=("--no-terminal-emulator",),
     )
     compare_openssh_oracle(
         "explicit no tty command",
@@ -911,13 +911,13 @@ def test_openssh_oracle_matrix(prefix, config, host_alias, env):
         ),
     )
     compare_openssh_pty_oracle(
-        "passthrough requested tty with local tty",
+        "no-terminal-emulator requested tty with local tty",
         prefix,
         config,
         host_alias,
         env,
         ssh_options=("-t",),
-        sessh_options=("--passthrough",),
+        sessh_options=("--no-terminal-emulator",),
         remote_args=("tty",),
     )
     compare_openssh_pty_oracle(
@@ -927,7 +927,7 @@ def test_openssh_oracle_matrix(prefix, config, host_alias, env):
         host_alias,
         env,
         ssh_options=("-tt",),
-        sessh_options=("--passthrough",),
+        sessh_options=("--no-terminal-emulator",),
         remote_args=("printf 'SIZE1:%s\\n' \"$(stty size)\"; IFS= read -r _; printf 'SIZE2:%s\\n' \"$(stty size)\"",),
         steps=(
             (b"SIZE1:24 100", resize_pty_then_send(31, 120, b"\n")),
