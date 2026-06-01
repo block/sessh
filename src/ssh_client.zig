@@ -142,6 +142,7 @@ const SshAction = enum {
 
 const ParsedSshArgs = struct {
     options: []const []const u8,
+    owned_options: ?[][]const u8 = null,
     host: []const u8,
     action: SshAction = .new,
     attach_id: ?[]const u8 = null,
@@ -178,6 +179,14 @@ const ParsedSshArgs = struct {
     terminal_emulator_set: bool = false,
     default_ipqos_option: ?[]const u8 = null,
     capture_tty_transcript: ?[]const u8 = null,
+
+    fn deinit(self: *ParsedSshArgs, allocator: std.mem.Allocator) void {
+        if (self.owned_options) |options| {
+            allocator.free(options);
+            self.owned_options = null;
+            self.options = &.{};
+        }
+    }
 };
 
 const ClientTarget = enum {
@@ -1196,13 +1205,14 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         },
         else => return err,
     };
-    var parsed_ssh_args = if (route_ref_args) |parsed| parsed else parseSshArgs(args, parse_options) catch |err| {
+    var parsed_ssh_args = if (route_ref_args) |parsed| parsed else parseSshArgs(allocator, args, parse_options) catch |err| {
         if (shouldUsePlainSshFallbackForArgError(args, err)) {
             try runPlainSshFallbackForUnsupportedArgs(allocator, args, err);
         }
         try printSshArgError(err);
         return process_exit.request(64);
     };
+    defer parsed_ssh_args.deinit(allocator);
     if (!parse_options.allow_mux_command_words and
         parsed_ssh_args.action == .new and
         std.mem.eql(u8, parsed_ssh_args.host, "."))
@@ -3705,13 +3715,20 @@ fn resolveLocalRefs(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !?[]u8
     }
 }
 
-fn parseSshArgs(args: []const []const u8, parse_options: CliParseOptions) !ParsedSshArgs {
+fn parseSshArgs(allocator: std.mem.Allocator, args: []const []const u8, parse_options: CliParseOptions) !ParsedSshArgs {
     if (args.len < 2) return error.MissingHost;
 
     var i: usize = 1;
     var pre_host = ParsedSshArgs{ .options = &.{}, .host = "" };
     try parseSesshOptionsBeforeHost(args, &i, &pre_host);
     const ssh_options_start = i;
+    // ssh allows options before the host, and sessh has its own pre-host
+    // options. If users interleave them, keep only real ssh options in the
+    // transport option list so sessh-only flags are not forwarded to ssh.
+    var pending_ssh_options_start = i;
+    var mixed_ssh_options: std.ArrayList([]const u8) = .empty;
+    var has_mixed_ssh_options = false;
+    errdefer mixed_ssh_options.deinit(allocator);
 
     while (i < args.len) {
         const arg = args[i];
@@ -3721,27 +3738,86 @@ fn parseSshArgs(args: []const []const u8, parse_options: CliParseOptions) !Parse
             i += 1;
             if (i >= args.len) return error.MissingHost;
             var parsed = pre_host;
-            parsed.options = args[ssh_options_start .. i - 1];
+            try finishParsedSshOptions(
+                allocator,
+                &parsed,
+                args,
+                ssh_options_start,
+                i - 1,
+                pending_ssh_options_start,
+                i - 1,
+                &mixed_ssh_options,
+                has_mixed_ssh_options,
+            );
             parsed.host = args[i];
             i += 1;
+            errdefer parsed.deinit(allocator);
             try parseSesshOptionsAfterHost(args, &i, &parsed, parse_options);
             return parsed;
         }
 
         if (!std.mem.startsWith(u8, arg, "-") or std.mem.eql(u8, arg, "-")) {
             var parsed = pre_host;
-            parsed.options = args[ssh_options_start..i];
+            try finishParsedSshOptions(
+                allocator,
+                &parsed,
+                args,
+                ssh_options_start,
+                i,
+                pending_ssh_options_start,
+                i,
+                &mixed_ssh_options,
+                has_mixed_ssh_options,
+            );
             parsed.host = arg;
             i += 1;
+            errdefer parsed.deinit(allocator);
             try parseSesshOptionsAfterHost(args, &i, &parsed, parse_options);
             return parsed;
         }
 
-        if (isSesshLongOption(arg)) return error.MissingHost;
+        if (isSesshLongOption(arg)) {
+            if (!has_mixed_ssh_options) {
+                has_mixed_ssh_options = true;
+                try mixed_ssh_options.appendSlice(allocator, args[ssh_options_start..i]);
+            } else {
+                try mixed_ssh_options.appendSlice(allocator, args[pending_ssh_options_start..i]);
+            }
+            try parseSesshOptionsBeforeHost(args, &i, &pre_host);
+            pending_ssh_options_start = i;
+            continue;
+        }
+        const ssh_option_start = i;
         try consumeSshOption(args, &i, &pre_host.tty_request);
+        if (has_mixed_ssh_options) {
+            try mixed_ssh_options.appendSlice(allocator, args[ssh_option_start..i]);
+            pending_ssh_options_start = i;
+        }
     }
 
     return error.MissingHost;
+}
+
+fn finishParsedSshOptions(
+    allocator: std.mem.Allocator,
+    parsed: *ParsedSshArgs,
+    args: []const []const u8,
+    contiguous_start: usize,
+    contiguous_end: usize,
+    pending_start: usize,
+    pending_end: usize,
+    mixed_ssh_options: *std.ArrayList([]const u8),
+    has_mixed_ssh_options: bool,
+) !void {
+    if (!has_mixed_ssh_options) {
+        parsed.options = args[contiguous_start..contiguous_end];
+        return;
+    }
+
+    try mixed_ssh_options.appendSlice(allocator, args[pending_start..pending_end]);
+    const owned = try mixed_ssh_options.toOwnedSlice(allocator);
+    parsed.owned_options = owned;
+    parsed.options = owned;
 }
 
 fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: *ParsedSshArgs) !void {
@@ -4852,7 +4928,7 @@ test "parseSshArgs passes through ssh options before host" {
         "example.com",
     };
 
-    const parsed = try parseSshArgs(&args, .{});
+    const parsed = try parseSshArgs(std.testing.allocator, &args, .{});
 
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqual(@as(usize, 6), parsed.options.len);
@@ -4865,7 +4941,7 @@ test "parseSshArgs passes through ssh options before host" {
 }
 
 test "parseSshArgs accepts public sessh options before ssh options and host" {
-    const parsed = try parseSshArgs(&.{
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--alias",
         "work",
@@ -4884,36 +4960,60 @@ test "parseSshArgs accepts public sessh options before ssh options and host" {
     try std.testing.expectEqualStrings("ssh_config", parsed.options[1]);
 }
 
+test "parseSshArgs accepts interleaved ssh and sessh options before host" {
+    var parsed = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "-t",
+        "--no-terminal-emulator",
+        "-p",
+        "2222",
+        "--log-level",
+        "debug",
+        "example.com",
+        "exit",
+        "3",
+    }, .{});
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("example.com", parsed.host);
+    try std.testing.expectEqual(client_log.Level.debug, parsed.client_log_level);
+    try std.testing.expect(!parsed.terminal_emulator);
+    try std.testing.expect(parsed.terminal_emulator_set);
+    try std.testing.expectEqual(SshTtyRequest.requested, parsed.tty_request);
+    try expectArgvEqual(&.{ "-t", "-p", "2222" }, parsed.options);
+    try expectArgvEqual(&.{ "exit", "3" }, parsed.shell_command_args);
+}
+
 test "parseSshArgs rejects config-only sessh options on direct ssh transport" {
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--leader",
         "CTRL-B",
         "example.com",
     }, .{}));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--scrollback-limit",
         "100",
         "example.com",
     }, .{}));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--initial-scrollback",
         "0",
         "example.com",
     }, .{}));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--bootstrap",
         "example.com",
     }, .{}));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--no-bootstrap",
         "example.com",
     }, .{}));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--ssh-options",
         "-F cfg",
@@ -4930,18 +5030,18 @@ test "ssh verbosity maps to inferred client log level" {
 }
 
 test "parseSshArgs rejects protocol-breaking ssh options" {
-    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-n",
         "example.com",
     }, .{}));
-    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-W",
         "host:22",
         "example.com",
     }, .{}));
-    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-o",
         "RequestTTY=force",
@@ -4950,7 +5050,7 @@ test "parseSshArgs rejects protocol-breaking ssh options" {
 }
 
 test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
-    const single = try parseSshArgs(&.{
+    const single = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-t",
         "example.com",
@@ -4962,7 +5062,7 @@ test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
     try std.testing.expectEqualStrings("echo", single.shell_command_args[0]);
     try std.testing.expectEqualStrings("$SESSH_TEST_HOST", single.shell_command_args[1]);
 
-    const forced = try parseSshArgs(&.{
+    const forced = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-tt",
         "example.com",
@@ -4974,7 +5074,7 @@ test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
     try std.testing.expectEqualStrings("uname", forced.shell_command_args[0]);
     try std.testing.expectEqualStrings("-a", forced.shell_command_args[1]);
 
-    const repeated = try parseSshArgs(&.{
+    const repeated = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-t",
         "-t",
@@ -4983,7 +5083,7 @@ test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
     }, .{});
     try std.testing.expectEqual(SshTtyRequest.forced, repeated.tty_request);
 
-    const empty = try parseSshArgs(&.{
+    const empty = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-t",
         "example.com",
@@ -4995,7 +5095,7 @@ test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
 }
 
 test "direct stream preserves ssh remote command tty semantics" {
-    const command = try parseSshArgs(&.{
+    const command = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "example.com",
         "echo",
@@ -5006,7 +5106,7 @@ test "direct stream preserves ssh remote command tty semantics" {
     try std.testing.expect(shouldUseDirectStream(command, false));
     try std.testing.expect(shouldUseDirectStream(command, true));
 
-    const single = try parseSshArgs(&.{
+    const single = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-t",
         "example.com",
@@ -5015,7 +5115,7 @@ test "direct stream preserves ssh remote command tty semantics" {
     try std.testing.expect(shouldUseDirectStream(single, false));
     try std.testing.expect(!shouldUseDirectStream(single, true));
 
-    const forced = try parseSshArgs(&.{
+    const forced = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-tt",
         "example.com",
@@ -5026,7 +5126,7 @@ test "direct stream preserves ssh remote command tty semantics" {
 }
 
 test "no terminal emulator forces direct stream and preserves ssh tty semantics" {
-    const terminal_emulator = try parseSshArgs(&.{
+    const terminal_emulator = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--terminal-emulator",
         "example.com",
@@ -5036,7 +5136,7 @@ test "no terminal emulator forces direct stream and preserves ssh tty semantics"
     try std.testing.expect(!shouldUseDirectStream(terminal_emulator, true));
     try std.testing.expect(!shouldUseDirectStream(terminal_emulator, false));
 
-    const interactive = try parseSshArgs(&.{
+    const interactive = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "example.com",
@@ -5048,7 +5148,7 @@ test "no terminal emulator forces direct stream and preserves ssh tty semantics"
     try std.testing.expect(directStreamUsesTty(interactive, true));
     try std.testing.expect(!directStreamUsesTty(interactive, false));
 
-    const command = try parseSshArgs(&.{
+    const command = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "example.com",
@@ -5059,7 +5159,7 @@ test "no terminal emulator forces direct stream and preserves ssh tty semantics"
     try std.testing.expect(shouldUseDirectStream(command, true));
     try std.testing.expect(!directStreamUsesTty(command, true));
 
-    const forced = try parseSshArgs(&.{
+    const forced = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "-tt",
@@ -5070,7 +5170,7 @@ test "no terminal emulator forces direct stream and preserves ssh tty semantics"
     try std.testing.expect(shouldUseDirectStream(forced, false));
     try std.testing.expect(directStreamUsesTty(forced, false));
 
-    const requested_with_tty = try parseSshArgs(&.{
+    const requested_with_tty = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "-t",
@@ -5081,7 +5181,7 @@ test "no terminal emulator forces direct stream and preserves ssh tty semantics"
     try std.testing.expect(shouldUseDirectStream(requested_with_tty, true));
     try std.testing.expect(directStreamUsesTty(requested_with_tty, true));
 
-    const requested_without_tty = try parseSshArgs(&.{
+    const requested_without_tty = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "-t",
@@ -5136,7 +5236,7 @@ test "plain ssh fallback is allowed for transport-incompatible plain ssh invocat
 }
 
 test "parseSshArgs permits explicit safe config overrides" {
-    const parsed = try parseSshArgs(&.{
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-oRequestTTY=no",
         "-o",
@@ -5178,7 +5278,7 @@ test "parseInteractiveIpQos returns first configured value" {
 }
 
 test "parseSshArgs accepts translated attach options after host" {
-    const parsed = try parseSshArgs(&.{
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
         "-F",
         "ssh_config",
@@ -5254,7 +5354,7 @@ test "explicit compat attach requests a tty only for attach" {
 }
 
 test "parseSshArgs accepts no bootstrap shorthand after host" {
-    const parsed = try parseSshArgs(&.{
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
         "example.com",
         "attach",
@@ -5272,7 +5372,7 @@ test "parseSshArgs accepts no bootstrap shorthand after host" {
 }
 
 test "parseSshArgs accepts attach without an id after host" {
-    const parsed = try parseSshArgs(&.{
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
         "example.com",
         "attach",
@@ -5288,54 +5388,54 @@ test "parseSshArgs accepts attach without an id after host" {
 test "parseSshArgs accepts translated remote session commands after host" {
     const client_guid = "c-11111111-1111-4111-8111-111111111111";
 
-    const list = try parseSshArgs(&.{ "sesshmux", "example.com", "list" }, .{ .allow_mux_command_words = true });
+    const list = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "list" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.list, list.action);
 
-    const refresh_list = try parseSshArgs(&.{ "sesshmux", "example.com", "list", "--refresh" }, .{ .allow_mux_command_words = true });
+    const refresh_list = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "list", "--refresh" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.list, refresh_list.action);
     try std.testing.expect(refresh_list.list_refresh);
 
-    const exited_list = try parseSshArgs(&.{ "sesshmux", "example.com", "list", "--exited", "--jsonl" }, .{ .allow_mux_command_words = true });
+    const exited_list = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "list", "--exited", "--jsonl" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.list, exited_list.action);
     try std.testing.expect(exited_list.list_exited);
     try std.testing.expect(exited_list.list_jsonl);
 
-    const client_list = try parseSshArgs(&.{ "sesshmux", "example.com", "list", "--client=s1", "--jsonl" }, .{ .allow_mux_command_words = true });
+    const client_list = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "list", "--client=s1", "--jsonl" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.list, client_list.action);
     try std.testing.expectEqualStrings("s1", client_list.list_client_target.?);
     try std.testing.expectEqualStrings("--client=s1", client_list.list_client_option_arg.?);
     try std.testing.expect(client_list.list_jsonl);
 
-    const client_list_spaced = try parseSshArgs(&.{ "sesshmux", "example.com", "list", "--client", "s1", "--jsonl" }, .{ .allow_mux_command_words = true });
+    const client_list_spaced = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "list", "--client", "s1", "--jsonl" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.list, client_list_spaced.action);
     try std.testing.expectEqualStrings("s1", client_list_spaced.list_client_target.?);
     try std.testing.expectEqualStrings("--client", client_list_spaced.list_client_option_arg.?);
     try std.testing.expect(client_list_spaced.list_jsonl);
 
-    const kill = try parseSshArgs(&.{ "sesshmux", "example.com", "kill", "s1" }, .{ .allow_mux_command_words = true });
+    const kill = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "kill", "s1" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.kill, kill.action);
     try std.testing.expectEqualStrings("s1", kill.kill_id.?);
 
-    const kill_all = try parseSshArgs(&.{ "sesshmux", "example.com", "kill", "--all" }, .{ .allow_mux_command_words = true });
+    const kill_all = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "kill", "--all" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.kill_all, kill_all.action);
 
-    const kill_current = try parseSshArgs(&.{ "sesshmux", "example.com", "kill", "--current" }, .{ .allow_mux_command_words = true });
+    const kill_current = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "kill", "--current" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.kill, kill_current.action);
     try std.testing.expect(kill_current.kill_current);
 
-    const detach = try parseSshArgs(&.{ "sesshmux", "example.com", "detach", client_guid, "s1" }, .{ .allow_mux_command_words = true });
+    const detach = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "detach", client_guid, "s1" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.detach_client, detach.action);
     try std.testing.expectEqual(ClientTarget.client_guid, detach.client_target);
     try std.testing.expectEqualStrings(client_guid, detach.client_guid.?);
     try std.testing.expectEqualStrings("s1", detach.client_session_ref.?);
 
-    const repaint = try parseSshArgs(&.{ "sesshmux", "example.com", "repaint", "--last-input", "--scrollback", "s1" }, .{ .allow_mux_command_words = true });
+    const repaint = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "repaint", "--last-input", "--scrollback", "s1" }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.repaint_client, repaint.action);
     try std.testing.expectEqual(ClientTarget.last_input, repaint.client_target);
     try std.testing.expect(repaint.client_repaint_scrollback);
     try std.testing.expectEqualStrings("s1", repaint.client_session_ref.?);
 
-    const debug = try parseSshArgs(&.{ "sesshmux", "example.com", "debug", "unresponsive-connection", "--seconds", "3", client_guid }, .{ .allow_mux_command_words = true });
+    const debug = try parseSshArgs(std.testing.allocator, &.{ "sesshmux", "example.com", "debug", "unresponsive-connection", "--seconds", "3", client_guid }, .{ .allow_mux_command_words = true });
     try std.testing.expectEqual(SshAction.debug_client, debug.action);
     try std.testing.expectEqual(DebugClientAction.unresponsive_connection, debug.debug_client_action.?);
     try std.testing.expectEqualStrings("3", debug.debug_unresponsive_seconds.?);
@@ -5344,32 +5444,32 @@ test "parseSshArgs accepts translated remote session commands after host" {
 }
 
 test "parseSshArgs rejects translated flags outside their command grammar" {
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
         "example.com",
         "list",
         "--all",
     }, .{ .allow_mux_command_words = true }));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
         "example.com",
         "attach",
         "s1",
         "--exited",
     }, .{ .allow_mux_command_words = true }));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
         "example.com",
         "kill",
         "--refresh",
     }, .{ .allow_mux_command_words = true }));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
         "example.com",
         "detach",
         "--refresh",
     }, .{ .allow_mux_command_words = true }));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(&.{
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
         "example.com",
         "debug",
@@ -5482,7 +5582,7 @@ test "stream reconnect status uses stderr when stdout is redirected" {
 }
 
 test "parseSshArgs accepts persistent command argv after delimiter" {
-    const parsed = try parseSshArgs(&.{
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "example.com",
         "--alias",
@@ -5500,7 +5600,7 @@ test "parseSshArgs accepts persistent command argv after delimiter" {
 }
 
 test "parseSshArgs accepts translated eval args for persistent commands" {
-    const parsed = try parseSshArgs(&.{
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
         "example.com",
         "--eval-args",
@@ -5516,13 +5616,13 @@ test "parseSshArgs accepts translated eval args for persistent commands" {
 }
 
 test "parseSshArgs rejects custom aliases with reserved typed prefix shape" {
-    try std.testing.expectError(error.InvalidAlias, parseSshArgs(&.{
+    try std.testing.expectError(error.InvalidAlias, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "example.com",
         "--alias",
         "s-deadbeef",
     }, .{}));
-    try std.testing.expectError(error.InvalidAlias, parseSshArgs(&.{
+    try std.testing.expectError(error.InvalidAlias, parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "example.com",
         "--alias",
@@ -6050,7 +6150,7 @@ test "sesshmux-dev uses development artifact upload" {
 }
 
 test "parseSshArgs accepts ssh-style remote commands without a tty request" {
-    const parsed = try parseSshArgs(&.{
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "example.com",
         "uname",

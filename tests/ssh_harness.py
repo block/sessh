@@ -1901,6 +1901,29 @@ def test_ssh_no_terminal_emulator_requested_tty_uses_stream_path(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_interleaved_tty_and_no_terminal_emulator_preserves_exit_status(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "-t", "--no-terminal-emulator", "test-host", "exit 3"],
+        env,
+        (),
+        timeout=10.0,
+    )
+
+    if result.returncode != 3:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+
+
 def test_ssh_terminal_emulator_false_config_uses_stream_path(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -4247,6 +4270,10 @@ def main(argv=None):
         (
             "ssh no-terminal-emulator requested tty uses stream path",
             test_ssh_no_terminal_emulator_requested_tty_uses_stream_path,
+        ),
+        (
+            "ssh interleaved tty and no-terminal-emulator preserves exit status",
+            test_ssh_interleaved_tty_and_no_terminal_emulator_preserves_exit_status,
         ),
         (
             "ssh terminal-emulator false config uses stream path",
