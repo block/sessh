@@ -44,6 +44,28 @@ pub const Child = struct {
     }
 };
 
+// All PTY users should go through these master-read helpers instead of calling
+// read(2) directly. PTY EOF is not identical to pipe EOF on every platform:
+// Linux reports the closed slave side as EIO on the master. Keeping that rule
+// here prevents the stream and session agents from growing separate PTY lore.
+pub const MasterRead = union(enum) {
+    bytes: []const u8,
+    would_block,
+    eof,
+};
+
+pub const DrainLimits = struct {
+    max_reads: usize = std.math.maxInt(usize),
+    max_bytes: usize = std.math.maxInt(usize),
+};
+
+pub const DrainResult = struct {
+    read_count: usize = 0,
+    byte_count: usize = 0,
+    eof: bool = false,
+    limited: bool = false,
+};
+
 pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
     if (options.command_argv.len > 0 and options.shell_command != null) return error.InvalidSessionCommand;
 
@@ -90,6 +112,66 @@ pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
         std.process.exit(127);
     }
     return .{ .pid = pid, .master_fd = master };
+}
+
+pub fn readMaster(fd: c.fd_t, buf: []u8) !MasterRead {
+    return readMasterInner(fd, buf);
+}
+
+pub fn readMasterNonBlocking(fd: c.fd_t, buf: []u8) !MasterRead {
+    const original_flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+    if (original_flags < 0) return error.PtyMasterReadFailed;
+    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
+    const changed_flags = (original_flags & nonblocking_flag) == 0;
+    if (changed_flags and c.fcntl(fd, c.F.SETFL, original_flags | nonblocking_flag) < 0) {
+        return error.PtyMasterReadFailed;
+    }
+    defer {
+        if (changed_flags) _ = c.fcntl(fd, c.F.SETFL, original_flags);
+    }
+    return readMasterInner(fd, buf);
+}
+
+fn readMasterInner(fd: c.fd_t, buf: []u8) !MasterRead {
+    while (true) {
+        const n = c.read(fd, buf.ptr, buf.len);
+        if (n > 0) return .{ .bytes = buf[0..@intCast(n)] };
+        if (n == 0) return .eof;
+        switch (posix.errno(n)) {
+            .AGAIN => return .would_block,
+            .INTR => continue,
+            // On Linux, a PTY master reports EOF as EIO after the slave side
+            // closes. Other fd types should not use this helper.
+            .IO => return .eof,
+            else => return error.PtyMasterReadFailed,
+        }
+    }
+}
+
+pub fn drainMasterNonBlocking(
+    fd: c.fd_t,
+    context: anytype,
+    on_bytes: anytype,
+    limits: DrainLimits,
+) !DrainResult {
+    var result = DrainResult{};
+    while (result.read_count < limits.max_reads and result.byte_count < limits.max_bytes) {
+        var buf: [4096]u8 = undefined;
+        switch (try readMasterNonBlocking(fd, &buf)) {
+            .bytes => |bytes| {
+                result.read_count += 1;
+                result.byte_count += bytes.len;
+                try on_bytes(context, bytes);
+            },
+            .would_block => return result,
+            .eof => {
+                result.eof = true;
+                return result;
+            },
+        }
+    }
+    result.limited = true;
+    return result;
 }
 
 pub fn waitStatusToTerm(status: u32) std.process.Child.Term {
@@ -211,4 +293,48 @@ test "default shell prefers process environment then passwd then sh" {
     try std.testing.expectEqualStrings("/bin/zsh", chooseDefaultShell("/bin/zsh", "/bin/bash"));
     try std.testing.expectEqualStrings("/bin/bash", chooseDefaultShell("", "/bin/bash"));
     try std.testing.expectEqualStrings("/bin/sh", chooseDefaultShell(null, ""));
+}
+
+const DrainTestContext = struct {
+    allocator: std.mem.Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *DrainTestContext) void {
+        self.bytes.deinit(self.allocator);
+    }
+};
+
+fn appendDrainTestBytes(context: *DrainTestContext, bytes: []const u8) !void {
+    try context.bytes.appendSlice(context.allocator, bytes);
+}
+
+test "drain master reads available PTY output while child is still alive" {
+    var child = try spawn(std.testing.allocator, .{
+        .rows = 24,
+        .cols = 80,
+        .shell = "/bin/sh",
+        .shell_command = "printf PTY_MASTER_DRAIN; read ignored",
+    });
+    defer child.terminate();
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = child.master_fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try posix.poll(&pollfds, 1_000);
+    try std.testing.expect(ready == 1);
+    try std.testing.expect((pollfds[0].revents & posix.POLL.IN) != 0);
+
+    var context = DrainTestContext{ .allocator = std.testing.allocator };
+    defer context.deinit();
+    const result = try drainMasterNonBlocking(
+        child.master_fd,
+        &context,
+        appendDrainTestBytes,
+        .{},
+    );
+
+    try std.testing.expectEqualStrings("PTY_MASTER_DRAIN", context.bytes.items);
+    try std.testing.expect(!result.eof);
 }

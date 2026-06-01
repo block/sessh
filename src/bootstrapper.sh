@@ -169,7 +169,7 @@ done
 
 case "$broker_args" in
   :internal-*) exec_args=$broker_args ;;
-  *) exec_args=":internal-broker: $broker_args" ;;
+  *) exec_args=":internal-session-broker: $broker_args" ;;
 esac
 
 cache_root=${XDG_CACHE_HOME:-${HOME:-}/.cache}/sessh/bin

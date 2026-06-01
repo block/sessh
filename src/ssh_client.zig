@@ -1145,7 +1145,7 @@ fn sesshLongOptionMissingValueError(arg: []const u8) anyerror {
 
 /// Start the ssh transport by running the bootstrapper as the remote command.
 ///
-/// The bootstrapper eventually execs `sesshmux :internal-broker:`, at which
+/// The bootstrapper eventually execs `sesshmux :internal-session-broker:`, at which
 /// point the normal framed runtime protocol can flow over ssh stdio. Installed
 /// packages keep one binary per supported platform in libexec/sessh, named
 /// `sesshmux-<os>-<arch>`. If that layout is unavailable, upload the current
@@ -1452,7 +1452,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                     child = new_child;
                     session.discardPendingInputAcks();
                     session.viewport_offset = try reconnect_ui.clearBanner();
-                    client.finishReconnectRepaint(child.child.stdout.?.handle, &session) catch |err| switch (err) {
+                    client.finishReconnectRepaint(child.child.stdout.?.handle, child.child.stdin.?.handle, &session) catch |err| switch (err) {
                         error.SessionEnded => {
                             try finishEndedRemoteSession(allocator, &child, &session);
                             return;
@@ -1603,6 +1603,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             session.viewport_offset = try reconnect_ui.clearBanner();
             client.finishReconnectRepaint(
                 child.child.stdout.?.handle,
+                child.child.stdin.?.handle,
                 &session,
             ) catch |err| {
                 child.closeStdin();
@@ -2336,6 +2337,7 @@ fn raceExistingConnectionWithReconnect(
     pending_input_at_disconnect: bool,
     pending_paste_like_input_at_disconnect: bool,
 ) !ReconnectRaceOutcome {
+    reconnect_ui.showUnresponsiveReconnectInProgressTitle();
     var reconnect_attempt: usize = 0;
     while (true) {
         const outcome = try raceExistingConnectionWithReconnectAttempt(
@@ -3078,7 +3080,7 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
     defer allocator.free(cols_arg);
     const mode_arg = if (stream_uses_tty) "pty" else "pipe";
     const broker_args = [_][]const u8{
-        ":internal-stream-agent:",
+        ":internal-stream-broker:",
         stream_guid,
         mode_arg,
         rows_arg,
@@ -3108,13 +3110,26 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
         null;
     defer if (input_mode_guard) |*guard| guard.restore();
 
+    // Direct stream stdout can be application data. If it is a terminal, title
+    // updates are the least invasive reconnect UI. If stdout is redirected,
+    // keep it byte-clean and use append-only stderr status only when stderr is
+    // itself a terminal; otherwise reconnects stay silent.
+    const status_mode: stream_agent.StreamReconnectStatusMode = if (c.isatty(1) != 0)
+        .title
+    else if (c.isatty(2) != 0)
+        .stderr_plain
+    else
+        .disabled;
+
     stream_agent.runLocalStream(allocator, &starter, .{
         .source_fd = 0,
         .sink_fd = 1,
         .stderr_fd = 2,
-        .show_status = c.isatty(2) != 0,
+        .status_mode = status_mode,
         .intercept_ctrl_r = stdin_is_tty,
+        .intercept_escape = stream_uses_tty and stdin_is_tty,
         .receive_stderr = !stream_uses_tty,
+        .title_fallback = parsed_ssh_args.host,
     }) catch |err| {
         try starter.exitAfterInitialFailure(err);
     };
@@ -3463,7 +3478,7 @@ fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []cons
     defer allocator.free(client_version);
     try script.appendSlice(allocator, "SESSH_CLIENT_VERSION=");
     try script.appendSlice(allocator, client_version);
-    try script.appendSlice(allocator, " exec sesshmux :internal-broker:");
+    try script.appendSlice(allocator, " exec sesshmux :internal-session-broker:");
     for (broker_args) |arg| {
         const quoted = try shellQuote(allocator, arg);
         defer allocator.free(quoted);

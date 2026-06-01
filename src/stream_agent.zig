@@ -11,11 +11,12 @@ const reconnect = @import("reconnect.zig");
 const reconnect_title = @import("reconnect_title.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
+const terminal = @import("terminal.zig");
 const pb = protocol.pb;
 
 const max_buffered_bytes = 1024 * 1024;
 const max_chunk_bytes = 16 * 1024;
-const stream_ping_interval_ms: u64 = 1_000;
+const transport_ping_interval_ms: u64 = 1_000;
 const stream_unresponsive_after_ms: u64 = 10_000;
 
 const StreamOutcome = union(enum) {
@@ -25,13 +26,21 @@ const StreamOutcome = union(enum) {
     replacement: c.fd_t,
 };
 
+pub const StreamReconnectStatusMode = enum {
+    disabled,
+    stderr_plain,
+    title,
+};
+
 pub const LocalStreamOptions = struct {
     source_fd: c.fd_t,
     sink_fd: c.fd_t,
     stderr_fd: c.fd_t,
-    show_status: bool,
+    status_mode: StreamReconnectStatusMode,
     intercept_ctrl_r: bool,
+    intercept_escape: bool = false,
     receive_stderr: bool,
+    title_fallback: []const u8 = "",
 };
 
 // Stream channel ids are wire values, not a closed enum. The standard channels
@@ -235,10 +244,17 @@ const StreamStepOutcome = union(enum) {
     replacement: c.fd_t,
 };
 
+const StreamSourceKind = enum {
+    byte_stream,
+    // PTY masters use pty_process read helpers so Linux EIO-on-slave-close is
+    // handled in the same place as normal session PTY reads.
+    pty_master,
+};
+
 const StreamSource = struct {
     fd: c.fd_t = -1,
     channel: StreamChannel = stream_channel_undefined,
-    source_eio_is_eof: bool = false,
+    kind: StreamSourceKind = .byte_stream,
     input_control: ?*StreamInputControl = null,
 };
 
@@ -270,6 +286,7 @@ const StreamAttachmentOptions = struct {
     source_count: usize = 0,
     sources: [max_stream_sources]StreamSource = .{ .{}, .{} },
     sinks: [channel_count]ChannelSink = .{ .{}, .{}, .{} },
+    reconnect_status: ?*StreamReconnectStatus = null,
     replacement_listen_fd: ?c.fd_t = null,
     close_outbound_on_inbound_eof: bool = false,
     source_exit_pid: ?c.pid_t = null,
@@ -282,16 +299,30 @@ const StreamAttachmentOptions = struct {
 
 const StreamInputControl = struct {
     enabled: bool,
+    escape_enabled: bool = false,
     status_visible: bool = false,
     reconnect_requested: bool = false,
+    disconnect_requested: bool = false,
+    escape_filter: terminal.EscapeFilter = .{},
 
     fn filter(self: *StreamInputControl, bytes: []const u8, out: []u8) []const u8 {
+        var input = bytes;
+        var scratch: [max_chunk_bytes]u8 = undefined;
+        if (self.escape_enabled) {
+            const result = self.escape_filter.filter(bytes, &scratch);
+            if (result.end) |end| switch (end) {
+                .detach => self.disconnect_requested = true,
+                .repaint, .reconnect => {},
+            };
+            input = result.bytes;
+        }
+
         if (!self.enabled or !self.status_visible) {
-            @memcpy(out[0..bytes.len], bytes);
-            return out[0..bytes.len];
+            @memcpy(out[0..input.len], input);
+            return out[0..input.len];
         }
         var written: usize = 0;
-        for (bytes) |byte| {
+        for (input) |byte| {
             if (byte == reconnect_control.ctrl_r) {
                 self.reconnect_requested = true;
                 continue;
@@ -302,23 +333,34 @@ const StreamInputControl = struct {
         return out[0..written];
     }
 
-    fn consumeReconnectRequest(self: *StreamInputControl) bool {
+    fn consumeAction(self: *StreamInputControl) StreamControlAction {
+        if (self.disconnect_requested) {
+            self.disconnect_requested = false;
+            self.reconnect_requested = false;
+            return .disconnect;
+        }
         const requested = self.reconnect_requested;
         self.reconnect_requested = false;
-        return requested;
+        return if (requested) .reconnect else .none;
     }
+};
+
+const StreamControlAction = enum {
+    none,
+    reconnect,
+    disconnect,
 };
 
 const StreamLiveness = struct {
     last_incoming_ms: u64,
     next_ping_ms: u64,
-    ping_interval_ms: u64 = stream_ping_interval_ms,
+    ping_interval_ms: u64 = transport_ping_interval_ms,
     unresponsive_after_ms: u64 = stream_unresponsive_after_ms,
 
     fn init(now_ms: u64) StreamLiveness {
         return .{
             .last_incoming_ms = now_ms,
-            .next_ping_ms = now_ms + stream_ping_interval_ms,
+            .next_ping_ms = now_ms + transport_ping_interval_ms,
         };
     }
 
@@ -422,16 +464,15 @@ const StreamAttachment = struct {
         if (ready == 0) {
             if (self.liveness.timedOut(now_after_poll_ms)) return .unresponsive;
             if (self.liveness.pingDue(now_after_poll_ms)) {
-                sendStreamMessage(state.allocator, self.transport_write_fd, .stream_ping, pb.StreamPing{}) catch return .transport_closed;
+                protocol.sendPing(self.transport_write_fd) catch return .transport_closed;
                 self.liveness.notePingSent(now_after_poll_ms);
             }
-            // A command can exit after we drain its final stdout bytes but
-            // before the pipe reports EOF. Poll then wakes only for our
-            // liveness timer, so the timeout path must also check the child
-            // status and send StreamEof. Otherwise short non-tty commands can
-            // print their output and leave the durable stream agent alive
-            // waiting for a reconnect that will never be needed.
-            try self.drainExitedSources();
+            // A source can become EOF just after we read its final data bytes.
+            // Poll usually wakes again for EOF, but the liveness timer is also
+            // a safe place to do a nonblocking drain so short commands do not
+            // leave the stream agent waiting for a reconnect that is no longer
+            // needed.
+            try drainChildStreamSources(state, &self.options);
             if (state.peer_ready) {
                 sendPending(state, self.transport_write_fd) catch |err| switch (err) {
                     error.WriteFailed => return .transport_closed,
@@ -469,13 +510,16 @@ const StreamAttachment = struct {
             return .progress;
         }
 
+        var drain_after_source_read = false;
         for (self.options.sources[0..self.options.source_count], 0..) |source, source_index| {
             const poll_index = source_poll_indices[source_index] orelse continue;
             if (pollfds[poll_index].revents != 0) {
-                try self.readSource(source);
+                try readStreamSource(state, source);
+                if (source.kind == .pty_master) drain_after_source_read = true;
             }
         }
-        try self.drainExitedSources();
+        if (drain_after_source_read) try drainStreamSourcesNonBlocking(state, &self.options);
+        try drainChildStreamSources(state, &self.options);
 
         if (state.peer_ready) {
             sendPending(state, self.transport_write_fd) catch |err| switch (err) {
@@ -485,82 +529,113 @@ const StreamAttachment = struct {
         }
         return .idle;
     }
-
-    fn readSource(self: *StreamAttachment, source: StreamSource) !void {
-        const channel_state = self.state.channel(source.channel);
-        if (channel_state.outbound_eof) return;
-        // HUP can arrive with bytes still waiting. Only a zero-length read
-        // means the byte stream is actually closed and should be mirrored to
-        // the peer as StreamEof. macOS can report POLLNVAL for sources like
-        // /dev/null even though read() is still valid and returns EOF, so any
-        // source event gets one read attempt.
-        var buf: [max_chunk_bytes]u8 = undefined;
-        const n = c.read(source.fd, &buf, buf.len);
-        if (n < 0) {
-            switch (posix.errno(n)) {
-                .AGAIN, .INTR => return,
-                .IO => if (source.source_eio_is_eof) {
-                    channel_state.outbound_eof = true;
-                } else return error.StreamReadFailed,
-                else => return error.StreamReadFailed,
-            }
-        } else if (n == 0) {
-            channel_state.outbound_eof = true;
-        } else {
-            try self.appendSourceBytes(source, buf[0..@intCast(n)]);
-        }
-    }
-
-    fn appendSourceBytes(self: *StreamAttachment, source: StreamSource, bytes: []const u8) !void {
-        if (source.input_control) |control| {
-            var filtered: [max_chunk_bytes]u8 = undefined;
-            const filtered_bytes = control.filter(bytes, &filtered);
-            try self.state.appendOutbound(source.channel, filtered_bytes);
-        } else {
-            try self.state.appendOutbound(source.channel, bytes);
-        }
-    }
-
-    fn drainExitedSources(self: *StreamAttachment) !void {
-        const pid = self.options.source_exit_pid orelse return;
-        const exited = self.options.source_exit_seen orelse return;
-        if (!exited.*) {
-            var status: c_int = 0;
-            const result = c.waitpid(pid, &status, 1);
-            if (result == pid) {
-                exited.* = true;
-            } else if (result < 0) {
-                exited.* = true;
-            } else {
-                return;
-            }
-        }
-
-        for (self.options.sources[0..self.options.source_count]) |source| {
-            if (source.fd < 0) continue;
-            const channel_state = self.state.channel(source.channel);
-            while (!channel_state.outbound_eof and channel_state.bufferedBytes() < max_buffered_bytes) {
-                var buf: [max_chunk_bytes]u8 = undefined;
-                switch (readSomeNonBlocking(source.fd, &buf)) {
-                    .bytes => |bytes| if (bytes.len == 0) {
-                        channel_state.outbound_eof = true;
-                        break;
-                    } else {
-                        try self.appendSourceBytes(source, bytes);
-                    },
-                    // Once the child process is gone, the pipe has no writers.
-                    // A would-block result here means this channel has no more
-                    // bytes for us to preserve, so publish EOF to the peer.
-                    .would_block => {
-                        channel_state.outbound_eof = true;
-                        break;
-                    },
-                    .failed => return error.StreamReadFailed,
-                }
-            }
-        }
-    }
 };
+
+fn readStreamSource(state: *StreamState, source: StreamSource) !void {
+    const channel_state = state.channel(source.channel);
+    if (channel_state.outbound_eof) return;
+    // HUP/ERR can arrive while bytes are still readable, so source readiness
+    // always gets a read attempt. PTY master EOF has platform-specific details;
+    // pty_process.readMaster owns those.
+    var buf: [max_chunk_bytes]u8 = undefined;
+    switch (try readStreamSourceFd(source, &buf)) {
+        .bytes => |bytes| try appendStreamSourceBytes(state, source, bytes),
+        .would_block => {},
+        .eof => channel_state.outbound_eof = true,
+    }
+}
+
+fn appendStreamSourceBytes(state: *StreamState, source: StreamSource, bytes: []const u8) !void {
+    if (source.input_control) |control| {
+        var filtered: [max_chunk_bytes]u8 = undefined;
+        const filtered_bytes = control.filter(bytes, &filtered);
+        try state.appendOutbound(source.channel, filtered_bytes);
+    } else {
+        try state.appendOutbound(source.channel, bytes);
+    }
+}
+
+fn drainChildStreamSources(state: *StreamState, options: *const StreamAttachmentOptions) !void {
+    if (options.source_exit_pid == null or options.source_exit_seen == null) return;
+    try drainStreamSourcesNonBlocking(state, options);
+    if (streamSourcesEof(state, options)) {
+        reapStreamSourceChildIfExited(options);
+    }
+}
+
+fn drainStreamSourcesNonBlocking(
+    state: *StreamState,
+    options: *const StreamAttachmentOptions,
+) !void {
+    for (options.sources[0..options.source_count]) |source| {
+        if (source.fd < 0) continue;
+        const channel_state = state.channel(source.channel);
+        while (!channel_state.outbound_eof and channel_state.bufferedBytes() < max_buffered_bytes) {
+            var buf: [max_chunk_bytes]u8 = undefined;
+            switch (try readStreamSourceFdNonBlocking(source, &buf)) {
+                .bytes => |bytes| if (bytes.len == 0) {
+                    channel_state.outbound_eof = true;
+                    break;
+                } else {
+                    try appendStreamSourceBytes(state, source, bytes);
+                },
+                .would_block => {
+                    // Would-block only means there is no source data ready
+                    // right now. EOF must come from the source fd itself, not
+                    // from a child-status guess.
+                    break;
+                },
+                .eof => {
+                    channel_state.outbound_eof = true;
+                    break;
+                },
+            }
+        }
+    }
+}
+
+fn readStreamSourceFd(source: StreamSource, buf: []u8) !ReadSomeResult {
+    return switch (source.kind) {
+        .pty_master => ptyMasterReadResult(try pty_process.readMaster(source.fd, buf)),
+        .byte_stream => readSome(source.fd, buf),
+    };
+}
+
+fn readStreamSourceFdNonBlocking(source: StreamSource, buf: []u8) !ReadSomeResult {
+    return switch (source.kind) {
+        .pty_master => ptyMasterReadResult(try pty_process.readMasterNonBlocking(source.fd, buf)),
+        .byte_stream => readSomeNonBlocking(source.fd, buf),
+    };
+}
+
+fn ptyMasterReadResult(result: pty_process.MasterRead) ReadSomeResult {
+    return switch (result) {
+        .bytes => |bytes| .{ .bytes = bytes },
+        .would_block => .would_block,
+        .eof => .eof,
+    };
+}
+
+fn streamSourcesEof(state: *const StreamState, options: *const StreamAttachmentOptions) bool {
+    for (options.sources[0..options.source_count]) |source| {
+        if (source.fd < 0) continue;
+        if (!state.constChannel(source.channel).outbound_eof) return false;
+    }
+    return true;
+}
+
+fn reapStreamSourceChildIfExited(options: *const StreamAttachmentOptions) void {
+    const pid = options.source_exit_pid orelse return;
+    const exited = options.source_exit_seen orelse return;
+    if (exited.*) return;
+
+    // Reap only after the source fds reached EOF. The byte stream is ordered as
+    // source data followed by StreamEof; child status is cleanup bookkeeping,
+    // not evidence that the source buffers have been drained.
+    var status: c_int = 0;
+    const result = c.waitpid(pid, &status, 1);
+    if (result == pid or result < 0) exited.* = true;
+}
 
 fn PendingReplacement(comptime Starter: type, comptime Transport: type) type {
     return struct {
@@ -689,7 +764,7 @@ const StreamEndpoint = union(enum) {
                     .{
                         .fd = pty.master_fd,
                         .channel = stream_channel_stdout,
-                        .source_eio_is_eof = true,
+                        .kind = .pty_master,
                     },
                     .{},
                 },
@@ -774,15 +849,10 @@ const PipeEndpoint = struct {
     }
 };
 
-/// The visible `:internal-stream-agent:` process runs inside the current ssh
-/// transport. It connects that short-lived transport to a durable agent socket
-/// for the `r-` GUID, starting the durable agent under the same entrypoint when
-/// needed. Keeping one public stream entrypoint avoids the old client/remote
-/// split where different sockets spoke different ad-hoc protocols.
-pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
-    if (args.len > 0 and std.mem.eql(u8, args[0], "--serve")) {
-        return runAgentServer(allocator, args[1..]);
-    }
+/// The stream broker is bound to one ssh transport. It connects that transport
+/// to the durable stream agent socket for the `r-` GUID, starting the agent when
+/// needed, then relays bytes between ssh stdio and the agent socket.
+pub fn runBroker(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     var config = try parseStreamAgentConfig(allocator, args);
     defer config.deinit(allocator);
 
@@ -794,9 +864,10 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
     try relayRawDuplex(0, 1, fd);
 }
 
-fn runAgentServer(allocator: std.mem.Allocator, args: []const []const u8) !void {
+pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+    _ = exe;
     if (args.len != 6) {
-        try io.writeAll(2, "sessh: :internal-stream-agent: --serve requires GUID SOCKET MODE ROWS COLS COMMAND\n");
+        try io.writeAll(2, "sessh: :internal-stream-agent: requires GUID SOCKET MODE ROWS COLS COMMAND\n");
         return error.InvalidStreamArgs;
     }
     const socket_path = args[1];
@@ -824,8 +895,8 @@ fn runAgentServer(allocator: std.mem.Allocator, args: []const []const u8) !void 
     }
     while (true) {
         if (attach_fd < 0) {
-            attach_fd = c.accept(listen_fd, null, null);
-            if (attach_fd < 0) return error.AcceptFailed;
+            var detached_options = endpoint.attachmentOptions(listen_fd);
+            attach_fd = try waitForReplacementWhileDetached(&state, listen_fd, &detached_options);
         }
 
         const outcome = try runAttachedStream(
@@ -848,8 +919,56 @@ fn runAgentServer(allocator: std.mem.Allocator, args: []const []const u8) !void 
     }
 }
 
+fn waitForReplacementWhileDetached(
+    state: *StreamState,
+    listen_fd: c.fd_t,
+    options: *const StreamAttachmentOptions,
+) !c.fd_t {
+    while (true) {
+        // The stream agent is durable even when no ssh transport is currently
+        // attached. It must keep draining remote fds into the offset-tracked
+        // buffers; otherwise the remote process can block, or PTY cleanup can
+        // make output unavailable before a replacement transport attaches.
+        var pollfds: [1 + max_stream_sources]posix.pollfd = undefined;
+        var count: usize = 0;
+        const listen_index = count;
+        pollfds[count] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
+        count += 1;
+
+        var source_poll_indices: [max_stream_sources]?usize = .{ null, null };
+        if (options.source_count > max_stream_sources) return error.StreamTooManySources;
+        for (options.sources[0..options.source_count], 0..) |source, source_index| {
+            if (source.fd < 0) continue;
+            if (!state.active_outbound.contains(source.channel)) return error.StreamInactiveChannel;
+            const channel_state = state.channel(source.channel);
+            if (channel_state.outbound_eof or channel_state.bufferedBytes() >= max_buffered_bytes) continue;
+            source_poll_indices[source_index] = count;
+            pollfds[count] = .{ .fd = source.fd, .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
+        }
+
+        _ = try posix.poll(pollfds[0..count], -1);
+        if ((pollfds[listen_index].revents & posix.POLL.IN) != 0) {
+            const fd = c.accept(listen_fd, null, null);
+            if (fd < 0) return error.AcceptFailed;
+            return fd;
+        }
+
+        for (options.sources[0..options.source_count], 0..) |source, source_index| {
+            const poll_index = source_poll_indices[source_index] orelse continue;
+            if (pollfds[poll_index].revents != 0) {
+                try readStreamSource(state, source);
+            }
+        }
+        try drainStreamSourcesNonBlocking(state, options);
+        if (streamSourcesEof(state, options)) {
+            reapStreamSourceChildIfExited(options);
+        }
+    }
+}
+
 /// Runs in the local `sessh` process. `start_transport` creates ssh transports
-/// that execute the visible `:internal-stream-agent:` entrypoint remotely; this
+/// that execute the visible `:internal-stream-broker:` entrypoint remotely; this
 /// loop owns local stdin/stdout and the reconnect policy.
 pub fn runLocalStream(
     allocator: std.mem.Allocator,
@@ -866,8 +985,11 @@ pub fn runLocalStream(
         .{ .stdout = true, .stderr = options.receive_stderr },
     );
     defer state.deinit();
-    var input_control = StreamInputControl{ .enabled = options.intercept_ctrl_r };
-    var reconnect_status = StreamReconnectStatus.init(options.show_status, options.intercept_ctrl_r);
+    var input_control = StreamInputControl{
+        .enabled = options.intercept_ctrl_r,
+        .escape_enabled = options.intercept_escape,
+    };
+    var reconnect_status = StreamReconnectStatus.init(options.status_mode, options.intercept_ctrl_r, options.title_fallback);
     defer reconnect_status.deinit();
 
     var attempt: usize = 0;
@@ -894,8 +1016,9 @@ pub fn runLocalStream(
                     return err;
                 }
                 const delay_ms = reconnect.delayMs(attempt);
-                const reconnect_now = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
-                attempt = reconnect.nextAttempt(attempt, reconnect_now);
+                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
+                if (action == .disconnect) return;
+                attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                 retrying = true;
                 continue;
             };
@@ -921,6 +1044,7 @@ pub fn runLocalStream(
                         .{},
                     },
                     .sinks = localStreamSinks(options.sink_fd, options.stderr_fd, options.receive_stderr),
+                    .reconnect_status = &reconnect_status,
                     // A direct stream represents one remote command, not
                     // an interactive session. Once the remote side has
                     // closed its output stream there is no process left to
@@ -960,8 +1084,9 @@ pub fn runLocalStream(
                             pending = Pending.start(allocator, start_transport) catch |err| {
                                 client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                                 const delay_ms = reconnect.delayMs(attempt);
-                                const reconnect_now = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
-                                attempt = reconnect.nextAttempt(attempt, reconnect_now);
+                                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
+                                if (action == .disconnect) return;
+                                attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                                 continue;
                             };
                             reconnect_status.showReconnecting();
@@ -977,13 +1102,20 @@ pub fn runLocalStream(
                     },
                     .idle => {},
                 }
-                if (input_control.consumeReconnectRequest() and old_unresponsive and pending == null) {
-                    pending = Pending.start(allocator, start_transport) catch |err| {
-                        client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
-                        continue;
-                    };
-                    reconnect_status.showReconnecting();
-                    input_control.status_visible = true;
+                switch (input_control.consumeAction()) {
+                    .disconnect => {
+                        abortTransport(&transport);
+                        return;
+                    },
+                    .reconnect => if (old_unresponsive and pending == null) {
+                        pending = Pending.start(allocator, start_transport) catch |err| {
+                            client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
+                            continue;
+                        };
+                        reconnect_status.showReconnecting();
+                        input_control.status_visible = true;
+                    },
+                    .none => {},
                 }
 
                 if (pending) |*replacement| {
@@ -1007,8 +1139,9 @@ pub fn runLocalStream(
                                 client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                                 if (old_unresponsive) {
                                     const delay_ms = reconnect.delayMs(attempt);
-                                    const reconnect_now = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
-                                    attempt = reconnect.nextAttempt(attempt, reconnect_now);
+                                    const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
+                                    if (action == .disconnect) return;
+                                    attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                                     pending = Pending.start(allocator, start_transport) catch |retry_err| {
                                         client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{retry_err});
                                         continue;
@@ -1029,7 +1162,7 @@ pub fn runLocalStream(
                 if (result != null) break;
                 reconnect_status.showReconnecting();
                 input_control.status_visible = true;
-                _ = pollReconnectInput(&state, options.source_fd, &input_control, 50);
+                if (pollReconnectInput(&state, options.source_fd, &input_control, 50) == .disconnect) return;
                 reconnect_status.flushDiagnostics();
             }
             pending = null;
@@ -1047,8 +1180,9 @@ pub fn runLocalStream(
             }
         }
         const delay_ms = reconnect.delayMs(attempt);
-        const reconnect_now = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
-        attempt = reconnect.nextAttempt(attempt, reconnect_now);
+        const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
+        if (action == .disconnect) return;
+        attempt = reconnect.nextAttempt(attempt, action == .reconnect);
         retrying = true;
     }
 }
@@ -1140,7 +1274,7 @@ fn handleFrame(
                 if (already_received < message.data.len) {
                     const new_data = message.data[already_received..];
                     if (sink.fd < 0) return error.StreamSinkClosed;
-                    try io.writeAll(sink.fd, new_data);
+                    try deliverInboundData(options, channel, sink.fd, new_data);
                     channel_state.recv_next_offset += new_data.len;
                 }
                 sendStreamMessage(state.allocator, transport_write_fd, .stream_ack, pb.StreamAck{
@@ -1154,7 +1288,7 @@ fn handleFrame(
             }
             if (message.offset != channel_state.recv_next_offset) return error.StreamOffsetGap;
             if (message.data.len != 0 and sink.fd < 0) return error.StreamSinkClosed;
-            if (message.data.len != 0) try io.writeAll(sink.fd, message.data);
+            if (message.data.len != 0) try deliverInboundData(options, channel, sink.fd, message.data);
             channel_state.recv_next_offset += message.data.len;
             sendStreamMessage(state.allocator, transport_write_fd, .stream_ack, pb.StreamAck{
                 .channel = channel,
@@ -1195,20 +1329,19 @@ fn handleFrame(
                 else => return err,
             };
         },
-        .stream_ping => {
-            var message = try protocol.decodePayload(pb.StreamPing, state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
-            sendStreamMessage(state.allocator, transport_write_fd, .stream_pong, pb.StreamPong{}) catch |err| switch (err) {
+        .ping, .pong => {
+            _ = protocol.handleTransportControlFrame(mutable.message_type, mutable.payload, transport_write_fd) catch |err| switch (err) {
                 error.WriteFailed => return error.StreamTransportWriteFailed,
                 else => return err,
             };
         },
-        .stream_pong => {
-            var message = try protocol.decodePayload(pb.StreamPong, state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
-        },
         else => return error.StreamUnexpectedFrame,
     }
+}
+
+fn deliverInboundData(options: *const StreamAttachmentOptions, channel: StreamChannel, sink_fd: c.fd_t, bytes: []const u8) !void {
+    if (options.reconnect_status) |status| status.observeInbound(channel, bytes);
+    try io.writeAll(sink_fd, bytes);
 }
 
 fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
@@ -1331,29 +1464,33 @@ fn copySomeOrClose(read_fd: c.fd_t, write_fd: c.fd_t) bool {
 const ReadSomeResult = union(enum) {
     bytes: []const u8,
     would_block,
-    failed,
+    eof,
 };
 
-fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) ReadSomeResult {
+fn readSome(fd: c.fd_t, buf: []u8) !ReadSomeResult {
+    while (true) {
+        const n = c.read(fd, buf.ptr, buf.len);
+        if (n > 0) return .{ .bytes = buf[0..@intCast(n)] };
+        if (n == 0) return .eof;
+        switch (posix.errno(n)) {
+            .AGAIN => return .would_block,
+            .INTR => continue,
+            else => return error.StreamReadFailed,
+        }
+    }
+}
+
+fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) !ReadSomeResult {
     const original_flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (original_flags < 0) return .failed;
+    if (original_flags < 0) return error.StreamReadFailed;
     const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
     const changed_flags = (original_flags & nonblocking_flag) == 0;
-    if (changed_flags and c.fcntl(fd, c.F.SETFL, original_flags | nonblocking_flag) < 0) return .failed;
+    if (changed_flags and c.fcntl(fd, c.F.SETFL, original_flags | nonblocking_flag) < 0) return error.StreamReadFailed;
     defer {
         if (changed_flags) _ = c.fcntl(fd, c.F.SETFL, original_flags);
     }
 
-    while (true) {
-        const n = c.read(fd, buf.ptr, buf.len);
-        if (n > 0) return .{ .bytes = buf[0..@intCast(n)] };
-        if (n == 0) return .{ .bytes = buf[0..0] };
-        switch (posix.errno(n)) {
-            .AGAIN => return .would_block,
-            .INTR => continue,
-            else => return .failed,
-        }
-    }
+    return readSome(fd, buf);
 }
 
 fn connectOrStartAgent(
@@ -1368,7 +1505,6 @@ fn connectOrStartAgent(
     const argv = [_][]const u8{
         exe,
         ":internal-stream-agent:",
-        "--serve",
         agent_args[0],
         socket_path,
         agent_args[1],
@@ -1396,7 +1532,7 @@ fn connectOrStartAgent(
 
 fn parseStreamAgentConfig(allocator: std.mem.Allocator, args: []const []const u8) !StreamAgentConfig {
     if (args.len != 5) {
-        try io.writeAll(2, "sessh: :internal-stream-agent: requires GUID MODE ROWS COLS COMMAND\n");
+        try io.writeAll(2, "sessh: :internal-stream-broker: requires GUID MODE ROWS COLS COMMAND\n");
         return error.InvalidStreamArgs;
     }
     if (!session_registry.isValidReconnectGuid(args[0])) return error.InvalidStreamGuid;
@@ -1459,17 +1595,18 @@ fn waitBeforeReconnect(
     state: *StreamState,
     source_fd: c.fd_t,
     input_control: *StreamInputControl,
-) bool {
+) StreamControlAction {
     var remaining_ms = delay_ms;
     while (remaining_ms > 0) {
         status.showRetry(remaining_ms);
         input_control.status_visible = true;
         const step_ms = @min(remaining_ms, 1_000);
-        if (pollReconnectInput(state, source_fd, input_control, @intCast(step_ms))) return true;
+        const action = pollReconnectInput(state, source_fd, input_control, @intCast(step_ms));
+        if (action != .none) return action;
         remaining_ms -= step_ms;
         status.flushDiagnostics();
     }
-    return input_control.consumeReconnectRequest();
+    return input_control.consumeAction();
 }
 
 fn pollReconnectInput(
@@ -1477,18 +1614,18 @@ fn pollReconnectInput(
     source_fd: c.fd_t,
     input_control: *StreamInputControl,
     timeout_ms: i32,
-) bool {
-    if (!input_control.enabled or !input_control.status_visible) {
+) StreamControlAction {
+    if ((!input_control.enabled and !input_control.escape_enabled) or !input_control.status_visible) {
         if (timeout_ms > 0) io.sleepMillis(@intCast(timeout_ms));
-        return false;
+        return input_control.consumeAction();
     }
     var pollfd = [_]posix.pollfd{.{
         .fd = source_fd,
         .events = posix.POLL.IN,
         .revents = 0,
     }};
-    const ready = posix.poll(&pollfd, timeout_ms) catch return input_control.consumeReconnectRequest();
-    if (ready == 0) return input_control.consumeReconnectRequest();
+    const ready = posix.poll(&pollfd, timeout_ms) catch return input_control.consumeAction();
+    if (ready == 0) return input_control.consumeAction();
     if (pollfd[0].revents != 0) {
         var buf: [max_chunk_bytes]u8 = undefined;
         const n = c.read(source_fd, &buf, buf.len);
@@ -1500,50 +1637,203 @@ fn pollReconnectInput(
             state.appendOutbound(stream_channel_stdin, filtered_bytes) catch {};
         }
     }
-    return input_control.consumeReconnectRequest();
+    return input_control.consumeAction();
 }
 
-// Direct streams must keep stdout byte-for-byte clean when it is redirected, so
-// reconnect status is append-only stderr text. The caller only enables this when
-// stderr is a terminal; otherwise reconnect attempts stay quiet.
-const StreamReconnectStatus = struct {
-    const max_diagnostic_lines = 3;
-    const Mode = enum {
-        disabled,
-        stderr_plain,
+const TerminalTitleTracker = struct {
+    const max_title_bytes = 512;
+    const State = enum {
+        ground,
+        escape,
+        csi,
+        osc_command,
+        osc_text,
+        osc_escape,
+        string,
+        string_escape,
     };
 
+    state: State = .ground,
+    osc_command: [8]u8 = [_]u8{0} ** 8,
+    osc_command_len: usize = 0,
+    tracking_title: bool = false,
+    title: [max_title_bytes]u8 = [_]u8{0} ** max_title_bytes,
+    title_len: usize = 0,
+    title_present: bool = false,
+    pending_title: [max_title_bytes]u8 = [_]u8{0} ** max_title_bytes,
+    pending_title_len: usize = 0,
+    csi_bytes: [32]u8 = [_]u8{0} ** 32,
+    csi_len: usize = 0,
+    synchronized_update_active: bool = false,
+
+    fn observe(self: *TerminalTitleTracker, bytes: []const u8) void {
+        for (bytes) |byte| self.observeByte(byte);
+    }
+
+    fn safeForLocalTitle(self: *const TerminalTitleTracker) bool {
+        // A finished `CSI ? 2026 h` leaves the parser in ground state, but the
+        // terminal is still inside a synchronized update. Title changes made
+        // there can be held back by the terminal until the matching `l`, so the
+        // reconnect UI treats that interval as unsafe too.
+        return self.state == .ground and !self.synchronized_update_active;
+    }
+
+    fn titlePresent(self: *const TerminalTitleTracker) bool {
+        return self.title_present;
+    }
+
+    fn titleSlice(self: *const TerminalTitleTracker) []const u8 {
+        return self.title[0..self.title_len];
+    }
+
+    fn observeByte(self: *TerminalTitleTracker, byte: u8) void {
+        switch (self.state) {
+            .ground => {
+                if (byte == 0x1b) self.state = .escape;
+            },
+            .escape => switch (byte) {
+                '[' => {
+                    self.state = .csi;
+                    self.csi_len = 0;
+                },
+                ']' => {
+                    self.state = .osc_command;
+                    self.osc_command_len = 0;
+                    self.tracking_title = false;
+                    self.pending_title_len = 0;
+                },
+                'P', '^', '_', 'X' => self.state = .string,
+                else => self.state = .ground,
+            },
+            .csi => {
+                if (byte == 0x1b) {
+                    self.state = .escape;
+                } else if (byte >= 0x40 and byte <= 0x7e) {
+                    self.finishCsi(byte);
+                    self.state = .ground;
+                } else if (self.csi_len < self.csi_bytes.len) {
+                    self.csi_bytes[self.csi_len] = byte;
+                    self.csi_len += 1;
+                }
+            },
+            .osc_command => {
+                if (byte == 0x07) {
+                    self.state = .ground;
+                } else if (byte == 0x1b) {
+                    self.state = .osc_escape;
+                } else if (byte == ';') {
+                    self.tracking_title = self.isTitleCommand();
+                    self.pending_title_len = 0;
+                    self.state = .osc_text;
+                } else if (self.osc_command_len < self.osc_command.len) {
+                    self.osc_command[self.osc_command_len] = byte;
+                    self.osc_command_len += 1;
+                }
+            },
+            .osc_text => {
+                if (byte == 0x07) {
+                    self.finishOsc();
+                    self.state = .ground;
+                } else if (byte == 0x1b) {
+                    self.state = .osc_escape;
+                } else {
+                    self.appendPendingTitle(byte);
+                }
+            },
+            .osc_escape => {
+                if (byte == '\\') {
+                    self.finishOsc();
+                    self.state = .ground;
+                } else {
+                    self.appendPendingTitle(0x1b);
+                    self.appendPendingTitle(byte);
+                    self.state = .osc_text;
+                }
+            },
+            .string => {
+                if (byte == 0x1b) self.state = .string_escape;
+            },
+            .string_escape => {
+                self.state = if (byte == '\\') .ground else .string;
+            },
+        }
+    }
+
+    fn isTitleCommand(self: *const TerminalTitleTracker) bool {
+        const command = self.osc_command[0..self.osc_command_len];
+        return std.mem.eql(u8, command, "0") or std.mem.eql(u8, command, "2");
+    }
+
+    fn appendPendingTitle(self: *TerminalTitleTracker, byte: u8) void {
+        if (!self.tracking_title) return;
+        if (self.pending_title_len >= self.pending_title.len) return;
+        self.pending_title[self.pending_title_len] = byte;
+        self.pending_title_len += 1;
+    }
+
+    fn finishOsc(self: *TerminalTitleTracker) void {
+        if (!self.tracking_title) return;
+        @memcpy(self.title[0..self.pending_title_len], self.pending_title[0..self.pending_title_len]);
+        self.title_len = self.pending_title_len;
+        self.title_present = true;
+    }
+
+    fn finishCsi(self: *TerminalTitleTracker, final_byte: u8) void {
+        const params = self.csi_bytes[0..self.csi_len];
+        if (std.mem.eql(u8, params, "?2026")) {
+            if (final_byte == 'h') self.synchronized_update_active = true;
+            if (final_byte == 'l') self.synchronized_update_active = false;
+        }
+    }
+};
+
+// Direct streams must keep application bytes clean. When stdout is a terminal we
+// can use the window title for reconnect status; otherwise the caller may allow
+// append-only stderr lines. Title mode tracks app OSC titles in the byte stream
+// so reconnect status can be restored without inventing a second UI channel.
+const StreamReconnectStatus = struct {
+    const max_diagnostic_lines = 3;
+    const max_title_fallback_bytes = 512;
+
     fd: c.fd_t,
-    mode: Mode,
+    mode: StreamReconnectStatusMode,
     line: [96]u8 = undefined,
     line_len: usize = 0,
     ctrl_r_enabled: bool,
     diagnostic_cursor: u64,
     live_diagnostic_start_seq: u64,
     rendered_diagnostic_seq: u64,
+    title_visible: bool = false,
+    title_tracker: TerminalTitleTracker = .{},
+    title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
+    title_fallback_len: usize = 0,
 
-    fn init(enabled: bool, ctrl_r_enabled: bool) StreamReconnectStatus {
+    fn init(mode: StreamReconnectStatusMode, ctrl_r_enabled: bool, title_fallback: []const u8) StreamReconnectStatus {
         const displayed = client_log.displayedUserDiagnosticSeq();
-        return .{
-            .fd = 2,
-            .mode = if (enabled) .stderr_plain else .disabled,
+        var status = StreamReconnectStatus{
+            .fd = if (mode == .title) 1 else 2,
+            .mode = mode,
             .ctrl_r_enabled = ctrl_r_enabled,
             .diagnostic_cursor = displayed,
             .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
             .rendered_diagnostic_seq = displayed,
         };
+        status.title_fallback_len = copyTitle(&status.title_fallback, title_fallback);
+        return status;
     }
 
-    fn initForTest(fd: c.fd_t, enabled: bool, ctrl_r_enabled: bool) StreamReconnectStatus {
+    fn initForTest(fd: c.fd_t, mode: StreamReconnectStatusMode, ctrl_r_enabled: bool, title_fallback: []const u8) StreamReconnectStatus {
         const displayed = client_log.displayedUserDiagnosticSeq();
-        return .{
+        var status = StreamReconnectStatus{
             .fd = fd,
-            .mode = if (enabled) .stderr_plain else .disabled,
+            .mode = mode,
             .ctrl_r_enabled = ctrl_r_enabled,
             .diagnostic_cursor = displayed,
             .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
             .rendered_diagnostic_seq = displayed,
         };
+        status.title_fallback_len = copyTitle(&status.title_fallback, title_fallback);
+        return status;
     }
 
     fn deinit(self: *StreamReconnectStatus) void {
@@ -1551,30 +1841,31 @@ const StreamReconnectStatus = struct {
     }
 
     fn showRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
-        var delay_buf: [16]u8 = undefined;
-        const delay = reconnect_title.formatDelay(delay_ms, &delay_buf) catch return;
-        const message = if (self.ctrl_r_enabled)
-            std.fmt.bufPrint(&self.line, "sessh: disconnected: Retry connecting {s}. CTRL-R now", .{delay}) catch return
-        else
-            std.fmt.bufPrint(&self.line, "sessh: disconnected: Retry connecting {s}", .{delay}) catch return;
+        const message = reconnect_title.retryStatus(&self.line, delay_ms, .{
+            .ctrl_r = self.ctrl_r_enabled,
+            .ctrl_c_detach = false,
+        }) catch return;
         self.line_len = message.len;
         self.refreshDiagnostics();
+        self.writeTitleRetry(delay_ms);
         self.writePlainStatusLine();
     }
 
     fn showReconnecting(self: *StreamReconnectStatus) void {
-        const message = if (self.ctrl_r_enabled)
-            "sessh: disconnected: Reconnecting... CTRL-R now"
-        else
-            "sessh: disconnected: Reconnecting...";
+        const message = reconnect_title.reconnectingStatus(.{
+            .ctrl_r = self.ctrl_r_enabled,
+            .ctrl_c_detach = false,
+        });
         @memcpy(self.line[0..message.len], message);
         self.line_len = message.len;
         self.refreshDiagnostics();
+        self.writeTitleReconnecting();
         self.writePlainStatusLine();
     }
 
     fn clear(self: *StreamReconnectStatus) void {
         self.refreshDiagnostics();
+        self.restoreTitle();
     }
 
     fn flushDiagnostics(self: *StreamReconnectStatus) void {
@@ -1586,6 +1877,45 @@ const StreamReconnectStatus = struct {
         const message = self.line[0..self.line_len];
         io.writeAll(self.fd, message) catch return;
         io.writeAll(self.fd, "\n") catch return;
+    }
+
+    fn writeTitleRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
+        if (!self.canWriteTitle()) return;
+        if (self.ctrl_r_enabled) {
+            reconnect_title.writeRetryNowTitle(self.fd, delay_ms) catch return;
+        } else {
+            reconnect_title.writeRetryTitle(self.fd, delay_ms) catch return;
+        }
+        self.title_visible = true;
+    }
+
+    fn writeTitleReconnecting(self: *StreamReconnectStatus) void {
+        if (!self.canWriteTitle()) return;
+        if (self.ctrl_r_enabled) {
+            reconnect_title.writeReconnectingNowTitle(self.fd) catch return;
+        } else {
+            reconnect_title.writeReconnectingTitle(self.fd) catch return;
+        }
+        self.title_visible = true;
+    }
+
+    fn canWriteTitle(self: *const StreamReconnectStatus) bool {
+        return self.mode == .title and self.fd >= 0 and self.title_tracker.safeForLocalTitle();
+    }
+
+    fn restoreTitle(self: *StreamReconnectStatus) void {
+        if (!self.title_visible or self.mode != .title or self.fd < 0) return;
+        const title = if (self.title_tracker.titlePresent())
+            self.title_tracker.titleSlice()
+        else
+            self.title_fallback[0..self.title_fallback_len];
+        reconnect_title.writeTitle(self.fd, title) catch {};
+        self.title_visible = false;
+    }
+
+    fn observeInbound(self: *StreamReconnectStatus, channel: StreamChannel, bytes: []const u8) void {
+        if (channel != stream_channel_stdout or self.mode != .title) return;
+        self.title_tracker.observe(bytes);
     }
 
     fn refreshDiagnostics(self: *StreamReconnectStatus) void {
@@ -1617,6 +1947,12 @@ const StreamReconnectStatus = struct {
         client_log.markUserDiagnosticsDisplayedThrough(new_cursor);
     }
 };
+
+fn copyTitle(dest: []u8, title: []const u8) usize {
+    const len = @min(dest.len, title.len);
+    @memcpy(dest[0..len], title[0..len]);
+    return len;
+}
 
 fn formatDiagnosticLine(
     out: []u8,
@@ -1661,16 +1997,16 @@ test "stream ping receives pong without changing offsets" {
 
     var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{ .stdout = true });
     defer state.deinit();
-    const payload = try protocol.encodePayload(std.testing.allocator, pb.StreamPing{});
+    const payload = try protocol.encodePayload(std.testing.allocator, pb.Ping{});
     const options = StreamAttachmentOptions{};
     try handleFrame(&state, fds[1], &options, .{
-        .message_type = .stream_ping,
+        .message_type = .ping,
         .payload = payload,
     });
 
     var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.stream_pong, frame.message_type);
+    try std.testing.expectEqual(protocol.MessageType.pong, frame.message_type);
     try std.testing.expectEqual(@as(u64, 0), state.constChannel(stream_channel_stdout).recv_next_offset);
     try std.testing.expectEqual(@as(u64, 0), state.constChannel(stream_channel_stdin).outboundNext());
 }
@@ -1755,6 +2091,36 @@ test "stream liveness schedules probes before declaring unresponsive" {
     try std.testing.expectEqual(@as(i32, 1_000), liveness.pollTimeoutMs(11_000, -1));
 }
 
+test "stream input control intercepts only reconnect UI controls" {
+    var control = StreamInputControl{
+        .enabled = true,
+        .status_visible = true,
+    };
+    var out: [16]u8 = undefined;
+
+    try std.testing.expectEqualStrings("ab", control.filter("a\x12b", &out));
+    try std.testing.expectEqual(StreamControlAction.reconnect, control.consumeAction());
+
+    try std.testing.expectEqualStrings("\x03", control.filter("\x03", &out));
+    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
+
+    control.status_visible = false;
+    try std.testing.expectEqualStrings("\x12", control.filter("\x12", &out));
+    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
+}
+
+test "stream input control uses ssh escape to disconnect passthrough" {
+    var control = StreamInputControl{
+        .enabled = true,
+        .escape_enabled = true,
+        .status_visible = true,
+    };
+    var out: [16]u8 = undefined;
+
+    try std.testing.expectEqualStrings("", control.filter("~.", &out));
+    try std.testing.expectEqual(StreamControlAction.disconnect, control.consumeAction());
+}
+
 test "pending stream replacement hands off a prepared transport" {
     const TestTransport = struct {
         closed: *bool,
@@ -1810,11 +2176,59 @@ test "stream completion waits for eof acknowledgement" {
     try std.testing.expect(state.complete());
 }
 
+test "stream child sources drain before child status is checked" {
+    var child = try pty_process.spawn(std.testing.allocator, .{
+        .rows = 24,
+        .cols = 80,
+        .shell = "/bin/sh",
+        .shell_command = "printf PTY_DRAIN_BEFORE_WAITPID; read ignored",
+    });
+    defer child.terminate();
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = child.master_fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try posix.poll(&pollfds, 1_000);
+    try std.testing.expect(ready == 1);
+    try std.testing.expect((pollfds[0].revents & posix.POLL.IN) != 0);
+
+    var state = StreamState.init(std.testing.allocator, .{ .stdout = true }, .{});
+    defer state.deinit();
+    var exited = false;
+    const options = StreamAttachmentOptions{
+        .source_count = 1,
+        .sources = .{
+            .{
+                .fd = child.master_fd,
+                .channel = stream_channel_stdout,
+                .kind = .pty_master,
+            },
+            .{},
+        },
+        .source_exit_pid = child.pid,
+        .source_exit_seen = &exited,
+    };
+
+    // This child is still alive and blocked in `read`, so a waitpid-first
+    // implementation would return without preserving the already-readable PTY
+    // bytes. The stream source must be drained before child status is checked.
+    try drainChildStreamSources(&state, &options);
+
+    try std.testing.expectEqualStrings(
+        "PTY_DRAIN_BEFORE_WAITPID",
+        state.constChannel(stream_channel_stdout).outbound.items,
+    );
+    try std.testing.expect(!state.constChannel(stream_channel_stdout).outbound_eof);
+    try std.testing.expect(!exited);
+}
+
 test "stream reconnect status uses plain stderr lines" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = StreamReconnectStatus.initForTest(fds[1], true, false);
+    var status = StreamReconnectStatus.initForTest(fds[1], .stderr_plain, false, "");
     status.showRetry(1_000);
     status.showReconnecting();
     status.clear();
@@ -1837,11 +2251,107 @@ test "stream reconnect status uses plain stderr lines" {
     );
 }
 
+test "stream reconnect status restores tracked application title" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
+    status.observeInbound(stream_channel_stdout, "\x1b]2;remote");
+    status.observeInbound(stream_channel_stdout, "-title\x1b\\");
+    status.showRetry(10_000);
+    status.clear();
+    posix.close(fds[1]);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    while (true) {
+        var buf: [128]u8 = undefined;
+        const n = c.read(fds[0], &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try std.testing.expectEqualStrings(
+        "\x1b]2;10sec retry CTRL-R\x1b\\\x1b]2;remote-title\x1b\\",
+        output.items,
+    );
+}
+
+test "stream reconnect status uses fallback title when app set none" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
+    status.showRetry(10_000);
+    status.clear();
+    posix.close(fds[1]);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    while (true) {
+        var buf: [128]u8 = undefined;
+        const n = c.read(fds[0], &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try std.testing.expectEqualStrings(
+        "\x1b]2;10sec retry CTRL-R\x1b\\\x1b]2;test-host\x1b\\",
+        output.items,
+    );
+}
+
+test "stream reconnect status skips title while terminal parser is unsafe" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
+    status.observeInbound(stream_channel_stdout, "\x1b]2;partial-title");
+    status.showRetry(10_000);
+    status.clear();
+    posix.close(fds[1]);
+
+    var buf: [16]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "stream reconnect status treats synchronized update as unsafe for title" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
+    status.observeInbound(stream_channel_stdout, "\x1b[?2026h");
+    status.showRetry(10_000);
+    status.clear();
+    status.observeInbound(stream_channel_stdout, "\x1b[?2026l");
+    status.showRetry(10_000);
+    status.clear();
+    posix.close(fds[1]);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    while (true) {
+        var buf: [128]u8 = undefined;
+        const n = c.read(fds[0], &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try std.testing.expectEqualStrings(
+        "\x1b]2;10sec retry CTRL-R\x1b\\\x1b]2;test-host\x1b\\",
+        output.items,
+    );
+}
+
 test "stream reconnect status renders ssh diagnostics before status" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = StreamReconnectStatus.initForTest(fds[1], true, false);
+    var status = StreamReconnectStatus.initForTest(fds[1], .stderr_plain, false, "");
     client_log.appendSshStderr("control sequence: \x1b[31mred\n");
     status.showRetry(1_000);
     status.clear();
@@ -1869,7 +2379,7 @@ test "stream reconnect status appends diagnostics after status line" {
     defer posix.close(fds[0]);
 
     client_log.markUserDiagnosticsDisplayedThrough(client_log.currentUserDiagnosticSeq());
-    var status = StreamReconnectStatus.initForTest(fds[1], true, false);
+    var status = StreamReconnectStatus.initForTest(fds[1], .stderr_plain, false, "");
     status.showRetry(1_000);
     client_log.appendSshStderr("connection failed\n");
     status.flushDiagnostics();

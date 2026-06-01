@@ -16,6 +16,33 @@ pub fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{}min", .{minutes});
 }
 
+pub const Controls = struct {
+    ctrl_r: bool = false,
+    ctrl_c_detach: bool = false,
+};
+
+pub fn retryStatus(buf: []u8, delay_ms: u64, controls: Controls) ![]const u8 {
+    var delay_buf: [16]u8 = undefined;
+    const delay = try formatDelay(delay_ms, &delay_buf);
+    if (controls.ctrl_r and controls.ctrl_c_detach) {
+        return std.fmt.bufPrint(buf, "sessh: disconnected: Retry connecting {s}. CTRL-R now. CTRL-C detach", .{delay});
+    }
+    if (controls.ctrl_r) {
+        return std.fmt.bufPrint(buf, "sessh: disconnected: Retry connecting {s}. CTRL-R now", .{delay});
+    }
+    if (controls.ctrl_c_detach) {
+        return std.fmt.bufPrint(buf, "sessh: disconnected: Retry connecting {s}. CTRL-C detach", .{delay});
+    }
+    return std.fmt.bufPrint(buf, "sessh: disconnected: Retry connecting {s}", .{delay});
+}
+
+pub fn reconnectingStatus(controls: Controls) []const u8 {
+    if (controls.ctrl_r and controls.ctrl_c_detach) return "sessh: disconnected: Reconnecting... CTRL-R now. CTRL-C detach";
+    if (controls.ctrl_r) return "sessh: disconnected: Reconnecting... CTRL-R now";
+    if (controls.ctrl_c_detach) return "sessh: disconnected: Reconnecting... CTRL-C detach";
+    return "sessh: disconnected: Reconnecting...";
+}
+
 pub fn writeRetryTitle(fd: c.fd_t, delay_ms: u64) !void {
     var title_buf: [48]u8 = undefined;
     const title = try retryTitle(delay_ms, &title_buf);
@@ -86,6 +113,22 @@ test "retry title uses compact reconnect delay" {
     try std.testing.expectEqualStrings("1min until retry connect", try retryTitle(60_000, &buf));
     try std.testing.expectEqualStrings("5sec retry CTRL-R", try retryNowTitle(5_000, &buf));
     try std.testing.expectEqualStrings("1min retry CTRL-R", try retryNowTitle(60_000, &buf));
+}
+
+test "retry status includes available controls" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "sessh: disconnected: Retry connecting 5sec. CTRL-R now. CTRL-C detach",
+        try retryStatus(&buf, 5_000, .{ .ctrl_r = true, .ctrl_c_detach = true }),
+    );
+    try std.testing.expectEqualStrings(
+        "sessh: disconnected: Retry connecting 5sec. CTRL-R now",
+        try retryStatus(&buf, 5_000, .{ .ctrl_r = true }),
+    );
+    try std.testing.expectEqualStrings(
+        "sessh: disconnected: Reconnecting... CTRL-R now. CTRL-C detach",
+        reconnectingStatus(.{ .ctrl_r = true, .ctrl_c_detach = true }),
+    );
 }
 
 test "writeTitle sanitizes control bytes" {

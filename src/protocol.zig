@@ -39,8 +39,8 @@ pub const MessageType = enum {
     stream_ack,
     stream_eof,
     stream_eof_ack,
-    stream_ping,
-    stream_pong,
+    ping,
+    pong,
 };
 
 pub const frame_header_len = 4;
@@ -86,6 +86,35 @@ pub fn sendFrame(fd: c.fd_t, message_type: MessageType, payload: []const u8) !vo
     const frame = try encodeFrame(app_allocator.allocator(), message_type, payload);
     defer app_allocator.allocator().free(frame);
     try io.writeAll(fd, frame);
+}
+
+pub fn sendPing(fd: c.fd_t) !void {
+    const payload = try encodePayload(app_allocator.allocator(), pb.Ping{});
+    defer app_allocator.allocator().free(payload);
+    try sendFrame(fd, .ping, payload);
+}
+
+pub fn sendPong(fd: c.fd_t) !void {
+    const payload = try encodePayload(app_allocator.allocator(), pb.Pong{});
+    defer app_allocator.allocator().free(payload);
+    try sendFrame(fd, .pong, payload);
+}
+
+pub fn handleTransportControlFrame(message_type: MessageType, payload: []const u8, write_fd: c.fd_t) !bool {
+    switch (message_type) {
+        .ping => {
+            var message = try decodePayload(pb.Ping, app_allocator.allocator(), payload);
+            defer message.deinit(app_allocator.allocator());
+            try sendPong(write_fd);
+            return true;
+        },
+        .pong => {
+            var message = try decodePayload(pb.Pong, app_allocator.allocator(), payload);
+            defer message.deinit(app_allocator.allocator());
+            return true;
+        },
+        else => return false,
+    }
 }
 
 pub fn encodeFrame(allocator: std.mem.Allocator, message_type: MessageType, payload: []const u8) ![]u8 {
@@ -146,8 +175,8 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .stream_ack => |message| ownedFrameFromMessage(allocator, .stream_ack, message),
             .stream_eof => |message| ownedFrameFromMessage(allocator, .stream_eof, message),
             .stream_eof_ack => |message| ownedFrameFromMessage(allocator, .stream_eof_ack, message),
-            .stream_ping => |message| ownedFrameFromMessage(allocator, .stream_ping, message),
-            .stream_pong => |message| ownedFrameFromMessage(allocator, .stream_pong, message),
+            .ping => |message| ownedFrameFromMessage(allocator, .ping, message),
+            .pong => |message| ownedFrameFromMessage(allocator, .pong, message),
         };
     }
 
@@ -326,15 +355,15 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_eof_ack = message } });
         },
-        .stream_ping => blk: {
-            var message = try decodePayload(pb.StreamPing, allocator, payload);
+        .ping => blk: {
+            var message = try decodePayload(pb.Ping, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_ping = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .ping = message } });
         },
-        .stream_pong => blk: {
-            var message = try decodePayload(pb.StreamPong, allocator, payload);
+        .pong => blk: {
+            var message = try decodePayload(pb.Pong, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_pong = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .pong = message } });
         },
     };
 }

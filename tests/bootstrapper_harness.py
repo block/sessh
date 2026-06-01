@@ -76,7 +76,7 @@ def test_cache_hit_execs_without_platform_or_tool_probe(tmp):
     result = run_bootstrapper(f"EXEC test-set {artifact_hash}\n", env)
 
     assert_ok(result)
-    if result.stdout != "OK\nCACHED :internal-broker:\n":
+    if result.stdout != "OK\nCACHED :internal-session-broker:\n":
         raise AssertionError(result.stdout)
 
 
@@ -90,12 +90,12 @@ def test_cache_hit_execs_explicit_internal_command(tmp):
     write_executable(artifact_path(env, artifact_hash), artifact)
 
     result = run_bootstrapper(
-        f"EXEC test-set {artifact_hash} -- :internal-stream-agent: r-00000000-0000-4000-8000-000000000001 pipe 24 80 -\n",
+        f"EXEC test-set {artifact_hash} -- :internal-stream-broker: r-00000000-0000-4000-8000-000000000001 pipe 24 80 -\n",
         env,
     )
 
     assert_ok(result)
-    expected = "OK\nCACHED :internal-stream-agent: r-00000000-0000-4000-8000-000000000001 pipe 24 80 -\n"
+    expected = "OK\nCACHED :internal-stream-broker: r-00000000-0000-4000-8000-000000000001 pipe 24 80 -\n"
     if result.stdout != expected:
         raise AssertionError(result.stdout)
 
@@ -120,7 +120,7 @@ def test_upload_installs_and_execs(tmp):
         raise AssertionError(result.stdout)
     if lines[1] != "OK":
         raise AssertionError(result.stdout)
-    if lines[2] != "UPLOADED :internal-broker:":
+    if lines[2] != "UPLOADED :internal-session-broker:":
         raise AssertionError(result.stdout)
 
     installed = artifact_path(env, artifact_hash)

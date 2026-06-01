@@ -63,8 +63,12 @@ fn runMain() !void {
         return session_agent.runSessionAgent(args[3]);
     }
 
-    if (std.mem.eql(u8, args[1], ":internal-broker:")) {
+    if (std.mem.eql(u8, args[1], ":internal-session-broker:")) {
         return broker.run(allocator, args[0], args[2..]);
+    }
+
+    if (std.mem.eql(u8, args[1], ":internal-stream-broker:")) {
+        return stream_agent.runBroker(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-stream-agent:")) {

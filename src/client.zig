@@ -704,7 +704,7 @@ pub const ReconnectUi = struct {
             const elapsed_ms = elapsedTimerMs(&timer);
             if (elapsed_ms >= delay_ms) {
                 self.showReconnectingTitle();
-                try self.drawStaticBanner("--- sessh: disconnected: Reconnecting... Ctrl-C detach ---");
+                try self.drawReconnectStaticBanner(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
                 return .wait_elapsed;
             }
 
@@ -716,7 +716,7 @@ pub const ReconnectUi = struct {
                 .detach => return .detach,
                 .reconnect_now => {
                     self.showReconnectingTitle();
-                    try self.drawStaticBanner("--- sessh: disconnected: Reconnecting... Ctrl-C detach ---");
+                    try self.drawReconnectStaticBanner(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
                     return .reconnect_now;
                 },
                 .wait_elapsed => {},
@@ -733,7 +733,11 @@ pub const ReconnectUi = struct {
 
     pub fn showDisconnectedReconnectInProgress(self: *ReconnectUi) !void {
         self.showReconnectingTitle();
-        try self.drawStaticBanner("--- sessh: disconnected: Reconnecting... Ctrl-C detach ---");
+        try self.drawReconnectStaticBanner(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
+    }
+
+    pub fn showUnresponsiveReconnectInProgressTitle(self: *ReconnectUi) void {
+        self.showReconnectingNowTitle();
     }
 
     pub fn showReconnectReady(self: *ReconnectUi, disposition: ReconnectSwitchDisposition) !void {
@@ -901,14 +905,14 @@ pub const ReconnectUi = struct {
 
     fn drawBanner(self: *ReconnectUi, delay_ms: u64) !void {
         self.showRetryTitle(delay_ms);
-        var delay_buf: [16]u8 = undefined;
-        const delay = try formatDelay(delay_ms, &delay_buf);
-        var message_buf: [96]u8 = undefined;
-        const message = try std.fmt.bufPrint(
-            &message_buf,
-            "--- sessh: disconnected: Retry connecting {s}. CTRL-R now. CTRL-C detach ---",
-            .{delay},
+        var status_buf: [96]u8 = undefined;
+        const status = try reconnect_title.retryStatus(
+            &status_buf,
+            delay_ms,
+            .{ .ctrl_r = true, .ctrl_c_detach = true },
         );
+        var message_buf: [128]u8 = undefined;
+        const message = try std.fmt.bufPrint(&message_buf, "--- {s} ---", .{status});
         try self.drawStaticBanner(message);
     }
 
@@ -938,6 +942,12 @@ pub const ReconnectUi = struct {
         self.banner_message_len = copy_len;
         try self.consumeDiagnostics();
         try self.drawCurrentBanner();
+    }
+
+    fn drawReconnectStaticBanner(self: *ReconnectUi, status: []const u8) !void {
+        var message_buf: [max_banner_message_bytes]u8 = undefined;
+        const message = try std.fmt.bufPrint(&message_buf, "--- {s} ---", .{status});
+        try self.drawStaticBanner(message);
     }
 
     fn drawCurrentBanner(self: *ReconnectUi) !void {
@@ -1057,13 +1067,19 @@ pub const ReconnectUi = struct {
 
     fn showRetryTitle(self: *ReconnectUi, delay_ms: u64) void {
         if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeRetryTitle(self.title_fd, delay_ms) catch return;
+        reconnect_title.writeRetryNowTitle(self.title_fd, delay_ms) catch return;
         self.title_visible = true;
     }
 
     fn showReconnectingTitle(self: *ReconnectUi) void {
         if (!self.title_enabled or self.title_fd < 0) return;
         reconnect_title.writeReconnectingTitle(self.title_fd) catch return;
+        self.title_visible = true;
+    }
+
+    fn showReconnectingNowTitle(self: *ReconnectUi) void {
+        if (!self.title_enabled or self.title_fd < 0) return;
+        reconnect_title.writeReconnectingNowTitle(self.title_fd) catch return;
         self.title_visible = true;
     }
 
@@ -1564,7 +1580,7 @@ test "ReconnectUi restores remote fallback title when no app title is present" {
     var buf: [128]u8 = undefined;
     const n = try posix.read(fds[0], &buf);
     try std.testing.expectEqualStrings(
-        "\x1b]2;5sec until retry connect\x1b\\\x1b]2;work.blox\x1b\\",
+        "\x1b]2;5sec retry CTRL-R\x1b\\\x1b]2;work.blox\x1b\\",
         buf[0..n],
     );
     try std.testing.expect(!ui.title_visible);
@@ -1589,7 +1605,7 @@ test "ReconnectUi leaves restored app title alone after reconnect repaint" {
 
     var buf: [128]u8 = undefined;
     const n = try posix.read(fds[0], &buf);
-    try std.testing.expectEqualStrings("\x1b]2;5sec until retry connect\x1b\\", buf[0..n]);
+    try std.testing.expectEqualStrings("\x1b]2;5sec retry CTRL-R\x1b\\", buf[0..n]);
     try std.testing.expect(!ui.title_visible);
 }
 
@@ -1610,7 +1626,7 @@ test "ReconnectUi restores local cleanup title on detach" {
     var buf: [128]u8 = undefined;
     const n = try posix.read(fds[0], &buf);
     try std.testing.expectEqualStrings(
-        "\x1b]2;5sec until retry connect\x1b\\\x1b]2;/tmp/local\x1b\\",
+        "\x1b]2;5sec retry CTRL-R\x1b\\\x1b]2;/tmp/local\x1b\\",
         buf[0..n],
     );
     try std.testing.expect(!ui.title_visible);
@@ -2559,7 +2575,9 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             },
         }
 
-        try io_helpers.writeAll(2, "\r\nsessh: disconnected: Reconnecting... Ctrl-C detach\r\n");
+        try io_helpers.writeAll(2, "\r\n");
+        try io_helpers.writeAll(2, reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
+        try io_helpers.writeAll(2, "\r\n");
         child = startLocalBroker(allocator, args[0], runtime_broker_args) catch |err| {
             session.restoreRelayEndPresentation();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
@@ -2860,7 +2878,7 @@ fn startLocalBroker(allocator: std.mem.Allocator, exe: []const u8, broker_args: 
     const argv = try allocator.alloc([]const u8, 2 + broker_args.len);
     defer allocator.free(argv);
     argv[0] = exe;
-    argv[1] = ":internal-broker:";
+    argv[1] = ":internal-session-broker:";
     @memcpy(argv[2..], broker_args);
     var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Pipe;
@@ -2874,7 +2892,7 @@ fn runLocalBrokerCommand(allocator: std.mem.Allocator, exe: []const u8, broker_a
     const argv = try allocator.alloc([]const u8, 2 + broker_args.len);
     defer allocator.free(argv);
     argv[0] = exe;
-    argv[1] = ":internal-broker:";
+    argv[1] = ":internal-session-broker:";
     @memcpy(argv[2..], broker_args);
 
     var env_map = try std.process.getEnvMap(allocator);
@@ -2913,7 +2931,7 @@ fn runLocalListCommand(
     const argv = try allocator.alloc([]const u8, 2 + command_args.len + extra_args);
     defer allocator.free(argv);
     argv[0] = exe;
-    argv[1] = ":internal-broker:";
+    argv[1] = ":internal-session-broker:";
     @memcpy(argv[2 .. 2 + command_args.len], command_args);
     var arg_index = 2 + command_args.len;
     if (jsonl) {
@@ -3284,7 +3302,7 @@ fn brokerListMatches(allocator: std.mem.Allocator, exe: []const u8, broker_args:
     const argv = allocator.alloc([]const u8, 4 + broker_args.len) catch return false;
     defer allocator.free(argv);
     argv[0] = exe;
-    argv[1] = ":internal-broker:";
+    argv[1] = ":internal-session-broker:";
     @memcpy(argv[2 .. 2 + broker_args.len], broker_args);
     argv[2 + broker_args.len] = "list";
     argv[3 + broker_args.len] = "--jsonl";
@@ -3924,15 +3942,16 @@ fn attachReconnectRuntimeInner(
 ) !void {
     const client_guid = try session.ensureClientGuid();
     session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice(), client_guid, session.sessionDirSlice());
-    try readSessionAttachedInner(read_fd, cancelled);
-    if (wait_for_repaint) try finishReconnectRepaintInner(read_fd, session, cancelled);
+    try readSessionAttachedInner(read_fd, write_fd, cancelled);
+    if (wait_for_repaint) try finishReconnectRepaintInner(read_fd, write_fd, session, cancelled);
 }
 
 pub fn finishReconnectRepaint(
     read_fd: c.fd_t,
+    write_fd: c.fd_t,
     session: *RuntimeSession,
 ) !void {
-    try finishReconnectRepaintInner(read_fd, session, null);
+    try finishReconnectRepaintInner(read_fd, write_fd, session, null);
 }
 
 pub fn repaintRuntimeSession(
@@ -3941,11 +3960,12 @@ pub fn repaintRuntimeSession(
     session: *RuntimeSession,
 ) !void {
     try sendResizeScreenRepaint(write_fd, terminal.currentWindowSize(), session.viewport_offset, &session.pending_repaint);
-    try finishReconnectRepaint(read_fd, session);
+    try finishReconnectRepaint(read_fd, write_fd, session);
 }
 
 fn finishReconnectRepaintInner(
     read_fd: c.fd_t,
+    write_fd: c.fd_t,
     session: *RuntimeSession,
     cancelled: ?*const std.atomic.Value(bool),
 ) !void {
@@ -3966,6 +3986,9 @@ fn finishReconnectRepaintInner(
             },
             .input_ack => {
                 _ = try handleInputAckFrame(frame.payload, &session.input_ack_tracker);
+            },
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
             .client_repaint_request => {},
             .tty_transcript_chunk => try handleTtyTranscriptChunkFrame(frame.payload),
@@ -4229,7 +4252,7 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
     }
 }
 
-fn readSessionCreated(read_fd: c.fd_t) !CreatedSession {
+fn readSessionCreated(read_fd: c.fd_t, write_fd: c.fd_t) !CreatedSession {
     while (true) {
         var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
         defer frame.deinit(app_allocator.allocator());
@@ -4250,6 +4273,9 @@ fn readSessionCreated(read_fd: c.fd_t) !CreatedSession {
                     .guid = try app_allocator.allocator().dupe(u8, created.session_guid),
                     .alias = try app_allocator.allocator().dupe(u8, created.session_alias),
                 };
+            },
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
             else => return error.UnexpectedFrame,
         }
@@ -4276,15 +4302,16 @@ test "initial viewport offset marks missing cursor response unknown" {
 }
 
 fn readSessionAttached(conn: c.fd_t) !void {
-    return readSessionAttachedInner(conn, null);
+    return readSessionAttachedInner(conn, conn, null);
 }
 
 fn readSessionAttachedInner(
-    conn: c.fd_t,
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
     cancelled: ?*const std.atomic.Value(bool),
 ) !void {
     while (true) {
-        var frame = try readFrameAllocMaybeCancelled(conn, cancelled);
+        var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .error_message => {
@@ -4300,6 +4327,9 @@ fn readSessionAttachedInner(
                 var attached = try protocol.decodePayload(pb.SessionAttached, app_allocator.allocator(), frame.payload);
                 defer attached.deinit(app_allocator.allocator());
                 return;
+            },
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
             else => return error.UnexpectedFrame,
         }
@@ -4439,6 +4469,9 @@ fn readHelloRequest(
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
+            },
             else => {
                 try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
                 return error.UnexpectedFrame;
@@ -4471,7 +4504,7 @@ fn sendSessionCreateAndReadCreated(
     peer_supports_command_oneof: bool,
 ) !CreatedSession {
     try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid, session_alias, command_argv, shell_command, peer_supports_command_oneof);
-    return readSessionCreated(read_fd);
+    return readSessionCreated(read_fd, write_fd);
 }
 
 fn sendSessionCreate(
@@ -4586,6 +4619,9 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
                 return true;
             },
             .session_ended => return false,
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, conn);
+            },
             else => return error.UnexpectedFrame,
         }
     }
@@ -4952,6 +4988,10 @@ fn handleRelayRuntimeFrame(
         .input_ack => {
             const ack = try handleInputAckFrame(frame.payload, input_ack_tracker);
             if (ack.progressed) connection_monitor.noteInputAckProgress(ack.still_pending);
+            return null;
+        },
+        .ping, .pong => {
+            _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             return null;
         },
         .session_ended => {

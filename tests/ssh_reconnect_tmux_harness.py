@@ -301,8 +301,8 @@ def main():
                 )
 
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "C-r"])
-            wait_capture(env, session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=2.0)
-            wait_visible_absent(env, session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=10.0)
+            wait_capture(env, session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=2.0)
+            wait_visible_absent(env, session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=10.0)
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "after-reconnect", "Enter"])
             final = wait_capture(env, session, "REMOTE:after-reconnect")
             after_repaint = capture_visible(env, session)
@@ -370,8 +370,8 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_session, "C-a", "s"])
             wait_capture(env, bottom_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_session, "C-r"])
-            wait_capture(env, bottom_session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=2.0)
-            wait_visible_absent(env, bottom_session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=10.0)
+            wait_capture(env, bottom_session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=2.0)
+            wait_visible_absent(env, bottom_session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=10.0)
             bottom_after = capture_visible(env, bottom_session)
             bottom_after_lines = bottom_after.splitlines()
             if "REMOTE_TOP" not in bottom_after_lines:
@@ -411,8 +411,8 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, "C-r"])
             wait_capture(env, bottom_failure_session, "planned batch reconnect failure", timeout=6.0)
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, "C-r"])
-            wait_capture(env, bottom_failure_session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=2.0)
-            wait_visible_absent(env, bottom_failure_session, "sessh: disconnected: Reconnecting... Ctrl-C detach", timeout=10.0)
+            wait_capture(env, bottom_failure_session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=2.0)
+            wait_visible_absent(env, bottom_failure_session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=10.0)
             bottom_failure_after = capture_visible(env, bottom_failure_session)
             if bottom_failure_after.count("REMOTE_TOP") != 1:
                 raise AssertionError(f"bottom reconnect after failed attempt duplicated session screen content:\n{bottom_failure_after}")

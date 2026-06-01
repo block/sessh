@@ -80,8 +80,8 @@ pub const Frame = struct {
         stream_ack,
         stream_eof,
         stream_eof_ack,
-        stream_ping,
-        stream_pong,
+        ping,
+        pong,
     };
     pub const payload_union = union(_payload_case) {
         @"error": sessh_handshake_v1.Error,
@@ -111,8 +111,8 @@ pub const Frame = struct {
         stream_ack: StreamAck,
         stream_eof: StreamEof,
         stream_eof_ack: StreamEofAck,
-        stream_ping: StreamPing,
-        stream_pong: StreamPong,
+        ping: Ping,
+        pong: Pong,
         pub const _desc_table = .{
             .@"error" = fd(10, .submessage),
             .session_create = fd(11, .submessage),
@@ -141,8 +141,8 @@ pub const Frame = struct {
             .stream_ack = fd(36, .submessage),
             .stream_eof = fd(37, .submessage),
             .stream_eof_ack = fd(38, .submessage),
-            .stream_ping = fd(39, .submessage),
-            .stream_pong = fd(40, .submessage),
+            .ping = fd(39, .submessage),
+            .pong = fd(40, .submessage),
         };
     };
 
@@ -561,10 +561,11 @@ pub const StreamEofAck = struct {
     }
 };
 
-/// A liveness probe for reconnectable byte streams. This is not an application
-/// byte and does not change stream offsets; it exists so an otherwise silent
-/// stream can notice an unresponsive ssh transport and start reconnecting.
-pub const StreamPing = struct {
+/// A transport liveness probe. This is not application input and must not change
+/// stream offsets or terminal state. It currently matters most for non-tty
+/// streams, where stdin can be EOF and no user input may arrive to force a write
+/// failure, but the same framed transport can use it for tty sessions too.
+pub const Ping = struct {
     pub const _desc_table = .{};
 
     /// Encodes the message to the writer
@@ -626,8 +627,8 @@ pub const StreamPing = struct {
     }
 };
 
-/// Response to StreamPing.
-pub const StreamPong = struct {
+/// Response to Ping.
+pub const Pong = struct {
     pub const _desc_table = .{};
 
     /// Encodes the message to the writer

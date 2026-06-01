@@ -47,8 +47,8 @@ message Frame {
     StreamAck stream_ack = 36;
     StreamEof stream_eof = 37;
     StreamEofAck stream_eof_ack = 38;
-    StreamPing stream_ping = 39;
-    StreamPong stream_pong = 40;
+    Ping ping = 39;
+    Pong pong = 40;
   }
 }
 
@@ -97,14 +97,15 @@ message StreamEofAck {
   uint64 offset = 2;
 }
 
-// A liveness probe for reconnectable byte streams. This is not an application
-// byte and does not change stream offsets; it exists so an otherwise silent
-// stream can notice an unresponsive ssh transport and start reconnecting.
-message StreamPing {
+// A transport liveness probe. This is not application input and must not change
+// stream offsets or terminal state. It currently matters most for non-tty
+// streams, where stdin can be EOF and no user input may arrive to force a write
+// failure, but the same framed transport can use it for tty sessions too.
+message Ping {
 }
 
-// Response to StreamPing.
-message StreamPong {
+// Response to Ping.
+message Pong {
 }
 
 // Embedded in SessionCreate.

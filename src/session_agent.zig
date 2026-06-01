@@ -1165,7 +1165,6 @@ pub fn runSessionAgent(session_dir: []const u8) !void {
 
     while (session_agent.running) {
         try sessionAgentPollOnce(&session_agent, &listen_fd, shutdown_pipe[0], runtime_repair_pipe[0]);
-        reapSessions(&session_agent);
         stopSessionAgentIfComplete(&session_agent);
     }
 }
@@ -1495,6 +1494,10 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
         };
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
+                continue;
+            },
             .resize => continue,
             .session_create => {
                 var request = readSessionCreateRequest(frame.payload) catch {
@@ -3139,50 +3142,30 @@ fn shouldDeferSynchronizedOutput(session_agent: *SessionAgent, session_index: us
 fn drainSessionOutput(session_agent: *SessionAgent, session_index: usize) void {
     if (!session_agent.sessions[session_index].alive) return;
 
-    var buf: [4096]u8 = undefined;
     const pty_fd = session_agent.sessions[session_index].pty_fd;
-    var read_count: u16 = 0;
-    var batch_bytes: usize = 0;
-    while (true) {
-        const n = c.read(pty_fd, &buf, buf.len);
-        if (n <= 0) {
-            if (read_count > 0) break;
-            endSessionFromPtyClose(session_agent, session_index);
-            return;
-        }
-        read_count += 1;
-
-        const bytes = buf[0..@intCast(n)];
-        batch_bytes += bytes.len;
-        feedSessionOutputBytes(session_agent, session_index, bytes) catch {
-            endSessionFromPtyClose(session_agent, session_index);
-            return;
-        };
-
-        const model = session_agent.sessions[session_index].terminal_model orelse continue;
-        const input_responses = model.pendingInputResponses();
-        if (input_responses.len > 0) {
-            io.writeAll(pty_fd, input_responses) catch {
-                endSessionFromPtyClose(session_agent, session_index);
-                return;
-            };
-            model.clearPendingInputResponses();
-        }
-
-        if (batch_bytes >= preferred_live_output_batch_bytes or
-            read_count >= max_live_output_reads_per_batch)
-        {
-            break;
-        }
-
-        var next = [_]posix.pollfd{.{
-            .fd = pty_fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&next, 0) catch 0;
-        if (ready == 0 or (next[0].revents & posix.POLL.IN) == 0) break;
+    var context = SessionPtyDrainContext{
+        .session_agent = session_agent,
+        .session_index = session_index,
+    };
+    const result = pty_process.drainMasterNonBlocking(
+        pty_fd,
+        &context,
+        feedSessionPtyBytes,
+        .{
+            .max_reads = max_live_output_reads_per_batch,
+            .max_bytes = preferred_live_output_batch_bytes,
+        },
+    ) catch {
+        endSessionFromPtyClose(session_agent, session_index);
+        return;
+    };
+    if (!session_agent.sessions[session_index].alive) return;
+    if (result.eof) {
+        endSessionFromPtyEof(session_agent, session_index);
+        return;
     }
+    if (result.read_count == 0) return;
+
     const now_ms = sessionAgentMonotonicMs(session_agent);
     if (shouldDeferSynchronizedOutput(session_agent, session_index, now_ms)) return;
     broadcastSessionPatch(session_agent, session_index);
@@ -3194,30 +3177,24 @@ fn drainSessionOutput(session_agent: *SessionAgent, session_index: usize) void {
     }
 }
 
-fn drainSessionOutputBeforeEnd(session_agent: *SessionAgent, session_index: usize) void {
-    if (!session_agent.sessions[session_index].alive) return;
+const SessionPtyDrainContext = struct {
+    session_agent: *SessionAgent,
+    session_index: usize,
+};
 
-    var buf: [4096]u8 = undefined;
-    const pty_fd = session_agent.sessions[session_index].pty_fd;
-    var read_any = false;
-    while (true) {
-        var next = [_]posix.pollfd{.{
-            .fd = pty_fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&next, 0) catch 0;
-        if (ready == 0 or next[0].revents == 0) break;
+fn feedSessionPtyBytes(context: *SessionPtyDrainContext, bytes: []const u8) !void {
+    const session_agent = context.session_agent;
+    const session_index = context.session_index;
+    if (!session_agent.sessions[session_index].alive) return error.SessionEndedDuringPtyDrain;
 
-        const n = c.read(pty_fd, &buf, buf.len);
-        if (n <= 0) break;
-        read_any = true;
-        feedSessionOutputBytes(session_agent, session_index, buf[0..@intCast(n)]) catch break;
-    }
-    if (read_any) {
-        broadcastSessionPatch(session_agent, session_index);
-        session_agent.sessions[session_index].clearPendingPlainOutput();
-    }
+    try feedSessionOutputBytes(session_agent, session_index, bytes);
+
+    const session = &session_agent.sessions[session_index];
+    const model = session.terminal_model orelse return;
+    const input_responses = model.pendingInputResponses();
+    if (input_responses.len == 0) return;
+    io.writeAll(session.pty_fd, input_responses) catch return error.SessionPtyResponseWriteFailed;
+    model.clearPendingInputResponses();
 }
 
 const RenderBarrierContext = struct {
@@ -3296,6 +3273,12 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
         .input => handleInputFrame(session_agent, attachment_index, frame.payload),
         .resize => handleResizeFrame(session_agent, attachment_index, frame.payload),
         .repaint_request => handleRepaintFrame(session_agent, attachment_index, frame.payload),
+        .ping, .pong => {
+            _ = protocol.handleTransportControlFrame(frame.message_type, frame.payload, attachment.fd) catch {
+                detachAttachment(session_agent, attachment_index);
+                return;
+            };
+        },
         else => {
             queueAttachmentError(session_agent, attachment, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
                 detachAttachment(session_agent, attachment_index);
@@ -4211,23 +4194,19 @@ fn findMostRecentSessionIndex(session_agent: *SessionAgent) ?usize {
     return null;
 }
 
-fn reapSessions(session_agent: *SessionAgent) void {
-    while (true) {
-        var status: c_int = 0;
-        const result = c.waitpid(-1, &status, 1);
-        if (result <= 0) return;
-        const session_index = findSessionIndexByPid(session_agent, result) orelse continue;
-        drainSessionOutputBeforeEnd(session_agent, session_index);
-        endSession(session_agent, session_index, session_agent.sessions[session_index].end_reason, exitInfoFromWaitStatus(status));
-    }
+fn endSessionFromPtyClose(session_agent: *SessionAgent, session_index: usize) void {
+    endSession(session_agent, session_index, session_agent.sessions[session_index].end_reason, .{ .ended_at_unix_ms = nowUnixMs() });
 }
 
-fn endSessionFromPtyClose(session_agent: *SessionAgent, session_index: usize) void {
+fn endSessionFromPtyEof(session_agent: *SessionAgent, session_index: usize) void {
+    // Only ask for child status after PTY EOF. Exit status is useful metadata,
+    // but checking it before PTY EOF can race with final terminal output that
+    // still needs to be drained from the master fd.
     if (waitForSessionExitInfo(session_agent.sessions[session_index].pid)) |exit_info| {
         endSession(session_agent, session_index, session_agent.sessions[session_index].end_reason, exit_info);
         return;
     }
-    endSession(session_agent, session_index, session_agent.sessions[session_index].end_reason, .{ .ended_at_unix_ms = nowUnixMs() });
+    endSessionFromPtyClose(session_agent, session_index);
 }
 
 fn waitForSessionExitInfo(pid: c.pid_t) ?ExitInfo {
@@ -4264,11 +4243,4 @@ fn nowUnixMs() u64 {
     if (c.clock_gettime(.REALTIME, &ts) != 0) return 0;
     if (ts.sec < 0) return 0;
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
-}
-
-fn findSessionIndexByPid(session_agent: *SessionAgent, pid: c.pid_t) ?usize {
-    for (&session_agent.sessions, 0..) |*session, i| {
-        if (session.alive and session.pid == pid) return i;
-    }
-    return null;
 }
