@@ -41,6 +41,8 @@ pub const MessageType = enum {
     stream_eof_ack,
     ping,
     pong,
+    stream_exit_status,
+    stream_exit_status_ack,
 };
 
 pub const frame_header_len = 4;
@@ -177,6 +179,8 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .stream_eof_ack => |message| ownedFrameFromMessage(allocator, .stream_eof_ack, message),
             .ping => |message| ownedFrameFromMessage(allocator, .ping, message),
             .pong => |message| ownedFrameFromMessage(allocator, .pong, message),
+            .stream_exit_status => |message| ownedFrameFromMessage(allocator, .stream_exit_status, message),
+            .stream_exit_status_ack => |message| ownedFrameFromMessage(allocator, .stream_exit_status_ack, message),
         };
     }
 
@@ -364,6 +368,16 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.Pong, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .pong = message } });
+        },
+        .stream_exit_status => blk: {
+            var message = try decodePayload(pb.StreamExitStatus, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_exit_status = message } });
+        },
+        .stream_exit_status_ack => blk: {
+            var message = try decodePayload(pb.StreamExitStatusAck, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_exit_status_ack = message } });
         },
     };
 }

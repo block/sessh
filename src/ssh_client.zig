@@ -1405,8 +1405,8 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             },
             .session_ended => {
                 client_log.debug("event=session_ended host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
-                try finishEndedRemoteSession(allocator, &child, &session);
-                return;
+                const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
+                return process_exit.request(exit_status);
             },
             .reconnect => {
                 client_log.debug("event=disconnect reason=leader_sever host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
@@ -1457,8 +1457,8 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                         &session,
                     ) catch |err| switch (err) {
                         error.SessionEnded => {
-                            try finishEndedRemoteSession(allocator, &child, &session);
-                            return;
+                            const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
+                            return process_exit.request(exit_status);
                         },
                         else => return err,
                     };
@@ -1474,8 +1474,8 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                     session.viewport_offset = try reconnect_ui.clearBanner();
                     client.finishReconnectRepaint(child.child.stdout.?.handle, child.child.stdin.?.handle, &session) catch |err| switch (err) {
                         error.SessionEnded => {
-                            try finishEndedRemoteSession(allocator, &child, &session);
-                            return;
+                            const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
+                            return process_exit.request(exit_status);
                         },
                         else => return err,
                     };
@@ -1489,8 +1489,8 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                     continue;
                 },
                 .session_ended => {
-                    try finishEndedRemoteSession(allocator, &child, &session);
-                    return;
+                    const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
+                    return process_exit.request(exit_status);
                 },
                 .detach => {
                     child.terminate();
@@ -1681,7 +1681,8 @@ fn finishEndedRemoteSession(
     allocator: std.mem.Allocator,
     child: *RuntimeConnection,
     session: *client.RuntimeSession,
-) !void {
+) !u8 {
+    const exit_status = session.endedProcessExitCode();
     session.restoreRelayEndPresentation();
     client.removeClientRouteHintForRemoteSession(allocator, session);
     client.tombstoneLocalRouteForRemoteSession(allocator, session) catch |err| {
@@ -1691,6 +1692,7 @@ fn finishEndedRemoteSession(
     _ = child.wait() catch {};
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
+    return exit_status;
 }
 
 fn finishReconnectUiForDetach(reconnect_ui: *client.ReconnectUi, active: *bool) void {
@@ -3160,7 +3162,7 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
     // useful in logs, and write failures are ignored by the status renderer.
     const status_mode = streamReconnectStatusMode(c.isatty(1) != 0);
 
-    stream_agent.runLocalStream(allocator, &starter, .{
+    const exit_status = stream_agent.runLocalStream(allocator, &starter, .{
         .source_fd = 0,
         .sink_fd = 1,
         .stderr_fd = 2,
@@ -3171,8 +3173,9 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
         .title_fallback = parsed_ssh_args.host,
     }) catch |err| {
         try starter.exitAfterInitialFailure(err);
+        unreachable;
     };
-    return process_exit.request(0);
+    return process_exit.request(exit_status);
 }
 
 fn streamReconnectStatusMode(stdout_is_tty: bool) stream_agent.StreamReconnectStatusMode {

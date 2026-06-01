@@ -596,6 +596,10 @@ pub const RuntimeSession = struct {
         defer ended.deinit(app_allocator.allocator());
         self.ended_tombstone_details = tombstoneDetailsFromSessionEnded(ended);
     }
+
+    pub fn endedProcessExitCode(self: *const RuntimeSession) u8 {
+        return processExitCodeFromTombstoneDetails(self.ended_tombstone_details);
+    }
 };
 
 fn tombstoneDetailsFromSessionEnded(ended: pb.SessionEnded) session_registry.TombstoneDetails {
@@ -612,6 +616,14 @@ fn tombstoneDetailsFromSessionEnded(ended: pb.SessionEnded) session_registry.Tom
             .EXIT_STATUS_KIND_SIGNALLED => .{ .kind = .signalled, .status = status.status },
             else => null,
         } else null,
+    };
+}
+
+fn processExitCodeFromTombstoneDetails(details: ?session_registry.TombstoneDetails) u8 {
+    const status = if (details) |value| value.exit_status orelse return 0 else return 0;
+    return switch (status.kind) {
+        .exited => if (status.status >= 0 and status.status <= 255) @intCast(status.status) else 255,
+        .signalled => if (status.status >= 0 and status.status <= 127) @intCast(128 + status.status) else 255,
     };
 }
 

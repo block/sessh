@@ -113,6 +113,15 @@ const StreamState = struct {
     active_outbound: ChannelMask,
     active_inbound: ChannelMask,
     peer_ready: bool = false,
+    // Process status is protocol metadata, not stream bytes. The sender holds
+    // completion until this is acknowledged so a reconnect cannot lose the
+    // status after all output bytes have already been accepted.
+    require_outbound_exit_status: bool = false,
+    expect_inbound_exit_status: bool = false,
+    outbound_exit_status: ?pb.ExitStatus = null,
+    outbound_exit_status_sent: bool = false,
+    outbound_exit_status_acked: bool = false,
+    inbound_exit_status: ?pb.ExitStatus = null,
 
     fn init(allocator: std.mem.Allocator, active_outbound: ChannelMask, active_inbound: ChannelMask) StreamState {
         var state = StreamState{
@@ -179,6 +188,12 @@ const StreamState = struct {
     }
 
     fn complete(self: *const StreamState) bool {
+        if (self.require_outbound_exit_status and
+            (self.outbound_exit_status == null or !self.outbound_exit_status_acked))
+        {
+            return false;
+        }
+        if (self.expect_inbound_exit_status and self.inbound_exit_status == null) return false;
         for (stream_channels) |stream_channel| {
             const channel_state = self.constChannel(stream_channel);
             if (self.active_outbound.contains(stream_channel)) {
@@ -292,6 +307,7 @@ const StreamAttachmentOptions = struct {
     close_outbound_on_inbound_eof: bool = false,
     source_exit_pid: ?c.pid_t = null,
     source_exit_seen: ?*bool = null,
+    source_exit_status: ?*?pb.ExitStatus = null,
 
     fn sink(self: *const StreamAttachmentOptions, channel: StreamChannel) ChannelSink {
         return self.sinks[channelIndex(channel)];
@@ -417,6 +433,7 @@ const StreamAttachment = struct {
                 state.channel(channel).outbound_eof_sent = false;
             }
         }
+        state.outbound_exit_status_sent = false;
         sendStreamMessage(state.allocator, transport_write_fd, .stream_resume, state.resumeMessage()) catch return error.StreamTransportClosed;
         const now_ms = nowMillis();
         return .{
@@ -561,6 +578,7 @@ fn drainChildStreamSources(state: *StreamState, options: *const StreamAttachment
     try drainStreamSourcesNonBlocking(state, options);
     if (streamSourcesEof(state, options)) {
         reapStreamSourceChildIfExited(options);
+        syncOutboundExitStatus(state, options);
     }
 }
 
@@ -635,7 +653,43 @@ fn reapStreamSourceChildIfExited(options: *const StreamAttachmentOptions) void {
     // not evidence that the source buffers have been drained.
     var status: c_int = 0;
     const result = c.waitpid(pid, &status, 1);
-    if (result == pid or result < 0) exited.* = true;
+    if (result == pid) {
+        if (options.source_exit_status) |exit_status| {
+            exit_status.* = exitStatusFromWaitStatus(status);
+        }
+        exited.* = true;
+    } else if (result < 0) {
+        if (options.source_exit_status) |exit_status| {
+            exit_status.* = .{ .kind = .EXIT_STATUS_KIND_UNSPECIFIED, .status = 0 };
+        }
+        exited.* = true;
+    }
+}
+
+fn syncOutboundExitStatus(state: *StreamState, options: *const StreamAttachmentOptions) void {
+    if (state.outbound_exit_status != null) return;
+    if (options.source_exit_status) |exit_status| {
+        state.outbound_exit_status = exit_status.*;
+    }
+}
+
+fn exitStatusFromWaitStatus(status: c_int) pb.ExitStatus {
+    const wait_status: u32 = @intCast(status);
+    return if (posix.W.IFEXITED(wait_status))
+        .{ .kind = .EXIT_STATUS_KIND_EXITED, .status = @intCast(posix.W.EXITSTATUS(wait_status)) }
+    else if (posix.W.IFSIGNALED(wait_status))
+        .{ .kind = .EXIT_STATUS_KIND_SIGNALLED, .status = @intCast(posix.W.TERMSIG(wait_status)) }
+    else
+        .{ .kind = .EXIT_STATUS_KIND_UNSPECIFIED, .status = @intCast(status) };
+}
+
+fn streamExitCode(status: ?pb.ExitStatus) u8 {
+    const value = status orelse return 0;
+    return switch (value.kind) {
+        .EXIT_STATUS_KIND_EXITED => if (value.status >= 0 and value.status <= 255) @intCast(value.status) else 255,
+        .EXIT_STATUS_KIND_SIGNALLED => if (value.status >= 0 and value.status <= 127) @intCast(128 + value.status) else 255,
+        else => 255,
+    };
 }
 
 fn PendingReplacement(comptime Starter: type, comptime Transport: type) type {
@@ -744,7 +798,7 @@ const StreamAgentConfig = struct {
 };
 
 const StreamEndpoint = union(enum) {
-    pty: pty_process.Child,
+    pty: PtyEndpoint,
     pipe: PipeEndpoint,
 
     fn activeOutbound(self: *const StreamEndpoint) ChannelMask {
@@ -765,14 +819,17 @@ const StreamEndpoint = union(enum) {
                 .source_count = 1,
                 .sources = .{
                     .{
-                        .fd = pty.master_fd,
+                        .fd = pty.child.master_fd,
                         .channel = stream_channel_stdout,
                         .kind = .pty_master,
                     },
                     .{},
                 },
-                .sinks = sinksWithStdin(pty.master_fd, null),
+                .sinks = sinksWithStdin(pty.child.master_fd, null),
                 .replacement_listen_fd = listen_fd,
+                .source_exit_pid = pty.child.pid,
+                .source_exit_seen = &pty.exited,
+                .source_exit_status = &pty.exit_status,
             },
             .pipe => |*pipe| .{
                 .source_count = 2,
@@ -784,14 +841,30 @@ const StreamEndpoint = union(enum) {
                 .replacement_listen_fd = listen_fd,
                 .source_exit_pid = pipe.child.id,
                 .source_exit_seen = &pipe.exited,
+                .source_exit_status = &pipe.exit_status,
             },
         };
     }
 
     fn deinit(self: *StreamEndpoint) void {
         switch (self.*) {
-            .pty => |*pty| pty.terminate(),
+            .pty => |*pty| pty.deinit(),
             .pipe => |*pipe| pipe.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
+const PtyEndpoint = struct {
+    child: pty_process.Child,
+    exited: bool = false,
+    exit_status: ?pb.ExitStatus = null,
+
+    fn deinit(self: *PtyEndpoint) void {
+        if (self.exited) {
+            self.child.closeMaster();
+        } else {
+            self.child.terminate();
         }
         self.* = undefined;
     }
@@ -803,6 +876,7 @@ const PipeEndpoint = struct {
     stdout_fd: c.fd_t,
     stderr_fd: c.fd_t,
     exited: bool = false,
+    exit_status: ?pb.ExitStatus = null,
 
     fn spawn(allocator: std.mem.Allocator, shell_command: ?[]const u8) !PipeEndpoint {
         const shell = pty_process.defaultShellPath();
@@ -890,6 +964,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
     defer endpoint.deinit();
 
     var state = StreamState.init(allocator, endpoint.activeOutbound(), endpoint.activeInbound());
+    state.require_outbound_exit_status = true;
     defer state.deinit();
 
     var attach_fd: c.fd_t = -1;
@@ -966,6 +1041,7 @@ fn waitForReplacementWhileDetached(
         try drainStreamSourcesNonBlocking(state, options);
         if (streamSourcesEof(state, options)) {
             reapStreamSourceChildIfExited(options);
+            syncOutboundExitStatus(state, options);
         }
     }
 }
@@ -977,7 +1053,7 @@ pub fn runLocalStream(
     allocator: std.mem.Allocator,
     start_transport: anytype,
     options: LocalStreamOptions,
-) !void {
+) !u8 {
     const Starter = @TypeOf(start_transport);
     const Transport = @TypeOf(start_transport.start() catch unreachable);
     const Pending = PendingReplacement(Starter, Transport);
@@ -987,6 +1063,7 @@ pub fn runLocalStream(
         .{ .stdin = true },
         .{ .stdout = true, .stderr = options.receive_stderr },
     );
+    state.expect_inbound_exit_status = true;
     defer state.deinit();
     var input_control = StreamInputControl{
         .enabled = options.intercept_ctrl_r,
@@ -1020,7 +1097,7 @@ pub fn runLocalStream(
                 }
                 const delay_ms = reconnect.delayMs(attempt);
                 const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
-                if (action == .disconnect) return;
+                if (action == .disconnect) return 0;
                 attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                 retrying = true;
                 continue;
@@ -1067,7 +1144,7 @@ pub fn runLocalStream(
                 switch (outcome) {
                     .complete => {
                         transport.close();
-                        return;
+                        return streamExitCode(state.inbound_exit_status);
                     },
                     .progress => {
                         if (old_unresponsive) {
@@ -1088,7 +1165,7 @@ pub fn runLocalStream(
                                 client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                                 const delay_ms = reconnect.delayMs(attempt);
                                 const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
-                                if (action == .disconnect) return;
+                                if (action == .disconnect) return 0;
                                 attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                                 continue;
                             };
@@ -1108,7 +1185,7 @@ pub fn runLocalStream(
                 switch (input_control.consumeAction()) {
                     .disconnect => {
                         abortTransport(&transport);
-                        return;
+                        return 0;
                     },
                     .reconnect => if (old_unresponsive and pending == null) {
                         pending = Pending.start(allocator, start_transport) catch |err| {
@@ -1143,7 +1220,7 @@ pub fn runLocalStream(
                                 if (old_unresponsive) {
                                     const delay_ms = reconnect.delayMs(attempt);
                                     const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
-                                    if (action == .disconnect) return;
+                                    if (action == .disconnect) return 0;
                                     attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                                     pending = Pending.start(allocator, start_transport) catch |retry_err| {
                                         client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{retry_err});
@@ -1165,7 +1242,7 @@ pub fn runLocalStream(
                 if (result != null) break;
                 reconnect_status.showReconnecting();
                 input_control.status_visible = true;
-                if (pollReconnectInput(&state, options.source_fd, &input_control, 50) == .disconnect) return;
+                if (pollReconnectInput(&state, options.source_fd, &input_control, 50) == .disconnect) return 0;
                 reconnect_status.flushDiagnostics();
             }
             pending = null;
@@ -1184,7 +1261,7 @@ pub fn runLocalStream(
         }
         const delay_ms = reconnect.delayMs(attempt);
         const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
-        if (action == .disconnect) return;
+        if (action == .disconnect) return 0;
         attempt = reconnect.nextAttempt(attempt, action == .reconnect);
         retrying = true;
     }
@@ -1332,6 +1409,20 @@ fn handleFrame(
                 else => return err,
             };
         },
+        .stream_exit_status => {
+            var message = try protocol.decodePayload(pb.StreamExitStatus, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            state.inbound_exit_status = message.exit_status orelse return error.StreamMissingExitStatus;
+            sendStreamMessage(state.allocator, transport_write_fd, .stream_exit_status_ack, pb.StreamExitStatusAck{}) catch |err| switch (err) {
+                error.WriteFailed => return error.StreamTransportWriteFailed,
+                else => return err,
+            };
+        },
+        .stream_exit_status_ack => {
+            var message = try protocol.decodePayload(pb.StreamExitStatusAck, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            state.outbound_exit_status_acked = true;
+        },
         .ping, .pong => {
             _ = protocol.handleTransportControlFrame(mutable.message_type, mutable.payload, transport_write_fd) catch |err| switch (err) {
                 error.WriteFailed => return error.StreamTransportWriteFailed,
@@ -1391,6 +1482,16 @@ fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
                 .offset = channel_state.outboundNext(),
             });
             channel_state.outbound_eof_sent = true;
+        }
+    }
+    if (!state.outbound_exit_status_acked) {
+        if (state.outbound_exit_status) |exit_status| {
+            if (!state.outbound_exit_status_sent) {
+                try sendStreamMessage(state.allocator, transport_write_fd, .stream_exit_status, pb.StreamExitStatus{
+                    .exit_status = exit_status,
+                });
+                state.outbound_exit_status_sent = true;
+            }
         }
     }
 }
@@ -1600,13 +1701,13 @@ fn decodeTermArg(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
 
 fn startStreamEndpoint(allocator: std.mem.Allocator, config: StreamAgentConfig) !StreamEndpoint {
     return switch (config.mode) {
-        .pty => .{ .pty = try pty_process.spawn(allocator, .{
+        .pty => .{ .pty = .{ .child = try pty_process.spawn(allocator, .{
             .rows = config.rows,
             .cols = config.cols,
             .shell_command = config.shell_command,
             .session_guid = config.guid,
             .tty_settings = config.tty_settings,
-        }) },
+        }) } },
         .pipe => .{ .pipe = try PipeEndpoint.spawn(allocator, config.shell_command) },
     };
 }
@@ -2204,6 +2305,73 @@ test "stream completion waits for eof acknowledgement" {
         .payload = payload,
     });
     try std.testing.expect(state.complete());
+}
+
+test "stream eof is not delayed waiting for exit status" {
+    var state = StreamState.init(std.testing.allocator, .{ .stdout = true }, .{});
+    defer state.deinit();
+    state.peer_ready = true;
+    state.require_outbound_exit_status = true;
+    state.channel(stream_channel_stdout).outbound_eof = true;
+
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    try sendPending(&state, fds[1]);
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = fds[0],
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try posix.poll(&pollfds, 100);
+    try std.testing.expectEqual(@as(c_int, 1), ready);
+
+    var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.stream_eof, frame.message_type);
+}
+
+test "stream completion waits for exit status acknowledgement" {
+    var state = StreamState.init(std.testing.allocator, .{ .stdout = true }, .{});
+    defer state.deinit();
+    state.require_outbound_exit_status = true;
+    state.outbound_exit_status = .{
+        .kind = .EXIT_STATUS_KIND_EXITED,
+        .status = 7,
+    };
+    state.channel(stream_channel_stdout).outbound_eof = true;
+    state.channel(stream_channel_stdout).outbound_eof_acked = true;
+
+    try std.testing.expect(!state.complete());
+
+    const payload = try protocol.encodePayload(std.testing.allocator, pb.StreamExitStatusAck{});
+    const options = StreamAttachmentOptions{};
+    try handleFrame(&state, -1, &options, .{
+        .message_type = .stream_exit_status_ack,
+        .payload = payload,
+    });
+    try std.testing.expect(state.complete());
+}
+
+test "stream exit status maps to local ssh-style exit code" {
+    try std.testing.expectEqual(@as(u8, 7), streamExitCode(.{
+        .kind = .EXIT_STATUS_KIND_EXITED,
+        .status = 7,
+    }));
+    try std.testing.expectEqual(@as(u8, 255), streamExitCode(.{
+        .kind = .EXIT_STATUS_KIND_EXITED,
+        .status = 300,
+    }));
+    try std.testing.expectEqual(@as(u8, 130), streamExitCode(.{
+        .kind = .EXIT_STATUS_KIND_SIGNALLED,
+        .status = 2,
+    }));
+    try std.testing.expectEqual(@as(u8, 255), streamExitCode(.{
+        .kind = .EXIT_STATUS_KIND_UNSPECIFIED,
+        .status = 0,
+    }));
 }
 
 test "stream child sources drain before child status is checked" {

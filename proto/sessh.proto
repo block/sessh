@@ -49,6 +49,8 @@ message Frame {
     StreamEofAck stream_eof_ack = 38;
     Ping ping = 39;
     Pong pong = 40;
+    StreamExitStatus stream_exit_status = 41;
+    StreamExitStatusAck stream_exit_status_ack = 42;
   }
 }
 
@@ -95,6 +97,19 @@ message StreamEofAck {
   int32 channel = 1;
   // Offset of the end of the sender's byte stream for this channel.
   uint64 offset = 2;
+}
+
+// Exit status for the remote process behind a reconnectable stream. This is
+// separate from StreamEof because stdout/stderr can close before the process
+// exits. The sender waits for StreamExitStatusAck before it lets the stream
+// finish, otherwise a reconnect between the status write and the peer's read
+// could lose the exit code.
+message StreamExitStatus {
+  ExitStatus exit_status = 1;
+}
+
+// Acknowledges that StreamExitStatus was received.
+message StreamExitStatusAck {
 }
 
 // A transport liveness probe. This is not application input and must not change

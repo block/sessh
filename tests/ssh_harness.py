@@ -1584,6 +1584,40 @@ def test_ssh_remote_command_uses_direct_stream(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_remote_command_stream_preserves_exit_status(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sessh(["test-host", "printf 'EXIT_STATUS_STDOUT\\n'; exit 7"], env, timeout=5.0)
+
+    if result.returncode != 7:
+        raise AssertionError(result)
+    if result.stdout != "EXIT_STATUS_STDOUT\n":
+        raise AssertionError(result)
+
+
+def test_ssh_remote_command_stream_waits_for_exit_status_after_output_eof(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sessh(["test-host", "exec >/dev/null 2>/dev/null; sleep 0.2; exit 9"], env, timeout=5.0)
+
+    if result.returncode != 9:
+        raise AssertionError(result)
+    if result.stdout or result.stderr:
+        raise AssertionError(result)
+
+
 def test_ssh_remote_command_stream_preserves_stderr_channel(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1630,6 +1664,29 @@ def test_ssh_tty_stdin_remote_command_does_not_allocate_tty_without_t(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_non_passthrough_tty_preserves_exit_status(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "-t", "test-host", "exit 67"],
+        env,
+        (),
+        timeout=10.0,
+    )
+
+    if result.returncode != 67:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+
+
 def test_ssh_passthrough_remote_command_uses_direct_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1650,6 +1707,41 @@ def test_ssh_passthrough_remote_command_uses_direct_stream(tmp):
     log_text = fake_log.read_text()
     if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
+
+
+def test_ssh_passthrough_remote_command_preserves_exit_status(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sessh(["--passthrough", "test-host", "exit 11"], env, timeout=5.0)
+
+    if result.returncode != 11:
+        raise AssertionError(result)
+
+
+def test_ssh_passthrough_tty_preserves_exit_status(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "-tt", "test-host", "exit 13"],
+        env,
+        (),
+        timeout=10.0,
+    )
+
+    if result.returncode != 13:
+        raise AssertionError(result)
 
 
 def test_ssh_passthrough_forced_tty_marks_stream_as_tty(tmp):
@@ -3780,6 +3872,14 @@ def main(argv=None):
             test_ssh_remote_command_uses_direct_stream,
         ),
         (
+            "ssh remote command stream preserves exit status",
+            test_ssh_remote_command_stream_preserves_exit_status,
+        ),
+        (
+            "ssh remote command stream waits for exit status after output eof",
+            test_ssh_remote_command_stream_waits_for_exit_status_after_output_eof,
+        ),
+        (
             "ssh remote command stream preserves stderr channel",
             test_ssh_remote_command_stream_preserves_stderr_channel,
         ),
@@ -3788,8 +3888,20 @@ def main(argv=None):
             test_ssh_tty_stdin_remote_command_does_not_allocate_tty_without_t,
         ),
         (
+            "ssh non-passthrough tty preserves exit status",
+            test_ssh_non_passthrough_tty_preserves_exit_status,
+        ),
+        (
             "ssh passthrough remote command uses direct stream",
             test_ssh_passthrough_remote_command_uses_direct_stream,
+        ),
+        (
+            "ssh passthrough remote command preserves exit status",
+            test_ssh_passthrough_remote_command_preserves_exit_status,
+        ),
+        (
+            "ssh passthrough tty preserves exit status",
+            test_ssh_passthrough_tty_preserves_exit_status,
         ),
         (
             "ssh passthrough forced tty marks stream as tty",
