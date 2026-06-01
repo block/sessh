@@ -2987,11 +2987,13 @@ fn shouldUseDirectStream(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) boo
     // Match ssh's PTY allocation rules for remote commands. Plain
     // `ssh HOST command` does not allocate a remote tty even when local stdin is
     // a tty, so it uses the stream path. `-t` only requests a remote tty when
-    // local stdin is a tty; `-tt` forces the persistent PTY path.
+    // local stdin is a tty. `-tt` with local stdin still uses sessh's normal
+    // session path; without local stdin it uses a direct stream PTY so stdout
+    // stays shaped like OpenSSH instead of receiving sessh renderer cleanup.
     return switch (parsed_ssh_args.tty_request) {
         .none => true,
         .requested => !stdin_is_tty,
-        .forced => false,
+        .forced => !stdin_is_tty,
     };
 }
 
@@ -5002,7 +5004,7 @@ test "direct stream preserves ssh remote command tty semantics" {
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(!shouldUseDirectStream(forced, false));
+    try std.testing.expect(shouldUseDirectStream(forced, false));
     try std.testing.expect(!shouldUseDirectStream(forced, true));
 }
 

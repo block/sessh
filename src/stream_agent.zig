@@ -65,6 +65,15 @@ const stream_channels = [_]StreamChannel{
 // child reaped or the stream complete.
 const source_poll_events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR;
 
+var local_stream_interrupt_write_fd: c.fd_t = -1;
+
+fn handleLocalStreamInterrupt(_: c_int) callconv(.c) void {
+    const fd = local_stream_interrupt_write_fd;
+    if (fd < 0) return;
+    var byte = [_]u8{1};
+    _ = c.write(fd, &byte, byte.len);
+}
+
 const ChannelMask = struct {
     stdin: bool = false,
     stdout: bool = false,
@@ -260,6 +269,7 @@ const StreamStepOutcome = union(enum) {
     idle,
     progress,
     complete,
+    interrupted,
     transport_closed,
     unresponsive,
     replacement: c.fd_t,
@@ -373,6 +383,7 @@ const StreamControlAction = enum {
     none,
     reconnect,
     disconnect,
+    interrupt,
 };
 
 const StreamLiveness = struct {
@@ -431,6 +442,7 @@ const StreamAttachment = struct {
     // otherwise blocking attachment when an async replacement transport is
     // ready, without shortening the main poll timeout.
     external_wakeup_fd: c.fd_t = -1,
+    interrupt_fd: c.fd_t = -1,
     last_resize_size: ?terminal.WindowSize = null,
 
     fn init(
@@ -469,7 +481,7 @@ const StreamAttachment = struct {
         if (state.complete()) return .complete;
 
         const now_before_poll_ms = nowMillis();
-        var pollfds: [1 + max_stream_sources + 1 + 1]posix.pollfd = undefined;
+        var pollfds: [1 + max_stream_sources + 1 + 2]posix.pollfd = undefined;
         var count: usize = 0;
         const transport_index = count;
         pollfds[count] = .{ .fd = self.transport_read_fd, .events = posix.POLL.IN, .revents = 0 };
@@ -500,6 +512,12 @@ const StreamAttachment = struct {
             pollfds[count] = .{ .fd = self.external_wakeup_fd, .events = posix.POLL.IN, .revents = 0 };
             count += 1;
         }
+        var interrupt_index: ?usize = null;
+        if (self.interrupt_fd >= 0) {
+            interrupt_index = count;
+            pollfds[count] = .{ .fd = self.interrupt_fd, .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
+        }
 
         const timeout_ms = self.liveness.pollTimeoutMs(now_before_poll_ms, requested_timeout_ms);
         const ready = try posix.poll(pollfds[0..count], timeout_ms);
@@ -527,6 +545,9 @@ const StreamAttachment = struct {
                 if (fd < 0) return error.AcceptFailed;
                 return .{ .replacement = fd };
             }
+        }
+        if (interrupt_index) |index| {
+            if (pollfds[index].revents != 0) return .interrupted;
         }
 
         if ((pollfds[transport_index].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
@@ -752,7 +773,7 @@ fn streamExitCode(status: ?pb.ExitStatus) u8 {
     const value = status orelse return 0;
     return switch (value.kind) {
         .EXIT_STATUS_KIND_EXITED => if (value.status >= 0 and value.status <= 255) @intCast(value.status) else 255,
-        .EXIT_STATUS_KIND_SIGNALLED => if (value.status >= 0 and value.status <= 127) @intCast(128 + value.status) else 255,
+        .EXIT_STATUS_KIND_SIGNALLED => 255,
         else => 255,
     };
 }
@@ -772,6 +793,75 @@ fn setCloseOnExec(fd: c.fd_t) !void {
     if ((flags & close_on_exec_flag) != 0) return;
     if (c.fcntl(fd, c.F.SETFD, flags | close_on_exec_flag) < 0) return error.FcntlFailed;
 }
+
+const LocalStreamInterrupt = struct {
+    read_fd: c.fd_t = -1,
+    write_fd: c.fd_t = -1,
+    previous_action: posix.Sigaction = undefined,
+    installed: bool = false,
+
+    fn install() !LocalStreamInterrupt {
+        const pipe_fds = try posix.pipe();
+        var interrupt = LocalStreamInterrupt{
+            .read_fd = pipe_fds[0],
+            .write_fd = pipe_fds[1],
+        };
+        errdefer interrupt.closeFds();
+
+        try setNonBlockingFd(interrupt.read_fd);
+        try setNonBlockingFd(interrupt.write_fd);
+        try setCloseOnExec(interrupt.read_fd);
+        try setCloseOnExec(interrupt.write_fd);
+
+        // OpenSSH does not expose a negative local SIGINT return code for
+        // non-tty commands; it exits as ssh failure 255. The stream client uses
+        // this pipe to turn SIGINT into a normal poll event so it can abort the
+        // transport, clean up local terminal state, and return the same status.
+        const action = posix.Sigaction{
+            .handler = .{ .handler = handleLocalStreamInterrupt },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        local_stream_interrupt_write_fd = interrupt.write_fd;
+        posix.sigaction(posix.SIG.INT, &action, &interrupt.previous_action);
+        interrupt.installed = true;
+        return interrupt;
+    }
+
+    fn deinit(self: *LocalStreamInterrupt) void {
+        if (self.installed) {
+            posix.sigaction(posix.SIG.INT, &self.previous_action, null);
+            self.installed = false;
+        }
+        local_stream_interrupt_write_fd = -1;
+        self.closeFds();
+    }
+
+    fn consume(self: *LocalStreamInterrupt) void {
+        var buf: [64]u8 = undefined;
+        while (true) {
+            const n = c.read(self.read_fd, &buf, buf.len);
+            if (n > 0) continue;
+            if (n == 0) return;
+            switch (posix.errno(n)) {
+                .INTR => continue,
+                .AGAIN => return,
+                else => return,
+            }
+        }
+    }
+
+    fn closeFds(self: *LocalStreamInterrupt) void {
+        if (self.read_fd >= 0) {
+            posix.close(self.read_fd);
+            self.read_fd = -1;
+        }
+        if (self.write_fd >= 0) {
+            posix.close(self.write_fd);
+            self.write_fd = -1;
+        }
+    }
+};
 
 fn PendingReplacement(comptime Starter: type, comptime Transport: type) type {
     return struct {
@@ -1206,6 +1296,8 @@ pub fn runLocalStream(
     };
     var reconnect_status = StreamReconnectStatus.init(options.status_mode, options.intercept_ctrl_r, options.title_fallback);
     defer reconnect_status.deinit();
+    var local_interrupt = try LocalStreamInterrupt.install();
+    defer local_interrupt.deinit();
 
     var attempt: usize = 0;
     var had_transport = false;
@@ -1231,8 +1323,9 @@ pub fn runLocalStream(
                     return err;
                 }
                 const delay_ms = reconnect.delayMs(attempt);
-                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
+                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control, &local_interrupt);
                 if (action == .disconnect) return 0;
+                if (action == .interrupt) return 255;
                 attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                 retrying = true;
                 continue;
@@ -1277,6 +1370,7 @@ pub fn runLocalStream(
             var old_unresponsive = false;
             while (true) {
                 attachment.external_wakeup_fd = if (pending) |*replacement| replacement.notifyFd() else -1;
+                attachment.interrupt_fd = local_interrupt.read_fd;
                 const outcome = attachment.step(-1) catch .transport_closed;
                 switch (outcome) {
                     .complete => {
@@ -1301,8 +1395,9 @@ pub fn runLocalStream(
                             pending = Pending.start(allocator, start_transport) catch |err| {
                                 client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                                 const delay_ms = reconnect.delayMs(attempt);
-                                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
+                                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control, &local_interrupt);
                                 if (action == .disconnect) return 0;
+                                if (action == .interrupt) return 255;
                                 attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                                 continue;
                             };
@@ -1313,6 +1408,11 @@ pub fn runLocalStream(
                     .transport_closed => {
                         transport.close();
                         break :transport_loop;
+                    },
+                    .interrupted => {
+                        local_interrupt.consume();
+                        abortTransport(&transport);
+                        return 255;
                     },
                     .replacement => |fd| {
                         _ = c.close(fd);
@@ -1333,6 +1433,7 @@ pub fn runLocalStream(
                         input_control.status_visible = true;
                     },
                     .none => {},
+                    .interrupt => unreachable,
                 }
 
                 if (pending) |*replacement| {
@@ -1356,8 +1457,9 @@ pub fn runLocalStream(
                                 client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                                 if (old_unresponsive) {
                                     const delay_ms = reconnect.delayMs(attempt);
-                                    const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
+                                    const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control, &local_interrupt);
                                     if (action == .disconnect) return 0;
+                                    if (action == .interrupt) return 255;
                                     attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                                     pending = Pending.start(allocator, start_transport) catch |retry_err| {
                                         client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{retry_err});
@@ -1379,9 +1481,12 @@ pub fn runLocalStream(
                 if (result != null) break;
                 reconnect_status.showReconnecting();
                 input_control.status_visible = true;
-                var pollfds: [2]posix.pollfd = undefined;
+                var pollfds: [3]posix.pollfd = undefined;
                 var count: usize = 0;
                 pollfds[count] = .{ .fd = replacement.notifyFd(), .events = posix.POLL.IN, .revents = 0 };
+                count += 1;
+                const interrupt_index = count;
+                pollfds[count] = .{ .fd = local_interrupt.read_fd, .events = posix.POLL.IN, .revents = 0 };
                 count += 1;
                 var input_index: ?usize = null;
                 if (reconnectInputPollEnabled(&input_control)) {
@@ -1391,6 +1496,10 @@ pub fn runLocalStream(
                 }
 
                 _ = posix.poll(pollfds[0..count], -1) catch {};
+                if (pollfds[interrupt_index].revents != 0) {
+                    local_interrupt.consume();
+                    return 255;
+                }
                 if (input_index) |index| {
                     if (pollfds[index].revents != 0) {
                         if (readReconnectInput(&state, options.source_fd, &input_control) == .disconnect) return 0;
@@ -1413,8 +1522,9 @@ pub fn runLocalStream(
             }
         }
         const delay_ms = reconnect.delayMs(attempt);
-        const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control);
+        const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control, &local_interrupt);
         if (action == .disconnect) return 0;
+        if (action == .interrupt) return 255;
         attempt = reconnect.nextAttempt(attempt, action == .reconnect);
         retrying = true;
     }
@@ -1438,6 +1548,7 @@ fn runAttachedStream(
             .complete => return .complete,
             .transport_closed => return .transport_closed,
             .unresponsive => return .unresponsive,
+            .interrupted => return .transport_closed,
             .replacement => |fd| return .{ .replacement = fd },
             .idle, .progress => {},
         }
@@ -1903,13 +2014,14 @@ fn waitBeforeReconnect(
     state: *StreamState,
     source_fd: c.fd_t,
     input_control: *StreamInputControl,
+    interrupt: ?*LocalStreamInterrupt,
 ) StreamControlAction {
     var remaining_ms = delay_ms;
     while (remaining_ms > 0) {
         status.showRetry(remaining_ms);
         input_control.status_visible = true;
         const step_ms = @min(remaining_ms, 1_000);
-        const action = pollReconnectInput(state, source_fd, input_control, @intCast(step_ms));
+        const action = pollReconnectInput(state, source_fd, input_control, interrupt, @intCast(step_ms));
         if (action != .none) return action;
         remaining_ms -= step_ms;
         status.flushDiagnostics();
@@ -1921,21 +2033,42 @@ fn pollReconnectInput(
     state: *StreamState,
     source_fd: c.fd_t,
     input_control: *StreamInputControl,
+    interrupt: ?*LocalStreamInterrupt,
     timeout_ms: i32,
 ) StreamControlAction {
-    if (!reconnectInputPollEnabled(input_control)) {
+    var pollfds: [2]posix.pollfd = undefined;
+    var count: usize = 0;
+    var interrupt_index: ?usize = null;
+    if (interrupt) |local_interrupt| {
+        if (local_interrupt.read_fd >= 0) {
+            interrupt_index = count;
+            pollfds[count] = .{ .fd = local_interrupt.read_fd, .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
+        }
+    }
+    var input_index: ?usize = null;
+    if (reconnectInputPollEnabled(input_control)) {
+        input_index = count;
+        pollfds[count] = .{ .fd = source_fd, .events = posix.POLL.IN, .revents = 0 };
+        count += 1;
+    }
+
+    if (count == 0) {
         if (timeout_ms > 0) io.sleepMillis(@intCast(timeout_ms));
         return input_control.consumeAction();
     }
-    var pollfd = [_]posix.pollfd{.{
-        .fd = source_fd,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = posix.poll(&pollfd, timeout_ms) catch return input_control.consumeAction();
+    const ready = posix.poll(pollfds[0..count], timeout_ms) catch return input_control.consumeAction();
     if (ready == 0) return input_control.consumeAction();
-    if (pollfd[0].revents != 0) {
-        return readReconnectInput(state, source_fd, input_control);
+    if (interrupt_index) |index| {
+        if (pollfds[index].revents != 0) {
+            if (interrupt) |local_interrupt| local_interrupt.consume();
+            return .interrupt;
+        }
+    }
+    if (input_index) |index| {
+        if (pollfds[index].revents != 0) {
+            return readReconnectInput(state, source_fd, input_control);
+        }
     }
     return input_control.consumeAction();
 }
@@ -2655,6 +2788,13 @@ test "stream completion waits for eof acknowledgement" {
     try std.testing.expect(state.complete());
 }
 
+test "stream exit code matches OpenSSH for remote signal death" {
+    try std.testing.expectEqual(@as(u8, 255), streamExitCode(.{
+        .kind = .EXIT_STATUS_KIND_SIGNALLED,
+        .status = 15,
+    }));
+}
+
 test "stream eof is not delayed waiting for exit status" {
     var state = StreamState.init(std.testing.allocator, .{ .stdout = true }, .{});
     defer state.deinit();
@@ -2712,7 +2852,7 @@ test "stream exit status maps to local ssh-style exit code" {
         .kind = .EXIT_STATUS_KIND_EXITED,
         .status = 300,
     }));
-    try std.testing.expectEqual(@as(u8, 130), streamExitCode(.{
+    try std.testing.expectEqual(@as(u8, 255), streamExitCode(.{
         .kind = .EXIT_STATUS_KIND_SIGNALLED,
         .status = 2,
     }));

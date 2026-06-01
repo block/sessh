@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 import hashlib
+import fcntl
+import json
 import os
+import pty
+import re
 import select
 import shutil
+import signal
+import struct
 import subprocess
 import tempfile
+import termios
 import time
 from pathlib import Path
 
@@ -41,6 +48,7 @@ def run(cmd, *, env=None, cwd=ROOT, timeout=120.0, check=True):
         cwd=cwd,
         env=env,
         text=True,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
@@ -49,6 +57,19 @@ def run(cmd, *, env=None, cwd=ROOT, timeout=120.0, check=True):
     if check and result.returncode != 0:
         raise AssertionError(f"{cmd} failed\nstdout={result.stdout}\nstderr={result.stderr}")
     return result
+
+
+def run_bytes(cmd, *, env=None, input_bytes=b"", timeout=30.0, check=False):
+    return subprocess.run(
+        cmd,
+        cwd=ROOT,
+        env=env,
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=check,
+    )
 
 
 def run_until_stdout(cmd, env, needle, timeout=30.0):
@@ -87,6 +108,108 @@ def run_until_stdout(cmd, env, needle, timeout=30.0):
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
     )
+
+
+def read_available_pty(fd):
+    output = b""
+    while True:
+        ready, _, _ = select.select([fd], [], [], 0)
+        if not ready:
+            return output
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            return output
+        if not chunk:
+            return output
+        output += chunk
+
+
+def read_pty_until(fd, output, needle, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while needle not in output:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"timed out waiting for {needle!r}; got {output!r}")
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            raise AssertionError(f"timed out waiting for {needle!r}; got {output!r}")
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError as exc:
+            raise AssertionError(f"pty closed waiting for {needle!r}; got {output!r}") from exc
+        if not chunk:
+            raise AssertionError(f"pty closed waiting for {needle!r}; got {output!r}")
+        output += chunk
+    return output
+
+
+def resize_pty_then_send(rows, cols, data):
+    def action(fd):
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        os.write(fd, data)
+
+    return action
+
+
+def run_in_pty(cmd, env, steps=(), *, rows=24, cols=100, timeout=30.0):
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(cmd[0], cmd, env)
+
+    output = b""
+    waited = False
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        for needle, to_send in steps:
+            output = read_pty_until(fd, output, needle, timeout)
+            if callable(to_send):
+                to_send(fd)
+            elif to_send:
+                os.write(fd, to_send)
+
+        deadline = time.monotonic() + timeout
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                waited = True
+                return subprocess.CompletedProcess(
+                    cmd,
+                    wait_status_to_returncode(status),
+                    normalize_output(output + read_available_pty(fd)),
+                    "",
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"timed out waiting for pty command to exit; got {output!r}")
+            ready, _, _ = select.select([fd], [], [], min(remaining, 0.05))
+            if ready:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    output += chunk
+    finally:
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(fd)
+
+
+def wait_status_to_returncode(status):
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return status
 
 
 def read_until_pipe(proc, pipe, needle, timeout=30.0):
@@ -138,6 +261,184 @@ def run_reconnect_probe(cmd, env, ready, after, timeout=60.0):
         stdout.decode("utf-8", "replace"),
         stderr.decode("utf-8", "replace"),
     )
+
+
+def normalize_output(value):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    value = value.replace("\r\n", "\n")
+    value = re.sub(r"/dev/(?:pts/)?[0-9]+", "<tty>", value)
+    value = re.sub(r"Connection to 127\\.0\\.0\\.1 closed\\.\\n?", "", value)
+    return value
+
+
+def strip_terminal_controls(value):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    # The normal sessh TTY path owns the outer terminal and may emit local
+    # probes, clears, and title updates around the remote program's bytes.
+    # Oracle checks for that path compare the visible command output, while
+    # passthrough checks still compare the exact stream.
+    value = re.sub(r"\x1b[\]PX_^].*?(?:\x07|\x1b\\)", "", value, flags=re.S)
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    value = re.sub(r"\x1b[ -/]*[@-~]", "", value)
+    return value
+
+
+def visible_terminal_output(value):
+    value = normalize_output(strip_terminal_controls(value))
+    value = value.replace("\r", "\n")
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def sessh_oracle_cmd(prefix, config, host_alias, ssh_options, remote_args, sessh_options=()):
+    return [
+        str(prefix / "bin" / "sessh"),
+        *sessh_options,
+        "-F",
+        str(config),
+        *ssh_options,
+        host_alias,
+        *remote_args,
+    ]
+
+
+def openssh_oracle_cmd(config, host_alias, ssh_options, remote_args):
+    return ["ssh", "-F", str(config), *ssh_options, host_alias, *remote_args]
+
+
+def assert_observable_matches(name, ssh_result, sessh_result, *, compare_stderr=True):
+    ssh_observed = (
+        ssh_result.returncode,
+        normalize_output(ssh_result.stdout),
+        normalize_output(ssh_result.stderr) if compare_stderr else "",
+    )
+    sessh_observed = (
+        sessh_result.returncode,
+        normalize_output(sessh_result.stdout),
+        normalize_output(sessh_result.stderr) if compare_stderr else "",
+    )
+    if ssh_observed != sessh_observed:
+        raise AssertionError(
+            f"OpenSSH oracle mismatch for {name}\n"
+            f"ssh:   rc={ssh_result.returncode} stdout={normalize_output(ssh_result.stdout)!r} stderr={normalize_output(ssh_result.stderr)!r}\n"
+            f"sessh: rc={sessh_result.returncode} stdout={normalize_output(sessh_result.stdout)!r} stderr={normalize_output(sessh_result.stderr)!r}"
+        )
+
+
+def assert_visible_terminal_matches(name, ssh_result, sessh_result):
+    ssh_observed = (ssh_result.returncode, visible_terminal_output(ssh_result.stdout))
+    sessh_observed = (sessh_result.returncode, visible_terminal_output(sessh_result.stdout))
+    if ssh_observed != sessh_observed:
+        raise AssertionError(
+            f"OpenSSH visible-terminal oracle mismatch for {name}\n"
+            f"ssh:   rc={ssh_result.returncode} visible_stdout={visible_terminal_output(ssh_result.stdout)!r}\n"
+            f"sessh: rc={sessh_result.returncode} visible_stdout={visible_terminal_output(sessh_result.stdout)!r}\n"
+            f"sessh raw stdout={normalize_output(sessh_result.stdout)!r}"
+        )
+
+
+def compare_openssh_oracle(
+    name,
+    prefix,
+    config,
+    host_alias,
+    env,
+    *,
+    ssh_options=(),
+    remote_args=(),
+    sessh_options=(),
+    input_bytes=b"",
+    compare_stderr=True,
+    timeout=30.0,
+):
+    ssh_result = run_bytes(
+        openssh_oracle_cmd(config, host_alias, ssh_options, remote_args),
+        input_bytes=input_bytes,
+        timeout=timeout,
+    )
+    sessh_result = run_bytes(
+        sessh_oracle_cmd(prefix, config, host_alias, ssh_options, remote_args, sessh_options),
+        env=env,
+        input_bytes=input_bytes,
+        timeout=timeout,
+    )
+    assert_observable_matches(name, ssh_result, sessh_result, compare_stderr=compare_stderr)
+
+
+def compare_openssh_pty_oracle(
+    name,
+    prefix,
+    config,
+    host_alias,
+    env,
+    *,
+    ssh_options=(),
+    remote_args=(),
+    sessh_options=(),
+    steps=(),
+    visible_only=False,
+    timeout=30.0,
+):
+    ssh_result = run_in_pty(
+        openssh_oracle_cmd(config, host_alias, ssh_options, remote_args),
+        os.environ.copy(),
+        steps,
+        timeout=timeout,
+    )
+    sessh_result = run_in_pty(
+        sessh_oracle_cmd(prefix, config, host_alias, ssh_options, remote_args, sessh_options),
+        env,
+        steps,
+        timeout=timeout,
+    )
+    if visible_only:
+        assert_visible_terminal_matches(name, ssh_result, sessh_result)
+    else:
+        assert_observable_matches(name, ssh_result, sessh_result, compare_stderr=False)
+
+
+def run_signal_after_stdout(cmd, env, needle, sig=signal.SIGINT, timeout=30.0):
+    proc = subprocess.Popen(
+        cmd,
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = read_until_pipe(proc, proc.stdout, needle, timeout)
+    proc.send_signal(sig)
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise
+    stdout += proc.stdout.read()
+    stderr = proc.stderr.read()
+    return subprocess.CompletedProcess(
+        cmd,
+        returncode,
+        stdout,
+        stderr,
+    )
+
+
+def compare_signal_oracle(name, prefix, config, host_alias, env, *, remote_args, needle, timeout=30.0):
+    ssh_result = run_signal_after_stdout(
+        openssh_oracle_cmd(config, host_alias, (), remote_args),
+        os.environ.copy(),
+        needle,
+        timeout=timeout,
+    )
+    sessh_result = run_signal_after_stdout(
+        sessh_oracle_cmd(prefix, config, host_alias, (), remote_args),
+        env,
+        needle,
+        timeout=timeout,
+    )
+    assert_observable_matches(name, ssh_result, sessh_result, compare_stderr=False)
 
 
 def skip(message):
@@ -206,6 +507,14 @@ def first_session_id(list_stdout):
             continue
         return line.split(None, 1)[0]
     raise AssertionError(f"no sessions in list output: {list_stdout!r}")
+
+
+def first_session_guid(jsonl_stdout):
+    for line in jsonl_stdout.splitlines():
+        if not line.strip():
+            continue
+        return json.loads(line)["guid"]
+    raise AssertionError(f"no sessions in jsonl list output: {jsonl_stdout!r}")
 
 
 def has_list_header(list_stdout):
@@ -289,6 +598,7 @@ Host {host_alias}
   Port {port}
   User root
   IdentityFile {key}
+  IdentitiesOnly yes
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
   LogLevel ERROR
@@ -313,6 +623,156 @@ def wait_for_ssh(host_alias, config):
     raise AssertionError(f"ssh target did not become ready: {result.stderr}")
 
 
+def warm_sessh_artifact_cache(prefix, config, host_alias, env):
+    result = run(
+        [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias, "true"],
+        env=env,
+        timeout=60.0,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result)
+
+
+def test_openssh_oracle_matrix(prefix, config, host_alias, env):
+    # These cases deliberately use the real OpenSSH client as the oracle. The
+    # fake-ssh harness is faster and more surgical, but it can only verify the
+    # behavior we remembered to simulate. This matrix locks down common
+    # user-visible behavior against an actual ssh client and sshd pair.
+    compare_openssh_oracle(
+        "remote command stdout/stderr/exit",
+        prefix,
+        config,
+        host_alias,
+        env,
+        remote_args=("printf 'OUT\\n'; printf 'ERR\\n' >&2; exit 7",),
+    )
+    compare_openssh_oracle(
+        "remote command stdin data and eof",
+        prefix,
+        config,
+        host_alias,
+        env,
+        remote_args=("IFS= read -r line; printf 'IN:%s\\n' \"$line\"; IFS= read -r rest || printf 'EOF\\n'",),
+        input_bytes=b"hello\n",
+    )
+    compare_openssh_oracle(
+        "remote command stdin immediate eof",
+        prefix,
+        config,
+        host_alias,
+        env,
+        remote_args=("if IFS= read -r line; then printf 'LINE:%s\\n' \"$line\"; else printf 'EOF\\n'; fi",),
+    )
+    compare_openssh_oracle(
+        "passthrough no command without tty",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-T",),
+        sessh_options=("--passthrough",),
+    )
+    compare_openssh_oracle(
+        "explicit no tty command",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-T",),
+        remote_args=("tty || true",),
+    )
+    compare_openssh_oracle(
+        "requested tty without local tty",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-t",),
+        remote_args=("tty || true",),
+        compare_stderr=False,
+    )
+    compare_openssh_oracle(
+        "forced tty without local tty",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-tt",),
+        remote_args=("tty",),
+        compare_stderr=False,
+    )
+    compare_openssh_oracle(
+        "RequestTTY=no command",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-o", "RequestTTY=no"),
+        remote_args=("tty || true",),
+    )
+    compare_openssh_oracle(
+        "remote command exit status",
+        prefix,
+        config,
+        host_alias,
+        env,
+        remote_args=("exit 23",),
+    )
+    compare_openssh_oracle(
+        "remote process signal death",
+        prefix,
+        config,
+        host_alias,
+        env,
+        remote_args=("kill -TERM $$",),
+        compare_stderr=False,
+    )
+    compare_signal_oracle(
+        "local SIGINT during non-tty command",
+        prefix,
+        config,
+        host_alias,
+        env,
+        remote_args=("printf 'READY\\n'; sleep 20",),
+        needle=b"READY\n",
+    )
+    compare_openssh_pty_oracle(
+        "requested tty with local tty",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-t",),
+        remote_args=("tty",),
+        visible_only=True,
+    )
+    compare_openssh_pty_oracle(
+        "passthrough requested tty with local tty",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-t",),
+        sessh_options=("--passthrough",),
+        remote_args=("tty",),
+    )
+    compare_openssh_pty_oracle(
+        "pty resize propagation",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-tt",),
+        sessh_options=("--passthrough",),
+        remote_args=("printf 'SIZE1:%s\\n' \"$(stty size)\"; IFS= read -r _; printf 'SIZE2:%s\\n' \"$(stty size)\"",),
+        steps=(
+            (b"SIZE1:24 100", resize_pty_then_send(31, 120, b"\n")),
+            (b"SIZE2:31 120", None),
+        ),
+    )
+
+
 def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_uname):
     tag = f"localhost/sessh-e2e-{arch}:{os.getpid()}"
     name = f"sessh-e2e-{arch}-{os.getpid()}"
@@ -334,6 +794,10 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
 
         env["HOME"] = str(tmp / f"home-{arch}")
         Path(env["HOME"]).mkdir(mode=0o700, exist_ok=True)
+
+        warm_sessh_artifact_cache(prefix, config, host_alias, env)
+        test_openssh_oracle_matrix(prefix, config, host_alias, env)
+
         remote_shell = "/tmp/sessh-e2e-shell"
         marker = f"PODMAN_SESSH_READY_{arch}"
         run(
@@ -444,7 +908,16 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         if not has_list_header(listed.stdout) or not has_session_row(listed.stdout):
             raise AssertionError(listed)
         session_id = first_session_id(listed.stdout)
-        compat_path = f"/tmp/sessh-0/guid/{session_id}/compat"
+        listed_jsonl = run(
+            [str(prefix / "bin" / "sesshmux"), "list", "--jsonl", "--ssh-options", ssh_options, host_alias],
+            env=env,
+            timeout=60.0,
+            check=False,
+        )
+        if listed_jsonl.returncode != 0:
+            raise AssertionError(listed_jsonl)
+        session_guid = first_session_guid(listed_jsonl.stdout)
+        compat_path = f"/tmp/sessh-0/guid/{session_guid}/compat"
         compat = run(
             [
                 "podman",

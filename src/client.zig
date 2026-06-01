@@ -4542,6 +4542,19 @@ fn sendSessionCreate(
     };
     defer message.environment.deinit(app_allocator.allocator());
     defer message.legacy_command_argv.deinit(app_allocator.allocator());
+    if (c.getenv("SHELL")) |shell_z| {
+        const shell = std.mem.span(shell_z);
+        if (shell.len > 0) {
+            // The session agent runs on the remote host, but it cannot recover
+            // the client-selected login shell after SessionCreate. Keep this as
+            // an explicit environment entry so tests and callers that choose a
+            // shell before launching sessh get the same shell inside the PTY.
+            try message.environment.append(app_allocator.allocator(), .{
+                .name = "SHELL",
+                .value = shell,
+            });
+        }
+    }
     // The normal sessh path runs a terminal emulator on the remote side. Copy
     // portable line-discipline modes, but keep TERM tied to that emulator
     // contract instead of leaking the outer terminal's TERM.
