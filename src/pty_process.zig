@@ -7,6 +7,7 @@ const tty_settings = @import("tty_settings.zig");
 
 extern "c" fn forkpty(amaster: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp: ?*c.winsize) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn ttyname(fd: c_int) ?[*:0]u8;
 
 pub const SpawnOptions = struct {
     rows: u16,
@@ -112,6 +113,9 @@ pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
             _ = setenv("TERM", "xterm-256color", 1);
         }
         _ = setenv("SHELL", shell_z.ptr, 1);
+        if (ttyname(0)) |path| {
+            _ = setenv("SSH_TTY", path, 1);
+        }
         if (session_guid_z) |guid| _ = setenv("SESSH_GUID", guid.ptr, 1);
         if (sessh_path_z) |path| _ = setenv("SESSH_PATH", path.ptr, 1);
         if (path_z) |path| _ = setenv("PATH", path.ptr, 1);

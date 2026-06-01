@@ -596,19 +596,47 @@ def read_pty_until(fd, output, needle, timeout=10.0):
     return output
 
 
-def run_sesshmux_in_pty(args, env, steps, timeout=10.0, child_tty_setup=None):
-    argv = [str(MUX_BIN), *args]
+def run_sesshmux_in_pty(
+    args,
+    env,
+    steps,
+    timeout=10.0,
+    child_tty_setup=None,
+    binary=None,
+    capture_tty_attrs=False,
+):
+    argv = [str(binary or MUX_BIN), *args]
+    sync_r = sync_w = None
+    if capture_tty_attrs:
+        sync_r, sync_w = os.pipe()
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(ROOT)
+        if sync_r is not None:
+            os.close(sync_w)
+            os.read(sync_r, 1)
+            os.close(sync_r)
         if child_tty_setup is not None:
             child_tty_setup(0)
         os.execvpe(argv[0], argv, env)
 
     output = b""
     waited = False
+    tty_attrs_before = None
+    tty_attrs_after = None
     try:
+        if sync_r is not None:
+            os.close(sync_r)
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        if capture_tty_attrs:
+            # Release builds call std.process.exit, so defers do not run. Keep
+            # the child parked until the parent records the initial tty state;
+            # otherwise a fast child could put the pty in raw mode before the
+            # test has a baseline to compare against.
+            tty_attrs_before = termios.tcgetattr(fd)
+            os.write(sync_w, b"x")
+            os.close(sync_w)
+            sync_w = None
         for needle, to_send in steps:
             output = read_pty_until(fd, output, needle, timeout)
             if callable(to_send):
@@ -623,12 +651,17 @@ def run_sesshmux_in_pty(args, env, steps, timeout=10.0, child_tty_setup=None):
                 waited = True
                 returncode = wait_status_to_returncode(status)
                 output += read_available_pty(fd)
-                return subprocess.CompletedProcess(
+                if capture_tty_attrs:
+                    tty_attrs_after = termios.tcgetattr(fd)
+                result = subprocess.CompletedProcess(
                     argv,
                     returncode,
                     output.decode("utf-8", "replace"),
                     "",
                 )
+                result.tty_attrs_before = tty_attrs_before
+                result.tty_attrs_after = tty_attrs_after
+                return result
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AssertionError(f"timed out waiting for pty command to exit; got {output!r}")
@@ -641,6 +674,8 @@ def run_sesshmux_in_pty(args, env, steps, timeout=10.0, child_tty_setup=None):
                 if chunk:
                     output += chunk
     finally:
+        if sync_w is not None:
+            os.close(sync_w)
         if not waited:
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -660,6 +695,24 @@ def set_passthrough_tty_mode_probe(fd):
     attrs[0] &= ~termios.ICRNL
     attrs[3] &= ~(termios.ECHO | termios.ICANON)
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
+def set_passthrough_output_mode_probe(fd):
+    attrs = termios.tcgetattr(fd)
+    attrs[1] &= ~termios.OPOST
+    if hasattr(termios, "ONLCR"):
+        attrs[1] &= ~termios.ONLCR
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
+def tty_attr_summary(attrs):
+    if attrs is None:
+        return "<none>"
+    return (
+        f"iflag=0x{attrs[0]:x} oflag=0x{attrs[1]:x} "
+        f"cflag=0x{attrs[2]:x} lflag=0x{attrs[3]:x} "
+        f"ispeed={attrs[4]} ospeed={attrs[5]}"
+    )
 
 
 def resize_pty_then_send(rows, cols, data):
@@ -901,8 +954,9 @@ def artifact_cache_path(env, artifact):
     return Path(env["XDG_CACHE_HOME"]) / "sessh" / "bin" / sessh_version() / sha256(artifact) / "sesshmux"
 
 
-def seed_remote_artifact_cache(env):
-    artifact = remote_path_artifact()
+def seed_remote_artifact_cache(env, artifact=None):
+    if artifact is None:
+        artifact = remote_path_artifact()
     cached = artifact_cache_path(env, artifact)
     cached.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(artifact, cached)
@@ -1962,6 +2016,173 @@ def test_ssh_passthrough_tty_copies_local_tty_modes(tmp):
 
     if result.returncode != 0:
         raise AssertionError(result)
+
+
+def test_ssh_passthrough_tty_copies_local_output_modes(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    command = (
+        "tokens=$(stty -a | tr ' ;' '\\n\\n'); "
+        "printf '%s\\n' \"$tokens\" | grep -x -- -opost >/dev/null && "
+        "printf 'REMOTE_OUTPUT_MODES\\r\\n' || { stty -a; exit 7; }"
+    )
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "-tt", "test-host", command],
+        env,
+        ((b"REMOTE_OUTPUT_MODES", None),),
+        timeout=10.0,
+        child_tty_setup=set_passthrough_output_mode_probe,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+
+
+def test_ssh_passthrough_tty_sets_ssh_tty(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    command = "test -n \"${SSH_TTY:-}\" && test -c \"$SSH_TTY\" && printf 'SSH_TTY_OK\\r\\n'"
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "-tt", "test-host", command],
+        env,
+        ((b"SSH_TTY_OK", None),),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+
+
+def test_ssh_passthrough_interactive_shell_keeps_prompt_aligned(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_shell = tmp / "fake-remote-shell"
+    write_fake_ssh(fake_bin / "ssh")
+    fake_shell.write_text(
+        "#!/bin/sh\n"
+        "printf 'REMOTE_PROMPT\\n%% '\n"
+        "while IFS= read -r line; do\n"
+        "  case \"$line\" in\n"
+        "    'echo hello') printf 'hello\\nREMOTE_PROMPT\\n%% ' ;;\n"
+        "    exit) exit 0 ;;\n"
+        "    *) printf 'UNKNOWN:%s\\nREMOTE_PROMPT\\n%% ' \"$line\" ;;\n"
+        "  esac\n"
+        "done\n"
+    )
+    fake_shell.chmod(fake_shell.stat().st_mode | stat.S_IXUSR)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_SHELL"] = str(fake_shell)
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "test-host"],
+        env,
+        (
+            (b"REMOTE_PROMPT\r\n% ", b"echo hello\n"),
+            (b"hello\r\nREMOTE_PROMPT\r\n% ", b"exit\n"),
+        ),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "REMOTE_PROMPT\n% " in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_passthrough_release_artifact_restores_local_tty_on_exit(tmp):
+    artifact = local_artifact()
+    if not artifact.exists():
+        print(f"SKIP release artifact tty restore test; missing {artifact}", file=sys.stderr)
+        return
+
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_shell = tmp / "fake-remote-shell"
+    write_fake_ssh(fake_bin / "ssh")
+    fake_shell.write_text(
+        "#!/bin/sh\n"
+        "printf 'REMOTE_READY\\n%% '\n"
+        "while IFS= read -r line; do\n"
+        "  case \"$line\" in\n"
+        "    exit) exit 0 ;;\n"
+        "    *) printf 'REMOTE_READY\\n%% ' ;;\n"
+        "  esac\n"
+        "done\n"
+    )
+    fake_shell.chmod(fake_shell.stat().st_mode | stat.S_IXUSR)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_SHELL"] = str(fake_shell)
+    seed_remote_artifact_cache(env, artifact)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "test-host"],
+        env,
+        ((b"REMOTE_READY\r\n% ", b"exit\n"),),
+        timeout=10.0,
+        binary=artifact,
+        capture_tty_attrs=True,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if result.tty_attrs_before != result.tty_attrs_after:
+        raise AssertionError(
+            "passthrough release artifact did not restore local tty modes\n"
+            f"before: {tty_attr_summary(result.tty_attrs_before)}\n"
+            f"after:  {tty_attr_summary(result.tty_attrs_after)}\n"
+            f"output: {result.stdout!r}"
+        )
+
+
+def test_ssh_non_passthrough_release_artifact_restores_local_tty_on_exit(tmp):
+    artifact = local_artifact()
+    if not artifact.exists():
+        print(f"SKIP release artifact tty restore test; missing {artifact}", file=sys.stderr)
+        return
+
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env, artifact)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "-t", "test-host", "printf 'NON_PASSTHROUGH_READY\\n'; exit 0"],
+        env,
+        ((b"NON_PASSTHROUGH_READY", None),),
+        timeout=10.0,
+        binary=artifact,
+        capture_tty_attrs=True,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if result.tty_attrs_before != result.tty_attrs_after:
+        raise AssertionError(
+            "non-passthrough release artifact did not restore local tty modes\n"
+            f"before: {tty_attr_summary(result.tty_attrs_before)}\n"
+            f"after:  {tty_attr_summary(result.tty_attrs_after)}\n"
+            f"output: {result.stdout!r}"
+        )
 
 
 def test_ssh_remote_command_stream_reconnects_after_transport_loss(tmp):
@@ -4009,6 +4230,26 @@ def main(argv=None):
         (
             "ssh passthrough tty copies local tty modes",
             test_ssh_passthrough_tty_copies_local_tty_modes,
+        ),
+        (
+            "ssh passthrough tty copies local output modes",
+            test_ssh_passthrough_tty_copies_local_output_modes,
+        ),
+        (
+            "ssh passthrough tty sets SSH_TTY",
+            test_ssh_passthrough_tty_sets_ssh_tty,
+        ),
+        (
+            "ssh passthrough interactive shell keeps prompt aligned",
+            test_ssh_passthrough_interactive_shell_keeps_prompt_aligned,
+        ),
+        (
+            "ssh passthrough release artifact restores local tty on exit",
+            test_ssh_passthrough_release_artifact_restores_local_tty_on_exit,
+        ),
+        (
+            "ssh non-passthrough release artifact restores local tty on exit",
+            test_ssh_non_passthrough_release_artifact_restores_local_tty_on_exit,
         ),
         (
             "ssh forced tty remote command allocates pty with stdin null",

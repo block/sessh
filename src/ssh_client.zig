@@ -3173,9 +3173,14 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
         .forward_resize = stream_uses_tty,
         .title_fallback = parsed_ssh_args.host,
     }) catch |err| {
+        if (input_mode_guard) |*guard| guard.restore();
         try starter.exitAfterInitialFailure(err);
         unreachable;
     };
+    // process_exit.request calls std.process.exit in release artifacts, which
+    // does not run Zig defers. Restore the user's terminal before requesting
+    // the ssh-compatible exit status.
+    if (input_mode_guard) |*guard| guard.restore();
     return process_exit.request(exit_status);
 }
 
