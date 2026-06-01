@@ -12,6 +12,7 @@ const runtime_refresher = @import("runtime_refresher.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
 const terminal = @import("terminal.zig");
+const tty_settings = @import("tty_settings.zig");
 const vt = @import("vt.zig");
 
 const max_sessions = 64;
@@ -699,6 +700,7 @@ const SessionCreateRequest = struct {
     session_alias: []u8,
     command_argv: [][]u8,
     shell_command: ?[]u8,
+    tty_settings: ?tty_settings.Settings,
 
     fn deinit(self: *SessionCreateRequest) void {
         app_allocator.allocator().free(self.session_alias);
@@ -706,6 +708,7 @@ const SessionCreateRequest = struct {
         for (self.command_argv) |arg| app_allocator.allocator().free(arg);
         app_allocator.allocator().free(self.command_argv);
         if (self.shell_command) |shell_command| app_allocator.allocator().free(shell_command);
+        if (self.tty_settings) |*settings| settings.deinit(app_allocator.allocator());
         self.environment.deinit();
         self.* = undefined;
     }
@@ -1527,6 +1530,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.session_guid,
                     request.command_argv,
                     request.shell_command,
+                    request.tty_settings,
                 ) catch |err| {
                     session_registry.removeAlias(app_allocator.allocator(), alias) catch {};
                     return err;
@@ -2727,12 +2731,17 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
     var environment = SessionEnvironment{};
     errdefer environment.deinit();
     var query_default_colors = vt.DefaultColors{};
+    var request_tty_settings: ?tty_settings.Settings = null;
+    errdefer if (request_tty_settings) |*settings| settings.deinit(app_allocator.allocator());
 
     for (message.environment.items) |entry| {
         try applySessionEnvironmentEntry(&environment, entry);
     }
     if (message.query_default_colors) |colors| {
         query_default_colors = try readDefaultColors(colors);
+    }
+    if (message.tty_settings) |settings| {
+        request_tty_settings = try readTtySettings(settings);
     }
     if (message.legacy_command_argv.items.len > 0 and message.command != null) return error.InvalidCommandArgv;
 
@@ -2767,6 +2776,27 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
             try app_allocator.allocator().dupe(u8, command)
         else
             null,
+        .tty_settings = request_tty_settings,
+    };
+}
+
+fn readTtySettings(message: pb.TtySettings) !tty_settings.Settings {
+    var modes = try app_allocator.allocator().alloc(tty_settings.Mode, message.tty_mode.items.len);
+    errdefer app_allocator.allocator().free(modes);
+    for (message.tty_mode.items, 0..) |mode, i| {
+        if (mode.opcode > std.math.maxInt(u8)) return error.InvalidTtySettings;
+        modes[i] = .{
+            .opcode = @intCast(mode.opcode),
+            .value = mode.value,
+        };
+    }
+
+    return .{
+        .term = if (message.term) |term|
+            try app_allocator.allocator().dupe(u8, term)
+        else
+            null,
+        .modes = modes,
     };
 }
 
@@ -2869,6 +2899,7 @@ fn createSession(
     session_guid: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
+    settings: ?tty_settings.Settings,
 ) !usize {
     if (session_agent.fixed_session_id != null and session_agent.started_session) return error.TooManySessions;
 
@@ -2897,6 +2928,7 @@ fn createSession(
             .shell_command = shell_command,
             .session_guid = session_guid_z,
             .add_sessh_path_to_env = true,
+            .tty_settings = settings,
         });
 
         session.* = Session{

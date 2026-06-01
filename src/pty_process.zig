@@ -3,6 +3,7 @@ const c = std.c;
 const posix = std.posix;
 
 const terminal = @import("terminal.zig");
+const tty_settings = @import("tty_settings.zig");
 
 extern "c" fn forkpty(amaster: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp: ?*c.winsize) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -15,6 +16,7 @@ pub const SpawnOptions = struct {
     shell_command: ?[]const u8 = null,
     session_guid: ?[]const u8 = null,
     add_sessh_path_to_env: bool = false,
+    tty_settings: ?tty_settings.Settings = null,
 };
 
 pub const Child = struct {
@@ -90,6 +92,11 @@ pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
     defer if (sessh_path_z) |path| allocator.free(path);
     const path_z: ?[:0]u8 = if (sessh_path_z) |sessh_path| try pathWithSesshPathForEnvironment(allocator, sessh_path) else null;
     defer if (path_z) |path| allocator.free(path);
+    const term_z: ?[:0]u8 = if (options.tty_settings) |settings|
+        if (settings.term) |term| try allocator.dupeZ(u8, term) else null
+    else
+        null;
+    defer if (term_z) |term| allocator.free(term);
 
     var master: c_int = -1;
     var size = c.winsize{ .row = options.rows, .col = options.cols, .xpixel = 0, .ypixel = 0 };
@@ -97,11 +104,18 @@ pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
     if (pid < 0) return error.ForkPtyFailed;
     if (pid == 0) {
         terminal.setSigpipe(posix.SIG.DFL);
-        _ = setenv("TERM", "xterm-256color", 1);
+        if (term_z) |term| {
+            _ = setenv("TERM", term.ptr, 1);
+        } else {
+            // No TERM means this PTY is backed by sessh's terminal emulator,
+            // not the caller's outer terminal.
+            _ = setenv("TERM", "xterm-256color", 1);
+        }
         _ = setenv("SHELL", shell_z.ptr, 1);
         if (session_guid_z) |guid| _ = setenv("SESSH_GUID", guid.ptr, 1);
         if (sessh_path_z) |path| _ = setenv("SESSH_PATH", path.ptr, 1);
         if (path_z) |path| _ = setenv("PATH", path.ptr, 1);
+        if (options.tty_settings) |settings| tty_settings.applyToFd(settings, 0) catch {};
         if (prepared_command) |command| {
             posix.execvpeZ(command.argv[0].?, command.argv.ptr, @ptrCast(c.environ)) catch {};
         } else {
@@ -337,4 +351,43 @@ test "drain master reads available PTY output while child is still alive" {
 
     try std.testing.expectEqualStrings("PTY_MASTER_DRAIN", context.bytes.items);
     try std.testing.expect(!result.eof);
+}
+
+fn readChildPtyOutput(allocator: std.mem.Allocator, child: *Child) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    while (true) {
+        var buf: [4096]u8 = undefined;
+        switch (try readMaster(child.master_fd, &buf)) {
+            .bytes => |bytes| try output.appendSlice(allocator, bytes),
+            .would_block => unreachable,
+            .eof => return output.toOwnedSlice(allocator),
+        }
+    }
+}
+
+test "spawn applies portable tty settings before exec" {
+    const modes = [_]tty_settings.Mode{
+        .{ .opcode = 53, .value = 0 },
+    };
+    const settings = tty_settings.Settings{
+        .term = "ansi",
+        .modes = &modes,
+    };
+    var child = try spawn(std.testing.allocator, .{
+        .rows = 24,
+        .cols = 80,
+        .shell = "/bin/sh",
+        .shell_command = "printf 'TERM=%s\\n' \"$TERM\"; stty -a",
+        .tty_settings = settings,
+    });
+    defer child.terminate();
+
+    const output = try readChildPtyOutput(std.testing.allocator, &child);
+    defer std.testing.allocator.free(output);
+    const term = child.wait();
+
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
+    try std.testing.expect(std.mem.indexOf(u8, output, "TERM=ansi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "-echo") != null);
 }

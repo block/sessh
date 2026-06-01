@@ -596,11 +596,13 @@ def read_pty_until(fd, output, needle, timeout=10.0):
     return output
 
 
-def run_sesshmux_in_pty(args, env, steps, timeout=10.0):
+def run_sesshmux_in_pty(args, env, steps, timeout=10.0, child_tty_setup=None):
     argv = [str(MUX_BIN), *args]
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(ROOT)
+        if child_tty_setup is not None:
+            child_tty_setup(0)
         os.execvpe(argv[0], argv, env)
 
     output = b""
@@ -647,6 +649,15 @@ def run_sesshmux_in_pty(args, env, steps, timeout=10.0):
             except ChildProcessError:
                 pass
         os.close(fd)
+
+
+def set_passthrough_tty_mode_probe(fd):
+    # This runs in the child side of pty.fork before sessh starts, so sessh
+    # should capture these modes and apply them to the remote passthrough PTY.
+    attrs = termios.tcgetattr(fd)
+    attrs[0] &= ~termios.ICRNL
+    attrs[3] &= ~(termios.ECHO | termios.ICANON)
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
 def wait_status_to_returncode(status):
@@ -1730,6 +1741,78 @@ def test_ssh_passthrough_command_in_tty_uses_single_stream_guid(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_tty_uses_emulated_term_not_outer_term(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["TERM"] = "ansi"
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "-tt", "test-host", "printf '%s\\n' \"$TERM\""],
+        env,
+        ((b"xterm-256color", None),),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "ansi" in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_passthrough_tty_copies_outer_term(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["TERM"] = "ansi"
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "-tt", "test-host", "printf '%s\\n' \"$TERM\""],
+        env,
+        ((b"ansi", None),),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+
+
+def test_ssh_passthrough_tty_copies_local_tty_modes(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    command = (
+        "tokens=$(stty -a | tr ' ;' '\\n\\n'); "
+        "printf '%s\\n' \"$tokens\" | grep -x -- -echo >/dev/null && "
+        "printf '%s\\n' \"$tokens\" | grep -x -- -icanon >/dev/null && "
+        "printf '%s\\n' \"$tokens\" | grep -x -- -icrnl >/dev/null && "
+        "printf 'REMOTE_TTY_MODES\\r\\n' || { stty -a; exit 7; }"
+    )
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "-tt", "test-host", command],
+        env,
+        ((b"REMOTE_TTY_MODES", None),),
+        timeout=10.0,
+        child_tty_setup=set_passthrough_tty_mode_probe,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+
+
 def test_ssh_remote_command_stream_reconnects_after_transport_loss(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1753,7 +1836,11 @@ def test_ssh_remote_command_stream_reconnects_after_transport_loss(tmp):
         raise AssertionError(result)
     if result.stdout != "STREAM_BEFORE\nSTREAM_AFTER\n":
         raise AssertionError(result)
-    if result.stderr:
+    if "sessh: disconnected: Retry connecting 10sec" not in result.stderr:
+        raise AssertionError(result)
+    if "sessh: disconnected: Reconnecting..." not in result.stderr:
+        raise AssertionError(result)
+    if "\x1b[K" in result.stderr:
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if "kill_batch_triggered=1" not in log_text:
@@ -3731,6 +3818,18 @@ def main(argv=None):
         (
             "ssh passthrough tty escape disconnects",
             test_ssh_passthrough_tty_escape_disconnects,
+        ),
+        (
+            "ssh tty uses emulated TERM not outer TERM",
+            test_ssh_tty_uses_emulated_term_not_outer_term,
+        ),
+        (
+            "ssh passthrough tty copies outer TERM",
+            test_ssh_passthrough_tty_copies_outer_term,
+        ),
+        (
+            "ssh passthrough tty copies local tty modes",
+            test_ssh_passthrough_tty_copies_local_tty_modes,
         ),
         (
             "ssh forced tty remote command allocates pty with stdin null",

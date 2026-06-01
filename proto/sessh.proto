@@ -120,6 +120,31 @@ message TerminalSize {
 
 // Embedded in SessionCreate.
 //
+// Portable PTY settings captured from the client-side tty before sessh puts it
+// into raw mode. This follows SSH's pty-req model: do not send a native
+// termios struct, because those layouts and flag values are OS-specific.
+message TtySettings {
+  // TERM value from the client environment. This is only present when the
+  // remote PTY exposes the client's real terminal, such as passthrough mode.
+  // Normal sessh sessions leave this absent so the remote advertises sessh's
+  // terminal-emulator TERM instead. Empty is meaningful when the client had
+  // TERM set to an empty string.
+  optional string term = 1;
+  // SSH/RFC 4254 terminal-mode opcode/value pairs. Unknown opcodes are ignored
+  // by the receiver, matching SSH server behavior.
+  repeated TtyMode tty_mode = 2;
+}
+
+// Embedded in TtySettings.
+message TtyMode {
+  // SSH terminal-mode opcode. Opcodes 1-159 have uint32 values; 128/129 are
+  // input/output baud rates.
+  uint32 opcode = 1;
+  uint32 value = 2;
+}
+
+// Embedded in SessionCreate.
+//
 // Environment value used when creating a new session.
 message EnvironmentEntry {
   string name = 1;
@@ -185,6 +210,8 @@ message SessionCreate {
     ExecCommand exec_command = 8;
     ShellCommand shell_command = 9;
   }
+  // Portable local tty settings to apply to the newly created remote PTY.
+  TtySettings tty_settings = 10;
 }
 
 // Framed payload, client -> session agent.

@@ -13,6 +13,7 @@ const reconnect = @import("reconnect.zig");
 const session_registry = @import("session_registry.zig");
 const stream_agent = @import("stream_agent.zig");
 const terminal = @import("terminal.zig");
+const tty_settings = @import("tty_settings.zig");
 const tty_transcript = @import("tty_transcript.zig");
 const pb = protocol.pb;
 
@@ -3092,6 +3093,21 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
     defer if (shell_command) |command| allocator.free(command);
     const command_arg = try encodeStreamCommandArg(allocator, shell_command);
     defer allocator.free(command_arg);
+    // Passthrough PTY mode exposes the user's real terminal directly, so its
+    // TERM belongs with the portable tty modes. Non-passthrough sessions omit
+    // TERM and let the remote side advertise sessh's terminal emulator.
+    var local_tty_settings = if (stream_uses_tty)
+        tty_settings.capture(allocator, 0, .{ .include_term = true }) catch |err| blk: {
+            client_log.debug("event=stream_tty_settings_capture_failed error={t}", .{err});
+            break :blk null;
+        }
+    else
+        null;
+    defer if (local_tty_settings) |*settings| settings.deinit(allocator);
+    const term_arg = try encodeStreamTermArg(allocator, if (local_tty_settings) |settings| settings.term else null);
+    defer allocator.free(term_arg);
+    const tty_modes_arg = try encodeStreamTtyModesArg(allocator, if (local_tty_settings) |settings| settings.modes else &.{});
+    defer allocator.free(tty_modes_arg);
 
     var artifacts = try loadArtifactSet(allocator);
     defer artifacts.deinit();
@@ -3110,6 +3126,8 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
         rows_arg,
         cols_arg,
         command_arg,
+        term_arg,
+        tty_modes_arg,
     };
 
     var parsed_transport_args = parsed_ssh_args;
@@ -3163,8 +3181,25 @@ fn streamReconnectStatusMode(stdout_is_tty: bool) stream_agent.StreamReconnectSt
 
 fn encodeStreamCommandArg(allocator: std.mem.Allocator, shell_command: ?[]const u8) ![]u8 {
     const command = shell_command orelse return allocator.dupe(u8, "-");
-    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(command.len));
-    _ = std.base64.standard.Encoder.encode(encoded, command);
+    return encodeBase64Arg(allocator, command);
+}
+
+fn encodeStreamTermArg(allocator: std.mem.Allocator, term: ?[]const u8) ![]u8 {
+    const value = term orelse return allocator.dupe(u8, "-");
+    if (value.len == 0) return allocator.dupe(u8, ".");
+    return encodeBase64Arg(allocator, value);
+}
+
+fn encodeStreamTtyModesArg(allocator: std.mem.Allocator, modes: []const tty_settings.Mode) ![]u8 {
+    if (modes.len == 0) return allocator.dupe(u8, "-");
+    const mode_bytes = try tty_settings.encodeModes(allocator, modes);
+    defer allocator.free(mode_bytes);
+    return encodeBase64Arg(allocator, mode_bytes);
+}
+
+fn encodeBase64Arg(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
     return encoded;
 }
 

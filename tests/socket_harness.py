@@ -387,6 +387,7 @@ def pack_session_create(
     command_argv=None,
     legacy_command_argv=None,
     shell_command=None,
+    tty_settings=None,
 ):
     pb = sessh_pb()
     message = pb.SessionCreate(scrollback_row_limit=scrollback)
@@ -405,6 +406,13 @@ def pack_session_create(
         message.legacy_command_argv.extend(str(arg) for arg in legacy_command_argv)
     if shell_command is not None:
         message.shell_command.command = str(shell_command)
+    if tty_settings is not None:
+        if "term" in tty_settings:
+            message.tty_settings.term = tty_settings["term"]
+        for opcode, value in tty_settings.get("modes", ()):
+            mode = message.tty_settings.tty_mode.add()
+            mode.opcode = opcode
+            mode.value = value
     message.query_default_colors.foreground_color = fg
     message.query_default_colors.background_color = bg
     return message.SerializeToString()
@@ -519,6 +527,7 @@ def create_and_attach_session(
     command_argv=None,
     legacy_command_argv=None,
     shell_command=None,
+    tty_settings=None,
     client_guid=None,
 ):
     send_frame(
@@ -533,6 +542,7 @@ def create_and_attach_session(
             command_argv=command_argv,
             legacy_command_argv=legacy_command_argv,
             shell_command=shell_command,
+            tty_settings=tty_settings,
         ),
     )
     assert_session_created(recv_until_message(conn, SESSION_CREATED))
@@ -1130,6 +1140,44 @@ def run_session_create_shell_command_test(_base_env):
                 if b"UNEXPECTED_SHELL_ARG" in draw_bytes:
                     raise AssertionError(draws)
                 send_frame(conn, INPUT, pack_bytes(b"exit\n"))
+                recv_until_message(conn, SESSION_ENDED)
+            finally:
+                conn.close()
+        finally:
+            cleanup_runtime(env)
+
+
+def run_session_create_tty_settings_test(_base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-tty-settings-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        cleanup_runtime(env)
+        try:
+            start_session_agent(env)
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            try:
+                conn.connect(str(socket_path(env)))
+                send_hello(conn)
+                send_resize(conn)
+                create_and_attach_session(
+                    conn,
+                    "/bin/sh",
+                    shell_command="printf 'TERM=%s\\n' \"$TERM\"; stty -a; exit",
+                    tty_settings={
+                        "term": "ansi",
+                        # RFC/OpenSSH opcode 53 is ECHO. Turning it off is a
+                        # visible way to verify that SessionCreate settings
+                        # reached the child PTY before exec.
+                        "modes": ((53, 0),),
+                    },
+                )
+                message_type, _payload = recv_frame(conn)
+                if message_type != SESSION_ATTACHED:
+                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                _matched, draws = recv_draw_until(conn, b"-echo")
+                draw_bytes = b"".join(draw["draw_bytes"] for draw in draws)
+                if b"TERM=ansi" not in draw_bytes or b"-echo" not in draw_bytes:
+                    raise AssertionError(draws)
                 recv_until_message(conn, SESSION_ENDED)
             finally:
                 conn.close()
@@ -3856,6 +3904,7 @@ def main():
             run_session_create_command_argv_test(env)
             run_session_create_legacy_command_argv_test(env)
             run_session_create_shell_command_test(env)
+            run_session_create_tty_settings_test(env)
             run_session_agent_crash_client_error_test(env)
             run_session_agent_registry_test(env)
             run_broker_starts_session_agent_test(env)

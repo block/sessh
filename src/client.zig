@@ -15,6 +15,7 @@ const reconnect_title = @import("reconnect_title.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
 const terminal = @import("terminal.zig");
+const tty_settings = @import("tty_settings.zig");
 const tty_transcript = @import("tty_transcript.zig");
 
 const pb = protocol.pb;
@@ -4529,6 +4530,25 @@ fn sendSessionCreate(
     };
     defer message.environment.deinit(app_allocator.allocator());
     defer message.legacy_command_argv.deinit(app_allocator.allocator());
+    // The normal sessh path runs a terminal emulator on the remote side. Copy
+    // portable line-discipline modes, but keep TERM tied to that emulator
+    // contract instead of leaking the outer terminal's TERM.
+    var captured_tty_settings = tty_settings.capture(app_allocator.allocator(), 0, .{ .include_term = false }) catch |err| blk: {
+        client_log.debug("event=tty_settings_capture_failed error={t}", .{err});
+        break :blk null;
+    };
+    defer if (captured_tty_settings) |*settings| settings.deinit(app_allocator.allocator());
+    var protocol_tty_settings = pb.TtySettings{};
+    defer protocol_tty_settings.tty_mode.deinit(app_allocator.allocator());
+    if (captured_tty_settings) |settings| {
+        for (settings.modes) |mode| {
+            try protocol_tty_settings.tty_mode.append(app_allocator.allocator(), .{
+                .opcode = mode.opcode,
+                .value = mode.value,
+            });
+        }
+        message.tty_settings = protocol_tty_settings;
+    }
     var exec_command = pb.ExecCommand{};
     defer exec_command.argv.deinit(app_allocator.allocator());
     if (shell_command) |command| {

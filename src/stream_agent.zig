@@ -12,6 +12,7 @@ const reconnect_title = @import("reconnect_title.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
 const terminal = @import("terminal.zig");
+const tty_settings = @import("tty_settings.zig");
 const pb = protocol.pb;
 
 const max_buffered_bytes = 1024 * 1024;
@@ -733,9 +734,11 @@ const StreamAgentConfig = struct {
     rows: u16,
     cols: u16,
     shell_command: ?[]u8,
+    tty_settings: ?tty_settings.Settings,
 
     fn deinit(self: *StreamAgentConfig, allocator: std.mem.Allocator) void {
         if (self.shell_command) |command| allocator.free(command);
+        if (self.tty_settings) |*settings| settings.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -866,12 +869,12 @@ pub fn runBroker(allocator: std.mem.Allocator, exe: []const u8, args: []const []
 
 pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     _ = exe;
-    if (args.len != 6) {
-        try io.writeAll(2, "sessh: :internal-stream-agent: requires GUID SOCKET MODE ROWS COLS COMMAND\n");
+    if (args.len != 8) {
+        try io.writeAll(2, "sessh: :internal-stream-agent: requires GUID SOCKET MODE ROWS COLS COMMAND TERM TTYMODES\n");
         return error.InvalidStreamArgs;
     }
     const socket_path = args[1];
-    var config = try parseStreamAgentConfig(allocator, &.{ args[0], args[2], args[3], args[4], args[5] });
+    var config = try parseStreamAgentConfig(allocator, &.{ args[0], args[2], args[3], args[4], args[5], args[6], args[7] });
     defer config.deinit(allocator);
 
     var socket_paths = try session_registry.runtimeAgentSocketPathsForGuid(allocator, config.guid);
@@ -1501,7 +1504,7 @@ fn connectOrStartAgent(
 ) !c.fd_t {
     if (socket_transport.connectSocket(socket_path)) |fd| return fd else |_| {}
 
-    if (agent_args.len != 5) return error.InvalidStreamArgs;
+    if (agent_args.len != 7) return error.InvalidStreamArgs;
     const argv = [_][]const u8{
         exe,
         ":internal-stream-agent:",
@@ -1511,6 +1514,8 @@ fn connectOrStartAgent(
         agent_args[2],
         agent_args[3],
         agent_args[4],
+        agent_args[5],
+        agent_args[6],
     };
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
@@ -1531,8 +1536,8 @@ fn connectOrStartAgent(
 }
 
 fn parseStreamAgentConfig(allocator: std.mem.Allocator, args: []const []const u8) !StreamAgentConfig {
-    if (args.len != 5) {
-        try io.writeAll(2, "sessh: :internal-stream-broker: requires GUID MODE ROWS COLS COMMAND\n");
+    if (args.len != 7) {
+        try io.writeAll(2, "sessh: :internal-stream-broker: requires GUID MODE ROWS COLS COMMAND TERM TTYMODES\n");
         return error.InvalidStreamArgs;
     }
     if (!session_registry.isValidReconnectGuid(args[0])) return error.InvalidStreamGuid;
@@ -1546,12 +1551,15 @@ fn parseStreamAgentConfig(allocator: std.mem.Allocator, args: []const []const u8
     const cols = try parseDimension(args[3]);
     const shell_command = try decodeCommandArg(allocator, args[4]);
     errdefer if (shell_command) |command| allocator.free(command);
+    const parsed_tty_settings = try decodeTtySettingsArgs(allocator, args[5], args[6]);
+    errdefer if (parsed_tty_settings) |*settings| settings.deinit(allocator);
     return .{
         .guid = args[0],
         .mode = mode,
         .rows = rows,
         .cols = cols,
         .shell_command = shell_command,
+        .tty_settings = parsed_tty_settings,
     };
 }
 
@@ -1569,6 +1577,27 @@ fn decodeCommandArg(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
     return out;
 }
 
+fn decodeTtySettingsArgs(allocator: std.mem.Allocator, term_arg: []const u8, modes_arg: []const u8) !?tty_settings.Settings {
+    const term = try decodeTermArg(allocator, term_arg);
+    errdefer if (term) |value| allocator.free(value);
+
+    var modes: []tty_settings.Mode = &.{};
+    if (!std.mem.eql(u8, modes_arg, "-")) {
+        const mode_bytes = try decodeCommandArg(allocator, modes_arg) orelse return error.InvalidStreamArgs;
+        defer allocator.free(mode_bytes);
+        modes = try tty_settings.decodeModes(allocator, mode_bytes);
+    }
+    errdefer allocator.free(modes);
+
+    if (term == null and modes.len == 0) return null;
+    return .{ .term = term, .modes = modes };
+}
+
+fn decodeTermArg(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
+    if (std.mem.eql(u8, value, ".")) return try allocator.dupe(u8, "");
+    return decodeCommandArg(allocator, value);
+}
+
 fn startStreamEndpoint(allocator: std.mem.Allocator, config: StreamAgentConfig) !StreamEndpoint {
     return switch (config.mode) {
         .pty => .{ .pty = try pty_process.spawn(allocator, .{
@@ -1576,6 +1605,7 @@ fn startStreamEndpoint(allocator: std.mem.Allocator, config: StreamAgentConfig) 
             .cols = config.cols,
             .shell_command = config.shell_command,
             .session_guid = config.guid,
+            .tty_settings = config.tty_settings,
         }) },
         .pipe => .{ .pipe = try PipeEndpoint.spawn(allocator, config.shell_command) },
     };

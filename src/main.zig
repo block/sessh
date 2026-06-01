@@ -193,6 +193,7 @@ test {
     _ = @import("ssh_client.zig");
     _ = @import("stream_agent.zig");
     _ = @import("terminal.zig");
+    _ = @import("tty_settings.zig");
     _ = @import("tty_transcript.zig");
     _ = @import("vt.zig");
 }
