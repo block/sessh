@@ -20,10 +20,12 @@ from test_env import isolated_env
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TMUX = shutil.which("tmux")
 PLATFORMS = (
     ("linux", "aarch64", "linux/arm64"),
     ("linux", "x86_64", "linux/amd64"),
 )
+_tmux_counter = 0
 
 
 CONTAINERFILE = """\
@@ -152,6 +154,130 @@ def resize_pty_then_send(rows, cols, data):
     return action
 
 
+def next_tmux_label():
+    global _tmux_counter
+    _tmux_counter += 1
+    return f"sessh-podman-{os.getpid()}-{_tmux_counter}"
+
+
+def tmux_run(label, args, *, env=None, check=True):
+    result = subprocess.run(
+        [TMUX, "-L", label, *args],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        raise AssertionError(f"tmux {args} failed\nstdout={result.stdout}\nstderr={result.stderr}")
+    return result
+
+
+def tmux_capture(label, session):
+    return tmux_run(label, ["capture-pane", "-p", "-t", session]).stdout
+
+
+def wait_tmux_capture(label, session, needle, timeout=30.0):
+    end = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < end:
+        last = tmux_capture(label, session)
+        if needle in last:
+            return last
+        time.sleep(0.05)
+    raise AssertionError(f"did not see {needle!r}; pane contained:\n{last}")
+
+
+def tmux_resize_then_send(rows, cols, data):
+    def action(label, session):
+        # Resizing the tmux window is the local-terminal-size event that ssh
+        # observes for SIGWINCH/window-change propagation. Resizing only the
+        # pane can leave the child process reporting the previous size.
+        tmux_run(label, ["resize-window", "-t", session, "-x", str(cols), "-y", str(rows)])
+        pane_size = tmux_run(label, ["display-message", "-p", "-t", session, "#{pane_height} #{pane_width}"]).stdout.strip()
+        if pane_size != f"{rows} {cols}":
+            raise AssertionError(f"tmux pane size was {pane_size!r}, expected {rows} {cols}")
+        time.sleep(0.3)
+        tmux_send_bytes(label, session, data)
+
+    return action
+
+
+def tmux_send_bytes(label, session, data):
+    if data == b"\n" or data == "\n":
+        tmux_run(label, ["send-keys", "-t", session, "Enter"])
+        return
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", "replace")
+    if data:
+        tmux_run(label, ["send-keys", "-t", session, "-l", data])
+
+
+def write_tmux_exit_runner(marker):
+    fd, path = tempfile.mkstemp(prefix="sessh-podman-tmux-runner-", dir="/tmp", text=True)
+    with os.fdopen(fd, "w") as script:
+        script.write(
+            "#!/bin/sh\n"
+            "\"$@\"\n"
+            "status=$?\n"
+            f"printf '\\n{marker}%s\\n' \"$status\"\n"
+            "while :; do sleep 3600; done\n"
+        )
+    os.chmod(path, 0o700)
+    return path
+
+
+def normalize_tmux_visible_output(value):
+    value = normalize_output(value)
+    lines = [line.rstrip() for line in value.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def run_in_tmux_visible(cmd, env, steps=(), *, rows=24, cols=100, timeout=30.0):
+    if TMUX is None:
+        skip("missing tmux")
+    label = next_tmux_label()
+    session = "visible"
+    marker = f"__SESSH_TMUX_EXIT_{os.getpid()}_{label}__:"
+    runner = write_tmux_exit_runner(marker)
+    try:
+        tmux_run(
+            label,
+            ["new-session", "-d", "-x", str(cols), "-y", str(rows), "-s", session, "--", runner, *cmd],
+            env=env,
+        )
+        for needle, action in steps:
+            if isinstance(needle, bytes):
+                needle = needle.decode("utf-8", "replace")
+            wait_tmux_capture(label, session, needle, timeout)
+            if callable(action):
+                action(label, session)
+            elif action:
+                tmux_send_bytes(label, session, action)
+
+        captured = wait_tmux_capture(label, session, marker, timeout)
+        match = re.search(re.escape(marker) + r"([0-9]+)", captured)
+        if not match:
+            raise AssertionError(f"exit marker was not parseable; pane contained:\n{captured}")
+        return subprocess.CompletedProcess(
+            cmd,
+            int(match.group(1)),
+            normalize_tmux_visible_output(captured[: match.start()]),
+            "",
+        )
+    finally:
+        tmux_run(label, ["kill-server"], check=False)
+        try:
+            os.unlink(runner)
+        except FileNotFoundError:
+            pass
+
+
 def run_in_pty(cmd, env, steps=(), *, rows=24, cols=100, timeout=30.0):
     pid, fd = pty.fork()
     if pid == 0:
@@ -272,26 +398,6 @@ def normalize_output(value):
     return value
 
 
-def strip_terminal_controls(value):
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", "replace")
-    # The normal sessh TTY path owns the outer terminal and may emit local
-    # probes, clears, and title updates around the remote program's bytes.
-    # Oracle checks for that path compare the visible command output, while
-    # passthrough checks still compare the exact stream.
-    value = re.sub(r"\x1b[\]PX_^].*?(?:\x07|\x1b\\)", "", value, flags=re.S)
-    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
-    value = re.sub(r"\x1b[ -/]*[@-~]", "", value)
-    return value
-
-
-def visible_terminal_output(value):
-    value = normalize_output(strip_terminal_controls(value))
-    value = value.replace("\r", "\n")
-    lines = [line.strip() for line in value.splitlines() if line.strip()]
-    return "\n".join(lines) + ("\n" if lines else "")
-
-
 def sessh_oracle_cmd(prefix, config, host_alias, ssh_options, remote_args, sessh_options=()):
     return [
         str(prefix / "bin" / "sessh"),
@@ -327,15 +433,14 @@ def assert_observable_matches(name, ssh_result, sessh_result, *, compare_stderr=
         )
 
 
-def assert_visible_terminal_matches(name, ssh_result, sessh_result):
-    ssh_observed = (ssh_result.returncode, visible_terminal_output(ssh_result.stdout))
-    sessh_observed = (sessh_result.returncode, visible_terminal_output(sessh_result.stdout))
+def assert_tmux_visible_matches(name, ssh_result, sessh_result):
+    ssh_observed = (ssh_result.returncode, normalize_tmux_visible_output(ssh_result.stdout))
+    sessh_observed = (sessh_result.returncode, normalize_tmux_visible_output(sessh_result.stdout))
     if ssh_observed != sessh_observed:
         raise AssertionError(
-            f"OpenSSH visible-terminal oracle mismatch for {name}\n"
-            f"ssh:   rc={ssh_result.returncode} visible_stdout={visible_terminal_output(ssh_result.stdout)!r}\n"
-            f"sessh: rc={sessh_result.returncode} visible_stdout={visible_terminal_output(sessh_result.stdout)!r}\n"
-            f"sessh raw stdout={normalize_output(sessh_result.stdout)!r}"
+            f"OpenSSH tmux-visible oracle mismatch for {name}\n"
+            f"ssh:   rc={ssh_result.returncode} visible_stdout={normalize_tmux_visible_output(ssh_result.stdout)!r}\n"
+            f"sessh: rc={sessh_result.returncode} visible_stdout={normalize_tmux_visible_output(sessh_result.stdout)!r}"
         )
 
 
@@ -378,7 +483,6 @@ def compare_openssh_pty_oracle(
     remote_args=(),
     sessh_options=(),
     steps=(),
-    visible_only=False,
     timeout=30.0,
 ):
     ssh_result = run_in_pty(
@@ -393,10 +497,39 @@ def compare_openssh_pty_oracle(
         steps,
         timeout=timeout,
     )
-    if visible_only:
-        assert_visible_terminal_matches(name, ssh_result, sessh_result)
-    else:
-        assert_observable_matches(name, ssh_result, sessh_result, compare_stderr=False)
+    assert_observable_matches(name, ssh_result, sessh_result, compare_stderr=False)
+
+
+def compare_openssh_tmux_visible_oracle(
+    name,
+    prefix,
+    config,
+    host_alias,
+    env,
+    *,
+    ssh_options=(),
+    remote_args=(),
+    sessh_options=(),
+    steps=(),
+    timeout=30.0,
+):
+    # Normal sessh TTY mode renders through sessh's terminal model, so its raw
+    # outer-terminal byte stream contains sessh-owned probes and cleanup that
+    # OpenSSH will not emit. tmux capture gives us the user-visible pane content
+    # instead, which is the compatibility surface for that path.
+    ssh_result = run_in_tmux_visible(
+        openssh_oracle_cmd(config, host_alias, ssh_options, remote_args),
+        os.environ.copy(),
+        steps,
+        timeout=timeout,
+    )
+    sessh_result = run_in_tmux_visible(
+        sessh_oracle_cmd(prefix, config, host_alias, ssh_options, remote_args, sessh_options),
+        env,
+        steps,
+        timeout=timeout,
+    )
+    assert_tmux_visible_matches(name, ssh_result, sessh_result)
 
 
 def run_signal_after_stdout(cmd, env, needle, sig=signal.SIGINT, timeout=30.0):
@@ -737,7 +870,7 @@ def test_openssh_oracle_matrix(prefix, config, host_alias, env):
         remote_args=("printf 'READY\\n'; sleep 20",),
         needle=b"READY\n",
     )
-    compare_openssh_pty_oracle(
+    compare_openssh_tmux_visible_oracle(
         "requested tty with local tty",
         prefix,
         config,
@@ -745,7 +878,37 @@ def test_openssh_oracle_matrix(prefix, config, host_alias, env):
         env,
         ssh_options=("-t",),
         remote_args=("tty",),
-        visible_only=True,
+    )
+    compare_openssh_tmux_visible_oracle(
+        "rendered tty stdout stderr exit",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-t",),
+        remote_args=("printf 'OUT\\n'; printf 'ERR\\n' >&2; exit 7",),
+    )
+    compare_openssh_tmux_visible_oracle(
+        "rendered tty exit status",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-t",),
+        remote_args=("exit 67",),
+    )
+    compare_openssh_tmux_visible_oracle(
+        "rendered tty resize propagation",
+        prefix,
+        config,
+        host_alias,
+        env,
+        ssh_options=("-tt",),
+        remote_args=("printf 'SIZE1:%s\\n' \"$(stty size)\"; IFS= read -r _; printf 'SIZE2:%s\\n' \"$(stty size)\"",),
+        steps=(
+            ("SIZE1:24 100", tmux_resize_then_send(31, 120, b"\n")),
+            ("SIZE2:31 120", None),
+        ),
     )
     compare_openssh_pty_oracle(
         "passthrough requested tty with local tty",
