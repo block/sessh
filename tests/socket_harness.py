@@ -142,9 +142,33 @@ def run_public(args, env, **kwargs):
     )
 
 
+def local_mux_args(args):
+    if not args or args[0] != ".":
+        return args
+    if len(args) == 1:
+        return ["new", "."]
+    command = args[1]
+    rest = args[2:]
+    if command == "new":
+        return ["new", *rest, "."]
+    if command == "attach":
+        return ["attach", "--host", ".", *rest]
+    if command == "list":
+        if "--local-only" in rest:
+            filtered = [arg for arg in rest if arg != "--local-only"]
+            return ["list", *filtered, "."]
+        return ["list", *rest]
+    if command == "kill":
+        if rest and rest[0] == "--all":
+            return ["kill", "--all", *rest[1:], "."]
+        return ["kill", ".", *rest]
+    if command in {"force-compat", "detach", "repaint", "debug"}:
+        return [command, *rest]
+    return args[1:]
+
+
 def run(args, env, **kwargs):
-    if args and args[0] == ".":
-        args = [":internal-sessh:", *args]
+    args = local_mux_args(args)
     return run_public(args, env, **kwargs)
 
 
@@ -3485,7 +3509,9 @@ def spawn_bin(env, args):
 
 def spawn_client(env, extra_args=None):
     extra_args = extra_args or []
-    return spawn_bin(env, [":internal-sessh:", ".", *extra_args])
+    if extra_args and extra_args[0] == "attach":
+        return spawn_bin(env, ["attach", *extra_args[1:]])
+    return spawn_bin(env, ["new", *extra_args, "."])
 
 
 def close_client(pid, fd):
@@ -3715,30 +3741,34 @@ def main():
             internal_sessh_version = run([":internal-sessh:", "--version"], env, timeout=5.0)
             if internal_sessh_version.returncode != 0 or internal_sessh_version.stdout != f"sessh {sessh_version()}\n":
                 raise AssertionError(internal_sessh_version)
-            internal_local_env = isolated_env(Path(tmp) / "internal-sessh-local")
-            internal_shell = Path(tmp) / "internal-sessh-shell"
+            internal_local = run([":internal-sessh:", "."], env, timeout=5.0)
+            if internal_local.returncode != 64 or '"." is not a valid ssh host' not in internal_local.stderr:
+                raise AssertionError(internal_local)
+
+            local_mux_env = isolated_env(Path(tmp) / "local-mux")
+            local_shell = Path(tmp) / "local-mux-shell"
             # Keep the shell alive until the harness has observed the marker.
             # If it exits immediately after printing, session cleanup can race
             # final draw delivery and leave the client with only cleanup bytes.
-            internal_shell.write_text(
+            local_shell.write_text(
                 "#!/bin/sh\n"
-                "printf 'internal-sessh-local-ok\\n'\n"
+                "printf 'local-mux-ok\\n'\n"
                 "while IFS= read -r line; do\n"
                 "  [ \"$line\" = exit ] && exit 0\n"
                 "done\n"
             )
-            internal_shell.chmod(0o700)
-            internal_local_env["SHELL"] = str(internal_shell)
-            cleanup_runtime(internal_local_env)
-            pid, fd = spawn_bin(internal_local_env, [":internal-sessh:", "."])
+            local_shell.chmod(0o700)
+            local_mux_env["SHELL"] = str(local_shell)
+            cleanup_runtime(local_mux_env)
+            pid, fd = spawn_bin(local_mux_env, ["new", "."])
             child_exited = False
             try:
-                read_until(fd, b"internal-sessh-local-ok", timeout=5.0)
+                read_until(fd, b"local-mux-ok", timeout=5.0)
                 os.write(fd, b"exit\n")
                 status = wait_child_draining_fd(pid, fd, timeout=5.0)
                 child_exited = True
                 if status != 0:
-                    raise AssertionError(f"internal sessh local exited with status {status}")
+                    raise AssertionError(f"local mux session exited with status {status}")
             finally:
                 if child_exited:
                     os.close(fd)

@@ -550,13 +550,19 @@ def sessh_args(*args):
     return [str(BIN), *args]
 
 
+def sesshmux_local_args(*extra):
+    if extra and extra[0] == "attach":
+        return [str(BIN), "attach", *extra[1:]]
+    return [str(BIN), "new", *extra, "."]
+
+
 def sessh_command(env, shell):
     parts = [
         "env",
         *quoted_env_assignments(env),
         f"SHELL={shlex.quote(str(shell))}",
     ]
-    parts.extend(shlex.quote(str(arg)) for arg in sessh_args("."))
+    parts.extend(shlex.quote(str(arg)) for arg in sesshmux_local_args())
     return " ".join(parts)
 
 

@@ -40,6 +40,12 @@ def sessh_args(*args):
     return [str(COMMAND_BIN), *args]
 
 
+def sesshmux_local_args(*extra):
+    if extra and extra[0] == "attach":
+        return [str(BIN), "attach", *extra[1:]]
+    return [str(BIN), "new", *extra, "."]
+
+
 def configure_command_bin(env):
     global COMMAND_BIN
     if BIN.name != "sesshmux-dev":
@@ -104,13 +110,13 @@ def sessh_command(env, *extra, shell="/bin/sh"):
         f"SHELL={shlex.quote(str(shell))}",
         f"PS1={shlex.quote(HARNESS_PROMPT)}",
     ]
-    parts.extend(shlex.quote(str(arg)) for arg in sessh_args(".", *extra))
+    parts.extend(shlex.quote(str(arg)) for arg in sesshmux_local_args(*extra))
     return " ".join(parts)
 
 
 def home_shell_command(name, *extra):
     args = [f"SHELL=~/{name}"]
-    args.extend(shlex.quote(str(arg)) for arg in sessh_args(".", *extra))
+    args.extend(shlex.quote(str(arg)) for arg in sesshmux_local_args(*extra))
     return " ".join(args)
 
 

@@ -16,6 +16,10 @@ export function sesshArgs(...args) {
   return [SESSH_BIN, ...args];
 }
 
+export function sesshmuxArgs(...args) {
+  return [SESSH_BIN, ...args];
+}
+
 const COLOR_MODE_DEFAULT = 0;
 const COLOR_MODE_PALETTE = 0x01000000;
 const COLOR_MODE_PALETTE_BRIGHT = 0x02000000;
