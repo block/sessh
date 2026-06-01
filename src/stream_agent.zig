@@ -427,6 +427,10 @@ const StreamAttachment = struct {
     transport_write_fd: c.fd_t,
     options: StreamAttachmentOptions,
     liveness: StreamLiveness,
+    // Optional fd used only by the local stream loop. It lets that loop wake an
+    // otherwise blocking attachment when an async replacement transport is
+    // ready, without shortening the main poll timeout.
+    external_wakeup_fd: c.fd_t = -1,
     last_resize_size: ?terminal.WindowSize = null,
 
     fn init(
@@ -465,7 +469,7 @@ const StreamAttachment = struct {
         if (state.complete()) return .complete;
 
         const now_before_poll_ms = nowMillis();
-        var pollfds: [1 + max_stream_sources + 1]posix.pollfd = undefined;
+        var pollfds: [1 + max_stream_sources + 1 + 1]posix.pollfd = undefined;
         var count: usize = 0;
         const transport_index = count;
         pollfds[count] = .{ .fd = self.transport_read_fd, .events = posix.POLL.IN, .revents = 0 };
@@ -487,6 +491,13 @@ const StreamAttachment = struct {
         if (self.options.replacement_listen_fd) |listen_fd| {
             replacement_index = count;
             pollfds[count] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
+        }
+
+        var external_wakeup_index: ?usize = null;
+        if (self.external_wakeup_fd >= 0) {
+            external_wakeup_index = count;
+            pollfds[count] = .{ .fd = self.external_wakeup_fd, .events = posix.POLL.IN, .revents = 0 };
             count += 1;
         }
 
@@ -558,12 +569,22 @@ const StreamAttachment = struct {
             return .progress;
         }
 
+        var source_ready = false;
         var drain_after_source_read = false;
         for (self.options.sources[0..self.options.source_count], 0..) |source, source_index| {
             const poll_index = source_poll_indices[source_index] orelse continue;
             if (pollfds[poll_index].revents != 0) {
+                source_ready = true;
                 try readStreamSource(state, source);
                 if (source.kind == .pty_master) drain_after_source_read = true;
+            }
+        }
+        if (!source_ready) {
+            // A wake-only event means the local loop has a replacement result
+            // to inspect. Do not flush buffered bytes to the old transport just
+            // because the replacement thread finished.
+            if (external_wakeup_index) |index| {
+                if (pollfds[index].revents != 0) return .idle;
             }
         }
         if (drain_after_source_read) try drainStreamSourcesNonBlocking(state, &self.options);
@@ -736,6 +757,22 @@ fn streamExitCode(status: ?pb.ExitStatus) u8 {
     };
 }
 
+fn setNonBlockingFd(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
+    if ((flags & nonblocking_flag) != 0) return;
+    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
+}
+
+fn setCloseOnExec(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFD, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const close_on_exec_flag = @as(c_int, @intCast(c.FD_CLOEXEC));
+    if ((flags & close_on_exec_flag) != 0) return;
+    if (c.fcntl(fd, c.F.SETFD, flags | close_on_exec_flag) < 0) return error.FcntlFailed;
+}
+
 fn PendingReplacement(comptime Starter: type, comptime Transport: type) type {
     return struct {
         const Self = @This();
@@ -743,6 +780,10 @@ fn PendingReplacement(comptime Starter: type, comptime Transport: type) type {
 
         state: *State,
 
+        // The reconnect attempt runs on a thread, but the stream loop is built
+        // around fd readiness. This pipe turns thread completion into another
+        // pollable event so the loop does not need a short timeout just to ask
+        // whether the thread is done.
         const State = struct {
             allocator: std.mem.Allocator,
             starter: Starter,
@@ -750,6 +791,8 @@ fn PendingReplacement(comptime Starter: type, comptime Transport: type) type {
             done: bool = false,
             abandoned: bool = false,
             result: ?Result = null,
+            notify_read_fd: c.fd_t = -1,
+            notify_write_fd: c.fd_t = -1,
 
             fn main(self: *State, thread_allocator: std.mem.Allocator) void {
                 var result: Result = if (self.starter.start()) |transport|
@@ -761,26 +804,71 @@ fn PendingReplacement(comptime Starter: type, comptime Transport: type) type {
                 if (self.abandoned) {
                     self.mutex.unlock();
                     cleanupReplacementResult(Transport, &result);
+                    self.closeNotifyFds();
                     self.allocator.destroy(self);
                     return;
                 }
                 self.result = result;
                 self.done = true;
+                self.notifyDone();
                 self.mutex.unlock();
                 _ = thread_allocator;
+            }
+
+            fn notifyDone(self: *State) void {
+                var byte = [_]u8{1};
+                while (true) {
+                    const n = c.write(self.notify_write_fd, byte[0..].ptr, byte.len);
+                    if (n > 0) return;
+                    if (n == 0) return;
+                    switch (posix.errno(n)) {
+                        .INTR => continue,
+                        else => return,
+                    }
+                }
+            }
+
+            fn closeNotifyFds(self: *State) void {
+                if (self.notify_read_fd >= 0) {
+                    posix.close(self.notify_read_fd);
+                    self.notify_read_fd = -1;
+                }
+                if (self.notify_write_fd >= 0) {
+                    posix.close(self.notify_write_fd);
+                    self.notify_write_fd = -1;
+                }
             }
         };
 
         fn start(allocator: std.mem.Allocator, starter: Starter) !Self {
+            const notify_pipe = try posix.pipe();
+            errdefer {
+                posix.close(notify_pipe[0]);
+                posix.close(notify_pipe[1]);
+            }
+            try setNonBlockingFd(notify_pipe[0]);
+            try setNonBlockingFd(notify_pipe[1]);
+            try setCloseOnExec(notify_pipe[0]);
+            try setCloseOnExec(notify_pipe[1]);
+
             const state = try allocator.create(State);
-            errdefer allocator.destroy(state);
             state.* = .{
                 .allocator = allocator,
                 .starter = starter,
+                .notify_read_fd = notify_pipe[0],
+                .notify_write_fd = notify_pipe[1],
             };
+            errdefer {
+                state.closeNotifyFds();
+                allocator.destroy(state);
+            }
             const thread = try std.Thread.spawn(.{}, State.main, .{ state, std.heap.smp_allocator });
             thread.detach();
             return .{ .state = state };
+        }
+
+        fn notifyFd(self: *const Self) c.fd_t {
+            return self.state.notify_read_fd;
         }
 
         fn takeIfDone(self: *Self) ?Result {
@@ -791,6 +879,7 @@ fn PendingReplacement(comptime Starter: type, comptime Transport: type) type {
             }
             const result = self.state.result.?;
             self.state.result = null;
+            self.state.closeNotifyFds();
             self.state.mutex.unlock();
             self.state.allocator.destroy(self.state);
             self.* = undefined;
@@ -802,6 +891,7 @@ fn PendingReplacement(comptime Starter: type, comptime Transport: type) type {
             if (self.state.done) {
                 var result = self.state.result.?;
                 self.state.result = null;
+                self.state.closeNotifyFds();
                 self.state.mutex.unlock();
                 cleanupReplacementResult(Transport, &result);
                 self.state.allocator.destroy(self.state);
@@ -1186,7 +1276,8 @@ pub fn runLocalStream(
             };
             var old_unresponsive = false;
             while (true) {
-                const outcome = attachment.step(if (pending == null) -1 else 50) catch .transport_closed;
+                attachment.external_wakeup_fd = if (pending) |*replacement| replacement.notifyFd() else -1;
+                const outcome = attachment.step(-1) catch .transport_closed;
                 switch (outcome) {
                     .complete => {
                         transport.close();
@@ -1288,7 +1379,23 @@ pub fn runLocalStream(
                 if (result != null) break;
                 reconnect_status.showReconnecting();
                 input_control.status_visible = true;
-                if (pollReconnectInput(&state, options.source_fd, &input_control, 50) == .disconnect) return 0;
+                var pollfds: [2]posix.pollfd = undefined;
+                var count: usize = 0;
+                pollfds[count] = .{ .fd = replacement.notifyFd(), .events = posix.POLL.IN, .revents = 0 };
+                count += 1;
+                var input_index: ?usize = null;
+                if (reconnectInputPollEnabled(&input_control)) {
+                    input_index = count;
+                    pollfds[count] = .{ .fd = options.source_fd, .events = posix.POLL.IN, .revents = 0 };
+                    count += 1;
+                }
+
+                _ = posix.poll(pollfds[0..count], -1) catch {};
+                if (input_index) |index| {
+                    if (pollfds[index].revents != 0) {
+                        if (readReconnectInput(&state, options.source_fd, &input_control) == .disconnect) return 0;
+                    }
+                }
                 reconnect_status.flushDiagnostics();
             }
             pending = null;
@@ -1816,7 +1923,7 @@ fn pollReconnectInput(
     input_control: *StreamInputControl,
     timeout_ms: i32,
 ) StreamControlAction {
-    if ((!input_control.enabled and !input_control.escape_enabled) or !input_control.status_visible) {
+    if (!reconnectInputPollEnabled(input_control)) {
         if (timeout_ms > 0) io.sleepMillis(@intCast(timeout_ms));
         return input_control.consumeAction();
     }
@@ -1828,15 +1935,28 @@ fn pollReconnectInput(
     const ready = posix.poll(&pollfd, timeout_ms) catch return input_control.consumeAction();
     if (ready == 0) return input_control.consumeAction();
     if (pollfd[0].revents != 0) {
-        var buf: [max_chunk_bytes]u8 = undefined;
-        const n = c.read(source_fd, &buf, buf.len);
-        if (n <= 0) {
-            state.channel(stream_channel_stdin).outbound_eof = true;
-        } else {
-            var filtered: [max_chunk_bytes]u8 = undefined;
-            const filtered_bytes = input_control.filter(buf[0..@intCast(n)], &filtered);
-            state.appendOutbound(stream_channel_stdin, filtered_bytes) catch {};
-        }
+        return readReconnectInput(state, source_fd, input_control);
+    }
+    return input_control.consumeAction();
+}
+
+fn reconnectInputPollEnabled(input_control: *const StreamInputControl) bool {
+    return (input_control.enabled or input_control.escape_enabled) and input_control.status_visible;
+}
+
+fn readReconnectInput(
+    state: *StreamState,
+    source_fd: c.fd_t,
+    input_control: *StreamInputControl,
+) StreamControlAction {
+    var buf: [max_chunk_bytes]u8 = undefined;
+    const n = c.read(source_fd, &buf, buf.len);
+    if (n <= 0) {
+        state.channel(stream_channel_stdin).outbound_eof = true;
+    } else {
+        var filtered: [max_chunk_bytes]u8 = undefined;
+        const filtered_bytes = input_control.filter(buf[0..@intCast(n)], &filtered);
+        state.appendOutbound(stream_channel_stdin, filtered_bytes) catch {};
     }
     return input_control.consumeAction();
 }
@@ -2470,18 +2590,49 @@ test "pending stream replacement hands off a prepared transport" {
     const Pending = PendingReplacement(*TestStarter, TestTransport);
     var pending = try Pending.start(std.testing.allocator, &starter);
 
-    var result: ?reconnect.AsyncResult(TestTransport) = null;
-    var attempts: usize = 0;
-    while (result == null and attempts < 100) : (attempts += 1) {
-        result = pending.takeIfDone();
-        if (result == null) io.sleepMillis(1);
-    }
-    var completed = result orelse return error.PendingReplacementDidNotFinish;
+    var pollfds = [_]posix.pollfd{.{
+        .fd = pending.notifyFd(),
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 1_000));
+
+    var completed = pending.takeIfDone() orelse return error.PendingReplacementDidNotFinish;
     defer cleanupReplacementResult(TestTransport, &completed);
 
     switch (completed) {
         .ready => try std.testing.expect(!closed),
         .failed => return error.UnexpectedPendingReplacementFailure,
+    }
+}
+
+test "pending stream replacement notifies failed preparation" {
+    const TestTransport = struct {
+        fn close(_: *@This()) void {}
+    };
+    const TestStarter = struct {
+        fn start(_: *@This()) !TestTransport {
+            return error.TestReplacementFailed;
+        }
+    };
+
+    var starter = TestStarter{};
+    const Pending = PendingReplacement(*TestStarter, TestTransport);
+    var pending = try Pending.start(std.testing.allocator, &starter);
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = pending.notifyFd(),
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 1_000));
+
+    var completed = pending.takeIfDone() orelse return error.PendingReplacementDidNotFinish;
+    defer cleanupReplacementResult(TestTransport, &completed);
+
+    switch (completed) {
+        .ready => return error.UnexpectedPendingReplacementSuccess,
+        .failed => |err| try std.testing.expectEqual(error.TestReplacementFailed, err),
     }
 }
 
