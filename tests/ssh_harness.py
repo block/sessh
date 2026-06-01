@@ -302,7 +302,15 @@ if [ "$saw_t" -ne 1 ]; then
       printf 'proxy_command=%s\\n' "$proxy_command" >>"$SESSH_FAKE_SSH_LOG"
     fi
     export SESSH_TEST_HOST=$host
-    printf 'PLAIN_SSH host=%s\\n' "$host"
+    if [ "$#" -gt 0 ] && [ "$*" = "tty" ]; then
+      if [ "$plain_option" = "-tt" ] || { [ "$plain_option" = "-t" ] && [ -t 0 ]; }; then
+        printf '/dev/pts/5\\n'
+      else
+        printf 'not a tty\\n'
+      fi
+    else
+      printf 'PLAIN_SSH host=%s\\n' "$host"
+    fi
     exit 0
   fi
   if [ "$request_tty" -ne 1 ]; then
@@ -1650,6 +1658,34 @@ def test_ssh_remote_command_uses_stream_proxy(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_tty_stdin_remote_command_does_not_allocate_tty_without_t(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_LOG_PROXYCOMMAND"] = "1"
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "test-host", "tty"],
+        env,
+        ((b"not a tty", None),),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "plain_remote_command=tty" not in log_text:
+        raise AssertionError(log_text)
+    if "proxy_command=" not in log_text or ":internal-stream-client:" not in log_text:
+        raise AssertionError(log_text)
+    if "--outer-tty" in log_text:
+        raise AssertionError(log_text)
+
+
 def test_ssh_passthrough_remote_command_uses_stream_proxy(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1693,6 +1729,8 @@ def test_ssh_passthrough_forced_tty_marks_stream_as_tty(tmp):
 
     if result.returncode != 0:
         raise AssertionError(result)
+    if "/dev/pts/5" not in result.stdout:
+        raise AssertionError(result)
     log_text = fake_log.read_text()
     if "plain_option=-tt" not in log_text or "plain_remote_command=tty" not in log_text:
         raise AssertionError(log_text)
@@ -1701,6 +1739,34 @@ def test_ssh_passthrough_forced_tty_marks_stream_as_tty(tmp):
     if "--outer-tty" not in log_text:
         raise AssertionError(log_text)
     if "--parent-control" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_passthrough_requested_tty_uses_stream_path(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_LOG_PROXYCOMMAND"] = "1"
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "-t", "test-host", "tty"],
+        env,
+        ((b"/dev/pts/5", None),),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "plain_option=-tt" not in log_text or "plain_remote_command=tty" not in log_text:
+        raise AssertionError(log_text)
+    if "proxy_command=" not in log_text or ":internal-stream-client:" not in log_text:
+        raise AssertionError(log_text)
+    if "--outer-tty" not in log_text:
         raise AssertionError(log_text)
 
 
@@ -1858,7 +1924,7 @@ def test_ssh_passthrough_tty_restores_remote_title_after_stream_reconnect(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_forced_tty_remote_command_uses_persistent_session(tmp):
+def test_ssh_forced_tty_remote_command_allocates_pty_with_stdin_null(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1867,18 +1933,19 @@ def test_ssh_forced_tty_remote_command_uses_persistent_session(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
-    env["SHELL"] = "/bin/sh"
 
-    result = run_sessh(["-tt", "test-host", "echo", "$SESSH_TEST_HOST"], env, timeout=30.0)
+    result = run_sessh(["-tt", "test-host", "tty"], env, timeout=30.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if "test-host" not in result.stdout:
+    if "/dev/" not in result.stdout:
         raise AssertionError(result)
     if "fallback to plain-ssh" in result.stderr:
         raise AssertionError(result.stderr)
     log_text = fake_log.read_text()
     if "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+    if "proxy_command=" in log_text or ":internal-stream-client:" in log_text:
         raise AssertionError(log_text)
     trace_text = fake_trace.read_text()
     runtime_invocation = re.search(r"event=parsed .*config_query=0 .*saw_t=1 request_tty=0", trace_text)
@@ -1886,25 +1953,24 @@ def test_ssh_forced_tty_remote_command_uses_persistent_session(tmp):
         raise AssertionError(trace_text)
 
 
-def test_ssh_tty_remote_command_uses_persistent_session_guid(tmp):
+def test_ssh_requested_tty_remote_command_allocates_pty_with_tty_stdin(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     write_fake_ssh(fake_bin / "ssh")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SHELL"] = "/bin/sh"
 
     result = run_sesshmux_in_pty(
-        [":internal-sessh:", "test-host", "printenv", "SESSH_GUID"],
+        [":internal-sessh:", "-t", "test-host", "tty"],
         env,
-        ((b"s-", None),),
+        ((b"/dev/", None),),
         timeout=30.0,
     )
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if re.search(r"s-[0-9a-fA-F-]{36}", result.stdout) is None:
+    if "/dev/" not in result.stdout:
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if "plain_ssh=1" in log_text:
@@ -1927,12 +1993,16 @@ def test_ssh_single_tty_remote_command_with_stdin_null_uses_stream_proxy(tmp):
 
     if result.returncode != 0:
         raise AssertionError(result)
+    if "not a tty" not in result.stdout:
+        raise AssertionError(result)
     if "fallback to plain-ssh" in result.stderr:
         raise AssertionError(result.stderr)
     log_text = fake_log.read_text()
     if "plain_ssh=1" not in log_text or "plain_option=-t" not in log_text or "plain_remote_command=tty" not in log_text:
         raise AssertionError(log_text)
     if "proxy_command=" not in log_text or ":internal-stream-client:" not in log_text:
+        raise AssertionError(log_text)
+    if "--outer-tty" in log_text:
         raise AssertionError(log_text)
 
 
@@ -3922,12 +3992,20 @@ def main(argv=None):
             test_ssh_remote_command_uses_stream_proxy,
         ),
         (
+            "ssh tty stdin remote command does not allocate tty without -t",
+            test_ssh_tty_stdin_remote_command_does_not_allocate_tty_without_t,
+        ),
+        (
             "ssh passthrough remote command uses stream proxy",
             test_ssh_passthrough_remote_command_uses_stream_proxy,
         ),
         (
             "ssh passthrough forced tty marks stream as tty",
             test_ssh_passthrough_forced_tty_marks_stream_as_tty,
+        ),
+        (
+            "ssh passthrough requested tty uses stream path",
+            test_ssh_passthrough_requested_tty_uses_stream_path,
         ),
         (
             "ssh passthrough tty uses single stream guid",
@@ -3942,12 +4020,12 @@ def main(argv=None):
             test_ssh_passthrough_tty_restores_remote_title_after_stream_reconnect,
         ),
         (
-            "ssh forced tty remote command uses persistent session",
-            test_ssh_forced_tty_remote_command_uses_persistent_session,
+            "ssh forced tty remote command allocates pty with stdin null",
+            test_ssh_forced_tty_remote_command_allocates_pty_with_stdin_null,
         ),
         (
-            "ssh tty remote command uses persistent session guid",
-            test_ssh_tty_remote_command_uses_persistent_session_guid,
+            "ssh requested tty remote command allocates pty with tty stdin",
+            test_ssh_requested_tty_remote_command_allocates_pty_with_tty_stdin,
         ),
         (
             "ssh single tty remote command with stdin null uses stream proxy",

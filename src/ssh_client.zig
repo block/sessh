@@ -2955,12 +2955,15 @@ fn shouldUseStreamProxy(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool
     if (parsed_ssh_args.passthrough) return true;
     if (parsed_ssh_args.shell_command_args.len == 0) return false;
 
-    // With a local tty, use the normal sessh runtime so command sessions get
-    // the same remote PTY and session environment as interactive sessions.
-    // Without a local tty, stream mode preserves ssh's byte-stream command
-    // behavior. A forced `-tt` is the exception because ssh explicitly asks for
-    // a remote tty even when local stdin is not one.
-    return !stdin_is_tty and parsed_ssh_args.tty_request != .forced;
+    // Match ssh's PTY allocation rules for remote commands. Plain
+    // `ssh HOST command` does not allocate a remote tty even when local stdin is
+    // a tty, so it uses the stream path. `-t` only requests a remote tty when
+    // local stdin is a tty; `-tt` forces the persistent PTY path.
+    return switch (parsed_ssh_args.tty_request) {
+        .none => true,
+        .requested => !stdin_is_tty,
+        .forced => false,
+    };
 }
 
 fn streamProxyUsesTty(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
@@ -3163,9 +3166,10 @@ fn runStreamProxySsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArg
     defer allocator.free(proxy_command);
 
     const default_options = defaultSshOptionsLen(parsed_ssh_args);
+    const force_tty_option_count: usize = if (stream_uses_tty) 1 else 0;
     const ssh_argv = try allocator.alloc(
         []const u8,
-        1 + 2 + 1 + default_options + parsed_ssh_args.options.len + 1 + parsed_ssh_args.shell_command_args.len,
+        1 + 2 + 1 + default_options + parsed_ssh_args.options.len + force_tty_option_count + 1 + parsed_ssh_args.shell_command_args.len,
     );
     defer allocator.free(ssh_argv);
 
@@ -3184,6 +3188,14 @@ fn runStreamProxySsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArg
     appendDefaultSshOptions(ssh_argv, &arg_index, parsed_ssh_args.default_ipqos_option);
     @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.options.len], parsed_ssh_args.options);
     arg_index += parsed_ssh_args.options.len;
+    if (stream_uses_tty) {
+        // The parent process owns local tty input so it can intercept CTRL-R.
+        // That means the outer ssh process may see a pipe on stdin. Once sessh
+        // has decided ssh semantics require a remote PTY, force it explicitly
+        // so OpenSSH does not downgrade `-t` just because of our relay pipe.
+        ssh_argv[arg_index] = "-tt";
+        arg_index += 1;
+    }
     ssh_argv[arg_index] = parsed_ssh_args.host;
     arg_index += 1;
     @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.shell_command_args.len], parsed_ssh_args.shell_command_args);
@@ -5813,7 +5825,7 @@ test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
     try std.testing.expectEqualStrings("", empty.shell_command_args[0]);
 }
 
-test "stream proxy handles ssh command mode only without local tty" {
+test "stream proxy preserves ssh remote command tty semantics" {
     const command = try parseSshArgs(&.{
         "sessh",
         "example.com",
@@ -5823,7 +5835,7 @@ test "stream proxy handles ssh command mode only without local tty" {
     try std.testing.expectEqual(SshTtyRequest.none, command.tty_request);
     try std.testing.expectEqual(@as(usize, 2), command.shell_command_args.len);
     try std.testing.expect(shouldUseStreamProxy(command, false));
-    try std.testing.expect(!shouldUseStreamProxy(command, true));
+    try std.testing.expect(shouldUseStreamProxy(command, true));
 
     const single = try parseSshArgs(&.{
         "sessh",
@@ -5841,6 +5853,7 @@ test "stream proxy handles ssh command mode only without local tty" {
         "tty",
     }, .{});
     try std.testing.expect(!shouldUseStreamProxy(forced, false));
+    try std.testing.expect(!shouldUseStreamProxy(forced, true));
 }
 
 test "passthrough forces stream proxy and preserves ssh tty semantics" {
@@ -5876,6 +5889,27 @@ test "passthrough forces stream proxy and preserves ssh tty semantics" {
     try std.testing.expect(forced.passthrough);
     try std.testing.expect(shouldUseStreamProxy(forced, false));
     try std.testing.expect(streamProxyUsesTty(forced, false));
+
+    const requested_with_tty = try parseSshArgs(&.{
+        "sessh",
+        "--passthrough",
+        "-t",
+        "example.com",
+        "tty",
+    }, .{});
+    try std.testing.expect(requested_with_tty.passthrough);
+    try std.testing.expect(shouldUseStreamProxy(requested_with_tty, true));
+    try std.testing.expect(streamProxyUsesTty(requested_with_tty, true));
+
+    const requested_without_tty = try parseSshArgs(&.{
+        "sessh",
+        "--passthrough",
+        "-t",
+        "example.com",
+        "tty",
+    }, .{});
+    try std.testing.expect(shouldUseStreamProxy(requested_without_tty, false));
+    try std.testing.expect(!streamProxyUsesTty(requested_without_tty, false));
 }
 
 test "plain ssh fallback is allowed for transport-incompatible plain ssh invocations" {
