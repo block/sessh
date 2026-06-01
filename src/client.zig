@@ -62,6 +62,7 @@ const LocalOptions = struct {
     list_include_cached_routes: bool = true,
     list_jsonl: bool = false,
     list_exited: bool = false,
+    list_all: bool = false,
     list_client_target: ?[]const u8 = null,
     client_session_ref: ?[]const u8 = null,
     client_target: ClientTarget = .default,
@@ -2421,7 +2422,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                 if (exit_status != 0) return process_exit.request(exit_status);
                 return;
             }
-            const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl, options.list_exited);
+            const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl, options.list_exited, options.list_all);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
@@ -2938,14 +2939,16 @@ fn runLocalListCommand(
     include_cached_routes: bool,
     jsonl: bool,
     exited: bool,
+    all: bool,
 ) !u8 {
     if (include_cached_routes and refresh) try refreshCachedRemoteRoutes(allocator, exe);
 
     var command_args_buf: [8][]const u8 = undefined;
     const command_args = appendBrokerCommand(runtime_broker_args, "list", null, &command_args_buf);
     const extra_args: usize = (if (jsonl) @as(usize, 1) else 0) +
+        (if (all) @as(usize, 1) else 0) +
         (if (exited) @as(usize, 1) else 0) +
-        (if (exited and !include_cached_routes) @as(usize, 1) else 0);
+        (if ((all or exited) and !include_cached_routes) @as(usize, 1) else 0);
     const argv = try allocator.alloc([]const u8, 2 + command_args.len + extra_args);
     defer allocator.free(argv);
     argv[0] = exe;
@@ -2956,11 +2959,15 @@ fn runLocalListCommand(
         argv[arg_index] = "--jsonl";
         arg_index += 1;
     }
+    if (all) {
+        argv[arg_index] = "--all";
+        arg_index += 1;
+    }
     if (exited) {
         argv[arg_index] = "--exited";
         arg_index += 1;
     }
-    if (exited and !include_cached_routes) {
+    if ((all or exited) and !include_cached_routes) {
         argv[arg_index] = "--local-only";
         arg_index += 1;
     }
@@ -2979,7 +2986,7 @@ fn runLocalListCommand(
         else => 1,
     };
     if (exit_status != 0) return exit_status;
-    if (include_cached_routes and !exited) {
+    if (include_cached_routes and !exited and !all) {
         const appended_cached_routes = try appendCachedRemoteRouteRows(allocator, jsonl);
         if (appended_cached_routes and !refresh) {
             try io_helpers.writeAll(2, "sessh: cached remote session status may be out of date; run `sesshmux list --refresh` to update\n");
@@ -3458,6 +3465,9 @@ fn parseLocalListOptions(args: []const []const u8, index: *usize, options: *Loca
         } else if (std.mem.eql(u8, arg, "--jsonl")) {
             options.list_jsonl = true;
             index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--all")) {
+            options.list_all = true;
+            index.* += 1;
         } else if (std.mem.startsWith(u8, arg, "--client=")) {
             const value = arg["--client=".len..];
             if (value.len == 0) return error.MissingClientListTarget;
@@ -3625,8 +3635,10 @@ fn validateLocalOptions(options: LocalOptions) !LocalOptions {
     if (!options.list_include_cached_routes and options.action != .list) return error.UnsupportedListLocalOnly;
     if (options.list_jsonl and options.action != .list) return error.UnsupportedListJsonl;
     if (options.list_exited and options.action != .list) return error.UnsupportedListExited;
+    if (options.list_all and options.action != .list) return error.UnsupportedListAll;
     if (options.list_client_target != null and options.action != .list) return error.UnsupportedClientTarget;
     if (options.list_client_target != null and (options.list_refresh or !options.list_include_cached_routes or options.list_exited)) return error.UnsupportedClientTarget;
+    if (options.list_all and (options.list_exited or options.list_client_target != null)) return error.UnsupportedListAll;
     if (options.client_target != .default and !actionSupportsClientTarget(options.action)) return error.UnsupportedClientTarget;
     if (options.client_guid != null and options.client_target != .client_guid) return error.UnsupportedClientTarget;
     if (options.client_repaint_scrollback and options.action != .repaint_client) return error.UnsupportedClientTarget;
@@ -3706,11 +3718,18 @@ test "parseLeader accepts case-insensitive spelling" {
 }
 
 test "parseLocalOptions keeps command flags command-specific" {
-    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
+    const list_all = try parseLocalOptions(&.{
         "sesshmux",
         ".",
         "list",
         "--all",
+    });
+    try std.testing.expect(list_all.list_all);
+    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
+        "sesshmux",
+        ".",
+        "list",
+        "--current",
     }));
     try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
         "sesshmux",

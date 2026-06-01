@@ -7,6 +7,8 @@ pub const host_width = 24;
 pub const version_width = 12;
 pub const ended_width = 8;
 pub const status_width = 10;
+pub const type_width = 16;
+pub const created_width = 8;
 
 pub fn writeHeader(writer: anytype) !void {
     try writePadded(writer, "ID", id_width);
@@ -30,6 +32,16 @@ pub fn writeExitedHeader(writer: anytype) !void {
     try writePadded(writer, "STATUS", status_width);
     try writer.writeAll("  ");
     try writer.writeAll("VERSION\n");
+}
+
+pub fn writeAllHeader(writer: anytype) !void {
+    try writePadded(writer, "ID", id_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, "TYPE", type_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, "CREATED", created_width);
+    try writer.writeAll("  ");
+    try writer.writeAll("INFO\n");
 }
 
 pub fn writeRow(writer: anytype, id: []const u8, attached: []const u8, input: []const u8, host: []const u8, version: []const u8) !void {
@@ -58,6 +70,17 @@ pub fn writeExitedRow(writer: anytype, id: []const u8, ended: []const u8, host: 
     try writer.writeAll("\n");
 }
 
+pub fn writeAllRow(writer: anytype, id: []const u8, type_name: []const u8, created: []const u8, info: []const u8) !void {
+    try writePadded(writer, id, id_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, type_name, type_width);
+    try writer.writeAll("  ");
+    try writePadded(writer, created, created_width);
+    try writer.writeAll("  ");
+    try writer.writeAll(info);
+    try writer.writeAll("\n");
+}
+
 pub fn writeJsonlRow(writer: anytype, id: []const u8, host: []const u8, version: []const u8, guid: []const u8, attached_count: ?u32, last_input_at_unix_ms: ?u64) !void {
     try writer.writeAll("{\"id\":");
     try writeJsonString(writer, id);
@@ -79,6 +102,24 @@ pub fn writeJsonlRow(writer: anytype, id: []const u8, host: []const u8, version:
     } else {
         try writer.writeAll("null");
     }
+    try writer.writeAll("}\n");
+}
+
+pub fn writeAllJsonlRow(writer: anytype, id: []const u8, guid: []const u8, type_name: []const u8, created_at_unix_ms: ?u64, info: []const u8) !void {
+    try writer.writeAll("{\"id\":");
+    try writeJsonString(writer, id);
+    try writer.writeAll(",\"guid\":");
+    try writeJsonString(writer, guid);
+    try writer.writeAll(",\"type\":");
+    try writeJsonString(writer, type_name);
+    try writer.writeAll(",\"created_at_unix_ms\":");
+    if (created_at_unix_ms) |ts| {
+        try writer.print("{}", .{ts});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"info\":");
+    try writeJsonString(writer, info);
     try writer.writeAll("}\n");
 }
 
@@ -212,6 +253,17 @@ test "writeExitedJsonlRow writes tombstone fields" {
     );
     try std.testing.expectEqualStrings(
         "{\"id\":\"s1\",\"aliases\":[\"s1\",\"old\"],\"host\":\"work\\\\host\",\"version\":\"0.5\\nx\",\"guid\":\"s-guid\",\"ended_at_unix_ms\":1234,\"end_reason\":\"process_exited\",\"exit_status\":{\"kind\":\"exited\",\"status\":7}}\n",
+        out.items,
+    );
+}
+
+test "writeAllJsonlRow writes mixed runtime identity fields" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    try writeAllJsonlRow(out.writer(std.testing.allocator), "c-12345678", "c-guid", "outgoing-client", 1234, "host=work\\host");
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"c-12345678\",\"guid\":\"c-guid\",\"type\":\"outgoing-client\",\"created_at_unix_ms\":1234,\"info\":\"host=work\\\\host\"}\n",
         out.items,
     );
 }

@@ -21,7 +21,7 @@ Each session directory lives under `guid/` followed by the `s-`-prefixed guid
 representation for the session. This directory includes:
 
 - `agent.sock`: symlink to the real socket path under `s/`
-- `meta.json`: runtime identity for the session agent (`agent_pid`, `version`)
+- `meta.json`: runtime identity for the session agent (`type`, `created_at_unix_ms`, `agent_pid`, `version`)
 - `compat`: symlink to the exact sessh binary for this session agent.
 
 We use a symlink for `agent.sock` because Unix-domain socket path lengths are
@@ -32,15 +32,23 @@ The actual socket path lives under `s/` followed by a compact representation of
 the guid (or random hex bytes if `XDG_RUNTIME_DIR` is too long to allow the
 full guid to fit).
 
-Client attachments also get runtime hints under `guid/<client-guid>/`. The
-prefix tells us what the directory represents: `s-` entries are session
-directories, and `c-` entries are client hints. On the session host, each client
-hint contains an `agent.sock` symlink to the session agent so commands like
-`sesshmux detach c-...` can reach the right agent without scanning every
-session. On the client machine, remote sessions also use the same directory for
-a `route.json` symlink to the durable route in `XDG_STATE_HOME`, so the command
-can first hop to the right host. The hints are removed when that client
-detaches.
+Runtime guid directories include small metadata files so `sesshmux list --all`
+can explain what each live guid represents. Local session directories use
+`meta.json` with `type: local-session`. Client and reconnectable stream
+directories can be owned from both sides of a connection at once, so each side
+writes its own file: `incoming-meta.json` for incoming clients or streams, and
+`outgoing-meta.json` for outgoing clients or streams. Teardown removes only the
+metadata file it owns; the last side to leave removes the now-empty directory.
+
+On the session host, each client hint contains an `agent.sock` symlink to the
+session agent so commands like `sesshmux detach c-...` can reach the right agent
+without scanning every session. On the client machine, remote sessions also use
+the same directory for a `route.json` symlink to the durable route in
+`XDG_STATE_HOME`, so the command can first hop to the right host. The hints are
+removed when that client detaches.
+
+Remote sessions themselves are not runtime guid entries on the client machine;
+they are durable routes in `XDG_STATE_HOME`.
 
 The XDG spec explicitly permits periodic cleanup of files in `XDG_RUNTIME_DIR`,
 and says runtime files should either have their access time updated at least

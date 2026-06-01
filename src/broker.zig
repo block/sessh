@@ -87,7 +87,7 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
             if (err == error.MissingClientListTarget) {
                 return finishCommand(64, "", "ERROR --client requires a value: " ++ client_list_target_help ++ "\n");
             }
-            return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl] [--exited] [--local-only] [--client incoming|outgoing|session|ID]\n");
+            return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl] [--all] [--exited] [--local-only] [--client incoming|outgoing|session|ID]\n");
         };
         const exit_status = if (options.client_selector == .none)
             try listAgents(allocator, options)
@@ -147,6 +147,7 @@ const ListOptions = struct {
     host_display: []const u8 = ".",
     format: ListFormat = .table,
     mode: ListMode = .live,
+    all: bool = false,
     local_only: bool = false,
     client_selector: ClientListSelector = .none,
 };
@@ -225,6 +226,9 @@ fn parseListOptions(args: []const []const u8) !ListOptions {
         } else if (std.mem.eql(u8, args[i], "--jsonl")) {
             options.format = .jsonl;
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--all")) {
+            options.all = true;
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--exited")) {
             options.mode = .exited;
             i += 1;
@@ -248,6 +252,7 @@ fn parseListOptions(args: []const []const u8) !ListOptions {
         }
     }
     if (options.client_selector != .none and (options.mode == .exited or options.local_only)) return error.InvalidListArgs;
+    if (options.all and (options.mode == .exited or options.client_selector != .none)) return error.InvalidListArgs;
     return options;
 }
 
@@ -364,6 +369,7 @@ fn parseDebugUnresponsiveSeconds(value: []const u8) !u32 {
 
 fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
     try session_registry.cleanupExpiredTombstones(allocator, nowUnixMs());
+    if (options.all) return listAllAgents(allocator, options);
     if (options.mode == .exited) return listExitedAgents(allocator, options);
 
     var stdout: std.ArrayList(u8) = .empty;
@@ -429,6 +435,129 @@ fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
 
     try io.writeAll(1, stdout.items);
     return 0;
+}
+
+fn listAllAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    const state_root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(state_root);
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    try writeAllRowsFromRoots(allocator, stdout.writer(allocator), options, runtime_root, state_root);
+    try io.writeAll(1, stdout.items);
+    return 0;
+}
+
+fn writeAllRowsFromRoots(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    options: ListOptions,
+    runtime_root: []const u8,
+    state_root: []const u8,
+) !void {
+    if (options.format == .table) try list_format.writeAllHeader(writer);
+    const now_ms = nowUnixMs();
+    try writeRuntimeGuidAllRows(allocator, writer, options, runtime_root, now_ms);
+    if (!options.local_only) try writeRemoteSessionAllRows(allocator, writer, options, state_root, now_ms);
+}
+
+fn writeRuntimeGuidAllRows(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    options: ListOptions,
+    runtime_root: []const u8,
+    now_ms: u64,
+) !void {
+    const guid_root = try session_registry.sessionsDirInRoot(allocator, runtime_root);
+    defer allocator.free(guid_root);
+    var dir = std.fs.openDirAbsolute(guid_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const entry_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ guid_root, entry.name });
+        defer allocator.free(entry_dir);
+        const display_id = session_registry.shortRuntimeGuid(allocator, entry.name) catch continue;
+        defer allocator.free(display_id);
+        const info = if (std.mem.eql(u8, options.host_display, "."))
+            ""
+        else
+            try std.fmt.allocPrint(allocator, "host={s}", .{options.host_display});
+        defer if (!std.mem.eql(u8, options.host_display, ".")) allocator.free(info);
+        for (session_registry.runtimeGuidMetaFilenamesForGuid(entry.name)) |filename| {
+            const meta_path = try session_registry.runtimeGuidMetaPathForFilenameInDir(allocator, entry_dir, filename);
+            defer allocator.free(meta_path);
+            const meta = session_registry.readRuntimeGuidMeta(allocator, meta_path) catch continue;
+            try writeAllIdentityRow(
+                writer,
+                options.format,
+                now_ms,
+                display_id,
+                entry.name,
+                session_registry.runtimeGuidTypeName(meta.guid_type),
+                meta.created_at_unix_ms,
+                info,
+            );
+        }
+    }
+}
+
+fn writeRemoteSessionAllRows(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    options: ListOptions,
+    state_root: []const u8,
+    now_ms: u64,
+) !void {
+    const state_sessions_dir = try std.fmt.allocPrint(allocator, "{s}/guid", .{state_root});
+    defer allocator.free(state_sessions_dir);
+    var dir = std.fs.openDirAbsolute(state_sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
+        const route_path = try std.fmt.allocPrint(allocator, "{s}/{s}/route.json", .{ state_sessions_dir, entry.name });
+        defer allocator.free(route_path);
+        var route = session_registry.readRoute(allocator, route_path) catch continue;
+        defer route.deinit(allocator);
+        if (route.host.len == 0 or std.mem.eql(u8, route.host, ".") or !route.last_known_alive) continue;
+
+        const info = try std.fmt.allocPrint(allocator, "host={s} version={s}", .{ route.host, route.agent_version });
+        defer allocator.free(info);
+        const display_id = try session_registry.shortSessionGuid(allocator, route.guid);
+        defer allocator.free(display_id);
+        try writeAllIdentityRow(writer, options.format, now_ms, display_id, route.guid, "remote-session", null, info);
+    }
+}
+
+fn writeAllIdentityRow(
+    writer: anytype,
+    format: ListFormat,
+    now_ms: u64,
+    id: []const u8,
+    guid: []const u8,
+    type_name: []const u8,
+    created_at_unix_ms: ?u64,
+    info: []const u8,
+) !void {
+    switch (format) {
+        .table => {
+            var created_buf: [32]u8 = undefined;
+            const created = if (created_at_unix_ms) |ts| try formatRelativeUnixMs(&created_buf, now_ms, ts) else "???";
+            try list_format.writeAllRow(writer, id, type_name, created, info);
+        },
+        .jsonl => try list_format.writeAllJsonlRow(writer, id, guid, type_name, created_at_unix_ms, info),
+    }
 }
 
 fn tombstoneRouteForDeadLocalSession(allocator: std.mem.Allocator, paths: session_registry.SessionPaths, now_ms: u64) !void {
@@ -1609,4 +1738,79 @@ fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .error_message, payload);
+}
+
+test "list all rows include runtime metadata and cached remote sessions" {
+    const allocator = std.testing.allocator;
+    const runtime_root = try std.fmt.allocPrint(allocator, "/tmp/sessh-broker-all-runtime-test-{}", .{c.getpid()});
+    defer allocator.free(runtime_root);
+    const state_root = try std.fmt.allocPrint(allocator, "/tmp/sessh-broker-all-state-test-{}", .{c.getpid()});
+    defer allocator.free(state_root);
+    std.fs.cwd().deleteTree(runtime_root) catch {};
+    std.fs.cwd().deleteTree(state_root) catch {};
+    defer std.fs.cwd().deleteTree(runtime_root) catch {};
+    defer std.fs.cwd().deleteTree(state_root) catch {};
+
+    const local_guid = "s-11111111-1111-4111-8111-111111111111";
+    const client_guid = "c-22222222-2222-4222-8222-222222222222";
+    const remote_guid = "s-33333333-3333-4333-8333-333333333333";
+    const stream_guid = "r-44444444-4444-4444-8444-444444444444";
+    const local_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, local_guid });
+    defer allocator.free(local_dir);
+    const client_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, client_guid });
+    defer allocator.free(client_dir);
+    const stream_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, stream_guid });
+    defer allocator.free(stream_dir);
+    try std.fs.cwd().makePath(local_dir);
+    try std.fs.cwd().makePath(client_dir);
+    try std.fs.cwd().makePath(stream_dir);
+
+    const local_meta = try std.fmt.allocPrint(allocator, "{s}/meta.json", .{local_dir});
+    defer allocator.free(local_meta);
+    const incoming_client_meta = try std.fmt.allocPrint(allocator, "{s}/incoming-meta.json", .{client_dir});
+    defer allocator.free(incoming_client_meta);
+    const outgoing_client_meta = try std.fmt.allocPrint(allocator, "{s}/outgoing-meta.json", .{client_dir});
+    defer allocator.free(outgoing_client_meta);
+    const stream_meta = try std.fmt.allocPrint(allocator, "{s}/outgoing-meta.json", .{stream_dir});
+    defer allocator.free(stream_meta);
+    try writeTestFile(local_meta, "{\"type\":\"local-session\",\"created_at_unix_ms\":1000}\n");
+    try writeTestFile(incoming_client_meta, "{\"type\":\"incoming-client\",\"created_at_unix_ms\":1500}\n");
+    try writeTestFile(outgoing_client_meta, "{\"type\":\"outgoing-client\",\"created_at_unix_ms\":2000}\n");
+    try writeTestFile(stream_meta, "{\"type\":\"outgoing-stream\",\"created_at_unix_ms\":3000}\n");
+
+    const remote_route_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ state_root, remote_guid });
+    defer allocator.free(remote_route_dir);
+    try std.fs.cwd().makePath(remote_route_dir);
+    const remote_route_path = try std.fmt.allocPrint(allocator, "{s}/route.json", .{remote_route_dir});
+    defer allocator.free(remote_route_path);
+    try writeTestFile(
+        remote_route_path,
+        "{\"guid\":\"s-33333333-3333-4333-8333-333333333333\",\"primary_alias\":\"s-33333333\",\"session_dir\":\"/tmp/remote/guid/s-33333333-3333-4333-8333-333333333333\",\"host\":\"work.example\",\"agent_version\":\"0.6.0-test\",\"alive\":true,\"attached_count\":null,\"last_input_at_unix_ms\":null,\"ssh_options\":[]}\n",
+    );
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try writeAllRowsFromRoots(allocator, out.writer(allocator), .{ .format = .jsonl, .all = true }, runtime_root, state_root);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"s-11111111\",\"guid\":\"s-11111111-1111-4111-8111-111111111111\",\"type\":\"local-session\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"c-22222222\",\"guid\":\"c-22222222-2222-4222-8222-222222222222\",\"type\":\"incoming-client\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"c-22222222\",\"guid\":\"c-22222222-2222-4222-8222-222222222222\",\"type\":\"outgoing-client\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"r-44444444\",\"guid\":\"r-44444444-4444-4444-8444-444444444444\",\"type\":\"outgoing-stream\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"s-33333333\",\"guid\":\"s-33333333-3333-4333-8333-333333333333\",\"type\":\"remote-session\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "host=work.example version=0.6.0-test") != null);
+
+    out.clearRetainingCapacity();
+    try writeAllRowsFromRoots(allocator, out.writer(allocator), .{ .format = .jsonl, .all = true, .local_only = true }, runtime_root, state_root);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"type\":\"remote-session\"") == null);
+
+    out.clearRetainingCapacity();
+    try writeAllRowsFromRoots(allocator, out.writer(allocator), .{ .format = .table, .all = true, .local_only = true }, runtime_root, state_root);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "s-11111111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "s-11111111-1111-4111-8111-111111111111") == null);
+}
+
+fn writeTestFile(path: []const u8, contents: []const u8) !void {
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
+    errdefer file.close();
+    try file.writeAll(contents);
+    file.close();
 }

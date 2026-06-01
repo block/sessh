@@ -54,8 +54,10 @@ pub const RuntimeAgentSocketPaths = struct {
     dir: []u8,
     socket: []u8,
     agent_sock_link: []u8,
+    meta: []u8,
 
     pub fn deinit(self: *RuntimeAgentSocketPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.meta);
         allocator.free(self.agent_sock_link);
         allocator.free(self.socket);
         allocator.free(self.dir);
@@ -65,6 +67,7 @@ pub const RuntimeAgentSocketPaths = struct {
     pub fn removeRuntimeFiles(self: RuntimeAgentSocketPaths) void {
         unlinkIfExists(self.socket) catch {};
         unlinkIfExists(self.agent_sock_link) catch {};
+        unlinkIfExists(self.meta) catch {};
         removeDirIfEmpty(self.dir) catch {};
     }
 };
@@ -574,12 +577,130 @@ pub const Meta = struct {
     }
 };
 
+pub const RuntimeGuidType = enum {
+    incoming_client,
+    outgoing_client,
+    local_session,
+    incoming_stream,
+    outgoing_stream,
+};
+
+pub fn runtimeGuidTypeName(guid_type: RuntimeGuidType) []const u8 {
+    return switch (guid_type) {
+        .incoming_client => "incoming-client",
+        .outgoing_client => "outgoing-client",
+        .local_session => "local-session",
+        .incoming_stream => "incoming-stream",
+        .outgoing_stream => "outgoing-stream",
+    };
+}
+
+const runtime_guid_session_meta_filenames = [_][]const u8{"meta.json"};
+const runtime_guid_directional_meta_filenames = [_][]const u8{
+    "incoming-meta.json",
+    "outgoing-meta.json",
+};
+const runtime_guid_empty_meta_filenames = [_][]const u8{};
+
+pub fn runtimeGuidMetaFilenamesForGuid(guid: []const u8) []const []const u8 {
+    if (isValidSessionGuid(guid)) return runtime_guid_session_meta_filenames[0..];
+    if (isValidClientGuid(guid) or isValidReconnectGuid(guid)) return runtime_guid_directional_meta_filenames[0..];
+    return runtime_guid_empty_meta_filenames[0..];
+}
+
+// Client and reconnectable-stream GUID directories can exist on both sides of
+// a connection at once. Each side owns one directional metadata file so teardown
+// can remove its own record without clobbering the other side's record.
+fn runtimeGuidMetaFilenameForType(guid_type: RuntimeGuidType) []const u8 {
+    return switch (guid_type) {
+        .local_session => "meta.json",
+        .incoming_client, .incoming_stream => "incoming-meta.json",
+        .outgoing_client, .outgoing_stream => "outgoing-meta.json",
+    };
+}
+
+fn runtimeGuidTypeFromName(value: []const u8) !RuntimeGuidType {
+    if (std.mem.eql(u8, value, "incoming-client")) return .incoming_client;
+    if (std.mem.eql(u8, value, "outgoing-client")) return .outgoing_client;
+    if (std.mem.eql(u8, value, "local-session")) return .local_session;
+    if (std.mem.eql(u8, value, "incoming-stream")) return .incoming_stream;
+    if (std.mem.eql(u8, value, "outgoing-stream")) return .outgoing_stream;
+    return error.InvalidRuntimeGuidMeta;
+}
+
+pub const RuntimeGuidMeta = struct {
+    guid_type: RuntimeGuidType,
+    created_at_unix_ms: ?u64,
+};
+
 pub fn writeMeta(paths: SessionPaths, agent_pid: c.pid_t, version: []const u8) !void {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(app_allocator.allocator());
     const writer = text.writer(app_allocator.allocator());
-    try writer.print("{{\"agent_pid\":{},\"version\":{f}}}\n", .{ agent_pid, std.json.fmt(version, .{}) });
+    const created_at_unix_ms = runtimeGuidMetaCreatedAtUnixMs(app_allocator.allocator(), paths.meta);
+    try writer.print(
+        "{{\"type\":{f},\"created_at_unix_ms\":{},\"agent_pid\":{},\"version\":{f}}}\n",
+        .{
+            std.json.fmt(runtimeGuidTypeName(.local_session), .{}),
+            created_at_unix_ms,
+            agent_pid,
+            std.json.fmt(version, .{}),
+        },
+    );
     try writeAtomicFile(paths.meta, text.items);
+}
+
+fn writeRuntimeGuidMetaInDir(allocator: std.mem.Allocator, dir: []const u8, guid_type: RuntimeGuidType) !void {
+    const path = try runtimeGuidMetaPathForTypeInDir(allocator, dir, guid_type);
+    defer allocator.free(path);
+    try writeRuntimeGuidMetaPath(allocator, path, guid_type);
+}
+
+fn writeRuntimeGuidMetaPath(allocator: std.mem.Allocator, path: []const u8, guid_type: RuntimeGuidType) !void {
+    const created_at_unix_ms = runtimeGuidMetaCreatedAtUnixMs(allocator, path);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    const writer = text.writer(allocator);
+    try writer.print(
+        "{{\"type\":{f},\"created_at_unix_ms\":{}}}\n",
+        .{ std.json.fmt(runtimeGuidTypeName(guid_type), .{}), created_at_unix_ms },
+    );
+    try writeAtomicFile(path, text.items);
+}
+
+fn runtimeGuidMetaCreatedAtUnixMs(allocator: std.mem.Allocator, path: []const u8) u64 {
+    const meta = readRuntimeGuidMeta(allocator, path) catch return currentUnixMs();
+    return meta.created_at_unix_ms orelse currentUnixMs();
+}
+
+fn removeRuntimeGuidMetaInDir(allocator: std.mem.Allocator, dir: []const u8, guid_type: RuntimeGuidType) !void {
+    const meta_path = try runtimeGuidMetaPathForTypeInDir(allocator, dir, guid_type);
+    defer allocator.free(meta_path);
+    try unlinkIfExists(meta_path);
+    removeDirIfEmpty(dir) catch |err| switch (err) {
+        error.DirNotEmpty => {},
+        else => return err,
+    };
+}
+
+fn currentUnixMs() u64 {
+    const ms = std.time.milliTimestamp();
+    if (ms <= 0) return 0;
+    return @intCast(ms);
+}
+
+pub fn readRuntimeGuidMeta(allocator: std.mem.Allocator, path: []const u8) !RuntimeGuidMeta {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 4096);
+    defer allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const object = try jsonObject(parsed.value);
+    const guid_type = try runtimeGuidTypeFromName(try jsonRequiredString(object, "type"));
+    return .{
+        .guid_type = guid_type,
+        .created_at_unix_ms = try jsonOptionalU64(object, "created_at_unix_ms"),
+    };
 }
 
 pub fn readMeta(allocator: std.mem.Allocator, paths: SessionPaths) !Meta {
@@ -1012,6 +1133,7 @@ fn writeClientRouteHintInRoots(
     const link_path = try clientRouteHintPathInRoot(allocator, runtime_root, canonical_client);
     defer allocator.free(link_path);
     try installSymlinkReplacing(allocator, link_path, route_path);
+    try writeRuntimeGuidMetaInDir(allocator, client_dir, .outgoing_client);
 }
 
 pub fn writeClientAgentSocketHint(allocator: std.mem.Allocator, client_guid: []const u8, session_guid: []const u8) !void {
@@ -1046,12 +1168,47 @@ fn writeClientAgentSocketHintInRoot(
     const link_path = try clientAgentSocketHintPathInRoot(allocator, runtime_root, canonical_client);
     defer allocator.free(link_path);
     try installSymlinkReplacing(allocator, link_path, target);
+    try writeRuntimeGuidMetaInDir(allocator, client_dir, .incoming_client);
 }
 
 pub fn runtimeAgentSocketPathsForGuid(allocator: std.mem.Allocator, guid: []const u8) !RuntimeAgentSocketPaths {
     const runtime_root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(runtime_root);
     return runtimeAgentSocketPathsForGuidInRoot(allocator, runtime_root, guid);
+}
+
+pub fn writeOutgoingStreamHint(allocator: std.mem.Allocator, guid: []const u8) !void {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    return writeOutgoingStreamHintInRoot(allocator, runtime_root, guid);
+}
+
+fn writeOutgoingStreamHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, guid: []const u8) !void {
+    try ensureRegistryRoot(allocator, runtime_root);
+    const guid_root = try sessionsDirInRoot(allocator, runtime_root);
+    defer allocator.free(guid_root);
+    try mkdirIgnoreExists(allocator, guid_root);
+
+    const canonical = try canonicalReconnectGuid(allocator, guid);
+    defer allocator.free(canonical);
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ guid_root, canonical });
+    defer allocator.free(dir);
+    try mkdirIgnoreExists(allocator, dir);
+    try writeRuntimeGuidMetaInDir(allocator, dir, .outgoing_stream);
+}
+
+pub fn removeOutgoingStreamHint(allocator: std.mem.Allocator, guid: []const u8) !void {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    return removeOutgoingStreamHintInRoot(allocator, runtime_root, guid);
+}
+
+fn removeOutgoingStreamHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, guid: []const u8) !void {
+    const canonical = try canonicalReconnectGuid(allocator, guid);
+    defer allocator.free(canonical);
+    const dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, canonical });
+    defer allocator.free(dir);
+    try removeRuntimeGuidMetaInDir(allocator, dir, .outgoing_stream);
 }
 
 pub fn runtimeAgentSocketPathsForGuidInRoot(
@@ -1079,6 +1236,9 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
     const agent_sock_link = try agentSocketLinkPath(allocator, dir);
     errdefer allocator.free(agent_sock_link);
 
+    const meta = try runtimeGuidMetaPathForTypeInDir(allocator, dir, .incoming_stream);
+    errdefer allocator.free(meta);
+
     const socket = socketPathFromAgentSocketLink(allocator, dir, agent_sock_link) catch |err| switch (err) {
         error.FileNotFound => blk: {
             var socket_allocation = try allocateSocketPathForGuidInRoot(allocator, runtime_root, canonical);
@@ -1090,11 +1250,13 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
         else => return err,
     };
     errdefer allocator.free(socket);
+    try writeRuntimeGuidMetaPath(allocator, meta, .incoming_stream);
 
     return .{
         .dir = dir,
         .socket = socket,
         .agent_sock_link = agent_sock_link,
+        .meta = meta,
     };
 }
 
@@ -1110,13 +1272,9 @@ fn removeClientRouteHintInRoot(allocator: std.mem.Allocator, runtime_root: []con
     const link_path = try clientRouteHintPathInRoot(allocator, runtime_root, canonical_client);
     defer allocator.free(link_path);
     try unlinkIfExists(link_path);
-
     const client_dir = try clientHintDirInRoot(allocator, runtime_root, canonical_client);
     defer allocator.free(client_dir);
-    removeDirIfEmpty(client_dir) catch |err| switch (err) {
-        error.DirNotEmpty => {},
-        else => return err,
-    };
+    try removeRuntimeGuidMetaInDir(allocator, client_dir, .outgoing_client);
 }
 
 pub fn removeClientAgentSocketHint(allocator: std.mem.Allocator, client_guid: []const u8) !void {
@@ -1131,13 +1289,9 @@ fn removeClientAgentSocketHintInRoot(allocator: std.mem.Allocator, runtime_root:
     const link_path = try clientAgentSocketHintPathInRoot(allocator, runtime_root, canonical_client);
     defer allocator.free(link_path);
     try unlinkIfExists(link_path);
-
     const client_dir = try clientHintDirInRoot(allocator, runtime_root, canonical_client);
     defer allocator.free(client_dir);
-    removeDirIfEmpty(client_dir) catch |err| switch (err) {
-        error.DirNotEmpty => {},
-        else => return err,
-    };
+    try removeRuntimeGuidMetaInDir(allocator, client_dir, .incoming_client);
 }
 
 pub fn readRouteForClientGuid(allocator: std.mem.Allocator, client_ref: []const u8) !Route {
@@ -1211,6 +1365,18 @@ fn clientRouteHintPathInRoot(allocator: std.mem.Allocator, runtime_root: []const
 
 fn clientAgentSocketHintPathInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, client_guid: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/guid/{s}/agent.sock", .{ runtime_root, client_guid });
+}
+
+pub fn runtimeGuidMetaPathInDir(allocator: std.mem.Allocator, dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/meta.json", .{dir});
+}
+
+pub fn runtimeGuidMetaPathForTypeInDir(allocator: std.mem.Allocator, dir: []const u8, guid_type: RuntimeGuidType) ![]u8 {
+    return runtimeGuidMetaPathForFilenameInDir(allocator, dir, runtimeGuidMetaFilenameForType(guid_type));
+}
+
+pub fn runtimeGuidMetaPathForFilenameInDir(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, filename });
 }
 
 fn routePathForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
@@ -1645,9 +1811,22 @@ pub fn shortClientGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     return shortTypedGuid(allocator, guid, client_guid_prefix);
 }
 
+pub fn shortReconnectGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    return shortTypedGuid(allocator, guid, reconnect_guid_prefix);
+}
+
+pub fn shortRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (isValidSessionGuid(guid)) return shortSessionGuid(allocator, guid);
+    if (isValidClientGuid(guid)) return shortClientGuid(allocator, guid);
+    if (isValidReconnectGuid(guid)) return shortReconnectGuid(allocator, guid);
+    return error.InvalidGuid;
+}
+
 fn shortTypedGuid(allocator: std.mem.Allocator, guid: []const u8, prefix: []const u8) ![]u8 {
     const compact = if (std.mem.eql(u8, prefix, session_guid_prefix))
         try compactGuid(allocator, guid)
+    else if (std.mem.eql(u8, prefix, reconnect_guid_prefix))
+        try compactReconnectGuid(allocator, guid)
     else
         try compactClientGuid(allocator, guid);
     defer allocator.free(compact);
@@ -2139,6 +2318,14 @@ fn removeDirIfEmpty(path: []const u8) !void {
     }
 }
 
+fn expectRuntimeGuidMetaType(allocator: std.mem.Allocator, path: []const u8, expected: RuntimeGuidType) !u64 {
+    const meta = try readRuntimeGuidMeta(allocator, path);
+    try std.testing.expectEqual(expected, meta.guid_type);
+    const created_at_unix_ms = meta.created_at_unix_ms orelse return error.MissingCreatedAt;
+    try std.testing.expect(created_at_unix_ms > 0);
+    return created_at_unix_ms;
+}
+
 test "refuses GUID session directories with runtime metadata" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(
@@ -2233,6 +2420,8 @@ test "runtime agent socket paths use typed guid directories and socket directory
     try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/r-550e8400-e29b-41d4-a716-446655440000", paths.dir);
     try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/s/550e8400e29b41d4a716446655440000", paths.socket);
     try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/r-550e8400-e29b-41d4-a716-446655440000/agent.sock", paths.agent_sock_link);
+    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/r-550e8400-e29b-41d4-a716-446655440000/incoming-meta.json", paths.meta);
+    const created_at_unix_ms = try expectRuntimeGuidMetaType(allocator, paths.meta, .incoming_stream);
 
     const link_target = try readLinkAlloc(allocator, paths.agent_sock_link, 4096);
     defer allocator.free(link_target);
@@ -2241,6 +2430,41 @@ test "runtime agent socket paths use typed guid directories and socket directory
     var again = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
     defer again.deinit(allocator);
     try std.testing.expectEqualStrings(paths.socket, again.socket);
+    try std.testing.expectEqual(created_at_unix_ms, try expectRuntimeGuidMetaType(allocator, again.meta, .incoming_stream));
+
+    paths.removeRuntimeFiles();
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.meta));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.dir));
+}
+
+test "outgoing stream hints use runtime metadata without stealing incoming stream cleanup" {
+    const allocator = std.testing.allocator;
+    const root = "zig-cache/outgoing-stream-hint-test";
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+
+    const guid = "r-550e8400-e29b-41d4-a716-446655440000";
+    const dir = "zig-cache/outgoing-stream-hint-test/guid/r-550e8400-e29b-41d4-a716-446655440000";
+    const incoming_meta_path = "zig-cache/outgoing-stream-hint-test/guid/r-550e8400-e29b-41d4-a716-446655440000/incoming-meta.json";
+    const outgoing_meta_path = "zig-cache/outgoing-stream-hint-test/guid/r-550e8400-e29b-41d4-a716-446655440000/outgoing-meta.json";
+
+    try writeOutgoingStreamHintInRoot(allocator, root, guid);
+    _ = try expectRuntimeGuidMetaType(allocator, outgoing_meta_path, .outgoing_stream);
+    try removeOutgoingStreamHintInRoot(allocator, root, guid);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(outgoing_meta_path));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(dir));
+
+    try writeOutgoingStreamHintInRoot(allocator, root, guid);
+    var incoming = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
+    defer incoming.deinit(allocator);
+    _ = try expectRuntimeGuidMetaType(allocator, incoming_meta_path, .incoming_stream);
+    _ = try expectRuntimeGuidMetaType(allocator, outgoing_meta_path, .outgoing_stream);
+
+    try removeOutgoingStreamHintInRoot(allocator, root, guid);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(outgoing_meta_path));
+    _ = try expectRuntimeGuidMetaType(allocator, incoming_meta_path, .incoming_stream);
+    incoming.removeRuntimeFiles();
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(dir));
 }
 
 test "validates session ids and aliases" {
@@ -2457,6 +2681,13 @@ test "runtime client route hints point client guids at session routes" {
     route_file.close();
 
     try writeClientRouteHintInRoots(allocator, runtime_root, state_root, client_guid, session_guid);
+    const client_dir = try clientHintDirInRoot(allocator, runtime_root, client_guid);
+    defer allocator.free(client_dir);
+    const outgoing_client_meta_path = try runtimeGuidMetaPathForTypeInDir(allocator, client_dir, .outgoing_client);
+    defer allocator.free(outgoing_client_meta_path);
+    const incoming_client_meta_path = try runtimeGuidMetaPathForTypeInDir(allocator, client_dir, .incoming_client);
+    defer allocator.free(incoming_client_meta_path);
+    _ = try expectRuntimeGuidMetaType(allocator, outgoing_client_meta_path, .outgoing_client);
     const hint_path = try clientRouteHintPathInRoot(allocator, runtime_root, client_guid);
     defer allocator.free(hint_path);
     const target = try readLinkAlloc(allocator, hint_path, 4096);
@@ -2469,6 +2700,8 @@ test "runtime client route hints point client guids at session routes" {
     const socket_target = try readLinkAlloc(allocator, socket_hint_path, 4096);
     defer allocator.free(socket_target);
     try std.testing.expectEqualStrings("../s-550e8400-e29b-41d4-a716-446655440000/agent.sock", socket_target);
+    _ = try expectRuntimeGuidMetaType(allocator, incoming_client_meta_path, .incoming_client);
+    _ = try expectRuntimeGuidMetaType(allocator, outgoing_client_meta_path, .outgoing_client);
 
     const socket_hint_from_prefix = try clientAgentSocketPathForClientGuidInRoot(allocator, runtime_root, "c-550e8400e");
     defer allocator.free(socket_hint_from_prefix);
@@ -2479,12 +2712,21 @@ test "runtime client route hints point client guids at session routes" {
     try std.testing.expectEqualStrings(session_guid, route.guid);
 
     try writeClientRouteHintInRoots(allocator, runtime_root, state_root, second_client_guid, session_guid);
+    const second_client_dir = try clientHintDirInRoot(allocator, runtime_root, second_client_guid);
+    defer allocator.free(second_client_dir);
+    const second_client_meta_path = try runtimeGuidMetaPathForTypeInDir(allocator, second_client_dir, .outgoing_client);
+    defer allocator.free(second_client_meta_path);
+    _ = try expectRuntimeGuidMetaType(allocator, second_client_meta_path, .outgoing_client);
     try std.testing.expectError(error.AmbiguousClientId, readRouteForClientGuidInRoot(allocator, runtime_root, "c-550e8400"));
 
     try removeClientRouteHintInRoot(allocator, runtime_root, client_guid);
     try std.testing.expectError(error.FileNotFound, readRouteForClientGuidInRoot(allocator, runtime_root, client_guid));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(outgoing_client_meta_path));
+    _ = try expectRuntimeGuidMetaType(allocator, incoming_client_meta_path, .incoming_client);
     try removeClientAgentSocketHintInRoot(allocator, runtime_root, client_guid);
     try std.testing.expectError(error.FileNotFound, clientAgentSocketPathForClientGuidInRoot(allocator, runtime_root, client_guid));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(incoming_client_meta_path));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(client_dir));
 }
 
 test "tombstone snapshots aliases, removes route, and releases aliases" {
@@ -2607,10 +2849,14 @@ test "registry writes json metadata" {
     defer allocation.deinit(allocator);
 
     try writeMeta(allocation.paths, 12345, "0.4.0-dev");
+    const created_at_unix_ms = try expectRuntimeGuidMetaType(allocator, allocation.paths.meta, .local_session);
     var meta = try readMeta(allocator, allocation.paths);
     defer meta.deinit(allocator);
     try std.testing.expectEqual(@as(c.pid_t, 12345), meta.agent_pid);
     try std.testing.expectEqualStrings("0.4.0-dev", meta.version);
+
+    try writeMeta(allocation.paths, 12346, "0.4.1-dev");
+    try std.testing.expectEqual(created_at_unix_ms, try expectRuntimeGuidMetaType(allocator, allocation.paths.meta, .local_session));
 }
 
 test "stale cleanup removes runtime session directory" {
