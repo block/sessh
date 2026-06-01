@@ -60,6 +60,10 @@ const stream_channels = [_]StreamChannel{
     stream_channel_stdout,
     stream_channel_stderr,
 };
+// Source EOF is reported as fd readiness on some platforms and as HUP/ERR on
+// others. Either way, a ready source gets a read attempt before we consider the
+// child reaped or the stream complete.
+const source_poll_events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR;
 
 const ChannelMask = struct {
     stdin: bool = false,
@@ -475,7 +479,7 @@ const StreamAttachment = struct {
             const channel_state = state.channel(source.channel);
             if (channel_state.outbound_eof or channel_state.bufferedBytes() >= max_buffered_bytes) continue;
             source_poll_indices[source_index] = count;
-            pollfds[count] = .{ .fd = source.fd, .events = posix.POLL.IN, .revents = 0 };
+            pollfds[count] = .{ .fd = source.fd, .events = source_poll_events, .revents = 0 };
             count += 1;
         }
 
@@ -502,18 +506,6 @@ const StreamAttachment = struct {
             if (self.liveness.pingDue(now_after_poll_ms)) {
                 protocol.sendPing(self.transport_write_fd) catch return .transport_closed;
                 self.liveness.notePingSent(now_after_poll_ms);
-            }
-            // A source can become EOF just after we read its final data bytes.
-            // Poll usually wakes again for EOF, but the liveness timer is also
-            // a safe place to do a nonblocking drain so short commands do not
-            // leave the stream agent waiting for a reconnect that is no longer
-            // needed.
-            try drainChildStreamSources(state, &self.options);
-            if (state.peer_ready) {
-                sendPending(state, self.transport_write_fd) catch |err| switch (err) {
-                    error.WriteFailed => return .transport_closed,
-                    else => return err,
-                };
             }
             return .idle;
         }
@@ -550,6 +542,19 @@ const StreamAttachment = struct {
                 error.StreamTransportWriteFailed => return .transport_closed,
                 else => return err,
             };
+            // A transport frame can make source bytes or EOF immediately useful
+            // without any new source readiness. For example, StreamResume tells
+            // us the peer is ready for retransmission, and inbound EOF can mark
+            // our outbound side closed. Drain child-backed sources once before
+            // sleeping again so short commands finish on actual EOF/status
+            // events instead of an unrelated later wakeup.
+            try drainChildStreamSources(state, &self.options);
+            if (state.peer_ready) {
+                sendPending(state, self.transport_write_fd) catch |err| switch (err) {
+                    error.WriteFailed => return .transport_closed,
+                    else => return err,
+                };
+            }
             return .progress;
         }
 
@@ -1061,7 +1066,7 @@ fn waitForReplacementWhileDetached(
             const channel_state = state.channel(source.channel);
             if (channel_state.outbound_eof or channel_state.bufferedBytes() >= max_buffered_bytes) continue;
             source_poll_indices[source_index] = count;
-            pollfds[count] = .{ .fd = source.fd, .events = posix.POLL.IN, .revents = 0 };
+            pollfds[count] = .{ .fd = source.fd, .events = source_poll_events, .revents = 0 };
             count += 1;
         }
 
@@ -2271,6 +2276,133 @@ test "stream receiver keeps suffix from overlapping data frame" {
     defer ack_message.deinit(std.testing.allocator);
     try std.testing.expectEqual(stream_channel_stdout, ack_message.channel);
     try std.testing.expectEqual(@as(u64, 11), ack_message.offset);
+}
+
+test "stream inbound eof promptly flushes generated outbound eof" {
+    const transport_in = try posix.pipe();
+    defer posix.close(transport_in[0]);
+    defer posix.close(transport_in[1]);
+    const transport_out = try posix.pipe();
+    defer posix.close(transport_out[0]);
+    defer posix.close(transport_out[1]);
+
+    var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{ .stdout = true });
+    defer state.deinit();
+    state.peer_ready = true;
+
+    const payload = try protocol.encodePayload(std.testing.allocator, pb.StreamEof{
+        .channel = stream_channel_stdout,
+        .offset = 0,
+    });
+    defer std.testing.allocator.free(payload);
+    try protocol.sendFrame(transport_in[1], .stream_eof, payload);
+
+    var attachment = StreamAttachment{
+        .state = &state,
+        .transport_read_fd = transport_in[0],
+        .transport_write_fd = transport_out[1],
+        .options = .{
+            .close_outbound_on_inbound_eof = true,
+        },
+        .liveness = StreamLiveness.init(1_000),
+    };
+
+    try std.testing.expectEqual(StreamStepOutcome.progress, try attachment.step(1_000));
+
+    var ack_frame = try protocol.readFrameAlloc(std.testing.allocator, transport_out[0]);
+    defer ack_frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.stream_eof_ack, ack_frame.message_type);
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = transport_out[0],
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 0));
+
+    var eof_frame = try protocol.readFrameAlloc(std.testing.allocator, transport_out[0]);
+    defer eof_frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.stream_eof, eof_frame.message_type);
+    var eof = try protocol.decodePayload(pb.StreamEof, std.testing.allocator, eof_frame.payload);
+    defer eof.deinit(std.testing.allocator);
+    try std.testing.expectEqual(stream_channel_stdin, eof.channel);
+}
+
+test "stream resume drains already-exited child source without waiting for source poll" {
+    var child = try pty_process.spawn(std.testing.allocator, .{
+        .rows = 24,
+        .cols = 80,
+        .shell = "/bin/sh",
+        .shell_command = "exit 13",
+    });
+    defer child.terminate();
+
+    var child_poll = [_]posix.pollfd{.{
+        .fd = child.master_fd,
+        .events = source_poll_events,
+        .revents = 0,
+    }};
+    const child_ready = try posix.poll(&child_poll, 1_000);
+    try std.testing.expectEqual(@as(usize, 1), child_ready);
+
+    const transport_in = try posix.pipe();
+    defer posix.close(transport_in[0]);
+    defer posix.close(transport_in[1]);
+    const transport_out = try posix.pipe();
+    defer posix.close(transport_out[0]);
+    defer posix.close(transport_out[1]);
+
+    var state = StreamState.init(std.testing.allocator, .{ .stdout = true }, .{ .stdin = true });
+    defer state.deinit();
+    var exited = false;
+    var exit_status: ?pb.ExitStatus = null;
+
+    const resume_payload = try protocol.encodePayload(std.testing.allocator, pb.StreamResume{});
+    defer std.testing.allocator.free(resume_payload);
+    try protocol.sendFrame(transport_in[1], .stream_resume, resume_payload);
+
+    var attachment = StreamAttachment{
+        .state = &state,
+        .transport_read_fd = transport_in[0],
+        .transport_write_fd = transport_out[1],
+        .options = .{
+            .source_count = 1,
+            .sources = .{
+                .{
+                    .fd = child.master_fd,
+                    .channel = stream_channel_stdout,
+                    .kind = .pty_master,
+                },
+                .{},
+            },
+            .source_exit_pid = child.pid,
+            .source_exit_seen = &exited,
+            .source_exit_status = &exit_status,
+        },
+        .liveness = StreamLiveness.init(1_000),
+    };
+
+    try std.testing.expectEqual(StreamStepOutcome.progress, try attachment.step(1_000));
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = transport_out[0],
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 0));
+
+    var eof_frame = try protocol.readFrameAlloc(std.testing.allocator, transport_out[0]);
+    defer eof_frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.stream_eof, eof_frame.message_type);
+    var eof = try protocol.decodePayload(pb.StreamEof, std.testing.allocator, eof_frame.payload);
+    defer eof.deinit(std.testing.allocator);
+    try std.testing.expectEqual(stream_channel_stdout, eof.channel);
+
+    try std.testing.expect(exited);
+    try std.testing.expect(exit_status != null);
+    try std.testing.expectEqual(pb.ExitStatusKind.EXIT_STATUS_KIND_EXITED, exit_status.?.kind);
+    try std.testing.expectEqual(@as(i32, 13), exit_status.?.status);
+    child.pid = 0;
 }
 
 test "stream liveness schedules probes before declaring unresponsive" {
