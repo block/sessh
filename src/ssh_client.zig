@@ -3137,14 +3137,10 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
 
     // Direct stream stdout can be application data. If it is a terminal, title
     // updates are the least invasive reconnect UI. If stdout is redirected,
-    // keep it byte-clean and use append-only stderr status only when stderr is
-    // itself a terminal; otherwise reconnects stay silent.
-    const status_mode: stream_agent.StreamReconnectStatusMode = if (c.isatty(1) != 0)
-        .title
-    else if (c.isatty(2) != 0)
-        .stderr_plain
-    else
-        .disabled;
+    // keep it byte-clean and use append-only stderr lines. The plain stderr
+    // form deliberately does not require stderr to be a terminal: it is also
+    // useful in logs, and write failures are ignored by the status renderer.
+    const status_mode = streamReconnectStatusMode(c.isatty(1) != 0);
 
     stream_agent.runLocalStream(allocator, &starter, .{
         .source_fd = 0,
@@ -3159,6 +3155,10 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
         try starter.exitAfterInitialFailure(err);
     };
     return process_exit.request(0);
+}
+
+fn streamReconnectStatusMode(stdout_is_tty: bool) stream_agent.StreamReconnectStatusMode {
+    return if (stdout_is_tty) .title else .stderr_plain;
 }
 
 fn encodeStreamCommandArg(allocator: std.mem.Allocator, shell_command: ?[]const u8) ![]u8 {
@@ -5400,6 +5400,11 @@ test "brokerArgsForAction uses broker subcommands" {
         .client_repaint_scrollback = true,
         .client_session_ref = "s1",
     }, &buf));
+}
+
+test "stream reconnect status uses stderr when stdout is redirected" {
+    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.title, streamReconnectStatusMode(true));
+    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, streamReconnectStatusMode(false));
 }
 
 test "parseSshArgs accepts persistent command argv after delimiter" {
