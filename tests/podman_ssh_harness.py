@@ -37,6 +37,7 @@ RUN ssh-keygen -A && mkdir -p /run/sshd /root/.ssh
 # because it does not do POSIX-style word splitting for unquoted scalar
 # expansion, which is exactly the class of bug `/bin/sh` would hide here.
 RUN sed -i 's#^\\(root:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:\\).*#\\1/bin/zsh#' /etc/passwd
+RUN printf '\\nAcceptEnv SESSH_TEST_SENDENV\\n' >> /etc/ssh/sshd_config
 COPY authorized_keys /root/.ssh/authorized_keys
 RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
 EXPOSE 22
@@ -470,6 +471,7 @@ def compare_openssh_oracle(
         timeout=timeout,
     )
     assert_observable_matches(name, ssh_result, sessh_result, compare_stderr=compare_stderr)
+    return ssh_result, sessh_result
 
 
 def compare_openssh_pty_oracle(
@@ -498,6 +500,7 @@ def compare_openssh_pty_oracle(
         timeout=timeout,
     )
     assert_observable_matches(name, ssh_result, sessh_result, compare_stderr=False)
+    return ssh_result, sessh_result
 
 
 def compare_openssh_tmux_visible_oracle(
@@ -530,6 +533,7 @@ def compare_openssh_tmux_visible_oracle(
         timeout=timeout,
     )
     assert_tmux_visible_matches(name, ssh_result, sessh_result)
+    return ssh_result, sessh_result
 
 
 def run_signal_after_stdout(cmd, env, needle, sig=signal.SIGINT, timeout=30.0):
@@ -572,6 +576,76 @@ def compare_signal_oracle(name, prefix, config, host_alias, env, *, remote_args,
         timeout=timeout,
     )
     assert_observable_matches(name, ssh_result, sessh_result, compare_stderr=False)
+
+
+def assert_sendenv_visible(name, results, expected_value):
+    for label, result in (("ssh", results[0]), ("sessh", results[1])):
+        stdout = normalize_output(result.stdout)
+        if expected_value not in stdout:
+            raise AssertionError(
+                f"{name} did not expose SendEnv value for {label}\n"
+                f"expected={expected_value!r} stdout={stdout!r}"
+            )
+
+
+def test_sendenv_oracle_cases(prefix, config, host_alias, env):
+    sendenv_name = "SESSH_TEST_SENDENV"
+    sendenv_value = "sendenv-from-client"
+    old_process_sendenv = os.environ.get(sendenv_name)
+    old_sessh_sendenv = env.get(sendenv_name)
+    os.environ[sendenv_name] = sendenv_value
+    env[sendenv_name] = sendenv_value
+    command = f"printf 'SENDENV:%s\\n' \"${{{sendenv_name}-unset}}\""
+    try:
+        assert_sendenv_visible(
+            "SendEnv non-tty command",
+            compare_openssh_oracle(
+                "SendEnv non-tty command",
+                prefix,
+                config,
+                host_alias,
+                env,
+                ssh_options=("-T",),
+                remote_args=(command,),
+            ),
+            sendenv_value,
+        )
+        assert_sendenv_visible(
+            "SendEnv terminal-emulator tty command",
+            compare_openssh_tmux_visible_oracle(
+                "SendEnv terminal-emulator tty command",
+                prefix,
+                config,
+                host_alias,
+                env,
+                ssh_options=("-t",),
+                remote_args=(command,),
+            ),
+            sendenv_value,
+        )
+        assert_sendenv_visible(
+            "SendEnv no-terminal-emulator tty command",
+            compare_openssh_pty_oracle(
+                "SendEnv no-terminal-emulator tty command",
+                prefix,
+                config,
+                host_alias,
+                env,
+                ssh_options=("-t",),
+                sessh_options=("--no-terminal-emulator",),
+                remote_args=(command,),
+            ),
+            sendenv_value,
+        )
+    finally:
+        if old_process_sendenv is None:
+            os.environ.pop(sendenv_name, None)
+        else:
+            os.environ[sendenv_name] = old_process_sendenv
+        if old_sessh_sendenv is None:
+            env.pop(sendenv_name, None)
+        else:
+            env[sendenv_name] = old_sessh_sendenv
 
 
 def skip(message):
@@ -736,6 +810,7 @@ Host {host_alias}
   UserKnownHostsFile /dev/null
   LogLevel ERROR
   BatchMode yes
+  SendEnv SESSH_TEST_SENDENV
 """
     )
     config.chmod(0o600)
@@ -815,6 +890,7 @@ def test_openssh_oracle_matrix(prefix, config, host_alias, env):
         ssh_options=("-T",),
         remote_args=("tty || true",),
     )
+    test_sendenv_oracle_cases(prefix, config, host_alias, env)
     compare_openssh_oracle(
         "requested tty without local tty",
         prefix,
