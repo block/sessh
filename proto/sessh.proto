@@ -49,42 +49,52 @@ message Frame {
     StreamEofAck stream_eof_ack = 38;
     StreamPing stream_ping = 39;
     StreamPong stream_pong = 40;
-    StreamParentStatus stream_parent_status = 41;
-    StreamReconnectNow stream_reconnect_now = 42;
   }
 }
 
-// Sent at the start of every ssh transport that carries a reconnectable byte
-// stream. The receiver uses recv_next_offset to drop bytes that the peer
-// already received and resume from the first unacknowledged byte.
+// Sent at the start of every ssh transport that carries reconnectable byte
+// streams. The receiver uses the per-channel offsets to drop bytes that the
+// peer already received and resume each channel from its first unacknowledged
+// byte.
 message StreamResume {
-  // Next inbound byte offset this peer expects from the other side.
-  uint64 recv_next_offset = 1;
+  uint64 stdin_recv_next_offset = 1;
+  uint64 stdout_recv_next_offset = 2;
+  uint64 stderr_recv_next_offset = 3;
 }
 
-// Raw bytes from this peer's outbound stream.
+// Raw bytes from this peer's outbound stream on one logical channel.
 message StreamData {
-  // Offset of data[0] in this peer's outbound byte stream.
-  uint64 offset = 1;
-  bytes data = 2;
+  // Logical byte-stream id. -1 is undefined; 0, 1, and 2 match the standard
+  // stdin, stdout, and stderr file descriptor numbers. Other positive values
+  // are reserved for future channels.
+  int32 channel = 1;
+  // Offset of data[0] in this peer's outbound byte stream for this channel.
+  uint64 offset = 2;
+  bytes data = 3;
 }
 
 // Acknowledges received StreamData bytes.
 message StreamAck {
-  // First byte offset not yet received from the sender.
-  uint64 offset = 1;
+  // Logical byte-stream id; see StreamData.channel.
+  int32 channel = 1;
+  // First byte offset not yet received from the sender for this channel.
+  uint64 offset = 2;
 }
 
 // Marks the end of this peer's outbound stream.
 message StreamEof {
-  // Offset of the end of the sender's byte stream.
-  uint64 offset = 1;
+  // Logical byte-stream id; see StreamData.channel.
+  int32 channel = 1;
+  // Offset of the end of the sender's byte stream for this channel.
+  uint64 offset = 2;
 }
 
 // Acknowledges that StreamEof was received.
 message StreamEofAck {
-  // Offset of the end of the sender's byte stream after receiving StreamEof.
-  uint64 offset = 1;
+  // Logical byte-stream id; see StreamData.channel.
+  int32 channel = 1;
+  // Offset of the end of the sender's byte stream for this channel.
+  uint64 offset = 2;
 }
 
 // A liveness probe for reconnectable byte streams. This is not an application
@@ -95,34 +105,6 @@ message StreamPing {
 
 // Response to StreamPing.
 message StreamPong {
-}
-
-message StreamParentRetry {
-  uint64 delay_ms = 1;
-}
-
-message StreamParentReconnecting {
-}
-
-message StreamParentClear {
-}
-
-// Sent by the stream ProxyCommand to its parent sessh process. ProxyCommand
-// stdout is reserved for the ssh byte stream, so reconnect UI is requested over
-// the same framed protobuf protocol on the local parent-control socket.
-message StreamParentStatus {
-  oneof status {
-    StreamParentRetry retry = 1;
-    StreamParentReconnecting reconnecting = 2;
-    StreamParentClear clear = 3;
-  }
-}
-
-// Sent by the parent sessh process to the stream ProxyCommand when the user
-// asks to reconnect immediately from local reconnect UI, currently with
-// Ctrl-R. This is intentionally outside the ssh byte stream so the remote
-// process never receives the UI control byte.
-message StreamReconnectNow {
 }
 
 // Embedded in SessionCreate.

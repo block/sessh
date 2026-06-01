@@ -9,7 +9,7 @@ const io = @import("io.zig");
 const process_exit = @import("process_exit.zig");
 const session_agent = @import("session_agent.zig");
 const ssh_client = @import("ssh_client.zig");
-const stream_proxy = @import("stream_proxy.zig");
+const stream_agent = @import("stream_agent.zig");
 const terminal = @import("terminal.zig");
 
 pub fn main() !void {
@@ -67,16 +67,8 @@ fn runMain() !void {
         return broker.run(allocator, args[0], args[2..]);
     }
 
-    if (std.mem.eql(u8, args[1], ":internal-stream-client:")) {
-        return ssh_client.runInternalStreamClient(allocator, args[2..]);
-    }
-
-    if (std.mem.eql(u8, args[1], ":internal-stream-remote:")) {
-        return stream_proxy.runRemote(allocator, args[0], args[2..]);
-    }
-
     if (std.mem.eql(u8, args[1], ":internal-stream-agent:")) {
-        return stream_proxy.runAgent(allocator, args[2..]);
+        return stream_agent.runAgent(allocator, args[0], args[2..]);
     }
 
     return ssh_client.runMux(allocator, args, true);
@@ -188,13 +180,14 @@ test {
     _ = @import("app_allocator.zig");
     _ = @import("broker.zig");
     _ = @import("client_renderer.zig");
+    _ = @import("pty_process.zig");
     _ = @import("process_exit.zig");
     _ = @import("runtime_refresher.zig");
     _ = @import("session_agent.zig");
     _ = @import("relay.zig");
     _ = @import("session_registry.zig");
     _ = @import("ssh_client.zig");
-    _ = @import("stream_proxy.zig");
+    _ = @import("stream_agent.zig");
     _ = @import("terminal.zig");
     _ = @import("tty_transcript.zig");
     _ = @import("vt.zig");

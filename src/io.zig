@@ -20,9 +20,9 @@ pub fn noteRead(fd: c.fd_t, bytes: []const u8) void {
     if (read_hook) |hook| hook(fd, bytes);
 }
 
-// Some callers hand us fds whose blocking mode we did not choose. OpenSSH, for
-// example, can mark ProxyCommand pipes nonblocking. Keep these helpers
-// blocking-style by waiting and retrying when the kernel reports "try again".
+// Some callers hand us fds whose blocking mode we did not choose. Keep these
+// helpers blocking-style by waiting and retrying when the kernel reports "try
+// again".
 pub fn readExact(fd: c.fd_t, buf: []u8) !void {
     var offset: usize = 0;
     while (offset < buf.len) {

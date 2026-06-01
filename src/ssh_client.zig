@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
-const app_allocator = @import("app_allocator.zig");
 const client = @import("client.zig");
 const client_log = @import("client_log.zig");
 const config = @import("config.zig");
@@ -11,14 +10,10 @@ const io = @import("io.zig");
 const process_exit = @import("process_exit.zig");
 const protocol = @import("protocol.zig");
 const reconnect = @import("reconnect.zig");
-const reconnect_control = @import("reconnect_control.zig");
-const reconnect_title = @import("reconnect_title.zig");
 const session_registry = @import("session_registry.zig");
-const socket_transport = @import("socket_transport.zig");
-const stream_proxy = @import("stream_proxy.zig");
+const stream_agent = @import("stream_agent.zig");
 const terminal = @import("terminal.zig");
 const tty_transcript = @import("tty_transcript.zig");
-const vt = @import("vt.zig");
 const pb = protocol.pb;
 
 const bootstrapper_script = @embedFile("bootstrapper.sh");
@@ -1218,12 +1213,12 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
     defer if (parsed_ssh_args.default_ipqos_option) |option| allocator.free(option);
 
     const stdin_is_tty = c.isatty(0) != 0;
-    if (shouldUseStreamProxy(parsed_ssh_args, stdin_is_tty)) {
+    if (shouldUseDirectStream(parsed_ssh_args, stdin_is_tty)) {
         if (parsed_ssh_args.capture_tty_transcript != null) {
             try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with stream passthrough\n");
             return process_exit.request(64);
         }
-        try runStreamProxySsh(allocator, parsed_ssh_args, stdin_is_tty);
+        try runDirectStreamSsh(allocator, parsed_ssh_args, stdin_is_tty);
     }
 
     const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
@@ -2011,7 +2006,10 @@ fn remoteCompatCommandScriptFor(
         \\    compat_target=$(readlink "$compat") || exit 1
         \\  fi
         \\  case "$(basename "$compat_target")" in
-        \\    sesshmux*) XDG_RUNTIME_DIR=$runtime_root SESSH_GUID="$session_guid" SESSH_CLIENT_VERSION={s} SESSH_COMPAT=1 exec "$compat" :internal-sessh: .{s} ;;
+        \\    # sesshmux owns the public mux command parser, so give it the
+        \\    # command directly. Older combined sessh-style compat binaries
+        \\    # still need "." to force a local route.
+        \\    sesshmux*) XDG_RUNTIME_DIR=$runtime_root SESSH_GUID="$session_guid" SESSH_CLIENT_VERSION={s} SESSH_COMPAT=1 exec "$compat"{s} ;;
         \\    *) XDG_RUNTIME_DIR=$runtime_root SESSH_GUID="$session_guid" SESSH_CLIENT_VERSION={s} SESSH_COMPAT=1 exec "$compat" .{s} ;;
         \\  esac
         \\}}
@@ -2023,7 +2021,10 @@ fn remoteCompatCommandScriptFor(
         \\    compat_target=$(readlink "$compat") || exit 1
         \\  fi
         \\  case "$(basename "$compat_target")" in
-        \\    sesshmux*) XDG_RUNTIME_DIR=$runtime_root SESSH_GUID="$session_guid" SESSH_CLIENT_VERSION={s} SESSH_COMPAT=1 "$compat" :internal-sessh: .{s} ;;
+        \\    # sesshmux owns the public mux command parser, so give it the
+        \\    # command directly. Older combined sessh-style compat binaries
+        \\    # still need "." to force a local route.
+        \\    sesshmux*) XDG_RUNTIME_DIR=$runtime_root SESSH_GUID="$session_guid" SESSH_CLIENT_VERSION={s} SESSH_COMPAT=1 "$compat"{s} ;;
         \\    *) XDG_RUNTIME_DIR=$runtime_root SESSH_GUID="$session_guid" SESSH_CLIENT_VERSION={s} SESSH_COMPAT=1 "$compat" .{s} ;;
         \\  esac
         \\}}
@@ -2949,7 +2950,7 @@ fn canUsePlainSshFallback(
         reconnect_ui == null;
 }
 
-fn shouldUseStreamProxy(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
+fn shouldUseDirectStream(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
     if (parsed_ssh_args.action != .new) return false;
     if (parsed_ssh_args.command_argv.len != 0) return false;
     if (parsed_ssh_args.passthrough) return true;
@@ -2966,7 +2967,7 @@ fn shouldUseStreamProxy(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool
     };
 }
 
-fn streamProxyUsesTty(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
+fn directStreamUsesTty(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
     return switch (parsed_ssh_args.tty_request) {
         .forced => true,
         .requested => stdin_is_tty,
@@ -3056,834 +3057,76 @@ const StreamClientStarter = struct {
     }
 };
 
-pub fn runInternalStreamClient(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    var guid: ?[]const u8 = null;
-    var host: ?[]const u8 = null;
-    var port: ?[]const u8 = null;
-    var outer_tty = false;
-    var ssh_options: std.ArrayList([]const u8) = .empty;
-    defer ssh_options.deinit(allocator);
-
-    // The stream proxy owns failure detection and reconnect. Disable ssh's
-    // keepalive timer on the inner connection so it does not race the proxy's
-    // own byte-preserving retry loop.
-    try ssh_options.append(allocator, "-oServerAliveInterval=0");
-
-    var i: usize = 0;
-    while (i < args.len) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--guid")) {
-            i += 1;
-            if (i >= args.len) return streamClientArgError("--guid requires a value");
-            guid = args[i];
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--host")) {
-            i += 1;
-            if (i >= args.len) return streamClientArgError("--host requires a value");
-            host = args[i];
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--port")) {
-            i += 1;
-            if (i >= args.len) return streamClientArgError("--port requires a value");
-            port = args[i];
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--ssh-option")) {
-            i += 1;
-            if (i >= args.len) return streamClientArgError("--ssh-option requires a value");
-            try ssh_options.append(allocator, args[i]);
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--outer-tty")) {
-            outer_tty = true;
-            i += 1;
-        } else {
-            return streamClientArgError("unsupported stream client option");
-        }
-    }
-
-    const resolved_guid = guid orelse return streamClientArgError("--guid requires a value");
-    if (!session_registry.isValidReconnectGuid(resolved_guid)) return streamClientArgError("invalid reconnect guid");
-    const resolved_host = host orelse return streamClientArgError("--host requires a value");
-    const resolved_port = port orelse return streamClientArgError("--port requires a value");
+fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) !noreturn {
+    const stream_guid = try session_registry.generateReconnectGuid(allocator);
+    defer allocator.free(stream_guid);
+    const stream_uses_tty = directStreamUsesTty(parsed_ssh_args, stdin_is_tty);
+    const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
+    defer if (shell_command) |command| allocator.free(command);
+    const command_arg = try encodeStreamCommandArg(allocator, shell_command);
+    defer allocator.free(command_arg);
 
     var artifacts = try loadArtifactSet(allocator);
     defer artifacts.deinit();
     const remote_command = try bootstrapCommand(allocator);
     defer allocator.free(remote_command);
 
-    const broker_args = [_][]const u8{ ":internal-stream-remote:", resolved_guid, resolved_port };
-    // Streams have one r-guid. The parent sessh process owns the local control
-    // socket for that guid, and the ProxyCommand child connects to it for
-    // status updates and local reconnect commands. The remote stream runtime
-    // uses a separate XDG_RUNTIME_DIR, so localhost/fake-ssh runs do not need
-    // a second guid or unlink/reuse dance.
-    var parent_control_paths = try session_registry.runtimeAgentSocketPathsForGuid(allocator, resolved_guid);
-    defer parent_control_paths.deinit(allocator);
+    const size = terminal.currentWindowSize();
+    const rows_arg = try std.fmt.allocPrint(allocator, "{}", .{size.rows});
+    defer allocator.free(rows_arg);
+    const cols_arg = try std.fmt.allocPrint(allocator, "{}", .{size.cols});
+    defer allocator.free(cols_arg);
+    const mode_arg = if (stream_uses_tty) "pty" else "pipe";
+    const broker_args = [_][]const u8{
+        ":internal-stream-agent:",
+        stream_guid,
+        mode_arg,
+        rows_arg,
+        cols_arg,
+        command_arg,
+    };
+
+    var parsed_transport_args = parsed_ssh_args;
+    if (stream_uses_tty) {
+        // In the direct stream design OpenSSH is only the transport. sessh
+        // owns the remote PTY, so user `-t`/`-tt` decides whether we request
+        // PTY mode from our stream agent but is not forwarded to transport ssh.
+        parsed_transport_args.tty_request = .none;
+    }
     var starter = StreamClientStarter{
         .allocator = allocator,
-        .parsed_ssh_args = .{
-            .options = ssh_options.items,
-            .host = resolved_host,
-        },
+        .parsed_ssh_args = parsed_transport_args,
         .artifacts = &artifacts,
         .remote_command = remote_command,
         .broker_args = broker_args[0..],
-        .stderr_mode = if (outer_tty) .discard else .forward,
+        .stderr_mode = .forward,
     };
-    stream_proxy.runClientStream(allocator, &starter, .{
-        .parent_control_socket_path = parent_control_paths.socket,
-    }) catch |err| {
-        try starter.exitAfterInitialFailure(err);
-    };
-}
 
-fn streamClientArgError(message: []const u8) !void {
-    try io.stderrPrint("sessh: :internal-stream-client: {s}\n", .{message});
-    return process_exit.request(64);
-}
-
-fn runStreamProxySsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) !noreturn {
-    const stream_guid = try session_registry.generateReconnectGuid(allocator);
-    defer allocator.free(stream_guid);
-    const stream_uses_tty = streamProxyUsesTty(parsed_ssh_args, stdin_is_tty);
-    const status_ui = streamReconnectStatusUi(stream_uses_tty, c.isatty(1) != 0);
-    const input_control_enabled = stdin_is_tty;
-    var control_paths = try session_registry.runtimeAgentSocketPathsForGuid(allocator, stream_guid);
-    defer {
-        control_paths.removeRuntimeFiles();
-        control_paths.deinit(allocator);
-    }
-    const control_listen_fd: c.fd_t = try socket_transport.listenSocket(control_paths.socket);
-    defer {
-        _ = c.close(control_listen_fd);
-    }
-
-    const proxy_command = try streamProxyCommand(
-        allocator,
-        stream_guid,
-        parsed_ssh_args,
-        stream_uses_tty,
-    );
-    defer allocator.free(proxy_command);
-
-    const default_options = defaultSshOptionsLen(parsed_ssh_args);
-    const force_tty_option_count: usize = if (stream_uses_tty) 1 else 0;
-    const ssh_argv = try allocator.alloc(
-        []const u8,
-        1 + 2 + 1 + default_options + parsed_ssh_args.options.len + force_tty_option_count + 1 + parsed_ssh_args.shell_command_args.len,
-    );
-    defer allocator.free(ssh_argv);
-
-    ssh_argv[0] = "ssh";
-    var arg_index: usize = 1;
-    // The stream can only reconnect automatically when both ssh layers use
-    // non-interactive authentication.
-    ssh_argv[arg_index] = "-oBatchMode=yes";
-    arg_index += 1;
-    // Keep OpenSSH's keepalive timer from killing the outer connection while
-    // the proxy is preserving and retrying the underlying byte stream.
-    ssh_argv[arg_index] = "-oServerAliveInterval=0";
-    arg_index += 1;
-    ssh_argv[arg_index] = proxy_command;
-    arg_index += 1;
-    appendDefaultSshOptions(ssh_argv, &arg_index, parsed_ssh_args.default_ipqos_option);
-    @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.options.len], parsed_ssh_args.options);
-    arg_index += parsed_ssh_args.options.len;
-    if (stream_uses_tty) {
-        // The parent process owns local tty input so it can intercept CTRL-R.
-        // That means the outer ssh process may see a pipe on stdin. Once sessh
-        // has decided ssh semantics require a remote PTY, force it explicitly
-        // so OpenSSH does not downgrade `-t` just because of our relay pipe.
-        ssh_argv[arg_index] = "-tt";
-        arg_index += 1;
-    }
-    ssh_argv[arg_index] = parsed_ssh_args.host;
-    arg_index += 1;
-    @memcpy(ssh_argv[arg_index .. arg_index + parsed_ssh_args.shell_command_args.len], parsed_ssh_args.shell_command_args);
-
-    var child = std.process.Child.init(ssh_argv, allocator);
-    child.expand_arg0 = .expand;
-    child.stdin_behavior = if (input_control_enabled) .Pipe else .Inherit;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Inherit;
-    var input_mode_guard: ?terminal.TerminalModeGuard = if (input_control_enabled and stream_uses_tty)
+    var input_mode_guard: ?terminal.TerminalModeGuard = if (stream_uses_tty and stdin_is_tty)
         try terminal.TerminalModeGuard.enable(0)
     else
         null;
     defer if (input_mode_guard) |*guard| guard.restore();
-    try child.spawn();
 
-    var relay_error: ?anyerror = null;
-    var relay_stdin_fd: ?c.fd_t = null;
-    if (child.stdin) |*stdin| {
-        relay_stdin_fd = stdin.handle;
-        child.stdin = null;
-    }
-    if (child.stdout) |*stdout| {
-        relayStreamParentIo(
-            allocator,
-            stdout.handle,
-            1,
-            control_listen_fd,
-            status_ui,
-            input_control_enabled,
-            !stream_uses_tty,
-            relay_stdin_fd,
-        ) catch |err| {
-            relay_error = err;
-            terminateChild(&child);
-        };
-        stdout.close();
-        child.stdout = null;
-    }
-    if (relay_error) |err| return err;
-
-    const term = try child.wait();
-    switch (term) {
-        .Exited => |code| return process_exit.request(code),
-        .Signal => |signal| {
-            try io.stderrPrint("sessh: stream ssh ended by signal {}\n", .{signal});
-            return process_exit.request(255);
-        },
-        else => {
-            try io.stderrPrint("sessh: stream ssh ended unexpectedly: {t}\n", .{term});
-            return process_exit.request(255);
-        },
-    }
-}
-
-const StreamReconnectStatusUi = enum {
-    window_title,
-    stderr_plain,
-};
-
-fn streamReconnectStatusUi(stream_uses_tty: bool, client_stdout_is_tty: bool) StreamReconnectStatusUi {
-    _ = stream_uses_tty;
-    // Remote PTY allocation controls ssh's byte-stream semantics, but it is not
-    // the right signal for reconnect UI. If local stdout is a terminal, remote
-    // bytes are being displayed there, so the window title is the least invasive
-    // place for transient status. If stdout is redirected, OSC title bytes would
-    // corrupt that stream; use plain append-only stderr lines instead, even for
-    // the odd case where the remote side has a PTY.
-    return if (client_stdout_is_tty) .window_title else .stderr_plain;
-}
-
-fn streamProxyCommand(
-    allocator: std.mem.Allocator,
-    guid: []const u8,
-    parsed_ssh_args: ParsedSshArgs,
-    stream_uses_tty: bool,
-) ![]u8 {
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
-    defer allocator.free(exe_path);
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
-    try appendShellToken(allocator, &out, exe_path);
-    try appendShellToken(allocator, &out, ":internal-stream-client:");
-    try appendShellToken(allocator, &out, "--guid");
-    try appendShellToken(allocator, &out, guid);
-    try appendShellToken(allocator, &out, "--host");
-    try appendShellToken(allocator, &out, parsed_ssh_args.host);
-    try appendShellToken(allocator, &out, "--port");
-    try appendShellToken(allocator, &out, "%p");
-    if (stream_uses_tty) {
-        try appendShellToken(allocator, &out, "--outer-tty");
-    }
-    if (parsed_ssh_args.default_ipqos_option) |option| {
-        try appendShellToken(allocator, &out, "--ssh-option");
-        try appendShellToken(allocator, &out, option);
-    }
-    for (parsed_ssh_args.options) |option| {
-        try appendShellToken(allocator, &out, "--ssh-option");
-        try appendShellToken(allocator, &out, option);
-    }
-
-    const command = try out.toOwnedSlice(allocator);
-    defer allocator.free(command);
-    return std.fmt.allocPrint(allocator, "-oProxyCommand={s}", .{command});
-}
-
-fn relayStreamParentIo(
-    allocator: std.mem.Allocator,
-    stdout_read_fd: c.fd_t,
-    stdout_write_fd: c.fd_t,
-    control_listen_fd: c.fd_t,
-    status_ui: StreamReconnectStatusUi,
-    input_control_enabled: bool,
-    raw_input_while_status_visible: bool,
-    child_stdin_fd: ?c.fd_t,
-) !void {
-    var title_relay: ?PassthroughTitleRelay = if (status_ui == .window_title)
-        try PassthroughTitleRelay.init(allocator, stdout_write_fd, input_control_enabled)
-    else
-        null;
-    defer if (title_relay) |*relay| relay.deinit();
-    var plain_status = StreamParentPlainStatus.init(input_control_enabled);
-    var input_mode_guard: ?terminal.TerminalModeGuard = null;
-    defer if (input_mode_guard) |*guard| guard.restore();
-    var stdin_fd: ?c.fd_t = child_stdin_fd;
-    defer {
-        if (stdin_fd) |fd| _ = c.close(fd);
-    }
-
-    var control_fd: c.fd_t = -1;
-    defer {
-        if (control_fd >= 0) _ = c.close(control_fd);
-    }
-
-    while (true) {
-        const status_visible = if (title_relay) |relay| relay.status_visible else plain_status.status_visible;
-        if (raw_input_while_status_visible and input_control_enabled) {
-            if (status_visible and input_mode_guard == null) {
-                input_mode_guard = terminal.TerminalModeGuard.enable(0) catch null;
-            } else if (!status_visible) {
-                if (input_mode_guard) |*guard| guard.restore();
-                input_mode_guard = null;
-            }
-        }
-
-        var pollfds: [4]posix.pollfd = undefined;
-        var count: usize = 0;
-        const stdout_index = count;
-        pollfds[count] = .{ .fd = stdout_read_fd, .events = posix.POLL.IN, .revents = 0 };
-        count += 1;
-
-        var listen_index: ?usize = null;
-        if (control_listen_fd >= 0 and control_fd < 0) {
-            listen_index = count;
-            pollfds[count] = .{ .fd = control_listen_fd, .events = posix.POLL.IN, .revents = 0 };
-            count += 1;
-        }
-
-        var control_index: ?usize = null;
-        if (control_fd >= 0) {
-            control_index = count;
-            pollfds[count] = .{ .fd = control_fd, .events = posix.POLL.IN, .revents = 0 };
-            count += 1;
-        }
-
-        var stdin_index: ?usize = null;
-        if (stdin_fd) |fd| {
-            stdin_index = count;
-            pollfds[count] = .{ .fd = 0, .events = posix.POLL.IN, .revents = 0 };
-            count += 1;
-            _ = fd;
-        }
-
-        _ = try posix.poll(pollfds[0..count], -1);
-
-        if (listen_index) |index| {
-            if ((pollfds[index].revents & posix.POLL.IN) != 0) {
-                const accepted = c.accept(control_listen_fd, null, null);
-                if (accepted >= 0) {
-                    control_fd = accepted;
-                    socket_transport.setCloseOnExec(control_fd) catch {};
-                }
-            }
-        }
-
-        if (control_index) |index| {
-            if ((pollfds[index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-                var frame = protocol.readFrameAlloc(app_allocator.allocator(), control_fd) catch {
-                    _ = c.close(control_fd);
-                    control_fd = -1;
-                    continue;
-                };
-                defer frame.deinit(app_allocator.allocator());
-                if (frame.message_type == .stream_parent_status) {
-                    var status = try protocol.decodePayload(pb.StreamParentStatus, app_allocator.allocator(), frame.payload);
-                    defer status.deinit(app_allocator.allocator());
-                    if (title_relay) |*relay| {
-                        try relay.handleStatusMessage(status);
-                    } else {
-                        plain_status.handleStatusMessage(status);
-                    }
-                }
-            }
-        }
-
-        if (stdin_index) |index| {
-            if ((pollfds[index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-                const fd = stdin_fd.?;
-                var input: [4096]u8 = undefined;
-                const n = c.read(0, &input, input.len);
-                if (n <= 0) {
-                    _ = c.close(fd);
-                    stdin_fd = null;
-                } else {
-                    const bytes = input[0..@intCast(n)];
-                    var filtered: [4096]u8 = undefined;
-                    const filtered_input = filterStreamParentInput(bytes, status_visible, &filtered);
-                    if (filtered_input.action == .reconnect_now and control_fd >= 0) {
-                        sendStreamParentControl(control_fd, .stream_reconnect_now, pb.StreamReconnectNow{}) catch {};
-                    }
-                    if (filtered_input.bytes.len > 0) try io.writeAll(fd, filtered_input.bytes);
-                }
-            }
-        }
-
-        if ((pollfds[stdout_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            var buf: [16 * 1024]u8 = undefined;
-            const n = c.read(stdout_read_fd, &buf, buf.len);
-            if (n < 0) switch (posix.errno(n)) {
-                .AGAIN, .INTR => continue,
-                else => return error.ReadFailed,
-            };
-            if (n == 0) {
-                if (title_relay) |*relay| try relay.flushBufferedRemoteForEnd();
-                return;
-            }
-            const bytes = buf[0..@intCast(n)];
-            if (title_relay) |*relay| {
-                try relay.feedRemoteBytes(bytes);
-            } else {
-                try io.writeAll(stdout_write_fd, bytes);
-            }
-        }
-    }
-}
-
-const FilteredStreamParentInput = struct {
-    bytes: []const u8,
-    action: reconnect_control.InputAction,
-};
-
-fn sendStreamParentControl(fd: c.fd_t, message_type: protocol.MessageType, message: anytype) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), message);
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, message_type, payload);
-}
-
-fn filterStreamParentInput(input: []const u8, status_visible: bool, out: []u8) FilteredStreamParentInput {
-    if (!status_visible) {
-        @memcpy(out[0..input.len], input);
-        return .{ .bytes = out[0..input.len], .action = .none };
-    }
-    var written: usize = 0;
-    var action: reconnect_control.InputAction = .none;
-    for (input) |byte| {
-        if (byte == reconnect_control.ctrl_r) {
-            action = .reconnect_now;
-            continue;
-        }
-        out[written] = byte;
-        written += 1;
-    }
-    return .{ .bytes = out[0..written], .action = action };
-}
-
-const StreamParentPlainStatus = struct {
-    ctrl_r_enabled: bool,
-    status_visible: bool = false,
-
-    fn init(ctrl_r_enabled: bool) StreamParentPlainStatus {
-        return .{ .ctrl_r_enabled = ctrl_r_enabled };
-    }
-
-    fn handleStatusMessage(self: *StreamParentPlainStatus, status: pb.StreamParentStatus) void {
-        switch (status.status orelse return) {
-            .retry => |retry| self.showRetry(retry.delay_ms),
-            .reconnecting => self.showReconnecting(),
-            .clear => self.status_visible = false,
-        }
-    }
-
-    fn showRetry(self: *StreamParentPlainStatus, delay_ms: u64) void {
-        var delay_buf: [16]u8 = undefined;
-        const delay = reconnect_title.formatDelay(delay_ms, &delay_buf) catch return;
-        if (self.ctrl_r_enabled) {
-            io.stderrPrint("sessh: disconnected: Retry connecting {s}. CTRL-R now\n", .{delay}) catch {};
-        } else {
-            io.stderrPrint("sessh: disconnected: Retry connecting {s}\n", .{delay}) catch {};
-        }
-        self.status_visible = true;
-    }
-
-    fn showReconnecting(self: *StreamParentPlainStatus) void {
-        if (self.ctrl_r_enabled) {
-            io.stderrPrint("sessh: disconnected: Reconnecting... CTRL-R now\n", .{}) catch {};
-        } else {
-            io.stderrPrint("sessh: disconnected: Reconnecting...\n", .{}) catch {};
-        }
-        self.status_visible = true;
-    }
-};
-
-// Owns all writes to the local terminal while tty passthrough is active. Remote
-// bytes are relayed unchanged, but we may need to inject a temporary reconnect
-// title between those bytes. To avoid corrupting a control sequence, bytes after
-// the last plain-text parser boundary are held in a small buffer. If that buffer
-// fills, we flush it and stop injecting local titles until the parser reaches a
-// boundary again.
-const PassthroughTitleRelay = struct {
-    // Synchronized-update applications commonly send a whole screen refresh
-    // between `CSI ? 2026 h` and `CSI ? 2026 l`. Keep enough pending bytes to
-    // handle ordinary full-screen redraws without giving up on title injection.
-    const unsafe_buffer_limit = 64 * 1024;
-
-    output_fd: c.fd_t,
-    ctrl_r_enabled: bool,
-    parser: *vt.SessionTerminal,
-    title_state: WindowTitleState = .{},
-    title_tracker: WindowTitleTracker,
-    sync_tracker: SynchronizedUpdateTracker = .{},
-    remote_buffer: [unsafe_buffer_limit]u8 = undefined,
-    remote_buffer_len: usize = 0,
-    remote_safe_prefix_len: usize = 0,
-    unsafe: bool = false,
-    status_visible: bool = false,
-    pending_clear: bool = false,
-
-    fn init(allocator: std.mem.Allocator, output_fd: c.fd_t, ctrl_r_enabled: bool) !PassthroughTitleRelay {
-        const size = terminal.currentWindowSize();
-        const parser = try vt.SessionTerminal.create(
-            allocator,
-            @max(size.rows, 1),
-            @max(size.cols, 1),
-            0,
-        );
-        errdefer parser.destroy();
-        var relay = PassthroughTitleRelay{
-            .output_fd = output_fd,
-            .ctrl_r_enabled = ctrl_r_enabled,
-            .parser = parser,
-            .title_tracker = undefined,
-        };
-        relay.title_tracker = WindowTitleTracker.init();
-        const fallback_title = std.process.getCwdAlloc(allocator) catch null;
-        defer if (fallback_title) |title| allocator.free(title);
-        relay.title_state.set(fallback_title orelse "");
-        return relay;
-    }
-
-    fn deinit(self: *PassthroughTitleRelay) void {
-        self.parser.destroy();
-        self.* = undefined;
-    }
-
-    fn handleStatusMessage(self: *PassthroughTitleRelay, status: pb.StreamParentStatus) !void {
-        switch (status.status orelse return) {
-            .retry => |retry| try self.showRetryTitle(retry.delay_ms),
-            .reconnecting => try self.showReconnectingTitle(),
-            .clear => try self.clearStatusTitle(),
-        }
-    }
-
-    fn showRetryTitle(self: *PassthroughTitleRelay, delay_ms: u64) !void {
-        if (self.unsafe) return;
-        if (self.ctrl_r_enabled) {
-            try reconnect_title.writeRetryNowTitle(self.output_fd, delay_ms);
-        } else {
-            try reconnect_title.writeRetryTitle(self.output_fd, delay_ms);
-        }
-        self.status_visible = true;
-        self.pending_clear = false;
-    }
-
-    fn showReconnectingTitle(self: *PassthroughTitleRelay) !void {
-        if (self.unsafe) return;
-        if (self.ctrl_r_enabled) {
-            try reconnect_title.writeReconnectingNowTitle(self.output_fd);
-        } else {
-            try reconnect_title.writeReconnectingTitle(self.output_fd);
-        }
-        self.status_visible = true;
-        self.pending_clear = false;
-    }
-
-    fn clearStatusTitle(self: *PassthroughTitleRelay) !void {
-        if (!self.status_visible) return;
-        if (self.unsafe) {
-            self.pending_clear = true;
-            return;
-        }
-        try reconnect_title.writeTitle(self.output_fd, self.title_state.slice());
-        self.status_visible = false;
-        self.pending_clear = false;
-    }
-
-    fn feedRemoteBytes(self: *PassthroughTitleRelay, bytes: []const u8) !void {
-        var index: usize = 0;
-        while (index < bytes.len) {
-            if (self.unsafe) {
-                const start = index;
-                while (index < bytes.len) : (index += 1) {
-                    try self.feedParserByte(bytes[index]);
-                    if (self.isPassthroughInjectionSafePoint()) {
-                        index += 1;
-                        try io.writeAll(self.output_fd, bytes[start..index]);
-                        self.unsafe = false;
-                        try self.afterSafePoint();
-                        break;
-                    }
-                }
-                if (self.unsafe) {
-                    try io.writeAll(self.output_fd, bytes[start..]);
-                    return;
-                }
-                continue;
-            }
-
-            self.appendRemoteBufferByte(bytes[index]);
-            try self.feedParserByte(bytes[index]);
-            index += 1;
-
-            if (self.isPassthroughInjectionSafePoint()) {
-                self.remote_safe_prefix_len = self.remote_buffer_len;
-            }
-            if (self.remote_buffer_len == self.remote_buffer.len) {
-                try self.flushSafeRemotePrefix();
-                if (self.remote_buffer_len == self.remote_buffer.len) {
-                    try self.flushAllRemoteBuffer();
-                    self.unsafe = true;
-                }
-            }
-        }
-        try self.flushSafeRemotePrefix();
-    }
-
-    fn flushBufferedRemoteForEnd(self: *PassthroughTitleRelay) !void {
-        try self.flushAllRemoteBuffer();
-    }
-
-    fn appendRemoteBufferByte(self: *PassthroughTitleRelay, byte: u8) void {
-        self.remote_buffer[self.remote_buffer_len] = byte;
-        self.remote_buffer_len += 1;
-    }
-
-    fn flushSafeRemotePrefix(self: *PassthroughTitleRelay) !void {
-        if (self.remote_safe_prefix_len == 0) return;
-        try io.writeAll(self.output_fd, self.remote_buffer[0..self.remote_safe_prefix_len]);
-        const remaining = self.remote_buffer_len - self.remote_safe_prefix_len;
-        if (remaining > 0) {
-            std.mem.copyForwards(
-                u8,
-                self.remote_buffer[0..remaining],
-                self.remote_buffer[self.remote_safe_prefix_len..self.remote_buffer_len],
-            );
-        }
-        self.remote_buffer_len = remaining;
-        self.remote_safe_prefix_len = 0;
-        if (remaining == 0) try self.afterSafePoint();
-    }
-
-    fn flushAllRemoteBuffer(self: *PassthroughTitleRelay) !void {
-        if (self.remote_buffer_len == 0) return;
-        try io.writeAll(self.output_fd, self.remote_buffer[0..self.remote_buffer_len]);
-        self.remote_buffer_len = 0;
-        self.remote_safe_prefix_len = 0;
-    }
-
-    fn feedParserByte(self: *PassthroughTitleRelay, byte: u8) !void {
-        if (self.title_tracker.feedByte(byte)) |title| self.title_state.set(title);
-        self.sync_tracker.feedByte(byte);
-        var one = [_]u8{byte};
-        try self.parser.feed(&one);
-    }
-
-    fn isPassthroughInjectionSafePoint(self: *const PassthroughTitleRelay) bool {
-        return self.parser.isPlainTextParserBoundary() and !self.sync_tracker.active;
-    }
-
-    fn afterSafePoint(self: *PassthroughTitleRelay) !void {
-        if (self.pending_clear) try self.clearStatusTitle();
-    }
-};
-
-const WindowTitleState = struct {
-    const max_title_bytes = 512;
-
-    title: [max_title_bytes]u8 = [_]u8{0} ** max_title_bytes,
-    title_len: usize = 0,
-
-    fn set(self: *WindowTitleState, title: []const u8) void {
-        self.title_len = @min(self.title.len, title.len);
-        @memcpy(self.title[0..self.title_len], title[0..self.title_len]);
-    }
-
-    fn slice(self: *const WindowTitleState) []const u8 {
-        return self.title[0..self.title_len];
-    }
-};
-
-// Synchronized update mode is started with `CSI ? 2026 h` and ended with
-// `CSI ? 2026 l`. After the start sequence, the normal VT parser is already
-// back at a plain-text boundary, but the terminal is intentionally holding
-// presentation updates. If we injected a reconnect title then, the user would
-// not see it until the remote app ended the synchronized update. We treat the
-// terminal as not ready for local title injection until the matching end
-// sequence has passed through.
-const SynchronizedUpdateTracker = struct {
-    const max_csi_bytes = 32;
-
-    const State = enum {
-        ground,
-        esc,
-        csi,
+    stream_agent.runLocalStream(allocator, &starter, .{
+        .source_fd = 0,
+        .sink_fd = 1,
+        .stderr_fd = 2,
+        .show_status = c.isatty(2) != 0,
+        .intercept_ctrl_r = stdin_is_tty,
+        .receive_stderr = !stream_uses_tty,
+    }) catch |err| {
+        try starter.exitAfterInitialFailure(err);
     };
-
-    active: bool = false,
-    state: State = .ground,
-    csi: [max_csi_bytes]u8 = undefined,
-    csi_len: usize = 0,
-
-    fn feed(self: *SynchronizedUpdateTracker, bytes: []const u8) void {
-        for (bytes) |byte| self.feedByte(byte);
-    }
-
-    fn feedByte(self: *SynchronizedUpdateTracker, byte: u8) void {
-        switch (self.state) {
-            .ground => {
-                if (byte == 0x1b) {
-                    self.state = .esc;
-                } else if (byte == 0x9b) {
-                    self.startCsi();
-                }
-            },
-            .esc => {
-                if (byte == '[') {
-                    self.startCsi();
-                } else if (byte != 0x1b) {
-                    self.state = .ground;
-                }
-            },
-            .csi => {
-                if (isCsiFinalByte(byte)) {
-                    self.finishCsi(byte);
-                    self.state = .ground;
-                } else if (self.csi_len < self.csi.len) {
-                    self.csi[self.csi_len] = byte;
-                    self.csi_len += 1;
-                }
-            },
-        }
-    }
-
-    fn startCsi(self: *SynchronizedUpdateTracker) void {
-        self.state = .csi;
-        self.csi_len = 0;
-    }
-
-    fn finishCsi(self: *SynchronizedUpdateTracker, final: u8) void {
-        const params = self.csi[0..self.csi_len];
-        if (!csiContainsPrivateMode(params, "2026")) return;
-        if (final == 'h') self.active = true;
-        if (final == 'l') self.active = false;
-    }
-};
-
-fn isCsiFinalByte(byte: u8) bool {
-    return byte >= 0x40 and byte <= 0x7e;
+    return process_exit.request(0);
 }
 
-fn csiContainsPrivateMode(params: []const u8, mode: []const u8) bool {
-    if (params.len == 0 or params[0] != '?') return false;
-    var fields = std.mem.splitScalar(u8, params[1..], ';');
-    while (fields.next()) |field| {
-        if (std.mem.eql(u8, field, mode)) return true;
-    }
-    return false;
+fn encodeStreamCommandArg(allocator: std.mem.Allocator, shell_command: ?[]const u8) ![]u8 {
+    const command = shell_command orelse return allocator.dupe(u8, "-");
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(command.len));
+    _ = std.base64.standard.Encoder.encode(encoded, command);
+    return encoded;
 }
-
-// Watches the decrypted terminal byte stream for OSC 0/2 title updates while
-// still relaying the bytes unchanged. The passthrough reconnect UI uses this
-// remembered app title when it clears a temporary local status title.
-const WindowTitleTracker = struct {
-    const max_command_bytes = 8;
-    const max_title_bytes = 512;
-    const State = enum {
-        ground,
-        esc,
-        osc_command,
-        osc_text,
-        osc_text_esc,
-    };
-
-    state: State = .ground,
-    command: [max_command_bytes]u8 = undefined,
-    command_len: usize = 0,
-    title: [max_title_bytes]u8 = undefined,
-    title_len: usize = 0,
-    tracking_title: bool = false,
-
-    fn init() WindowTitleTracker {
-        return .{};
-    }
-
-    fn feed(self: *WindowTitleTracker, bytes: []const u8) ?[]const u8 {
-        var latest_title: ?[]const u8 = null;
-        for (bytes) |byte| {
-            if (self.feedByte(byte)) |title| latest_title = title;
-        }
-        return latest_title;
-    }
-
-    fn feedByte(self: *WindowTitleTracker, byte: u8) ?[]const u8 {
-        switch (self.state) {
-            .ground => {
-                if (byte == 0x1b) self.state = .esc;
-            },
-            .esc => {
-                if (byte == ']') {
-                    self.command_len = 0;
-                    self.title_len = 0;
-                    self.tracking_title = false;
-                    self.state = .osc_command;
-                } else if (byte != 0x1b) {
-                    self.state = .ground;
-                }
-            },
-            .osc_command => {
-                if (byte == ';') {
-                    const command = self.command[0..self.command_len];
-                    self.tracking_title = std.mem.eql(u8, command, "0") or std.mem.eql(u8, command, "2");
-                    self.title_len = 0;
-                    self.state = .osc_text;
-                } else if (byte == 0x07) {
-                    self.state = .ground;
-                } else if (byte == 0x1b) {
-                    self.state = .ground;
-                } else if (self.command_len < self.command.len) {
-                    self.command[self.command_len] = byte;
-                    self.command_len += 1;
-                }
-            },
-            .osc_text => {
-                if (byte == 0x07) {
-                    return self.finishTitle();
-                } else if (byte == 0x1b) {
-                    self.state = .osc_text_esc;
-                } else {
-                    self.appendTitleByte(byte);
-                }
-            },
-            .osc_text_esc => {
-                if (byte == '\\') {
-                    return self.finishTitle();
-                } else {
-                    self.state = .ground;
-                }
-            },
-        }
-        return null;
-    }
-
-    fn appendTitleByte(self: *WindowTitleTracker, byte: u8) void {
-        if (!self.tracking_title or self.title_len == self.title.len) return;
-        self.title[self.title_len] = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
-        self.title_len += 1;
-    }
-
-    fn finishTitle(self: *WindowTitleTracker) ?[]const u8 {
-        const title = if (self.tracking_title) self.title[0..self.title_len] else null;
-        self.state = .ground;
-        self.command_len = 0;
-        self.title_len = 0;
-        self.tracking_title = false;
-        return title;
-    }
-};
 
 fn appendShellToken(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
     if (out.items.len > 0) try out.append(allocator, ' ');
@@ -5465,183 +4708,6 @@ test "shellQuote produces single-quoted shell words" {
     try std.testing.expectEqualStrings("'alpha '\\'' beta'", quoted);
 }
 
-test "window title tracker records remote OSC title changes" {
-    var title_state = WindowTitleState{};
-    title_state.set("initial");
-    var tracker = WindowTitleTracker.init();
-
-    try std.testing.expect(tracker.feed("before\x1b]2;remote") == null);
-    if (tracker.feed("-title\x1b\\after")) |title| title_state.set(title);
-    try std.testing.expectEqualStrings("remote-title", title_state.slice());
-
-    if (tracker.feed("\x1b]1;ignored\x07")) |title| title_state.set(title);
-    try std.testing.expectEqualStrings("remote-title", title_state.slice());
-
-    if (tracker.feed("\x1b]0;both-title\x07")) |title| title_state.set(title);
-    try std.testing.expectEqualStrings("both-title", title_state.slice());
-}
-
-test "passthrough title relay parses remote output for later restore" {
-    const output = try posix.pipe();
-    defer posix.close(output[0]);
-
-    var relay = try PassthroughTitleRelay.init(std.testing.allocator, output[1], false);
-    defer relay.deinit();
-    relay.title_state.set("initial");
-
-    try relay.feedRemoteBytes("plain\x1b]2;parsed-title\x07text");
-    posix.close(output[1]);
-
-    var relayed_buf: [64]u8 = undefined;
-    const relayed_len = try posix.read(output[0], &relayed_buf);
-    try std.testing.expectEqualStrings("plain\x1b]2;parsed-title\x07text", relayed_buf[0..relayed_len]);
-
-    try std.testing.expectEqualStrings("parsed-title", relay.title_state.slice());
-}
-
-test "passthrough title status is emitted before a buffered partial control sequence" {
-    const output = try posix.pipe();
-    defer posix.close(output[0]);
-
-    var relay = try PassthroughTitleRelay.init(std.testing.allocator, output[1], false);
-    defer relay.deinit();
-    relay.title_state.set("initial");
-
-    try relay.feedRemoteBytes("plain\x1b]2;remote");
-    try relay.handleStatusMessage(.{ .status = .{ .retry = .{ .delay_ms = 12_000 } } });
-    try relay.feedRemoteBytes("-title\x1b\\after");
-    try relay.handleStatusMessage(.{ .status = .{ .clear = .{} } });
-    posix.close(output[1]);
-
-    var output_bytes: std.ArrayList(u8) = .empty;
-    defer output_bytes.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(output[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output_bytes.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expectEqualStrings(
-        "plain" ++
-            "\x1b]2;12sec until retry connect\x1b\\" ++
-            "\x1b]2;remote-title\x1b\\after" ++
-            "\x1b]2;remote-title\x1b\\",
-        output_bytes.items,
-    );
-}
-
-test "passthrough title status treats synchronized update as unsafe until end marker" {
-    const output = try posix.pipe();
-    defer posix.close(output[0]);
-
-    var relay = try PassthroughTitleRelay.init(std.testing.allocator, output[1], false);
-    defer relay.deinit();
-    relay.title_state.set("initial");
-
-    try relay.feedRemoteBytes("plain\x1b[?2026hdraw");
-    try relay.handleStatusMessage(.{ .status = .{ .retry = .{ .delay_ms = 12_000 } } });
-    try relay.feedRemoteBytes("\x1b[?2026l");
-    try relay.handleStatusMessage(.{ .status = .{ .clear = .{} } });
-    posix.close(output[1]);
-
-    var output_bytes: std.ArrayList(u8) = .empty;
-    defer output_bytes.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(output[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output_bytes.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expectEqualStrings(
-        "plain" ++
-            "\x1b]2;12sec until retry connect\x1b\\" ++
-            "\x1b[?2026hdraw\x1b[?2026l" ++
-            "\x1b]2;initial\x1b\\",
-        output_bytes.items,
-    );
-}
-
-test "passthrough title status suppresses updates after unsafe buffer overflow" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var output = try tmp.dir.createFile("output", .{ .read = true });
-    defer output.close();
-
-    var relay = try PassthroughTitleRelay.init(std.testing.allocator, output.handle, false);
-    defer relay.deinit();
-    relay.title_state.set("initial");
-
-    const partial = try std.testing.allocator.alloc(u8, PassthroughTitleRelay.unsafe_buffer_limit);
-    defer std.testing.allocator.free(partial);
-    @memcpy(partial[0..4], "\x1b]2;");
-    @memset(partial[4..], 'a');
-    try relay.feedRemoteBytes(partial);
-    try relay.handleStatusMessage(.{ .status = .{ .retry = .{ .delay_ms = 12_000 } } });
-    try std.testing.expect(relay.unsafe);
-    try std.testing.expect(!relay.status_visible);
-
-    try relay.feedRemoteBytes("\x07");
-    try std.testing.expect(!relay.unsafe);
-    try relay.handleStatusMessage(.{ .status = .{ .retry = .{ .delay_ms = 1_000 } } });
-    try output.seekTo(0);
-    const output_bytes = try output.readToEndAlloc(std.testing.allocator, PassthroughTitleRelay.unsafe_buffer_limit + 1024);
-    defer std.testing.allocator.free(output_bytes);
-
-    try std.testing.expectEqual(@as(usize, partial.len + 1 + "\x1b]2;1sec until retry connect\x1b\\".len), output_bytes.len);
-    try std.testing.expectEqualStrings(partial, output_bytes[0..partial.len]);
-    try std.testing.expectEqual(@as(u8, 0x07), output_bytes[partial.len]);
-    try std.testing.expectEqualStrings(
-        "\x1b]2;1sec until retry connect\x1b\\",
-        output_bytes[partial.len + 1 ..],
-    );
-}
-
-test "stream reconnect status ui depends on local stdout" {
-    try std.testing.expectEqual(StreamReconnectStatusUi.window_title, streamReconnectStatusUi(true, true));
-    try std.testing.expectEqual(StreamReconnectStatusUi.stderr_plain, streamReconnectStatusUi(true, false));
-    try std.testing.expectEqual(StreamReconnectStatusUi.window_title, streamReconnectStatusUi(false, true));
-    try std.testing.expectEqual(StreamReconnectStatusUi.stderr_plain, streamReconnectStatusUi(false, false));
-}
-
-test "stream parent input filters ctrl-r only while status is visible" {
-    var out: [16]u8 = undefined;
-    const inactive = filterStreamParentInput(&.{ 'a', reconnect_control.ctrl_r, 'b' }, false, &out);
-    try std.testing.expectEqual(reconnect_control.InputAction.none, inactive.action);
-    try std.testing.expectEqualStrings(&.{ 'a', reconnect_control.ctrl_r, 'b' }, inactive.bytes);
-
-    const active = filterStreamParentInput(&.{ 'a', reconnect_control.ctrl_r, 'b' }, true, &out);
-    try std.testing.expectEqual(reconnect_control.InputAction.reconnect_now, active.action);
-    try std.testing.expectEqualStrings("ab", active.bytes);
-}
-
-test "stream proxy command only carries stream identity" {
-    const tty_stream = try streamProxyCommand(
-        std.testing.allocator,
-        "r-11111111-1111-4111-8111-111111111111",
-        .{ .options = &.{}, .host = "example.com" },
-        true,
-    );
-    defer std.testing.allocator.free(tty_stream);
-    try std.testing.expect(std.mem.indexOf(u8, tty_stream, "--outer-tty") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tty_stream, "--guid") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tty_stream, "r-11111111-1111-4111-8111-111111111111") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tty_stream, "--parent-control") == null);
-
-    const non_tty_stream = try streamProxyCommand(
-        std.testing.allocator,
-        "r-11111111-1111-4111-8111-111111111111",
-        .{ .options = &.{}, .host = "example.com" },
-        false,
-    );
-    defer std.testing.allocator.free(non_tty_stream);
-    try std.testing.expect(std.mem.indexOf(u8, non_tty_stream, "--outer-tty") == null);
-    try std.testing.expect(std.mem.indexOf(u8, non_tty_stream, "--parent-control") == null);
-}
-
 test "joinRemoteShellCommandArgs matches ssh remote command joining" {
     const joined = try joinRemoteShellCommandArgs(std.testing.allocator, &.{ "echo", "$SESSH_TEST_HOST" });
     defer std.testing.allocator.free(joined);
@@ -5825,7 +4891,7 @@ test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
     try std.testing.expectEqualStrings("", empty.shell_command_args[0]);
 }
 
-test "stream proxy preserves ssh remote command tty semantics" {
+test "direct stream preserves ssh remote command tty semantics" {
     const command = try parseSshArgs(&.{
         "sessh",
         "example.com",
@@ -5834,8 +4900,8 @@ test "stream proxy preserves ssh remote command tty semantics" {
     }, .{});
     try std.testing.expectEqual(SshTtyRequest.none, command.tty_request);
     try std.testing.expectEqual(@as(usize, 2), command.shell_command_args.len);
-    try std.testing.expect(shouldUseStreamProxy(command, false));
-    try std.testing.expect(shouldUseStreamProxy(command, true));
+    try std.testing.expect(shouldUseDirectStream(command, false));
+    try std.testing.expect(shouldUseDirectStream(command, true));
 
     const single = try parseSshArgs(&.{
         "sessh",
@@ -5843,8 +4909,8 @@ test "stream proxy preserves ssh remote command tty semantics" {
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(shouldUseStreamProxy(single, false));
-    try std.testing.expect(!shouldUseStreamProxy(single, true));
+    try std.testing.expect(shouldUseDirectStream(single, false));
+    try std.testing.expect(!shouldUseDirectStream(single, true));
 
     const forced = try parseSshArgs(&.{
         "sessh",
@@ -5852,21 +4918,21 @@ test "stream proxy preserves ssh remote command tty semantics" {
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(!shouldUseStreamProxy(forced, false));
-    try std.testing.expect(!shouldUseStreamProxy(forced, true));
+    try std.testing.expect(!shouldUseDirectStream(forced, false));
+    try std.testing.expect(!shouldUseDirectStream(forced, true));
 }
 
-test "passthrough forces stream proxy and preserves ssh tty semantics" {
+test "passthrough forces direct stream and preserves ssh tty semantics" {
     const interactive = try parseSshArgs(&.{
         "sessh",
         "--passthrough",
         "example.com",
     }, .{});
     try std.testing.expect(interactive.passthrough);
-    try std.testing.expect(shouldUseStreamProxy(interactive, true));
-    try std.testing.expect(shouldUseStreamProxy(interactive, false));
-    try std.testing.expect(streamProxyUsesTty(interactive, true));
-    try std.testing.expect(!streamProxyUsesTty(interactive, false));
+    try std.testing.expect(shouldUseDirectStream(interactive, true));
+    try std.testing.expect(shouldUseDirectStream(interactive, false));
+    try std.testing.expect(directStreamUsesTty(interactive, true));
+    try std.testing.expect(!directStreamUsesTty(interactive, false));
 
     const command = try parseSshArgs(&.{
         "sessh",
@@ -5876,8 +4942,8 @@ test "passthrough forces stream proxy and preserves ssh tty semantics" {
         "hello",
     }, .{});
     try std.testing.expect(command.passthrough);
-    try std.testing.expect(shouldUseStreamProxy(command, true));
-    try std.testing.expect(!streamProxyUsesTty(command, true));
+    try std.testing.expect(shouldUseDirectStream(command, true));
+    try std.testing.expect(!directStreamUsesTty(command, true));
 
     const forced = try parseSshArgs(&.{
         "sessh",
@@ -5887,8 +4953,8 @@ test "passthrough forces stream proxy and preserves ssh tty semantics" {
         "tty",
     }, .{});
     try std.testing.expect(forced.passthrough);
-    try std.testing.expect(shouldUseStreamProxy(forced, false));
-    try std.testing.expect(streamProxyUsesTty(forced, false));
+    try std.testing.expect(shouldUseDirectStream(forced, false));
+    try std.testing.expect(directStreamUsesTty(forced, false));
 
     const requested_with_tty = try parseSshArgs(&.{
         "sessh",
@@ -5898,8 +4964,8 @@ test "passthrough forces stream proxy and preserves ssh tty semantics" {
         "tty",
     }, .{});
     try std.testing.expect(requested_with_tty.passthrough);
-    try std.testing.expect(shouldUseStreamProxy(requested_with_tty, true));
-    try std.testing.expect(streamProxyUsesTty(requested_with_tty, true));
+    try std.testing.expect(shouldUseDirectStream(requested_with_tty, true));
+    try std.testing.expect(directStreamUsesTty(requested_with_tty, true));
 
     const requested_without_tty = try parseSshArgs(&.{
         "sessh",
@@ -5908,8 +4974,8 @@ test "passthrough forces stream proxy and preserves ssh tty semantics" {
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(shouldUseStreamProxy(requested_without_tty, false));
-    try std.testing.expect(!streamProxyUsesTty(requested_without_tty, false));
+    try std.testing.expect(shouldUseDirectStream(requested_without_tty, false));
+    try std.testing.expect(!directStreamUsesTty(requested_without_tty, false));
 }
 
 test "plain ssh fallback is allowed for transport-incompatible plain ssh invocations" {

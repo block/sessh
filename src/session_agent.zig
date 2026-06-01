@@ -6,6 +6,7 @@ const posix = std.posix;
 const config = @import("config.zig");
 const client_renderer = @import("client_renderer.zig");
 const io = @import("io.zig");
+const pty_process = @import("pty_process.zig");
 const protocol = @import("protocol.zig");
 const runtime_refresher = @import("runtime_refresher.zig");
 const session_registry = @import("session_registry.zig");
@@ -22,9 +23,6 @@ const synchronized_output_max_hold_ms: i64 = 1000;
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
-
-extern "c" fn forkpty(amaster: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp: ?*c.winsize) c_int;
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 var shutdown_signal_write_fd: c.fd_t = -1;
 
@@ -2887,47 +2885,20 @@ fn createSession(
         const session_guid_z = try app_allocator.allocator().dupeZ(u8, session_guid);
         defer app_allocator.allocator().free(session_guid_z);
 
-        const shell_path = session_environment.shell orelse defaultShellPath();
-        const shell_z = try app_allocator.allocator().dupeZ(u8, shell_path);
-        defer app_allocator.allocator().free(shell_z);
-        const sessh_path_z = try sesshPathForEnvironment(app_allocator.allocator());
-        defer app_allocator.allocator().free(sessh_path_z);
-        const path_z = try pathWithSesshPathForEnvironment(app_allocator.allocator(), sessh_path_z);
-        defer app_allocator.allocator().free(path_z);
-        const shell_argv0 = try loginShellArg0(app_allocator.allocator(), shell_path);
-        defer app_allocator.allocator().free(shell_argv0);
-        var prepared_command: ?PreparedCommand = if (shell_command) |command|
-            try prepareShellCommand(app_allocator.allocator(), shell_path, command)
-        else if (command_argv.len > 0)
-            try prepareCommandArgv(app_allocator.allocator(), command_argv)
-        else
-            null;
-        defer if (prepared_command) |*command| command.deinit(app_allocator.allocator());
-
-        var master: c_int = -1;
-        var size = c.winsize{ .row = rows, .col = cols, .xpixel = 0, .ypixel = 0 };
-        const pid = forkpty(&master, null, null, &size);
-        if (pid < 0) return error.ForkPtyFailed;
-        if (pid == 0) {
-            terminal.setSigpipe(posix.SIG.DFL);
-            _ = setenv("TERM", "xterm-256color", 1);
-            _ = setenv("SHELL", shell_z.ptr, 1);
-            _ = setenv("SESSH_GUID", session_guid_z.ptr, 1);
-            _ = setenv("SESSH_PATH", sessh_path_z.ptr, 1);
-            _ = setenv("PATH", path_z.ptr, 1);
-            if (prepared_command) |command| {
-                posix.execvpeZ(command.argv[0].?, command.argv.ptr, @ptrCast(c.environ)) catch {};
-            } else {
-                const dash_i: [*:0]const u8 = "-i";
-                var child_argv = [_:null]?[*:0]const u8{ shell_argv0.ptr, dash_i };
-                _ = c.execve(shell_z.ptr, &child_argv, @ptrCast(c.environ));
-            }
-            std.process.exit(127);
-        }
+        const shell_path = session_environment.shell orelse pty_process.defaultShellPath();
+        const child = try pty_process.spawn(app_allocator.allocator(), .{
+            .rows = rows,
+            .cols = cols,
+            .shell = shell_path,
+            .command_argv = command_argv,
+            .shell_command = shell_command,
+            .session_guid = session_guid_z,
+            .add_sessh_path_to_env = true,
+        });
 
         session.* = Session{
-            .pid = pid,
-            .pty_fd = master,
+            .pid = child.pid,
+            .pty_fd = child.master_fd,
             .terminal_model = terminal_model,
             .rows = rows,
             .cols = cols,
@@ -2940,7 +2911,7 @@ fn createSession(
         if (session_agent.fixed_session_id == null) session_agent.next_id += 1;
         logSessionAgent(session_agent, "event=session_create id={s} pid={} rows={} cols={} scrollback_rows={} shell={s} command_argc={} shell_command={}", .{
             session.idSlice(),
-            pid,
+            child.pid,
             rows,
             cols,
             scrollback_row_count,
