@@ -1675,7 +1675,7 @@ def test_ssh_passthrough_remote_command_uses_stream_proxy(tmp):
         raise AssertionError(log_text)
     if "--outer-tty" in log_text:
         raise AssertionError(log_text)
-    if "--title-status-path" in log_text:
+    if "--parent-control" in log_text:
         raise AssertionError(log_text)
 
 
@@ -1700,11 +1700,11 @@ def test_ssh_passthrough_forced_tty_marks_stream_as_tty(tmp):
         raise AssertionError(log_text)
     if "--outer-tty" not in log_text:
         raise AssertionError(log_text)
-    if "--title-status-path" in log_text:
+    if "--parent-control" in log_text:
         raise AssertionError(log_text)
 
 
-def test_ssh_passthrough_tty_enables_title_status_path(tmp):
+def test_ssh_passthrough_tty_uses_single_stream_guid(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1724,11 +1724,13 @@ def test_ssh_passthrough_tty_enables_title_status_path(tmp):
     if result.returncode != 0:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "--outer-tty" not in log_text or "--title-status-path" not in log_text:
+    if "--outer-tty" not in log_text:
+        raise AssertionError(log_text)
+    if "--parent-control" in log_text:
         raise AssertionError(log_text)
 
 
-def test_ssh_passthrough_command_in_tty_enables_title_status_path(tmp):
+def test_ssh_passthrough_command_in_tty_uses_single_stream_guid(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1748,7 +1750,7 @@ def test_ssh_passthrough_command_in_tty_enables_title_status_path(tmp):
     if result.returncode != 0:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "--outer-tty" in log_text or "--title-status-path" not in log_text:
+    if "--outer-tty" in log_text or "--parent-control" in log_text:
         raise AssertionError(log_text)
 
 
@@ -1816,13 +1818,14 @@ def test_ssh_passthrough_tty_restores_remote_title_after_stream_reconnect(tmp):
             raise AssertionError(f"remote title was not relayed before reconnect:\n{output!r}")
 
         kill_once_file.write_text("")
-        retry_title = b"\x1b]2;10sec until retry connect\x1b\\"
+        retry_title = b"\x1b]2;10sec retry CTRL-R\x1b\\"
         try:
             output = read_pty_until(fd, output, retry_title, 20.0)
         except AssertionError as exc:
             raise AssertionError(f"{exc}\nfake ssh log:\n{optional_text(fake_log)}") from exc
+        os.write(fd, b"\x12")
         restore_title = b"\x1b]2;remote-title\x1b\\"
-        output = read_pty_until(fd, output, restore_title, 25.0)
+        output = read_pty_until(fd, output, restore_title, 8.0)
 
         retry_index = output.index(retry_title)
         restore_index = output.index(restore_title, retry_index + len(retry_title))
@@ -2276,6 +2279,39 @@ def test_sesshmux_unknown_command_does_not_fallback_to_plain_ssh(tmp):
         raise AssertionError(result)
     if fake_log.exists():
         raise AssertionError(fake_log.read_text())
+
+
+def test_internal_sessh_rejects_dot_host(tmp):
+    env = isolated_env(tmp)
+
+    bare = run_sesshmux([":internal-sessh:", "."], env, timeout=5.0)
+    if bare.returncode != 64 or '"." is not a valid ssh host' not in bare.stderr:
+        raise AssertionError(bare)
+
+    with_command = run_sesshmux([":internal-sessh:", ".", "list"], env, timeout=5.0)
+    if with_command.returncode != 64 or '"." is not a valid ssh host' not in with_command.stderr:
+        raise AssertionError(with_command)
+
+
+def test_internal_sessh_host_list_is_remote_command(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    env["SESSH_FAKE_SSH_LOG_PROXYCOMMAND"] = "1"
+
+    result = run_sesshmux([":internal-sessh:", "test-host", "list"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "plain_ssh=1" not in log_text or "plain_remote_command=list" not in log_text:
+        raise AssertionError(log_text)
+    if ":internal-stream-client:" not in log_text:
+        raise AssertionError(log_text)
 
 
 def test_ssh_unsupported_option_does_not_fallback_for_sessh_action(tmp):
@@ -3894,12 +3930,12 @@ def main(argv=None):
             test_ssh_passthrough_forced_tty_marks_stream_as_tty,
         ),
         (
-            "ssh passthrough tty enables title status path",
-            test_ssh_passthrough_tty_enables_title_status_path,
+            "ssh passthrough tty uses single stream guid",
+            test_ssh_passthrough_tty_uses_single_stream_guid,
         ),
         (
-            "ssh passthrough command in tty enables title status path",
-            test_ssh_passthrough_command_in_tty_enables_title_status_path,
+            "ssh passthrough command in tty uses single stream guid",
+            test_ssh_passthrough_command_in_tty_uses_single_stream_guid,
         ),
         (
             "ssh passthrough tty restores remote title after stream reconnect",
@@ -3940,6 +3976,14 @@ def main(argv=None):
         (
             "sesshmux unknown command does not fallback to plain ssh",
             test_sesshmux_unknown_command_does_not_fallback_to_plain_ssh,
+        ),
+        (
+            "internal sessh rejects dot host",
+            test_internal_sessh_rejects_dot_host,
+        ),
+        (
+            "internal sessh host list is remote command",
+            test_internal_sessh_host_list_is_remote_command,
         ),
         (
             "ssh unsupported option does not fallback for sessh action",

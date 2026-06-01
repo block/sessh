@@ -2,9 +2,11 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const app_allocator = @import("app_allocator.zig");
 const io = @import("io.zig");
 const protocol = @import("protocol.zig");
 const client_log = @import("client_log.zig");
+const reconnect_control = @import("reconnect_control.zig");
 const reconnect = @import("reconnect.zig");
 const reconnect_title = @import("reconnect_title.zig");
 const session_registry = @import("session_registry.zig");
@@ -24,8 +26,7 @@ const StreamOutcome = union(enum) {
 };
 
 pub const ClientStreamOptions = struct {
-    status_enabled: bool = false,
-    title_status_path: ?[]const u8 = null,
+    parent_control_socket_path: []const u8,
 };
 
 // Tracks byte offsets for one side of the reconnectable stream. `outbound`
@@ -372,10 +373,10 @@ pub fn runRemote(allocator: std.mem.Allocator, exe: []const u8, args: []const []
     const guid = args[0];
     if (!session_registry.isValidReconnectGuid(guid)) return error.InvalidStreamGuid;
     const port = try parsePort(args[1]);
-    const socket_path = try streamSocketPath(allocator, guid);
-    defer allocator.free(socket_path);
+    var socket_paths = try session_registry.runtimeAgentSocketPathsForGuid(allocator, guid);
+    defer socket_paths.deinit(allocator);
 
-    const fd = try connectOrStartAgent(allocator, exe, guid, port, socket_path);
+    const fd = try connectOrStartAgent(allocator, exe, guid, port, socket_paths.socket);
     defer _ = c.close(fd);
     try relayRawDuplex(0, 1, fd);
 }
@@ -445,10 +446,7 @@ pub fn runClientStream(
 
     var state = StreamState.init(allocator);
     defer state.deinit();
-    var reconnect_status = if (options.title_status_path) |path|
-        StreamReconnectStatus.initTitle(path)
-    else
-        StreamReconnectStatus.init(options.status_enabled);
+    var reconnect_status = try StreamReconnectStatus.initParentControl(options.parent_control_socket_path);
     defer reconnect_status.deinit();
 
     var attempt: usize = 0;
@@ -475,8 +473,8 @@ pub fn runClientStream(
                     return err;
                 }
                 const delay_ms = reconnect.delayMs(attempt);
-                sleepBeforeReconnect(&reconnect_status, delay_ms);
-                attempt = reconnect.nextAttempt(attempt, false);
+                const reconnect_now = waitBeforeReconnect(&reconnect_status, delay_ms);
+                attempt = reconnect.nextAttempt(attempt, reconnect_now);
                 retrying = true;
                 continue;
             };
@@ -484,6 +482,7 @@ pub fn runClientStream(
         had_transport = true;
         reconnect_status.flushDiagnostics();
         reconnect_status.clear();
+        reconnect_status.discardPendingControl();
 
         transport_loop: while (true) {
             var attachment = StreamAttachment.init(
@@ -511,6 +510,7 @@ pub fn runClientStream(
                             old_unresponsive = false;
                             attempt = 0;
                             reconnect_status.clear();
+                            reconnect_status.discardPendingControl();
                         }
                     },
                     .unresponsive => {
@@ -522,8 +522,8 @@ pub fn runClientStream(
                             pending = Pending.start(allocator, start_transport) catch |err| {
                                 client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                                 const delay_ms = reconnect.delayMs(attempt);
-                                sleepBeforeReconnect(&reconnect_status, delay_ms);
-                                attempt = reconnect.nextAttempt(attempt, false);
+                                const reconnect_now = waitBeforeReconnect(&reconnect_status, delay_ms);
+                                attempt = reconnect.nextAttempt(attempt, reconnect_now);
                                 continue;
                             };
                             reconnect_status.showReconnecting();
@@ -550,6 +550,7 @@ pub fn runClientStream(
                                     attempt = 0;
                                     retrying = false;
                                     reconnect_status.clear();
+                                    reconnect_status.discardPendingControl();
                                     continue :transport_loop;
                                 }
                                 var discard = new_transport;
@@ -559,8 +560,8 @@ pub fn runClientStream(
                                 client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                                 if (old_unresponsive) {
                                     const delay_ms = reconnect.delayMs(attempt);
-                                    sleepBeforeReconnect(&reconnect_status, delay_ms);
-                                    attempt = reconnect.nextAttempt(attempt, false);
+                                    const reconnect_now = waitBeforeReconnect(&reconnect_status, delay_ms);
+                                    attempt = reconnect.nextAttempt(attempt, reconnect_now);
                                     pending = Pending.start(allocator, start_transport) catch |retry_err| {
                                         client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{retry_err});
                                         continue;
@@ -580,7 +581,7 @@ pub fn runClientStream(
                 result = replacement.takeIfDone();
                 if (result != null) break;
                 reconnect_status.showReconnecting();
-                io.sleepMillis(50);
+                _ = reconnect_status.pollControl(50);
                 reconnect_status.flushDiagnostics();
             }
             pending = null;
@@ -589,6 +590,7 @@ pub fn runClientStream(
                     resumed_transport = new_transport;
                     attempt = 0;
                     retrying = false;
+                    reconnect_status.discardPendingControl();
                     continue :client_loop;
                 },
                 .failed => |err| {
@@ -597,8 +599,8 @@ pub fn runClientStream(
             }
         }
         const delay_ms = reconnect.delayMs(attempt);
-        sleepBeforeReconnect(&reconnect_status, delay_ms);
-        attempt = reconnect.nextAttempt(attempt, false);
+        const reconnect_now = waitBeforeReconnect(&reconnect_status, delay_ms);
+        attempt = reconnect.nextAttempt(attempt, reconnect_now);
         retrying = true;
     }
 }
@@ -871,12 +873,6 @@ fn connectOrStartAgent(
     return error.StreamAgentDidNotStart;
 }
 
-fn streamSocketPath(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    const root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(root);
-    return std.fmt.allocPrint(allocator, "{s}/r/{s}.sock", .{ root, guid });
-}
-
 fn parsePort(value: []const u8) !u16 {
     const port = try std.fmt.parseInt(u16, value, 10);
     if (port == 0) return error.InvalidStreamPort;
@@ -891,15 +887,16 @@ fn elapsedMs(start_ms: u64, end_ms: u64) u64 {
     return if (end_ms >= start_ms) end_ms - start_ms else 0;
 }
 
-fn sleepBeforeReconnect(status: *StreamReconnectStatus, delay_ms: u64) void {
+fn waitBeforeReconnect(status: *StreamReconnectStatus, delay_ms: u64) bool {
     var remaining_ms = delay_ms;
     while (remaining_ms > 0) {
         status.showRetry(remaining_ms);
         const step_ms = @min(remaining_ms, 1_000);
-        io.sleepMillis(step_ms);
+        if (status.pollControl(@intCast(step_ms))) return true;
         remaining_ms -= step_ms;
         status.flushDiagnostics();
     }
+    return status.consumeReconnectRequest();
 }
 
 // In ProxyCommand mode stdout is the ssh byte stream, so reconnect status must
@@ -912,7 +909,7 @@ const StreamReconnectStatus = struct {
     const Mode = enum {
         disabled,
         stderr_plain,
-        window_title,
+        parent_control,
     };
 
     fd: c.fd_t,
@@ -920,6 +917,7 @@ const StreamReconnectStatus = struct {
     owned_fd: bool = false,
     line: [96]u8 = undefined,
     line_len: usize = 0,
+    reconnect_requested: bool = false,
     diagnostic_cursor: u64,
     live_diagnostic_start_seq: u64,
     rendered_diagnostic_seq: u64,
@@ -935,23 +933,16 @@ const StreamReconnectStatus = struct {
         };
     }
 
-    fn initTitle(title_status_path: []const u8) StreamReconnectStatus {
+    fn initParentControl(socket_path: []const u8) !StreamReconnectStatus {
         const displayed = client_log.displayedUserDiagnosticSeq();
         // The proxy only sees OpenSSH's ProxyCommand byte stream, not the
-        // decrypted terminal output. Send status requests to the parent relay
-        // so it can inject title changes only at safe parser boundaries.
-        const fd = socket_transport.connectSocket(title_status_path) catch {
-            return .{
-                .fd = -1,
-                .mode = .disabled,
-                .diagnostic_cursor = displayed,
-                .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
-                .rendered_diagnostic_seq = displayed,
-            };
-        };
+        // decrypted terminal output or the user's real stdin. Send status
+        // requests to the parent relay, and receive local reconnect commands
+        // from the same socket.
+        const fd = try socket_transport.connectSocket(socket_path);
         return .{
             .fd = fd,
-            .mode = .window_title,
+            .mode = .parent_control,
             .owned_fd = true,
             .diagnostic_cursor = displayed,
             .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
@@ -970,11 +961,11 @@ const StreamReconnectStatus = struct {
         };
     }
 
-    fn initTitleForTest(fd: c.fd_t) StreamReconnectStatus {
+    fn initParentControlForTest(fd: c.fd_t) StreamReconnectStatus {
         const displayed = client_log.displayedUserDiagnosticSeq();
         return .{
             .fd = fd,
-            .mode = .window_title,
+            .mode = .parent_control,
             .diagnostic_cursor = displayed,
             .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
             .rendered_diagnostic_seq = displayed,
@@ -993,8 +984,8 @@ const StreamReconnectStatus = struct {
     fn showRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
         var delay_buf: [16]u8 = undefined;
         const delay = reconnect_title.formatDelay(delay_ms, &delay_buf) catch return;
-        if (self.mode == .window_title) {
-            self.sendTitleStatus("retry {}\n", .{delay_ms});
+        if (self.mode == .parent_control) {
+            self.sendParentStatus(.{ .retry = .{ .delay_ms = delay_ms } });
             return;
         }
         const message = std.fmt.bufPrint(
@@ -1008,8 +999,8 @@ const StreamReconnectStatus = struct {
     }
 
     fn showReconnecting(self: *StreamReconnectStatus) void {
-        if (self.mode == .window_title) {
-            self.sendTitleStatus("reconnecting\n", .{});
+        if (self.mode == .parent_control) {
+            self.sendParentStatus(.{ .reconnecting = .{} });
             return;
         }
         const message = "sessh: disconnected: Reconnecting...";
@@ -1020,8 +1011,8 @@ const StreamReconnectStatus = struct {
     }
 
     fn clear(self: *StreamReconnectStatus) void {
-        if (self.mode == .window_title) {
-            self.sendTitleStatus("clear\n", .{});
+        if (self.mode == .parent_control) {
+            self.sendParentStatus(.{ .clear = .{} });
             return;
         }
         self.refreshDiagnostics();
@@ -1067,11 +1058,79 @@ const StreamReconnectStatus = struct {
         client_log.markUserDiagnosticsDisplayedThrough(new_cursor);
     }
 
-    fn sendTitleStatus(self: *StreamReconnectStatus, comptime fmt: []const u8, args: anytype) void {
-        if (self.mode != .window_title or self.fd < 0) return;
-        var buf: [64]u8 = undefined;
-        const message = std.fmt.bufPrint(&buf, fmt, args) catch return;
-        io.writeAll(self.fd, message) catch {};
+    fn pollControl(self: *StreamReconnectStatus, timeout_ms: i32) bool {
+        if (self.mode != .parent_control or self.fd < 0) {
+            if (timeout_ms > 0) io.sleepMillis(@intCast(timeout_ms));
+            return false;
+        }
+        var pollfd = [_]posix.pollfd{.{
+            .fd = self.fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&pollfd, timeout_ms) catch return self.consumeReconnectRequest();
+        if (ready == 0) return self.consumeReconnectRequest();
+        if ((pollfd[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfd[0].revents & posix.POLL.IN) == 0)
+        {
+            self.mode = .disabled;
+            return self.consumeReconnectRequest();
+        }
+        if ((pollfd[0].revents & posix.POLL.IN) != 0) {
+            self.readControlFrame() catch {
+                self.mode = .disabled;
+                return self.consumeReconnectRequest();
+            };
+        }
+        return self.consumeReconnectRequest();
+    }
+
+    fn discardPendingControl(self: *StreamReconnectStatus) void {
+        if (self.mode != .parent_control or self.fd < 0) return;
+        while (true) {
+            var pollfd = [_]posix.pollfd{.{
+                .fd = self.fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = posix.poll(&pollfd, 0) catch break;
+            if (ready == 0 or (pollfd[0].revents & posix.POLL.IN) == 0) break;
+            self.readControlFrame() catch {
+                self.mode = .disabled;
+                break;
+            };
+        }
+        self.reconnect_requested = false;
+    }
+
+    fn consumeReconnectRequest(self: *StreamReconnectStatus) bool {
+        const requested = self.reconnect_requested;
+        self.reconnect_requested = false;
+        return requested;
+    }
+
+    fn readControlFrame(self: *StreamReconnectStatus) !void {
+        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), self.fd);
+        defer frame.deinit(app_allocator.allocator());
+        try self.handleControlFrame(frame.message_type, frame.payload);
+    }
+
+    fn handleControlFrame(self: *StreamReconnectStatus, message_type: protocol.MessageType, payload: []const u8) !void {
+        switch (message_type) {
+            .stream_reconnect_now => {
+                var message = try protocol.decodePayload(pb.StreamReconnectNow, app_allocator.allocator(), payload);
+                defer message.deinit(app_allocator.allocator());
+                self.reconnect_requested = true;
+            },
+            else => {},
+        }
+    }
+
+    fn sendParentStatus(self: *StreamReconnectStatus, status: pb.StreamParentStatus.status_union) void {
+        if (self.mode != .parent_control or self.fd < 0) return;
+        sendStreamMessage(app_allocator.allocator(), self.fd, .stream_parent_status, pb.StreamParentStatus{
+            .status = status,
+        }) catch {};
     }
 };
 
@@ -1284,32 +1343,69 @@ test "stream reconnect status uses plain stderr lines" {
     );
 }
 
-test "stream reconnect title status sends parent relay commands" {
+test "stream reconnect status sends parent relay commands" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = StreamReconnectStatus.initTitleForTest(fds[1]);
+    var status = StreamReconnectStatus.initParentControlForTest(fds[1]);
     status.showRetry(12_000);
     status.showReconnecting();
     status.clear();
     posix.close(fds[1]);
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fds[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    var retry_frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
+    defer retry_frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.stream_parent_status, retry_frame.message_type);
+    var retry = try protocol.decodePayload(pb.StreamParentStatus, std.testing.allocator, retry_frame.payload);
+    defer retry.deinit(std.testing.allocator);
+    switch (retry.status.?) {
+        .retry => |message| try std.testing.expectEqual(@as(u64, 12_000), message.delay_ms),
+        else => return error.UnexpectedStreamParentStatus,
     }
 
-    try std.testing.expectEqualStrings(
-        "retry 12000\n" ++
-            "reconnecting\n" ++
-            "clear\n",
-        output.items,
-    );
+    var reconnecting_frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
+    defer reconnecting_frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.stream_parent_status, reconnecting_frame.message_type);
+    var reconnecting = try protocol.decodePayload(pb.StreamParentStatus, std.testing.allocator, reconnecting_frame.payload);
+    defer reconnecting.deinit(std.testing.allocator);
+    switch (reconnecting.status.?) {
+        .reconnecting => {},
+        else => return error.UnexpectedStreamParentStatus,
+    }
+
+    var clear_frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
+    defer clear_frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.stream_parent_status, clear_frame.message_type);
+    var clear = try protocol.decodePayload(pb.StreamParentStatus, std.testing.allocator, clear_frame.payload);
+    defer clear.deinit(std.testing.allocator);
+    switch (clear.status.?) {
+        .clear => {},
+        else => return error.UnexpectedStreamParentStatus,
+    }
+}
+
+test "stream reconnect parent control consumes reconnect-now once" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const payload = try protocol.encodePayload(std.testing.allocator, pb.StreamReconnectNow{});
+    defer std.testing.allocator.free(payload);
+    try protocol.sendFrame(fds[1], .stream_reconnect_now, payload);
+    try protocol.sendFrame(fds[1], .stream_reconnect_now, payload);
+
+    var status = StreamReconnectStatus.initParentControlForTest(fds[0]);
+    try std.testing.expect(status.pollControl(0));
+    try std.testing.expect(status.pollControl(0));
+    try std.testing.expect(!status.consumeReconnectRequest());
+
+    try protocol.sendFrame(fds[1], .stream_reconnect_now, payload);
+    status.discardPendingControl();
+    try std.testing.expect(!status.consumeReconnectRequest());
+
+    try protocol.sendFrame(fds[1], .stream_reconnect_now, payload);
+    try std.testing.expect(status.pollControl(0));
+    try std.testing.expect(!status.consumeReconnectRequest());
 }
 
 test "stream reconnect status renders ssh diagnostics before status" {

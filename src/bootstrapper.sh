@@ -172,6 +172,20 @@ case "$broker_args" in
   *) exec_args=":internal-broker: $broker_args" ;;
 esac
 
+case "$broker_args" in
+  :internal-stream-remote:*)
+    # A stream has one r-guid, but local/fake ssh runs execute both sides on the
+    # same machine. Keep the remote stream agent in a different runtime root so
+    # it never collides with the parent control socket for that r-guid.
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+      XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR/sessh-stream-remote
+    else
+      XDG_RUNTIME_DIR=/tmp/sessh-$(id -u)/sessh-stream-remote
+    fi
+    export XDG_RUNTIME_DIR
+    ;;
+esac
+
 cache_root=${XDG_CACHE_HOME:-${HOME:-}/.cache}/sessh/bin
 [ "$cache_root" != "/.cache/sessh/bin" ] || err INVALID_ENV missing_cache_home
 cache_dir=$cache_root/$artifact_set_id

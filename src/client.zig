@@ -10,6 +10,7 @@ const io_helpers = @import("io.zig");
 const list_format = @import("list_format.zig");
 const protocol = @import("protocol.zig");
 const process_exit = @import("process_exit.zig");
+const reconnect_control = @import("reconnect_control.zig");
 const reconnect_title = @import("reconnect_title.zig");
 const session_registry = @import("session_registry.zig");
 const socket_transport = @import("socket_transport.zig");
@@ -623,8 +624,6 @@ pub const ReconnectUi = struct {
     const max_diagnostic_banner_lines = 3;
     const max_banner_message_bytes = 256;
     const max_title_fallback_bytes = 512;
-    const ctrl_c = 0x03;
-    const ctrl_r = 0x12;
 
     mode_guard: terminal.TerminalModeGuard,
     viewport_offset: u16 = 0,
@@ -858,16 +857,16 @@ pub const ReconnectUi = struct {
         if (n <= 0) return .detach;
         io_helpers.noteRead(0, input[0..@intCast(n)]);
 
-        var ignored = false;
-        for (input[0..@intCast(n)]) |byte| {
-            if (byte == ctrl_c) return .detach;
-            if (byte == ctrl_r) {
+        const bytes = input[0..@intCast(n)];
+        switch (reconnect_control.scanInput(bytes, .{ .ctrl_c_detaches = true })) {
+            .detach => return .detach,
+            .reconnect_now => {
                 self.reconnect_acknowledged = true;
                 return .reconnect_now;
-            }
-            ignored = true;
+            },
+            .none => {},
         }
-        if (ignored) {
+        if (bytes.len > 0) {
             self.input_during_disconnect = true;
             try self.alertDisconnectedInput();
         }
@@ -2342,8 +2341,9 @@ test "client detach request uses normal detach relay end" {
     );
 }
 
-/// Implements the public `sessh .` path. This is both the local testing
-/// transport and the same broker/agent flow used by ssh after bootstrap.
+/// Implements sesshmux-local commands after the mux translator has selected the
+/// local "." target. The sessh entrypoint does not call this directly for ".";
+/// there, "." is rejected as an invalid ssh host.
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var options = parseLocalOptions(args) catch |err| {
         try writeLocalArgError(err);

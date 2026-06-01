@@ -49,6 +49,8 @@ message Frame {
     StreamEofAck stream_eof_ack = 38;
     StreamPing stream_ping = 39;
     StreamPong stream_pong = 40;
+    StreamParentStatus stream_parent_status = 41;
+    StreamReconnectNow stream_reconnect_now = 42;
   }
 }
 
@@ -93,6 +95,34 @@ message StreamPing {
 
 // Response to StreamPing.
 message StreamPong {
+}
+
+message StreamParentRetry {
+  uint64 delay_ms = 1;
+}
+
+message StreamParentReconnecting {
+}
+
+message StreamParentClear {
+}
+
+// Sent by the stream ProxyCommand to its parent sessh process. ProxyCommand
+// stdout is reserved for the ssh byte stream, so reconnect UI is requested over
+// the same framed protobuf protocol on the local parent-control socket.
+message StreamParentStatus {
+  oneof status {
+    StreamParentRetry retry = 1;
+    StreamParentReconnecting reconnecting = 2;
+    StreamParentClear clear = 3;
+  }
+}
+
+// Sent by the parent sessh process to the stream ProxyCommand when the user
+// asks to reconnect immediately from local reconnect UI, currently with
+// Ctrl-R. This is intentionally outside the ssh byte stream so the remote
+// process never receives the UI control byte.
+message StreamReconnectNow {
 }
 
 // Embedded in SessionCreate.

@@ -47,6 +47,28 @@ pub const Allocation = struct {
     }
 };
 
+/// Runtime socket identity for anything addressed by a top-level typed GUID.
+/// The real Unix socket lives in `runtime/s` to keep paths short; the GUID
+/// directory contains the stable `agent.sock` symlink used by lookup code.
+pub const RuntimeAgentSocketPaths = struct {
+    dir: []u8,
+    socket: []u8,
+    agent_sock_link: []u8,
+
+    pub fn deinit(self: *RuntimeAgentSocketPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.agent_sock_link);
+        allocator.free(self.socket);
+        allocator.free(self.dir);
+        self.* = undefined;
+    }
+
+    pub fn removeRuntimeFiles(self: RuntimeAgentSocketPaths) void {
+        unlinkIfExists(self.socket) catch {};
+        unlinkIfExists(self.agent_sock_link) catch {};
+        removeDirIfEmpty(self.dir) catch {};
+    }
+};
+
 pub const GeneratedIdentity = struct {
     guid: []u8,
     alias: []u8,
@@ -376,6 +398,24 @@ pub fn canonicalClientGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8
     return out;
 }
 
+pub fn canonicalReconnectGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (!isValidReconnectGuid(guid)) return error.InvalidReconnectId;
+    const out = try allocator.alloc(u8, reconnect_guid_len);
+    out[0] = reconnect_guid_prefix[0];
+    out[1] = reconnect_guid_prefix[1];
+    for (guid[reconnect_guid_prefix.len..], 0..) |byte, i| {
+        out[reconnect_guid_prefix.len + i] = std.ascii.toLower(byte);
+    }
+    return out;
+}
+
+fn canonicalRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (isValidSessionGuid(guid) or isValidCompactGuid(guid)) return canonicalGuid(allocator, guid);
+    if (isValidClientGuid(guid)) return canonicalClientGuid(allocator, guid);
+    if (isValidReconnectGuid(guid)) return canonicalReconnectGuid(allocator, guid);
+    return error.InvalidSessionId;
+}
+
 pub fn compactGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidCompactGuid(guid)) {
         const out = try allocator.alloc(u8, compact_guid_len);
@@ -403,6 +443,25 @@ pub fn compactClientGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
         dst += 1;
     }
     return out;
+}
+
+pub fn compactReconnectGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (!isValidReconnectGuid(guid)) return error.InvalidReconnectId;
+    var out = try allocator.alloc(u8, compact_guid_len);
+    var dst: usize = 0;
+    for (guid[reconnect_guid_prefix.len..]) |byte| {
+        if (byte == '-') continue;
+        out[dst] = std.ascii.toLower(byte);
+        dst += 1;
+    }
+    return out;
+}
+
+fn compactRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (isValidSessionGuid(guid) or isValidCompactGuid(guid)) return compactGuid(allocator, guid);
+    if (isValidClientGuid(guid)) return compactClientGuid(allocator, guid);
+    if (isValidReconnectGuid(guid)) return compactReconnectGuid(allocator, guid);
+    return error.InvalidSessionId;
 }
 
 pub fn generateGuid(allocator: std.mem.Allocator) ![]u8 {
@@ -987,6 +1046,56 @@ fn writeClientAgentSocketHintInRoot(
     const link_path = try clientAgentSocketHintPathInRoot(allocator, runtime_root, canonical_client);
     defer allocator.free(link_path);
     try installSymlinkReplacing(allocator, link_path, target);
+}
+
+pub fn runtimeAgentSocketPathsForGuid(allocator: std.mem.Allocator, guid: []const u8) !RuntimeAgentSocketPaths {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    return runtimeAgentSocketPathsForGuidInRoot(allocator, runtime_root, guid);
+}
+
+pub fn runtimeAgentSocketPathsForGuidInRoot(
+    allocator: std.mem.Allocator,
+    runtime_root: []const u8,
+    guid: []const u8,
+) !RuntimeAgentSocketPaths {
+    try ensureRegistryRoot(allocator, runtime_root);
+
+    const guid_root = try sessionsDirInRoot(allocator, runtime_root);
+    defer allocator.free(guid_root);
+    try mkdirIgnoreExists(allocator, guid_root);
+
+    const socket_root = try sessionSocketsDirInRoot(allocator, runtime_root);
+    defer allocator.free(socket_root);
+    try mkdirIgnoreExists(allocator, socket_root);
+
+    const canonical = try canonicalRuntimeGuid(allocator, guid);
+    defer allocator.free(canonical);
+
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ guid_root, canonical });
+    errdefer allocator.free(dir);
+    try mkdirIgnoreExists(allocator, dir);
+
+    const agent_sock_link = try agentSocketLinkPath(allocator, dir);
+    errdefer allocator.free(agent_sock_link);
+
+    const socket = socketPathFromAgentSocketLink(allocator, dir, agent_sock_link) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            var socket_allocation = try allocateSocketPathForGuidInRoot(allocator, runtime_root, canonical);
+            errdefer socket_allocation.deinit(allocator);
+            try installAgentSocketLink(allocator, agent_sock_link, socket_allocation.name);
+            allocator.free(socket_allocation.name);
+            break :blk socket_allocation.path;
+        },
+        else => return err,
+    };
+    errdefer allocator.free(socket);
+
+    return .{
+        .dir = dir,
+        .socket = socket,
+        .agent_sock_link = agent_sock_link,
+    };
 }
 
 pub fn removeClientRouteHint(allocator: std.mem.Allocator, client_guid: []const u8) !void {
@@ -1815,7 +1924,7 @@ fn allocateSocketPathForGuidInRoot(allocator: std.mem.Allocator, root: []const u
     const socket_dir = try sessionSocketsDirInRoot(allocator, root);
     defer allocator.free(socket_dir);
 
-    const compact = try compactGuid(allocator, guid);
+    const compact = try compactRuntimeGuid(allocator, guid);
     defer allocator.free(compact);
     const compact_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ socket_dir, compact });
     errdefer allocator.free(compact_path);
@@ -2109,6 +2218,29 @@ test "long runtime roots use random socket names when compact guid does not fit"
     const expected_target = try std.fmt.allocPrint(allocator, "../../s/{s}", .{socket_name});
     defer allocator.free(expected_target);
     try std.testing.expectEqualStrings(expected_target, link_target);
+}
+
+test "runtime agent socket paths use typed guid directories and socket directory" {
+    const allocator = std.testing.allocator;
+    const root = "zig-cache/runtime-agent-socket-path-test";
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+
+    const guid = "r-550e8400-e29b-41d4-a716-446655440000";
+    var paths = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
+    defer paths.deinit(allocator);
+
+    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/r-550e8400-e29b-41d4-a716-446655440000", paths.dir);
+    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/s/550e8400e29b41d4a716446655440000", paths.socket);
+    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/r-550e8400-e29b-41d4-a716-446655440000/agent.sock", paths.agent_sock_link);
+
+    const link_target = try readLinkAlloc(allocator, paths.agent_sock_link, 4096);
+    defer allocator.free(link_target);
+    try std.testing.expectEqualStrings("../../s/550e8400e29b41d4a716446655440000", link_target);
+
+    var again = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
+    defer again.deinit(allocator);
+    try std.testing.expectEqualStrings(paths.socket, again.socket);
 }
 
 test "validates session ids and aliases" {

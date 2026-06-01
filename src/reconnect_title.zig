@@ -22,8 +22,18 @@ pub fn writeRetryTitle(fd: c.fd_t, delay_ms: u64) !void {
     try writeTitle(fd, title);
 }
 
+pub fn writeRetryNowTitle(fd: c.fd_t, delay_ms: u64) !void {
+    var title_buf: [48]u8 = undefined;
+    const title = try retryNowTitle(delay_ms, &title_buf);
+    try writeTitle(fd, title);
+}
+
 pub fn writeReconnectingTitle(fd: c.fd_t) !void {
     try writeTitle(fd, "reconnecting");
+}
+
+pub fn writeReconnectingNowTitle(fd: c.fd_t) !void {
+    try writeTitle(fd, "reconnecting CTRL-R");
 }
 
 pub fn writeConnectionReadyTitle(fd: c.fd_t) !void {
@@ -40,6 +50,12 @@ pub fn retryTitle(delay_ms: u64, buf: []u8) ![]const u8 {
     var delay_buf: [16]u8 = undefined;
     const delay = try formatDelay(delay_ms, &delay_buf);
     return std.fmt.bufPrint(buf, "{s} until retry connect", .{delay});
+}
+
+pub fn retryNowTitle(delay_ms: u64, buf: []u8) ![]const u8 {
+    var delay_buf: [16]u8 = undefined;
+    const delay = try formatDelay(delay_ms, &delay_buf);
+    return std.fmt.bufPrint(buf, "{s} retry CTRL-R", .{delay});
 }
 
 pub fn switchCountdownTitle(delay_ms: u64, buf: []u8) ![]const u8 {
@@ -68,6 +84,8 @@ test "retry title uses compact reconnect delay" {
     var buf: [48]u8 = undefined;
     try std.testing.expectEqualStrings("5sec until retry connect", try retryTitle(5_000, &buf));
     try std.testing.expectEqualStrings("1min until retry connect", try retryTitle(60_000, &buf));
+    try std.testing.expectEqualStrings("5sec retry CTRL-R", try retryNowTitle(5_000, &buf));
+    try std.testing.expectEqualStrings("1min retry CTRL-R", try retryNowTitle(60_000, &buf));
 }
 
 test "writeTitle sanitizes control bytes" {

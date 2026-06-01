@@ -41,6 +41,8 @@ pub const MessageType = enum {
     stream_eof_ack,
     stream_ping,
     stream_pong,
+    stream_parent_status,
+    stream_reconnect_now,
 };
 
 pub const frame_header_len = 4;
@@ -148,6 +150,8 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .stream_eof_ack => |message| ownedFrameFromMessage(allocator, .stream_eof_ack, message),
             .stream_ping => |message| ownedFrameFromMessage(allocator, .stream_ping, message),
             .stream_pong => |message| ownedFrameFromMessage(allocator, .stream_pong, message),
+            .stream_parent_status => |message| ownedFrameFromMessage(allocator, .stream_parent_status, message),
+            .stream_reconnect_now => |message| ownedFrameFromMessage(allocator, .stream_reconnect_now, message),
         };
     }
 
@@ -335,6 +339,16 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.StreamPong, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_pong = message } });
+        },
+        .stream_parent_status => blk: {
+            var message = try decodePayload(pb.StreamParentStatus, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_parent_status = message } });
+        },
+        .stream_reconnect_now => blk: {
+            var message = try decodePayload(pb.StreamReconnectNow, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_reconnect_now = message } });
         },
     };
 }
