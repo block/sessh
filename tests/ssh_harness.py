@@ -611,7 +611,9 @@ def run_sesshmux_in_pty(args, env, steps, timeout=10.0, child_tty_setup=None):
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         for needle, to_send in steps:
             output = read_pty_until(fd, output, needle, timeout)
-            if to_send:
+            if callable(to_send):
+                to_send(fd)
+            elif to_send:
                 os.write(fd, to_send)
 
         deadline = time.monotonic() + timeout
@@ -658,6 +660,15 @@ def set_passthrough_tty_mode_probe(fd):
     attrs[0] &= ~termios.ICRNL
     attrs[3] &= ~(termios.ECHO | termios.ICANON)
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
+def resize_pty_then_send(rows, cols, data):
+    def action(fd):
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        if data:
+            os.write(fd, data)
+
+    return action
 
 
 def wait_status_to_returncode(status):
@@ -1687,6 +1698,30 @@ def test_ssh_non_passthrough_tty_preserves_exit_status(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_non_passthrough_tty_propagates_resize(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    command = "printf 'READY:%s\\n' \"$(stty size)\"; IFS= read -r _; printf 'RESIZED:%s\\n' \"$(stty size)\""
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "-t", "test-host", command],
+        env,
+        (
+            (b"READY:24 100", resize_pty_then_send(31, 120, b"\n")),
+            (b"RESIZED:31 120", None),
+        ),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+
+
 def test_ssh_passthrough_remote_command_uses_direct_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1741,6 +1776,30 @@ def test_ssh_passthrough_tty_preserves_exit_status(tmp):
     )
 
     if result.returncode != 13:
+        raise AssertionError(result)
+
+
+def test_ssh_passthrough_tty_propagates_resize(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    command = "printf 'READY:%s\\n' \"$(stty size)\"; IFS= read -r _; printf 'RESIZED:%s\\n' \"$(stty size)\""
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--passthrough", "-tt", "test-host", command],
+        env,
+        (
+            (b"READY:24 100", resize_pty_then_send(32, 121, b"\n")),
+            (b"RESIZED:32 121", None),
+        ),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
         raise AssertionError(result)
 
 
@@ -3892,6 +3951,10 @@ def main(argv=None):
             test_ssh_non_passthrough_tty_preserves_exit_status,
         ),
         (
+            "ssh non-passthrough tty propagates resize",
+            test_ssh_non_passthrough_tty_propagates_resize,
+        ),
+        (
             "ssh passthrough remote command uses direct stream",
             test_ssh_passthrough_remote_command_uses_direct_stream,
         ),
@@ -3902,6 +3965,10 @@ def main(argv=None):
         (
             "ssh passthrough tty preserves exit status",
             test_ssh_passthrough_tty_preserves_exit_status,
+        ),
+        (
+            "ssh passthrough tty propagates resize",
+            test_ssh_passthrough_tty_propagates_resize,
         ),
         (
             "ssh passthrough forced tty marks stream as tty",

@@ -41,6 +41,7 @@ pub const LocalStreamOptions = struct {
     intercept_ctrl_r: bool,
     intercept_escape: bool = false,
     receive_stderr: bool,
+    forward_resize: bool = false,
     title_fallback: []const u8 = "",
 };
 
@@ -304,6 +305,8 @@ const StreamAttachmentOptions = struct {
     sinks: [channel_count]ChannelSink = .{ .{}, .{}, .{} },
     reconnect_status: ?*StreamReconnectStatus = null,
     replacement_listen_fd: ?c.fd_t = null,
+    resize_pty_fd: ?c.fd_t = null,
+    forward_resize: bool = false,
     close_outbound_on_inbound_eof: bool = false,
     source_exit_pid: ?c.pid_t = null,
     source_exit_seen: ?*bool = null,
@@ -420,6 +423,7 @@ const StreamAttachment = struct {
     transport_write_fd: c.fd_t,
     options: StreamAttachmentOptions,
     liveness: StreamLiveness,
+    last_resize_size: ?terminal.WindowSize = null,
 
     fn init(
         state: *StreamState,
@@ -435,6 +439,12 @@ const StreamAttachment = struct {
         }
         state.outbound_exit_status_sent = false;
         sendStreamMessage(state.allocator, transport_write_fd, .stream_resume, state.resumeMessage()) catch return error.StreamTransportClosed;
+        var last_resize_size: ?terminal.WindowSize = null;
+        if (options.forward_resize) {
+            const size = terminal.currentWindowSize();
+            sendResizeMessage(state.allocator, transport_write_fd, size) catch return error.StreamTransportClosed;
+            last_resize_size = size;
+        }
         const now_ms = nowMillis();
         return .{
             .state = state,
@@ -442,6 +452,7 @@ const StreamAttachment = struct {
             .transport_write_fd = transport_write_fd,
             .options = options,
             .liveness = StreamLiveness.init(now_ms),
+            .last_resize_size = last_resize_size,
         };
     }
 
@@ -480,6 +491,13 @@ const StreamAttachment = struct {
         const now_after_poll_ms = nowMillis();
 
         if (ready == 0) {
+            // Window-size changes do not necessarily make stdin/stdout
+            // readable. Liveness wakeups also give us a chance to keep the
+            // remote PTY size current while the stream is otherwise idle.
+            self.maybeSendResize() catch |err| switch (err) {
+                error.WriteFailed => return .transport_closed,
+                else => return err,
+            };
             if (self.liveness.timedOut(now_after_poll_ms)) return .unresponsive;
             if (self.liveness.pingDue(now_after_poll_ms)) {
                 protocol.sendPing(self.transport_write_fd) catch return .transport_closed;
@@ -513,6 +531,13 @@ const StreamAttachment = struct {
         {
             return .transport_closed;
         }
+        // If resize and input arrive together, send the resize first. A common
+        // pattern is "resize terminal, then press Enter"; the command woken by
+        // that Enter should see the new PTY size.
+        self.maybeSendResize() catch |err| switch (err) {
+            error.WriteFailed => return .transport_closed,
+            else => return err,
+        };
         if ((pollfds[transport_index].revents & posix.POLL.IN) != 0) {
             const frame = protocol.readFrameAlloc(state.allocator, self.transport_read_fd) catch return .transport_closed;
             self.liveness.noteIncoming(nowMillis());
@@ -546,6 +571,20 @@ const StreamAttachment = struct {
             };
         }
         return .idle;
+    }
+
+    fn maybeSendResize(self: *StreamAttachment) !void {
+        if (!self.options.forward_resize) return;
+        const previous = self.last_resize_size orelse {
+            const size = terminal.currentWindowSize();
+            try sendResizeMessage(self.state.allocator, self.transport_write_fd, size);
+            self.last_resize_size = size;
+            return;
+        };
+        const size = terminal.currentWindowSize();
+        if (size.rows == previous.rows and size.cols == previous.cols) return;
+        try sendResizeMessage(self.state.allocator, self.transport_write_fd, size);
+        self.last_resize_size = size;
     }
 };
 
@@ -827,6 +866,7 @@ const StreamEndpoint = union(enum) {
                 },
                 .sinks = sinksWithStdin(pty.child.master_fd, null),
                 .replacement_listen_fd = listen_fd,
+                .resize_pty_fd = pty.child.master_fd,
                 .source_exit_pid = pty.child.pid,
                 .source_exit_seen = &pty.exited,
                 .source_exit_status = &pty.exit_status,
@@ -1125,6 +1165,7 @@ pub fn runLocalStream(
                     },
                     .sinks = localStreamSinks(options.sink_fd, options.stderr_fd, options.receive_stderr),
                     .reconnect_status = &reconnect_status,
+                    .forward_resize = options.forward_resize,
                     // A direct stream represents one remote command, not
                     // an interactive session. Once the remote side has
                     // closed its output stream there is no process left to
@@ -1409,6 +1450,23 @@ fn handleFrame(
                 else => return err,
             };
         },
+        .resize => {
+            var message = try protocol.decodePayload(pb.Resize, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            if (message.terminal_rows == 0 or message.terminal_cols == 0) return error.StreamInvalidResize;
+            if (message.terminal_rows > std.math.maxInt(u16) or
+                message.terminal_cols > std.math.maxInt(u16))
+            {
+                return error.StreamInvalidResize;
+            }
+            if (options.resize_pty_fd) |fd| {
+                _ = terminal.setPtySize(
+                    fd,
+                    @intCast(message.terminal_rows),
+                    @intCast(message.terminal_cols),
+                );
+            }
+        },
         .stream_exit_status => {
             var message = try protocol.decodePayload(pb.StreamExitStatus, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
@@ -1505,6 +1563,13 @@ fn sendStreamMessage(
     const payload = try protocol.encodePayload(allocator, message);
     defer allocator.free(payload);
     try protocol.sendFrame(fd, message_type, payload);
+}
+
+fn sendResizeMessage(allocator: std.mem.Allocator, fd: c.fd_t, size: terminal.WindowSize) !void {
+    try sendStreamMessage(allocator, fd, .resize, pb.Resize{
+        .terminal_rows = size.rows,
+        .terminal_cols = size.cols,
+    });
 }
 
 fn abortTransport(transport: anytype) void {

@@ -3170,6 +3170,7 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
         .intercept_ctrl_r = stdin_is_tty,
         .intercept_escape = stream_uses_tty and stdin_is_tty,
         .receive_stderr = !stream_uses_tty,
+        .forward_resize = stream_uses_tty,
         .title_fallback = parsed_ssh_args.host,
     }) catch |err| {
         try starter.exitAfterInitialFailure(err);
