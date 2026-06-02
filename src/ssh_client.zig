@@ -1202,14 +1202,6 @@ const CliParseOptions = struct {
 };
 
 fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, parse_options: CliParseOptions) !void {
-    // A leading "." is a sesshmux-local target produced by the mux translator,
-    // not an ssh host. The :internal-sessh: entrypoint remains ssh-shaped, so
-    // `:internal-sessh: .` and `:internal-sessh: . ...` are rejected below as
-    // attempts to use "." as a host.
-    if (parse_options.allow_mux_command_words and args.len >= 2 and std.mem.eql(u8, args[1], ".")) {
-        return client.run(allocator, args);
-    }
-
     var route_storage: ?session_registry.Route = null;
     defer if (route_storage) |*route| route.deinit(allocator);
 
@@ -1234,6 +1226,39 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
     {
         try io.writeAll(2, "sessh: \".\" is not a valid ssh host\n");
         return process_exit.request(64);
+    }
+    if (parse_options.allow_mux_command_words and
+        parsed_ssh_args.action == .new and
+        std.mem.eql(u8, parsed_ssh_args.host, "."))
+    {
+        // "." is parsed as the host like any other mux `new` target. Only
+        // after parsing do we interpret it as "use the local session broker."
+        applyFileConfigToLocalNew(allocator, &parsed_ssh_args) catch |err| {
+            try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
+            return process_exit.request(64);
+        };
+        client_log.setLevel(parsed_ssh_args.client_log_level);
+        if (parsed_ssh_args.terminal_emulator_set and !parsed_ssh_args.terminal_emulator) {
+            try io.writeAll(2, "sesshmux: new . requires terminal-emulator mode\n");
+            return process_exit.request(64);
+        }
+        if (parsed_ssh_args.force_proxy_mode_set and parsed_ssh_args.force_proxy_mode) {
+            try io.writeAll(2, "sesshmux: new . does not support proxy stream mode\n");
+            return process_exit.request(64);
+        }
+        const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
+        defer if (shell_command) |command| allocator.free(command);
+        return client.runLocalNewSession(allocator, .{
+            .exe = args[0],
+            .new_detached = parsed_ssh_args.new_detached,
+            .alias = parsed_ssh_args.alias,
+            .scrollback_row_count = parsed_ssh_args.scrollback_row_count,
+            .leader = parsed_ssh_args.leader,
+            .banner_args = parsed_ssh_args.banner_args.slice(),
+            .capture_tty_transcript = parsed_ssh_args.capture_tty_transcript,
+            .command_argv = parsed_ssh_args.command_argv,
+            .shell_command = shell_command,
+        });
     }
     if ((parsed_ssh_args.action == .attach or
         parsed_ssh_args.action == .list or
@@ -2355,6 +2380,26 @@ fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !v
     }
     if (!parsed.force_proxy_mode_set) {
         if (file_config.force_proxy_mode) |enabled| parsed.force_proxy_mode = enabled;
+    }
+    if (!parsed.client_log_level_set) {
+        if (file_config.client_log_level) |level| {
+            parsed.client_log_level = level;
+        } else {
+            parsed.client_log_level = inferredClientLogLevel(parsed.options);
+        }
+    }
+}
+
+// Local `sesshmux new .` has no ssh transport, so ssh-only config such as
+// `terminal-emulator` and `force-proxy-mode` must not change its execution
+// path. Apply only the fields that already make sense for local mux sessions.
+fn applyFileConfigToLocalNew(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !void {
+    const file_config = try client.loadFileConfig(allocator);
+    if (!parsed.leader_set) {
+        if (file_config.leader) |leader| parsed.leader = leader;
+    }
+    if (!parsed.scrollback_row_count_set) {
+        if (file_config.scrollback_row_count) |count| parsed.scrollback_row_count = count;
     }
     if (!parsed.client_log_level_set) {
         if (file_config.client_log_level) |level| {
@@ -4037,6 +4082,14 @@ fn parseRouteRefArgs(
 }
 
 fn runLocalRouteCommand(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    // The ssh-shaped parser keeps "." as the host. When it is already present
+    // in argv, pass the command to the local client unchanged. Route-ref forms
+    // such as `sesshmux attach alias` have no host token, so those still need
+    // the local marker inserted before calling the local client.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], ".")) {
+        return client.run(allocator, args);
+    }
+
     const local_args = try allocator.alloc([]const u8, args.len + 1);
     defer allocator.free(local_args);
     local_args[0] = args[0];
@@ -5991,6 +6044,20 @@ test "parseSshArgs accepts translated remote session commands after host" {
     try std.testing.expectEqualStrings(client_guid, debug.client_guid.?);
 }
 
+test "parseSshArgs treats dot as a host for translated local new" {
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
+        "sesshmux",
+        ".",
+        "--",
+        "ls",
+        "-l",
+    }, .{ .allow_mux_command_words = true });
+
+    try std.testing.expectEqual(SshAction.new, parsed.action);
+    try std.testing.expectEqualStrings(".", parsed.host);
+    try expectArgvEqual(&.{ "ls", "-l" }, parsed.command_argv);
+}
+
 test "parseSshArgs rejects translated flags outside their command grammar" {
     try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
@@ -6257,6 +6324,15 @@ test "translateMuxArgs maps new command to ssh-shaped invocation" {
     });
     defer preserved_without_delimiter.deinit();
     try expectArgvEqual(&.{ "sesshmux", "example.com", "--", "top", "-H" }, preserved_without_delimiter.args.items);
+
+    var local_command = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "new",
+        ".",
+        "ls",
+    });
+    defer local_command.deinit();
+    try expectArgvEqual(&.{ "sesshmux", ".", "--", "ls" }, local_command.args.items);
 
     var eval_args = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",

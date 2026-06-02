@@ -3040,6 +3040,24 @@ def test_ssh_attach_without_id_reattaches_latest_session(tmp):
         raise AssertionError(attached.stderr)
 
 
+def test_mux_new_dot_host_runs_local_command_argv(tmp):
+    env = isolated_env(tmp)
+    command = tmp / "local-command"
+    marker = "LOCAL_DOT_COMMAND"
+    command.write_text(
+        "#!/bin/sh\n"
+        f"printf '{marker}:%s\\r\\n' \"$1\"\n"
+    )
+    command.chmod(0o700)
+
+    result = run_sesshmux(["new", ".", str(command), "arg-one"], env, timeout=10.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if f"{marker}:arg-one" not in result.stdout:
+        raise AssertionError(process_diagnostics(result))
+
+
 def test_mux_new_detached_creates_local_session_without_attach(tmp):
     env = isolated_env(tmp)
     shell = tmp / "detached-shell"
@@ -4970,6 +4988,10 @@ def main(argv=None):
         (
             "ssh attach without id reattaches latest session",
             test_ssh_attach_without_id_reattaches_latest_session,
+        ),
+        (
+            "mux new dot host runs local command argv",
+            test_mux_new_dot_host_runs_local_command_argv,
         ),
         (
             "mux new detached creates local session without attach",

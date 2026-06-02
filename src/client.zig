@@ -84,6 +84,18 @@ const LocalOptions = struct {
     capture_tty_transcript: ?[]const u8 = null,
 };
 
+pub const LocalNewSessionRequest = struct {
+    exe: []const u8,
+    new_detached: bool = false,
+    alias: ?[]const u8 = null,
+    scrollback_row_count: u32 = config.default_scrollback_row_count,
+    leader: Leader = .none,
+    banner_args: []const []const u8 = &.{},
+    capture_tty_transcript: ?[]const u8 = null,
+    command_argv: []const []const u8 = &.{},
+    shell_command: ?[]const u8 = null,
+};
+
 pub const DetachBannerArgs = struct {
     buf: [16][]const u8 = undefined,
     len: usize = 0,
@@ -2412,6 +2424,161 @@ fn writeLocalArgError(err: anyerror) !void {
     }
 }
 
+pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSessionRequest) !void {
+    if (request.new_detached and request.capture_tty_transcript != null) {
+        try io_helpers.writeAll(2, "sesshmux: new --detached does not support --capture-tty-transcript\n");
+        return process_exit.request(64);
+    }
+
+    var transcript_recorder: ?tty_transcript.Recorder = null;
+    if (request.capture_tty_transcript) |path| {
+        transcript_recorder = try tty_transcript.Recorder.init(allocator, path);
+        if (transcript_recorder) |*recorder| {
+            try recorder.warnEnabled();
+            tty_transcript.activate(recorder);
+        }
+    }
+    defer if (transcript_recorder) |*recorder| {
+        tty_transcript.deactivate();
+        recorder.deinit();
+    };
+
+    var generated_guid: ?[]u8 = null;
+    defer if (generated_guid) |guid| allocator.free(guid);
+    var generated_alias: ?[]u8 = null;
+    defer if (generated_alias) |alias| allocator.free(alias);
+    if (request.alias) |alias| {
+        generated_guid = try session_registry.generateGuid(allocator);
+        generated_alias = try allocator.dupe(u8, alias);
+    } else {
+        const identity = try session_registry.generateGuidWithDefaultAlias(allocator);
+        generated_guid = identity.guid;
+        generated_alias = identity.alias;
+    }
+
+    const runtime_broker_args: []const []const u8 = &.{};
+    var child = try startLocalBroker(allocator, request.exe, runtime_broker_args);
+    const child_read_fd = child.stdout.?.handle;
+    const child_write_fd = child.stdin.?.handle;
+
+    if (request.new_detached) {
+        var created = createSessionOnRuntime(
+            child_read_fd,
+            child_write_fd,
+            request.scrollback_row_count,
+            generated_guid.?,
+            generated_alias.?,
+            request.command_argv,
+            request.shell_command,
+        ) catch |err| {
+            if (process_exit.is(err)) return err;
+            terminateChild(&child);
+            try io_helpers.stderrPrint("sessh: local runtime create failed: {t}\n", .{err});
+            return process_exit.request(1);
+        };
+        defer created.deinit();
+        try session_registry.ensureAliasForGuid(allocator, created.alias, created.guid);
+        try session_registry.writeLocalRoute(allocator, created.guid, created.alias, created.session_dir, config.version);
+        session_registry.markRouteDetachedNow(allocator, created.guid) catch |err| {
+            client_log.debug("event=local_route_detached_mark_failed session={s} error={t}", .{ created.guid, err });
+        };
+        closeChildStdin(&child);
+        _ = child.wait() catch {};
+        var created_buf: [128]u8 = undefined;
+        const created_line = try std.fmt.bufPrint(&created_buf, "CREATED {s}\n", .{created.guid});
+        try io_helpers.writeAll(1, created_line);
+        return;
+    }
+
+    var local_alias_created = false;
+    var session = startNewSessionOnRuntime(
+        child_read_fd,
+        child_write_fd,
+        request.scrollback_row_count,
+        generated_guid.?,
+        generated_alias.?,
+        request.command_argv,
+        request.shell_command,
+    ) catch |err| {
+        if (process_exit.is(err)) return err;
+        terminateChild(&child);
+        try io_helpers.stderrPrint("sessh: local runtime attach failed: {t}\n", .{err});
+        return process_exit.request(1);
+    };
+    defer session.deinit();
+    try session_registry.ensureAliasForGuid(allocator, session.idSlice(), session.guidSlice());
+    try session_registry.writeLocalRoute(allocator, session.guidSlice(), session.idSlice(), session.sessionDirSlice(), config.version);
+    local_alias_created = true;
+    writeClientRouteHintForSession(allocator, &session);
+    defer removeClientRouteHintForSession(allocator, &session);
+
+    while (true) {
+        const end = relayRuntimeSession(
+            child.stdout.?.handle,
+            child.stdin.?.handle,
+            &session,
+            request.leader,
+            .{},
+        ) catch |err| {
+            if (process_exit.is(err)) return err;
+            terminateChild(&child);
+            if (local_alias_created) session_registry.removeAlias(allocator, session.idSlice()) catch {};
+            try io_helpers.stderrPrint("sessh: local runtime attach failed: {t}\n", .{err});
+            return process_exit.request(1);
+        };
+
+        switch (end) {
+            .detach => {
+                session.restoreRelayEndPresentation();
+                terminateChild(&child);
+                markRouteDetachedForSession(allocator, &session);
+                try tty_transcript.finishActiveOrReport();
+                writeDetachBannerForTarget(&.{}, ".", request.banner_args, session.idSlice());
+                return;
+            },
+            .session_ended => {
+                session.restoreRelayEndPresentation();
+                closeChildStdin(&child);
+                _ = child.wait() catch {};
+                try tty_transcript.finishActiveOrReport();
+                return;
+            },
+            .reconnect => {
+                terminateChild(&child);
+            },
+            .unresponsive => {
+                terminateChild(&child);
+            },
+            .transport_closed => {
+                closeChildStdin(&child);
+                _ = child.wait() catch {};
+                if (!anySessionExistsViaBroker(allocator, request.exe, runtime_broker_args)) {
+                    session.restoreRelayEndPresentation();
+                    try io_helpers.writeAll(2, "\r\nsessh: session agent crashed\r\n");
+                    return process_exit.request(1);
+                }
+            },
+        }
+
+        try io_helpers.writeAll(2, "\r\n");
+        try io_helpers.writeAll(2, reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
+        try io_helpers.writeAll(2, "\r\n");
+        child = startLocalBroker(allocator, request.exe, runtime_broker_args) catch |err| {
+            session.restoreRelayEndPresentation();
+            try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
+            return process_exit.request(1);
+        };
+        reconnectSessionOnRuntime(child.stdout.?.handle, child.stdin.?.handle, &session) catch |err| {
+            if (process_exit.is(err)) return err;
+            terminateChild(&child);
+            if (local_alias_created) session_registry.removeAlias(allocator, session.idSlice()) catch {};
+            session.restoreRelayEndPresentation();
+            try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
+            return process_exit.request(1);
+        };
+    }
+}
+
 fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, options: LocalOptions) !void {
     if (options.capture_tty_transcript != null and options.action != .new and options.action != .attach) {
         try io_helpers.writeAll(2, "sessh: --capture-tty-transcript is only supported for new and attach sessions\n");
@@ -2484,6 +2651,18 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         .new, .attach => {},
     }
 
+    if (options.action == .new) {
+        return runLocalNewSession(allocator, .{
+            .exe = args[0],
+            .new_detached = options.new_detached,
+            .alias = options.alias,
+            .scrollback_row_count = options.scrollback_row_count,
+            .leader = options.leader,
+            .banner_args = options.banner_args.slice(),
+            .capture_tty_transcript = options.capture_tty_transcript,
+        });
+    }
+
     var transcript_recorder: ?tty_transcript.Recorder = null;
     if (options.capture_tty_transcript) |path| {
         transcript_recorder = try tty_transcript.Recorder.init(allocator, path);
@@ -2496,23 +2675,6 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         tty_transcript.deactivate();
         recorder.deinit();
     };
-
-    var generated_guid: ?[]u8 = null;
-    defer if (generated_guid) |guid| allocator.free(guid);
-    var generated_alias: ?[]u8 = null;
-    defer if (generated_alias) |alias| allocator.free(alias);
-    var local_alias_created = false;
-
-    if (options.action == .new) {
-        if (options.alias) |alias| {
-            generated_guid = try session_registry.generateGuid(allocator);
-            generated_alias = try allocator.dupe(u8, alias);
-        } else {
-            const identity = try session_registry.generateGuidWithDefaultAlias(allocator);
-            generated_guid = identity.guid;
-            generated_alias = identity.alias;
-        }
-    }
 
     var compat_attach_id: ?[]u8 = null;
     defer if (compat_attach_id) |id| allocator.free(id);
@@ -2528,45 +2690,8 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     var child = try startLocalBroker(allocator, args[0], runtime_broker_args);
     const child_read_fd = child.stdout.?.handle;
     const child_write_fd = child.stdin.?.handle;
-    if (options.action == .new and options.new_detached) {
-        var created = createSessionOnRuntime(
-            child_read_fd,
-            child_write_fd,
-            options.scrollback_row_count,
-            generated_guid.?,
-            generated_alias.?,
-            &.{},
-            null,
-        ) catch |err| {
-            if (process_exit.is(err)) return err;
-            terminateChild(&child);
-            try io_helpers.stderrPrint("sessh: local runtime create failed: {t}\n", .{err});
-            return process_exit.request(1);
-        };
-        defer created.deinit();
-        try session_registry.ensureAliasForGuid(allocator, created.alias, created.guid);
-        try session_registry.writeLocalRoute(allocator, created.guid, created.alias, created.session_dir, config.version);
-        session_registry.markRouteDetachedNow(allocator, created.guid) catch |err| {
-            client_log.debug("event=local_route_detached_mark_failed session={s} error={t}", .{ created.guid, err });
-        };
-        closeChildStdin(&child);
-        _ = child.wait() catch {};
-        var created_buf: [128]u8 = undefined;
-        const created_line = try std.fmt.bufPrint(&created_buf, "CREATED {s}\n", .{created.guid});
-        try io_helpers.writeAll(1, created_line);
-        return;
-    }
 
     var session = (switch (options.action) {
-        .new => startNewSessionOnRuntime(
-            child_read_fd,
-            child_write_fd,
-            options.scrollback_row_count,
-            generated_guid.?,
-            generated_alias.?,
-            &.{},
-            null,
-        ),
         .attach => startAttachSessionOnRuntime(
             child_read_fd,
             child_write_fd,
@@ -2574,7 +2699,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             "",
             options.initial_scrollback_row_count,
         ),
-        .list, .kill, .kill_all, .detach_client, .repaint_client, .debug_client => unreachable,
+        .new, .list, .kill, .kill_all, .detach_client, .repaint_client, .debug_client => unreachable,
     }) catch |err| {
         if (process_exit.is(err)) return err;
         terminateChild(&child);
@@ -2582,11 +2707,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         return process_exit.request(1);
     };
     defer session.deinit();
-    if (options.action == .new) {
-        try session_registry.ensureAliasForGuid(allocator, session.idSlice(), session.guidSlice());
-        try session_registry.writeLocalRoute(allocator, session.guidSlice(), session.idSlice(), session.sessionDirSlice(), config.version);
-        local_alias_created = true;
-    } else if (options.action == .attach and session.guidSlice().len > 0) {
+    if (options.action == .attach and session.guidSlice().len > 0) {
         session_registry.markRouteAttached(allocator, session.guidSlice()) catch |err| {
             client_log.debug("event=local_route_attached_mark_failed session={s} error={t}", .{ session.guidSlice(), err });
         };
@@ -2604,7 +2725,6 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         ) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
-            if (local_alias_created) session_registry.removeAlias(allocator, session.idSlice()) catch {};
             try io_helpers.stderrPrint("sessh: local runtime attach failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -2653,7 +2773,6 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         reconnectSessionOnRuntime(child.stdout.?.handle, child.stdin.?.handle, &session) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
-            if (local_alias_created) session_registry.removeAlias(allocator, session.idSlice()) catch {};
             session.restoreRelayEndPresentation();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
