@@ -146,6 +146,7 @@ const ParsedSshArgs = struct {
     host: []const u8,
     action: SshAction = .new,
     attach_id: ?[]const u8 = null,
+    attach_id_from_latest_route: bool = false,
     attach_session_dir: []const u8 = "",
     kill_id: ?[]const u8 = null,
     kill_current: bool = false,
@@ -650,7 +651,6 @@ fn translateMuxAttach(translated: *TranslatedMuxArgs, args: []const []const u8) 
         try appendMany(translated, sessh_options.items);
     } else if (positional.items.len == 0) {
         if (ssh_options.items.len > 0) return error.MissingHost;
-        try translated.append(".");
         try translated.append("attach");
         try appendMany(translated, sessh_options.items);
     } else {
@@ -1236,6 +1236,9 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         parsed_ssh_args.action == .kill) and
         (parsed_ssh_args.host.len == 0 or std.mem.eql(u8, parsed_ssh_args.host, ".")))
     {
+        if (parsed_ssh_args.action == .attach and parsed_ssh_args.attach_id_from_latest_route) {
+            return runLocalAttachRouteCommand(allocator, args, parsed_ssh_args.attach_id.?);
+        }
         return runLocalRouteCommand(allocator, args);
     }
     applyFileConfigToSsh(allocator, &parsed_ssh_args) catch |err| {
@@ -1693,6 +1696,7 @@ fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) v
 
 fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, session: *client.RuntimeSession) !void {
     session.restoreRelayEndPresentation();
+    client.markRouteDetachedForSession(allocator, session);
     client.removeClientRouteHintForRemoteSession(allocator, session);
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
@@ -3639,10 +3643,11 @@ fn parseRouteRefArgs(
         if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "attach")) {
             if (action != null) return error.ConflictingSesshAction;
             i += 1;
-            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingAttachId;
             action = .attach;
-            ref = args[i];
-            i += 1;
+            if (i < args.len and !std.mem.startsWith(u8, args[i], "--")) {
+                ref = args[i];
+                i += 1;
+            }
         } else if (parse_options.allow_mux_command_words and std.mem.eql(u8, arg, "kill")) {
             if (action != null) return error.ConflictingSesshAction;
             i += 1;
@@ -3685,15 +3690,23 @@ fn parseRouteRefArgs(
             return null;
         }
     }
-    const resolved_ref = ref orelse return null;
-    const resolved_action = action.?;
-    route_storage.* = session_registry.readRouteForRef(allocator, resolved_ref) catch |err| switch (err) {
-        error.FileNotFound => {
-            if (session_registry.tombstoneExistsForRef(allocator, resolved_ref)) return error.SessionAlreadyExited;
-            return err;
-        },
-        else => return err,
-    };
+    const resolved_action = action orelse return null;
+    if (ref) |resolved_ref| {
+        route_storage.* = session_registry.readRouteForRef(allocator, resolved_ref) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (session_registry.tombstoneExistsForRef(allocator, resolved_ref)) return error.SessionAlreadyExited;
+                return err;
+            },
+            else => return err,
+        };
+    } else {
+        if (resolved_action != .attach) return null;
+        route_storage.* = (try session_registry.readLatestDetachedRouteNotAttachedByThisMachine(allocator)) orelse {
+            parsed.action = .attach;
+            return parsed;
+        };
+        parsed.attach_id_from_latest_route = true;
+    }
     const route = &route_storage.*.?;
     parsed.options = route.ssh_options;
     parsed.host = route.host;
@@ -3715,6 +3728,17 @@ fn runLocalRouteCommand(allocator: std.mem.Allocator, args: []const []const u8) 
     local_args[0] = args[0];
     local_args[1] = ".";
     @memcpy(local_args[2..], args[1..]);
+    return client.run(allocator, local_args);
+}
+
+fn runLocalAttachRouteCommand(allocator: std.mem.Allocator, args: []const []const u8, session_ref: []const u8) !void {
+    const local_args = try allocator.alloc([]const u8, args.len + 2);
+    defer allocator.free(local_args);
+    local_args[0] = args[0];
+    local_args[1] = ".";
+    local_args[2] = "attach";
+    local_args[3] = session_ref;
+    @memcpy(local_args[4..], args[2..]);
     return client.run(allocator, local_args);
 }
 
@@ -5858,7 +5882,7 @@ test "translateMuxArgs maps local and host-qualified attach" {
         "attach",
     });
     defer latest_local.deinit();
-    try expectArgvEqual(&.{ "sesshmux", ".", "attach" }, latest_local.args.items);
+    try expectArgvEqual(&.{ "sesshmux", "attach" }, latest_local.args.items);
 
     var local = try translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",

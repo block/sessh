@@ -1080,7 +1080,7 @@ def ensure_alias(env, alias, guid=None):
     alias_path.symlink_to(Path("../guid") / guid)
 
 
-def write_ssh_route(env, alias, guid, host, ssh_options=()):
+def write_ssh_route(env, alias, guid, host, ssh_options=(), detached_at_unix_ms=None):
     guid = canonical_guid(guid)
     ensure_alias(env, alias, guid)
     session = state_sessions_dir(env) / guid
@@ -1095,6 +1095,9 @@ def write_ssh_route(env, alias, guid, host, ssh_options=()):
                 "host": host,
                 "agent_version": "cached-test",
                 "alive": True,
+                "attached_count": None,
+                "last_input_at_unix_ms": None,
+                "detached_at_unix_ms": detached_at_unix_ms,
                 "ssh_options": list(ssh_options),
             },
             separators=(",", ":"),
@@ -1110,6 +1113,16 @@ def write_client_route_hint(env, client_guid, session_id):
     if hint.exists() or hint.is_symlink():
         hint.unlink()
     hint.symlink_to(route_file(env, session_id))
+    (hint.parent / "outgoing-meta.json").write_text(
+        json.dumps(
+            {
+                "type": "outgoing-client",
+                "created_at_unix_ms": 1,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
     return hint
 
 
@@ -2869,6 +2882,72 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_no_host_attach_uses_latest_detached_route(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "42"
+    write_ssh_route(env, "older-detached", guid_for_alias("older-detached"), "older-host", detached_at_unix_ms=1000)
+    write_ssh_route(env, "newer-detached", guid_for_alias("newer-detached"), "newer-host", detached_at_unix_ms=2000)
+
+    result = run_sesshmux(["attach"], env, timeout=30.0)
+
+    if result.returncode == 0:
+        raise AssertionError(result)
+    trace_text = optional_text(fake_trace)
+    if "event=parsed host=newer-host" not in trace_text:
+        raise AssertionError(
+            "bare attach did not choose newest detached route\n"
+            f"fake ssh trace:\n{trace_text}\n"
+            f"sesshmux result:\n{process_diagnostics(result)}"
+        )
+    if "event=parsed host=older-host" in trace_text:
+        raise AssertionError(trace_text)
+
+    explicit_local = run_sesshmux(["attach", "--host", "."], env, timeout=30.0)
+    if explicit_local.returncode == 0:
+        raise AssertionError(explicit_local)
+    if optional_text(fake_trace).count("event=parsed host=") != trace_text.count("event=parsed host="):
+        raise AssertionError("explicit --host . unexpectedly invoked ssh")
+
+
+def test_ssh_no_host_attach_skips_route_attached_by_this_machine(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "42"
+
+    older_guid = guid_for_alias("older-detached")
+    busy_guid = guid_for_alias("busy-detached")
+    write_ssh_route(env, "older-detached", older_guid, "older-host", detached_at_unix_ms=2000)
+    write_ssh_route(env, "busy-detached", busy_guid, "busy-host", detached_at_unix_ms=3000)
+    write_client_route_hint(env, "c-33333333-3333-4333-8333-333333333333", busy_guid)
+
+    result = run_sesshmux(["attach"], env, timeout=30.0)
+
+    if result.returncode == 0:
+        raise AssertionError(result)
+    trace_text = optional_text(fake_trace)
+    if "event=parsed host=older-host" not in trace_text:
+        raise AssertionError(
+            "bare attach did not skip route with outgoing-client hint\n"
+            f"fake ssh trace:\n{trace_text}\n"
+            f"sesshmux result:\n{process_diagnostics(result)}"
+        )
+    if "event=parsed host=busy-host" in trace_text:
+        raise AssertionError(trace_text)
+
+
 def test_ssh_no_host_list_client_uses_remote_route(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -4566,6 +4645,14 @@ def main(argv=None):
         (
             "ssh no-host attach uses local route",
             test_ssh_no_host_attach_uses_local_route,
+        ),
+        (
+            "ssh no-host attach uses latest detached route",
+            test_ssh_no_host_attach_uses_latest_detached_route,
+        ),
+        (
+            "ssh no-host attach skips route attached by this machine",
+            test_ssh_no_host_attach_skips_route_attached_by_this_machine,
         ),
         (
             "ssh no-host list --client uses remote route",

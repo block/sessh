@@ -2545,7 +2545,13 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         try session_registry.ensureAliasForGuid(allocator, session.idSlice(), session.guidSlice());
         try session_registry.writeLocalRoute(allocator, session.guidSlice(), session.idSlice(), session.sessionDirSlice(), config.version);
         local_alias_created = true;
+    } else if (options.action == .attach and session.guidSlice().len > 0) {
+        session_registry.markRouteAttached(allocator, session.guidSlice()) catch |err| {
+            client_log.debug("event=local_route_attached_mark_failed session={s} error={t}", .{ session.guidSlice(), err });
+        };
     }
+    writeClientRouteHintForSession(allocator, &session);
+    defer removeClientRouteHintForSession(allocator, &session);
 
     while (true) {
         const end = relayRuntimeSession(
@@ -2566,6 +2572,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             .detach => {
                 session.restoreRelayEndPresentation();
                 terminateChild(&child);
+                markRouteDetachedForSession(allocator, &session);
                 try tty_transcript.finishActiveOrReport();
                 writeDetachBannerForTarget(&.{}, ".", options.banner_args.slice(), session.idSlice());
                 return;
@@ -3892,6 +3899,31 @@ pub fn ensureLocalRouteForRemoteSession(
 }
 
 pub fn removeClientRouteHintForRemoteSession(allocator: std.mem.Allocator, session: *const RuntimeSession) void {
+    removeClientRouteHintForSession(allocator, session);
+}
+
+pub fn markRouteDetachedForSession(allocator: std.mem.Allocator, session: *const RuntimeSession) void {
+    if (session.guidSlice().len == 0) return;
+    session_registry.markRouteDetachedNow(allocator, session.guidSlice()) catch |err| {
+        client_log.debug("event=route_detached_mark_failed session={s} error={t}", .{
+            session.guidSlice(),
+            err,
+        });
+    };
+}
+
+fn writeClientRouteHintForSession(allocator: std.mem.Allocator, session: *const RuntimeSession) void {
+    if (session.clientGuidSlice().len == 0 or session.guidSlice().len == 0) return;
+    session_registry.writeClientRouteHint(allocator, session.clientGuidSlice(), session.guidSlice()) catch |err| {
+        client_log.debug("event=client_route_hint_write_failed session={s} client={s} error={t}", .{
+            session.guidSlice(),
+            session.clientGuidSlice(),
+            err,
+        });
+    };
+}
+
+fn removeClientRouteHintForSession(allocator: std.mem.Allocator, session: *const RuntimeSession) void {
     if (session.clientGuidSlice().len == 0) return;
     session_registry.removeClientRouteHint(allocator, session.clientGuidSlice()) catch |err| {
         client_log.debug("event=client_route_hint_remove_failed session={s} client={s} error={t}", .{

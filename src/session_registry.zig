@@ -730,6 +730,7 @@ pub const Route = struct {
     last_known_alive: bool,
     attached_count: ?u32,
     last_input_at_unix_ms: ?u64,
+    detached_at_unix_ms: ?u64,
 
     pub fn deinit(self: *Route, allocator: std.mem.Allocator) void {
         for (self.ssh_options) |option| allocator.free(option);
@@ -845,6 +846,7 @@ const RouteStatus = struct {
     agent_version: []const u8 = "",
     attached_count: ?u32 = null,
     last_input_at_unix_ms: ?u64 = null,
+    detached_at_unix_ms: ?u64 = null,
 };
 
 fn writeRoute(
@@ -890,6 +892,12 @@ fn writeRoute(
     } else {
         try writer.writeAll("null");
     }
+    try writer.writeAll(",\"detached_at_unix_ms\":");
+    if (status.detached_at_unix_ms) |ts| {
+        try writer.print("{}", .{ts});
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeAll(",\"ssh_options\":[");
     for (ssh_options, 0..) |arg, i| {
         if (i > 0) try writer.writeAll(",");
@@ -907,6 +915,7 @@ fn writeRoute(
 pub const RouteLiveStatus = struct {
     attached_count: ?u32 = null,
     last_input_at_unix_ms: ?u64 = null,
+    detached_at_unix_ms: ?u64 = null,
 };
 
 pub fn updateRouteStatus(allocator: std.mem.Allocator, guid: []const u8, last_known_alive: bool, agent_version: ?[]const u8, live_status: ?RouteLiveStatus) !void {
@@ -915,6 +924,7 @@ pub fn updateRouteStatus(allocator: std.mem.Allocator, guid: []const u8, last_kn
     const live: RouteLiveStatus = live_status orelse .{
         .attached_count = route.attached_count,
         .last_input_at_unix_ms = route.last_input_at_unix_ms,
+        .detached_at_unix_ms = route.detached_at_unix_ms,
     };
     try writeRoute(
         allocator,
@@ -928,8 +938,29 @@ pub fn updateRouteStatus(allocator: std.mem.Allocator, guid: []const u8, last_kn
             .agent_version = agent_version orelse route.agent_version,
             .attached_count = live.attached_count,
             .last_input_at_unix_ms = live.last_input_at_unix_ms,
+            .detached_at_unix_ms = live.detached_at_unix_ms,
         },
     );
+}
+
+pub fn markRouteAttached(allocator: std.mem.Allocator, guid: []const u8) !void {
+    var route = try readRouteForRef(allocator, guid);
+    defer route.deinit(allocator);
+    try updateRouteStatus(allocator, route.guid, true, null, .{
+        .attached_count = route.attached_count,
+        .last_input_at_unix_ms = route.last_input_at_unix_ms,
+        .detached_at_unix_ms = null,
+    });
+}
+
+pub fn markRouteDetachedNow(allocator: std.mem.Allocator, guid: []const u8) !void {
+    var route = try readRouteForRef(allocator, guid);
+    defer route.deinit(allocator);
+    try updateRouteStatus(allocator, route.guid, true, null, .{
+        .attached_count = route.attached_count,
+        .last_input_at_unix_ms = route.last_input_at_unix_ms,
+        .detached_at_unix_ms = currentUnixMs(),
+    });
 }
 
 pub fn writeTombstoneForRoute(allocator: std.mem.Allocator, route: *const Route, details: TombstoneDetails) !void {
@@ -944,6 +975,7 @@ fn writeTombstoneForRouteInRoot(allocator: std.mem.Allocator, root: []const u8, 
 
     const aliases = try aliasesForGuidInRoot(allocator, root, canonical);
     defer freeStringArray(allocator, aliases);
+    const include_primary_alias = isValidAlias(route.primary_alias) and !aliasListContains(aliases, route.primary_alias);
 
     try ensureTombstoneDir(allocator, root);
     const path = try tombstonePathForGuidInRoot(allocator, root, canonical);
@@ -962,6 +994,10 @@ fn writeTombstoneForRouteInRoot(allocator: std.mem.Allocator, root: []const u8, 
     for (aliases, 0..) |alias, i| {
         if (i > 0) try writer.writeAll(",");
         try writer.print("{f}", .{std.json.fmt(alias, .{})});
+    }
+    if (include_primary_alias) {
+        if (aliases.len > 0) try writer.writeAll(",");
+        try writer.print("{f}", .{std.json.fmt(route.primary_alias, .{})});
     }
     try writer.print(
         "],\"session_dir\":{f},\"host\":{f},\"agent_version\":{f},\"ended_at_unix_ms\":{},\"end_reason\":{f},\"exit_status\":",
@@ -989,6 +1025,13 @@ fn writeTombstoneForRouteInRoot(allocator: std.mem.Allocator, root: []const u8, 
     defer allocator.free(route_path);
     try unlinkIfExists(route_path);
     try removeAliasesForGuidInRoot(allocator, root, canonical, aliases);
+}
+
+fn aliasListContains(aliases: []const []const u8, needle: []const u8) bool {
+    for (aliases) |alias| {
+        if (std.mem.eql(u8, alias, needle)) return true;
+    }
+    return false;
 }
 
 pub fn readTombstoneForRef(allocator: std.mem.Allocator, ref: []const u8) !Tombstone {
@@ -1093,6 +1136,106 @@ pub fn readRouteForRef(allocator: std.mem.Allocator, ref: []const u8) !Route {
     var paths = try pathsForRef(allocator, ref);
     defer paths.deinit(allocator);
     return readRoute(allocator, paths.route);
+}
+
+/// Return the newest locally-detached route across local and cached remote
+/// sessions that this machine is not currently attached to.
+///
+/// This is used by bare `sesshmux attach`: no host means "pick the session I
+/// last detached from", while `sesshmux attach --host .` is the explicit
+/// local-only form. We only exclude attachments from this machine because doing
+/// more would require connecting to every host with a cached route just to
+/// answer a local command-line default.
+pub fn readLatestDetachedRouteNotAttachedByThisMachine(allocator: std.mem.Allocator) !?Route {
+    const state_sessions_dir = try stateSessionsDir(allocator);
+    defer allocator.free(state_sessions_dir);
+    var dir = std.fs.openDirAbsolute(state_sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer dir.close();
+
+    var best: ?Route = null;
+    errdefer if (best) |*route| route.deinit(allocator);
+    var best_detached_at_unix_ms: u64 = 0;
+    var best_route_mtime_ns: i128 = 0;
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .directory or !isValidSessionGuid(entry.name)) continue;
+        const route_path = try std.fmt.allocPrint(allocator, "{s}/{s}/route.json", .{ state_sessions_dir, entry.name });
+        defer allocator.free(route_path);
+        var route = readRoute(allocator, route_path) catch continue;
+        errdefer route.deinit(allocator);
+        if (!route.last_known_alive) {
+            route.deinit(allocator);
+            continue;
+        }
+        if (try routeHasOutgoingClientHint(allocator, route.guid)) {
+            route.deinit(allocator);
+            continue;
+        }
+
+        const route_mtime_ns = routeFileMtimeNs(route_path);
+        // Older route files predate detached_at_unix_ms. Treat their mtime as
+        // the best available local-detach signal so legacy detached sessions
+        // remain attachable, while outgoing-client hints still prevent us from
+        // selecting a route this machine is actively using.
+        const detached_at_unix_ms = route.detached_at_unix_ms orelse @as(u64, @intCast(@max(route_mtime_ns, 0) / std.time.ns_per_ms));
+        const is_newer = best == null or
+            detached_at_unix_ms > best_detached_at_unix_ms or
+            (detached_at_unix_ms == best_detached_at_unix_ms and route_mtime_ns > best_route_mtime_ns);
+        if (is_newer) {
+            if (best) |*old| old.deinit(allocator);
+            best = route;
+            best_detached_at_unix_ms = detached_at_unix_ms;
+            best_route_mtime_ns = route_mtime_ns;
+        } else {
+            route.deinit(allocator);
+        }
+    }
+
+    return best;
+}
+
+fn routeHasOutgoingClientHint(allocator: std.mem.Allocator, route_guid: []const u8) !bool {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    const guid_root = try sessionsDirInRoot(allocator, runtime_root);
+    defer allocator.free(guid_root);
+
+    var dir = std.fs.openDirAbsolute(guid_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer dir.close();
+
+    const canonical_route_guid = try canonicalGuid(allocator, route_guid);
+    defer allocator.free(canonical_route_guid);
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .directory or !isValidClientGuid(entry.name)) continue;
+        // The route.json symlink is the outgoing-client hint. Newer runtimes
+        // also write outgoing-meta.json, but older attached clients may only
+        // have the symlink, and that is still enough to know this machine is
+        // already attached to the route.
+        const hint_path = try clientRouteHintPathInRoot(allocator, runtime_root, entry.name);
+        defer allocator.free(hint_path);
+        const target = readLinkAlloc(allocator, hint_path, 4096) catch continue;
+        defer allocator.free(target);
+        const route_dir = std.fs.path.dirname(target) orelse continue;
+        const target_guid = canonicalGuid(allocator, std.fs.path.basename(route_dir)) catch continue;
+        defer allocator.free(target_guid);
+        if (std.mem.eql(u8, target_guid, canonical_route_guid)) return true;
+    }
+    return false;
+}
+
+fn routeFileMtimeNs(path: []const u8) i128 {
+    const stat = std.fs.cwd().statFile(path) catch return 0;
+    if (stat.mtime <= 0) return 0;
+    return stat.mtime;
 }
 
 /// Client ids are top-level runtime entries. Client machines use `route.json`
@@ -1561,6 +1704,7 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
         .last_known_alive = (try jsonOptionalBool(object, "alive")) orelse true,
         .attached_count = attached_count,
         .last_input_at_unix_ms = try jsonOptionalU64(object, "last_input_at_unix_ms"),
+        .detached_at_unix_ms = try jsonOptionalU64(object, "detached_at_unix_ms"),
     };
 }
 
@@ -2646,6 +2790,7 @@ test "route json persists absolute session directories" {
     try std.testing.expect(route.last_known_alive);
     try std.testing.expectEqual(@as(?u32, 2), route.attached_count);
     try std.testing.expectEqual(@as(?u64, 1234), route.last_input_at_unix_ms);
+    try std.testing.expectEqual(@as(?u64, null), route.detached_at_unix_ms);
     try std.testing.expectEqual(@as(usize, 1), route.ssh_options.len);
     try std.testing.expectEqualStrings("-F", route.ssh_options[0]);
 }

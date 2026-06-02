@@ -652,6 +652,7 @@ fn querySessionListLiveStatus(allocator: std.mem.Allocator, paths: session_regis
     return .{
         .attached_count = @intCast(state.attached_clients.items.len),
         .last_input_at_unix_ms = state.last_input_at_unix_ms,
+        .detached_at_unix_ms = state.detached_at_unix_ms,
     };
 }
 

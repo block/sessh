@@ -4102,6 +4102,24 @@ fn refreshAttachedFlag(session_agent: *SessionAgent, session_index: usize) void 
     } else if (was_attached or session_agent.sessions[session_index].detached_at_unix_ms == 0) {
         session_agent.sessions[session_index].detached_at_unix_ms = nowUnixMs();
     }
+    if (now_attached != was_attached) updateRouteAttachmentState(session_agent, session_index, count);
+}
+
+fn updateRouteAttachmentState(session_agent: *SessionAgent, session_index: usize, attached_count_value: u32) void {
+    const session = &session_agent.sessions[session_index];
+    session_registry.updateRouteStatus(
+        app_allocator.allocator(),
+        session.idSlice(),
+        true,
+        null,
+        .{
+            .attached_count = attached_count_value,
+            .last_input_at_unix_ms = if (session.last_input_at_unix_ms == 0) null else session.last_input_at_unix_ms,
+            .detached_at_unix_ms = if (session.detached_at_unix_ms == 0) null else session.detached_at_unix_ms,
+        },
+    ) catch |err| {
+        logSessionAgent(session_agent, "event=route_attachment_state_update_failed id={s} error={t}", .{ session.idSlice(), err });
+    };
 }
 
 fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, exit_info: ExitInfo) void {
