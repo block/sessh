@@ -1864,6 +1864,41 @@ def test_ssh_remote_command_uses_direct_stream(tmp):
         raise AssertionError(log_text)
 
 
+def test_ssh_remote_command_option_after_host_is_remote_arg(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_bin = tmp / "remote-bin"
+    remote_rsync = remote_bin / "rsync"
+    write_fake_ssh(fake_bin / "ssh")
+    remote_bin.mkdir()
+    remote_rsync.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = \"--version\" ]; then\n"
+        "  printf 'REMOTE_RSYNC_VERSION\\n'\n"
+        "else\n"
+        "  printf 'REMOTE_RSYNC_ARGS:%s\\n' \"$*\"\n"
+        "fi\n"
+    )
+    remote_rsync.chmod(remote_rsync.stat().st_mode | stat.S_IXUSR)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_PATH"] = str(remote_bin)
+    seed_remote_artifact_cache(env)
+
+    result = run_sessh(["test-host", "rsync", "--version"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if result.stdout != "REMOTE_RSYNC_VERSION\n":
+        raise AssertionError(result)
+    if "sessh " in result.stdout:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+
+
 def test_ssh_remote_command_stream_preserves_exit_status(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -4808,6 +4843,10 @@ def main(argv=None):
         (
             "ssh remote command uses direct stream",
             test_ssh_remote_command_uses_direct_stream,
+        ),
+        (
+            "ssh remote command option after host is remote arg",
+            test_ssh_remote_command_option_after_host_is_remote_arg,
         ),
         (
             "ssh remote command stream preserves exit status",

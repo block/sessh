@@ -42,8 +42,8 @@ fn runMain() !void {
 
     if (args.len == 1) return usage(0, entrypoint);
     if (entrypoint == .sessh and args.len == 2) return usage(0, entrypoint);
-    if (hasAnyArg(args, &.{ "--help", "-h" })) return usage(0, entrypoint);
-    if (hasArg(args, "--version")) {
+    if (topLevelArgIs(args, entrypoint, &.{ "--help", "-h" })) return usage(0, entrypoint);
+    if (topLevelArgIs(args, entrypoint, &.{"--version"})) {
         try io.writeAll(1, entrypointName(entrypoint));
         try io.writeAll(1, " " ++ config.version ++ "\n");
         return;
@@ -124,6 +124,13 @@ test "internal sessh modality removes sentinel" {
     try std.testing.expectEqualStrings("example.com", rewritten[2]);
 }
 
+test "sessh top-level options do not match remote command arguments" {
+    try std.testing.expect(topLevelArgIs(&.{ "sesshmux-dev", ":internal-sessh:", "--version" }, .sessh, &.{"--version"}));
+    try std.testing.expect(!topLevelArgIs(&.{ "sesshmux-dev", ":internal-sessh:", "example.com", "--version" }, .sessh, &.{"--version"}));
+    try std.testing.expect(topLevelArgIs(&.{ "sesshmux-dev", "--version" }, .sesshmux, &.{"--version"}));
+    try std.testing.expect(!topLevelArgIs(&.{ "sesshmux-dev", "list", "--version" }, .sesshmux, &.{"--version"}));
+}
+
 fn usage(code: u8, entrypoint: EntryPoint) !void {
     const text = switch (entrypoint) {
         .sessh =>
@@ -171,17 +178,16 @@ fn usage(code: u8, entrypoint: EntryPoint) !void {
     return process_exit.request(code);
 }
 
-fn hasAnyArg(args: []const []const u8, needles: []const []const u8) bool {
-    for (args) |arg| {
-        for (needles) |needle| {
-            if (std.mem.eql(u8, arg, needle)) return true;
-        }
+fn topLevelArgIs(args: []const []const u8, entrypoint: EntryPoint, needles: []const []const u8) bool {
+    const index: usize = switch (entrypoint) {
+        .sessh => 2,
+        .sesshmux => 1,
+    };
+    if (args.len != index + 1) return false;
+    for (needles) |needle| {
+        if (std.mem.eql(u8, args[index], needle)) return true;
     }
     return false;
-}
-
-fn hasArg(args: []const []const u8, needle: []const u8) bool {
-    return hasAnyArg(args, &.{needle});
 }
 
 test {

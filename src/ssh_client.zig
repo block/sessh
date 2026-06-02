@@ -4337,14 +4337,23 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
     }
 }
 
-// After the host, `sessh` is either parsing options for a new session or the
-// ssh-shaped form produced by `sesshmux <command> ...`. Once a command word is
-// seen, control moves to that command's parser so flags from one command cannot
-// be accidentally accepted by another and rejected only after the fact.
+// Direct `sessh` follows ssh's command-line boundary: the first non-option
+// token is the host, and every later token is part of the remote command.
+// `sesshmux` translations use this same struct but deliberately enable a
+// second post-host grammar so commands such as `sesshmux attach --host HOST`
+// can be sent through the remote broker.
 fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *ParsedSshArgs, parse_options: CliParseOptions) !void {
+    if (!parse_options.allow_mux_command_words) {
+        if (index.* < args.len) {
+            parsed.shell_command_args = args[index.*..];
+            index.* = args.len;
+        }
+        return;
+    }
+
     while (index.* < args.len) {
         const arg = args[index.*];
-        if (parse_options.allow_mux_command_words and isTranslatedMuxCommand(arg)) {
+        if (isTranslatedMuxCommand(arg)) {
             try parseTranslatedMuxCommand(args, index, parsed, parse_options);
             return;
         }
@@ -5523,6 +5532,25 @@ test "parseSshArgs accepts interleaved ssh and sessh options before host" {
     try expectArgvEqual(&.{ "exit", "3" }, parsed.shell_command_args);
 }
 
+test "parseSshArgs treats every direct post-host token as remote command" {
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "example.com",
+        "rsync",
+        "--version",
+        "--no-terminal-emulator",
+        "--alias",
+        "work",
+        "-t",
+    }, .{});
+
+    try std.testing.expectEqualStrings("example.com", parsed.host);
+    try std.testing.expectEqual(SshAction.new, parsed.action);
+    try std.testing.expect(!parsed.terminal_emulator_set);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed.alias);
+    try expectArgvEqual(&.{ "rsync", "--version", "--no-terminal-emulator", "--alias", "work", "-t" }, parsed.shell_command_args);
+}
+
 test "parseSshArgs rejects config-only sessh options on direct ssh transport" {
     try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
@@ -6256,16 +6284,16 @@ test "stream reconnect status uses stderr when stdout is redirected" {
     try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, streamReconnectStatusMode(false));
 }
 
-test "parseSshArgs accepts persistent command argv after delimiter" {
+test "parseSshArgs accepts translated persistent command argv after delimiter" {
     const parsed = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
+        "sesshmux",
         "example.com",
         "--alias",
         "work",
         "--",
         "top",
         "-H",
-    }, .{});
+    }, .{ .allow_mux_command_words = true });
 
     try std.testing.expectEqual(SshAction.new, parsed.action);
     try std.testing.expectEqualStrings("work", parsed.alias.?);
@@ -6313,15 +6341,15 @@ test "parseSshArgs accepts translated detached new flag" {
 test "parseSshArgs rejects custom aliases with reserved typed prefix shape" {
     try std.testing.expectError(error.InvalidAlias, parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "example.com",
         "--alias",
         "s-deadbeef",
+        "example.com",
     }, .{}));
     try std.testing.expectError(error.InvalidAlias, parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "example.com",
         "--alias",
         "x-anything",
+        "example.com",
     }, .{}));
 }
 
