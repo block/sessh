@@ -1756,15 +1756,19 @@ test "list all rows include runtime metadata and cached remote sessions" {
     const client_guid = "c-22222222-2222-4222-8222-222222222222";
     const remote_guid = "s-33333333-3333-4333-8333-333333333333";
     const stream_guid = "r-44444444-4444-4444-8444-444444444444";
+    const proxy_guid = "p-55555555-5555-4555-8555-555555555555";
     const local_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, local_guid });
     defer allocator.free(local_dir);
     const client_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, client_guid });
     defer allocator.free(client_dir);
     const stream_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, stream_guid });
     defer allocator.free(stream_dir);
+    const proxy_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, proxy_guid });
+    defer allocator.free(proxy_dir);
     try std.fs.cwd().makePath(local_dir);
     try std.fs.cwd().makePath(client_dir);
     try std.fs.cwd().makePath(stream_dir);
+    try std.fs.cwd().makePath(proxy_dir);
 
     const local_meta = try std.fmt.allocPrint(allocator, "{s}/meta.json", .{local_dir});
     defer allocator.free(local_meta);
@@ -1774,10 +1778,13 @@ test "list all rows include runtime metadata and cached remote sessions" {
     defer allocator.free(outgoing_client_meta);
     const stream_meta = try std.fmt.allocPrint(allocator, "{s}/outgoing-meta.json", .{stream_dir});
     defer allocator.free(stream_meta);
+    const proxy_meta = try std.fmt.allocPrint(allocator, "{s}/outgoing-meta.json", .{proxy_dir});
+    defer allocator.free(proxy_meta);
     try writeTestFile(local_meta, "{\"type\":\"local-session\",\"created_at_unix_ms\":1000}\n");
     try writeTestFile(incoming_client_meta, "{\"type\":\"incoming-client\",\"created_at_unix_ms\":1500}\n");
     try writeTestFile(outgoing_client_meta, "{\"type\":\"outgoing-client\",\"created_at_unix_ms\":2000}\n");
     try writeTestFile(stream_meta, "{\"type\":\"outgoing-stream\",\"created_at_unix_ms\":3000}\n");
+    try writeTestFile(proxy_meta, "{\"type\":\"outgoing-proxy\",\"created_at_unix_ms\":3500}\n");
 
     const remote_route_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ state_root, remote_guid });
     defer allocator.free(remote_route_dir);
@@ -1796,6 +1803,7 @@ test "list all rows include runtime metadata and cached remote sessions" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"c-22222222\",\"guid\":\"c-22222222-2222-4222-8222-222222222222\",\"type\":\"incoming-client\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"c-22222222\",\"guid\":\"c-22222222-2222-4222-8222-222222222222\",\"type\":\"outgoing-client\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"r-44444444\",\"guid\":\"r-44444444-4444-4444-8444-444444444444\",\"type\":\"outgoing-stream\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"p-55555555\",\"guid\":\"p-55555555-5555-4555-8555-555555555555\",\"type\":\"outgoing-proxy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"s-33333333\",\"guid\":\"s-33333333-3333-4333-8333-333333333333\",\"type\":\"remote-session\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "host=work.example version=0.6.0-test") != null);
 

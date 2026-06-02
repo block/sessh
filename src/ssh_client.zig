@@ -179,6 +179,9 @@ const ParsedSshArgs = struct {
     bootstrap_set: bool = false,
     terminal_emulator: bool = true,
     terminal_emulator_set: bool = false,
+    force_proxy_mode: bool = false,
+    force_proxy_mode_set: bool = false,
+    proxy_required: bool = false,
     default_ipqos_option: ?[]const u8 = null,
     capture_tty_transcript: ?[]const u8 = null,
 
@@ -591,7 +594,8 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
         } else if (host == null and std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "-")) {
             if (invocation == .sesshmux) return error.UnsupportedMuxOption;
             const start = i;
-            try consumeSshOption(args, &i, &tty_request);
+            var proxy_required = false;
+            try consumeSshOption(args, &i, &tty_request, &proxy_required);
             try ssh_options.appendSlice(translated.allocator, args[start..i]);
         } else if (host == null) {
             host = arg;
@@ -915,7 +919,8 @@ const MuxCommandParser = struct {
         {
             const start = self.index;
             var tty_request: SshTtyRequest = .none;
-            try consumeSshOption(self.args, &self.index, &tty_request);
+            var proxy_required = false;
+            try consumeSshOption(self.args, &self.index, &tty_request, &proxy_required);
             try self.ssh_options.appendSlice(self.translated.allocator, self.args[start..self.index]);
             return true;
         }
@@ -1256,6 +1261,13 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
     defer if (parsed_ssh_args.default_ipqos_option) |option| allocator.free(option);
 
     const stdin_is_tty = c.isatty(0) != 0;
+    if (shouldUseProxyStream(parsed_ssh_args)) {
+        if (parsed_ssh_args.capture_tty_transcript != null) {
+            try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with proxy stream mode\n");
+            return process_exit.request(64);
+        }
+        try runProxyStreamSsh(allocator, args[0], parsed_ssh_args);
+    }
     if (shouldUseDirectStream(parsed_ssh_args, stdin_is_tty)) {
         if (parsed_ssh_args.capture_tty_transcript != null) {
             try io.writeAll(2, "sessh: --capture-tty-transcript is not supported without the terminal emulator\n");
@@ -2288,6 +2300,9 @@ fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !v
     if (!parsed.terminal_emulator_set) {
         if (file_config.terminal_emulator) |enabled| parsed.terminal_emulator = enabled;
     }
+    if (!parsed.force_proxy_mode_set) {
+        if (file_config.force_proxy_mode) |enabled| parsed.force_proxy_mode = enabled;
+    }
     if (!parsed.client_log_level_set) {
         if (file_config.client_log_level) |level| {
             parsed.client_log_level = level;
@@ -3062,7 +3077,7 @@ const StreamClientTransport = struct {
 const StreamClientStarter = struct {
     allocator: std.mem.Allocator,
     parsed_ssh_args: ParsedSshArgs,
-    artifacts: *const ArtifactSet,
+    artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
     bootstrap_entrypoint: BootstrapEntrypoint,
     broker_args: []const []const u8,
@@ -3233,6 +3248,252 @@ fn runDirectStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshAr
 
 fn streamReconnectStatusMode(stdout_is_tty: bool) stream_agent.StreamReconnectStatusMode {
     return if (stdout_is_tty) .title else .stderr_plain;
+}
+
+fn shouldUseProxyStream(parsed_ssh_args: ParsedSshArgs) bool {
+    return parsed_ssh_args.action == .new and
+        parsed_ssh_args.command_argv.len == 0 and
+        (parsed_ssh_args.force_proxy_mode or parsed_ssh_args.proxy_required);
+}
+
+// Proxy stream mode is for SSH features that OpenSSH must own directly, such
+// as X11, agent forwarding, port forwarding, subsystems, and direct streams.
+// The visible outer `ssh` process gets the user's original options plus a
+// ProxyCommand. That ProxyCommand is a local sessh process that reconnects a
+// byte-clean stream to a remote stream agent, and the remote stream agent then
+// opens a TCP connection to sshd on the remote machine.
+fn runProxyStreamSsh(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_args: ParsedSshArgs) !noreturn {
+    const proxy_command_option = try proxyCommandOption(allocator, exe, parsed_ssh_args);
+    defer allocator.free(proxy_command_option);
+
+    const default_options = defaultSshOptionsLen(parsed_ssh_args);
+    const ssh_arg_count = 1 + default_options + parsed_ssh_args.options.len + 1 + parsed_ssh_args.shell_command_args.len;
+    const ssh_args = try allocator.alloc([]const u8, ssh_arg_count);
+    defer allocator.free(ssh_args);
+
+    var index: usize = 0;
+    // Put sessh's ProxyCommand first. OpenSSH gives command-line options high
+    // precedence, and this keeps a user/config ProxyCommand available to the
+    // inner bootstrap ssh while ensuring the outer ssh talks over our stream.
+    ssh_args[index] = proxy_command_option;
+    index += 1;
+    appendDefaultSshOptions(ssh_args, &index, parsed_ssh_args.default_ipqos_option);
+    @memcpy(ssh_args[index .. index + parsed_ssh_args.options.len], parsed_ssh_args.options);
+    index += parsed_ssh_args.options.len;
+    ssh_args[index] = parsed_ssh_args.host;
+    index += 1;
+    @memcpy(ssh_args[index..], parsed_ssh_args.shell_command_args);
+
+    try runPlainSshArgv(allocator, ssh_args, "proxy-stream");
+}
+
+fn proxyCommandOption(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_args: ParsedSshArgs) ![]u8 {
+    var command: std.ArrayList(u8) = .empty;
+    defer command.deinit(allocator);
+
+    try appendShellToken(allocator, &command, exe);
+    try appendShellToken(allocator, &command, ":internal-proxy-stream:");
+    try appendShellToken(allocator, &command, "--host");
+    try appendShellToken(allocator, &command, "%h");
+    try appendShellToken(allocator, &command, "--port");
+    try appendShellToken(allocator, &command, "%p");
+    try appendShellToken(allocator, &command, "--user");
+    try appendShellToken(allocator, &command, "%r");
+    try appendProxyTransportSshOptions(allocator, &command, parsed_ssh_args.options);
+
+    return std.fmt.allocPrint(allocator, "-oProxyCommand={s}", .{command.items});
+}
+
+fn appendProxyTransportSshOptions(
+    allocator: std.mem.Allocator,
+    command: *std.ArrayList(u8),
+    options: []const []const u8,
+) !void {
+    var i: usize = 0;
+    while (i < options.len) {
+        const value_index = sshOptionSeparateValueIndex(options, i);
+        if (sshOptionRequiresOuterProxy(options, i)) {
+            i = if (value_index) |index| index + 1 else i + 1;
+            continue;
+        }
+
+        try appendShellToken(allocator, command, "--ssh-option");
+        try appendShellToken(allocator, command, options[i]);
+        if (value_index) |index| {
+            try appendShellToken(allocator, command, "--ssh-option");
+            try appendShellToken(allocator, command, options[index]);
+            i = index + 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn sshOptionRequiresOuterProxy(options: []const []const u8, index: usize) bool {
+    const arg = options[index];
+    if (arg.len < 2 or arg[0] != '-' or std.mem.startsWith(u8, arg, "--")) return false;
+    if (sshTtyRequestCount(arg) != null) return false;
+
+    var pos: usize = 1;
+    while (pos < arg.len) : (pos += 1) {
+        const option = arg[pos];
+        if (isProxyRequiredSshFlag(option) or isProxyRequiredSshOptionWithValue(option)) return true;
+        if (option == 'o') {
+            const value = optionValueFromOptions(options, index, pos) orelse return false;
+            return sshConfigOptionRequiresProxy(value) catch false;
+        }
+        if (sshOptionRequiresValue(option) or isUnsafeSshOptionWithValue(option)) return false;
+    }
+    return false;
+}
+
+fn optionValueFromOptions(options: []const []const u8, index: usize, option_pos: usize) ?[]const u8 {
+    const arg = options[index];
+    if (option_pos + 1 < arg.len) return arg[option_pos + 1 ..];
+    if (index + 1 >= options.len) return null;
+    return options[index + 1];
+}
+
+const ProxyStreamInvocation = struct {
+    host: []const u8,
+    port: []const u8,
+    user: []const u8 = "",
+    ssh_options: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *ProxyStreamInvocation, allocator: std.mem.Allocator) void {
+        self.ssh_options.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const []const u8) !void {
+    var invocation = parseProxyStreamInvocation(allocator, args) catch |err| {
+        try printProxyStreamArgError(err);
+        return process_exit.request(64);
+    };
+    defer invocation.deinit(allocator);
+
+    const proxy_guid = try session_registry.generateProxyGuid(allocator);
+    defer allocator.free(proxy_guid);
+    session_registry.writeOutgoingProxyHint(allocator, proxy_guid) catch |err| {
+        client_log.debug("event=outgoing_proxy_hint_write_failed proxy={s} error={t}", .{ proxy_guid, err });
+    };
+    defer session_registry.removeOutgoingProxyHint(allocator, proxy_guid) catch |err| {
+        client_log.debug("event=outgoing_proxy_hint_remove_failed proxy={s} error={t}", .{ proxy_guid, err });
+    };
+
+    if (invocation.port.len == 0) return error.InvalidProxyStreamArgs;
+    _ = try std.fmt.parseInt(u16, invocation.port, 10);
+
+    try invocation.ssh_options.append(allocator, "-p");
+    try invocation.ssh_options.append(allocator, invocation.port);
+    if (invocation.user.len > 0) {
+        try invocation.ssh_options.append(allocator, "-l");
+        try invocation.ssh_options.append(allocator, invocation.user);
+    }
+
+    var artifacts = try loadArtifactSet(allocator);
+    defer artifacts.deinit();
+    const remote_command = try bootstrapCommand(allocator);
+    defer allocator.free(remote_command);
+
+    const proxy_target_arg = try encodeBase64Arg(allocator, "localhost");
+    defer allocator.free(proxy_target_arg);
+    const broker_args = [_][]const u8{
+        proxy_guid,
+        "proxy",
+        "1",
+        "1",
+        proxy_target_arg,
+        invocation.port,
+        "-",
+    };
+
+    const parsed_transport_args = ParsedSshArgs{
+        .options = invocation.ssh_options.items,
+        .host = invocation.host,
+    };
+    var starter = StreamClientStarter{
+        .allocator = allocator,
+        .parsed_ssh_args = parsed_transport_args,
+        .artifacts = &artifacts,
+        .remote_command = remote_command,
+        .bootstrap_entrypoint = .stream_broker,
+        .broker_args = broker_args[0..],
+        .stderr_mode = .forward,
+    };
+
+    const exit_status = stream_agent.runLocalStream(allocator, &starter, .{
+        .source_fd = 0,
+        .sink_fd = 1,
+        .stderr_fd = 2,
+        .status_mode = .stderr_plain,
+        .intercept_ctrl_r = false,
+        .receive_stderr = false,
+        .expect_exit_status = false,
+        .title_fallback = invocation.host,
+    }) catch |err| {
+        session_registry.removeOutgoingProxyHint(allocator, proxy_guid) catch |remove_err| {
+            client_log.debug("event=outgoing_proxy_hint_remove_failed proxy={s} error={t}", .{ proxy_guid, remove_err });
+        };
+        try starter.exitAfterInitialFailure(err);
+        return;
+    };
+    session_registry.removeOutgoingProxyHint(allocator, proxy_guid) catch |err| {
+        client_log.debug("event=outgoing_proxy_hint_remove_failed proxy={s} error={t}", .{ proxy_guid, err });
+    };
+    return process_exit.request(exit_status);
+}
+
+fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []const u8) !ProxyStreamInvocation {
+    var invocation = ProxyStreamInvocation{
+        .host = "",
+        .port = "",
+    };
+    errdefer invocation.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < args.len) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--host")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingProxyHost;
+            invocation.host = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingProxyPort;
+            _ = try std.fmt.parseInt(u16, args[i], 10);
+            invocation.port = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--user")) {
+            i += 1;
+            if (i >= args.len) return error.MissingProxyUser;
+            invocation.user = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--ssh-option")) {
+            i += 1;
+            if (i >= args.len) return error.MissingSshOptionValue;
+            try invocation.ssh_options.append(allocator, args[i]);
+            i += 1;
+        } else {
+            return error.InvalidProxyStreamArgs;
+        }
+    }
+
+    if (invocation.host.len == 0) return error.MissingProxyHost;
+    if (invocation.port.len == 0) return error.MissingProxyPort;
+    return invocation;
+}
+
+fn printProxyStreamArgError(err: anyerror) !void {
+    switch (err) {
+        error.MissingProxyHost => try io.writeAll(2, "sessh: :internal-proxy-stream: requires --host HOST\n"),
+        error.MissingProxyPort => try io.writeAll(2, "sessh: :internal-proxy-stream: requires --port PORT\n"),
+        error.MissingProxyUser => try io.writeAll(2, "sessh: :internal-proxy-stream: --user requires a value\n"),
+        error.MissingSshOptionValue => try io.writeAll(2, "sessh: :internal-proxy-stream: --ssh-option requires a value\n"),
+        else => try io.stderrPrint("sessh: invalid :internal-proxy-stream: arguments: {t}\n", .{err}),
+    }
 }
 
 fn encodeStreamCommandArg(allocator: std.mem.Allocator, shell_command: ?[]const u8) ![]u8 {
@@ -3839,7 +4100,7 @@ fn parseSshArgs(allocator: std.mem.Allocator, args: []const []const u8, parse_op
             continue;
         }
         const ssh_option_start = i;
-        try consumeSshOption(args, &i, &pre_host.tty_request);
+        try consumeSshOption(args, &i, &pre_host.tty_request, &pre_host.proxy_required);
         if (has_mixed_ssh_options) {
             try mixed_ssh_options.appendSlice(allocator, args[ssh_option_start..i]);
             pending_ssh_options_start = i;
@@ -3932,6 +4193,14 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
         } else if (std.mem.eql(u8, arg, "--no-terminal-emulator")) {
             parsed.terminal_emulator = false;
             parsed.terminal_emulator_set = true;
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--force-proxy-mode")) {
+            parsed.force_proxy_mode = true;
+            parsed.force_proxy_mode_set = true;
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--no-force-proxy-mode")) {
+            parsed.force_proxy_mode = false;
+            parsed.force_proxy_mode_set = true;
             index.* += 1;
         } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
             index.* += 1;
@@ -4095,6 +4364,18 @@ fn parseCommonSesshOptionAfterHost(args: []const []const u8, index: *usize, pars
     if (std.mem.eql(u8, arg, "--no-terminal-emulator")) {
         parsed.terminal_emulator = false;
         parsed.terminal_emulator_set = true;
+        index.* += 1;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--force-proxy-mode")) {
+        parsed.force_proxy_mode = true;
+        parsed.force_proxy_mode_set = true;
+        index.* += 1;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--no-force-proxy-mode")) {
+        parsed.force_proxy_mode = false;
+        parsed.force_proxy_mode_set = true;
         index.* += 1;
         return true;
     }
@@ -4268,6 +4549,8 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--no-bootstrap") or
         std.mem.eql(u8, arg, "--terminal-emulator") or
         std.mem.eql(u8, arg, "--no-terminal-emulator") or
+        std.mem.eql(u8, arg, "--force-proxy-mode") or
+        std.mem.eql(u8, arg, "--no-force-proxy-mode") or
         std.mem.eql(u8, arg, "--ssh-options") or
         std.mem.eql(u8, arg, "--capture-tty-transcript") or
         std.mem.eql(u8, arg, "--refresh") or
@@ -4301,7 +4584,12 @@ fn setParsedClientTarget(parsed: *ParsedSshArgs, target: ClientTarget, client_gu
     parsed.client_guid = client_guid;
 }
 
-fn consumeSshOption(args: []const []const u8, index: *usize, tty_request: *SshTtyRequest) !void {
+fn consumeSshOption(
+    args: []const []const u8,
+    index: *usize,
+    tty_request: *SshTtyRequest,
+    proxy_required: *bool,
+) !void {
     const arg = args[index.*];
     if (std.mem.startsWith(u8, arg, "--")) return error.UnsupportedSshOption;
 
@@ -4314,13 +4602,27 @@ fn consumeSshOption(args: []const []const u8, index: *usize, tty_request: *SshTt
     var pos: usize = 1;
     while (pos < arg.len) {
         const option = arg[pos];
+        if (isProxyRequiredSshFlag(option)) {
+            proxy_required.* = true;
+            pos += 1;
+            continue;
+        }
+        if (isProxyRequiredSshOptionWithValue(option)) {
+            _ = try optionValue(args, index, pos);
+            proxy_required.* = true;
+            return;
+        }
         if (isUnsafeSshFlag(option) or isUnsafeSshOptionWithValue(option)) {
             return error.UnsafeSshOption;
         }
 
         if (option == 'o') {
             const value = try optionValue(args, index, pos);
-            try validateSshConfigOption(value);
+            if (try sshConfigOptionRequiresProxy(value)) {
+                proxy_required.* = true;
+            } else {
+                try validateSshConfigOption(value);
+            }
             return;
         }
 
@@ -4370,19 +4672,27 @@ fn optionValue(args: []const []const u8, index: *usize, option_pos: usize) ![]co
 }
 
 fn isSafeSshFlag(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "46AaCgKkMqsTvXxYy", option) != null;
+    return std.mem.indexOfScalar(u8, "46CgKkqsTv", option) != null;
 }
 
 fn isUnsafeSshFlag(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "fGNnstV", option) != null;
+    return std.mem.indexOfScalar(u8, "fGntV", option) != null;
 }
 
 fn sshOptionRequiresValue(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "BbcDEeFIiJLlmPpRSw", option) != null;
+    return std.mem.indexOfScalar(u8, "BbcDEeFIiJLlmOPpRSwW", option) != null;
 }
 
 fn isUnsafeSshOptionWithValue(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "OQW", option) != null;
+    return option == 'Q';
+}
+
+fn isProxyRequiredSshFlag(option: u8) bool {
+    return std.mem.indexOfScalar(u8, "AaMNsXxYy", option) != null;
+}
+
+fn isProxyRequiredSshOptionWithValue(option: u8) bool {
+    return std.mem.indexOfScalar(u8, "DLORWw", option) != null;
 }
 
 fn validateSshConfigOption(raw_option: []const u8) !void {
@@ -4405,6 +4715,28 @@ fn validateSshConfigOption(raw_option: []const u8) !void {
         if (!sshConfigValueIs(raw_option, key.len, "no")) return error.UnsafeSshOption;
         return;
     }
+}
+
+fn sshConfigOptionRequiresProxy(raw_option: []const u8) !bool {
+    const key = sshConfigKey(raw_option);
+    if (sshConfigKeyIs(raw_option, "RemoteCommand")) return true;
+    if (sshConfigKeyIs(raw_option, "ForwardAgent")) return !sshConfigValueIs(raw_option, key.len, "no");
+    if (sshConfigKeyIs(raw_option, "ForwardX11")) return !sshConfigValueIs(raw_option, key.len, "no");
+    if (sshConfigKeyIs(raw_option, "ForwardX11Trusted")) return !sshConfigValueIs(raw_option, key.len, "no");
+    if (sshConfigKeyIs(raw_option, "LocalForward")) return true;
+    if (sshConfigKeyIs(raw_option, "RemoteForward")) return true;
+    if (sshConfigKeyIs(raw_option, "DynamicForward")) return true;
+    if (sshConfigKeyIs(raw_option, "StreamLocalBindUnlink")) return true;
+    if (sshConfigKeyIs(raw_option, "StreamLocalForward")) return true;
+    if (sshConfigKeyIs(raw_option, "ClearAllForwardings")) return true;
+    if (sshConfigKeyIs(raw_option, "PermitLocalCommand")) return !sshConfigValueIs(raw_option, key.len, "no");
+    if (sshConfigKeyIs(raw_option, "RequestTTY")) return !sshConfigValueIs(raw_option, key.len, "no");
+    if (sshConfigKeyIs(raw_option, "SessionType")) return !sshConfigValueIs(raw_option, key.len, "default");
+    if (sshConfigKeyIs(raw_option, "StdinNull")) return !sshConfigValueIs(raw_option, key.len, "no");
+    if (sshConfigKeyIs(raw_option, "ForkAfterAuthentication")) return !sshConfigValueIs(raw_option, key.len, "no");
+    if (sshConfigKeyIs(raw_option, "Tunnel")) return !sshConfigValueIs(raw_option, key.len, "no");
+    if (sshConfigKeyIs(raw_option, "TunnelDevice")) return true;
+    return false;
 }
 
 fn sshConfigKeyIs(raw_option: []const u8, expected: []const u8) bool {
@@ -5098,16 +5430,107 @@ test "parseSshArgs rejects protocol-breaking ssh options" {
     }, .{}));
     try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "-W",
-        "host:22",
+        "-G",
         "example.com",
     }, .{}));
     try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
+        "-Q",
+        "cipher",
+        "example.com",
+    }, .{}));
+}
+
+test "parseSshArgs routes OpenSSH-owned options to proxy stream mode" {
+    const x11 = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "-X",
+        "example.com",
+    }, .{});
+    try std.testing.expect(x11.proxy_required);
+    try std.testing.expect(shouldUseProxyStream(x11));
+
+    const agent = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "-A",
+        "example.com",
+    }, .{});
+    try std.testing.expect(agent.proxy_required);
+    try std.testing.expect(shouldUseProxyStream(agent));
+
+    const forward = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "-L",
+        "8080:localhost:80",
+        "example.com",
+    }, .{});
+    try std.testing.expect(forward.proxy_required);
+    try std.testing.expect(shouldUseProxyStream(forward));
+
+    const direct = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "-W",
+        "host:22",
+        "example.com",
+    }, .{});
+    try std.testing.expect(direct.proxy_required);
+    try std.testing.expect(shouldUseProxyStream(direct));
+
+    const request_tty = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
         "-o",
         "RequestTTY=force",
         "example.com",
-    }, .{}));
+    }, .{});
+    try std.testing.expect(request_tty.proxy_required);
+    try std.testing.expect(shouldUseProxyStream(request_tty));
+
+    const explicit = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "--force-proxy-mode",
+        "example.com",
+    }, .{});
+    try std.testing.expect(explicit.force_proxy_mode);
+    try std.testing.expect(explicit.force_proxy_mode_set);
+    try std.testing.expect(shouldUseProxyStream(explicit));
+
+    const explicit_disabled = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "--no-force-proxy-mode",
+        "example.com",
+    }, .{});
+    try std.testing.expect(!explicit_disabled.force_proxy_mode);
+    try std.testing.expect(explicit_disabled.force_proxy_mode_set);
+    try std.testing.expect(!shouldUseProxyStream(explicit_disabled));
+}
+
+test "proxy command keeps outer-only options off bootstrap ssh" {
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "-X",
+        "-L",
+        "8080:localhost:80",
+        "-o",
+        "ForwardAgent=yes",
+        "-o",
+        "BatchMode=yes",
+        "-v",
+        "example.com",
+    }, .{});
+    try std.testing.expect(shouldUseProxyStream(parsed));
+
+    const option = try proxyCommandOption(std.testing.allocator, "sesshmux-dev", parsed);
+    defer std.testing.allocator.free(option);
+
+    try std.testing.expect(std.mem.indexOf(u8, option, ":internal-proxy-stream:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "%h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "%p") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "%r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "BatchMode=yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "-v") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "ForwardAgent=yes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "8080:localhost:80") == null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "'-X'") == null);
 }
 
 test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {

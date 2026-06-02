@@ -75,6 +75,10 @@ fn runMain() !void {
         return stream_agent.runAgent(allocator, args[0], args[2..]);
     }
 
+    if (std.mem.eql(u8, args[1], ":internal-proxy-stream:")) {
+        return ssh_client.runProxyStream(allocator, args[0], args[2..]);
+    }
+
     return ssh_client.runMux(allocator, args, true);
 }
 

@@ -50,6 +50,11 @@ batch_mode=0
 verbose=
 plain_option=
 ipqos_option=
+proxy_command=
+x11_option=
+agent_option=
+forward_option=
+forward_value=
 
 trace_fake_ssh_start() {
   if [ -n "${SESSH_FAKE_SSH_TRACE:-}" ]; then
@@ -77,6 +82,12 @@ trace_fake_ssh_parsed() {
 
 record_o_option() {
   case "$1" in
+    [Pp][Rr][Oo][Xx][Yy][Cc][Oo][Mm][Mm][Aa][Nn][Dd]=*)
+      proxy_command=${1#*=}
+      ;;
+    [Pp][Rr][Oo][Xx][Yy][Cc][Oo][Mm][Mm][Aa][Nn][Dd]\\ *)
+      proxy_command=${1#* }
+      ;;
     [Ii][Pp][Qq][Oo][Ss]=*)
       if [ -z "$ipqos_option" ]; then
         ipqos_option=${1#*=}
@@ -127,6 +138,29 @@ while [ "$#" -gt 0 ]; do
       plain_option=$1
       shift
       ;;
+    -X|-Y|-x)
+      x11_option=$1
+      shift
+      ;;
+    -A|-a)
+      agent_option=$1
+      shift
+      ;;
+    -L|-R|-D|-W|-w)
+      forward_option=$1
+      shift
+      if [ "$#" -eq 0 ]; then
+        printf 'fake ssh: missing %s argument\\n' "$forward_option" >&2
+        exit 97
+      fi
+      forward_value=$1
+      shift
+      ;;
+    -L*|-R*|-D*|-W*|-w*)
+      forward_option=$(printf '%s' "$1" | cut -c1-2)
+      forward_value=$(printf '%s' "$1" | cut -c3-)
+      shift
+      ;;
     -F)
       shift
       if [ "$#" -eq 0 ]; then
@@ -155,6 +189,10 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     -N)
+      plain_option=$1
+      shift
+      ;;
+    -n)
       if [ -n "${SESSH_FAKE_SSH_ALLOW_PLAIN:-}" ]; then
         plain_option=$1
         shift
@@ -195,6 +233,28 @@ if [ "$config_query" -eq 1 ]; then
     printf 'hostname %s\\n' "$host"
     printf 'ipqos %s\\n' "${SESSH_FAKE_SSH_G_IPQOS:-af21 cs1}"
   fi
+  exit 0
+fi
+
+if [ -n "$proxy_command" ]; then
+  printf 'invoked=1\\n' >>"$SESSH_FAKE_SSH_LOG"
+  printf 'proxy_ssh=1\\n' >>"$SESSH_FAKE_SSH_LOG"
+  printf 'proxy_host=%s\\n' "$host" >>"$SESSH_FAKE_SSH_LOG"
+  printf 'proxy_command=%s\\n' "$proxy_command" >>"$SESSH_FAKE_SSH_LOG"
+  if [ -n "$x11_option" ]; then
+    printf 'proxy_x11_option=%s\\n' "$x11_option" >>"$SESSH_FAKE_SSH_LOG"
+  fi
+  if [ -n "$agent_option" ]; then
+    printf 'proxy_agent_option=%s\\n' "$agent_option" >>"$SESSH_FAKE_SSH_LOG"
+  fi
+  if [ -n "$forward_option" ]; then
+    printf 'proxy_forward_option=%s\\n' "$forward_option" >>"$SESSH_FAKE_SSH_LOG"
+    printf 'proxy_forward_value=%s\\n' "$forward_value" >>"$SESSH_FAKE_SSH_LOG"
+  fi
+  if [ "$#" -gt 0 ]; then
+    printf 'proxy_remote_command=%s\\n' "$*" >>"$SESSH_FAKE_SSH_LOG"
+  fi
+  printf 'PROXY_SSH host=%s\\n' "$host"
   exit 0
 fi
 
@@ -1643,7 +1703,7 @@ def test_ssh_unsupported_option_falls_back_to_plain_ssh(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
 
-    result = run_sessh(["-N", "test-host"], env, timeout=5.0)
+    result = run_sessh(["-n", "test-host"], env, timeout=5.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -1652,9 +1712,131 @@ def test_ssh_unsupported_option_falls_back_to_plain_ssh(tmp):
     if "fallback to plain-ssh due to ssh option incompatible with sessh transport" not in result.stderr:
         raise AssertionError(result.stderr)
     log_text = fake_log.read_text()
-    if "plain_ssh=1" not in log_text or "plain_option=-N" not in log_text:
+    if "plain_ssh=1" not in log_text or "plain_option=-n" not in log_text:
         raise AssertionError(log_text)
     if "bootstrapper=1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_x11_uses_proxy_stream(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    result = run_sessh(["-X", "test-host", "echo", "hello"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "fallback to plain-ssh" in result.stderr:
+        raise AssertionError(result.stderr)
+    if "PROXY_SSH host=test-host" not in result.stdout:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "proxy_ssh=1" not in log_text:
+        raise AssertionError(log_text)
+    if "proxy_x11_option=-X" not in log_text:
+        raise AssertionError(log_text)
+    if ":internal-proxy-stream:" not in log_text:
+        raise AssertionError(log_text)
+    if "proxy_remote_command=echo hello" not in log_text:
+        raise AssertionError(log_text)
+    if "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_forwarding_uses_proxy_stream(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    result = run_sessh(["-L", "8080:localhost:80", "test-host"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "fallback to plain-ssh" in result.stderr:
+        raise AssertionError(result.stderr)
+    log_text = fake_log.read_text()
+    if "proxy_ssh=1" not in log_text:
+        raise AssertionError(log_text)
+    if "proxy_forward_option=-L" not in log_text:
+        raise AssertionError(log_text)
+    if "proxy_forward_value=8080:localhost:80" not in log_text:
+        raise AssertionError(log_text)
+    if ":internal-proxy-stream:" not in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_force_proxy_mode_uses_proxy_stream(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    result = run_sessh(["--force-proxy-mode", "test-host"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "fallback to plain-ssh" in result.stderr:
+        raise AssertionError(result.stderr)
+    log_text = fake_log.read_text()
+    if "proxy_ssh=1" not in log_text:
+        raise AssertionError(log_text)
+    if ":internal-proxy-stream:" not in log_text:
+        raise AssertionError(log_text)
+    if "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_force_proxy_mode_config_uses_proxy_stream(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    write_sessh_config(env, "force-proxy-mode=true\n")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    result = run_sessh(["test-host"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "proxy_ssh=1" not in log_text:
+        raise AssertionError(log_text)
+    if ":internal-proxy-stream:" not in log_text:
+        raise AssertionError(log_text)
+    if "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_no_force_proxy_mode_overrides_config(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    write_sessh_config(env, "force-proxy-mode=yes\n")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sessh(["--no-force-proxy-mode", "test-host", "echo", "hello"], env, timeout=5.0)
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if result.stdout != "hello\n":
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "proxy_ssh=1" in log_text or ":internal-proxy-stream:" in log_text:
+        raise AssertionError(log_text)
+    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
@@ -4461,6 +4643,26 @@ def main(argv=None):
         (
             "ssh unsupported option falls back to plain ssh",
             test_ssh_unsupported_option_falls_back_to_plain_ssh,
+        ),
+        (
+            "ssh x11 uses proxy stream",
+            test_ssh_x11_uses_proxy_stream,
+        ),
+        (
+            "ssh forwarding uses proxy stream",
+            test_ssh_forwarding_uses_proxy_stream,
+        ),
+        (
+            "ssh force proxy mode uses proxy stream",
+            test_ssh_force_proxy_mode_uses_proxy_stream,
+        ),
+        (
+            "ssh force proxy mode config uses proxy stream",
+            test_ssh_force_proxy_mode_config_uses_proxy_stream,
+        ),
+        (
+            "ssh no force proxy mode overrides config",
+            test_ssh_no_force_proxy_mode_overrides_config,
         ),
         (
             "ssh remote command uses direct stream",

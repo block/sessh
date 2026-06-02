@@ -43,6 +43,7 @@ pub const LocalStreamOptions = struct {
     receive_stderr: bool,
     forward_resize: bool = false,
     title_fallback: []const u8 = "",
+    expect_exit_status: bool = true,
 };
 
 // Stream channel ids are wire values, not a closed enum. The standard channels
@@ -1012,6 +1013,7 @@ fn cleanupReplacementResult(comptime Transport: type, result: *reconnect.AsyncRe
 const StreamMode = enum {
     pty,
     pipe,
+    proxy,
 };
 
 const StreamAgentConfig = struct {
@@ -1021,10 +1023,13 @@ const StreamAgentConfig = struct {
     cols: u16,
     shell_command: ?[]u8,
     tty_settings: ?tty_settings.Settings,
+    proxy_host: ?[]u8,
+    proxy_port: u16 = 0,
 
     fn deinit(self: *StreamAgentConfig, allocator: std.mem.Allocator) void {
         if (self.shell_command) |command| allocator.free(command);
         if (self.tty_settings) |*settings| settings.deinit(allocator);
+        if (self.proxy_host) |host| allocator.free(host);
         self.* = undefined;
     }
 };
@@ -1032,11 +1037,13 @@ const StreamAgentConfig = struct {
 const StreamEndpoint = union(enum) {
     pty: PtyEndpoint,
     pipe: PipeEndpoint,
+    proxy: ProxyEndpoint,
 
     fn activeOutbound(self: *const StreamEndpoint) ChannelMask {
         return switch (self.*) {
             .pty => .{ .stdout = true },
             .pipe => .{ .stdout = true, .stderr = true },
+            .proxy => .{ .stdout = true },
         };
     }
 
@@ -1076,6 +1083,22 @@ const StreamEndpoint = union(enum) {
                 .source_exit_seen = &pipe.exited,
                 .source_exit_status = &pipe.exit_status,
             },
+            .proxy => |*proxy| .{
+                .source_count = 1,
+                .sources = .{
+                    .{ .fd = proxy.fd, .channel = stream_channel_stdout },
+                    .{},
+                },
+                .sinks = blk: {
+                    var sinks: [channel_count]ChannelSink = .{ .{}, .{}, .{} };
+                    sinks[channelIndex(stream_channel_stdin)] = .{
+                        .fd = proxy.fd,
+                        .shutdown_on_eof = true,
+                    };
+                    break :blk sinks;
+                },
+                .replacement_listen_fd = listen_fd,
+            },
         };
     }
 
@@ -1083,6 +1106,7 @@ const StreamEndpoint = union(enum) {
         switch (self.*) {
             .pty => |*pty| pty.deinit(),
             .pipe => |*pipe| pipe.deinit(),
+            .proxy => |*proxy| proxy.deinit(),
         }
         self.* = undefined;
     }
@@ -1159,9 +1183,32 @@ const PipeEndpoint = struct {
     }
 };
 
+const ProxyEndpoint = struct {
+    stream: std.net.Stream,
+    fd: c.fd_t,
+
+    fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16) !ProxyEndpoint {
+        const stream = try std.net.tcpConnectToHost(allocator, host, port);
+        return .{
+            .stream = stream,
+            .fd = stream.handle,
+        };
+    }
+
+    fn deinit(self: *ProxyEndpoint) void {
+        if (self.fd >= 0) {
+            self.stream.close();
+            self.fd = -1;
+        }
+        self.* = undefined;
+    }
+};
+
 /// The stream broker is bound to one ssh transport. It connects that transport
-/// to the durable stream agent socket for the `r-` GUID, starting the agent when
-/// needed, then relays bytes between ssh stdio and the agent socket.
+/// to the durable stream agent socket for the stream GUID, starting the agent
+/// when needed, then relays bytes between ssh stdio and the agent socket.
+/// Direct command streams use `r-` GUIDs; proxy streams use `p-` GUIDs so
+/// runtime listings can distinguish them without inspecting agent state.
 pub fn runBroker(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     var config = try parseStreamAgentConfig(allocator, args);
     defer config.deinit(allocator);
@@ -1197,7 +1244,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
     defer endpoint.deinit();
 
     var state = StreamState.init(allocator, endpoint.activeOutbound(), endpoint.activeInbound());
-    state.require_outbound_exit_status = true;
+    state.require_outbound_exit_status = endpointHasExitStatus(&endpoint);
     defer state.deinit();
 
     var attach_fd: c.fd_t = -1;
@@ -1296,7 +1343,7 @@ pub fn runLocalStream(
         .{ .stdin = true },
         .{ .stdout = true, .stderr = options.receive_stderr },
     );
-    state.expect_inbound_exit_status = true;
+    state.expect_inbound_exit_status = options.expect_exit_status;
     defer state.deinit();
     var input_control = StreamInputControl{
         .enabled = options.intercept_ctrl_r,
@@ -1943,15 +1990,39 @@ fn parseStreamAgentConfig(allocator: std.mem.Allocator, args: []const []const u8
         try io.writeAll(2, "sessh: :internal-stream-broker: requires GUID MODE ROWS COLS COMMAND TERM TTYMODES\n");
         return error.InvalidStreamArgs;
     }
-    if (!session_registry.isValidReconnectGuid(args[0])) return error.InvalidStreamGuid;
     const mode: StreamMode = if (std.mem.eql(u8, args[1], "pty"))
         .pty
     else if (std.mem.eql(u8, args[1], "pipe"))
         .pipe
+    else if (std.mem.eql(u8, args[1], "proxy"))
+        .proxy
     else
         return error.InvalidStreamMode;
+
+    switch (mode) {
+        .pty, .pipe => if (!session_registry.isValidReconnectGuid(args[0])) return error.InvalidStreamGuid,
+        .proxy => if (!session_registry.isValidProxyGuid(args[0])) return error.InvalidStreamGuid,
+    }
+
     const rows = try parseDimension(args[2]);
     const cols = try parseDimension(args[3]);
+    if (mode == .proxy) {
+        const proxy_host = try decodeCommandArg(allocator, args[4]) orelse return error.InvalidStreamArgs;
+        errdefer allocator.free(proxy_host);
+        const proxy_port = try parsePort(args[5]);
+        if (!std.mem.eql(u8, args[6], "-")) return error.InvalidStreamArgs;
+        return .{
+            .guid = args[0],
+            .mode = mode,
+            .rows = rows,
+            .cols = cols,
+            .shell_command = null,
+            .tty_settings = null,
+            .proxy_host = proxy_host,
+            .proxy_port = proxy_port,
+        };
+    }
+
     const shell_command = try decodeCommandArg(allocator, args[4]);
     errdefer if (shell_command) |command| allocator.free(command);
     const parsed_tty_settings = try decodeTtySettingsArgs(allocator, args[5], args[6]);
@@ -1963,12 +2034,19 @@ fn parseStreamAgentConfig(allocator: std.mem.Allocator, args: []const []const u8
         .cols = cols,
         .shell_command = shell_command,
         .tty_settings = parsed_tty_settings,
+        .proxy_host = null,
     };
 }
 
 fn parseDimension(value: []const u8) !u16 {
     const parsed = try std.fmt.parseInt(u16, value, 10);
     return @max(parsed, 1);
+}
+
+fn parsePort(value: []const u8) !u16 {
+    const parsed = try std.fmt.parseInt(u16, value, 10);
+    if (parsed == 0) return error.InvalidStreamArgs;
+    return parsed;
 }
 
 fn decodeCommandArg(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
@@ -2011,6 +2089,14 @@ fn startStreamEndpoint(allocator: std.mem.Allocator, config: StreamAgentConfig) 
             .tty_settings = config.tty_settings,
         }) } },
         .pipe => .{ .pipe = try PipeEndpoint.spawn(allocator, config.shell_command) },
+        .proxy => .{ .proxy = try ProxyEndpoint.connect(allocator, config.proxy_host.?, config.proxy_port) },
+    };
+}
+
+fn endpointHasExitStatus(endpoint: *const StreamEndpoint) bool {
+    return switch (endpoint.*) {
+        .pty, .pipe => true,
+        .proxy => false,
     };
 }
 
@@ -2473,6 +2559,35 @@ fn formatDiagnosticLine(
     if (prefix.len + message.len > out.len) return error.NoSpaceLeft;
     @memcpy(out[prefix.len .. prefix.len + message.len], message);
     return out[0 .. prefix.len + message.len];
+}
+
+test "proxy stream config uses proxy guid and tcp target" {
+    var config = try parseStreamAgentConfig(std.testing.allocator, &.{
+        "p-550e8400-e29b-41d4-a716-446655440000",
+        "proxy",
+        "1",
+        "1",
+        "bG9jYWxob3N0",
+        "22",
+        "-",
+    });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(StreamMode.proxy, config.mode);
+    try std.testing.expectEqualStrings("localhost", config.proxy_host.?);
+    try std.testing.expectEqual(@as(u16, 22), config.proxy_port);
+    try std.testing.expectEqual(@as(?[]u8, null), config.shell_command);
+    try std.testing.expect(config.tty_settings == null);
+
+    try std.testing.expectError(error.InvalidStreamGuid, parseStreamAgentConfig(std.testing.allocator, &.{
+        "r-550e8400-e29b-41d4-a716-446655440000",
+        "proxy",
+        "1",
+        "1",
+        "bG9jYWxob3N0",
+        "22",
+        "-",
+    }));
 }
 
 test "stream frames round trip through a pipe" {

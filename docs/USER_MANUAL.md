@@ -47,14 +47,18 @@ sessh [[ssh-option|sessh-option] ...] destination [command [argument ...]]
   terminal emulator for this connection. Disabling it carries bytes over the
   reconnectable stream directly, which better preserves terminal features sessh
   does not model. The positive form is mainly useful for overriding config.
+- `--force-proxy-mode` / `--no-force-proxy-mode`: force, or explicitly do not
+  force, the ProxyCommand-based stream path for this connection. Sessh still
+  enables proxy mode automatically when an ssh option requires OpenSSH to own
+  the outer session.
 
 Sessh-specific behavior is configured in the config file documented below.
 
 ## Config file
 
 The config file uses `.env` syntax. It can specify sessh-specific options, but
-not arbitrary ssh options. `client-log-level` can be overridden with
-`--log-level`; the other keys are config-only.
+not arbitrary ssh options. Some keys also have command-line overrides for a
+single invocation.
 
 The default config path follows the XDG spec. If `$XDG_CONFIG_HOME` is defined:
 `$XDG_CONFIG_HOME/sessh/sessh.env`. Otherwise: `~/.config/sessh/sessh.env`
@@ -71,6 +75,7 @@ initial-scrollback=-1
 client-log-level=warn
 bootstrap=true
 terminal-emulator=true
+force-proxy-mode=false
 ```
 
 - `leader`: set the leader key for client commands or disable with `None`. The
@@ -90,6 +95,10 @@ terminal-emulator=true
   `false`/`no` and `true`/`yes` are accepted. Disabling it is equivalent to
   passing `--no-terminal-emulator`; `--terminal-emulator` enables it for a
   single invocation.
+- `force-proxy-mode`: force the ProxyCommand-based stream path by default.
+  `false`/`no` and `true`/`yes` are accepted. It defaults to `false`;
+  `--force-proxy-mode` and `--no-force-proxy-mode` override it for a single
+  invocation.
 
 ## Mux Commands
 

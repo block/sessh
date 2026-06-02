@@ -10,9 +10,11 @@ pub const compact_guid_len = 32;
 pub const session_guid_prefix = "s-";
 pub const client_guid_prefix = "c-";
 pub const reconnect_guid_prefix = "r-";
+pub const proxy_guid_prefix = "p-";
 pub const session_guid_len = session_guid_prefix.len + guid_body_len;
 pub const client_guid_len = client_guid_prefix.len + guid_body_len;
 pub const reconnect_guid_len = reconnect_guid_prefix.len + guid_body_len;
+pub const proxy_guid_len = proxy_guid_prefix.len + guid_body_len;
 pub const generated_alias_hex_len = 8;
 pub const generated_alias_len = session_guid_prefix.len + generated_alias_hex_len;
 pub const tombstone_retention_ms: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -293,8 +295,13 @@ pub fn isValidReconnectGuid(guid: []const u8) bool {
         isValidGuidBody(guid[reconnect_guid_prefix.len..]);
 }
 
+pub fn isValidProxyGuid(guid: []const u8) bool {
+    return std.mem.startsWith(u8, guid, proxy_guid_prefix) and
+        isValidGuidBody(guid[proxy_guid_prefix.len..]);
+}
+
 pub fn isValidGuid(guid: []const u8) bool {
-    return isValidSessionGuid(guid) or isValidClientGuid(guid) or isValidReconnectGuid(guid);
+    return isValidSessionGuid(guid) or isValidClientGuid(guid) or isValidReconnectGuid(guid) or isValidProxyGuid(guid);
 }
 
 pub fn isValidCompactGuid(guid: []const u8) bool {
@@ -412,10 +419,22 @@ pub fn canonicalReconnectGuid(allocator: std.mem.Allocator, guid: []const u8) ![
     return out;
 }
 
+pub fn canonicalProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (!isValidProxyGuid(guid)) return error.InvalidProxyId;
+    const out = try allocator.alloc(u8, proxy_guid_len);
+    out[0] = proxy_guid_prefix[0];
+    out[1] = proxy_guid_prefix[1];
+    for (guid[proxy_guid_prefix.len..], 0..) |byte, i| {
+        out[proxy_guid_prefix.len + i] = std.ascii.toLower(byte);
+    }
+    return out;
+}
+
 fn canonicalRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidSessionGuid(guid) or isValidCompactGuid(guid)) return canonicalGuid(allocator, guid);
     if (isValidClientGuid(guid)) return canonicalClientGuid(allocator, guid);
     if (isValidReconnectGuid(guid)) return canonicalReconnectGuid(allocator, guid);
+    if (isValidProxyGuid(guid)) return canonicalProxyGuid(allocator, guid);
     return error.InvalidSessionId;
 }
 
@@ -460,10 +479,23 @@ pub fn compactReconnectGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u
     return out;
 }
 
+pub fn compactProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (!isValidProxyGuid(guid)) return error.InvalidProxyId;
+    var out = try allocator.alloc(u8, compact_guid_len);
+    var dst: usize = 0;
+    for (guid[proxy_guid_prefix.len..]) |byte| {
+        if (byte == '-') continue;
+        out[dst] = std.ascii.toLower(byte);
+        dst += 1;
+    }
+    return out;
+}
+
 fn compactRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidSessionGuid(guid) or isValidCompactGuid(guid)) return compactGuid(allocator, guid);
     if (isValidClientGuid(guid)) return compactClientGuid(allocator, guid);
     if (isValidReconnectGuid(guid)) return compactReconnectGuid(allocator, guid);
+    if (isValidProxyGuid(guid)) return compactProxyGuid(allocator, guid);
     return error.InvalidSessionId;
 }
 
@@ -505,6 +537,22 @@ pub fn generateReconnectGuid(allocator: std.mem.Allocator) ![]u8 {
     out[0] = reconnect_guid_prefix[0];
     out[1] = reconnect_guid_prefix[1];
     @memcpy(out[reconnect_guid_prefix.len..], session_guid[session_guid_prefix.len..]);
+    return out;
+}
+
+pub fn generateProxyGuid(allocator: std.mem.Allocator) ![]u8 {
+    var bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const compact = std.fmt.bytesToHex(bytes, .lower);
+    const session_guid = try canonicalGuid(allocator, &compact);
+    defer allocator.free(session_guid);
+
+    const out = try allocator.alloc(u8, proxy_guid_len);
+    out[0] = proxy_guid_prefix[0];
+    out[1] = proxy_guid_prefix[1];
+    @memcpy(out[proxy_guid_prefix.len..], session_guid[session_guid_prefix.len..]);
     return out;
 }
 
@@ -583,6 +631,8 @@ pub const RuntimeGuidType = enum {
     local_session,
     incoming_stream,
     outgoing_stream,
+    incoming_proxy,
+    outgoing_proxy,
 };
 
 pub fn runtimeGuidTypeName(guid_type: RuntimeGuidType) []const u8 {
@@ -592,6 +642,8 @@ pub fn runtimeGuidTypeName(guid_type: RuntimeGuidType) []const u8 {
         .local_session => "local-session",
         .incoming_stream => "incoming-stream",
         .outgoing_stream => "outgoing-stream",
+        .incoming_proxy => "incoming-proxy",
+        .outgoing_proxy => "outgoing-proxy",
     };
 }
 
@@ -604,7 +656,7 @@ const runtime_guid_empty_meta_filenames = [_][]const u8{};
 
 pub fn runtimeGuidMetaFilenamesForGuid(guid: []const u8) []const []const u8 {
     if (isValidSessionGuid(guid)) return runtime_guid_session_meta_filenames[0..];
-    if (isValidClientGuid(guid) or isValidReconnectGuid(guid)) return runtime_guid_directional_meta_filenames[0..];
+    if (isValidClientGuid(guid) or isValidReconnectGuid(guid) or isValidProxyGuid(guid)) return runtime_guid_directional_meta_filenames[0..];
     return runtime_guid_empty_meta_filenames[0..];
 }
 
@@ -614,8 +666,8 @@ pub fn runtimeGuidMetaFilenamesForGuid(guid: []const u8) []const []const u8 {
 fn runtimeGuidMetaFilenameForType(guid_type: RuntimeGuidType) []const u8 {
     return switch (guid_type) {
         .local_session => "meta.json",
-        .incoming_client, .incoming_stream => "incoming-meta.json",
-        .outgoing_client, .outgoing_stream => "outgoing-meta.json",
+        .incoming_client, .incoming_stream, .incoming_proxy => "incoming-meta.json",
+        .outgoing_client, .outgoing_stream, .outgoing_proxy => "outgoing-meta.json",
     };
 }
 
@@ -625,6 +677,8 @@ fn runtimeGuidTypeFromName(value: []const u8) !RuntimeGuidType {
     if (std.mem.eql(u8, value, "local-session")) return .local_session;
     if (std.mem.eql(u8, value, "incoming-stream")) return .incoming_stream;
     if (std.mem.eql(u8, value, "outgoing-stream")) return .outgoing_stream;
+    if (std.mem.eql(u8, value, "incoming-proxy")) return .incoming_proxy;
+    if (std.mem.eql(u8, value, "outgoing-proxy")) return .outgoing_proxy;
     return error.InvalidRuntimeGuidMeta;
 }
 
@@ -1327,17 +1381,36 @@ pub fn writeOutgoingStreamHint(allocator: std.mem.Allocator, guid: []const u8) !
 }
 
 fn writeOutgoingStreamHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, guid: []const u8) !void {
+    return writeDirectionalRuntimeGuidHintInRoot(allocator, runtime_root, guid, .outgoing_stream);
+}
+
+pub fn writeOutgoingProxyHint(allocator: std.mem.Allocator, guid: []const u8) !void {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    return writeOutgoingProxyHintInRoot(allocator, runtime_root, guid);
+}
+
+fn writeOutgoingProxyHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, guid: []const u8) !void {
+    return writeDirectionalRuntimeGuidHintInRoot(allocator, runtime_root, guid, .outgoing_proxy);
+}
+
+fn writeDirectionalRuntimeGuidHintInRoot(
+    allocator: std.mem.Allocator,
+    runtime_root: []const u8,
+    guid: []const u8,
+    guid_type: RuntimeGuidType,
+) !void {
     try ensureRegistryRoot(allocator, runtime_root);
     const guid_root = try sessionsDirInRoot(allocator, runtime_root);
     defer allocator.free(guid_root);
     try mkdirIgnoreExists(allocator, guid_root);
 
-    const canonical = try canonicalReconnectGuid(allocator, guid);
+    const canonical = try canonicalRuntimeGuid(allocator, guid);
     defer allocator.free(canonical);
     const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ guid_root, canonical });
     defer allocator.free(dir);
     try mkdirIgnoreExists(allocator, dir);
-    try writeRuntimeGuidMetaInDir(allocator, dir, .outgoing_stream);
+    try writeRuntimeGuidMetaInDir(allocator, dir, guid_type);
 }
 
 pub fn removeOutgoingStreamHint(allocator: std.mem.Allocator, guid: []const u8) !void {
@@ -1347,11 +1420,30 @@ pub fn removeOutgoingStreamHint(allocator: std.mem.Allocator, guid: []const u8) 
 }
 
 fn removeOutgoingStreamHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, guid: []const u8) !void {
-    const canonical = try canonicalReconnectGuid(allocator, guid);
+    return removeDirectionalRuntimeGuidHintInRoot(allocator, runtime_root, guid, .outgoing_stream);
+}
+
+pub fn removeOutgoingProxyHint(allocator: std.mem.Allocator, guid: []const u8) !void {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    return removeOutgoingProxyHintInRoot(allocator, runtime_root, guid);
+}
+
+fn removeOutgoingProxyHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, guid: []const u8) !void {
+    return removeDirectionalRuntimeGuidHintInRoot(allocator, runtime_root, guid, .outgoing_proxy);
+}
+
+fn removeDirectionalRuntimeGuidHintInRoot(
+    allocator: std.mem.Allocator,
+    runtime_root: []const u8,
+    guid: []const u8,
+    guid_type: RuntimeGuidType,
+) !void {
+    const canonical = try canonicalRuntimeGuid(allocator, guid);
     defer allocator.free(canonical);
     const dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, canonical });
     defer allocator.free(dir);
-    try removeRuntimeGuidMetaInDir(allocator, dir, .outgoing_stream);
+    try removeRuntimeGuidMetaInDir(allocator, dir, guid_type);
 }
 
 pub fn runtimeAgentSocketPathsForGuidInRoot(
@@ -1379,7 +1471,8 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
     const agent_sock_link = try agentSocketLinkPath(allocator, dir);
     errdefer allocator.free(agent_sock_link);
 
-    const meta = try runtimeGuidMetaPathForTypeInDir(allocator, dir, .incoming_stream);
+    const incoming_meta_type = runtimeIncomingMetaTypeForGuid(canonical);
+    const meta = try runtimeGuidMetaPathForTypeInDir(allocator, dir, incoming_meta_type);
     errdefer allocator.free(meta);
 
     const socket = socketPathFromAgentSocketLink(allocator, dir, agent_sock_link) catch |err| switch (err) {
@@ -1393,7 +1486,7 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
         else => return err,
     };
     errdefer allocator.free(socket);
-    try writeRuntimeGuidMetaPath(allocator, meta, .incoming_stream);
+    try writeRuntimeGuidMetaPath(allocator, meta, incoming_meta_type);
 
     return .{
         .dir = dir,
@@ -1401,6 +1494,13 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
         .agent_sock_link = agent_sock_link,
         .meta = meta,
     };
+}
+
+fn runtimeIncomingMetaTypeForGuid(guid: []const u8) RuntimeGuidType {
+    if (isValidProxyGuid(guid)) return .incoming_proxy;
+    if (isValidReconnectGuid(guid)) return .incoming_stream;
+    if (isValidClientGuid(guid)) return .incoming_client;
+    return .local_session;
 }
 
 pub fn removeClientRouteHint(allocator: std.mem.Allocator, client_guid: []const u8) !void {
@@ -1959,10 +2059,15 @@ pub fn shortReconnectGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 
     return shortTypedGuid(allocator, guid, reconnect_guid_prefix);
 }
 
+pub fn shortProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    return shortTypedGuid(allocator, guid, proxy_guid_prefix);
+}
+
 pub fn shortRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidSessionGuid(guid)) return shortSessionGuid(allocator, guid);
     if (isValidClientGuid(guid)) return shortClientGuid(allocator, guid);
     if (isValidReconnectGuid(guid)) return shortReconnectGuid(allocator, guid);
+    if (isValidProxyGuid(guid)) return shortProxyGuid(allocator, guid);
     return error.InvalidGuid;
 }
 
@@ -1971,6 +2076,8 @@ fn shortTypedGuid(allocator: std.mem.Allocator, guid: []const u8, prefix: []cons
         try compactGuid(allocator, guid)
     else if (std.mem.eql(u8, prefix, reconnect_guid_prefix))
         try compactReconnectGuid(allocator, guid)
+    else if (std.mem.eql(u8, prefix, proxy_guid_prefix))
+        try compactProxyGuid(allocator, guid)
     else
         try compactClientGuid(allocator, guid);
     defer allocator.free(compact);
@@ -2579,6 +2686,13 @@ test "runtime agent socket paths use typed guid directories and socket directory
     paths.removeRuntimeFiles();
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.meta));
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.dir));
+
+    const proxy_guid = "p-550e8400-e29b-41d4-a716-446655440001";
+    var proxy_paths = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, proxy_guid);
+    defer proxy_paths.deinit(allocator);
+    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/p-550e8400-e29b-41d4-a716-446655440001/incoming-meta.json", proxy_paths.meta);
+    _ = try expectRuntimeGuidMetaType(allocator, proxy_paths.meta, .incoming_proxy);
+    proxy_paths.removeRuntimeFiles();
 }
 
 test "outgoing stream hints use runtime metadata without stealing incoming stream cleanup" {
@@ -2611,14 +2725,49 @@ test "outgoing stream hints use runtime metadata without stealing incoming strea
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(dir));
 }
 
+test "outgoing proxy hints use proxy runtime metadata without stealing incoming proxy cleanup" {
+    const allocator = std.testing.allocator;
+    const root = "zig-cache/outgoing-proxy-hint-test";
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+
+    const guid = "p-550e8400-e29b-41d4-a716-446655440000";
+    const dir = "zig-cache/outgoing-proxy-hint-test/guid/p-550e8400-e29b-41d4-a716-446655440000";
+    const incoming_meta_path = "zig-cache/outgoing-proxy-hint-test/guid/p-550e8400-e29b-41d4-a716-446655440000/incoming-meta.json";
+    const outgoing_meta_path = "zig-cache/outgoing-proxy-hint-test/guid/p-550e8400-e29b-41d4-a716-446655440000/outgoing-meta.json";
+
+    try writeOutgoingProxyHintInRoot(allocator, root, guid);
+    _ = try expectRuntimeGuidMetaType(allocator, outgoing_meta_path, .outgoing_proxy);
+    try removeOutgoingProxyHintInRoot(allocator, root, guid);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(outgoing_meta_path));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(dir));
+
+    try writeOutgoingProxyHintInRoot(allocator, root, guid);
+    var incoming = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
+    defer incoming.deinit(allocator);
+    _ = try expectRuntimeGuidMetaType(allocator, incoming_meta_path, .incoming_proxy);
+    _ = try expectRuntimeGuidMetaType(allocator, outgoing_meta_path, .outgoing_proxy);
+
+    try removeOutgoingProxyHintInRoot(allocator, root, guid);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(outgoing_meta_path));
+    _ = try expectRuntimeGuidMetaType(allocator, incoming_meta_path, .incoming_proxy);
+    incoming.removeRuntimeFiles();
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(dir));
+}
+
 test "validates session ids and aliases" {
     try std.testing.expect(isValidSessionId("s-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(isValidSessionId("550e8400e29b41d4a716446655440000"));
     try std.testing.expect(isValidSessionGuid("s-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(isValidClientGuid("c-550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(isValidReconnectGuid("r-550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(isValidProxyGuid("p-550e8400-e29b-41d4-a716-446655440000"));
     const generated_client = try generateClientGuid(std.testing.allocator);
     defer std.testing.allocator.free(generated_client);
     try std.testing.expect(isValidClientGuid(generated_client));
+    const generated_proxy = try generateProxyGuid(std.testing.allocator);
+    defer std.testing.allocator.free(generated_proxy);
+    try std.testing.expect(isValidProxyGuid(generated_proxy));
     try std.testing.expect(!isValidSessionId("550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(!isValidSessionId("c-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(!isValidSessionId(""));
@@ -2904,6 +3053,7 @@ test "tombstone snapshots aliases, removes route, and releases aliases" {
         .last_known_alive = true,
         .attached_count = null,
         .last_input_at_unix_ms = null,
+        .detached_at_unix_ms = null,
     };
     defer route.deinit(allocator);
 
@@ -2961,6 +3111,7 @@ test "expired tombstone cleanup removes only recorded aliases" {
         .last_known_alive = true,
         .attached_count = null,
         .last_input_at_unix_ms = null,
+        .detached_at_unix_ms = null,
     };
     defer route.deinit(allocator);
 
