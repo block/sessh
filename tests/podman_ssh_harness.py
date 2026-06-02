@@ -831,6 +831,25 @@ def wait_for_ssh(host_alias, config):
     raise AssertionError(f"ssh target did not become ready: {result.stderr}")
 
 
+def set_remote_login_shell(container, shell_path):
+    # Interactive ssh sessions use the remote account's login shell. These
+    # tests install tiny shells that exit quickly so the harness can assert on
+    # session startup without needing to drive an interactive prompt. The shell
+    # scripts still delegate `-c ...` back to zsh because ssh also uses the
+    # login shell to run sessh's remote bootstrap command.
+    run(
+        [
+            "podman",
+            "exec",
+            container,
+            "sh",
+            "-c",
+            f"sed -i 's#^\\(root:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:\\).*#\\1{shell_path}#' /etc/passwd",
+        ],
+        timeout=10.0,
+    )
+
+
 def warm_sessh_artifact_cache(prefix, config, host_alias, env):
     result = run(
         [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias, "true"],
@@ -1046,11 +1065,11 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
                 container,
                 "sh",
                 "-c",
-                f"cat > {remote_shell} <<'EOF'\n#!/bin/sh\nprintf '{marker}\\n'\nEOF\nchmod +x {remote_shell}",
+                f"cat > {remote_shell} <<'EOF'\n#!/bin/sh\nif [ \"$1\" = -c ]; then exec /bin/zsh \"$@\"; fi\nprintf '{marker}\\n'\nEOF\nchmod +x {remote_shell}",
             ],
             timeout=10.0,
         )
-        env["SHELL"] = remote_shell
+        set_remote_login_shell(container, remote_shell)
 
         result = run(
             [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias],
@@ -1074,11 +1093,11 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
                 container,
                 "sh",
                 "-c",
-                f"cat > {remote_shell} <<'EOF'\n#!/bin/sh\nprintf '{reconnect_marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\nEOF\nchmod +x {remote_shell}",
+                f"cat > {remote_shell} <<'EOF'\n#!/bin/sh\nif [ \"$1\" = -c ]; then exec /bin/zsh \"$@\"; fi\nprintf '{reconnect_marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\nEOF\nchmod +x {remote_shell}",
             ],
             timeout=10.0,
         )
-        env["SHELL"] = remote_shell
+        set_remote_login_shell(container, remote_shell)
         config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "sessh.env").write_text("leader=CTRL-B\n")
@@ -1120,11 +1139,11 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
                 container,
                 "sh",
                 "-c",
-                f"cat > {remote_shell} <<'EOF'\n#!/bin/sh\nprintf '{command_marker}\\n'\nwhile :; do sleep 1; done\nEOF\nchmod +x {remote_shell}",
+                f"cat > {remote_shell} <<'EOF'\n#!/bin/sh\nif [ \"$1\" = -c ]; then exec /bin/zsh \"$@\"; fi\nprintf '{command_marker}\\n'\nwhile :; do sleep 1; done\nEOF\nchmod +x {remote_shell}",
             ],
             timeout=10.0,
         )
-        env["SHELL"] = remote_shell
+        set_remote_login_shell(container, remote_shell)
 
         started = run_until_stdout(
             [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias],

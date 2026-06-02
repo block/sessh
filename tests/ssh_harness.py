@@ -1369,7 +1369,7 @@ def test_ssh_clean_remote_exit_tombstones_local_route(tmp):
 
     result = run_sessh(["--alias", alias, "test-host"], env, timeout=30.0)
 
-    if result.returncode != 0:
+    if result.returncode != 7:
         raise AssertionError(result)
     if marker not in result.stdout:
         raise AssertionError(result)
@@ -1723,7 +1723,7 @@ def test_ssh_tty_stdin_remote_command_does_not_allocate_tty_without_t(tmp):
         timeout=10.0,
     )
 
-    if result.returncode != 0:
+    if result.returncode != 1:
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
@@ -2421,7 +2421,7 @@ def test_ssh_single_tty_remote_command_with_stdin_null_uses_direct_stream(tmp):
 
     result = run_sessh(["-t", "test-host", "tty"], env, timeout=5.0)
 
-    if result.returncode != 0:
+    if result.returncode != 1:
         raise AssertionError(result)
     if "not a tty" not in result.stdout:
         raise AssertionError(result)
@@ -2483,7 +2483,7 @@ def test_ssh_tty_quoted_empty_remote_command_uses_shell_eval(tmp):
 
     result = run_sessh(["-tt", "test-host", '""'], env, timeout=30.0)
 
-    if result.returncode != 0:
+    if result.returncode != 7:
         raise AssertionError(result)
     if 'SHELL_COMMAND:""' not in result.stdout or "UNEXPECTED_INTERACTIVE" in result.stdout:
         raise AssertionError(result)
