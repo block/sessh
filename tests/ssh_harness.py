@@ -2869,6 +2869,32 @@ def test_sesshmux_unknown_command_does_not_fallback_to_plain_ssh(tmp):
         raise AssertionError(fake_log.read_text())
 
 
+def test_sesshmux_subcommands_reject_raw_ssh_options(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+
+    cases = [
+        ("new", ["new", "-n", "test-host"]),
+        ("attach", ["attach", "-n", "--host", "test-host", "s1"]),
+        ("list", ["list", "-n"]),
+        ("kill", ["kill", "-n", "s1"]),
+        ("detach", ["detach", "-n", "s1"]),
+        ("repaint", ["repaint", "-n", "s1"]),
+        ("debug", ["debug", "sever-connection", "-n", "s1"]),
+    ]
+    for name, args in cases:
+        result = run_sesshmux(args, env, timeout=5.0)
+        if result.returncode != 64 or "sesshmux: unsupported option for this command" not in result.stderr:
+            raise AssertionError(f"{name}: {process_diagnostics(result)}")
+        if fake_log.exists():
+            raise AssertionError(f"{name}: raw ssh option fell through to ssh:\n{fake_log.read_text()}")
+
+
 def test_internal_sessh_rejects_dot_host(tmp):
     env = isolated_env(tmp)
 
@@ -2913,7 +2939,10 @@ def test_ssh_unsupported_option_does_not_fallback_for_sessh_action(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
 
-    result = run_sesshmux(["attach", "-N", "test-host", "s1"], env, timeout=5.0)
+    # `sesshmux` only accepts ssh arguments through --ssh-options. `-n` is
+    # intentionally unsafe for sessh's persistent transport, and this sesshmux
+    # action must reject it instead of falling back to plain ssh.
+    result = run_sesshmux(["attach", "--ssh-options", "-n", "--host", "test-host", "s1"], env, timeout=5.0)
 
     if result.returncode != 64:
         raise AssertionError(result)
@@ -4913,6 +4942,10 @@ def main(argv=None):
         (
             "sesshmux unknown command does not fallback to plain ssh",
             test_sesshmux_unknown_command_does_not_fallback_to_plain_ssh,
+        ),
+        (
+            "sesshmux subcommands reject raw ssh options",
+            test_sesshmux_subcommands_reject_raw_ssh_options,
         ),
         (
             "internal sessh rejects dot host",

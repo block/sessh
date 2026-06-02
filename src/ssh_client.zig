@@ -920,21 +920,14 @@ const MuxCommandParser = struct {
             return true;
         }
 
-        if (std.mem.startsWith(u8, current, "-") and !std.mem.eql(u8, current, "-") and self.positional.items.len == 0 and
-            !std.mem.startsWith(u8, current, "--"))
-        {
-            const start = self.index;
-            var tty_request: SshTtyRequest = .none;
-            var proxy_required = false;
-            try consumeSshOption(self.args, &self.index, &tty_request, &proxy_required);
-            try self.ssh_options.appendSlice(self.translated.allocator, self.args[start..self.index]);
-            return true;
-        }
-
         return false;
     }
 
     fn appendPositional(self: *@This()) !void {
+        // Public sesshmux commands do not accept raw ssh flags. Callers must
+        // use `--ssh-options` so command parsing stays separate from ssh
+        // option parsing.
+        if (std.mem.startsWith(u8, self.arg(), "-")) return error.UnsupportedMuxOption;
         try self.positional.append(self.translated.allocator, self.arg());
         self.index += 1;
     }
@@ -1228,7 +1221,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         else => return err,
     };
     var parsed_ssh_args = if (route_ref_args) |parsed| parsed else parseSshArgs(allocator, args, parse_options) catch |err| {
-        if (shouldUsePlainSshFallbackForArgError(args, err)) {
+        if (!parse_options.allow_mux_command_words and shouldUsePlainSshFallbackForArgError(args, err)) {
             try runPlainSshFallbackForUnsupportedArgs(allocator, args, err);
         }
         try printSshArgError(err);
@@ -6751,6 +6744,26 @@ test "translateMuxArgs maps client management commands" {
 }
 
 test "translateMuxArgs rejects flags outside their public command grammar" {
+    try std.testing.expectError(error.UnsupportedMuxOption, translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "attach",
+        "-n",
+        "--host",
+        "example.com",
+        "s1",
+    }));
+    try std.testing.expectError(error.UnsupportedMuxOption, translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "list",
+        "-F",
+        "cfg",
+    }));
+    try std.testing.expectError(error.UnsupportedMuxOption, translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "detach",
+        "-v",
+        "s1",
+    }));
     try std.testing.expectError(error.UnsupportedMuxOption, translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
         "list",
