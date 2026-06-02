@@ -337,6 +337,7 @@ const StreamInputControl = struct {
     status_visible: bool = false,
     reconnect_requested: bool = false,
     disconnect_requested: bool = false,
+    help_requested: bool = false,
     escape_filter: terminal.EscapeFilter = .{},
 
     fn filter(self: *StreamInputControl, bytes: []const u8, out: []u8) []const u8 {
@@ -346,6 +347,7 @@ const StreamInputControl = struct {
             const result = self.escape_filter.filter(bytes, &scratch);
             if (result.end) |end| switch (end) {
                 .detach => self.disconnect_requested = true,
+                .help => self.help_requested = true,
                 .repaint, .reconnect => {},
             };
             input = result.bytes;
@@ -371,7 +373,12 @@ const StreamInputControl = struct {
         if (self.disconnect_requested) {
             self.disconnect_requested = false;
             self.reconnect_requested = false;
+            self.help_requested = false;
             return .disconnect;
+        }
+        if (self.help_requested) {
+            self.help_requested = false;
+            return .help;
         }
         const requested = self.reconnect_requested;
         self.reconnect_requested = false;
@@ -383,6 +390,7 @@ const StreamControlAction = enum {
     none,
     reconnect,
     disconnect,
+    help,
     interrupt,
 };
 
@@ -1432,6 +1440,7 @@ pub fn runLocalStream(
                         reconnect_status.showReconnecting();
                         input_control.status_visible = true;
                     },
+                    .help => reconnect_status.showEscapeHelp(),
                     .none => {},
                     .interrupt => unreachable,
                 }
@@ -1502,7 +1511,12 @@ pub fn runLocalStream(
                 }
                 if (input_index) |index| {
                     if (pollfds[index].revents != 0) {
-                        if (readReconnectInput(&state, options.source_fd, &input_control) == .disconnect) return 0;
+                        switch (readReconnectInput(&state, options.source_fd, &input_control)) {
+                            .disconnect => return 0,
+                            .help => reconnect_status.showEscapeHelp(),
+                            .none, .reconnect => {},
+                            .interrupt => unreachable,
+                        }
                     }
                 }
                 reconnect_status.flushDiagnostics();
@@ -2022,11 +2036,20 @@ fn waitBeforeReconnect(
         input_control.status_visible = true;
         const step_ms = @min(remaining_ms, 1_000);
         const action = pollReconnectInput(state, source_fd, input_control, interrupt, @intCast(step_ms));
+        if (action == .help) {
+            status.showEscapeHelp();
+            continue;
+        }
         if (action != .none) return action;
         remaining_ms -= step_ms;
         status.flushDiagnostics();
     }
-    return input_control.consumeAction();
+    const action = input_control.consumeAction();
+    if (action == .help) {
+        status.showEscapeHelp();
+        return .none;
+    }
+    return action;
 }
 
 fn pollReconnectInput(
@@ -2258,6 +2281,7 @@ const StreamReconnectStatus = struct {
     live_diagnostic_start_seq: u64,
     rendered_diagnostic_seq: u64,
     title_visible: bool = false,
+    escape_help_pending: bool = false,
     title_tracker: TerminalTitleTracker = .{},
     title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
     title_fallback_len: usize = 0,
@@ -2326,6 +2350,23 @@ const StreamReconnectStatus = struct {
         self.refreshDiagnostics();
     }
 
+    fn showEscapeHelp(self: *StreamReconnectStatus) void {
+        switch (self.mode) {
+            .title => {
+                if (!self.canWriteTitle()) {
+                    // Direct TTY streams share the terminal with remote output.
+                    // If the remote stream is mid-control-sequence, wait until
+                    // the parser reaches a safe point before writing local help.
+                    self.escape_help_pending = true;
+                    return;
+                }
+                self.writeEscapeHelpText();
+            },
+            .stderr_plain => self.writeEscapeHelpText(),
+            .disabled => {},
+        }
+    }
+
     fn writePlainStatusLine(self: *StreamReconnectStatus) void {
         if (self.mode != .stderr_plain) return;
         const message = self.line[0..self.line_len];
@@ -2370,6 +2411,7 @@ const StreamReconnectStatus = struct {
     fn observeInbound(self: *StreamReconnectStatus, channel: StreamChannel, bytes: []const u8) void {
         if (channel != stream_channel_stdout or self.mode != .title) return;
         self.title_tracker.observe(bytes);
+        if (self.escape_help_pending and self.canWriteTitle()) self.writeEscapeHelpText();
     }
 
     fn refreshDiagnostics(self: *StreamReconnectStatus) void {
@@ -2399,6 +2441,16 @@ const StreamReconnectStatus = struct {
         self.diagnostic_cursor = new_cursor;
         self.rendered_diagnostic_seq = new_cursor;
         client_log.markUserDiagnosticsDisplayedThrough(new_cursor);
+    }
+
+    fn writeEscapeHelpText(self: *StreamReconnectStatus) void {
+        if (self.fd < 0) return;
+        self.escape_help_pending = false;
+        io.writeAll(self.fd, "\r\n") catch return;
+        inline for (terminal.escape_help_lines) |line| {
+            io.writeAll(self.fd, line) catch return;
+            io.writeAll(self.fd, "\r\n") catch return;
+        }
     }
 };
 
@@ -2702,6 +2754,21 @@ test "stream input control uses ssh escape to disconnect no-terminal-emulator st
     try std.testing.expectEqual(StreamControlAction.disconnect, control.consumeAction());
 }
 
+test "stream input control supports ssh help and doubled tilde escapes" {
+    var control = StreamInputControl{
+        .enabled = true,
+        .escape_enabled = true,
+        .status_visible = true,
+    };
+    var out: [16]u8 = undefined;
+
+    try std.testing.expectEqualStrings("", control.filter("~?", &out));
+    try std.testing.expectEqual(StreamControlAction.help, control.consumeAction());
+
+    try std.testing.expectEqualStrings("~hello", control.filter("~~hello", &out));
+    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
+}
+
 test "pending stream replacement hands off a prepared transport" {
     const TestTransport = struct {
         closed: *bool,
@@ -3002,6 +3069,34 @@ test "stream reconnect status skips title while terminal parser is unsafe" {
     var buf: [16]u8 = undefined;
     const n = try posix.read(fds[0], &buf);
     try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "stream escape help waits for terminal parser safe point" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    try setNonBlockingFd(fds[0]);
+
+    var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
+    status.observeInbound(stream_channel_stdout, "\x1b]2;partial-title");
+    status.showEscapeHelp();
+
+    var empty_buf: [16]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, posix.read(fds[0], &empty_buf));
+
+    status.observeInbound(stream_channel_stdout, "\x1b\\");
+    posix.close(fds[1]);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    while (true) {
+        var buf: [128]u8 = undefined;
+        const n = c.read(fds[0], &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "Supported escape sequences") != null);
 }
 
 test "stream reconnect status treats synchronized update as unsafe for title" {

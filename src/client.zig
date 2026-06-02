@@ -4186,6 +4186,7 @@ pub fn pollAndForwardReconnectInput(
             .detach => .detach,
             else => .transport_closed,
         },
+        .help => {},
         .repaint => sendRepaint(write_fd, "", &session.pending_repaint) catch |err| switch (err) {
             error.WriteFailed => return .transport_closed,
             else => return err,
@@ -4877,6 +4878,17 @@ fn relayTerminal(
             }
             if (result.end) |end| switch (end) {
                 .detach => return finishRelay(requestSessionDetach(read_fd, write_fd), relay_end_restore),
+                .help => {
+                    if (try showEscapeHelpModal(
+                        input_fd,
+                        read_fd,
+                        write_fd,
+                        viewport_offset,
+                        pending_repaint,
+                        input_ack_tracker,
+                        ended_tombstone_details,
+                    )) |modal_end| return finishRelay(modal_end, relay_end_restore);
+                },
                 .repaint => sendRepaint(write_fd, "", pending_repaint) catch |err| switch (err) {
                     error.WriteFailed => return try finishRelayAfterRuntimeWriteFailed(
                         read_fd,
@@ -4913,6 +4925,180 @@ fn relayTerminal(
         if (connection_monitor.isUnresponsive()) {
             return .unresponsive;
         }
+    }
+}
+
+fn showEscapeHelpModal(
+    input_fd: c.fd_t,
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    viewport_offset: *i32,
+    pending_repaint: *PendingRepaint,
+    input_ack_tracker: *InputAckTracker,
+    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+) !?RelayEnd {
+    // The help banner is local UI, not part of the remote terminal model. While
+    // it is visible, remote draw frames are discarded and a repaint is requested
+    // after dismissal so the client resumes from the session agent's latest
+    // screen state.
+    const renderer = client_renderer.Renderer.init(1);
+    var banner_state: ?BannerDrawState = null;
+    var last_size = terminal.currentWindowSize();
+    try drawEscapeHelpBanner(renderer, last_size, viewport_offset, &banner_state);
+
+    while (true) {
+        var pollfds = [_]posix.pollfd{
+            .{ .fd = input_fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = read_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        _ = try posix.poll(&pollfds, 250);
+
+        if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+            if (try drainEscapeHelpRuntimeFrames(
+                read_fd,
+                write_fd,
+                input_ack_tracker,
+                ended_tombstone_details,
+            )) |end| {
+                try clearEscapeHelpBanner(renderer, viewport_offset, &banner_state);
+                return end;
+            }
+        }
+
+        if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+            var input: [256]u8 = undefined;
+            const n = c.read(input_fd, &input, input.len);
+            if (n <= 0) {
+                try clearEscapeHelpBanner(renderer, viewport_offset, &banner_state);
+                return requestSessionDetach(read_fd, write_fd);
+            }
+            const bytes = input[0..@intCast(n)];
+            io_helpers.noteRead(input_fd, bytes);
+            // The key that dismisses the help screen is local UI input. Do not
+            // forward it to the remote session after the repaint.
+            break;
+        }
+
+        const size = terminal.currentWindowSize();
+        if (size.rows != last_size.rows or size.cols != last_size.cols) {
+            last_size = size;
+            try drawEscapeHelpBanner(renderer, size, viewport_offset, &banner_state);
+        }
+    }
+
+    try clearEscapeHelpBanner(renderer, viewport_offset, &banner_state);
+    sendScreenRepaint(write_fd, pending_repaint) catch |err| switch (err) {
+        error.WriteFailed => return .transport_closed,
+        else => return err,
+    };
+    return null;
+}
+
+fn drawEscapeHelpBanner(
+    renderer: client_renderer.Renderer,
+    size: WindowSize,
+    viewport_offset: *i32,
+    banner_state: *?BannerDrawState,
+) !void {
+    var lines: [terminal.escape_help_banner_lines.len]BannerLine = undefined;
+    inline for (terminal.escape_help_banner_lines, 0..) |line, index| {
+        lines[index] = .{
+            .text = line,
+            .alignment = if (index == 0) .center else .left,
+        };
+    }
+    const top: u16 = if (viewport_offset.* > 0)
+        @intCast(@min(@as(usize, @intCast(viewport_offset.*)), @as(usize, std.math.maxInt(u16))))
+    else
+        0;
+    const next = try drawBannerLines(renderer, size, top, banner_state.*, &lines);
+    viewport_offset.* = @intCast(next.viewport_offset);
+    banner_state.* = next;
+}
+
+fn clearEscapeHelpBanner(
+    renderer: client_renderer.Renderer,
+    viewport_offset: *i32,
+    banner_state: *?BannerDrawState,
+) !void {
+    const state = banner_state.* orelse return;
+    const size = terminal.currentWindowSize();
+    try eraseBannerRows(renderer, state, size.rows, size.cols);
+    try restoreBannerExpansion(renderer, state, size.rows);
+    const cleared = clearedViewportOffset(state);
+    viewport_offset.* = @intCast(cleared);
+    banner_state.* = null;
+    try renderer.moveCursor(cleared, 0);
+}
+
+fn drainEscapeHelpRuntimeFrames(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    input_ack_tracker: *InputAckTracker,
+    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+) !?RelayEnd {
+    while (true) {
+        var runtime_poll = [_]posix.pollfd{.{
+            .fd = read_fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        _ = try posix.poll(&runtime_poll, 0);
+        const revents = runtime_poll[0].revents;
+        if ((revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (revents & posix.POLL.IN) == 0)
+        {
+            return .transport_closed;
+        }
+        if ((revents & posix.POLL.IN) == 0) return null;
+
+        if (try handleEscapeHelpRuntimeFrame(read_fd, write_fd, input_ack_tracker, ended_tombstone_details)) |end| return end;
+    }
+}
+
+fn handleEscapeHelpRuntimeFrame(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    input_ack_tracker: *InputAckTracker,
+    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+) !?RelayEnd {
+    var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
+    defer frame.deinit(app_allocator.allocator());
+    switch (frame.message_type) {
+        // The banner sits on top of the last rendered screen. Applying remote
+        // draws here would interleave two renderers; repaint-after-dismiss is
+        // the boundary that gets us back to a single source of screen truth.
+        .draw, .repaint_response, .client_repaint_request => return null,
+        .client_detach_request => {
+            var request = try protocol.decodePayload(pb.ClientDetachRequest, app_allocator.allocator(), frame.payload);
+            defer request.deinit(app_allocator.allocator());
+            return .detach;
+        },
+        .tty_transcript_chunk => {
+            try handleTtyTranscriptChunkFrame(frame.payload);
+            return null;
+        },
+        .input_ack => {
+            _ = try handleInputAckFrame(frame.payload, input_ack_tracker);
+            return null;
+        },
+        .ping, .pong => {
+            _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
+            return null;
+        },
+        .session_ended => {
+            if (ended_tombstone_details) |details| {
+                var ended = try protocol.decodePayload(pb.SessionEnded, app_allocator.allocator(), frame.payload);
+                defer ended.deinit(app_allocator.allocator());
+                details.* = tombstoneDetailsFromSessionEnded(ended);
+            }
+            return .session_ended;
+        },
+        .error_message => {
+            try printErrorPayload(frame.payload);
+            return .session_ended;
+        },
+        else => return error.UnexpectedFrame,
     }
 }
 

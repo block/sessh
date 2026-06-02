@@ -64,6 +64,7 @@ pub const Leader = union(enum) {
 
 pub const FilterEnd = enum {
     detach,
+    help,
     repaint,
     reconnect,
 };
@@ -73,9 +74,23 @@ pub const FilterResult = struct {
     end: ?FilterEnd = null,
 };
 
+pub const escape_help_lines = [_][]const u8{
+    "Supported escape sequences:",
+    "~.  disconnect",
+    "~?  show this help",
+    "~~  send ~",
+};
+
+pub const escape_help_banner_lines = [_][]const u8{
+    "Supported escape sequences. Any key to dismiss",
+    "~.  detach",
+    "~?  show this help",
+    "~~  send ~",
+};
+
 /// Removes local sessh escape sequences from terminal input before forwarding
-/// bytes to the remote PTY. This mirrors ssh's line-start `~.` escape and the
-/// optional sessh leader commands.
+/// bytes to the remote PTY. This mirrors ssh's line-start `~.`/`~?`/`~~`
+/// escapes and the optional sessh leader commands.
 pub const EscapeFilter = struct {
     leader_byte: ?u8 = null,
     at_line_start: bool = true,
@@ -111,6 +126,13 @@ pub const EscapeFilter = struct {
             if (self.pending_tilde) {
                 self.pending_tilde = false;
                 if (byte == '.') return .{ .bytes = out[0..written], .end = .detach };
+                if (byte == '?') return .{ .bytes = out[0..written], .end = .help };
+                if (byte == '~') {
+                    out[written] = '~';
+                    written += 1;
+                    self.at_line_start = false;
+                    continue;
+                }
                 out[written] = '~';
                 written += 1;
                 self.at_line_start = false;
@@ -142,6 +164,35 @@ pub fn leaderByte(leader: Leader) ?u8 {
         .none => null,
         .ctrl => |key| key & 0x1f,
     };
+}
+
+test "EscapeFilter handles ssh line-start escapes" {
+    var filter = EscapeFilter{};
+    var out: [16]u8 = undefined;
+
+    var result = filter.filter("~.", &out);
+    try std.testing.expectEqualStrings("", result.bytes);
+    try std.testing.expectEqual(FilterEnd.detach, result.end.?);
+
+    filter = .{};
+    result = filter.filter("~?", &out);
+    try std.testing.expectEqualStrings("", result.bytes);
+    try std.testing.expectEqual(FilterEnd.help, result.end.?);
+
+    filter = .{};
+    result = filter.filter("\r~?", &out);
+    try std.testing.expectEqualStrings("\r", result.bytes);
+    try std.testing.expectEqual(FilterEnd.help, result.end.?);
+
+    filter = .{};
+    result = filter.filter("~~hello", &out);
+    try std.testing.expectEqualStrings("~hello", result.bytes);
+    try std.testing.expectEqual(@as(?FilterEnd, null), result.end);
+
+    filter = .{};
+    result = filter.filter("x~?", &out);
+    try std.testing.expectEqualStrings("x~?", result.bytes);
+    try std.testing.expectEqual(@as(?FilterEnd, null), result.end);
 }
 
 /// Restores local tty mode even when the remote PTY leaves itself in raw/no-echo

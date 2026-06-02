@@ -596,6 +596,25 @@ def read_pty_until(fd, output, needle, timeout=10.0):
     return output
 
 
+def read_pty_until_count(fd, output, needle, minimum, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while output.count(needle) < minimum:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"timed out waiting for {minimum} occurrences of {needle!r}; got {output!r}")
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            raise AssertionError(f"timed out waiting for {minimum} occurrences of {needle!r}; got {output!r}")
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError as exc:
+            raise AssertionError(f"pty closed waiting for {needle!r}; got {output!r}") from exc
+        if not chunk:
+            raise AssertionError(f"pty closed waiting for {needle!r}; got {output!r}")
+        output += chunk
+    return output
+
+
 def run_sesshmux_in_pty(
     args,
     env,
@@ -2357,6 +2376,151 @@ def test_ssh_no_terminal_emulator_tty_escape_disconnects(tmp):
     if result.returncode != 0:
         raise AssertionError(result)
     if "~." in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_no_terminal_emulator_tty_escape_help(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "printf 'HELP_READY\\r\\n'; while :; do sleep 1; done"],
+        env,
+        (
+            (b"HELP_READY", b"\r~?"),
+            (b"Supported escape sequences", b"\r~."),
+        ),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "~.  disconnect" not in result.stdout:
+        raise AssertionError(result)
+    if "~~  send ~" not in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_no_terminal_emulator_tty_escape_doubled_tilde(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "printf 'TILDE_READY\\r\\n'; IFS= read -r line; printf 'LINE:%s\\r\\n' \"$line\""],
+        env,
+        (
+            (b"TILDE_READY", b"~~hello\n"),
+            (b"LINE:~hello", None),
+        ),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "LINE:~~hello" in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_terminal_emulator_tty_escape_doubled_tilde(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "-tt", "test-host", "printf 'TILDE_READY\\n'; IFS= read -r line; printf 'LINE:%s\\n' \"$line\""],
+        env,
+        (
+            (b"TILDE_READY", b"~~hello\n"),
+            (b"LINE:~hello", None),
+        ),
+        timeout=10.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "LINE:~~hello" in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_terminal_emulator_tty_escape_help_modal_repaints(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    seed_remote_artifact_cache(env)
+
+    argv = [
+        str(MUX_BIN),
+        ":internal-sessh:",
+        "-tt",
+        "test-host",
+        "printf 'HELP_READY\\n'; while IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done",
+    ]
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(argv[0], argv, env)
+
+    output = b""
+    waited = False
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        output = read_pty_until(fd, output, b"HELP_READY", 10.0)
+        os.write(fd, b"\r~?")
+        output = read_pty_until(fd, output, b"Any key to dismiss", 10.0)
+        output = read_pty_until(fd, output, b"~.  detach", 10.0)
+        os.write(fd, b"ignored\n")
+        output = read_pty_until_count(fd, output, b"HELP_READY", 2, 10.0)
+        os.write(fd, b"after\n")
+        output = read_pty_until(fd, output, b"REMOTE:after", 10.0)
+        os.write(fd, b"\r~.")
+
+        deadline = time.monotonic() + 10.0
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                waited = True
+                returncode = wait_status_to_returncode(status)
+                output += read_available_pty(fd)
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"timed out waiting for pty command to exit; got {output!r}")
+            ready, _, _ = select.select([fd], [], [], min(remaining, 0.05))
+            if ready:
+                output += read_available_pty(fd)
+    finally:
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(fd)
+
+    result = subprocess.CompletedProcess(argv, returncode, output.decode("utf-8", "replace"), "")
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "REMOTE:ignored" in result.stdout:
         raise AssertionError(result)
 
 
@@ -4302,6 +4466,22 @@ def main(argv=None):
         (
             "ssh no-terminal-emulator tty escape disconnects",
             test_ssh_no_terminal_emulator_tty_escape_disconnects,
+        ),
+        (
+            "ssh no-terminal-emulator tty escape help",
+            test_ssh_no_terminal_emulator_tty_escape_help,
+        ),
+        (
+            "ssh no-terminal-emulator tty escape doubled tilde",
+            test_ssh_no_terminal_emulator_tty_escape_doubled_tilde,
+        ),
+        (
+            "ssh terminal-emulator tty escape doubled tilde",
+            test_ssh_terminal_emulator_tty_escape_doubled_tilde,
+        ),
+        (
+            "ssh terminal-emulator tty escape help modal repaints",
+            test_ssh_terminal_emulator_tty_escape_help_modal_repaints,
         ),
         (
             "ssh tty uses emulated TERM not outer TERM",
