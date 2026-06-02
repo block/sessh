@@ -154,9 +154,6 @@ def local_mux_args(args):
     if command == "attach":
         return ["attach", "--host", ".", *rest]
     if command == "list":
-        if "--local-only" in rest:
-            filtered = [arg for arg in rest if arg != "--local-only"]
-            return ["list", *filtered, "."]
         return ["list", *rest]
     if command == "kill":
         if rest and rest[0] == "--all":
@@ -3462,6 +3459,7 @@ def run_broker_attach_without_id_uses_latest_detached_test(base_env):
                 if proc.poll() is None:
                     proc.terminate()
                     proc.wait(timeout=2.0)
+            cleanup_runtime(env)
 
 
 def run_broker_kill_edge_cases_test(base_env):
@@ -3973,7 +3971,7 @@ def main():
                 "last_input_at_unix_ms": None,
             }:
                 raise AssertionError(listed_jsonl.stdout)
-            listed = run([".", "list", "--local-only"], env, check=True, timeout=5.0)
+            listed = run(["list", "."], env, check=True, timeout=5.0)
             if listed.stderr:
                 raise AssertionError(listed)
             if "remote8" in sessions(listed.stdout):

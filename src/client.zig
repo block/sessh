@@ -3098,7 +3098,7 @@ fn runLocalBrokerCommand(allocator: std.mem.Allocator, exe: []const u8, broker_a
     };
 }
 
-fn runLocalListCommand(
+pub fn runLocalListCommand(
     allocator: std.mem.Allocator,
     exe: []const u8,
     runtime_broker_args: []const []const u8,

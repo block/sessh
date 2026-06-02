@@ -84,6 +84,22 @@ run_isolated() {
   check_isolation_empty "$*"
 }
 
+run_with_host_podman_environment() {
+  printf '\n==> %s\n' "$*"
+  (
+    # Podman itself is outside sessh's test isolation. It reads the caller's
+    # normal HOME/XDG config to find the configured Podman machine and may use
+    # the caller's runtime/temp settings to reach its socket. The Podman harness
+    # creates isolated sessh client environments internally, so only point it at
+    # the freshly built binary here.
+    HISTFILE=/dev/null
+    SESSH_BIN=zig-out/bin/sesshmux-dev
+    export HISTFILE SESSH_BIN
+    "$@"
+  )
+  check_isolation_empty "$*"
+}
+
 find_zig() {
   if [ -n "${ZIG:-}" ]; then
     printf '%s\n' "$ZIG"
@@ -213,7 +229,7 @@ case "$mode" in
     run_isolated python3 tests/terminal_conformance_harness.py
     if [ "$mode" = "full" ]; then
       printf '\n==> Slow Podman ssh harness is about to start. Run `scripts/check --ci` to skip it.\n'
-      run_isolated python3 tests/podman_ssh_harness.py
+      run_with_host_podman_environment python3 tests/podman_ssh_harness.py
     fi
     run git diff --check
     ;;
