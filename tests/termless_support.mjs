@@ -408,7 +408,7 @@ export function writeShellEmitter(path) {
       "#!/bin/sh",
       "printf 'SESSH_TERMLESS_READY\\r\\n'",
       "printf '\\033]2;sessh-termless\\007'",
-      "sleep 1",
+      "IFS= read -r line",
       "",
     ].join("\n"),
   );

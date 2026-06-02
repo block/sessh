@@ -38,6 +38,23 @@ function writeSesshConfig(root, contents) {
   writeFileSync(join(configDir, "sessh.env"), contents);
 }
 
+// Closing the attached client is not enough here: the local session can still
+// be tearing down under the isolated runtime/state directories. Tell the test
+// shell to exit, then wait for the client process to observe that exit before
+// deleting the temp root.
+async function exitEmitterSession(term, timeoutMs = 5000) {
+  if (!term?.alive) return;
+  term.type("exit\r");
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!term.alive) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  throw new Error(`sessh did not exit after test shell was told to exit; current output:\n${term.getText()}`);
+}
+
 function staleVisibleRows(rows) {
   let prefill = "";
   for (let row = 1; row <= rows; row += 1) {
@@ -66,6 +83,7 @@ test("sessh local transport renders child pty output", async () => {
 
     await waitForText(term, "SESSH_TERMLESS_READY", 12000);
     await waitForTitle(term, "sessh-termless", 12000);
+    await exitEmitterSession(term);
   } finally {
     await term?.close();
     rmSync(testRoot, { recursive: true, force: true });
@@ -153,6 +171,7 @@ test("sessh starts when the outer terminal does not answer terminal queries", as
 
     await waitForText(term, "SESSH_TERMLESS_READY", 12000);
     await waitForTitle(term, "sessh-termless", 12000);
+    await exitEmitterSession(term);
   } finally {
     await term?.close();
     rmSync(testRoot, { recursive: true, force: true });
