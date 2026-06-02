@@ -145,6 +145,7 @@ test("sessh initial-scrollback=0 attach clears stale outer row tails", async () 
         );
       }
     }
+    await exitEmitterSession(attach);
   } finally {
     await starter?.close();
     await attach?.close();
