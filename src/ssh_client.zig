@@ -162,6 +162,7 @@ const ParsedSshArgs = struct {
     client_repaint_scrollback: bool = false,
     debug_client_action: ?DebugClientAction = null,
     debug_unresponsive_seconds: ?[]const u8 = null,
+    new_detached: bool = false,
     command_argv: []const []const u8 = &.{},
     shell_command_args: []const []const u8 = &.{},
     tty_request: SshTtyRequest = .none,
@@ -563,6 +564,7 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
     var command_argv: []const []const u8 = &.{};
     var command_from_delimiter = false;
     var eval_args = false;
+    var detached = false;
     var tty_request: SshTtyRequest = .none;
     var i: usize = 0;
     while (i < args.len) {
@@ -584,6 +586,9 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
         } else if (std.mem.eql(u8, arg, "--eval-args")) {
             if (host != null) return error.SesshOptionAfterHost;
             eval_args = true;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--detached")) {
+            detached = true;
             i += 1;
         } else if (isSesshLongOption(arg)) {
             if (host != null) return error.SesshOptionAfterHost;
@@ -609,6 +614,7 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
     const resolved_host = host orelse return error.MissingHost;
     try appendMany(translated, ssh_options.items);
     try translated.append(resolved_host);
+    if (detached) try translated.append("--detached");
     try appendMany(translated, sessh_options.items);
     if (command_argv.len > 0) {
         if (eval_args) {
@@ -1251,6 +1257,20 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         return process_exit.request(64);
     };
     client_log.setLevel(parsed_ssh_args.client_log_level);
+    if (parsed_ssh_args.new_detached) {
+        if (parsed_ssh_args.capture_tty_transcript != null) {
+            try io.writeAll(2, "sesshmux: new --detached does not support --capture-tty-transcript\n");
+            return process_exit.request(64);
+        }
+        if (!parsed_ssh_args.terminal_emulator) {
+            try io.writeAll(2, "sesshmux: new --detached requires terminal-emulator mode\n");
+            return process_exit.request(64);
+        }
+        if (parsed_ssh_args.force_proxy_mode or parsed_ssh_args.proxy_required) {
+            try io.writeAll(2, "sesshmux: new --detached does not support proxy stream mode\n");
+            return process_exit.request(64);
+        }
+    }
     if (parsed_ssh_args.capture_tty_transcript != null and isRemoteManagementAction(parsed_ssh_args.action)) {
         try io.writeAll(2, "sessh: --capture-tty-transcript is only supported for new and attach sessions\n");
         return process_exit.request(64);
@@ -1367,6 +1387,46 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         null,
         null,
     );
+
+    if (parsed_ssh_args.action == .new and parsed_ssh_args.new_detached) {
+        var created = client.createSessionOnRuntime(
+            child.child.stdout.?.handle,
+            child.child.stdin.?.handle,
+            parsed_ssh_args.scrollback_row_count,
+            new_guid.?,
+            new_alias.?,
+            parsed_ssh_args.command_argv,
+            shell_command,
+        ) catch |err| {
+            if (err == error.VersionMismatch) {
+                child.closeStdin();
+                _ = child.wait() catch {};
+                try io.writeAll(2, "sesshmux: new --detached requires a compatible sesshmux agent\n");
+                return process_exit.request(1);
+            }
+            waitAfterRuntimeAttachFailure(&child, "create");
+            if (process_exit.is(err)) return err;
+            try io.stderrPrint("sessh: ssh runtime create failed: {t}\n", .{err});
+            return process_exit.request(1);
+        };
+        defer created.deinit();
+        child.suppressSshStderr();
+        try client.ensureLocalRouteForCreatedRemoteSession(
+            allocator,
+            &created,
+            parsed_ssh_args.host,
+            parsed_ssh_args.options,
+        );
+        session_registry.markRouteDetachedNow(allocator, created.guid) catch |err| {
+            client_log.debug("event=remote_route_detached_mark_failed session={s} error={t}", .{ created.guid, err });
+        };
+        child.closeStdin();
+        _ = child.wait() catch {};
+        var created_buf: [128]u8 = undefined;
+        const created_line = try std.fmt.bufPrint(&created_buf, "CREATED {s}\n", .{created.guid});
+        try io.writeAll(1, created_line);
+        return;
+    }
 
     var session = (switch (parsed_ssh_args.action) {
         .new => client.startNewSessionOnRuntime(
@@ -4293,6 +4353,12 @@ fn parseCommonSesshOptionAfterHost(args: []const []const u8, index: *usize, pars
         index.* = args.len;
         return true;
     }
+    if (std.mem.eql(u8, arg, "--detached")) {
+        if (!parse_options.allow_mux_command_words or parsed.action != .new) return false;
+        parsed.new_detached = true;
+        index.* += 1;
+        return true;
+    }
     if (std.mem.eql(u8, arg, "--leader")) {
         index.* += 1;
         if (index.* >= args.len) return error.MissingLeader;
@@ -5956,6 +6022,13 @@ test "parseSshArgs rejects translated flags outside their command grammar" {
     try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sesshmux",
         "example.com",
+        "attach",
+        "s1",
+        "--detached",
+    }, .{ .allow_mux_command_words = true }));
+    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "example.com",
         "kill",
         "--refresh",
     }, .{ .allow_mux_command_words = true }));
@@ -6118,6 +6191,26 @@ test "parseSshArgs accepts translated eval args for persistent commands" {
     try std.testing.expectEqualStrings("$SESSH_TEST_HOST", parsed.shell_command_args[1]);
 }
 
+test "parseSshArgs accepts translated detached new flag" {
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "example.com",
+        "--detached",
+    }, .{ .allow_mux_command_words = true });
+
+    try std.testing.expectEqual(SshAction.new, parsed.action);
+    try std.testing.expect(parsed.new_detached);
+
+    const literal = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "example.com",
+        "--detached",
+    }, .{});
+
+    try std.testing.expect(!literal.new_detached);
+    try expectArgvEqual(&.{"--detached"}, literal.shell_command_args);
+}
+
 test "parseSshArgs rejects custom aliases with reserved typed prefix shape" {
     try std.testing.expectError(error.InvalidAlias, parseSshArgs(std.testing.allocator, &.{
         "sessh",
@@ -6189,6 +6282,35 @@ test "translateMuxArgs maps new command to ssh-shaped invocation" {
         "echo",
         "$SESSH_TEST_HOST",
     }, eval_args.args.items);
+
+    var detached = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "new",
+        "--detached",
+        "example.com",
+    });
+    defer detached.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "--detached" }, detached.args.items);
+
+    var detached_after_host = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "new",
+        "example.com",
+        "--detached",
+        "top",
+    });
+    defer detached_after_host.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "--detached", "--", "top" }, detached_after_host.args.items);
+
+    var literal_detached_command = try translateMuxArgs(std.testing.allocator, &.{
+        "sesshmux",
+        "new",
+        "example.com",
+        "--",
+        "--detached",
+    });
+    defer literal_detached_command.deinit();
+    try expectArgvEqual(&.{ "sesshmux", "example.com", "--", "--detached" }, literal_detached_command.args.items);
 
     try std.testing.expectError(error.UnsupportedMuxOption, translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",

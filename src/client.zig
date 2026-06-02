@@ -54,6 +54,7 @@ const DebugClientAction = enum {
 const LocalOptions = struct {
     action: LocalAction = .new,
     action_set: bool = false,
+    new_detached: bool = false,
     attach_id: ?[]const u8 = null,
     kill_id: ?[]const u8 = null,
     kill_current: bool = false,
@@ -271,11 +272,14 @@ pub const RuntimeRecovery = enum {
     detach,
 };
 
-const CreatedSession = struct {
+pub const CreatedSession = struct {
     guid: []u8,
     alias: []u8,
+    session_dir: []u8,
 
-    fn deinit(self: *CreatedSession, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *CreatedSession) void {
+        const allocator = app_allocator.allocator();
+        allocator.free(self.session_dir);
         allocator.free(self.alias);
         allocator.free(self.guid);
         self.* = undefined;
@@ -2403,6 +2407,7 @@ fn writeLocalArgError(err: anyerror) !void {
         error.MissingClientListTarget => try io_helpers.writeAll(2, "sessh: --client requires a value: " ++ client_list_target_help ++ "\n"),
         error.MissingKillTarget => try io_helpers.writeAll(2, "sesshmux: kill requires --all, a guid, or --current\n"),
         error.MissingCurrentSession => try io_helpers.writeAll(2, "sesshmux: --current requires $SESSH_GUID\n"),
+        error.DetachedCaptureUnsupported => try io_helpers.writeAll(2, "sesshmux: new --detached does not support --capture-tty-transcript\n"),
         else => try io_helpers.stderrPrint("sessh: invalid . arguments: {t}\n", .{err}),
     }
 }
@@ -2521,10 +2526,41 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     }
 
     var child = try startLocalBroker(allocator, args[0], runtime_broker_args);
+    const child_read_fd = child.stdout.?.handle;
+    const child_write_fd = child.stdin.?.handle;
+    if (options.action == .new and options.new_detached) {
+        var created = createSessionOnRuntime(
+            child_read_fd,
+            child_write_fd,
+            options.scrollback_row_count,
+            generated_guid.?,
+            generated_alias.?,
+            &.{},
+            null,
+        ) catch |err| {
+            if (process_exit.is(err)) return err;
+            terminateChild(&child);
+            try io_helpers.stderrPrint("sessh: local runtime create failed: {t}\n", .{err});
+            return process_exit.request(1);
+        };
+        defer created.deinit();
+        try session_registry.ensureAliasForGuid(allocator, created.alias, created.guid);
+        try session_registry.writeLocalRoute(allocator, created.guid, created.alias, created.session_dir, config.version);
+        session_registry.markRouteDetachedNow(allocator, created.guid) catch |err| {
+            client_log.debug("event=local_route_detached_mark_failed session={s} error={t}", .{ created.guid, err });
+        };
+        closeChildStdin(&child);
+        _ = child.wait() catch {};
+        var created_buf: [128]u8 = undefined;
+        const created_line = try std.fmt.bufPrint(&created_buf, "CREATED {s}\n", .{created.guid});
+        try io_helpers.writeAll(1, created_line);
+        return;
+    }
+
     var session = (switch (options.action) {
         .new => startNewSessionOnRuntime(
-            child.stdout.?.handle,
-            child.stdin.?.handle,
+            child_read_fd,
+            child_write_fd,
             options.scrollback_row_count,
             generated_guid.?,
             generated_alias.?,
@@ -2532,8 +2568,8 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             null,
         ),
         .attach => startAttachSessionOnRuntime(
-            child.stdout.?.handle,
-            child.stdin.?.handle,
+            child_read_fd,
+            child_write_fd,
             options.attach_id orelse compat_attach_id orelse "",
             "",
             options.initial_scrollback_row_count,
@@ -3446,6 +3482,9 @@ fn parseLocalNewOptions(args: []const []const u8, index: *usize, options: *Local
             if (!session_registry.isValidCustomAlias(args[index.*])) return error.InvalidAlias;
             options.alias = args[index.*];
             index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--detached")) {
+            options.new_detached = true;
+            index.* += 1;
         } else if (try parseLocalCommonSessionOption(args, index, options)) {
             continue;
         } else {
@@ -3658,6 +3697,8 @@ fn validateLocalOptions(options: LocalOptions) !LocalOptions {
     if (options.action == .debug_client and options.debug_client_action == null) return error.MissingDebugAction;
     if (options.debug_unresponsive_seconds != null and
         (options.action != .debug_client or options.debug_client_action != .unresponsive_connection)) return error.UnsupportedDebugSeconds;
+    if (options.new_detached and options.action != .new) return error.UnsupportedClientTarget;
+    if (options.new_detached and options.capture_tty_transcript != null) return error.DetachedCaptureUnsupported;
     if (options.action == .kill) {
         if (options.kill_id != null and options.kill_current) return error.MultipleTargets;
         if (options.kill_id == null and !options.kill_current) return error.MissingKillTarget;
@@ -3756,6 +3797,13 @@ test "parseLocalOptions keeps command flags command-specific" {
         "s1",
         "--exited",
     }));
+    const detached_new = try parseLocalOptions(&.{
+        "sesshmux",
+        ".",
+        "--detached",
+    });
+    try std.testing.expect(detached_new.new_detached);
+    try std.testing.expectEqual(LocalAction.new, detached_new.action);
     try std.testing.expectError(error.UnsupportedClientTarget, parseLocalOptions(&.{
         "sesshmux",
         ".",
@@ -3826,12 +3874,64 @@ pub fn startNewSessionOnRuntime(
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
 ) !RuntimeSession {
+    const size = terminal.currentWindowSize();
     const viewport_offset = queryInitialViewportOffset();
+    var created = try createSessionOnRuntimeWithSize(
+        read_fd,
+        write_fd,
+        size,
+        scrollback_row_count,
+        session_guid,
+        session_alias,
+        command_argv,
+        shell_command,
+    );
+    defer created.deinit();
+    const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
+    defer app_allocator.allocator().free(client_guid);
+    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid, client_guid, "");
+    var session = try readRuntimeSession(read_fd);
+    try session.setClientGuid(client_guid);
+    session.viewport_offset = viewport_offset orelse 0;
+    session.pending_repaint.repaint_request_seq = repaint_request_seq;
+    return session;
+}
+
+pub fn createSessionOnRuntime(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    scrollback_row_count: u32,
+    session_guid: []const u8,
+    session_alias: []const u8,
+    command_argv: []const []const u8,
+    shell_command: ?[]const u8,
+) !CreatedSession {
+    return createSessionOnRuntimeWithSize(
+        read_fd,
+        write_fd,
+        terminal.currentWindowSize(),
+        scrollback_row_count,
+        session_guid,
+        session_alias,
+        command_argv,
+        shell_command,
+    );
+}
+
+fn createSessionOnRuntimeWithSize(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    size: WindowSize,
+    scrollback_row_count: u32,
+    session_guid: []const u8,
+    session_alias: []const u8,
+    command_argv: []const []const u8,
+    shell_command: ?[]const u8,
+) !CreatedSession {
     const peer_protocol = try runtimeHandshakeWithPeerProtocol(read_fd, write_fd);
     const peer_supports_command_oneof = peerSupportsSessionCreateCommandOneof(peer_protocol);
     if (shell_command != null and !peer_supports_command_oneof) return error.VersionMismatch;
-    const size = terminal.currentWindowSize();
-    var created = try sendSessionCreateAndReadCreated(
+    return sendSessionCreateAndReadCreated(
         read_fd,
         write_fd,
         size,
@@ -3842,15 +3942,6 @@ pub fn startNewSessionOnRuntime(
         shell_command,
         peer_supports_command_oneof,
     );
-    defer created.deinit(app_allocator.allocator());
-    const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
-    defer app_allocator.allocator().free(client_guid);
-    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid, client_guid, "");
-    var session = try readRuntimeSession(read_fd);
-    try session.setClientGuid(client_guid);
-    session.viewport_offset = viewport_offset orelse 0;
-    session.pending_repaint.repaint_request_seq = repaint_request_seq;
-    return session;
 }
 
 pub fn startAttachSessionOnRuntime(
@@ -3901,6 +3992,24 @@ pub fn ensureLocalRouteForRemoteSession(
             });
         };
     }
+}
+
+pub fn ensureLocalRouteForCreatedRemoteSession(
+    allocator: std.mem.Allocator,
+    created: *const CreatedSession,
+    host: []const u8,
+    ssh_options: []const []const u8,
+) !void {
+    try session_registry.ensureAliasForGuid(allocator, created.alias, created.guid);
+    try session_registry.writeSshRoute(
+        allocator,
+        created.guid,
+        created.alias,
+        created.session_dir,
+        host,
+        ssh_options,
+        config.version,
+    );
 }
 
 pub fn removeClientRouteHintForRemoteSession(allocator: std.mem.Allocator, session: *const RuntimeSession) void {
@@ -4342,11 +4451,12 @@ fn readSessionCreated(read_fd: c.fd_t, write_fd: c.fd_t) !CreatedSession {
                 return process_exit.request(1);
             },
             .session_created => {
-                var created = try protocol.decodePayload(pb.SessionCreated, app_allocator.allocator(), frame.payload);
-                defer created.deinit(app_allocator.allocator());
+                var message = try protocol.decodePayload(pb.SessionCreated, app_allocator.allocator(), frame.payload);
+                defer message.deinit(app_allocator.allocator());
                 return .{
-                    .guid = try app_allocator.allocator().dupe(u8, created.session_guid),
-                    .alias = try app_allocator.allocator().dupe(u8, created.session_alias),
+                    .guid = try app_allocator.allocator().dupe(u8, message.session_guid),
+                    .alias = try app_allocator.allocator().dupe(u8, message.session_alias),
+                    .session_dir = try app_allocator.allocator().dupe(u8, message.session_dir),
                 };
             },
             .ping, .pong => {

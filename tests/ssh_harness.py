@@ -3011,6 +3011,100 @@ def test_ssh_attach_without_id_reattaches_latest_session(tmp):
         raise AssertionError(attached.stderr)
 
 
+def test_mux_new_detached_creates_local_session_without_attach(tmp):
+    env = isolated_env(tmp)
+    shell = tmp / "detached-shell"
+    marker = "LOCAL_DETACHED_READY"
+    shell.write_text(
+        "#!/bin/sh\n"
+        f"printf '{marker}\\r\\n'\n"
+        "while IFS= read -r line; do\n"
+        "  [ \"$line\" = exit ] && exit 0\n"
+        "  printf 'LOCAL_DETACHED_LINE:%s\\r\\n' \"$line\"\n"
+        "done\n"
+    )
+    shell.chmod(0o700)
+    env["SHELL"] = str(shell)
+
+    created = run_sesshmux(["new", "--detached", "--alias", "detached-local", "."], env, timeout=10.0)
+
+    if created.returncode != 0:
+        raise AssertionError(created)
+    if not created.stdout.startswith("CREATED s-"):
+        raise AssertionError(created)
+    if marker in created.stdout:
+        raise AssertionError(f"detached create leaked session output:\n{created.stdout}")
+
+    listed = run_sesshmux(["list", "--jsonl"], env, timeout=10.0)
+    if listed.returncode != 0:
+        raise AssertionError(listed)
+    rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
+    matches = [row for row in rows if row.get("id") == "detached-local"]
+    if len(matches) != 1:
+        raise AssertionError(process_diagnostics(listed))
+    if matches[0].get("attached_count") != 0:
+        raise AssertionError(matches[0])
+
+    attached = run_sesshmux_until_stdout(["attach", "detached-local"], env, marker, timeout=10.0)
+    if attached.returncode != 0:
+        raise AssertionError(attached)
+    if marker not in attached.stdout:
+        raise AssertionError(attached)
+
+
+def test_mux_new_detached_creates_remote_route_without_attach(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_runtime = tmp / "remote-runtime"
+    remote_state = tmp / "remote-state"
+    remote_shell = tmp / "remote-detached-shell"
+    marker = "REMOTE_DETACHED_READY"
+    remote_runtime.mkdir(mode=0o700)
+    remote_state.mkdir(mode=0o700)
+    remote_shell.write_text(
+        "#!/bin/sh\n"
+        f"printf '{marker}\\r\\n'\n"
+        "while IFS= read -r line; do\n"
+        "  [ \"$line\" = exit ] && exit 0\n"
+        "  printf 'REMOTE_DETACHED_LINE:%s\\r\\n' \"$line\"\n"
+        "done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"] = str(remote_runtime)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"] = str(remote_state)
+    env["SHELL"] = str(remote_shell)
+    seed_remote_artifact_cache(env)
+
+    created = run_sesshmux(["new", "--detached", "--alias", "remote-detached", "test-host"], env, timeout=30.0)
+
+    if created.returncode != 0:
+        raise AssertionError(created)
+    if not created.stdout.startswith("CREATED s-"):
+        raise AssertionError(created)
+    if marker in created.stdout:
+        raise AssertionError(f"detached create leaked session output:\n{created.stdout}")
+
+    listed = run_sesshmux(["list", "--jsonl"], env, timeout=30.0)
+    if listed.returncode != 0:
+        raise AssertionError(listed)
+    rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
+    matches = [row for row in rows if row.get("id") == "remote-detached"]
+    if len(matches) != 1:
+        raise AssertionError(process_diagnostics(listed))
+    if matches[0].get("host") != "test-host":
+        raise AssertionError(matches[0])
+
+    attached = run_sesshmux_until_stdout(["attach", "--host", "test-host", "remote-detached"], env, marker, timeout=30.0)
+    if attached.returncode != 0:
+        raise AssertionError(attached)
+    if marker not in attached.stdout:
+        raise AssertionError(attached)
+
+
 def test_ssh_no_host_attach_uses_local_route(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -4843,6 +4937,14 @@ def main(argv=None):
         (
             "ssh attach without id reattaches latest session",
             test_ssh_attach_without_id_reattaches_latest_session,
+        ),
+        (
+            "mux new detached creates local session without attach",
+            test_mux_new_detached_creates_local_session_without_attach,
+        ),
+        (
+            "mux new detached creates remote route without attach",
+            test_mux_new_detached_creates_remote_route_without_attach,
         ),
         (
             "ssh no-host attach uses local route",
