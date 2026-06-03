@@ -1792,7 +1792,7 @@ def test_ssh_forwarding_uses_proxy_stream(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_force_proxy_mode_uses_proxy_stream(tmp):
+def test_ssh_filter_level_raw_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1800,7 +1800,7 @@ def test_ssh_force_proxy_mode_uses_proxy_stream(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    result = run_sessh(["--force-proxy-mode", "test-host"], env, timeout=5.0)
+    result = run_sessh(["--filter-level", "raw", "test-host"], env, timeout=5.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -1815,12 +1815,12 @@ def test_ssh_force_proxy_mode_uses_proxy_stream(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_force_proxy_mode_config_uses_proxy_stream(tmp):
+def test_ssh_filter_level_config_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     write_fake_ssh(fake_bin / "ssh")
-    write_sessh_config(env, "force-proxy-mode=true\n")
+    write_sessh_config(env, "filter-level=raw\n")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
@@ -1837,24 +1837,25 @@ def test_ssh_force_proxy_mode_config_uses_proxy_stream(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_no_force_proxy_mode_overrides_config(tmp):
+def test_ssh_filter_level_cli_overrides_config(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     write_fake_ssh(fake_bin / "ssh")
-    write_sessh_config(env, "force-proxy-mode=yes\n")
+    write_sessh_config(env, "filter-level=raw\n")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    seed_remote_artifact_cache(env)
 
-    result = run_sessh(["--no-force-proxy-mode", "test-host", "echo", "hello"], env, timeout=5.0)
+    result = run_sessh(["--filter-level", "unhygienic", "test-host"], env, timeout=5.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if result.stdout != "hello\n":
-        raise AssertionError(result)
     log_text = fake_log.read_text()
     if "proxy_ssh=1" not in log_text or ":internal-proxy-stream:" not in log_text:
+        raise AssertionError(log_text)
+    if "--filter-level" not in log_text or "unhygienic" not in log_text:
+        raise AssertionError(log_text)
+    if " raw" in log_text or "'raw'" in log_text:
         raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
@@ -2545,7 +2546,7 @@ def test_ssh_no_terminal_emulator_tty_uses_proxy_with_hygienic_diagnostics(tmp):
     log_text = fake_log.read_text()
     if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
-    if "--connection-diagnostics" not in log_text or "hygienic" not in log_text:
+    if "--filter-level" not in log_text or "hygienic" not in log_text:
         raise AssertionError(log_text)
     if "--client-socket" not in log_text or "/c/" not in log_text:
         raise AssertionError(log_text)
@@ -4723,16 +4724,16 @@ def main(argv=None):
             test_ssh_forwarding_uses_proxy_stream,
         ),
         (
-            "ssh force proxy mode uses proxy stream",
-            test_ssh_force_proxy_mode_uses_proxy_stream,
+            "ssh filter-level raw uses proxy stream",
+            test_ssh_filter_level_raw_uses_proxy_stream,
         ),
         (
-            "ssh force proxy mode config uses proxy stream",
-            test_ssh_force_proxy_mode_config_uses_proxy_stream,
+            "ssh filter-level config uses proxy stream",
+            test_ssh_filter_level_config_uses_proxy_stream,
         ),
         (
-            "ssh no force proxy mode overrides config",
-            test_ssh_no_force_proxy_mode_overrides_config,
+            "ssh filter-level cli overrides config",
+            test_ssh_filter_level_cli_overrides_config,
         ),
         (
             "ssh remote command uses proxy stream",

@@ -50,15 +50,13 @@ sessh [[ssh-option|sessh-option] ...] destination [command [argument ...]]
   does not model. The stream path uses a ProxyCommand transport and lets the
   visible `ssh` process own PTY allocation. The positive form is mainly useful
   for overriding config.
-- `--force-proxy-mode` / `--no-force-proxy-mode`: force, or explicitly do not
-  force, the ProxyCommand-based stream path for this connection. Sessh still
-  enables proxy mode automatically when an ssh option requires OpenSSH to own
-  the outer session.
-- `--connection-diagnostics none|unhygienic|hygienic|overlay`: choose how
-  reconnect diagnostics are displayed. `overlay` is the default terminal
-  emulator UI. In proxy mode, `overlay` uses the hygienic side-channel path.
+- `--filter-level raw|unhygienic|hygienic|emulated`: choose the maximum level of
+  stream filtering sessh may apply. `emulated` is the default terminal-emulator
+  UI and naturally degrades to `hygienic` when an ssh option requires OpenSSH to
+  own the outer session. `hygienic`, `unhygienic`, and `raw` force the
+  ProxyCommand-based stream path. `raw` suppresses reconnect diagnostics,
   `unhygienic` prints direct stderr diagnostics with CRLF line endings, and
-  `none` suppresses reconnect diagnostics.
+  `hygienic` uses the side-channel path when the visible client can support it.
 
 Sessh-specific behavior is configured in the config file documented below.
 
@@ -83,8 +81,7 @@ initial-scrollback=-1
 client-log-level=warn
 bootstrap=true
 terminal-emulator=true
-force-proxy-mode=false
-connection-diagnostics=overlay
+filter-level=emulated
 ```
 
 - `leader`: set the leader key for client commands or disable with `None`. The
@@ -104,13 +101,9 @@ connection-diagnostics=overlay
   `false`/`no` and `true`/`yes` are accepted. Disabling it is equivalent to
   passing `--no-terminal-emulator`; `--terminal-emulator` enables it for a
   single invocation.
-- `force-proxy-mode`: force the ProxyCommand-based stream path by default.
-  `false`/`no` and `true`/`yes` are accepted. It defaults to `false`;
-  `--force-proxy-mode` and `--no-force-proxy-mode` override it for a single
-  invocation.
-- `connection-diagnostics`: configure reconnect diagnostics. Supported values
-  are `none`, `unhygienic`, `hygienic`, and `overlay`. The command-line
-  `--connection-diagnostics` option overrides it for a single invocation.
+- `filter-level`: configure the default stream filtering level. Supported
+  values are `raw`, `unhygienic`, `hygienic`, and `emulated`. The command-line
+  `--filter-level` option overrides it for a single invocation.
 
 ## Mux Commands
 

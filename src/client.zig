@@ -119,8 +119,7 @@ pub const FileConfig = struct {
     client_log_level: ?client_log.Level = null,
     bootstrap: ?bool = null,
     terminal_emulator: ?bool = null,
-    force_proxy_mode: ?bool = null,
-    connection_diagnostics: ?config.ConnectionDiagnostics = null,
+    filter_level: ?config.FilterLevel = null,
 };
 
 pub fn loadFileConfig(allocator: std.mem.Allocator) !FileConfig {
@@ -183,10 +182,8 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
             parsed.bootstrap = try parseBool(value);
         } else if (keyMatches(key, "terminal-emulator")) {
             parsed.terminal_emulator = try parseBool(value);
-        } else if (keyMatches(key, "force-proxy-mode")) {
-            parsed.force_proxy_mode = try parseBool(value);
-        } else if (keyMatches(key, "connection-diagnostics")) {
-            parsed.connection_diagnostics = try config.parseConnectionDiagnostics(value);
+        } else if (keyMatches(key, "filter-level")) {
+            parsed.filter_level = try config.parseFilterLevel(value);
         } else {
             return error.UnknownConfigKey;
         }
@@ -1604,8 +1601,7 @@ test "parseEnvConfig accepts sessh env keys" {
         \\client-log-level=debug
         \\bootstrap=false
         \\terminal-emulator=no
-        \\force-proxy-mode=yes
-        \\connection-diagnostics=hygienic
+        \\filter-level=hygienic
         \\
     );
 
@@ -1619,8 +1615,7 @@ test "parseEnvConfig accepts sessh env keys" {
     try std.testing.expectEqual(@as(?client_log.Level, .debug), parsed.client_log_level);
     try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
     try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
-    try std.testing.expectEqual(@as(?bool, true), parsed.force_proxy_mode);
-    try std.testing.expectEqual(@as(?config.ConnectionDiagnostics, .hygienic), parsed.connection_diagnostics);
+    try std.testing.expectEqual(@as(?config.FilterLevel, .hygienic), parsed.filter_level);
 }
 
 test "parseEnvConfig maps initial scrollback minus one to all retained rows" {

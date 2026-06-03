@@ -186,10 +186,8 @@ const ParsedSshArgs = struct {
     bootstrap_set: bool = false,
     terminal_emulator: bool = true,
     terminal_emulator_set: bool = false,
-    force_proxy_mode: bool = false,
-    force_proxy_mode_set: bool = false,
-    connection_diagnostics: config.ConnectionDiagnostics = config.default_connection_diagnostics,
-    connection_diagnostics_set: bool = false,
+    filter_level: config.FilterLevel = config.default_filter_level,
+    filter_level_set: bool = false,
     proxy_required: bool = false,
     default_ipqos_option: ?[]const u8 = null,
     capture_tty_transcript: ?[]const u8 = null,
@@ -1175,7 +1173,7 @@ fn sesshLongOptionRequiresValue(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--alias") or
-        std.mem.eql(u8, arg, "--connection-diagnostics") or
+        std.mem.eql(u8, arg, "--filter-level") or
         std.mem.eql(u8, arg, "--capture-tty-transcript");
 }
 
@@ -1185,7 +1183,7 @@ fn sesshLongOptionMissingValueError(arg: []const u8) anyerror {
     if (std.mem.eql(u8, arg, "--initial-scrollback")) return error.MissingInitialScrollback;
     if (std.mem.eql(u8, arg, "--log-level")) return error.MissingClientLogLevel;
     if (std.mem.eql(u8, arg, "--alias")) return error.MissingAlias;
-    if (std.mem.eql(u8, arg, "--connection-diagnostics")) return error.MissingConnectionDiagnostics;
+    if (std.mem.eql(u8, arg, "--filter-level")) return error.MissingFilterLevel;
     if (std.mem.eql(u8, arg, "--capture-tty-transcript")) return error.MissingTtyTranscriptPath;
     return error.UnsupportedMuxOption;
 }
@@ -1244,8 +1242,8 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             try io.writeAll(2, "sesshmux: new . requires terminal-emulator mode\n");
             return process_exit.request(64);
         }
-        if (parsed_ssh_args.force_proxy_mode_set and parsed_ssh_args.force_proxy_mode) {
-            try io.writeAll(2, "sesshmux: new . does not support proxy stream mode\n");
+        if (parsed_ssh_args.filter_level_set and filterLevelForcesProxy(parsed_ssh_args.filter_level)) {
+            try io.writeAll(2, "sesshmux: new . does not support proxy stream filter levels\n");
             return process_exit.request(64);
         }
         const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
@@ -1298,12 +1296,12 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             try io.writeAll(2, "sesshmux: new --detached requires terminal-emulator mode\n");
             return process_exit.request(64);
         }
-        if (parsed_ssh_args.force_proxy_mode or parsed_ssh_args.proxy_required) {
+        if (filterLevelForcesProxy(parsed_ssh_args.filter_level) or parsed_ssh_args.proxy_required) {
             try io.writeAll(2, "sesshmux: new --detached does not support proxy stream mode\n");
             return process_exit.request(64);
         }
     }
-    if (parsed_ssh_args.action != .new and (parsed_ssh_args.force_proxy_mode or parsed_ssh_args.proxy_required)) {
+    if (parsed_ssh_args.action != .new and (filterLevelForcesProxy(parsed_ssh_args.filter_level) or parsed_ssh_args.proxy_required)) {
         try io.writeAll(2, "sessh: proxy stream mode is only supported for new sessions\n");
         return process_exit.request(64);
     }
@@ -1559,7 +1557,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         const pending_paste_like_input_at_disconnect = session.hasPendingPasteLikeInputAck();
         var reconnect_ui = try client.ReconnectUi.beginWithPresentation(
             session.viewport_offset,
-            reconnectPresentationForDiagnostics(parsed_ssh_args.connection_diagnostics),
+            reconnectPresentationForFilterLevel(parsed_ssh_args.filter_level),
         );
         var reconnect_ui_active = true;
         defer if (reconnect_ui_active) reconnect_ui.deinit();
@@ -1833,12 +1831,12 @@ fn finishReconnectUiForDetach(reconnect_ui: *client.ReconnectUi, active: *bool) 
     active.* = false;
 }
 
-fn reconnectPresentationForDiagnostics(mode: config.ConnectionDiagnostics) client.ReconnectPresentation {
-    return switch (mode) {
-        .none => .none,
+fn reconnectPresentationForFilterLevel(level: config.FilterLevel) client.ReconnectPresentation {
+    return switch (level) {
+        .raw => .none,
         .unhygienic => .stderr_plain,
         .hygienic => .title,
-        .overlay => .overlay,
+        .emulated => .overlay,
     };
 }
 
@@ -2401,11 +2399,8 @@ fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !v
     if (!parsed.terminal_emulator_set) {
         if (file_config.terminal_emulator) |enabled| parsed.terminal_emulator = enabled;
     }
-    if (!parsed.force_proxy_mode_set) {
-        if (file_config.force_proxy_mode) |enabled| parsed.force_proxy_mode = enabled;
-    }
-    if (!parsed.connection_diagnostics_set) {
-        if (file_config.connection_diagnostics) |mode| parsed.connection_diagnostics = mode;
+    if (!parsed.filter_level_set) {
+        if (file_config.filter_level) |level| parsed.filter_level = level;
     }
     if (!parsed.client_log_level_set) {
         if (file_config.client_log_level) |level| {
@@ -2417,7 +2412,7 @@ fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !v
 }
 
 // Local `sesshmux new .` has no ssh transport, so ssh-only config such as
-// `terminal-emulator` and `force-proxy-mode` must not change its execution
+// `terminal-emulator` and `filter-level` must not change its execution
 // path. Apply only the fields that already make sense for local mux sessions.
 fn applyFileConfigToLocalNew(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !void {
     const file_config = try client.loadFileConfig(allocator);
@@ -3253,18 +3248,25 @@ const StreamClientStarter = struct {
     }
 };
 
-fn proxyStreamReconnectStatusMode(mode: config.ConnectionDiagnostics, has_client_socket: bool) stream_agent.StreamReconnectStatusMode {
-    return switch (mode) {
-        .none => .disabled,
+fn proxyStreamReconnectStatusMode(level: config.FilterLevel, has_client_socket: bool) stream_agent.StreamReconnectStatusMode {
+    return switch (level) {
+        .raw => .disabled,
         .unhygienic => .stderr_plain,
-        .hygienic, .overlay => if (has_client_socket) .client_control else .stderr_plain,
+        .hygienic, .emulated => if (has_client_socket) .client_control else .stderr_plain,
+    };
+}
+
+fn filterLevelForcesProxy(level: config.FilterLevel) bool {
+    return switch (level) {
+        .raw, .unhygienic, .hygienic => true,
+        .emulated => false,
     };
 }
 
 fn shouldUseProxyStream(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
     if (parsed_ssh_args.action != .new) return false;
     if (parsed_ssh_args.command_argv.len != 0) return false;
-    if (parsed_ssh_args.force_proxy_mode or parsed_ssh_args.proxy_required) return true;
+    if (filterLevelForcesProxy(parsed_ssh_args.filter_level) or parsed_ssh_args.proxy_required) return true;
     return shouldUseStreamPath(parsed_ssh_args, stdin_is_tty);
 }
 
@@ -3302,7 +3304,7 @@ fn runProxyStreamSsh(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_a
         exe,
         parsed_ssh_args,
         if (client_socket_allocation) |allocation| allocation.path else null,
-        diagnostics_plan.command_mode,
+        diagnostics_plan.command_level,
         diagnostics_plan.client_ctrl_r,
     );
     defer allocator.free(proxy_command_option);
@@ -3335,36 +3337,36 @@ fn runProxyStreamSsh(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_a
 }
 
 const ProxyDiagnosticsPlan = struct {
-    command_mode: config.ConnectionDiagnostics,
+    command_level: config.FilterLevel,
     use_client_socket: bool,
     wrap_visible_ssh: bool,
     client_ctrl_r: bool,
 };
 
 fn proxyDiagnosticsPlan(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool, stdout_is_tty: bool) ProxyDiagnosticsPlan {
-    return switch (parsed_ssh_args.connection_diagnostics) {
-        .none => .{
-            .command_mode = .none,
+    return switch (parsed_ssh_args.filter_level) {
+        .raw => .{
+            .command_level = .raw,
             .use_client_socket = false,
             .wrap_visible_ssh = false,
             .client_ctrl_r = false,
         },
         .unhygienic => .{
-            .command_mode = .unhygienic,
+            .command_level = .unhygienic,
             .use_client_socket = false,
             .wrap_visible_ssh = false,
             .client_ctrl_r = false,
         },
-        .hygienic, .overlay => blk: {
+        .hygienic, .emulated => blk: {
             if (!stdout_is_tty) break :blk .{
-                .command_mode = .unhygienic,
+                .command_level = .unhygienic,
                 .use_client_socket = false,
                 .wrap_visible_ssh = false,
                 .client_ctrl_r = false,
             };
             const wrap_visible_ssh = outerSshAllocatesTty(parsed_ssh_args, stdin_is_tty);
             break :blk .{
-                .command_mode = .hygienic,
+                .command_level = .hygienic,
                 .use_client_socket = true,
                 .wrap_visible_ssh = wrap_visible_ssh,
                 .client_ctrl_r = wrap_visible_ssh and stdin_is_tty,
@@ -3445,7 +3447,7 @@ fn proxyCommandOption(
     exe: []const u8,
     parsed_ssh_args: ParsedSshArgs,
     client_socket: ?[]const u8,
-    diagnostics_mode: config.ConnectionDiagnostics,
+    filter_level: config.FilterLevel,
     client_ctrl_r: bool,
 ) ![]u8 {
     var command: std.ArrayList(u8) = .empty;
@@ -3459,8 +3461,8 @@ fn proxyCommandOption(
     try appendShellToken(allocator, &command, "%p");
     try appendShellToken(allocator, &command, "--user");
     try appendShellToken(allocator, &command, "%r");
-    try appendShellToken(allocator, &command, "--connection-diagnostics");
-    try appendShellToken(allocator, &command, diagnostics_mode.label());
+    try appendShellToken(allocator, &command, "--filter-level");
+    try appendShellToken(allocator, &command, filter_level.label());
     if (client_socket) |path| {
         try appendShellToken(allocator, &command, "--client-socket");
         try appendShellToken(allocator, &command, path);
@@ -3530,7 +3532,7 @@ const ProxyStreamInvocation = struct {
     port: []const u8,
     user: []const u8 = "",
     client_socket: ?[]const u8 = null,
-    connection_diagnostics: config.ConnectionDiagnostics = .none,
+    filter_level: config.FilterLevel = .raw,
     client_ctrl_r: bool = false,
     ssh_options: std.ArrayList([]const u8) = .empty,
 
@@ -3620,7 +3622,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
     }
     defer if (client_control_fd >= 0) posix.close(client_control_fd);
     const status_mode = proxyStreamReconnectStatusMode(
-        invocation.connection_diagnostics,
+        invocation.filter_level,
         client_control_fd >= 0 and proxy_control_output_mode != .none,
     );
 
@@ -3682,10 +3684,10 @@ fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []cons
             if (i >= args.len or args[i].len == 0) return error.MissingClientSocket;
             invocation.client_socket = args[i];
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--connection-diagnostics")) {
+        } else if (std.mem.eql(u8, arg, "--filter-level")) {
             i += 1;
-            if (i >= args.len or args[i].len == 0) return error.MissingConnectionDiagnostics;
-            invocation.connection_diagnostics = try config.parseConnectionDiagnostics(args[i]);
+            if (i >= args.len or args[i].len == 0) return error.MissingFilterLevel;
+            invocation.filter_level = try config.parseFilterLevel(args[i]);
             i += 1;
         } else if (std.mem.eql(u8, arg, "--client-ctrl-r")) {
             i += 1;
@@ -3709,8 +3711,8 @@ fn printProxyStreamArgError(err: anyerror) !void {
         error.MissingProxyUser => try io.writeAll(2, "sessh: :internal-proxy-stream: --user requires a value\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: :internal-proxy-stream: --ssh-option requires a value\n"),
         error.MissingClientSocket => try io.writeAll(2, "sessh: :internal-proxy-stream: --client-socket requires a path\n"),
-        error.MissingConnectionDiagnostics => try io.writeAll(2, "sessh: :internal-proxy-stream: --connection-diagnostics requires a value\n"),
-        error.InvalidConnectionDiagnostics => try io.writeAll(2, "sessh: :internal-proxy-stream: invalid connection diagnostics mode\n"),
+        error.MissingFilterLevel => try io.writeAll(2, "sessh: :internal-proxy-stream: --filter-level requires a value\n"),
+        error.InvalidFilterLevel => try io.writeAll(2, "sessh: :internal-proxy-stream: invalid filter level\n"),
         error.MissingClientCtrlR => try io.writeAll(2, "sessh: :internal-proxy-stream: --client-ctrl-r requires a value\n"),
         error.InvalidClientCtrlR => try io.writeAll(2, "sessh: :internal-proxy-stream: --client-ctrl-r must be 0 or 1\n"),
         else => try io.stderrPrint("sessh: invalid :internal-proxy-stream: arguments: {t}\n", .{err}),
@@ -4683,19 +4685,11 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
             parsed.terminal_emulator = false;
             parsed.terminal_emulator_set = true;
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--force-proxy-mode")) {
-            parsed.force_proxy_mode = true;
-            parsed.force_proxy_mode_set = true;
+        } else if (std.mem.eql(u8, arg, "--filter-level")) {
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--no-force-proxy-mode")) {
-            parsed.force_proxy_mode = false;
-            parsed.force_proxy_mode_set = true;
-            index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--connection-diagnostics")) {
-            index.* += 1;
-            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingConnectionDiagnostics;
-            parsed.connection_diagnostics = try config.parseConnectionDiagnostics(args[index.*]);
-            parsed.connection_diagnostics_set = true;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingFilterLevel;
+            parsed.filter_level = try config.parseFilterLevel(args[index.*]);
+            parsed.filter_level_set = true;
             index.* += 1;
         } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
             index.* += 1;
@@ -4877,23 +4871,11 @@ fn parseCommonSesshOptionAfterHost(args: []const []const u8, index: *usize, pars
         index.* += 1;
         return true;
     }
-    if (std.mem.eql(u8, arg, "--force-proxy-mode")) {
-        parsed.force_proxy_mode = true;
-        parsed.force_proxy_mode_set = true;
+    if (std.mem.eql(u8, arg, "--filter-level")) {
         index.* += 1;
-        return true;
-    }
-    if (std.mem.eql(u8, arg, "--no-force-proxy-mode")) {
-        parsed.force_proxy_mode = false;
-        parsed.force_proxy_mode_set = true;
-        index.* += 1;
-        return true;
-    }
-    if (std.mem.eql(u8, arg, "--connection-diagnostics")) {
-        index.* += 1;
-        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingConnectionDiagnostics;
-        parsed.connection_diagnostics = try config.parseConnectionDiagnostics(args[index.*]);
-        parsed.connection_diagnostics_set = true;
+        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingFilterLevel;
+        parsed.filter_level = try config.parseFilterLevel(args[index.*]);
+        parsed.filter_level_set = true;
         index.* += 1;
         return true;
     }
@@ -5069,9 +5051,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--no-bootstrap") or
         std.mem.eql(u8, arg, "--terminal-emulator") or
         std.mem.eql(u8, arg, "--no-terminal-emulator") or
-        std.mem.eql(u8, arg, "--force-proxy-mode") or
-        std.mem.eql(u8, arg, "--no-force-proxy-mode") or
-        std.mem.eql(u8, arg, "--connection-diagnostics") or
+        std.mem.eql(u8, arg, "--filter-level") or
         std.mem.eql(u8, arg, "--ssh-options") or
         std.mem.eql(u8, arg, "--capture-tty-transcript") or
         std.mem.eql(u8, arg, "--refresh") or
@@ -5316,7 +5296,7 @@ fn printSshArgError(err: anyerror) !void {
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),
         error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
-        error.MissingConnectionDiagnostics => try io.writeAll(2, "sessh: --connection-diagnostics requires one of: none, unhygienic, hygienic, overlay\n"),
+        error.MissingFilterLevel => try io.writeAll(2, "sessh: --filter-level requires one of: raw, unhygienic, hygienic, emulated\n"),
         error.MissingTtyTranscriptPath => try io.writeAll(2, "sessh: --capture-tty-transcript requires a path\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: ssh option is missing its value\n"),
         error.MissingSshOptions => try io.writeAll(2, "sesshmux: --ssh-options requires a value\n"),
@@ -5333,7 +5313,7 @@ fn printSshArgError(err: anyerror) !void {
         error.InvalidScrollbackRowCount => try io.writeAll(2, "sessh: invalid scrollback row count\n"),
         error.InvalidInitialScrollback => try io.writeAll(2, "sessh: invalid initial scrollback\n"),
         error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
-        error.InvalidConnectionDiagnostics => try io.writeAll(2, "sessh: invalid connection diagnostics mode; expected one of: none, unhygienic, hygienic, overlay\n"),
+        error.InvalidFilterLevel => try io.writeAll(2, "sessh: invalid filter level; expected one of: raw, unhygienic, hygienic, emulated\n"),
         error.InvalidAlias => try io.writeAll(2, "sessh: invalid alias\n"),
         error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
         error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands require -t or -tt for persistent sessions\n"),
@@ -6054,20 +6034,22 @@ test "parseSshArgs routes OpenSSH-owned options to proxy stream mode" {
 
     const explicit = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "--force-proxy-mode",
+        "--filter-level",
+        "hygienic",
         "example.com",
     }, .{});
-    try std.testing.expect(explicit.force_proxy_mode);
-    try std.testing.expect(explicit.force_proxy_mode_set);
+    try std.testing.expectEqual(config.FilterLevel.hygienic, explicit.filter_level);
+    try std.testing.expect(explicit.filter_level_set);
     try std.testing.expect(shouldUseProxyStream(explicit, true));
 
     const explicit_disabled = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "--no-force-proxy-mode",
+        "--filter-level",
+        "emulated",
         "example.com",
     }, .{});
-    try std.testing.expect(!explicit_disabled.force_proxy_mode);
-    try std.testing.expect(explicit_disabled.force_proxy_mode_set);
+    try std.testing.expectEqual(config.FilterLevel.emulated, explicit_disabled.filter_level);
+    try std.testing.expect(explicit_disabled.filter_level_set);
     try std.testing.expect(!shouldUseProxyStream(explicit_disabled, true));
 }
 
@@ -6094,7 +6076,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "%h") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%p") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%r") != null);
-    try std.testing.expect(std.mem.indexOf(u8, option, "--connection-diagnostics") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "--filter-level") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "hygienic") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--client-socket") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "/tmp/sessh-test/c/abc") != null);
@@ -6642,22 +6624,22 @@ test "brokerArgsForAction uses broker subcommands" {
     }, &buf));
 }
 
-test "proxy stream reconnect status follows diagnostics mode" {
-    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.disabled, proxyStreamReconnectStatusMode(.none, false));
+test "proxy stream reconnect status follows filter level" {
+    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.disabled, proxyStreamReconnectStatusMode(.raw, false));
     try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, proxyStreamReconnectStatusMode(.unhygienic, false));
     try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, proxyStreamReconnectStatusMode(.hygienic, false));
     try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.hygienic, true));
-    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.overlay, true));
+    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.emulated, true));
 }
 
-test "terminal reconnect presentation follows diagnostics mode" {
-    try std.testing.expectEqual(client.ReconnectPresentation.none, reconnectPresentationForDiagnostics(.none));
-    try std.testing.expectEqual(client.ReconnectPresentation.stderr_plain, reconnectPresentationForDiagnostics(.unhygienic));
-    try std.testing.expectEqual(client.ReconnectPresentation.title, reconnectPresentationForDiagnostics(.hygienic));
-    try std.testing.expectEqual(client.ReconnectPresentation.overlay, reconnectPresentationForDiagnostics(.overlay));
+test "terminal reconnect presentation follows filter level" {
+    try std.testing.expectEqual(client.ReconnectPresentation.none, reconnectPresentationForFilterLevel(.raw));
+    try std.testing.expectEqual(client.ReconnectPresentation.stderr_plain, reconnectPresentationForFilterLevel(.unhygienic));
+    try std.testing.expectEqual(client.ReconnectPresentation.title, reconnectPresentationForFilterLevel(.hygienic));
+    try std.testing.expectEqual(client.ReconnectPresentation.overlay, reconnectPresentationForFilterLevel(.emulated));
 }
 
-test "proxy diagnostics plan maps overlay to hygienic client socket" {
+test "proxy diagnostics plan maps emulated to hygienic client socket" {
     const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
@@ -6665,54 +6647,55 @@ test "proxy diagnostics plan maps overlay to hygienic client socket" {
     }, .{});
 
     const interactive = proxyDiagnosticsPlan(parsed, true, true);
-    try std.testing.expectEqual(config.ConnectionDiagnostics.hygienic, interactive.command_mode);
+    try std.testing.expectEqual(config.FilterLevel.hygienic, interactive.command_level);
     try std.testing.expect(interactive.use_client_socket);
     try std.testing.expect(interactive.wrap_visible_ssh);
     try std.testing.expect(interactive.client_ctrl_r);
 
     const no_stdout = proxyDiagnosticsPlan(parsed, true, false);
-    try std.testing.expectEqual(config.ConnectionDiagnostics.unhygienic, no_stdout.command_mode);
+    try std.testing.expectEqual(config.FilterLevel.unhygienic, no_stdout.command_level);
     try std.testing.expect(!no_stdout.use_client_socket);
     try std.testing.expect(!no_stdout.wrap_visible_ssh);
     try std.testing.expect(!no_stdout.client_ctrl_r);
 }
 
-test "proxy diagnostics plan honors quiet and unhygienic modes" {
-    const none = try parseSshArgs(std.testing.allocator, &.{
+test "proxy diagnostics plan honors raw and unhygienic levels" {
+    const raw = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "--connection-diagnostics",
-        "none",
+        "--filter-level",
+        "raw",
         "--no-terminal-emulator",
         "example.com",
     }, .{});
-    try std.testing.expectEqual(config.ConnectionDiagnostics.none, none.connection_diagnostics);
-    const none_plan = proxyDiagnosticsPlan(none, true, true);
-    try std.testing.expectEqual(config.ConnectionDiagnostics.none, none_plan.command_mode);
-    try std.testing.expect(!none_plan.use_client_socket);
+    try std.testing.expectEqual(config.FilterLevel.raw, raw.filter_level);
+    const raw_plan = proxyDiagnosticsPlan(raw, true, true);
+    try std.testing.expectEqual(config.FilterLevel.raw, raw_plan.command_level);
+    try std.testing.expect(!raw_plan.use_client_socket);
 
     const unhygienic = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "--connection-diagnostics",
+        "--filter-level",
         "unhygienic",
         "--no-terminal-emulator",
         "example.com",
     }, .{});
-    try std.testing.expectEqual(config.ConnectionDiagnostics.unhygienic, unhygienic.connection_diagnostics);
+    try std.testing.expectEqual(config.FilterLevel.unhygienic, unhygienic.filter_level);
     const noisy_plan = proxyDiagnosticsPlan(unhygienic, true, true);
-    try std.testing.expectEqual(config.ConnectionDiagnostics.unhygienic, noisy_plan.command_mode);
+    try std.testing.expectEqual(config.FilterLevel.unhygienic, noisy_plan.command_level);
     try std.testing.expect(!noisy_plan.use_client_socket);
 }
 
 test "proxy diagnostics plan disables ctrl-r when visible ssh is not wrapped" {
     const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "--force-proxy-mode",
+        "--filter-level",
+        "hygienic",
         "-T",
         "example.com",
     }, .{});
 
     const plan = proxyDiagnosticsPlan(parsed, true, true);
-    try std.testing.expectEqual(config.ConnectionDiagnostics.hygienic, plan.command_mode);
+    try std.testing.expectEqual(config.FilterLevel.hygienic, plan.command_level);
     try std.testing.expect(plan.use_client_socket);
     try std.testing.expect(!plan.wrap_visible_ssh);
     try std.testing.expect(!plan.client_ctrl_r);
