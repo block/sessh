@@ -21,27 +21,27 @@ message Frame {
 
   oneof payload {
     sessh.handshake.v1.Error error = 10;
-    SessionCreate session_create = 11;
-    SessionAttach session_attach = 12;
-    Input input = 13;
-    Resize resize = 14;
-    RepaintRequest repaint_request = 15;
-    SessionCreated session_created = 17;
-    SessionAttached session_attached = 18;
-    SessionEnded session_ended = 19;
-    Draw draw = 20;
-    RepaintResponse repaint_response = 22;
-    TtyTranscriptChunk tty_transcript_chunk = 23;
-    InputAck input_ack = 24;
-    SessionLiveStateQuery session_live_state_query = 25;
-    SessionLiveState session_live_state = 26;
-    SessionClientControlResponse session_client_control_response = 28;
-    ClientRepaintRequest client_repaint_request = 29;
-    ClientDetachRequest client_detach_request = 30;
-    SessionClientDetachRequest session_client_detach_request = 27;
-    SessionClientRepaintRequest session_client_repaint_request = 31;
-    SessionClientDebugSeverConnectionRequest session_client_debug_sever_connection_request = 32;
-    SessionClientDebugUnresponsiveConnectionRequest session_client_debug_unresponsive_connection_request = 33;
+    TeSessionCreate te_session_create = 11;
+    TeSessionAttach te_session_attach = 12;
+    TeInput te_input = 13;
+    TeResize te_resize = 14;
+    TeRepaintRequest te_repaint_request = 15;
+    TeSessionCreated te_session_created = 17;
+    TeSessionAttached te_session_attached = 18;
+    TeSessionEnded te_session_ended = 19;
+    TeDraw te_draw = 20;
+    TeRepaintResponse te_repaint_response = 22;
+    TeTtyTranscriptChunk te_tty_transcript_chunk = 23;
+    TeInputAck te_input_ack = 24;
+    TeSessionLiveStateQuery te_session_live_state_query = 25;
+    TeSessionLiveState te_session_live_state = 26;
+    TeSessionClientControlResponse te_session_client_control_response = 28;
+    TeClientRepaintRequest te_client_repaint_request = 29;
+    TeClientDetachRequest te_client_detach_request = 30;
+    TeSessionClientDetachRequest te_session_client_detach_request = 27;
+    TeSessionClientRepaintRequest te_session_client_repaint_request = 31;
+    TeSessionClientDebugSeverConnectionRequest te_session_client_debug_sever_connection_request = 32;
+    TeSessionClientDebugUnresponsiveConnectionRequest te_session_client_debug_unresponsive_connection_request = 33;
     Ping ping = 39;
     Pong pong = 40;
     ProxyStreamResume proxy_stream_resume = 43;
@@ -49,15 +49,6 @@ message Frame {
     ProxyStreamAck proxy_stream_ack = 45;
     ProxyStreamEof proxy_stream_eof = 46;
     ProxyStreamEofAck proxy_stream_eof_ack = 47;
-    TtyStreamResume tty_stream_resume = 48;
-    TtyStreamInput tty_stream_input = 49;
-    TtyStreamOutput tty_stream_output = 50;
-    TtyStreamAck tty_stream_ack = 51;
-    TtyStreamEof tty_stream_eof = 52;
-    TtyStreamEofAck tty_stream_eof_ack = 53;
-    TtyStreamResize tty_stream_resize = 54;
-    TtyStreamExitStatus tty_stream_exit_status = 55;
-    TtyStreamExitStatusAck tty_stream_exit_status_ack = 56;
   }
 }
 
@@ -93,79 +84,9 @@ message ProxyStreamEofAck {
   uint64 offset = 1;
 }
 
-// TTY streams carry one PTY input byte stream and one PTY output byte stream.
-enum TtyStreamDirection {
-  TTY_STREAM_DIRECTION_UNSPECIFIED = 0;
-  TTY_STREAM_DIRECTION_INPUT = 1;
-  TTY_STREAM_DIRECTION_OUTPUT = 2;
-}
-
-// Sent at the start of every ssh transport that carries a sessh-owned PTY
-// stream. The receiver uses the offsets to resume PTY input and output from the
-// first unacknowledged byte in each direction.
-message TtyStreamResume {
-  uint64 input_recv_next_offset = 1;
-  uint64 output_recv_next_offset = 2;
-}
-
-// Raw bytes written toward the remote PTY.
-message TtyStreamInput {
-  uint64 offset = 1;
-  bytes data = 2;
-}
-
-// Raw bytes read from the remote PTY.
-message TtyStreamOutput {
-  uint64 offset = 1;
-  bytes data = 2;
-}
-
-// Acknowledges received TtyStreamInput or TtyStreamOutput bytes.
-message TtyStreamAck {
-  TtyStreamDirection stream = 1;
-  // First byte offset not yet received from the sender for this stream.
-  uint64 offset = 2;
-}
-
-// Marks the end of this peer's outbound PTY input or output stream.
-message TtyStreamEof {
-  TtyStreamDirection stream = 1;
-  // Offset of the end of the sender's byte stream.
-  uint64 offset = 2;
-}
-
-// Acknowledges that TtyStreamEof was received.
-message TtyStreamEofAck {
-  TtyStreamDirection stream = 1;
-  // Offset of the end of the sender's byte stream.
-  uint64 offset = 2;
-}
-
-// PTY size update for a sessh-owned TTY stream.
-message TtyStreamResize {
-  // Rows visible in the local terminal. The stream agent bounds this to u16.
-  uint32 terminal_rows = 1;
-  // Columns visible in the local terminal. The stream agent bounds this to u16.
-  uint32 terminal_cols = 2;
-}
-
-// Exit status for the remote process behind a sessh-owned TTY stream. This is
-// separate from TtyStreamEof because PTY output can close before the process
-// exits. The sender waits for TtyStreamExitStatusAck before it lets the stream
-// finish, otherwise a reconnect between the status write and the peer's read
-// could lose the exit code.
-message TtyStreamExitStatus {
-  ExitStatus exit_status = 1;
-}
-
-// Acknowledges that TtyStreamExitStatus was received.
-message TtyStreamExitStatusAck {
-}
-
 // A transport liveness probe. This is not application input and must not change
-// stream offsets or terminal state. It currently matters most for non-tty
-// streams, where stdin can be EOF and no user input may arrive to force a write
-// failure, but the same framed transport can use it for tty sessions too.
+// stream offsets or terminal state. It currently matters most for proxy streams,
+// where stdin can be EOF and no user input may arrive to force a write failure.
 message Ping {
 }
 
@@ -173,22 +94,22 @@ message Ping {
 message Pong {
 }
 
-// Embedded in SessionCreate.
+// Embedded in TeSessionCreate.
 //
 // Initial terminal size used when creating a new PTY session.
-message TerminalSize {
+message TeTerminalSize {
   // Rows visible in the terminal. The session agent bounds this to u16.
   uint32 terminal_rows = 1;
   // Columns visible in the terminal. The session agent bounds this to u16.
   uint32 terminal_cols = 2;
 }
 
-// Embedded in SessionCreate.
+// Embedded in TeSessionCreate.
 //
 // Portable PTY settings captured from the client-side tty before sessh puts it
 // into raw mode. This follows SSH's pty-req model: do not send a native
 // termios struct, because those layouts and flag values are OS-specific.
-message TtySettings {
+message TeTtySettings {
   // TERM value from the client environment. This is only present when the
   // remote PTY exposes the client's real terminal, such as no-terminal-emulator
   // mode.
@@ -198,67 +119,67 @@ message TtySettings {
   optional string term = 1;
   // SSH/RFC 4254 terminal-mode opcode/value pairs. Unknown opcodes are ignored
   // by the receiver, matching SSH server behavior.
-  repeated TtyMode tty_mode = 2;
+  repeated TeTtyMode tty_mode = 2;
 }
 
-// Embedded in TtySettings.
-message TtyMode {
+// Embedded in TeTtySettings.
+message TeTtyMode {
   // SSH terminal-mode opcode. Opcodes 1-159 have uint32 values; 128/129 are
   // input/output baud rates.
   uint32 opcode = 1;
   uint32 value = 2;
 }
 
-// Embedded in SessionCreate.
+// Embedded in TeSessionCreate.
 //
 // Environment value used when creating a new session.
-message EnvironmentEntry {
+message TeEnvironmentEntry {
   string name = 1;
   string value = 2;
 }
 
-// Embedded in SessionCreate.
+// Embedded in TeSessionCreate.
 //
 // Outer terminal default colors reported by the client.
-message DefaultColors {
+message TeDefaultColors {
   // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
   uint32 foreground_color = 1;
   // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
   uint32 background_color = 2;
 }
 
-// Embedded in SessionCreate.
+// Embedded in TeSessionCreate.
 //
 // Execs a program directly, preserving argv boundaries. Empty argv is treated
 // the same as no command.
-message ExecCommand {
+message TeExecCommand {
   repeated string argv = 1;
 }
 
-// Embedded in SessionCreate.
+// Embedded in TeSessionCreate.
 //
 // Evaluates a command string with the remote account's shell. An empty command
 // is still a command; clients that want an interactive login shell must leave
-// SessionCreate.command unset.
-message ShellCommand {
+// TeSessionCreate.command unset.
+message TeShellCommand {
   string command = 1;
 }
 
 // Framed payload, client -> session agent.
 //
 // Creates a new interactive PTY session without attaching this client. A
-// successful SessionCreate is followed by SessionCreated. The client may then
-// attach using SessionAttach on the same connection, or close the connection
+// successful TeSessionCreate is followed by TeSessionCreated. The client may
+// then attach using TeSessionAttach on the same connection, or close the connection
 // and leave the session detached.
-message SessionCreate {
+message TeSessionCreate {
   // Initial PTY size.
-  TerminalSize terminal_size = 1;
+  TeTerminalSize terminal_size = 1;
   // Maximum session-agent-retained scrollback rows for this session.
   uint32 scrollback_row_limit = 2;
   // Session environment entries. Currently SHELL is the only used key.
-  repeated EnvironmentEntry environment = 3;
+  repeated TeEnvironmentEntry environment = 3;
   // Colors the session agent may use to answer early OSC 10/11 queries.
-  DefaultColors query_default_colors = 4;
+  TeDefaultColors query_default_colors = 4;
   // Canonical session GUID in s-prefixed hyphenated UUID form, e.g.
   // s-550e8400-e29b-41d4-a716-446655440000.
   string session_guid = 5;
@@ -273,19 +194,19 @@ message SessionCreate {
   // mirrors ssh's `ssh HOST cmd args...` behavior after the local argv has
   // been joined into a command string for the remote shell.
   oneof command {
-    ExecCommand exec_command = 8;
-    ShellCommand shell_command = 9;
+    TeExecCommand exec_command = 8;
+    TeShellCommand shell_command = 9;
   }
   // Portable local tty settings to apply to the newly created remote PTY.
-  TtySettings tty_settings = 10;
+  TeTtySettings tty_settings = 10;
 }
 
 // Framed payload, client -> session agent.
 //
-// Attaches to an existing session. A successful SessionAttach is followed by
-// SessionAttached for the selected session, then Draw/RepaintResponse messages.
-message SessionAttach {
-  Resize resize = 1;
+// Attaches to an existing session. A successful TeSessionAttach is followed by
+// TeSessionAttached for the selected session, then TeDraw/TeRepaintResponse messages.
+message TeSessionAttach {
+  TeResize resize = 1;
   // Session GUID, compact session GUID, or alias. Empty means attach the most
   // recent session known to the selected broker.
   string session_ref = 2;
@@ -304,7 +225,7 @@ message SessionAttach {
 // Framed payload, client -> session agent.
 //
 // Local terminal input bytes.
-message Input {
+message TeInput {
   // Raw bytes read from the local terminal.
   bytes data = 1;
   // Client-assigned input sequence. The session agent acknowledges nonzero
@@ -314,23 +235,23 @@ message Input {
 
 // Framed payload, session agent -> client.
 //
-// Confirms that the session agent received an Input frame.
-message InputAck {
+// Confirms that the session agent received a TeInput frame.
+message TeInputAck {
   uint64 input_seq = 1;
 }
 
 // Framed payload, client -> session agent.
 //
 // Current terminal size for this attachment.
-message Resize {
+message TeResize {
   // Rows visible in the local terminal. The session agent bounds this to u16.
   uint32 terminal_rows = 1;
   // Columns visible in the local terminal. The session agent bounds this to u16.
   uint32 terminal_cols = 2;
-  // Present for resize frames after attach and for embedded SessionAttach
+  // Present for resize frames after attach and for embedded TeSessionAttach
   // resizes. The session agent applies the new size, then answers this request
-  // with a RepaintResponse.
-  optional RepaintRequest repaint_request = 3;
+  // with a TeRepaintResponse.
+  optional TeRepaintRequest repaint_request = 3;
   // Rows between the outer terminal viewport top and the sessh viewport top.
   // Omitted means the viewports are aligned. -1 means the client no longer
   // knows the offset, typically after SIGWINCH resized an unaligned viewport;
@@ -341,17 +262,17 @@ message Resize {
 // Framed payload, client -> session agent.
 //
 // Requests that the session agent redraw terminal state for this attachment.
-message RepaintRequest {
-  // Client-local repaint request sequence copied into RepaintResponse. While
-  // this repaint is outstanding, the client ignores framed Draw messages and
-  // resumes applying draws only after receiving the matching RepaintResponse.
-  // If multiple RepaintRequests are in flight, the session agent may ignore all
+message TeRepaintRequest {
+  // Client-local repaint request sequence copied into TeRepaintResponse. While
+  // this repaint is outstanding, the client ignores framed TeDraw messages and
+  // resumes applying draws only after receiving the matching TeRepaintResponse.
+  // If multiple TeRepaintRequests are in flight, the session agent may ignore all
   // but the last one.
   uint64 repaint_request_seq = 1;
   // Opaque scrollback cursor. Absent means assume the client has current
   // scrollback and send none. Present empty bytes means send all retained
   // scrollback available; present non-empty bytes must come from a previous
-  // Draw.scrollback_cursor.
+  // TeDraw.scrollback_cursor.
   optional bytes scrollback_cursor = 2;
   // Optional cap for retained scrollback rows included with an initial attach
   // repaint. Absent means all available retained scrollback.
@@ -361,8 +282,8 @@ message RepaintRequest {
 // Framed payload, session agent -> client.
 //
 // Requests that an attached client initiate its normal repaint flow by sending
-// a RepaintRequest back to the session agent.
-message ClientRepaintRequest {
+// a TeRepaintRequest back to the session agent.
+message TeClientRepaintRequest {
   // When true, the client clears outer terminal scrollback and requests all
   // retained inner scrollback plus the current screen. When false, it requests
   // only the current screen.
@@ -372,12 +293,12 @@ message ClientRepaintRequest {
 // Framed payload, session agent -> client.
 //
 // Requests that an attached client detach using its normal local detach flow.
-message ClientDetachRequest {}
+message TeClientDetachRequest {}
 
 // Framed payload, session agent -> client.
 //
-// Confirms that a SessionCreate created the requested session.
-message SessionCreated {
+// Confirms that a TeSessionCreate created the requested session.
+message TeSessionCreated {
   // Canonical session GUID in s-prefixed hyphenated UUID form.
   string session_guid = 1;
   // Alias registered for this session in the creating namespace.
@@ -389,7 +310,7 @@ message SessionCreated {
 // Framed payload, session agent -> client.
 //
 // Confirms the session selected for this connection.
-message SessionAttached {
+message TeSessionAttached {
   // Canonical session GUID in s-prefixed hyphenated UUID form.
   string session_guid = 1;
   // Primary alias for this session in the attaching namespace, if known.
@@ -401,55 +322,55 @@ message SessionAttached {
 // Framed payload, broker/client -> session agent.
 //
 // Queries the agent's current in-memory state for its live session.
-message SessionLiveStateQuery {
+message TeSessionLiveStateQuery {
 }
 
 // Framed payload, session agent -> broker/client.
 //
 // In-memory live state for the session currently hosted by this agent.
-message SessionLiveState {
+message TeSessionLiveState {
   // Present only when the session is detached.
   optional uint64 detached_at_unix_ms = 1;
-  repeated AttachedClient attached_clients = 2;
+  repeated TeAttachedClient attached_clients = 2;
   // Present after any attached client has sent non-control-sequence input.
   optional uint64 last_input_at_unix_ms = 3;
 }
 
-message AttachedClient {
+message TeAttachedClient {
   // Canonical client GUID in c-prefixed hyphenated UUID form.
   string client_guid = 1;
-  TerminalSize terminal_size = 2;
+  TeTerminalSize terminal_size = 2;
   uint64 attached_at_unix_ms = 3;
   // Present after the client has sent non-control-sequence input.
   optional uint64 last_input_at_unix_ms = 4;
 }
 
-enum ClientControlTargetKind {
-  CLIENT_CONTROL_TARGET_KIND_UNSPECIFIED = 0;
-  CLIENT_CONTROL_TARGET_KIND_DEFAULT = 1;
-  CLIENT_CONTROL_TARGET_KIND_ALL = 2;
-  CLIENT_CONTROL_TARGET_KIND_LAST_INPUT = 3;
-  CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID = 4;
+enum TeClientControlTargetKind {
+  TE_CLIENT_CONTROL_TARGET_KIND_UNSPECIFIED = 0;
+  TE_CLIENT_CONTROL_TARGET_KIND_DEFAULT = 1;
+  TE_CLIENT_CONTROL_TARGET_KIND_ALL = 2;
+  TE_CLIENT_CONTROL_TARGET_KIND_LAST_INPUT = 3;
+  TE_CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID = 4;
 }
 
 // Embedded in session-client-management requests.
-message ClientControlTarget {
-  ClientControlTargetKind target_kind = 1;
+message TeClientControlTarget {
+  TeClientControlTargetKind target_kind = 1;
   string client_guid = 2;
 }
 
 // Framed payload, broker/client -> session agent.
 //
 // Requests normal detach behavior on one or more attached clients.
-message SessionClientDetachRequest {
-  ClientControlTarget target = 1;
+message TeSessionClientDetachRequest {
+  TeClientControlTarget target = 1;
 }
 
 // Framed payload, broker/client -> session agent.
 //
 // Requests repaint behavior on one or more attached clients.
-message SessionClientRepaintRequest {
-  ClientControlTarget target = 1;
+message TeSessionClientRepaintRequest {
+  TeClientControlTarget target = 1;
   // When true, the selected client clears outer terminal scrollback and
   // requests retained inner scrollback plus the current screen.
   bool include_scrollback = 2;
@@ -458,8 +379,8 @@ message SessionClientRepaintRequest {
 // Framed payload, broker/client -> session agent.
 //
 // Debug-only request that severs one or more attached client connections.
-message SessionClientDebugSeverConnectionRequest {
-  ClientControlTarget target = 1;
+message TeSessionClientDebugSeverConnectionRequest {
+  TeClientControlTarget target = 1;
 }
 
 // Framed payload, broker/client -> session agent.
@@ -467,33 +388,33 @@ message SessionClientDebugSeverConnectionRequest {
 // Debug-only request that makes one or more attached client connections stop
 // responding for a bounded duration. Omitted or zero seconds asks the receiver
 // to use its default debug-unresponsive duration.
-message SessionClientDebugUnresponsiveConnectionRequest {
-  ClientControlTarget target = 1;
+message TeSessionClientDebugUnresponsiveConnectionRequest {
+  TeClientControlTarget target = 1;
   uint32 seconds = 2;
 }
 
 // Framed payload, session agent -> broker/client.
 //
 // Confirms which attached clients were affected by a client-control request.
-message SessionClientControlResponse {
+message TeSessionClientControlResponse {
   repeated string affected_client_guid = 1;
 }
 
-enum SessionEndReason {
-  SESSION_END_REASON_UNSPECIFIED = 0;
-  SESSION_END_REASON_PROCESS_EXITED = 1;
-  SESSION_END_REASON_KILLED_BY_REQUEST = 2;
-  SESSION_END_REASON_AGENT_SHUTDOWN = 3;
+enum TeSessionEndReason {
+  TE_SESSION_END_REASON_UNSPECIFIED = 0;
+  TE_SESSION_END_REASON_PROCESS_EXITED = 1;
+  TE_SESSION_END_REASON_KILLED_BY_REQUEST = 2;
+  TE_SESSION_END_REASON_AGENT_SHUTDOWN = 3;
 }
 
-enum ExitStatusKind {
-  EXIT_STATUS_KIND_UNSPECIFIED = 0;
-  EXIT_STATUS_KIND_EXITED = 1;
-  EXIT_STATUS_KIND_SIGNALLED = 2;
+enum TeExitStatusKind {
+  TE_EXIT_STATUS_KIND_UNSPECIFIED = 0;
+  TE_EXIT_STATUS_KIND_EXITED = 1;
+  TE_EXIT_STATUS_KIND_SIGNALLED = 2;
 }
 
-message ExitStatus {
-  ExitStatusKind kind = 1;
+message TeExitStatus {
+  TeExitStatusKind kind = 1;
   // Process exit status when kind is EXITED, or signal number when kind is
   // SIGNALLED.
   sint32 status = 2;
@@ -502,18 +423,18 @@ message ExitStatus {
 // Framed payload, session agent -> client.
 //
 // Tells an attached client that the session has ended.
-message SessionEnded {
-  SessionEndReason reason = 1;
+message TeSessionEnded {
+  TeSessionEndReason reason = 1;
   // Absent means the session agent did not observe a wait status, for example
   // because it is shutting down and synthesized the end notification.
-  optional ExitStatus exit_status = 2;
+  optional TeExitStatus exit_status = 2;
   optional uint64 ended_at_unix_ms = 3;
 }
 
 // Framed payload, session agent -> client.
 //
 // Session-agent-generated terminal bytes for the attached session.
-message Draw {
+message TeDraw {
   // Opaque cursor representing the client scrollback state after applying this
   // draw. Clients must store and pass this back without interpreting it.
   bytes scrollback_cursor = 1;
@@ -521,7 +442,7 @@ message Draw {
   // after applying this draw. Omitted means the viewports are aligned.
   optional sint32 viewport_offset = 2;
   // Self-contained terminal bytes to write to the outer terminal in protocol
-  // order. A Draw must apply and clean up any temporary terminal state it uses.
+  // order. A TeDraw must apply and clean up any temporary terminal state it uses.
   bytes draw_bytes = 3;
   // Terminal bytes the client keeps in memory until it really leaves the
   // session view. Transport loss starts reconnect, so the client keeps this
@@ -541,23 +462,23 @@ message Draw {
 
 // Framed payload, session agent -> client.
 //
-// Response for a RepaintRequest. The embedded Draw is applied exactly like a
-// framed Draw.
-message RepaintResponse {
+// Response for a TeRepaintRequest. The embedded TeDraw is applied exactly like a
+// framed TeDraw.
+message TeRepaintResponse {
   uint64 repaint_request_seq = 1;
-  Draw draw = 2;
+  TeDraw draw = 2;
 }
 
-enum TtyTranscriptStream {
-  TTY_TRANSCRIPT_STREAM_UNSPECIFIED = 0;
-  TTY_TRANSCRIPT_STREAM_INNER_IN = 1;
-  TTY_TRANSCRIPT_STREAM_INNER_OUT = 2;
+enum TeTtyTranscriptStream {
+  TE_TTY_TRANSCRIPT_STREAM_UNSPECIFIED = 0;
+  TE_TTY_TRANSCRIPT_STREAM_INNER_IN = 1;
+  TE_TTY_TRANSCRIPT_STREAM_INNER_OUT = 2;
 }
 
 // Framed payload, session agent -> client.
 //
 // Raw inner PTY bytes captured for a client-requested tty transcript.
-message TtyTranscriptChunk {
-  TtyTranscriptStream stream = 1;
+message TeTtyTranscriptChunk {
+  TeTtyTranscriptStream stream = 1;
   bytes data = 2;
 }

@@ -12,28 +12,28 @@ pub const MessageType = enum {
     hello_error,
     error_message,
 
-    session_create,
-    session_attach,
-    input,
-    resize,
-    repaint_request,
+    te_session_create,
+    te_session_attach,
+    te_input,
+    te_resize,
+    te_repaint_request,
 
-    session_created,
-    session_attached,
-    session_ended,
-    draw,
-    repaint_response,
-    tty_transcript_chunk,
-    input_ack,
-    session_live_state_query,
-    session_live_state,
-    session_client_control_response,
-    client_repaint_request,
-    client_detach_request,
-    session_client_detach_request,
-    session_client_repaint_request,
-    session_client_debug_sever_connection_request,
-    session_client_debug_unresponsive_connection_request,
+    te_session_created,
+    te_session_attached,
+    te_session_ended,
+    te_draw,
+    te_repaint_response,
+    te_tty_transcript_chunk,
+    te_input_ack,
+    te_session_live_state_query,
+    te_session_live_state,
+    te_session_client_control_response,
+    te_client_repaint_request,
+    te_client_detach_request,
+    te_session_client_detach_request,
+    te_session_client_repaint_request,
+    te_session_client_debug_sever_connection_request,
+    te_session_client_debug_unresponsive_connection_request,
     ping,
     pong,
     proxy_stream_resume,
@@ -41,15 +41,6 @@ pub const MessageType = enum {
     proxy_stream_ack,
     proxy_stream_eof,
     proxy_stream_eof_ack,
-    tty_stream_resume,
-    tty_stream_input,
-    tty_stream_output,
-    tty_stream_ack,
-    tty_stream_eof,
-    tty_stream_eof_ack,
-    tty_stream_resize,
-    tty_stream_exit_status,
-    tty_stream_exit_status_ack,
 };
 
 pub const frame_header_len = 4;
@@ -158,27 +149,27 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
         const payload = frame.payload orelse return error.UnknownFrame;
         return switch (payload) {
             .@"error" => |message| ownedFrameFromMessage(allocator, .error_message, message),
-            .session_create => |message| ownedFrameFromMessage(allocator, .session_create, message),
-            .session_attach => |message| ownedFrameFromMessage(allocator, .session_attach, message),
-            .input => |message| ownedFrameFromMessage(allocator, .input, message),
-            .resize => |message| ownedFrameFromMessage(allocator, .resize, message),
-            .repaint_request => |message| ownedFrameFromMessage(allocator, .repaint_request, message),
-            .session_created => |message| ownedFrameFromMessage(allocator, .session_created, message),
-            .session_attached => |message| ownedFrameFromMessage(allocator, .session_attached, message),
-            .session_ended => |message| ownedFrameFromMessage(allocator, .session_ended, message),
-            .draw => |message| ownedFrameFromMessage(allocator, .draw, message),
-            .repaint_response => |message| ownedFrameFromMessage(allocator, .repaint_response, message),
-            .tty_transcript_chunk => |message| ownedFrameFromMessage(allocator, .tty_transcript_chunk, message),
-            .input_ack => |message| ownedFrameFromMessage(allocator, .input_ack, message),
-            .session_live_state_query => |message| ownedFrameFromMessage(allocator, .session_live_state_query, message),
-            .session_live_state => |message| ownedFrameFromMessage(allocator, .session_live_state, message),
-            .session_client_control_response => |message| ownedFrameFromMessage(allocator, .session_client_control_response, message),
-            .client_repaint_request => |message| ownedFrameFromMessage(allocator, .client_repaint_request, message),
-            .client_detach_request => |message| ownedFrameFromMessage(allocator, .client_detach_request, message),
-            .session_client_detach_request => |message| ownedFrameFromMessage(allocator, .session_client_detach_request, message),
-            .session_client_repaint_request => |message| ownedFrameFromMessage(allocator, .session_client_repaint_request, message),
-            .session_client_debug_sever_connection_request => |message| ownedFrameFromMessage(allocator, .session_client_debug_sever_connection_request, message),
-            .session_client_debug_unresponsive_connection_request => |message| ownedFrameFromMessage(allocator, .session_client_debug_unresponsive_connection_request, message),
+            .te_session_create => |message| ownedFrameFromMessage(allocator, .te_session_create, message),
+            .te_session_attach => |message| ownedFrameFromMessage(allocator, .te_session_attach, message),
+            .te_input => |message| ownedFrameFromMessage(allocator, .te_input, message),
+            .te_resize => |message| ownedFrameFromMessage(allocator, .te_resize, message),
+            .te_repaint_request => |message| ownedFrameFromMessage(allocator, .te_repaint_request, message),
+            .te_session_created => |message| ownedFrameFromMessage(allocator, .te_session_created, message),
+            .te_session_attached => |message| ownedFrameFromMessage(allocator, .te_session_attached, message),
+            .te_session_ended => |message| ownedFrameFromMessage(allocator, .te_session_ended, message),
+            .te_draw => |message| ownedFrameFromMessage(allocator, .te_draw, message),
+            .te_repaint_response => |message| ownedFrameFromMessage(allocator, .te_repaint_response, message),
+            .te_tty_transcript_chunk => |message| ownedFrameFromMessage(allocator, .te_tty_transcript_chunk, message),
+            .te_input_ack => |message| ownedFrameFromMessage(allocator, .te_input_ack, message),
+            .te_session_live_state_query => |message| ownedFrameFromMessage(allocator, .te_session_live_state_query, message),
+            .te_session_live_state => |message| ownedFrameFromMessage(allocator, .te_session_live_state, message),
+            .te_session_client_control_response => |message| ownedFrameFromMessage(allocator, .te_session_client_control_response, message),
+            .te_client_repaint_request => |message| ownedFrameFromMessage(allocator, .te_client_repaint_request, message),
+            .te_client_detach_request => |message| ownedFrameFromMessage(allocator, .te_client_detach_request, message),
+            .te_session_client_detach_request => |message| ownedFrameFromMessage(allocator, .te_session_client_detach_request, message),
+            .te_session_client_repaint_request => |message| ownedFrameFromMessage(allocator, .te_session_client_repaint_request, message),
+            .te_session_client_debug_sever_connection_request => |message| ownedFrameFromMessage(allocator, .te_session_client_debug_sever_connection_request, message),
+            .te_session_client_debug_unresponsive_connection_request => |message| ownedFrameFromMessage(allocator, .te_session_client_debug_unresponsive_connection_request, message),
             .ping => |message| ownedFrameFromMessage(allocator, .ping, message),
             .pong => |message| ownedFrameFromMessage(allocator, .pong, message),
             .proxy_stream_resume => |message| ownedFrameFromMessage(allocator, .proxy_stream_resume, message),
@@ -186,15 +177,6 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .proxy_stream_ack => |message| ownedFrameFromMessage(allocator, .proxy_stream_ack, message),
             .proxy_stream_eof => |message| ownedFrameFromMessage(allocator, .proxy_stream_eof, message),
             .proxy_stream_eof_ack => |message| ownedFrameFromMessage(allocator, .proxy_stream_eof_ack, message),
-            .tty_stream_resume => |message| ownedFrameFromMessage(allocator, .tty_stream_resume, message),
-            .tty_stream_input => |message| ownedFrameFromMessage(allocator, .tty_stream_input, message),
-            .tty_stream_output => |message| ownedFrameFromMessage(allocator, .tty_stream_output, message),
-            .tty_stream_ack => |message| ownedFrameFromMessage(allocator, .tty_stream_ack, message),
-            .tty_stream_eof => |message| ownedFrameFromMessage(allocator, .tty_stream_eof, message),
-            .tty_stream_eof_ack => |message| ownedFrameFromMessage(allocator, .tty_stream_eof_ack, message),
-            .tty_stream_resize => |message| ownedFrameFromMessage(allocator, .tty_stream_resize, message),
-            .tty_stream_exit_status => |message| ownedFrameFromMessage(allocator, .tty_stream_exit_status, message),
-            .tty_stream_exit_status_ack => |message| ownedFrameFromMessage(allocator, .tty_stream_exit_status_ack, message),
         };
     }
 
@@ -243,110 +225,110 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .@"error" = message } });
         },
-        .session_create => blk: {
-            var message = try decodePayload(pb.SessionCreate, allocator, payload);
+        .te_session_create => blk: {
+            var message = try decodePayload(pb.TeSessionCreate, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_create = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_create = message } });
         },
-        .session_attach => blk: {
-            var message = try decodePayload(pb.SessionAttach, allocator, payload);
+        .te_session_attach => blk: {
+            var message = try decodePayload(pb.TeSessionAttach, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_attach = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_attach = message } });
         },
-        .input => blk: {
-            var message = try decodePayload(pb.Input, allocator, payload);
+        .te_input => blk: {
+            var message = try decodePayload(pb.TeInput, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .input = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_input = message } });
         },
-        .resize => blk: {
-            var message = try decodePayload(pb.Resize, allocator, payload);
+        .te_resize => blk: {
+            var message = try decodePayload(pb.TeResize, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .resize = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_resize = message } });
         },
-        .repaint_request => blk: {
-            var message = try decodePayload(pb.RepaintRequest, allocator, payload);
+        .te_repaint_request => blk: {
+            var message = try decodePayload(pb.TeRepaintRequest, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .repaint_request = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_repaint_request = message } });
         },
-        .session_created => blk: {
-            var message = try decodePayload(pb.SessionCreated, allocator, payload);
+        .te_session_created => blk: {
+            var message = try decodePayload(pb.TeSessionCreated, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_created = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_created = message } });
         },
-        .session_attached => blk: {
-            var message = try decodePayload(pb.SessionAttached, allocator, payload);
+        .te_session_attached => blk: {
+            var message = try decodePayload(pb.TeSessionAttached, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_attached = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_attached = message } });
         },
-        .session_ended => blk: {
-            var message = try decodePayload(pb.SessionEnded, allocator, payload);
+        .te_session_ended => blk: {
+            var message = try decodePayload(pb.TeSessionEnded, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_ended = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_ended = message } });
         },
-        .draw => blk: {
-            var message = try decodePayload(pb.Draw, allocator, payload);
+        .te_draw => blk: {
+            var message = try decodePayload(pb.TeDraw, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .draw = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_draw = message } });
         },
-        .repaint_response => blk: {
-            var message = try decodePayload(pb.RepaintResponse, allocator, payload);
+        .te_repaint_response => blk: {
+            var message = try decodePayload(pb.TeRepaintResponse, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .repaint_response = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_repaint_response = message } });
         },
-        .tty_transcript_chunk => blk: {
-            var message = try decodePayload(pb.TtyTranscriptChunk, allocator, payload);
+        .te_tty_transcript_chunk => blk: {
+            var message = try decodePayload(pb.TeTtyTranscriptChunk, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_transcript_chunk = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_tty_transcript_chunk = message } });
         },
-        .input_ack => blk: {
-            var message = try decodePayload(pb.InputAck, allocator, payload);
+        .te_input_ack => blk: {
+            var message = try decodePayload(pb.TeInputAck, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .input_ack = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_input_ack = message } });
         },
-        .session_live_state_query => blk: {
-            var message = try decodePayload(pb.SessionLiveStateQuery, allocator, payload);
+        .te_session_live_state_query => blk: {
+            var message = try decodePayload(pb.TeSessionLiveStateQuery, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_live_state_query = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_live_state_query = message } });
         },
-        .session_live_state => blk: {
-            var message = try decodePayload(pb.SessionLiveState, allocator, payload);
+        .te_session_live_state => blk: {
+            var message = try decodePayload(pb.TeSessionLiveState, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_live_state = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_live_state = message } });
         },
-        .session_client_control_response => blk: {
-            var message = try decodePayload(pb.SessionClientControlResponse, allocator, payload);
+        .te_session_client_control_response => blk: {
+            var message = try decodePayload(pb.TeSessionClientControlResponse, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_control_response = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_client_control_response = message } });
         },
-        .client_repaint_request => blk: {
-            var message = try decodePayload(pb.ClientRepaintRequest, allocator, payload);
+        .te_client_repaint_request => blk: {
+            var message = try decodePayload(pb.TeClientRepaintRequest, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_repaint_request = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_client_repaint_request = message } });
         },
-        .client_detach_request => blk: {
-            var message = try decodePayload(pb.ClientDetachRequest, allocator, payload);
+        .te_client_detach_request => blk: {
+            var message = try decodePayload(pb.TeClientDetachRequest, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_detach_request = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_client_detach_request = message } });
         },
-        .session_client_detach_request => blk: {
-            var message = try decodePayload(pb.SessionClientDetachRequest, allocator, payload);
+        .te_session_client_detach_request => blk: {
+            var message = try decodePayload(pb.TeSessionClientDetachRequest, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_detach_request = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_client_detach_request = message } });
         },
-        .session_client_repaint_request => blk: {
-            var message = try decodePayload(pb.SessionClientRepaintRequest, allocator, payload);
+        .te_session_client_repaint_request => blk: {
+            var message = try decodePayload(pb.TeSessionClientRepaintRequest, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_repaint_request = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_client_repaint_request = message } });
         },
-        .session_client_debug_sever_connection_request => blk: {
-            var message = try decodePayload(pb.SessionClientDebugSeverConnectionRequest, allocator, payload);
+        .te_session_client_debug_sever_connection_request => blk: {
+            var message = try decodePayload(pb.TeSessionClientDebugSeverConnectionRequest, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_debug_sever_connection_request = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_client_debug_sever_connection_request = message } });
         },
-        .session_client_debug_unresponsive_connection_request => blk: {
-            var message = try decodePayload(pb.SessionClientDebugUnresponsiveConnectionRequest, allocator, payload);
+        .te_session_client_debug_unresponsive_connection_request => blk: {
+            var message = try decodePayload(pb.TeSessionClientDebugUnresponsiveConnectionRequest, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_debug_unresponsive_connection_request = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_client_debug_unresponsive_connection_request = message } });
         },
         .ping => blk: {
             var message = try decodePayload(pb.Ping, allocator, payload);
@@ -383,51 +365,6 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_eof_ack = message } });
         },
-        .tty_stream_resume => blk: {
-            var message = try decodePayload(pb.TtyStreamResume, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_resume = message } });
-        },
-        .tty_stream_input => blk: {
-            var message = try decodePayload(pb.TtyStreamInput, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_input = message } });
-        },
-        .tty_stream_output => blk: {
-            var message = try decodePayload(pb.TtyStreamOutput, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_output = message } });
-        },
-        .tty_stream_ack => blk: {
-            var message = try decodePayload(pb.TtyStreamAck, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_ack = message } });
-        },
-        .tty_stream_eof => blk: {
-            var message = try decodePayload(pb.TtyStreamEof, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_eof = message } });
-        },
-        .tty_stream_eof_ack => blk: {
-            var message = try decodePayload(pb.TtyStreamEofAck, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_eof_ack = message } });
-        },
-        .tty_stream_resize => blk: {
-            var message = try decodePayload(pb.TtyStreamResize, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_resize = message } });
-        },
-        .tty_stream_exit_status => blk: {
-            var message = try decodePayload(pb.TtyStreamExitStatus, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_exit_status = message } });
-        },
-        .tty_stream_exit_status_ack => blk: {
-            var message = try decodePayload(pb.TtyStreamExitStatusAck, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_exit_status_ack = message } });
-        },
     };
 }
 
@@ -446,7 +383,7 @@ fn writeU32(bytes: []u8, value: u32) void {
 }
 
 test "generated protobuf payload round trip" {
-    const original = pb.Draw{
+    const original = pb.TeDraw{
         .scrollback_cursor = "opaque-cursor",
         .viewport_offset = 4,
         .draw_bytes = "sessh",
@@ -454,7 +391,7 @@ test "generated protobuf payload round trip" {
     const encoded = try encodePayload(std.testing.allocator, original);
     defer std.testing.allocator.free(encoded);
 
-    var decoded = try decodePayload(pb.Draw, std.testing.allocator, encoded);
+    var decoded = try decodePayload(pb.TeDraw, std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("opaque-cursor", decoded.scrollback_cursor);
     try std.testing.expectEqual(@as(?i32, 4), decoded.viewport_offset);
@@ -462,17 +399,17 @@ test "generated protobuf payload round trip" {
 }
 
 test "frame envelope round trip" {
-    const payload = try encodePayload(std.testing.allocator, pb.InputAck{ .input_seq = 42 });
+    const payload = try encodePayload(std.testing.allocator, pb.TeInputAck{ .input_seq = 42 });
     defer std.testing.allocator.free(payload);
-    const frame_bytes = try encodeFrame(std.testing.allocator, .input_ack, payload);
+    const frame_bytes = try encodeFrame(std.testing.allocator, .te_input_ack, payload);
     defer std.testing.allocator.free(frame_bytes);
 
     const envelope = frame_bytes[frame_header_len..];
     var frame = try decodeEnvelopeAlloc(std.testing.allocator, envelope);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(MessageType.input_ack, frame.message_type);
+    try std.testing.expectEqual(MessageType.te_input_ack, frame.message_type);
 
-    var decoded = try decodePayload(pb.InputAck, std.testing.allocator, frame.payload);
+    var decoded = try decodePayload(pb.TeInputAck, std.testing.allocator, frame.payload);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 42), decoded.input_seq);
 }
@@ -511,15 +448,15 @@ test "hello compatibility accepts peer max protocol when it satisfies local mini
 }
 
 test "session ended exit status is optional" {
-    const payload = try encodePayload(std.testing.allocator, pb.SessionEnded{
-        .reason = .SESSION_END_REASON_KILLED_BY_REQUEST,
+    const payload = try encodePayload(std.testing.allocator, pb.TeSessionEnded{
+        .reason = .TE_SESSION_END_REASON_KILLED_BY_REQUEST,
         .ended_at_unix_ms = 42,
     });
     defer std.testing.allocator.free(payload);
 
-    var decoded = try decodePayload(pb.SessionEnded, std.testing.allocator, payload);
+    var decoded = try decodePayload(pb.TeSessionEnded, std.testing.allocator, payload);
     defer decoded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(pb.SessionEndReason.SESSION_END_REASON_KILLED_BY_REQUEST, decoded.reason);
-    try std.testing.expectEqual(@as(?pb.ExitStatus, null), decoded.exit_status);
+    try std.testing.expectEqual(pb.TeSessionEndReason.TE_SESSION_END_REASON_KILLED_BY_REQUEST, decoded.reason);
+    try std.testing.expectEqual(@as(?pb.TeExitStatus, null), decoded.exit_status);
     try std.testing.expectEqual(@as(?u64, 42), decoded.ended_at_unix_ms);
 }

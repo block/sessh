@@ -8,11 +8,11 @@ like `ssh`:
 sessh [ssh-option ...] destination [command [argument ...]]
 ```
 
-`sessh` connection recovery is strongest for interactive sessions. Non-tty
-commands use a ProxyCommand-based stream so OpenSSH still owns ssh semantics,
-while tty-shaped commands can use sessh's PTY stream path when their terminal
-behavior can be preserved. If sessh cannot safely preserve ssh behavior, it
-falls back to plain `ssh`.
+`sessh` connection recovery is strongest for terminal-emulator sessions. When
+the terminal emulator is disabled, sessh uses a ProxyCommand-based stream so
+OpenSSH owns ssh semantics directly, including PTY allocation for tty-shaped
+commands. If the remote OS/arch has no matching sessh binary, sessh warns and
+falls back to plain `ssh` without persistence.
 
 If the `ssh` disconnects while `sessh` is running interactively then it will
 retry the connection in the background (with exponential backoff) and reattach
@@ -47,8 +47,9 @@ sessh [[ssh-option|sessh-option] ...] destination [command [argument ...]]
 - `--terminal-emulator` / `--no-terminal-emulator`: enable or disable sessh's
   terminal emulator for this connection. Disabling it uses a stream path instead
   of sessh's terminal renderer, which better preserves terminal features sessh
-  does not model. Non-tty cases use the ProxyCommand stream; tty cases use
-  sessh's PTY stream. The positive form is mainly useful for overriding config.
+  does not model. The stream path uses a ProxyCommand transport and lets the
+  visible `ssh` process own PTY allocation. The positive form is mainly useful
+  for overriding config.
 - `--force-proxy-mode` / `--no-force-proxy-mode`: force, or explicitly do not
   force, the ProxyCommand-based stream path for this connection. Sessh still
   enables proxy mode automatically when an ssh option requires OpenSSH to own
@@ -193,15 +194,15 @@ If you have a leader defined, there are two additionals commands available:
 2. You may simulate network disconnection: `<leader> s`. You can use this to
    see `sessh` reconnections in action.
 
-## Plain-SSH-Fallback and Compat-Fallback
+## Plain SSH and Compat-Fallback
 
-`sessh` falls back to plain-ssh when:
+`sessh` falls back to plain ssh when the remote OS/arch has no matching sessh
+binary. In that case there is no remote sessh program to run, so `sessh` prints
+a warning to stderr and delegates to ordinary `ssh` without session
+persistence.
 
-1. remote OS/arch is unsupported, or
-2. an incompatible `ssh` option is passed
-
-Under plain-ssh-fallback, `sessh` will print a warning to stderr and then
-delegate to ordinary `ssh`, which means there will be no session persistence.
+SSH options that require OpenSSH to own the session use the ProxyCommand stream
+path instead of plain-ssh fallback.
 
 If the remote session agent is an incompatible `sessh` version, `sessh` may use
 compat-fallback: it runs the remote compat binary that started that session

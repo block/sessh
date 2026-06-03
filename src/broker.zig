@@ -31,8 +31,8 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
         var frame = try protocol.readFrameAlloc(allocator, 0);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
-            .resize => continue,
-            .session_attach => {
+            .te_resize => continue,
+            .te_session_attach => {
                 const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
                     error.NoSessions => {
                         try sendError(1, "SESSION_NOT_FOUND", "no sessions", "");
@@ -56,7 +56,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                 try attachAgentAndRelay(allocator, agent_fd, frame.payload);
                 return;
             },
-            .session_create => {
+            .te_session_create => {
                 const agent_fd = startSessionAgentAndConnect(allocator, exe, frame.payload) catch |err| switch (err) {
                     error.AliasExists => {
                         try sendError(1, "ALIAS_EXISTS", "session alias already exists", "");
@@ -153,10 +153,10 @@ const ListOptions = struct {
 };
 
 const ClientControlTarget = struct {
-    kind: pb.ClientControlTargetKind,
+    kind: pb.TeClientControlTargetKind,
     client_guid: []const u8 = "",
 
-    fn proto(self: ClientControlTarget) pb.ClientControlTarget {
+    fn proto(self: ClientControlTarget) pb.TeClientControlTarget {
         return .{
             .target_kind = self.kind,
             .client_guid = self.client_guid,
@@ -285,10 +285,10 @@ fn parseClientControlCommand(args: []const []const u8) !ClientControlCommand {
             }
         } else return error.InvalidClientControlCommand;
 
-    var target_kind: pb.ClientControlTargetKind = if (command_kind == .repaint)
-        .CLIENT_CONTROL_TARGET_KIND_ALL
+    var target_kind: pb.TeClientControlTargetKind = if (command_kind == .repaint)
+        .TE_CLIENT_CONTROL_TARGET_KIND_ALL
     else
-        .CLIENT_CONTROL_TARGET_KIND_DEFAULT;
+        .TE_CLIENT_CONTROL_TARGET_KIND_DEFAULT;
     var explicit_target = false;
     var client_guid: []const u8 = "";
     var include_scrollback = false;
@@ -299,12 +299,12 @@ fn parseClientControlCommand(args: []const []const u8) !ClientControlCommand {
         if (std.mem.eql(u8, args[i], "--all")) {
             if (explicit_target) return error.MultipleTargets;
             explicit_target = true;
-            target_kind = .CLIENT_CONTROL_TARGET_KIND_ALL;
+            target_kind = .TE_CLIENT_CONTROL_TARGET_KIND_ALL;
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--last-input")) {
             if (explicit_target) return error.MultipleTargets;
             explicit_target = true;
-            target_kind = .CLIENT_CONTROL_TARGET_KIND_LAST_INPUT;
+            target_kind = .TE_CLIENT_CONTROL_TARGET_KIND_LAST_INPUT;
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--scrollback")) {
             if (command_kind != .repaint) return error.UnsupportedClientControlArgs;
@@ -321,7 +321,7 @@ fn parseClientControlCommand(args: []const []const u8) !ClientControlCommand {
         } else if (!explicit_target and std.mem.startsWith(u8, args[i], session_registry.client_guid_prefix)) {
             explicit_target = true;
             client_guid = args[i];
-            target_kind = .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID;
+            target_kind = .TE_CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID;
             i += 1;
         } else if (session_ref == null) {
             session_ref = args[i];
@@ -336,7 +336,7 @@ fn parseClientControlCommand(args: []const []const u8) !ClientControlCommand {
         .client_guid = client_guid,
     };
     const resolved_session_ref = session_ref orelse blk: {
-        if (target.kind == .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID) break :blk null;
+        if (target.kind == .TE_CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID) break :blk null;
         return error.MissingSessionRef;
     };
     return switch (command_kind) {
@@ -726,7 +726,7 @@ fn listClientsForSessionPaths(allocator: std.mem.Allocator, writer: anytype, opt
         return 1;
     };
     defer state.deinit(allocator);
-    std.mem.sort(pb.AttachedClient, state.attached_clients.items, {}, attachedClientSortLessThan);
+    std.mem.sort(pb.TeAttachedClient, state.attached_clients.items, {}, attachedClientSortLessThan);
 
     const session_guid = std.fs.path.basename(paths.dir);
     const display_id = (try session_registry.primaryAliasForGuid(allocator, session_guid)) orelse try session_registry.shortSessionGuid(allocator, session_guid);
@@ -777,7 +777,7 @@ fn listClientByRef(allocator: std.mem.Allocator, writer: anytype, options: ListO
         return 1;
     };
     defer state.deinit(allocator);
-    std.mem.sort(pb.AttachedClient, state.attached_clients.items, {}, attachedClientSortLessThan);
+    std.mem.sort(pb.TeAttachedClient, state.attached_clients.items, {}, attachedClientSortLessThan);
 
     const session_guid = try sessionGuidFromClientAgentSocketHint(allocator, socket_path);
     defer allocator.free(session_guid);
@@ -830,7 +830,7 @@ fn writeClientRows(
     session_display_id: []const u8,
     session_guid: []const u8,
     host_display: []const u8,
-    clients: []const pb.AttachedClient,
+    clients: []const pb.TeAttachedClient,
     client_filter_ref: ?[]const u8,
 ) !void {
     switch (format) {
@@ -859,7 +859,7 @@ fn writeClientTableRow(
     now_ms: u64,
     session_display_id: []const u8,
     host_display: []const u8,
-    client_info: pb.AttachedClient,
+    client_info: pb.TeAttachedClient,
 ) !void {
     const client_id = try session_registry.shortClientGuid(app_allocator.allocator(), client_info.client_guid);
     defer app_allocator.allocator().free(client_id);
@@ -891,7 +891,7 @@ fn writeClientJsonlRow(
     session_display_id: []const u8,
     session_guid: []const u8,
     host_display: []const u8,
-    client_info: pb.AttachedClient,
+    client_info: pb.TeAttachedClient,
 ) !void {
     try writer.writeAll("{\"client_guid\":");
     try writeJsonString(writer, client_info.client_guid);
@@ -1024,7 +1024,7 @@ fn runClientControlCommandForSessionRef(
     allocator: std.mem.Allocator,
     session_ref: []const u8,
     command: ClientControlCommand,
-) !pb.SessionClientControlResponse {
+) !pb.TeSessionClientControlResponse {
     var paths = pathsForLocalSessionRef(allocator, session_ref) catch |err| switch (err) {
         error.SessionAlreadyExited => {
             return finishClientControlCommand(1, "", "ERROR session already exited\n");
@@ -1055,9 +1055,9 @@ fn runClientControlCommandForSessionRef(
 fn runClientControlCommandForClientGuid(
     allocator: std.mem.Allocator,
     command: ClientControlCommand,
-) !pb.SessionClientControlResponse {
+) !pb.TeSessionClientControlResponse {
     const target = command.target();
-    if (target.kind != .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID) return finishClientControlCommand(1, "", "ERROR invalid client target\n");
+    if (target.kind != .TE_CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID) return finishClientControlCommand(1, "", "ERROR invalid client target\n");
     const socket_path = session_registry.clientAgentSocketPathForClientGuid(allocator, target.client_guid) catch |err| switch (err) {
         error.InvalidClientId => return finishClientControlCommand(1, "", "ERROR invalid client target\n"),
         error.AmbiguousClientId => return finishClientControlCommand(1, "", "ERROR client target is ambiguous\n"),
@@ -1077,12 +1077,12 @@ fn runClientControlCommandForClientGuid(
     };
 }
 
-fn finishClientControlCommand(exit_status: u8, stdout: []const u8, stderr: []const u8) !pb.SessionClientControlResponse {
+fn finishClientControlCommand(exit_status: u8, stdout: []const u8, stderr: []const u8) !pb.TeSessionClientControlResponse {
     try finishCommand(exit_status, stdout, stderr);
     unreachable;
 }
 
-fn attachedClientSortLessThan(_: void, a: pb.AttachedClient, b: pb.AttachedClient) bool {
+fn attachedClientSortLessThan(_: void, a: pb.TeAttachedClient, b: pb.TeAttachedClient) bool {
     const a_input = a.last_input_at_unix_ms orelse 0;
     const b_input = b.last_input_at_unix_ms orelse 0;
     if (a_input != b_input) return a_input > b_input;
@@ -1145,7 +1145,7 @@ fn sendSessionClientControlRequest(
     allocator: std.mem.Allocator,
     paths: session_registry.SessionPaths,
     command: ClientControlCommand,
-) !pb.SessionClientControlResponse {
+) !pb.TeSessionClientControlResponse {
     return sendSessionClientControlRequestToSocketPath(allocator, paths.socket, command);
 }
 
@@ -1153,7 +1153,7 @@ fn sendSessionClientControlRequestToSocketPath(
     allocator: std.mem.Allocator,
     socket_path: []const u8,
     command: ClientControlCommand,
-) !pb.SessionClientControlResponse {
+) !pb.TeSessionClientControlResponse {
     const fd = try socket_transport.connectSocket(socket_path);
     defer _ = c.close(fd);
 
@@ -1165,7 +1165,7 @@ fn sendSessionClientControlRequestToSocketPath(
     var frame = try protocol.readFrameAlloc(allocator, fd);
     defer frame.deinit(allocator);
     switch (frame.message_type) {
-        .session_client_control_response => return protocol.decodePayload(pb.SessionClientControlResponse, allocator, frame.payload),
+        .te_session_client_control_response => return protocol.decodePayload(pb.TeSessionClientControlResponse, allocator, frame.payload),
         .error_message => {
             var message = try protocol.decodePayload(hpb.Error, allocator, frame.payload);
             defer message.deinit(allocator);
@@ -1182,27 +1182,27 @@ fn encodeClientControlRequest(
 ) !struct { protocol.MessageType, []u8 } {
     return switch (command) {
         .detach => |detach| .{
-            .session_client_detach_request,
-            try protocol.encodePayload(allocator, pb.SessionClientDetachRequest{
+            .te_session_client_detach_request,
+            try protocol.encodePayload(allocator, pb.TeSessionClientDetachRequest{
                 .target = detach.target.proto(),
             }),
         },
         .repaint => |repaint| .{
-            .session_client_repaint_request,
-            try protocol.encodePayload(allocator, pb.SessionClientRepaintRequest{
+            .te_session_client_repaint_request,
+            try protocol.encodePayload(allocator, pb.TeSessionClientRepaintRequest{
                 .target = repaint.target.proto(),
                 .include_scrollback = repaint.include_scrollback,
             }),
         },
         .debug_sever_connection => |debug| .{
-            .session_client_debug_sever_connection_request,
-            try protocol.encodePayload(allocator, pb.SessionClientDebugSeverConnectionRequest{
+            .te_session_client_debug_sever_connection_request,
+            try protocol.encodePayload(allocator, pb.TeSessionClientDebugSeverConnectionRequest{
                 .target = debug.target.proto(),
             }),
         },
         .debug_unresponsive_connection => |debug| .{
-            .session_client_debug_unresponsive_connection_request,
-            try protocol.encodePayload(allocator, pb.SessionClientDebugUnresponsiveConnectionRequest{
+            .te_session_client_debug_unresponsive_connection_request,
+            try protocol.encodePayload(allocator, pb.TeSessionClientDebugUnresponsiveConnectionRequest{
                 .target = debug.target.proto(),
                 .seconds = debug.seconds,
             }),
@@ -1403,7 +1403,7 @@ fn runCompatCommand(allocator: std.mem.Allocator, paths: session_registry.Sessio
 }
 
 fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.fd_t {
-    var request = try protocol.decodePayload(pb.SessionAttach, allocator, payload);
+    var request = try protocol.decodePayload(pb.TeSessionAttach, allocator, payload);
     defer request.deinit(allocator);
     var paths = if (request.session_dir.len > 0) blk: {
         if (!std.mem.startsWith(u8, request.session_dir, "/")) return error.InvalidSessionDir;
@@ -1515,24 +1515,24 @@ fn querySessionLiveStateDetachedAt(allocator: std.mem.Allocator, paths: session_
     return state.detached_at_unix_ms;
 }
 
-fn querySessionLiveState(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !pb.SessionLiveState {
+fn querySessionLiveState(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !pb.TeSessionLiveState {
     return querySessionLiveStateFromSocketPath(allocator, paths.socket);
 }
 
-fn querySessionLiveStateFromSocketPath(allocator: std.mem.Allocator, socket_path: []const u8) !pb.SessionLiveState {
+fn querySessionLiveStateFromSocketPath(allocator: std.mem.Allocator, socket_path: []const u8) !pb.TeSessionLiveState {
     const fd = try socket_transport.connectSocket(socket_path);
     defer _ = c.close(fd);
 
     try initiateRuntimeHandshake(allocator, fd);
 
-    const query_payload = try protocol.encodePayload(allocator, pb.SessionLiveStateQuery{});
+    const query_payload = try protocol.encodePayload(allocator, pb.TeSessionLiveStateQuery{});
     defer allocator.free(query_payload);
-    try protocol.sendFrame(fd, .session_live_state_query, query_payload);
+    try protocol.sendFrame(fd, .te_session_live_state_query, query_payload);
 
     var frame = try protocol.readFrameAlloc(allocator, fd);
     defer frame.deinit(allocator);
     switch (frame.message_type) {
-        .session_live_state => return protocol.decodePayload(pb.SessionLiveState, allocator, frame.payload),
+        .te_session_live_state => return protocol.decodePayload(pb.TeSessionLiveState, allocator, frame.payload),
         .error_message => return error.SessionLiveStateUnavailable,
         else => return error.UnexpectedFrame,
     }
@@ -1554,7 +1554,7 @@ fn statAbsolute(path: []const u8) !std.fs.File.Stat {
 }
 
 fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_create_payload: []const u8) !c.fd_t {
-    var request = try protocol.decodePayload(pb.SessionCreate, allocator, session_create_payload);
+    var request = try protocol.decodePayload(pb.TeSessionCreate, allocator, session_create_payload);
     defer request.deinit(allocator);
     if (request.session_alias.len > 0) {
         if (!session_registry.isValidAlias(request.session_alias)) return error.InvalidAlias;
@@ -1602,7 +1602,7 @@ fn createSessionAndRelay(
         },
         else => return err,
     };
-    try protocol.sendFrame(agent_fd, .session_create, session_create_payload);
+    try protocol.sendFrame(agent_fd, .te_session_create, session_create_payload);
     try relay.relayFrames(0, 1, agent_fd);
 }
 
@@ -1618,7 +1618,7 @@ fn attachAgentAndRelay(
         },
         else => return err,
     };
-    try protocol.sendFrame(agent_fd, .session_attach, session_attach_payload);
+    try protocol.sendFrame(agent_fd, .te_session_attach, session_attach_payload);
     try relay.relayFrames(0, 1, agent_fd);
 }
 
@@ -1755,19 +1755,15 @@ test "list all rows include runtime metadata and cached remote sessions" {
     const local_guid = "s-11111111-1111-4111-8111-111111111111";
     const client_guid = "c-22222222-2222-4222-8222-222222222222";
     const remote_guid = "s-33333333-3333-4333-8333-333333333333";
-    const stream_guid = "t-44444444-4444-4444-8444-444444444444";
     const proxy_guid = "p-55555555-5555-4555-8555-555555555555";
     const local_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, local_guid });
     defer allocator.free(local_dir);
     const client_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, client_guid });
     defer allocator.free(client_dir);
-    const stream_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, stream_guid });
-    defer allocator.free(stream_dir);
     const proxy_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, proxy_guid });
     defer allocator.free(proxy_dir);
     try std.fs.cwd().makePath(local_dir);
     try std.fs.cwd().makePath(client_dir);
-    try std.fs.cwd().makePath(stream_dir);
     try std.fs.cwd().makePath(proxy_dir);
 
     const local_meta = try std.fmt.allocPrint(allocator, "{s}/meta.json", .{local_dir});
@@ -1776,14 +1772,11 @@ test "list all rows include runtime metadata and cached remote sessions" {
     defer allocator.free(incoming_client_meta);
     const outgoing_client_meta = try std.fmt.allocPrint(allocator, "{s}/outgoing-meta.json", .{client_dir});
     defer allocator.free(outgoing_client_meta);
-    const stream_meta = try std.fmt.allocPrint(allocator, "{s}/outgoing-meta.json", .{stream_dir});
-    defer allocator.free(stream_meta);
     const proxy_meta = try std.fmt.allocPrint(allocator, "{s}/outgoing-meta.json", .{proxy_dir});
     defer allocator.free(proxy_meta);
     try writeTestFile(local_meta, "{\"type\":\"local-session\",\"created_at_unix_ms\":1000}\n");
     try writeTestFile(incoming_client_meta, "{\"type\":\"incoming-client\",\"created_at_unix_ms\":1500}\n");
     try writeTestFile(outgoing_client_meta, "{\"type\":\"outgoing-client\",\"created_at_unix_ms\":2000}\n");
-    try writeTestFile(stream_meta, "{\"type\":\"outgoing-tty-stream\",\"created_at_unix_ms\":3000}\n");
     try writeTestFile(proxy_meta, "{\"type\":\"outgoing-proxy\",\"created_at_unix_ms\":3500}\n");
 
     const remote_route_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ state_root, remote_guid });
@@ -1802,7 +1795,6 @@ test "list all rows include runtime metadata and cached remote sessions" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"s-11111111\",\"guid\":\"s-11111111-1111-4111-8111-111111111111\",\"type\":\"local-session\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"c-22222222\",\"guid\":\"c-22222222-2222-4222-8222-222222222222\",\"type\":\"incoming-client\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"c-22222222\",\"guid\":\"c-22222222-2222-4222-8222-222222222222\",\"type\":\"outgoing-client\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"t-44444444\",\"guid\":\"t-44444444-4444-4444-8444-444444444444\",\"type\":\"outgoing-tty-stream\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"p-55555555\",\"guid\":\"p-55555555-5555-4555-8555-555555555555\",\"type\":\"outgoing-proxy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"s-33333333\",\"guid\":\"s-33333333-3333-4333-8333-333333333333\",\"type\":\"remote-session\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "host=work.example version=0.6.0-test") != null);

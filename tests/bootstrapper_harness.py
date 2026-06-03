@@ -90,12 +90,12 @@ def test_cache_hit_execs_explicit_internal_command(tmp):
     write_executable(artifact_path(env, artifact_hash), artifact)
 
     result = run_bootstrapper(
-        f"EXEC test-set {artifact_hash} -- :internal-stream-broker: t-00000000-0000-4000-8000-000000000001 tty 24 80 - - -\n",
+        f"EXEC test-set {artifact_hash} -- :internal-stream-broker: p-00000000-0000-4000-8000-000000000001 proxy 1 1 bG9jYWxob3N0 22 -\n",
         env,
     )
 
     assert_ok(result)
-    expected = "OK\nCACHED :internal-stream-broker: t-00000000-0000-4000-8000-000000000001 tty 24 80 - - -\n"
+    expected = "OK\nCACHED :internal-stream-broker: p-00000000-0000-4000-8000-000000000001 proxy 1 1 bG9jYWxob3N0 22 -\n"
     if result.stdout != expected:
         raise AssertionError(result.stdout)
 

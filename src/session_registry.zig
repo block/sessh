@@ -9,11 +9,9 @@ pub const guid_body_len = 36;
 pub const compact_guid_len = 32;
 pub const session_guid_prefix = "s-";
 pub const client_guid_prefix = "c-";
-pub const tty_guid_prefix = "t-";
 pub const proxy_guid_prefix = "p-";
 pub const session_guid_len = session_guid_prefix.len + guid_body_len;
 pub const client_guid_len = client_guid_prefix.len + guid_body_len;
-pub const tty_guid_len = tty_guid_prefix.len + guid_body_len;
 pub const proxy_guid_len = proxy_guid_prefix.len + guid_body_len;
 pub const generated_alias_hex_len = 8;
 pub const generated_alias_len = session_guid_prefix.len + generated_alias_hex_len;
@@ -50,7 +48,7 @@ pub const Allocation = struct {
 };
 
 /// Runtime socket identity for anything addressed by a top-level typed GUID.
-/// The real Unix socket lives in `runtime/s` to keep paths short; the GUID
+/// The real Unix socket lives in `runtime/a` to keep paths short; the GUID
 /// directory contains the stable `agent.sock` symlink used by lookup code.
 pub const RuntimeAgentSocketPaths = struct {
     dir: []u8,
@@ -130,7 +128,7 @@ fn allocateSessionDirForGuidInRoots(allocator: std.mem.Allocator, runtime_root: 
     defer allocator.free(sessions_dir);
     try mkdirIgnoreExists(allocator, sessions_dir);
 
-    const socket_dir = try sessionSocketsDirInRoot(allocator, runtime_root);
+    const socket_dir = try agentSocketsDirInRoot(allocator, runtime_root);
     defer allocator.free(socket_dir);
     try mkdirIgnoreExists(allocator, socket_dir);
 
@@ -180,18 +178,8 @@ fn stateSessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 
     return std.fmt.allocPrint(allocator, "{s}/guid", .{root});
 }
 
-pub fn sessionSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/s", .{root});
-}
-
-fn runtimeAgentSocketNamespaceForGuid(guid: []const u8) []const u8 {
-    if (isValidProxyGuid(guid)) return "p";
-    if (isValidTtyGuid(guid)) return "t";
-    return "s";
-}
-
-fn runtimeAgentSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, runtimeAgentSocketNamespaceForGuid(guid) });
+pub fn agentSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/a", .{root});
 }
 
 pub fn clientHintsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
@@ -300,18 +288,13 @@ pub fn isValidClientGuid(guid: []const u8) bool {
         isValidGuidBody(guid[client_guid_prefix.len..]);
 }
 
-pub fn isValidTtyGuid(guid: []const u8) bool {
-    return std.mem.startsWith(u8, guid, tty_guid_prefix) and
-        isValidGuidBody(guid[tty_guid_prefix.len..]);
-}
-
 pub fn isValidProxyGuid(guid: []const u8) bool {
     return std.mem.startsWith(u8, guid, proxy_guid_prefix) and
         isValidGuidBody(guid[proxy_guid_prefix.len..]);
 }
 
 pub fn isValidGuid(guid: []const u8) bool {
-    return isValidSessionGuid(guid) or isValidClientGuid(guid) or isValidTtyGuid(guid) or isValidProxyGuid(guid);
+    return isValidSessionGuid(guid) or isValidClientGuid(guid) or isValidProxyGuid(guid);
 }
 
 pub fn isValidCompactGuid(guid: []const u8) bool {
@@ -418,17 +401,6 @@ pub fn canonicalClientGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8
     return out;
 }
 
-pub fn canonicalTtyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    if (!isValidTtyGuid(guid)) return error.InvalidTtyId;
-    const out = try allocator.alloc(u8, tty_guid_len);
-    out[0] = tty_guid_prefix[0];
-    out[1] = tty_guid_prefix[1];
-    for (guid[tty_guid_prefix.len..], 0..) |byte, i| {
-        out[tty_guid_prefix.len + i] = std.ascii.toLower(byte);
-    }
-    return out;
-}
-
 pub fn canonicalProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (!isValidProxyGuid(guid)) return error.InvalidProxyId;
     const out = try allocator.alloc(u8, proxy_guid_len);
@@ -443,7 +415,6 @@ pub fn canonicalProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 
 fn canonicalRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidSessionGuid(guid) or isValidCompactGuid(guid)) return canonicalGuid(allocator, guid);
     if (isValidClientGuid(guid)) return canonicalClientGuid(allocator, guid);
-    if (isValidTtyGuid(guid)) return canonicalTtyGuid(allocator, guid);
     if (isValidProxyGuid(guid)) return canonicalProxyGuid(allocator, guid);
     return error.InvalidSessionId;
 }
@@ -477,18 +448,6 @@ pub fn compactClientGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     return out;
 }
 
-pub fn compactTtyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    if (!isValidTtyGuid(guid)) return error.InvalidTtyId;
-    var out = try allocator.alloc(u8, compact_guid_len);
-    var dst: usize = 0;
-    for (guid[tty_guid_prefix.len..]) |byte| {
-        if (byte == '-') continue;
-        out[dst] = std.ascii.toLower(byte);
-        dst += 1;
-    }
-    return out;
-}
-
 pub fn compactProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (!isValidProxyGuid(guid)) return error.InvalidProxyId;
     var out = try allocator.alloc(u8, compact_guid_len);
@@ -504,7 +463,6 @@ pub fn compactProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
 fn compactRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidSessionGuid(guid) or isValidCompactGuid(guid)) return compactGuid(allocator, guid);
     if (isValidClientGuid(guid)) return compactClientGuid(allocator, guid);
-    if (isValidTtyGuid(guid)) return compactTtyGuid(allocator, guid);
     if (isValidProxyGuid(guid)) return compactProxyGuid(allocator, guid);
     return error.InvalidSessionId;
 }
@@ -531,22 +489,6 @@ pub fn generateClientGuid(allocator: std.mem.Allocator) ![]u8 {
     out[0] = client_guid_prefix[0];
     out[1] = client_guid_prefix[1];
     @memcpy(out[client_guid_prefix.len..], session_guid[session_guid_prefix.len..]);
-    return out;
-}
-
-pub fn generateTtyGuid(allocator: std.mem.Allocator) ![]u8 {
-    var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    const compact = std.fmt.bytesToHex(bytes, .lower);
-    const session_guid = try canonicalGuid(allocator, &compact);
-    defer allocator.free(session_guid);
-
-    const out = try allocator.alloc(u8, tty_guid_len);
-    out[0] = tty_guid_prefix[0];
-    out[1] = tty_guid_prefix[1];
-    @memcpy(out[tty_guid_prefix.len..], session_guid[session_guid_prefix.len..]);
     return out;
 }
 
@@ -639,8 +581,6 @@ pub const RuntimeGuidType = enum {
     incoming_client,
     outgoing_client,
     local_session,
-    incoming_tty_stream,
-    outgoing_tty_stream,
     incoming_proxy,
     outgoing_proxy,
 };
@@ -650,8 +590,6 @@ pub fn runtimeGuidTypeName(guid_type: RuntimeGuidType) []const u8 {
         .incoming_client => "incoming-client",
         .outgoing_client => "outgoing-client",
         .local_session => "local-session",
-        .incoming_tty_stream => "incoming-tty-stream",
-        .outgoing_tty_stream => "outgoing-tty-stream",
         .incoming_proxy => "incoming-proxy",
         .outgoing_proxy => "outgoing-proxy",
     };
@@ -666,7 +604,7 @@ const runtime_guid_empty_meta_filenames = [_][]const u8{};
 
 pub fn runtimeGuidMetaFilenamesForGuid(guid: []const u8) []const []const u8 {
     if (isValidSessionGuid(guid)) return runtime_guid_session_meta_filenames[0..];
-    if (isValidClientGuid(guid) or isValidTtyGuid(guid) or isValidProxyGuid(guid)) return runtime_guid_directional_meta_filenames[0..];
+    if (isValidClientGuid(guid) or isValidProxyGuid(guid)) return runtime_guid_directional_meta_filenames[0..];
     return runtime_guid_empty_meta_filenames[0..];
 }
 
@@ -676,8 +614,8 @@ pub fn runtimeGuidMetaFilenamesForGuid(guid: []const u8) []const []const u8 {
 fn runtimeGuidMetaFilenameForType(guid_type: RuntimeGuidType) []const u8 {
     return switch (guid_type) {
         .local_session => "meta.json",
-        .incoming_client, .incoming_tty_stream, .incoming_proxy => "incoming-meta.json",
-        .outgoing_client, .outgoing_tty_stream, .outgoing_proxy => "outgoing-meta.json",
+        .incoming_client, .incoming_proxy => "incoming-meta.json",
+        .outgoing_client, .outgoing_proxy => "outgoing-meta.json",
     };
 }
 
@@ -685,8 +623,6 @@ fn runtimeGuidTypeFromName(value: []const u8) !RuntimeGuidType {
     if (std.mem.eql(u8, value, "incoming-client")) return .incoming_client;
     if (std.mem.eql(u8, value, "outgoing-client")) return .outgoing_client;
     if (std.mem.eql(u8, value, "local-session")) return .local_session;
-    if (std.mem.eql(u8, value, "incoming-tty-stream")) return .incoming_tty_stream;
-    if (std.mem.eql(u8, value, "outgoing-tty-stream")) return .outgoing_tty_stream;
     if (std.mem.eql(u8, value, "incoming-proxy")) return .incoming_proxy;
     if (std.mem.eql(u8, value, "outgoing-proxy")) return .outgoing_proxy;
     return error.InvalidRuntimeGuidMeta;
@@ -1384,16 +1320,6 @@ pub fn runtimeAgentSocketPathsForGuid(allocator: std.mem.Allocator, guid: []cons
     return runtimeAgentSocketPathsForGuidInRoot(allocator, runtime_root, guid);
 }
 
-pub fn writeOutgoingTtyStreamHint(allocator: std.mem.Allocator, guid: []const u8) !void {
-    const runtime_root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(runtime_root);
-    return writeOutgoingTtyStreamHintInRoot(allocator, runtime_root, guid);
-}
-
-fn writeOutgoingTtyStreamHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, guid: []const u8) !void {
-    return writeDirectionalRuntimeGuidHintInRoot(allocator, runtime_root, guid, .outgoing_tty_stream);
-}
-
 pub fn writeOutgoingProxyHint(allocator: std.mem.Allocator, guid: []const u8) !void {
     const runtime_root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(runtime_root);
@@ -1421,16 +1347,6 @@ fn writeDirectionalRuntimeGuidHintInRoot(
     defer allocator.free(dir);
     try mkdirIgnoreExists(allocator, dir);
     try writeRuntimeGuidMetaInDir(allocator, dir, guid_type);
-}
-
-pub fn removeOutgoingTtyStreamHint(allocator: std.mem.Allocator, guid: []const u8) !void {
-    const runtime_root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(runtime_root);
-    return removeOutgoingTtyStreamHintInRoot(allocator, runtime_root, guid);
-}
-
-fn removeOutgoingTtyStreamHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, guid: []const u8) !void {
-    return removeDirectionalRuntimeGuidHintInRoot(allocator, runtime_root, guid, .outgoing_tty_stream);
 }
 
 pub fn removeOutgoingProxyHint(allocator: std.mem.Allocator, guid: []const u8) !void {
@@ -1470,7 +1386,7 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
     const canonical = try canonicalRuntimeGuid(allocator, guid);
     defer allocator.free(canonical);
 
-    const socket_root = try runtimeAgentSocketsDirInRoot(allocator, runtime_root, canonical);
+    const socket_root = try agentSocketsDirInRoot(allocator, runtime_root);
     defer allocator.free(socket_root);
     try mkdirIgnoreExists(allocator, socket_root);
 
@@ -1489,7 +1405,7 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
         error.FileNotFound => blk: {
             var socket_allocation = try allocateRuntimeAgentSocketPathForGuidInRoot(allocator, runtime_root, canonical);
             errdefer socket_allocation.deinit(allocator);
-            try installRuntimeAgentSocketLink(allocator, agent_sock_link, runtimeAgentSocketNamespaceForGuid(canonical), socket_allocation.name);
+            try installAgentSocketLink(allocator, agent_sock_link, socket_allocation.name);
             allocator.free(socket_allocation.name);
             break :blk socket_allocation.path;
         },
@@ -1508,7 +1424,6 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
 
 fn runtimeIncomingMetaTypeForGuid(guid: []const u8) RuntimeGuidType {
     if (isValidProxyGuid(guid)) return .incoming_proxy;
-    if (isValidTtyGuid(guid)) return .incoming_tty_stream;
     if (isValidClientGuid(guid)) return .incoming_client;
     return .local_session;
 }
@@ -2065,10 +1980,6 @@ pub fn shortClientGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     return shortTypedGuid(allocator, guid, client_guid_prefix);
 }
 
-pub fn shortTtyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    return shortTypedGuid(allocator, guid, tty_guid_prefix);
-}
-
 pub fn shortProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     return shortTypedGuid(allocator, guid, proxy_guid_prefix);
 }
@@ -2076,7 +1987,6 @@ pub fn shortProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
 pub fn shortRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidSessionGuid(guid)) return shortSessionGuid(allocator, guid);
     if (isValidClientGuid(guid)) return shortClientGuid(allocator, guid);
-    if (isValidTtyGuid(guid)) return shortTtyGuid(allocator, guid);
     if (isValidProxyGuid(guid)) return shortProxyGuid(allocator, guid);
     return error.InvalidGuid;
 }
@@ -2084,8 +1994,6 @@ pub fn shortRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
 fn shortTypedGuid(allocator: std.mem.Allocator, guid: []const u8, prefix: []const u8) ![]u8 {
     const compact = if (std.mem.eql(u8, prefix, session_guid_prefix))
         try compactGuid(allocator, guid)
-    else if (std.mem.eql(u8, prefix, tty_guid_prefix))
-        try compactTtyGuid(allocator, guid)
     else if (std.mem.eql(u8, prefix, proxy_guid_prefix))
         try compactProxyGuid(allocator, guid)
     else
@@ -2361,13 +2269,13 @@ const SocketPathAllocation = struct {
 };
 
 fn allocateSocketPathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !SocketPathAllocation {
-    const socket_dir = try sessionSocketsDirInRoot(allocator, root);
+    const socket_dir = try agentSocketsDirInRoot(allocator, root);
     defer allocator.free(socket_dir);
     return allocateSocketPathForGuidInDir(allocator, socket_dir, guid);
 }
 
 fn allocateRuntimeAgentSocketPathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !SocketPathAllocation {
-    const socket_dir = try runtimeAgentSocketsDirInRoot(allocator, root, guid);
+    const socket_dir = try agentSocketsDirInRoot(allocator, root);
     defer allocator.free(socket_dir);
     return allocateSocketPathForGuidInDir(allocator, socket_dir, guid);
 }
@@ -2441,18 +2349,7 @@ fn agentSocketLinkPath(allocator: std.mem.Allocator, dir: []const u8) ![]u8 {
 }
 
 fn installAgentSocketLink(allocator: std.mem.Allocator, link_path: []const u8, socket_name: []const u8) !void {
-    const target = try std.fmt.allocPrint(allocator, "../../s/{s}", .{socket_name});
-    defer allocator.free(target);
-    return installSymlinkReplacing(allocator, link_path, target);
-}
-
-fn installRuntimeAgentSocketLink(
-    allocator: std.mem.Allocator,
-    link_path: []const u8,
-    namespace: []const u8,
-    socket_name: []const u8,
-) !void {
-    const target = try std.fmt.allocPrint(allocator, "../../{s}/{s}", .{ namespace, socket_name });
+    const target = try std.fmt.allocPrint(allocator, "../../a/{s}", .{socket_name});
     defer allocator.free(target);
     return installSymlinkReplacing(allocator, link_path, target);
 }
@@ -2486,7 +2383,7 @@ fn installSymlinkReplacing(allocator: std.mem.Allocator, link_path: []const u8, 
 
 fn ensureAgentSocketLinkForSocketPath(allocator: std.mem.Allocator, link_path: []const u8, socket_path: []const u8) !void {
     const socket_name = std.fs.path.basename(socket_path);
-    const expected_target = try std.fmt.allocPrint(allocator, "../../s/{s}", .{socket_name});
+    const expected_target = try std.fmt.allocPrint(allocator, "../../a/{s}", .{socket_name});
     defer allocator.free(expected_target);
 
     const existing_target = readLinkAlloc(allocator, link_path, 4096) catch |err| switch (err) {
@@ -2507,15 +2404,11 @@ fn socketPathFromAgentSocketLink(allocator: std.mem.Allocator, dir: []const u8, 
     const target = try readLinkAlloc(allocator, link_path, 4096);
     defer allocator.free(target);
     if (isAbsolutePath(target)) return allocator.dupe(u8, target);
-    if (std.mem.startsWith(u8, target, "../../s/") or
-        std.mem.startsWith(u8, target, "../../t/") or
-        std.mem.startsWith(u8, target, "../../p/"))
-    {
+    if (std.mem.startsWith(u8, target, "../../a/")) {
         const guid_dir = std.fs.path.dirname(dir) orelse return error.InvalidSessionDir;
         const root = std.fs.path.dirname(guid_dir) orelse return error.InvalidSessionDir;
-        const namespace = target["../../".len..][0..1];
-        const socket_name = target["../../s/".len..];
-        return std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ root, namespace, socket_name });
+        const socket_name = target["../../a/".len..];
+        return std.fmt.allocPrint(allocator, "{s}/a/{s}", .{ root, socket_name });
     }
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, target });
 }
@@ -2649,7 +2542,7 @@ test "session paths use guid session directories and separate socket directory" 
 
     try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", allocation.id);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000", allocation.paths.dir);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/s/550e8400e29b41d4a716446655440000", allocation.paths.socket);
+    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/a/550e8400e29b41d4a716446655440000", allocation.paths.socket);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/agent.sock", allocation.paths.agent_sock_link);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/meta.json", allocation.paths.meta);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/compat", allocation.paths.compat);
@@ -2657,13 +2550,13 @@ test "session paths use guid session directories and separate socket directory" 
 
     const link_target = try readLinkAlloc(allocator, allocation.paths.agent_sock_link, 4096);
     defer allocator.free(link_target);
-    try std.testing.expectEqualStrings("../../s/550e8400e29b41d4a716446655440000", link_target);
+    try std.testing.expectEqualStrings("../../a/550e8400e29b41d4a716446655440000", link_target);
 }
 
 test "long runtime roots use random socket names when compact guid does not fit" {
     const allocator = std.testing.allocator;
     const prefix = "zig-cache/session-registry-long-root-";
-    const root_len = maxUnixSocketPathLen() - "/s/".len - 16;
+    const root_len = maxUnixSocketPathLen() - "/a/".len - 16;
     try std.testing.expect(root_len > prefix.len);
 
     const root = try allocator.alloc(u8, root_len);
@@ -2688,7 +2581,7 @@ test "long runtime roots use random socket names when compact guid does not fit"
 
     const link_target = try readLinkAlloc(allocator, allocation.paths.agent_sock_link, 4096);
     defer allocator.free(link_target);
-    const expected_target = try std.fmt.allocPrint(allocator, "../../s/{s}", .{socket_name});
+    const expected_target = try std.fmt.allocPrint(allocator, "../../a/{s}", .{socket_name});
     defer allocator.free(expected_target);
     try std.testing.expectEqualStrings(expected_target, link_target);
 }
@@ -2699,69 +2592,28 @@ test "runtime agent socket paths use typed guid directories and socket directory
     std.fs.cwd().deleteTree(root) catch {};
     defer std.fs.cwd().deleteTree(root) catch {};
 
-    const guid = "t-550e8400-e29b-41d4-a716-446655440000";
+    const guid = "p-550e8400-e29b-41d4-a716-446655440000";
     var paths = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
     defer paths.deinit(allocator);
 
-    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/t-550e8400-e29b-41d4-a716-446655440000", paths.dir);
-    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/t/550e8400e29b41d4a716446655440000", paths.socket);
-    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/t-550e8400-e29b-41d4-a716-446655440000/agent.sock", paths.agent_sock_link);
-    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/t-550e8400-e29b-41d4-a716-446655440000/incoming-meta.json", paths.meta);
-    const created_at_unix_ms = try expectRuntimeGuidMetaType(allocator, paths.meta, .incoming_tty_stream);
+    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/p-550e8400-e29b-41d4-a716-446655440000", paths.dir);
+    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/a/550e8400e29b41d4a716446655440000", paths.socket);
+    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/p-550e8400-e29b-41d4-a716-446655440000/agent.sock", paths.agent_sock_link);
+    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/p-550e8400-e29b-41d4-a716-446655440000/incoming-meta.json", paths.meta);
+    const created_at_unix_ms = try expectRuntimeGuidMetaType(allocator, paths.meta, .incoming_proxy);
 
     const link_target = try readLinkAlloc(allocator, paths.agent_sock_link, 4096);
     defer allocator.free(link_target);
-    try std.testing.expectEqualStrings("../../t/550e8400e29b41d4a716446655440000", link_target);
+    try std.testing.expectEqualStrings("../../a/550e8400e29b41d4a716446655440000", link_target);
 
     var again = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
     defer again.deinit(allocator);
     try std.testing.expectEqualStrings(paths.socket, again.socket);
-    try std.testing.expectEqual(created_at_unix_ms, try expectRuntimeGuidMetaType(allocator, again.meta, .incoming_tty_stream));
+    try std.testing.expectEqual(created_at_unix_ms, try expectRuntimeGuidMetaType(allocator, again.meta, .incoming_proxy));
 
     paths.removeRuntimeFiles();
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.meta));
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.dir));
-
-    const proxy_guid = "p-550e8400-e29b-41d4-a716-446655440001";
-    var proxy_paths = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, proxy_guid);
-    defer proxy_paths.deinit(allocator);
-    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/p/550e8400e29b41d4a716446655440001", proxy_paths.socket);
-    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/p-550e8400-e29b-41d4-a716-446655440001/incoming-meta.json", proxy_paths.meta);
-    const proxy_link_target = try readLinkAlloc(allocator, proxy_paths.agent_sock_link, 4096);
-    defer allocator.free(proxy_link_target);
-    try std.testing.expectEqualStrings("../../p/550e8400e29b41d4a716446655440001", proxy_link_target);
-    _ = try expectRuntimeGuidMetaType(allocator, proxy_paths.meta, .incoming_proxy);
-    proxy_paths.removeRuntimeFiles();
-}
-
-test "outgoing tty stream hints use runtime metadata without stealing incoming stream cleanup" {
-    const allocator = std.testing.allocator;
-    const root = "zig-cache/outgoing-tty-stream-hint-test";
-    std.fs.cwd().deleteTree(root) catch {};
-    defer std.fs.cwd().deleteTree(root) catch {};
-
-    const guid = "t-550e8400-e29b-41d4-a716-446655440000";
-    const dir = "zig-cache/outgoing-tty-stream-hint-test/guid/t-550e8400-e29b-41d4-a716-446655440000";
-    const incoming_meta_path = "zig-cache/outgoing-tty-stream-hint-test/guid/t-550e8400-e29b-41d4-a716-446655440000/incoming-meta.json";
-    const outgoing_meta_path = "zig-cache/outgoing-tty-stream-hint-test/guid/t-550e8400-e29b-41d4-a716-446655440000/outgoing-meta.json";
-
-    try writeOutgoingTtyStreamHintInRoot(allocator, root, guid);
-    _ = try expectRuntimeGuidMetaType(allocator, outgoing_meta_path, .outgoing_tty_stream);
-    try removeOutgoingTtyStreamHintInRoot(allocator, root, guid);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(outgoing_meta_path));
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(dir));
-
-    try writeOutgoingTtyStreamHintInRoot(allocator, root, guid);
-    var incoming = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
-    defer incoming.deinit(allocator);
-    _ = try expectRuntimeGuidMetaType(allocator, incoming_meta_path, .incoming_tty_stream);
-    _ = try expectRuntimeGuidMetaType(allocator, outgoing_meta_path, .outgoing_tty_stream);
-
-    try removeOutgoingTtyStreamHintInRoot(allocator, root, guid);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(outgoing_meta_path));
-    _ = try expectRuntimeGuidMetaType(allocator, incoming_meta_path, .incoming_tty_stream);
-    incoming.removeRuntimeFiles();
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(dir));
 }
 
 test "outgoing proxy hints use proxy runtime metadata without stealing incoming proxy cleanup" {
@@ -2799,7 +2651,6 @@ test "validates session ids and aliases" {
     try std.testing.expect(isValidSessionId("550e8400e29b41d4a716446655440000"));
     try std.testing.expect(isValidSessionGuid("s-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(isValidClientGuid("c-550e8400-e29b-41d4-a716-446655440000"));
-    try std.testing.expect(isValidTtyGuid("t-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(isValidProxyGuid("p-550e8400-e29b-41d4-a716-446655440000"));
     const generated_client = try generateClientGuid(std.testing.allocator);
     defer std.testing.allocator.free(generated_client);

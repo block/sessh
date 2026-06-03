@@ -37,14 +37,14 @@ missing scrollback and generates accurate repaint instructions for the client.
 
 In the event of a network disconnection, the session agent will continue
 terminal emulation. The virtual screen may update and/or generate additional
-lines of scrollback. When the client reconnects, it sends a Resize message with
-an embedded RepaintRequest message containing enough information for the
+lines of scrollback. When the client reconnects, it sends a `TeResize` message
+with an embedded `TeRepaintRequest` message containing enough information for the
 session agent to decide:
 1. Are the client's scrollback contents stale? (i.e. are they from before
    scrollback was cleared?)
 2. Which retained scrollback rows, if any, should be sent to the client?
 
-RepaintResponse includes an embedded Draw message with instructions to add
+`TeRepaintResponse` includes an embedded `TeDraw` message with instructions to add
 missing scrollback rows, possibly clearing older scrollback if stale. These
 instructions also clear and re-render the screen, and restore state (e.g.
 cursor position/visibility/style, terminal modes such as mouse reporting or
@@ -53,14 +53,14 @@ bracketed paste, etc).
 ## Smart resize
 
 When the terminal window is resized our client receives a SIGWINCH which we
-handle by sending a Resize message to the remote, the same message that gets
-embedded within SessionAttach. Resizing is treated as a logical reconnection.
+handle by sending a `TeResize` message to the remote, the same message that gets
+embedded within `TeSessionAttach`. Resizing is treated as a logical reconnection.
 
-The Resize contains a RepaintRequest and we drop any Draw packets until the
-matching RepaintResponse is received. It doesn't make sense to try to apply
+The `TeResize` contains a `TeRepaintRequest` and we drop any `TeDraw` packets until
+the matching `TeRepaintResponse` is received. It doesn't make sense to try to apply
 rendering operations that were generated for a different sized window.
 
-Resize carries the client's current viewport offset when known. The session
+`TeResize` carries the client's current viewport offset when known. The session
 agent answers an unknown offset by aligning the viewport in the repaint
 response.
 
@@ -70,28 +70,28 @@ We allow for the possibility of the client to render banners independently of
 the remote, but the client doesn't have the ability to remove the banners by
 itself. It can redraw a different banner, but the only way it can remove a
 banner is by asking the remote to repaint. After requesting repaint, the client
-ignores subsequent Draw packets up until the matching RepaintResponse so that
+ignores subsequent `TeDraw` packets up until the matching `TeRepaintResponse` so that
 the banner doesn't end up in the outer terminal's scrollback.
 
 The client uses banners to notify the user when the connection has died or
 become unresponsive.
 
-## Input acknowledgements
+## TeInput acknowledgements
 
-Each Input frame carries a client-assigned sequence number. The session agent
-answers with InputAck after receiving a nonzero input sequence. The client uses
+Each `TeInput` frame carries a client-assigned sequence number. The session agent
+answers with `TeInputAck` after receiving a nonzero input sequence. The client uses
 the highest acknowledged sequence to know whether input was still pending when
 a connection died, and to detect unresponsive connections after user input.
 
 ## Client-side state cleanup
 
 Both of the previous capabilities rely on the remote generating well-formed
-packets of rendering instructions. The Draw message contains rendering
+packets of rendering instructions. The `TeDraw` message contains rendering
 instructions, but the remote guarantees that they avoid leaking incidental
 rendering state (e.g. bold/inverse/colors, OSC 8 hyperlinks, cursor movement,
 etc): If any earlier instructions modify that state, then there must be later
-instructions within that same Draw message to restore that state.
+instructions within that same `TeDraw` message to restore that state.
 
-A Draw may intentionally leave terminal state set when that state is part of
+A `TeDraw` may intentionally leave terminal state set when that state is part of
 the modeled session (e.g. alternate screen), but it contains a separate field
 with instructions to restore that state when `sessh` exits.

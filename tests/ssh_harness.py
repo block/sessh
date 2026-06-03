@@ -188,18 +188,9 @@ while [ "$#" -gt 0 ]; do
       esac
       shift
       ;;
-    -N)
+    -N|-n|-f)
       plain_option=$1
       shift
-      ;;
-    -n)
-      if [ -n "${SESSH_FAKE_SSH_ALLOW_PLAIN:-}" ]; then
-        plain_option=$1
-        shift
-      else
-        printf 'fake ssh: unsupported option: %s\\n' "$1" >&2
-        exit 97
-      fi
       ;;
     -*)
       printf 'fake ssh: unsupported option: %s\\n' "$1" >&2
@@ -797,9 +788,9 @@ def run_sesshmux_in_pty(
 
 
 def set_no_terminal_emulator_tty_mode_probe(fd):
-    # This runs in the child side of pty.fork before sessh starts, so sessh
-    # should capture these modes and apply them to the remote
-    # no-terminal-emulator PTY.
+    # This runs in the child side of pty.fork before sessh starts. In
+    # no-terminal-emulator mode, the visible ssh process owns the PTY and should
+    # propagate these local modes.
     attrs = termios.tcgetattr(fd)
     attrs[0] &= ~termios.ICRNL
     attrs[3] &= ~(termios.ECHO | termios.ICANON)
@@ -1242,16 +1233,16 @@ def actual_socket_path(env, session_id="s1"):
         if not alias_path.is_symlink():
             ensure_alias(env, session_id)
         guid = canonical_guid(Path(os.readlink(alias_path)).name)
-    return runtime_root(env) / "s" / compact_guid(guid)
+    return runtime_root(env) / "a" / compact_guid(guid)
 
 
 def ensure_agent_socket_link(env, session_id="s1"):
     session = session_path(env, session_id)
     session.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (runtime_root(env) / "s").mkdir(mode=0o700, parents=True, exist_ok=True)
+    (runtime_root(env) / "a").mkdir(mode=0o700, parents=True, exist_ok=True)
     link = session / "agent.sock"
     if not link.exists() and not link.is_symlink():
-        link.symlink_to(Path("../../s") / actual_socket_path(env, session_id).name)
+        link.symlink_to(Path("../../a") / actual_socket_path(env, session_id).name)
 
 
 def session_compat_path(env, session_id="s1"):
@@ -1723,27 +1714,27 @@ def test_ssh_failure_uses_ssh_exit_status_and_visible_args(tmp):
         raise AssertionError(result.stderr)
 
 
-def test_ssh_unsupported_option_falls_back_to_plain_ssh(tmp):
+def test_ssh_stdin_null_option_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     write_fake_ssh(fake_bin / "ssh")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
+    seed_remote_artifact_cache(env)
 
-    result = run_sessh(["-n", "test-host"], env, timeout=5.0)
+    result = run_sessh(["-n", "test-host", "echo", "hello"], env, timeout=5.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if "PLAIN_SSH host=test-host" not in result.stdout:
+    if result.stdout != "hello\n":
         raise AssertionError(result)
-    if "fallback to plain-ssh due to ssh option incompatible with sessh transport" not in result.stderr:
+    if "fallback to plain ssh" in result.stderr:
         raise AssertionError(result.stderr)
     log_text = fake_log.read_text()
-    if "plain_ssh=1" not in log_text or "plain_option=-n" not in log_text:
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
-    if "bootstrapper=1" in log_text:
+    if "proxy_remote_command=echo hello" not in log_text:
         raise AssertionError(log_text)
 
 
@@ -2138,7 +2129,7 @@ def test_ssh_no_terminal_emulator_tty_propagates_resize(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_forced_tty_marks_stream_as_tty(tmp):
+def test_ssh_no_terminal_emulator_forced_tty_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2147,14 +2138,19 @@ def test_ssh_no_terminal_emulator_forced_tty_marks_stream_as_tty(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     seed_remote_artifact_cache(env)
 
-    result = run_sessh(["--no-terminal-emulator", "-tt", "test-host", "tty"], env, timeout=5.0)
+    result = run_sesshmux_in_pty(
+        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "tty"],
+        env,
+        ((b"/dev/", None),),
+        timeout=10.0,
+    )
 
     if result.returncode != 0:
         raise AssertionError(result)
     if "/dev/" not in result.stdout:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
@@ -2177,7 +2173,7 @@ def test_ssh_no_terminal_emulator_requested_tty_uses_stream_path(tmp):
     if result.returncode != 0:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
@@ -2200,7 +2196,7 @@ def test_ssh_interleaved_tty_and_no_terminal_emulator_preserves_exit_status(tmp)
     if result.returncode != 3:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
@@ -2224,7 +2220,7 @@ def test_ssh_terminal_emulator_false_config_uses_stream_path(tmp):
     if result.returncode != 0:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
@@ -2249,29 +2245,6 @@ def test_ssh_terminal_emulator_cli_overrides_disabled_config(tmp):
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if "plain_ssh=1" in log_text or "batch_mode=1" in log_text:
-        raise AssertionError(log_text)
-
-
-def test_ssh_no_terminal_emulator_tty_uses_single_stream_guid(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    seed_remote_artifact_cache(env)
-
-    result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "tty"],
-        env,
-        ((b"/dev/", None),),
-        timeout=10.0,
-    )
-
-    if result.returncode != 0:
-        raise AssertionError(result)
-    log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text:
         raise AssertionError(log_text)
 
 
@@ -2539,159 +2512,39 @@ def test_ssh_terminal_emulator_release_artifact_restores_local_tty_on_exit(tmp):
         )
 
 
-def test_ssh_forced_tty_remote_command_stream_reconnects_after_transport_loss(tmp):
+def test_ssh_no_terminal_emulator_tty_uses_proxy_without_diagnostics(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
-    kill_file = tmp / "kill-stream-transport"
     write_fake_ssh(fake_bin / "ssh")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SESSH_FAKE_SSH_KILL_BATCH_ONCE_FILE"] = str(kill_file)
     seed_remote_artifact_cache(env)
 
-    command = (
-        "printf 'STREAM_BEFORE\\n'; "
-        f": > {shlex.quote(str(kill_file))}; "
-        "sleep 0.2; "
-        "printf 'STREAM_AFTER\\n'"
-    )
-    result = run_sessh(["-tt", "test-host", command], env, timeout=40.0)
-
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if result.stdout != "STREAM_BEFORE\nSTREAM_AFTER\n":
-        raise AssertionError(result)
-    if "sessh: disconnected: Retry connecting 10sec" not in result.stderr:
-        raise AssertionError(result)
-    if "sessh: disconnected: Reconnecting..." not in result.stderr:
-        raise AssertionError(result)
-    if "\x1b[K" in result.stderr:
-        raise AssertionError(result)
-    log_text = fake_log.read_text()
-    if "kill_batch_triggered=1" not in log_text:
-        raise AssertionError(log_text)
-    if log_text.count("batch_mode=1") < 2:
-        raise AssertionError(log_text)
-
-
-def test_ssh_no_terminal_emulator_tty_reconnect_title_restores_app_title(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    kill_file = tmp / "kill-no_terminal_emulator-transport"
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SESSH_FAKE_SSH_KILL_BATCH_ONCE_FILE"] = str(kill_file)
-    seed_remote_artifact_cache(env)
-
-    command = (
-        "printf '\\033]2;remote-title\\033\\\\NO_TERMINAL_EMULATOR_READY\\r\\n'; "
-        f": > {shlex.quote(str(kill_file))}; "
-        "sleep 0.2; "
-        "printf 'NO_TERMINAL_EMULATOR_AFTER\\r\\n'"
-    )
+    command = "printf 'NO_TERMINAL_EMULATOR_READY\\r\\n'; exit 255"
     result = run_sesshmux_in_pty(
         [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", command],
         env,
         (
             (b"NO_TERMINAL_EMULATOR_READY", None),
-            (title_sequence("10sec retry CTRL-R").encode(), b"\x12"),
-            (b"NO_TERMINAL_EMULATOR_AFTER", None),
         ),
         timeout=30.0,
     )
 
-    if result.returncode != 0:
+    if result.returncode != 255:
         raise AssertionError(result)
-    if "sessh: disconnected:" in result.stdout:
+    combined = result.stdout + result.stderr
+    if "sessh: disconnected:" in combined:
         raise AssertionError(result)
-    if "CTRL-C detach" in result.stdout:
+    if "CTRL-C detach" in combined:
         raise AssertionError(result)
-    retry_index = result.stdout.find(title_sequence("10sec retry CTRL-R"))
-    restore_index = result.stdout.find(title_sequence("remote-title"), retry_index + 1)
-    if retry_index < 0 or restore_index < 0:
+    if "CTRL-R" in combined:
+        raise AssertionError(result)
+    if title_sequence("10sec retry CTRL-R") in combined:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "kill_batch_triggered=1" not in log_text:
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
-    if log_text.count("batch_mode=1") < 2:
-        raise AssertionError(log_text)
-
-
-def test_ssh_no_terminal_emulator_tty_escape_disconnects(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    seed_remote_artifact_cache(env)
-
-    result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "printf 'ESCAPE_READY\\r\\n'; while :; do sleep 1; done"],
-        env,
-        ((b"ESCAPE_READY", b"\r~."),),
-        timeout=10.0,
-    )
-
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if "~." in result.stdout:
-        raise AssertionError(result)
-
-
-def test_ssh_no_terminal_emulator_tty_escape_help(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    seed_remote_artifact_cache(env)
-
-    result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "printf 'HELP_READY\\r\\n'; while :; do sleep 1; done"],
-        env,
-        (
-            (b"HELP_READY", b"\r~?"),
-            (b"Supported escape sequences", b"\r~."),
-        ),
-        timeout=10.0,
-    )
-
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if "~.  disconnect" not in result.stdout:
-        raise AssertionError(result)
-    if "~~  send ~" not in result.stdout:
-        raise AssertionError(result)
-
-
-def test_ssh_no_terminal_emulator_tty_escape_doubled_tilde(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    seed_remote_artifact_cache(env)
-
-    result = run_sesshmux_in_pty(
-        [":internal-sessh:", "--no-terminal-emulator", "-tt", "test-host", "printf 'TILDE_READY\\r\\n'; IFS= read -r line; printf 'LINE:%s\\r\\n' \"$line\""],
-        env,
-        (
-            (b"TILDE_READY", b"~~hello\n"),
-            (b"LINE:~hello", None),
-        ),
-        timeout=10.0,
-    )
-
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if "LINE:~~hello" in result.stdout:
-        raise AssertionError(result)
 
 
 def test_ssh_terminal_emulator_tty_escape_doubled_tilde(tmp):
@@ -2806,10 +2659,10 @@ def test_ssh_forced_tty_remote_command_allocates_pty_with_stdin_null(tmp):
     if "fallback to plain-ssh" in result.stderr:
         raise AssertionError(result.stderr)
     log_text = fake_log.read_text()
-    if "plain_ssh=1" in log_text:
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
     trace_text = fake_trace.read_text()
-    runtime_invocation = re.search(r"event=parsed .*config_query=0 .*saw_t=1 request_tty=0", trace_text)
+    runtime_invocation = re.search(r"event=parsed .*config_query=0 .*request_tty=1", trace_text)
     if runtime_invocation is None:
         raise AssertionError(trace_text)
 
@@ -3007,14 +2860,14 @@ def test_ssh_unsupported_option_does_not_fallback_for_sessh_action(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
 
-    # `sesshmux` only accepts ssh arguments through --ssh-options. `-n` is
-    # intentionally unsafe for sessh's persistent transport, and this sesshmux
-    # action must reject it instead of falling back to plain ssh.
+    # `-n` requires proxy stream mode, and proxy streams are only used for new
+    # sessions. Management actions must reject it instead of falling back to
+    # plain ssh.
     result = run_sesshmux(["attach", "--ssh-options", "-n", "--host", "test-host", "s1"], env, timeout=5.0)
 
     if result.returncode != 64:
         raise AssertionError(result)
-    if "ssh option is not safe for sessh transport" not in result.stderr:
+    if "proxy stream mode is only supported for new sessions" not in result.stderr:
         raise AssertionError(result.stderr)
     if fake_log.exists():
         raise AssertionError(fake_log.read_text())
@@ -4527,7 +4380,9 @@ def test_ssh_unsupported_remote_platform_falls_back_to_plain_ssh(tmp):
         raise AssertionError(result)
     if "PLAIN_SSH host=test-host" not in result.stdout:
         raise AssertionError(result)
-    if "using plain-ssh-fallback without persistence" not in result.stderr:
+    if "no matching sessh binary is available" not in result.stderr:
+        raise AssertionError(result)
+    if "falling back to plain ssh without persistence" not in result.stderr:
         raise AssertionError(result)
     if "unsupported" not in result.stderr:
         raise AssertionError(result)
@@ -4850,8 +4705,8 @@ def main(argv=None):
             test_ssh_failure_uses_ssh_exit_status_and_visible_args,
         ),
         (
-            "ssh unsupported option falls back to plain ssh",
-            test_ssh_unsupported_option_falls_back_to_plain_ssh,
+            "ssh stdin-null option uses proxy stream",
+            test_ssh_stdin_null_option_uses_proxy_stream,
         ),
         (
             "ssh x11 uses proxy stream",
@@ -4922,8 +4777,8 @@ def main(argv=None):
             test_ssh_no_terminal_emulator_tty_propagates_resize,
         ),
         (
-            "ssh no-terminal-emulator forced tty marks stream as tty",
-            test_ssh_no_terminal_emulator_forced_tty_marks_stream_as_tty,
+            "ssh no-terminal-emulator forced tty uses proxy stream",
+            test_ssh_no_terminal_emulator_forced_tty_uses_proxy_stream,
         ),
         (
             "ssh no-terminal-emulator requested tty uses stream path",
@@ -4942,32 +4797,12 @@ def main(argv=None):
             test_ssh_terminal_emulator_cli_overrides_disabled_config,
         ),
         (
-            "ssh no-terminal-emulator tty uses single stream guid",
-            test_ssh_no_terminal_emulator_tty_uses_single_stream_guid,
-        ),
-        (
             "ssh no-terminal-emulator command in tty uses proxy stream",
             test_ssh_no_terminal_emulator_command_in_tty_uses_proxy_stream,
         ),
         (
-            "ssh forced tty remote command stream reconnects after transport loss",
-            test_ssh_forced_tty_remote_command_stream_reconnects_after_transport_loss,
-        ),
-        (
-            "ssh no-terminal-emulator tty reconnect title restores app title",
-            test_ssh_no_terminal_emulator_tty_reconnect_title_restores_app_title,
-        ),
-        (
-            "ssh no-terminal-emulator tty escape disconnects",
-            test_ssh_no_terminal_emulator_tty_escape_disconnects,
-        ),
-        (
-            "ssh no-terminal-emulator tty escape help",
-            test_ssh_no_terminal_emulator_tty_escape_help,
-        ),
-        (
-            "ssh no-terminal-emulator tty escape doubled tilde",
-            test_ssh_no_terminal_emulator_tty_escape_doubled_tilde,
+            "ssh no-terminal-emulator tty uses proxy without diagnostics",
+            test_ssh_no_terminal_emulator_tty_uses_proxy_without_diagnostics,
         ),
         (
             "ssh terminal-emulator tty escape doubled tilde",
@@ -5174,11 +5009,11 @@ def main(argv=None):
             test_ssh_leader_detach_exits_while_remote_output_is_flowing,
         ),
         (
-            "ssh unsupported remote platform uses plain-ssh-fallback",
+            "ssh unsupported remote platform without matching binary uses plain ssh",
             test_ssh_unsupported_remote_platform_falls_back_to_plain_ssh,
         ),
         (
-            "ssh unsupported remote platform does not use plain-ssh-fallback for attach",
+            "ssh unsupported remote platform without matching binary rejects attach",
             test_ssh_unsupported_remote_platform_does_not_plain_ssh_fallback_for_attach,
         ),
         (

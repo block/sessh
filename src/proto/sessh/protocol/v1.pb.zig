@@ -7,42 +7,34 @@ const fd = protobuf.fd;
 /// import package sessh.handshake.v1
 const sessh_handshake_v1 = @import("../handshake/v1.pb.zig");
 
-/// TTY streams carry one PTY input byte stream and one PTY output byte stream.
-pub const TtyStreamDirection = enum(i32) {
-    TTY_STREAM_DIRECTION_UNSPECIFIED = 0,
-    TTY_STREAM_DIRECTION_INPUT = 1,
-    TTY_STREAM_DIRECTION_OUTPUT = 2,
+pub const TeClientControlTargetKind = enum(i32) {
+    TE_CLIENT_CONTROL_TARGET_KIND_UNSPECIFIED = 0,
+    TE_CLIENT_CONTROL_TARGET_KIND_DEFAULT = 1,
+    TE_CLIENT_CONTROL_TARGET_KIND_ALL = 2,
+    TE_CLIENT_CONTROL_TARGET_KIND_LAST_INPUT = 3,
+    TE_CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID = 4,
     _,
 };
 
-pub const ClientControlTargetKind = enum(i32) {
-    CLIENT_CONTROL_TARGET_KIND_UNSPECIFIED = 0,
-    CLIENT_CONTROL_TARGET_KIND_DEFAULT = 1,
-    CLIENT_CONTROL_TARGET_KIND_ALL = 2,
-    CLIENT_CONTROL_TARGET_KIND_LAST_INPUT = 3,
-    CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID = 4,
+pub const TeSessionEndReason = enum(i32) {
+    TE_SESSION_END_REASON_UNSPECIFIED = 0,
+    TE_SESSION_END_REASON_PROCESS_EXITED = 1,
+    TE_SESSION_END_REASON_KILLED_BY_REQUEST = 2,
+    TE_SESSION_END_REASON_AGENT_SHUTDOWN = 3,
     _,
 };
 
-pub const SessionEndReason = enum(i32) {
-    SESSION_END_REASON_UNSPECIFIED = 0,
-    SESSION_END_REASON_PROCESS_EXITED = 1,
-    SESSION_END_REASON_KILLED_BY_REQUEST = 2,
-    SESSION_END_REASON_AGENT_SHUTDOWN = 3,
+pub const TeExitStatusKind = enum(i32) {
+    TE_EXIT_STATUS_KIND_UNSPECIFIED = 0,
+    TE_EXIT_STATUS_KIND_EXITED = 1,
+    TE_EXIT_STATUS_KIND_SIGNALLED = 2,
     _,
 };
 
-pub const ExitStatusKind = enum(i32) {
-    EXIT_STATUS_KIND_UNSPECIFIED = 0,
-    EXIT_STATUS_KIND_EXITED = 1,
-    EXIT_STATUS_KIND_SIGNALLED = 2,
-    _,
-};
-
-pub const TtyTranscriptStream = enum(i32) {
-    TTY_TRANSCRIPT_STREAM_UNSPECIFIED = 0,
-    TTY_TRANSCRIPT_STREAM_INNER_IN = 1,
-    TTY_TRANSCRIPT_STREAM_INNER_OUT = 2,
+pub const TeTtyTranscriptStream = enum(i32) {
+    TE_TTY_TRANSCRIPT_STREAM_UNSPECIFIED = 0,
+    TE_TTY_TRANSCRIPT_STREAM_INNER_IN = 1,
+    TE_TTY_TRANSCRIPT_STREAM_INNER_OUT = 2,
     _,
 };
 
@@ -62,27 +54,27 @@ pub const Frame = struct {
 
     pub const _payload_case = enum {
         @"error",
-        session_create,
-        session_attach,
-        input,
-        resize,
-        repaint_request,
-        session_created,
-        session_attached,
-        session_ended,
-        draw,
-        repaint_response,
-        tty_transcript_chunk,
-        input_ack,
-        session_live_state_query,
-        session_live_state,
-        session_client_control_response,
-        client_repaint_request,
-        client_detach_request,
-        session_client_detach_request,
-        session_client_repaint_request,
-        session_client_debug_sever_connection_request,
-        session_client_debug_unresponsive_connection_request,
+        te_session_create,
+        te_session_attach,
+        te_input,
+        te_resize,
+        te_repaint_request,
+        te_session_created,
+        te_session_attached,
+        te_session_ended,
+        te_draw,
+        te_repaint_response,
+        te_tty_transcript_chunk,
+        te_input_ack,
+        te_session_live_state_query,
+        te_session_live_state,
+        te_session_client_control_response,
+        te_client_repaint_request,
+        te_client_detach_request,
+        te_session_client_detach_request,
+        te_session_client_repaint_request,
+        te_session_client_debug_sever_connection_request,
+        te_session_client_debug_unresponsive_connection_request,
         ping,
         pong,
         proxy_stream_resume,
@@ -90,39 +82,30 @@ pub const Frame = struct {
         proxy_stream_ack,
         proxy_stream_eof,
         proxy_stream_eof_ack,
-        tty_stream_resume,
-        tty_stream_input,
-        tty_stream_output,
-        tty_stream_ack,
-        tty_stream_eof,
-        tty_stream_eof_ack,
-        tty_stream_resize,
-        tty_stream_exit_status,
-        tty_stream_exit_status_ack,
     };
     pub const payload_union = union(_payload_case) {
         @"error": sessh_handshake_v1.Error,
-        session_create: SessionCreate,
-        session_attach: SessionAttach,
-        input: Input,
-        resize: Resize,
-        repaint_request: RepaintRequest,
-        session_created: SessionCreated,
-        session_attached: SessionAttached,
-        session_ended: SessionEnded,
-        draw: Draw,
-        repaint_response: RepaintResponse,
-        tty_transcript_chunk: TtyTranscriptChunk,
-        input_ack: InputAck,
-        session_live_state_query: SessionLiveStateQuery,
-        session_live_state: SessionLiveState,
-        session_client_control_response: SessionClientControlResponse,
-        client_repaint_request: ClientRepaintRequest,
-        client_detach_request: ClientDetachRequest,
-        session_client_detach_request: SessionClientDetachRequest,
-        session_client_repaint_request: SessionClientRepaintRequest,
-        session_client_debug_sever_connection_request: SessionClientDebugSeverConnectionRequest,
-        session_client_debug_unresponsive_connection_request: SessionClientDebugUnresponsiveConnectionRequest,
+        te_session_create: TeSessionCreate,
+        te_session_attach: TeSessionAttach,
+        te_input: TeInput,
+        te_resize: TeResize,
+        te_repaint_request: TeRepaintRequest,
+        te_session_created: TeSessionCreated,
+        te_session_attached: TeSessionAttached,
+        te_session_ended: TeSessionEnded,
+        te_draw: TeDraw,
+        te_repaint_response: TeRepaintResponse,
+        te_tty_transcript_chunk: TeTtyTranscriptChunk,
+        te_input_ack: TeInputAck,
+        te_session_live_state_query: TeSessionLiveStateQuery,
+        te_session_live_state: TeSessionLiveState,
+        te_session_client_control_response: TeSessionClientControlResponse,
+        te_client_repaint_request: TeClientRepaintRequest,
+        te_client_detach_request: TeClientDetachRequest,
+        te_session_client_detach_request: TeSessionClientDetachRequest,
+        te_session_client_repaint_request: TeSessionClientRepaintRequest,
+        te_session_client_debug_sever_connection_request: TeSessionClientDebugSeverConnectionRequest,
+        te_session_client_debug_unresponsive_connection_request: TeSessionClientDebugUnresponsiveConnectionRequest,
         ping: Ping,
         pong: Pong,
         proxy_stream_resume: ProxyStreamResume,
@@ -130,38 +113,29 @@ pub const Frame = struct {
         proxy_stream_ack: ProxyStreamAck,
         proxy_stream_eof: ProxyStreamEof,
         proxy_stream_eof_ack: ProxyStreamEofAck,
-        tty_stream_resume: TtyStreamResume,
-        tty_stream_input: TtyStreamInput,
-        tty_stream_output: TtyStreamOutput,
-        tty_stream_ack: TtyStreamAck,
-        tty_stream_eof: TtyStreamEof,
-        tty_stream_eof_ack: TtyStreamEofAck,
-        tty_stream_resize: TtyStreamResize,
-        tty_stream_exit_status: TtyStreamExitStatus,
-        tty_stream_exit_status_ack: TtyStreamExitStatusAck,
         pub const _desc_table = .{
             .@"error" = fd(10, .submessage),
-            .session_create = fd(11, .submessage),
-            .session_attach = fd(12, .submessage),
-            .input = fd(13, .submessage),
-            .resize = fd(14, .submessage),
-            .repaint_request = fd(15, .submessage),
-            .session_created = fd(17, .submessage),
-            .session_attached = fd(18, .submessage),
-            .session_ended = fd(19, .submessage),
-            .draw = fd(20, .submessage),
-            .repaint_response = fd(22, .submessage),
-            .tty_transcript_chunk = fd(23, .submessage),
-            .input_ack = fd(24, .submessage),
-            .session_live_state_query = fd(25, .submessage),
-            .session_live_state = fd(26, .submessage),
-            .session_client_control_response = fd(28, .submessage),
-            .client_repaint_request = fd(29, .submessage),
-            .client_detach_request = fd(30, .submessage),
-            .session_client_detach_request = fd(27, .submessage),
-            .session_client_repaint_request = fd(31, .submessage),
-            .session_client_debug_sever_connection_request = fd(32, .submessage),
-            .session_client_debug_unresponsive_connection_request = fd(33, .submessage),
+            .te_session_create = fd(11, .submessage),
+            .te_session_attach = fd(12, .submessage),
+            .te_input = fd(13, .submessage),
+            .te_resize = fd(14, .submessage),
+            .te_repaint_request = fd(15, .submessage),
+            .te_session_created = fd(17, .submessage),
+            .te_session_attached = fd(18, .submessage),
+            .te_session_ended = fd(19, .submessage),
+            .te_draw = fd(20, .submessage),
+            .te_repaint_response = fd(22, .submessage),
+            .te_tty_transcript_chunk = fd(23, .submessage),
+            .te_input_ack = fd(24, .submessage),
+            .te_session_live_state_query = fd(25, .submessage),
+            .te_session_live_state = fd(26, .submessage),
+            .te_session_client_control_response = fd(28, .submessage),
+            .te_client_repaint_request = fd(29, .submessage),
+            .te_client_detach_request = fd(30, .submessage),
+            .te_session_client_detach_request = fd(27, .submessage),
+            .te_session_client_repaint_request = fd(31, .submessage),
+            .te_session_client_debug_sever_connection_request = fd(32, .submessage),
+            .te_session_client_debug_unresponsive_connection_request = fd(33, .submessage),
             .ping = fd(39, .submessage),
             .pong = fd(40, .submessage),
             .proxy_stream_resume = fd(43, .submessage),
@@ -169,15 +143,6 @@ pub const Frame = struct {
             .proxy_stream_ack = fd(45, .submessage),
             .proxy_stream_eof = fd(46, .submessage),
             .proxy_stream_eof_ack = fd(47, .submessage),
-            .tty_stream_resume = fd(48, .submessage),
-            .tty_stream_input = fd(49, .submessage),
-            .tty_stream_output = fd(50, .submessage),
-            .tty_stream_ack = fd(51, .submessage),
-            .tty_stream_eof = fd(52, .submessage),
-            .tty_stream_eof_ack = fd(53, .submessage),
-            .tty_stream_resize = fd(54, .submessage),
-            .tty_stream_exit_status = fd(55, .submessage),
-            .tty_stream_exit_status_ack = fd(56, .submessage),
         };
     };
 
@@ -583,629 +548,9 @@ pub const ProxyStreamEofAck = struct {
     }
 };
 
-/// Sent at the start of every ssh transport that carries a sessh-owned PTY
-/// stream. The receiver uses the offsets to resume PTY input and output from the
-/// first unacknowledged byte in each direction.
-pub const TtyStreamResume = struct {
-    input_recv_next_offset: u64 = 0,
-    output_recv_next_offset: u64 = 0,
-
-    pub const _desc_table = .{
-        .input_recv_next_offset = fd(1, .{ .scalar = .uint64 }),
-        .output_recv_next_offset = fd(2, .{ .scalar = .uint64 }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Raw bytes written toward the remote PTY.
-pub const TtyStreamInput = struct {
-    offset: u64 = 0,
-    data: []const u8 = &.{},
-
-    pub const _desc_table = .{
-        .offset = fd(1, .{ .scalar = .uint64 }),
-        .data = fd(2, .{ .scalar = .bytes }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Raw bytes read from the remote PTY.
-pub const TtyStreamOutput = struct {
-    offset: u64 = 0,
-    data: []const u8 = &.{},
-
-    pub const _desc_table = .{
-        .offset = fd(1, .{ .scalar = .uint64 }),
-        .data = fd(2, .{ .scalar = .bytes }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Acknowledges received TtyStreamInput or TtyStreamOutput bytes.
-pub const TtyStreamAck = struct {
-    stream: TtyStreamDirection = @enumFromInt(0),
-    offset: u64 = 0,
-
-    pub const _desc_table = .{
-        .stream = fd(1, .@"enum"),
-        .offset = fd(2, .{ .scalar = .uint64 }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Marks the end of this peer's outbound PTY input or output stream.
-pub const TtyStreamEof = struct {
-    stream: TtyStreamDirection = @enumFromInt(0),
-    offset: u64 = 0,
-
-    pub const _desc_table = .{
-        .stream = fd(1, .@"enum"),
-        .offset = fd(2, .{ .scalar = .uint64 }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Acknowledges that TtyStreamEof was received.
-pub const TtyStreamEofAck = struct {
-    stream: TtyStreamDirection = @enumFromInt(0),
-    offset: u64 = 0,
-
-    pub const _desc_table = .{
-        .stream = fd(1, .@"enum"),
-        .offset = fd(2, .{ .scalar = .uint64 }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// PTY size update for a sessh-owned TTY stream.
-pub const TtyStreamResize = struct {
-    terminal_rows: u32 = 0,
-    terminal_cols: u32 = 0,
-
-    pub const _desc_table = .{
-        .terminal_rows = fd(1, .{ .scalar = .uint32 }),
-        .terminal_cols = fd(2, .{ .scalar = .uint32 }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Exit status for the remote process behind a sessh-owned TTY stream. This is
-/// separate from TtyStreamEof because PTY output can close before the process
-/// exits. The sender waits for TtyStreamExitStatusAck before it lets the stream
-/// finish, otherwise a reconnect between the status write and the peer's read
-/// could lose the exit code.
-pub const TtyStreamExitStatus = struct {
-    exit_status: ?ExitStatus = null,
-
-    pub const _desc_table = .{
-        .exit_status = fd(1, .submessage),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Acknowledges that TtyStreamExitStatus was received.
-pub const TtyStreamExitStatusAck = struct {
-    pub const _desc_table = .{};
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
 /// A transport liveness probe. This is not application input and must not change
-/// stream offsets or terminal state. It currently matters most for non-tty
-/// streams, where stdin can be EOF and no user input may arrive to force a write
-/// failure, but the same framed transport can use it for tty sessions too.
+/// stream offsets or terminal state. It currently matters most for proxy streams,
+/// where stdin can be EOF and no user input may arrive to force a write failure.
 pub const Ping = struct {
     pub const _desc_table = .{};
 
@@ -1331,10 +676,10 @@ pub const Pong = struct {
     }
 };
 
-/// Embedded in SessionCreate.
+/// Embedded in TeSessionCreate.
 ///
 /// Initial terminal size used when creating a new PTY session.
-pub const TerminalSize = struct {
+pub const TeTerminalSize = struct {
     terminal_rows: u32 = 0,
     terminal_cols: u32 = 0,
 
@@ -1402,14 +747,14 @@ pub const TerminalSize = struct {
     }
 };
 
-/// Embedded in SessionCreate.
+/// Embedded in TeSessionCreate.
 ///
 /// Portable PTY settings captured from the client-side tty before sessh puts it
 /// into raw mode. This follows SSH's pty-req model: do not send a native
 /// termios struct, because those layouts and flag values are OS-specific.
-pub const TtySettings = struct {
+pub const TeTtySettings = struct {
     term: ?[]const u8 = null,
-    tty_mode: std.ArrayListUnmanaged(TtyMode) = .empty,
+    tty_mode: std.ArrayListUnmanaged(TeTtyMode) = .empty,
 
     pub const _desc_table = .{
         .term = fd(1, .{ .scalar = .string }),
@@ -1475,8 +820,8 @@ pub const TtySettings = struct {
     }
 };
 
-/// Embedded in TtySettings.
-pub const TtyMode = struct {
+/// Embedded in TeTtySettings.
+pub const TeTtyMode = struct {
     opcode: u32 = 0,
     value: u32 = 0,
 
@@ -1544,10 +889,10 @@ pub const TtyMode = struct {
     }
 };
 
-/// Embedded in SessionCreate.
+/// Embedded in TeSessionCreate.
 ///
 /// Environment value used when creating a new session.
-pub const EnvironmentEntry = struct {
+pub const TeEnvironmentEntry = struct {
     name: []const u8 = &.{},
     value: []const u8 = &.{},
 
@@ -1615,10 +960,10 @@ pub const EnvironmentEntry = struct {
     }
 };
 
-/// Embedded in SessionCreate.
+/// Embedded in TeSessionCreate.
 ///
 /// Outer terminal default colors reported by the client.
-pub const DefaultColors = struct {
+pub const TeDefaultColors = struct {
     foreground_color: u32 = 0,
     background_color: u32 = 0,
 
@@ -1686,11 +1031,11 @@ pub const DefaultColors = struct {
     }
 };
 
-/// Embedded in SessionCreate.
+/// Embedded in TeSessionCreate.
 ///
 /// Execs a program directly, preserving argv boundaries. Empty argv is treated
 /// the same as no command.
-pub const ExecCommand = struct {
+pub const TeExecCommand = struct {
     argv: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub const _desc_table = .{
@@ -1756,12 +1101,12 @@ pub const ExecCommand = struct {
     }
 };
 
-/// Embedded in SessionCreate.
+/// Embedded in TeSessionCreate.
 ///
 /// Evaluates a command string with the remote account's shell. An empty command
 /// is still a command; clients that want an interactive login shell must leave
-/// SessionCreate.command unset.
-pub const ShellCommand = struct {
+/// TeSessionCreate.command unset.
+pub const TeShellCommand = struct {
     command: []const u8 = &.{},
 
     pub const _desc_table = .{
@@ -1830,18 +1175,18 @@ pub const ShellCommand = struct {
 /// Framed payload, client -> session agent.
 ///
 /// Creates a new interactive PTY session without attaching this client. A
-/// successful SessionCreate is followed by SessionCreated. The client may then
-/// attach using SessionAttach on the same connection, or close the connection
+/// successful TeSessionCreate is followed by TeSessionCreated. The client may
+/// then attach using TeSessionAttach on the same connection, or close the connection
 /// and leave the session detached.
-pub const SessionCreate = struct {
-    terminal_size: ?TerminalSize = null,
+pub const TeSessionCreate = struct {
+    terminal_size: ?TeTerminalSize = null,
     scrollback_row_limit: u32 = 0,
-    environment: std.ArrayListUnmanaged(EnvironmentEntry) = .empty,
-    query_default_colors: ?DefaultColors = null,
+    environment: std.ArrayListUnmanaged(TeEnvironmentEntry) = .empty,
+    query_default_colors: ?TeDefaultColors = null,
     session_guid: []const u8 = &.{},
     session_alias: []const u8 = &.{},
     legacy_command_argv: std.ArrayListUnmanaged([]const u8) = .empty,
-    tty_settings: ?TtySettings = null,
+    tty_settings: ?TeTtySettings = null,
     command: ?command_union = null,
 
     pub const _command_case = enum {
@@ -1849,8 +1194,8 @@ pub const SessionCreate = struct {
         shell_command,
     };
     pub const command_union = union(_command_case) {
-        exec_command: ExecCommand,
-        shell_command: ShellCommand,
+        exec_command: TeExecCommand,
+        shell_command: TeShellCommand,
         pub const _desc_table = .{
             .exec_command = fd(8, .submessage),
             .shell_command = fd(9, .submessage),
@@ -1930,10 +1275,10 @@ pub const SessionCreate = struct {
 
 /// Framed payload, client -> session agent.
 ///
-/// Attaches to an existing session. A successful SessionAttach is followed by
-/// SessionAttached for the selected session, then Draw/RepaintResponse messages.
-pub const SessionAttach = struct {
-    resize: ?Resize = null,
+/// Attaches to an existing session. A successful TeSessionAttach is followed by
+/// TeSessionAttached for the selected session, then TeDraw/TeRepaintResponse messages.
+pub const TeSessionAttach = struct {
+    resize: ?TeResize = null,
     session_ref: []const u8 = &.{},
     capture_tty_transcript: bool = false,
     client_guid: []const u8 = &.{},
@@ -2009,7 +1354,7 @@ pub const SessionAttach = struct {
 /// Framed payload, client -> session agent.
 ///
 /// Local terminal input bytes.
-pub const Input = struct {
+pub const TeInput = struct {
     data: []const u8 = &.{},
     input_seq: u64 = 0,
 
@@ -2079,8 +1424,8 @@ pub const Input = struct {
 
 /// Framed payload, session agent -> client.
 ///
-/// Confirms that the session agent received an Input frame.
-pub const InputAck = struct {
+/// Confirms that the session agent received a TeInput frame.
+pub const TeInputAck = struct {
     input_seq: u64 = 0,
 
     pub const _desc_table = .{
@@ -2149,10 +1494,10 @@ pub const InputAck = struct {
 /// Framed payload, client -> session agent.
 ///
 /// Current terminal size for this attachment.
-pub const Resize = struct {
+pub const TeResize = struct {
     terminal_rows: u32 = 0,
     terminal_cols: u32 = 0,
-    repaint_request: ?RepaintRequest = null,
+    repaint_request: ?TeRepaintRequest = null,
     viewport_offset: ?i32 = null,
 
     pub const _desc_table = .{
@@ -2224,7 +1569,7 @@ pub const Resize = struct {
 /// Framed payload, client -> session agent.
 ///
 /// Requests that the session agent redraw terminal state for this attachment.
-pub const RepaintRequest = struct {
+pub const TeRepaintRequest = struct {
     repaint_request_seq: u64 = 0,
     scrollback_cursor: ?[]const u8 = null,
     initial_scrollback_rows: ?u32 = null,
@@ -2297,8 +1642,8 @@ pub const RepaintRequest = struct {
 /// Framed payload, session agent -> client.
 ///
 /// Requests that an attached client initiate its normal repaint flow by sending
-/// a RepaintRequest back to the session agent.
-pub const ClientRepaintRequest = struct {
+/// a TeRepaintRequest back to the session agent.
+pub const TeClientRepaintRequest = struct {
     include_scrollback: bool = false,
 
     pub const _desc_table = .{
@@ -2367,7 +1712,7 @@ pub const ClientRepaintRequest = struct {
 /// Framed payload, session agent -> client.
 ///
 /// Requests that an attached client detach using its normal local detach flow.
-pub const ClientDetachRequest = struct {
+pub const TeClientDetachRequest = struct {
     pub const _desc_table = .{};
 
     /// Encodes the message to the writer
@@ -2431,8 +1776,8 @@ pub const ClientDetachRequest = struct {
 
 /// Framed payload, session agent -> client.
 ///
-/// Confirms that a SessionCreate created the requested session.
-pub const SessionCreated = struct {
+/// Confirms that a TeSessionCreate created the requested session.
+pub const TeSessionCreated = struct {
     session_guid: []const u8 = &.{},
     session_alias: []const u8 = &.{},
     session_dir: []const u8 = &.{},
@@ -2505,7 +1850,7 @@ pub const SessionCreated = struct {
 /// Framed payload, session agent -> client.
 ///
 /// Confirms the session selected for this connection.
-pub const SessionAttached = struct {
+pub const TeSessionAttached = struct {
     session_guid: []const u8 = &.{},
     session_alias: []const u8 = &.{},
     session_dir: []const u8 = &.{},
@@ -2578,7 +1923,7 @@ pub const SessionAttached = struct {
 /// Framed payload, broker/client -> session agent.
 ///
 /// Queries the agent's current in-memory state for its live session.
-pub const SessionLiveStateQuery = struct {
+pub const TeSessionLiveStateQuery = struct {
     pub const _desc_table = .{};
 
     /// Encodes the message to the writer
@@ -2643,9 +1988,9 @@ pub const SessionLiveStateQuery = struct {
 /// Framed payload, session agent -> broker/client.
 ///
 /// In-memory live state for the session currently hosted by this agent.
-pub const SessionLiveState = struct {
+pub const TeSessionLiveState = struct {
     detached_at_unix_ms: ?u64 = null,
-    attached_clients: std.ArrayListUnmanaged(AttachedClient) = .empty,
+    attached_clients: std.ArrayListUnmanaged(TeAttachedClient) = .empty,
     last_input_at_unix_ms: ?u64 = null,
 
     pub const _desc_table = .{
@@ -2713,9 +2058,9 @@ pub const SessionLiveState = struct {
     }
 };
 
-pub const AttachedClient = struct {
+pub const TeAttachedClient = struct {
     client_guid: []const u8 = &.{},
-    terminal_size: ?TerminalSize = null,
+    terminal_size: ?TeTerminalSize = null,
     attached_at_unix_ms: u64 = 0,
     last_input_at_unix_ms: ?u64 = null,
 
@@ -2786,8 +2131,8 @@ pub const AttachedClient = struct {
 };
 
 /// Embedded in session-client-management requests.
-pub const ClientControlTarget = struct {
-    target_kind: ClientControlTargetKind = @enumFromInt(0),
+pub const TeClientControlTarget = struct {
+    target_kind: TeClientControlTargetKind = @enumFromInt(0),
     client_guid: []const u8 = &.{},
 
     pub const _desc_table = .{
@@ -2857,8 +2202,8 @@ pub const ClientControlTarget = struct {
 /// Framed payload, broker/client -> session agent.
 ///
 /// Requests normal detach behavior on one or more attached clients.
-pub const SessionClientDetachRequest = struct {
-    target: ?ClientControlTarget = null,
+pub const TeSessionClientDetachRequest = struct {
+    target: ?TeClientControlTarget = null,
 
     pub const _desc_table = .{
         .target = fd(1, .submessage),
@@ -2926,8 +2271,8 @@ pub const SessionClientDetachRequest = struct {
 /// Framed payload, broker/client -> session agent.
 ///
 /// Requests repaint behavior on one or more attached clients.
-pub const SessionClientRepaintRequest = struct {
-    target: ?ClientControlTarget = null,
+pub const TeSessionClientRepaintRequest = struct {
+    target: ?TeClientControlTarget = null,
     include_scrollback: bool = false,
 
     pub const _desc_table = .{
@@ -2997,8 +2342,8 @@ pub const SessionClientRepaintRequest = struct {
 /// Framed payload, broker/client -> session agent.
 ///
 /// Debug-only request that severs one or more attached client connections.
-pub const SessionClientDebugSeverConnectionRequest = struct {
-    target: ?ClientControlTarget = null,
+pub const TeSessionClientDebugSeverConnectionRequest = struct {
+    target: ?TeClientControlTarget = null,
 
     pub const _desc_table = .{
         .target = fd(1, .submessage),
@@ -3068,8 +2413,8 @@ pub const SessionClientDebugSeverConnectionRequest = struct {
 /// Debug-only request that makes one or more attached client connections stop
 /// responding for a bounded duration. Omitted or zero seconds asks the receiver
 /// to use its default debug-unresponsive duration.
-pub const SessionClientDebugUnresponsiveConnectionRequest = struct {
-    target: ?ClientControlTarget = null,
+pub const TeSessionClientDebugUnresponsiveConnectionRequest = struct {
+    target: ?TeClientControlTarget = null,
     seconds: u32 = 0,
 
     pub const _desc_table = .{
@@ -3139,7 +2484,7 @@ pub const SessionClientDebugUnresponsiveConnectionRequest = struct {
 /// Framed payload, session agent -> broker/client.
 ///
 /// Confirms which attached clients were affected by a client-control request.
-pub const SessionClientControlResponse = struct {
+pub const TeSessionClientControlResponse = struct {
     affected_client_guid: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub const _desc_table = .{
@@ -3205,8 +2550,8 @@ pub const SessionClientControlResponse = struct {
     }
 };
 
-pub const ExitStatus = struct {
-    kind: ExitStatusKind = @enumFromInt(0),
+pub const TeExitStatus = struct {
+    kind: TeExitStatusKind = @enumFromInt(0),
     status: i32 = 0,
 
     pub const _desc_table = .{
@@ -3276,9 +2621,9 @@ pub const ExitStatus = struct {
 /// Framed payload, session agent -> client.
 ///
 /// Tells an attached client that the session has ended.
-pub const SessionEnded = struct {
-    reason: SessionEndReason = @enumFromInt(0),
-    exit_status: ?ExitStatus = null,
+pub const TeSessionEnded = struct {
+    reason: TeSessionEndReason = @enumFromInt(0),
+    exit_status: ?TeExitStatus = null,
     ended_at_unix_ms: ?u64 = null,
 
     pub const _desc_table = .{
@@ -3349,7 +2694,7 @@ pub const SessionEnded = struct {
 /// Framed payload, session agent -> client.
 ///
 /// Session-agent-generated terminal bytes for the attached session.
-pub const Draw = struct {
+pub const TeDraw = struct {
     scrollback_cursor: []const u8 = &.{},
     viewport_offset: ?i32 = null,
     draw_bytes: []const u8 = &.{},
@@ -3425,11 +2770,11 @@ pub const Draw = struct {
 
 /// Framed payload, session agent -> client.
 ///
-/// Response for a RepaintRequest. The embedded Draw is applied exactly like a
-/// framed Draw.
-pub const RepaintResponse = struct {
+/// Response for a TeRepaintRequest. The embedded TeDraw is applied exactly like a
+/// framed TeDraw.
+pub const TeRepaintResponse = struct {
     repaint_request_seq: u64 = 0,
-    draw: ?Draw = null,
+    draw: ?TeDraw = null,
 
     pub const _desc_table = .{
         .repaint_request_seq = fd(1, .{ .scalar = .uint64 }),
@@ -3498,8 +2843,8 @@ pub const RepaintResponse = struct {
 /// Framed payload, session agent -> client.
 ///
 /// Raw inner PTY bytes captured for a client-requested tty transcript.
-pub const TtyTranscriptChunk = struct {
-    stream: TtyTranscriptStream = @enumFromInt(0),
+pub const TeTtyTranscriptChunk = struct {
+    stream: TeTtyTranscriptStream = @enumFromInt(0),
     data: []const u8 = &.{},
 
     pub const _desc_table = .{

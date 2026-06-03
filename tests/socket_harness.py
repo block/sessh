@@ -38,26 +38,26 @@ HELLO_REQUEST = "hello_request"
 HELLO_OK = "hello_ok"
 HELLO_ERROR = "hello_error"
 ERROR = "error"
-SESSION_CREATE = "session_create"
-SESSION_ATTACH = "session_attach"
-INPUT = "input"
-RESIZE = "resize"
-REPAINT_REQUEST = "repaint_request"
-SESSION_CREATED = "session_created"
-SESSION_ATTACHED = "session_attached"
-SESSION_ENDED = "session_ended"
-DRAW = "draw"
-REPAINT_RESPONSE = "repaint_response"
-INPUT_ACK = "input_ack"
-SESSION_LIVE_STATE_QUERY = "session_live_state_query"
-SESSION_LIVE_STATE = "session_live_state"
-SESSION_CLIENT_CONTROL_RESPONSE = "session_client_control_response"
-CLIENT_REPAINT_REQUEST = "client_repaint_request"
-CLIENT_DETACH_REQUEST = "client_detach_request"
-SESSION_CLIENT_DETACH_REQUEST = "session_client_detach_request"
-SESSION_CLIENT_REPAINT_REQUEST = "session_client_repaint_request"
-SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST = "session_client_debug_sever_connection_request"
-SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST = "session_client_debug_unresponsive_connection_request"
+SESSION_CREATE = "te_session_create"
+SESSION_ATTACH = "te_session_attach"
+INPUT = "te_input"
+RESIZE = "te_resize"
+REPAINT_REQUEST = "te_repaint_request"
+SESSION_CREATED = "te_session_created"
+SESSION_ATTACHED = "te_session_attached"
+SESSION_ENDED = "te_session_ended"
+DRAW = "te_draw"
+REPAINT_RESPONSE = "te_repaint_response"
+INPUT_ACK = "te_input_ack"
+SESSION_LIVE_STATE_QUERY = "te_session_live_state_query"
+SESSION_LIVE_STATE = "te_session_live_state"
+SESSION_CLIENT_CONTROL_RESPONSE = "te_session_client_control_response"
+CLIENT_REPAINT_REQUEST = "te_client_repaint_request"
+CLIENT_DETACH_REQUEST = "te_client_detach_request"
+SESSION_CLIENT_DETACH_REQUEST = "te_session_client_detach_request"
+SESSION_CLIENT_REPAINT_REQUEST = "te_session_client_repaint_request"
+SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST = "te_session_client_debug_sever_connection_request"
+SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST = "te_session_client_debug_unresponsive_connection_request"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -368,7 +368,7 @@ def sessh_hpb():
 
 
 def pack_input(value, input_seq=0):
-    return sessh_pb().Input(data=value, input_seq=input_seq).SerializeToString()
+    return sessh_pb().TeInput(data=value, input_seq=input_seq).SerializeToString()
 
 
 def pack_bytes(value):
@@ -387,7 +387,7 @@ def pack_session_create(
     tty_settings=None,
 ):
     pb = sessh_pb()
-    message = pb.SessionCreate(scrollback_row_limit=scrollback)
+    message = pb.TeSessionCreate(scrollback_row_limit=scrollback)
     message.session_guid = guid_for_ref(session_id)
     if not is_guid_ref(session_id):
         message.session_alias = session_id
@@ -418,7 +418,7 @@ def pack_session_create(
 def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_ref="", client_guid=None):
     global _NEXT_REPAINT_REQUEST_SEQ, _NEXT_CLIENT_GUID
     pb = sessh_pb()
-    message = pb.SessionAttach()
+    message = pb.TeSessionAttach()
     message.session_ref = session_ref
     if client_guid is None:
         client_guid = client_guid_for_index(_NEXT_CLIENT_GUID)
@@ -446,7 +446,7 @@ def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_
 def send_resize(conn, rows=24, cols=80, repaint=None, viewport_offset=None):
     global _LAST_RESIZE
     _LAST_RESIZE = (rows, cols)
-    message = sessh_pb().Resize(terminal_rows=rows, terminal_cols=cols)
+    message = sessh_pb().TeResize(terminal_rows=rows, terminal_cols=cols)
     if viewport_offset is not None:
         message.viewport_offset = viewport_offset
     if repaint is not None:
@@ -463,7 +463,7 @@ def send_resize(conn, rows=24, cols=80, repaint=None, viewport_offset=None):
 def send_resize_screen_repaint(conn, rows, cols, repaint_request_seq, viewport_offset=None):
     global _LAST_RESIZE
     _LAST_RESIZE = (rows, cols)
-    message = sessh_pb().Resize(terminal_rows=rows, terminal_cols=cols)
+    message = sessh_pb().TeResize(terminal_rows=rows, terminal_cols=cols)
     if viewport_offset is not None:
         message.viewport_offset = viewport_offset
     message.repaint_request.repaint_request_seq = repaint_request_seq
@@ -471,44 +471,44 @@ def send_resize_screen_repaint(conn, rows, cols, repaint_request_seq, viewport_o
 
 
 def pack_repaint(repaint_request_seq, scrollback_cursor=None, scrollback_epoch=0):
-    message = sessh_pb().RepaintRequest(repaint_request_seq=repaint_request_seq)
+    message = sessh_pb().TeRepaintRequest(repaint_request_seq=repaint_request_seq)
     if scrollback_cursor is not None:
         message.scrollback_cursor = encode_request_scrollback_cursor(scrollback_epoch, scrollback_cursor)
     return message.SerializeToString()
 
 
 def parse_input_ack(payload):
-    message = sessh_pb().InputAck()
+    message = sessh_pb().TeInputAck()
     message.ParseFromString(payload)
     return message.input_seq
 
 
 def parse_session_ended(payload):
-    message = sessh_pb().SessionEnded()
+    message = sessh_pb().TeSessionEnded()
     message.ParseFromString(payload)
     return message
 
 
 def assert_session_attached(payload):
-    message = sessh_pb().SessionAttached()
+    message = sessh_pb().TeSessionAttached()
     message.ParseFromString(payload)
     return message
 
 
 def assert_session_created(payload):
-    message = sessh_pb().SessionCreated()
+    message = sessh_pb().TeSessionCreated()
     message.ParseFromString(payload)
     return message
 
 
 def parse_session_live_state(payload):
-    message = sessh_pb().SessionLiveState()
+    message = sessh_pb().TeSessionLiveState()
     message.ParseFromString(payload)
     return message
 
 
 def parse_client_repaint_request(payload):
-    message = sessh_pb().ClientRepaintRequest()
+    message = sessh_pb().TeClientRepaintRequest()
     message.ParseFromString(payload)
     return message
 
@@ -547,7 +547,7 @@ def create_and_attach_session(
 
 
 def parse_draw(payload):
-    message = sessh_pb().Draw()
+    message = sessh_pb().TeDraw()
     message.ParseFromString(payload)
     if not message.scrollback_cursor:
         raise AssertionError(f"missing scrollback cursor: {payload!r}")
@@ -563,7 +563,7 @@ def parse_draw(payload):
 
 
 def parse_repaint_response(payload):
-    message = sessh_pb().RepaintResponse()
+    message = sessh_pb().TeRepaintResponse()
     message.ParseFromString(payload)
     if not message.HasField("draw"):
         raise AssertionError(f"missing repaint response draw: {payload!r}")
@@ -807,7 +807,7 @@ def query_session_live_state(env, session_id="s1"):
     try:
         conn.connect(str(socket_path(env, session_id)))
         send_hello(conn)
-        send_frame(conn, SESSION_LIVE_STATE_QUERY, sessh_pb().SessionLiveStateQuery().SerializeToString())
+        send_frame(conn, SESSION_LIVE_STATE_QUERY, sessh_pb().TeSessionLiveStateQuery().SerializeToString())
         message_type, payload = recv_frame(conn)
         if message_type != SESSION_LIVE_STATE:
             raise AssertionError(f"expected SESSION_LIVE_STATE, got {message_type}")
@@ -858,7 +858,7 @@ def socket_path(env, session_id="s1"):
 
 
 def actual_socket_path(env, session_id="s1"):
-    return runtime_root(env) / "s" / compact_guid(guid_for_ref(session_id))
+    return runtime_root(env) / "a" / compact_guid(guid_for_ref(session_id))
 
 
 def agent_sock_link_path(env, session_id="s1"):
@@ -868,10 +868,10 @@ def agent_sock_link_path(env, session_id="s1"):
 def ensure_agent_socket_link(env, session_id="s1"):
     path = session_dir(env, session_id)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (runtime_root(env) / "s").mkdir(mode=0o700, parents=True, exist_ok=True)
+    (runtime_root(env) / "a").mkdir(mode=0o700, parents=True, exist_ok=True)
     link = path / "agent.sock"
     if not link.exists() and not link.is_symlink():
-        link.symlink_to(Path("../../s") / compact_guid(guid_for_ref(session_id)))
+        link.symlink_to(Path("../../a") / compact_guid(guid_for_ref(session_id)))
 
 
 def start_session_agent(env, session_id="s1"):
@@ -1528,11 +1528,11 @@ def run_session_ended_payload_protocol_test(base_env):
 
             ended = parse_session_ended(recv_until_message(conn, SESSION_ENDED))
             pb = sessh_pb()
-            if ended.reason != pb.SESSION_END_REASON_PROCESS_EXITED:
+            if ended.reason != pb.TE_SESSION_END_REASON_PROCESS_EXITED:
                 raise AssertionError(f"unexpected process-exit reason: {ended!r}")
             if not ended.HasField("exit_status"):
                 raise AssertionError(f"missing process exit status: {ended!r}")
-            if ended.exit_status.kind != pb.EXIT_STATUS_KIND_EXITED or ended.exit_status.status != 7:
+            if ended.exit_status.kind != pb.TE_EXIT_STATUS_KIND_EXITED or ended.exit_status.status != 7:
                 raise AssertionError(f"unexpected process exit status: {ended!r}")
             if not ended.HasField("ended_at_unix_ms"):
                 raise AssertionError(f"missing end timestamp: {ended!r}")
@@ -1570,7 +1570,7 @@ def run_session_ended_payload_protocol_test(base_env):
             os.kill(proc.pid, signal.SIGTERM)
             ended = parse_session_ended(recv_until_message(conn, SESSION_ENDED))
             pb = sessh_pb()
-            if ended.reason != pb.SESSION_END_REASON_KILLED_BY_REQUEST:
+            if ended.reason != pb.TE_SESSION_END_REASON_KILLED_BY_REQUEST:
                 raise AssertionError(f"unexpected killed reason: {ended!r}")
             if ended.HasField("exit_status"):
                 raise AssertionError(f"killed-by-request should not report a wait status: {ended!r}")

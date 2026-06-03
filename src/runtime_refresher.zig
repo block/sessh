@@ -100,7 +100,7 @@ const PathSet = struct {
         defer allocator.free(sessions_dir);
         try set.add(allocator, sessions_dir);
 
-        const sockets_dir = try session_registry.sessionSocketsDirInRoot(allocator, runtime_root);
+        const sockets_dir = try session_registry.agentSocketsDirInRoot(allocator, runtime_root);
         defer allocator.free(sockets_dir);
         try set.add(allocator, sockets_dir);
 
@@ -261,7 +261,7 @@ test "refresh pass marks session runtime paths sticky without following symlinks
 
     const sessions_dir = try session_registry.sessionsDirInRoot(allocator, root);
     defer allocator.free(sessions_dir);
-    const sockets_dir = try std.fmt.allocPrint(allocator, "{s}/s", .{root});
+    const sockets_dir = try session_registry.agentSocketsDirInRoot(allocator, root);
     defer allocator.free(sockets_dir);
 
     try std.testing.expect((try statNoFollow(root)).mode & sticky_bit != 0);

@@ -13,7 +13,6 @@ const reconnect = @import("reconnect.zig");
 const session_registry = @import("session_registry.zig");
 const stream_agent = @import("stream_agent.zig");
 const terminal = @import("terminal.zig");
-const tty_settings = @import("tty_settings.zig");
 const tty_transcript = @import("tty_transcript.zig");
 const pb = protocol.pb;
 
@@ -376,9 +375,6 @@ pub fn runMux(allocator: std.mem.Allocator, args: []const []const u8, strict_com
             .allow_mux_command_words = true,
         };
         var translated = translateMuxArgsForInvocation(allocator, args, invocation) catch |err| {
-            if (invocation == .sessh and shouldUsePlainSshFallbackForMuxNewArgError(args, err)) {
-                try runPlainSshFallbackForMuxNewArgs(allocator, args, err);
-            }
             try printSshArgError(err);
             return process_exit.request(64);
         };
@@ -1212,9 +1208,6 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         else => return err,
     };
     var parsed_ssh_args = if (route_ref_args) |parsed| parsed else parseSshArgs(allocator, args, parse_options) catch |err| {
-        if (!parse_options.allow_mux_command_words and shouldUsePlainSshFallbackForArgError(args, err)) {
-            try runPlainSshFallbackForUnsupportedArgs(allocator, args, err);
-        }
         try printSshArgError(err);
         return process_exit.request(64);
     };
@@ -1300,6 +1293,10 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             return process_exit.request(64);
         }
     }
+    if (parsed_ssh_args.action != .new and (parsed_ssh_args.force_proxy_mode or parsed_ssh_args.proxy_required)) {
+        try io.writeAll(2, "sessh: proxy stream mode is only supported for new sessions\n");
+        return process_exit.request(64);
+    }
     if (parsed_ssh_args.capture_tty_transcript != null and isRemoteManagementAction(parsed_ssh_args.action)) {
         try io.writeAll(2, "sessh: --capture-tty-transcript is only supported for new and attach sessions\n");
         return process_exit.request(64);
@@ -1316,13 +1313,6 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             return process_exit.request(64);
         }
         try runProxyStreamSsh(allocator, args[0], parsed_ssh_args);
-    }
-    if (shouldUseTtyStream(parsed_ssh_args, stdin_is_tty)) {
-        if (parsed_ssh_args.capture_tty_transcript != null) {
-            try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with tty stream mode\n");
-            return process_exit.request(64);
-        }
-        try runTtyStreamSsh(allocator, parsed_ssh_args, stdin_is_tty);
     }
 
     const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
@@ -3145,26 +3135,12 @@ fn shouldUseStreamPath(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool 
     // `ssh HOST command` does not allocate a remote tty even when local stdin is
     // a tty, so it uses the stream path. `-t` only requests a remote tty when
     // local stdin is a tty. `-tt` with local stdin still uses sessh's normal
-    // session path; without local stdin it uses a tty stream PTY so stdout
-    // stays shaped like OpenSSH instead of receiving sessh renderer cleanup.
+    // terminal-emulator session path; without local stdin it stays on the
+    // stream path and lets the visible outer ssh allocate the PTY.
     return switch (parsed_ssh_args.tty_request) {
         .none => true,
         .requested => !stdin_is_tty,
         .forced => !stdin_is_tty,
-    };
-}
-
-fn shouldUseTtyStream(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
-    if (!shouldUseStreamPath(parsed_ssh_args, stdin_is_tty)) return false;
-    if (parsed_ssh_args.force_proxy_mode or parsed_ssh_args.proxy_required) return false;
-    return streamPathUsesTty(parsed_ssh_args, stdin_is_tty);
-}
-
-fn streamPathUsesTty(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
-    return switch (parsed_ssh_args.tty_request) {
-        .forced => true,
-        .requested => stdin_is_tty,
-        .none => stdin_is_tty and parsed_ssh_args.shell_command_args.len == 0,
     };
 }
 
@@ -3252,112 +3228,6 @@ const StreamClientStarter = struct {
     }
 };
 
-fn runTtyStreamSsh(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) !noreturn {
-    const stream_guid = try session_registry.generateTtyGuid(allocator);
-    defer allocator.free(stream_guid);
-    session_registry.writeOutgoingTtyStreamHint(allocator, stream_guid) catch |err| {
-        client_log.debug("event=outgoing_tty_stream_hint_write_failed stream={s} error={t}", .{ stream_guid, err });
-    };
-    defer session_registry.removeOutgoingTtyStreamHint(allocator, stream_guid) catch |err| {
-        client_log.debug("event=outgoing_tty_stream_hint_remove_failed stream={s} error={t}", .{ stream_guid, err });
-    };
-    const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
-    defer if (shell_command) |command| allocator.free(command);
-    const command_arg = try encodeStreamCommandArg(allocator, shell_command);
-    defer allocator.free(command_arg);
-    // TTY stream mode exposes the user's real terminal directly when one is
-    // present, so its TERM belongs with the portable tty modes.
-    var local_tty_settings = tty_settings.capture(allocator, 0, .{ .include_term = true }) catch |err| blk: {
-        client_log.debug("event=stream_tty_settings_capture_failed error={t}", .{err});
-        break :blk null;
-    };
-    defer if (local_tty_settings) |*settings| settings.deinit(allocator);
-    const term_arg = try encodeStreamTermArg(allocator, if (local_tty_settings) |settings| settings.term else null);
-    defer allocator.free(term_arg);
-    const tty_modes_arg = try encodeStreamTtyModesArg(allocator, if (local_tty_settings) |settings| settings.modes else &.{});
-    defer allocator.free(tty_modes_arg);
-
-    var artifacts = try loadArtifactSet(allocator);
-    defer artifacts.deinit();
-    const remote_command = try bootstrapCommand(allocator);
-    defer allocator.free(remote_command);
-
-    const size = terminal.currentWindowSize();
-    const rows_arg = try std.fmt.allocPrint(allocator, "{}", .{size.rows});
-    defer allocator.free(rows_arg);
-    const cols_arg = try std.fmt.allocPrint(allocator, "{}", .{size.cols});
-    defer allocator.free(cols_arg);
-    const broker_args = [_][]const u8{
-        stream_guid,
-        "tty",
-        rows_arg,
-        cols_arg,
-        command_arg,
-        term_arg,
-        tty_modes_arg,
-    };
-
-    var parsed_transport_args = parsed_ssh_args;
-    // OpenSSH is only the transport. sessh owns the remote PTY, so user
-    // `-t`/`-tt` decides whether we use this path but is not forwarded to the
-    // transport ssh.
-    parsed_transport_args.tty_request = .none;
-    var starter = StreamClientStarter{
-        .allocator = allocator,
-        .parsed_ssh_args = parsed_transport_args,
-        .artifacts = &artifacts,
-        .remote_command = remote_command,
-        .bootstrap_entrypoint = .stream_broker,
-        .broker_args = broker_args[0..],
-        .stderr_mode = .forward,
-    };
-
-    var input_mode_guard: ?terminal.TerminalModeGuard = if (stdin_is_tty)
-        try terminal.TerminalModeGuard.enable(0)
-    else
-        null;
-    defer if (input_mode_guard) |*guard| guard.restore();
-
-    // TTY stream output is application data. If it is a terminal, title
-    // updates are the least invasive reconnect UI. If stdout is redirected,
-    // keep it byte-clean and use append-only stderr lines. The plain stderr
-    // form deliberately does not require stderr to be a terminal: it is also
-    // useful in logs, and write failures are ignored by the status renderer.
-    const status_mode = streamReconnectStatusMode(c.isatty(1) != 0);
-
-    const exit_status = stream_agent.runLocalStream(allocator, &starter, .{
-        .protocol = .tty,
-        .source_fd = 0,
-        .sink_fd = 1,
-        .stderr_fd = 2,
-        .status_mode = status_mode,
-        .intercept_ctrl_r = stdin_is_tty,
-        .intercept_escape = stdin_is_tty,
-        .receive_stderr = false,
-        .forward_resize = true,
-        .title_fallback = parsed_ssh_args.host,
-    }) catch |err| {
-        if (input_mode_guard) |*guard| guard.restore();
-        session_registry.removeOutgoingTtyStreamHint(allocator, stream_guid) catch |remove_err| {
-            client_log.debug("event=outgoing_tty_stream_hint_remove_failed stream={s} error={t}", .{ stream_guid, remove_err });
-        };
-        try starter.exitAfterInitialFailure(err);
-        unreachable;
-    };
-    // process_exit.request calls std.process.exit in release artifacts, which
-    // does not run Zig defers. Restore the user's terminal before requesting
-    // the ssh-compatible exit status.
-    if (input_mode_guard) |*guard| guard.restore();
-    session_registry.removeOutgoingTtyStreamHint(allocator, stream_guid) catch |err| {
-        client_log.debug("event=outgoing_tty_stream_hint_remove_failed stream={s} error={t}", .{ stream_guid, err });
-    };
-    return process_exit.request(exit_status);
-}
-
-fn streamReconnectStatusMode(stdout_is_tty: bool) stream_agent.StreamReconnectStatusMode {
-    return if (stdout_is_tty) .title else .stderr_plain;
-}
-
 fn proxyStreamReconnectStatusMode() stream_agent.StreamReconnectStatusMode {
     // Proxy mode is a byte-clean ProxyCommand for an outer OpenSSH process.
     // Status text written by the proxy can reach the user's terminal while the
@@ -3370,8 +3240,7 @@ fn shouldUseProxyStream(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool
     if (parsed_ssh_args.action != .new) return false;
     if (parsed_ssh_args.command_argv.len != 0) return false;
     if (parsed_ssh_args.force_proxy_mode or parsed_ssh_args.proxy_required) return true;
-    return shouldUseStreamPath(parsed_ssh_args, stdin_is_tty) and
-        !streamPathUsesTty(parsed_ssh_args, stdin_is_tty);
+    return shouldUseStreamPath(parsed_ssh_args, stdin_is_tty);
 }
 
 // Proxy stream mode is for SSH features that OpenSSH must own directly, such
@@ -3430,6 +3299,10 @@ fn appendProxyTransportSshOptions(
     var i: usize = 0;
     while (i < options.len) {
         const value_index = sshOptionSeparateValueIndex(options, i);
+        if (isSshTtyRequestOption(options[i])) {
+            i += 1;
+            continue;
+        }
         if (sshOptionRequiresOuterProxy(options, i)) {
             i = if (value_index) |index| index + 1 else i + 1;
             continue;
@@ -3450,7 +3323,6 @@ fn appendProxyTransportSshOptions(
 fn sshOptionRequiresOuterProxy(options: []const []const u8, index: usize) bool {
     const arg = options[index];
     if (arg.len < 2 or arg[0] != '-' or std.mem.startsWith(u8, arg, "--")) return false;
-    if (sshTtyRequestCount(arg) != null) return false;
 
     var pos: usize = 1;
     while (pos < arg.len) : (pos += 1) {
@@ -3542,14 +3414,10 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
     };
 
     const exit_status = stream_agent.runLocalStream(allocator, &starter, .{
-        .protocol = .proxy,
         .source_fd = 0,
         .sink_fd = 1,
-        .stderr_fd = 2,
         .status_mode = proxyStreamReconnectStatusMode(),
         .intercept_ctrl_r = false,
-        .receive_stderr = false,
-        .expect_exit_status = false,
         .title_fallback = invocation.host,
     }) catch |err| {
         session_registry.removeOutgoingProxyHint(allocator, proxy_guid) catch |remove_err| {
@@ -3615,24 +3483,6 @@ fn printProxyStreamArgError(err: anyerror) !void {
     }
 }
 
-fn encodeStreamCommandArg(allocator: std.mem.Allocator, shell_command: ?[]const u8) ![]u8 {
-    const command = shell_command orelse return allocator.dupe(u8, "-");
-    return encodeBase64Arg(allocator, command);
-}
-
-fn encodeStreamTermArg(allocator: std.mem.Allocator, term: ?[]const u8) ![]u8 {
-    const value = term orelse return allocator.dupe(u8, "-");
-    if (value.len == 0) return allocator.dupe(u8, ".");
-    return encodeBase64Arg(allocator, value);
-}
-
-fn encodeStreamTtyModesArg(allocator: std.mem.Allocator, modes: []const tty_settings.Mode) ![]u8 {
-    if (modes.len == 0) return allocator.dupe(u8, "-");
-    const mode_bytes = try tty_settings.encodeModes(allocator, modes);
-    defer allocator.free(mode_bytes);
-    return encodeBase64Arg(allocator, mode_bytes);
-}
-
 fn encodeBase64Arg(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
     _ = std.base64.standard.Encoder.encode(encoded, bytes);
@@ -3644,120 +3494,6 @@ fn appendShellToken(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value
     const quoted = try shellQuote(allocator, value);
     defer allocator.free(quoted);
     try out.appendSlice(allocator, quoted);
-}
-
-fn shouldUsePlainSshFallbackForArgError(args: []const []const u8, err: anyerror) bool {
-    switch (err) {
-        error.UnsupportedSshOption,
-        error.UnsafeSshOption,
-        error.UnsupportedSesshOption,
-        error.UnsupportedSesshCliOption,
-        error.RemoteCommandUnsupported,
-        => {},
-        else => return false,
-    }
-
-    return !hasSesshSpecificRequest(args);
-}
-
-fn shouldUsePlainSshFallbackForMuxNewArgError(args: []const []const u8, err: anyerror) bool {
-    if (args.len < 2 or !std.mem.eql(u8, args[1], "new")) return false;
-    switch (err) {
-        error.UnsupportedSshOption,
-        error.UnsafeSshOption,
-        error.UnsupportedMuxOption,
-        error.UnsupportedSesshCliOption,
-        error.RemoteCommandUnsupported,
-        => {},
-        else => return false,
-    }
-
-    return !muxNewHasSesshSpecificRequest(args[2..]);
-}
-
-fn muxNewHasSesshSpecificRequest(args: []const []const u8) bool {
-    var host_seen = false;
-    var i: usize = 0;
-    while (i < args.len) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--") or std.mem.eql(u8, arg, "--ssh-options") or isSesshLongOption(arg)) {
-            return true;
-        }
-
-        if (!host_seen and std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "-")) {
-            if (std.mem.startsWith(u8, arg, "--")) return false;
-            var pos: usize = 1;
-            var consumed_value = false;
-            while (pos < arg.len) : (pos += 1) {
-                if (sshOptionConsumesValueForHostScan(arg[pos])) {
-                    i += if (pos + 1 < arg.len) 1 else 2;
-                    consumed_value = true;
-                    break;
-                }
-            }
-            if (!consumed_value) i += 1;
-            continue;
-        }
-
-        if (!host_seen) host_seen = true;
-        i += 1;
-    }
-    return false;
-}
-
-fn hasSesshSpecificRequest(args: []const []const u8) bool {
-    const host_index = plainSshHostIndex(args);
-    const before_host_end = host_index orelse args.len;
-
-    var i: usize = 1;
-    while (i < before_host_end) : (i += 1) {
-        if (isSesshLongOption(args[i])) return true;
-    }
-
-    const host = host_index orelse return false;
-    i = host + 1;
-    while (i < args.len) {
-        const arg = args[i];
-        if (!isSesshLongOption(arg)) return false;
-        return true;
-    }
-
-    return false;
-}
-
-fn plainSshHostIndex(args: []const []const u8) ?usize {
-    var i: usize = 1;
-    while (i < args.len) {
-        const arg = args[i];
-        if (arg.len == 0) return i;
-
-        if (std.mem.eql(u8, arg, "--")) {
-            return if (i + 1 < args.len) i + 1 else null;
-        }
-
-        if (!std.mem.startsWith(u8, arg, "-") or std.mem.eql(u8, arg, "-")) return i;
-
-        if (std.mem.startsWith(u8, arg, "--")) {
-            i += 1;
-            continue;
-        }
-
-        var pos: usize = 1;
-        var consumed_value = false;
-        while (pos < arg.len) : (pos += 1) {
-            if (sshOptionConsumesValueForHostScan(arg[pos])) {
-                if (pos + 1 < arg.len) {
-                    i += 1;
-                } else {
-                    i += 2;
-                }
-                consumed_value = true;
-                break;
-            }
-        }
-        if (!consumed_value) i += 1;
-    }
-    return null;
 }
 
 fn sshOptionConsumesValueForHostScan(option: u8) bool {
@@ -3792,42 +3528,14 @@ fn unsupportedPlatformAction(action: SshAction) []const u8 {
     };
 }
 
-fn runPlainSshFallbackForUnsupportedArgs(allocator: std.mem.Allocator, args: []const []const u8, err: anyerror) !noreturn {
-    try io.stderrPrint(
-        "sessh: fallback to plain-ssh due to {s}; persistence disabled\n",
-        .{plainSshFallbackReason(err)},
-    );
-    try runPlainSshArgv(allocator, args[1..], "plain-ssh-fallback");
-}
-
-fn runPlainSshFallbackForMuxNewArgs(allocator: std.mem.Allocator, args: []const []const u8, err: anyerror) !noreturn {
-    try io.stderrPrint(
-        "sessh: fallback to plain-ssh due to {s}; persistence disabled\n",
-        .{plainSshFallbackReason(err)},
-    );
-    try runPlainSshArgv(allocator, args[2..], "plain-ssh-fallback");
-}
-
-fn plainSshFallbackReason(err: anyerror) []const u8 {
-    return switch (err) {
-        error.RemoteCommandUnsupported => "non-interactive invocation",
-        error.UnsafeSshOption => "ssh option incompatible with sessh transport",
-        error.UnsupportedSshOption => "unsupported ssh option",
-        error.UnsupportedMuxOption => "unsupported ssh option",
-        error.UnsupportedSesshOption => "unsupported post-host argument",
-        error.UnsupportedSesshCliOption => "unsupported sessh option",
-        else => "unsupported invocation",
-    };
-}
-
 fn runPlainSshFallback(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, platform: ?Platform) !noreturn {
     if (platform) |remote_platform| {
         try io.stderrPrint(
-            "sessh: remote platform {s} {s} is unsupported; using plain-ssh-fallback without persistence\n",
+            "sessh: no matching sessh binary for remote platform {s} {s}; falling back to plain ssh without persistence\n",
             .{ remote_platform.os, remote_platform.arch },
         );
     } else {
-        try io.writeAll(2, "sessh: remote platform is unsupported; using plain-ssh-fallback without persistence\n");
+        try io.writeAll(2, "sessh: remote platform is unsupported and no matching sessh binary is available; falling back to plain ssh without persistence\n");
     }
 
     const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + 1);
@@ -4841,7 +4549,7 @@ fn isSafeSshFlag(option: u8) bool {
 }
 
 fn isUnsafeSshFlag(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "fGntV", option) != null;
+    return std.mem.indexOfScalar(u8, "GtV", option) != null;
 }
 
 fn sshOptionRequiresValue(option: u8) bool {
@@ -4853,7 +4561,7 @@ fn isUnsafeSshOptionWithValue(option: u8) bool {
 }
 
 fn isProxyRequiredSshFlag(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "AaMNsXxYy", option) != null;
+    return std.mem.indexOfScalar(u8, "AafMNsXxYyn", option) != null;
 }
 
 fn isProxyRequiredSshOptionWithValue(option: u8) bool {
@@ -5609,11 +5317,6 @@ test "ssh verbosity maps to inferred client log level" {
 test "parseSshArgs rejects protocol-breaking ssh options" {
     try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "-n",
-        "example.com",
-    }, .{}));
-    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
         "-G",
         "example.com",
     }, .{}));
@@ -5641,6 +5344,22 @@ test "parseSshArgs routes OpenSSH-owned options to proxy stream mode" {
     }, .{});
     try std.testing.expect(agent.proxy_required);
     try std.testing.expect(shouldUseProxyStream(agent, true));
+
+    const stdin_null = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "-n",
+        "example.com",
+    }, .{});
+    try std.testing.expect(stdin_null.proxy_required);
+    try std.testing.expect(shouldUseProxyStream(stdin_null, true));
+
+    const fork_after_auth = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "-f",
+        "example.com",
+    }, .{});
+    try std.testing.expect(fork_after_auth.proxy_required);
+    try std.testing.expect(shouldUseProxyStream(fork_after_auth, true));
 
     const forward = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
@@ -5692,6 +5411,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
         "-X",
+        "-tt",
         "-L",
         "8080:localhost:80",
         "-o",
@@ -5715,6 +5435,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "ForwardAgent=yes") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "8080:localhost:80") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "'-X'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "'-tt'") == null);
 }
 
 test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
@@ -5775,8 +5496,6 @@ test "stream routing preserves ssh remote command tty semantics" {
     try std.testing.expect(shouldUseStreamPath(command, true));
     try std.testing.expect(shouldUseProxyStream(command, false));
     try std.testing.expect(shouldUseProxyStream(command, true));
-    try std.testing.expect(!shouldUseTtyStream(command, false));
-    try std.testing.expect(!shouldUseTtyStream(command, true));
 
     const single = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
@@ -5788,8 +5507,6 @@ test "stream routing preserves ssh remote command tty semantics" {
     try std.testing.expect(!shouldUseStreamPath(single, true));
     try std.testing.expect(shouldUseProxyStream(single, false));
     try std.testing.expect(!shouldUseProxyStream(single, true));
-    try std.testing.expect(!shouldUseTtyStream(single, false));
-    try std.testing.expect(!shouldUseTtyStream(single, true));
 
     const forced = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
@@ -5799,9 +5516,7 @@ test "stream routing preserves ssh remote command tty semantics" {
     }, .{});
     try std.testing.expect(shouldUseStreamPath(forced, false));
     try std.testing.expect(!shouldUseStreamPath(forced, true));
-    try std.testing.expect(shouldUseTtyStream(forced, false));
-    try std.testing.expect(!shouldUseTtyStream(forced, true));
-    try std.testing.expect(!shouldUseProxyStream(forced, false));
+    try std.testing.expect(shouldUseProxyStream(forced, false));
     try std.testing.expect(!shouldUseProxyStream(forced, true));
 }
 
@@ -5825,11 +5540,7 @@ test "no terminal emulator forces stream path and preserves ssh tty semantics" {
     try std.testing.expect(interactive.terminal_emulator_set);
     try std.testing.expect(shouldUseStreamPath(interactive, true));
     try std.testing.expect(shouldUseStreamPath(interactive, false));
-    try std.testing.expect(streamPathUsesTty(interactive, true));
-    try std.testing.expect(!streamPathUsesTty(interactive, false));
-    try std.testing.expect(shouldUseTtyStream(interactive, true));
-    try std.testing.expect(!shouldUseTtyStream(interactive, false));
-    try std.testing.expect(!shouldUseProxyStream(interactive, true));
+    try std.testing.expect(shouldUseProxyStream(interactive, true));
     try std.testing.expect(shouldUseProxyStream(interactive, false));
 
     const command = try parseSshArgs(std.testing.allocator, &.{
@@ -5841,9 +5552,7 @@ test "no terminal emulator forces stream path and preserves ssh tty semantics" {
     }, .{});
     try std.testing.expect(!command.terminal_emulator);
     try std.testing.expect(shouldUseStreamPath(command, true));
-    try std.testing.expect(!streamPathUsesTty(command, true));
     try std.testing.expect(shouldUseProxyStream(command, true));
-    try std.testing.expect(!shouldUseTtyStream(command, true));
 
     const forced = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
@@ -5854,9 +5563,7 @@ test "no terminal emulator forces stream path and preserves ssh tty semantics" {
     }, .{});
     try std.testing.expect(!forced.terminal_emulator);
     try std.testing.expect(shouldUseStreamPath(forced, false));
-    try std.testing.expect(streamPathUsesTty(forced, false));
-    try std.testing.expect(shouldUseTtyStream(forced, false));
-    try std.testing.expect(!shouldUseProxyStream(forced, false));
+    try std.testing.expect(shouldUseProxyStream(forced, false));
 
     const requested_with_tty = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
@@ -5867,9 +5574,7 @@ test "no terminal emulator forces stream path and preserves ssh tty semantics" {
     }, .{});
     try std.testing.expect(!requested_with_tty.terminal_emulator);
     try std.testing.expect(shouldUseStreamPath(requested_with_tty, true));
-    try std.testing.expect(streamPathUsesTty(requested_with_tty, true));
-    try std.testing.expect(shouldUseTtyStream(requested_with_tty, true));
-    try std.testing.expect(!shouldUseProxyStream(requested_with_tty, true));
+    try std.testing.expect(shouldUseProxyStream(requested_with_tty, true));
 
     const requested_without_tty = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
@@ -5879,52 +5584,7 @@ test "no terminal emulator forces stream path and preserves ssh tty semantics" {
         "tty",
     }, .{});
     try std.testing.expect(shouldUseStreamPath(requested_without_tty, false));
-    try std.testing.expect(!streamPathUsesTty(requested_without_tty, false));
     try std.testing.expect(shouldUseProxyStream(requested_without_tty, false));
-    try std.testing.expect(!shouldUseTtyStream(requested_without_tty, false));
-}
-
-test "plain ssh fallback is allowed for transport-incompatible plain ssh invocations" {
-    try std.testing.expect(shouldUsePlainSshFallbackForArgError(&.{
-        "sessh",
-        "-N",
-        "example.com",
-    }, error.UnsafeSshOption));
-    try std.testing.expect(!shouldUsePlainSshFallbackForArgError(&.{
-        "sessh",
-        "-N",
-        "example.com",
-        "--alias",
-        "s1",
-    }, error.UnsafeSshOption));
-    try std.testing.expect(shouldUsePlainSshFallbackForMuxNewArgError(&.{
-        "sessh",
-        "new",
-        "-N",
-        "example.com",
-    }, error.UnsafeSshOption));
-    try std.testing.expect(shouldUsePlainSshFallbackForMuxNewArgError(&.{
-        "sessh",
-        "new",
-        "example.com",
-        "echo",
-        "hello",
-    }, error.RemoteCommandUnsupported));
-    try std.testing.expect(!shouldUsePlainSshFallbackForMuxNewArgError(&.{
-        "sessh",
-        "new",
-        "--alias",
-        "s1",
-        "-N",
-        "example.com",
-    }, error.UnsafeSshOption));
-    try std.testing.expect(!shouldUsePlainSshFallbackForMuxNewArgError(&.{
-        "sessh",
-        "attach",
-        "-N",
-        "example.com",
-        "s1",
-    }, error.UnsafeSshOption));
 }
 
 test "parseSshArgs permits explicit safe config overrides" {
@@ -6311,11 +5971,6 @@ test "brokerArgsForAction uses broker subcommands" {
         .client_repaint_scrollback = true,
         .client_session_ref = "s1",
     }, &buf));
-}
-
-test "stream reconnect status uses stderr when stdout is redirected" {
-    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.title, streamReconnectStatusMode(true));
-    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, streamReconnectStatusMode(false));
 }
 
 test "proxy stream reconnect status is disabled by default" {

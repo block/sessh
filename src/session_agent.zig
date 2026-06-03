@@ -1501,8 +1501,8 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
                 continue;
             },
-            .resize => continue,
-            .session_create => {
+            .te_resize => continue,
+            .te_session_create => {
                 var request = readSessionCreateRequest(frame.payload) catch {
                     try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid SESSION_CREATE payload", "");
                     return false;
@@ -1543,27 +1543,27 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                 try sendSessionCreatedForSession(session_agent, fd, session, alias);
                 continue;
             },
-            .session_live_state_query => {
+            .te_session_live_state_query => {
                 try sendSessionLiveState(session_agent, fd);
                 return false;
             },
-            .session_client_detach_request => {
+            .te_session_client_detach_request => {
                 try handleSessionClientDetachRequest(session_agent, fd, frame.payload);
                 return false;
             },
-            .session_client_repaint_request => {
+            .te_session_client_repaint_request => {
                 try handleSessionClientRepaintRequest(session_agent, fd, frame.payload);
                 return false;
             },
-            .session_client_debug_sever_connection_request => {
+            .te_session_client_debug_sever_connection_request => {
                 try handleSessionClientDebugSeverConnectionRequest(session_agent, fd, frame.payload);
                 return false;
             },
-            .session_client_debug_unresponsive_connection_request => {
+            .te_session_client_debug_unresponsive_connection_request => {
                 try handleSessionClientDebugUnresponsiveConnectionRequest(session_agent, fd, frame.payload);
                 return false;
             },
-            .session_attach => {
+            .te_session_attach => {
                 var request = try readAttachRequest(frame.payload);
                 defer request.deinit();
                 const session_index = if (request.session_ref.len > 0)
@@ -1810,23 +1810,23 @@ fn attachedCount(session_agent: *SessionAgent, session_index: usize) u32 {
 fn sendSessionAttachedForSession(session_agent: *const SessionAgent, attachment: *Attachment, session: *const Session) !void {
     const maybe_alias = try session_registry.primaryAliasForGuid(app_allocator.allocator(), session.idSlice());
     defer if (maybe_alias) |alias| app_allocator.allocator().free(alias);
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionAttached{
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionAttached{
         .session_guid = session.idSlice(),
         .session_alias = maybe_alias orelse "",
         .session_dir = sessionDirSlice(session_agent),
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .session_attached, payload);
+    try queueAttachmentFrame(attachment, .te_session_attached, payload);
 }
 
 fn sendSessionCreatedForSession(session_agent: *const SessionAgent, fd: c.fd_t, session: *const Session, alias: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionCreated{
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionCreated{
         .session_guid = session.idSlice(),
         .session_alias = alias,
         .session_dir = sessionDirSlice(session_agent),
     });
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .session_created, payload);
+    try protocol.sendFrame(fd, .te_session_created, payload);
 }
 
 fn sendSessionLiveState(session_agent: *SessionAgent, fd: c.fd_t) !void {
@@ -1835,7 +1835,7 @@ fn sendSessionLiveState(session_agent: *SessionAgent, fd: c.fd_t) !void {
         return;
     };
     const session = &session_agent.sessions[session_index];
-    var response = pb.SessionLiveState{};
+    var response = pb.TeSessionLiveState{};
     defer response.attached_clients.deinit(app_allocator.allocator());
 
     if (session.detached_at_unix_ms != 0) response.detached_at_unix_ms = session.detached_at_unix_ms;
@@ -1855,7 +1855,7 @@ fn sendSessionLiveState(session_agent: *SessionAgent, fd: c.fd_t) !void {
 
     const payload = try protocol.encodePayload(app_allocator.allocator(), response);
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .session_live_state, payload);
+    try protocol.sendFrame(fd, .te_session_live_state, payload);
 }
 
 const CapturedClientControlGuids = struct {
@@ -1865,7 +1865,7 @@ const CapturedClientControlGuids = struct {
 };
 
 fn handleSessionClientDetachRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.SessionClientDetachRequest, app_allocator.allocator(), payload);
+    var request = try protocol.decodePayload(pb.TeSessionClientDetachRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
     var selected: [max_attachments]usize = undefined;
     const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
@@ -1878,7 +1878,7 @@ fn handleSessionClientDetachRequest(session_agent: *SessionAgent, fd: c.fd_t, pa
 }
 
 fn handleSessionClientRepaintRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.SessionClientRepaintRequest, app_allocator.allocator(), payload);
+    var request = try protocol.decodePayload(pb.TeSessionClientRepaintRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
     var selected: [max_attachments]usize = undefined;
     const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
@@ -1891,7 +1891,7 @@ fn handleSessionClientRepaintRequest(session_agent: *SessionAgent, fd: c.fd_t, p
 }
 
 fn handleSessionClientDebugSeverConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.SessionClientDebugSeverConnectionRequest, app_allocator.allocator(), payload);
+    var request = try protocol.decodePayload(pb.TeSessionClientDebugSeverConnectionRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
     var selected: [max_attachments]usize = undefined;
     const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
@@ -1904,7 +1904,7 @@ fn handleSessionClientDebugSeverConnectionRequest(session_agent: *SessionAgent, 
 }
 
 fn handleSessionClientDebugUnresponsiveConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.SessionClientDebugUnresponsiveConnectionRequest, app_allocator.allocator(), payload);
+    var request = try protocol.decodePayload(pb.TeSessionClientDebugUnresponsiveConnectionRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
     var selected: [max_attachments]usize = undefined;
     const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
@@ -1926,7 +1926,7 @@ fn handleSessionClientDebugUnresponsiveConnectionRequest(session_agent: *Session
 fn resolveClientControlTargetsOrSend(
     session_agent: *SessionAgent,
     fd: c.fd_t,
-    maybe_target: ?pb.ClientControlTarget,
+    maybe_target: ?pb.TeClientControlTarget,
     selected: *[max_attachments]usize,
 ) !?usize {
     const session_index = findMostRecentSessionIndex(session_agent) orelse {
@@ -1962,27 +1962,27 @@ fn captureSelectedClientControlGuids(session_agent: *const SessionAgent, selecte
 }
 
 fn sendClientControlResponse(fd: c.fd_t, captured: CapturedClientControlGuids) !void {
-    var response = pb.SessionClientControlResponse{};
+    var response = pb.TeSessionClientControlResponse{};
     defer response.affected_client_guid.deinit(app_allocator.allocator());
     for (captured.bufs[0..captured.count], captured.lens[0..captured.count]) |*buf, len| {
         try response.affected_client_guid.append(app_allocator.allocator(), buf[0..len]);
     }
     const response_payload = try protocol.encodePayload(app_allocator.allocator(), response);
     defer app_allocator.allocator().free(response_payload);
-    try protocol.sendFrame(fd, .session_client_control_response, response_payload);
+    try protocol.sendFrame(fd, .te_session_client_control_response, response_payload);
 }
 
 fn resolveClientControlTargets(
     session_agent: *const SessionAgent,
     session_index: usize,
-    target: pb.ClientControlTarget,
+    target: pb.TeClientControlTarget,
     selected: *[max_attachments]usize,
 ) !usize {
     return switch (target.target_kind) {
-        .CLIENT_CONTROL_TARGET_KIND_DEFAULT => resolveDefaultClientTarget(session_agent, session_index, selected),
-        .CLIENT_CONTROL_TARGET_KIND_ALL => resolveAllClientTargets(session_agent, session_index, selected),
-        .CLIENT_CONTROL_TARGET_KIND_LAST_INPUT => resolveLastInputClientTarget(session_agent, session_index, selected),
-        .CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID => resolveClientGuidTarget(session_agent, session_index, target.client_guid, selected),
+        .TE_CLIENT_CONTROL_TARGET_KIND_DEFAULT => resolveDefaultClientTarget(session_agent, session_index, selected),
+        .TE_CLIENT_CONTROL_TARGET_KIND_ALL => resolveAllClientTargets(session_agent, session_index, selected),
+        .TE_CLIENT_CONTROL_TARGET_KIND_LAST_INPUT => resolveLastInputClientTarget(session_agent, session_index, selected),
+        .TE_CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID => resolveClientGuidTarget(session_agent, session_index, target.client_guid, selected),
         else => error.InvalidClientControlTarget,
     };
 }
@@ -2119,12 +2119,12 @@ fn requestClientDetachFromControl(session_agent: *SessionAgent, attachment_index
     if (attachment_index >= session_agent.attachments.len) return;
     const attachment = &session_agent.attachments[attachment_index];
     if (!attachment.active or attachment.close_after_flush) return;
-    const payload = protocol.encodePayload(app_allocator.allocator(), pb.ClientDetachRequest{}) catch {
+    const payload = protocol.encodePayload(app_allocator.allocator(), pb.TeClientDetachRequest{}) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };
     defer app_allocator.allocator().free(payload);
-    queueAttachmentFrame(attachment, .client_detach_request, payload) catch {
+    queueAttachmentFrame(attachment, .te_client_detach_request, payload) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };
@@ -2135,14 +2135,14 @@ fn requestClientRepaintFromControl(session_agent: *SessionAgent, attachment_inde
     if (attachment_index >= session_agent.attachments.len) return;
     const attachment = &session_agent.attachments[attachment_index];
     if (!attachment.active or attachment.close_after_flush) return;
-    const payload = protocol.encodePayload(app_allocator.allocator(), pb.ClientRepaintRequest{
+    const payload = protocol.encodePayload(app_allocator.allocator(), pb.TeClientRepaintRequest{
         .include_scrollback = include_scrollback,
     }) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };
     defer app_allocator.allocator().free(payload);
-    queueAttachmentFrame(attachment, .client_repaint_request, payload) catch {
+    queueAttachmentFrame(attachment, .te_client_repaint_request, payload) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };
@@ -2154,42 +2154,42 @@ fn sessionDirSlice(session_agent: *const SessionAgent) []const u8 {
 }
 
 fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !void {
-    const exit_status: ?pb.ExitStatus = switch (exit_info.kind) {
-        1 => .{ .kind = .EXIT_STATUS_KIND_EXITED, .status = exit_info.status },
-        2 => .{ .kind = .EXIT_STATUS_KIND_SIGNALLED, .status = exit_info.status },
+    const exit_status: ?pb.TeExitStatus = switch (exit_info.kind) {
+        1 => .{ .kind = .TE_EXIT_STATUS_KIND_EXITED, .status = exit_info.status },
+        2 => .{ .kind = .TE_EXIT_STATUS_KIND_SIGNALLED, .status = exit_info.status },
         else => null,
     };
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.SessionEnded{
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionEnded{
         .reason = switch (reason) {
-            1 => .SESSION_END_REASON_KILLED_BY_REQUEST,
-            2 => .SESSION_END_REASON_AGENT_SHUTDOWN,
-            else => .SESSION_END_REASON_PROCESS_EXITED,
+            1 => .TE_SESSION_END_REASON_KILLED_BY_REQUEST,
+            2 => .TE_SESSION_END_REASON_AGENT_SHUTDOWN,
+            else => .TE_SESSION_END_REASON_PROCESS_EXITED,
         },
         .exit_status = exit_status,
         .ended_at_unix_ms = if (exit_info.ended_at_unix_ms == 0) null else exit_info.ended_at_unix_ms,
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .session_ended, payload);
+    try queueAttachmentFrame(attachment, .te_session_ended, payload);
 }
 
 fn queueTtyTranscriptChunk(
     attachment: *Attachment,
-    stream: pb.TtyTranscriptStream,
+    stream: pb.TeTtyTranscriptStream,
     bytes: []const u8,
 ) !void {
     if (!attachment.capture_tty_transcript or bytes.len == 0) return;
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TtyTranscriptChunk{
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeTtyTranscriptChunk{
         .stream = stream,
         .data = bytes,
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .tty_transcript_chunk, payload);
+    try queueAttachmentFrame(attachment, .te_tty_transcript_chunk, payload);
 }
 
 fn queueTtyTranscriptChunkForSession(
     session_agent: *SessionAgent,
     session_index: usize,
-    stream: pb.TtyTranscriptStream,
+    stream: pb.TeTtyTranscriptStream,
     bytes: []const u8,
 ) void {
     if (bytes.len == 0) return;
@@ -2254,7 +2254,7 @@ fn queueDrawFrame(
 ) !void {
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
     encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.Draw{
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeDraw{
         .scrollback_cursor = encoded_cursor[0..],
         .viewport_offset = attachment.presentation.protocolViewportOffset(),
         .draw_bytes = draw_bytes,
@@ -2262,7 +2262,7 @@ fn queueDrawFrame(
         .relay_end_restore_bytes = relay_end_restore_bytes,
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .draw, payload);
+    try queueAttachmentFrame(attachment, .te_draw, payload);
 }
 
 fn appendDrawCleanup(draw_bytes: *std.ArrayList(u8)) !void {
@@ -2531,7 +2531,7 @@ fn queueRepaintResponseFrame(
 ) !void {
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
     encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.RepaintResponse{
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeRepaintResponse{
         .repaint_request_seq = repaint_request_seq,
         .draw = .{
             .scrollback_cursor = encoded_cursor[0..],
@@ -2542,7 +2542,7 @@ fn queueRepaintResponseFrame(
         },
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .repaint_response, payload);
+    try queueAttachmentFrame(attachment, .te_repaint_response, payload);
 }
 
 fn queueRepaintResponseDraw(
@@ -2724,7 +2724,7 @@ fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
 }
 
 fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
-    var message = try protocol.decodePayload(pb.SessionCreate, app_allocator.allocator(), payload);
+    var message = try protocol.decodePayload(pb.TeSessionCreate, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     const terminal_size = message.terminal_size orelse return error.MissingTerminalSize;
     if (!session_registry.isValidSessionGuid(message.session_guid)) return error.InvalidSessionGuid;
@@ -2780,7 +2780,7 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
     };
 }
 
-fn readTtySettings(message: pb.TtySettings) !tty_settings.Settings {
+fn readTtySettings(message: pb.TeTtySettings) !tty_settings.Settings {
     var modes = try app_allocator.allocator().alloc(tty_settings.Mode, message.tty_mode.items.len);
     errdefer app_allocator.allocator().free(modes);
     for (message.tty_mode.items, 0..) |mode, i| {
@@ -2808,14 +2808,14 @@ fn registerSessionAlias(session_guid: []const u8, requested_alias: []const u8) !
     return session_registry.createDefaultAliasForGuid(app_allocator.allocator(), session_guid);
 }
 
-fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.EnvironmentEntry) !void {
+fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.TeEnvironmentEntry) !void {
     if (std.mem.eql(u8, entry.name, "SHELL") and entry.value.len > 0) {
         if (environment.shell) |shell| app_allocator.allocator().free(shell);
         environment.shell = try app_allocator.allocator().dupe(u8, entry.value);
     }
 }
 
-fn readDefaultColors(colors: pb.DefaultColors) !vt.DefaultColors {
+fn readDefaultColors(colors: pb.TeDefaultColors) !vt.DefaultColors {
     return .{
         .foreground_color = try readDefaultColorValue(colors.foreground_color),
         .background_color = try readDefaultColorValue(colors.background_color),
@@ -2823,12 +2823,12 @@ fn readDefaultColors(colors: pb.DefaultColors) !vt.DefaultColors {
 }
 
 fn readResizePayload(payload: []const u8) !ResizePayload {
-    var message = try protocol.decodePayload(pb.Resize, app_allocator.allocator(), payload);
+    var message = try protocol.decodePayload(pb.TeResize, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     return try resizePayloadFromMessage(message);
 }
 
-fn terminalSizePayloadFromMessage(message: pb.TerminalSize) !TerminalSizePayload {
+fn terminalSizePayloadFromMessage(message: pb.TeTerminalSize) !TerminalSizePayload {
     if (message.terminal_rows > std.math.maxInt(u16) or
         message.terminal_cols > std.math.maxInt(u16))
     {
@@ -2840,7 +2840,7 @@ fn terminalSizePayloadFromMessage(message: pb.TerminalSize) !TerminalSizePayload
     };
 }
 
-fn resizePayloadFromMessage(message: pb.Resize) !ResizePayload {
+fn resizePayloadFromMessage(message: pb.TeResize) !ResizePayload {
     if (message.terminal_rows > std.math.maxInt(u16) or
         message.terminal_cols > std.math.maxInt(u16))
     {
@@ -2859,7 +2859,7 @@ fn resizePayloadFromMessage(message: pb.Resize) !ResizePayload {
 }
 
 fn readAttachRequest(payload: []const u8) !AttachRequest {
-    var message = try protocol.decodePayload(pb.SessionAttach, app_allocator.allocator(), payload);
+    var message = try protocol.decodePayload(pb.TeSessionAttach, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     const resize = message.resize orelse return error.MissingResize;
     if (message.session_ref.len > 0 and !session_registry.isValidSessionRef(message.session_ref)) return error.InvalidSessionRef;
@@ -2873,12 +2873,12 @@ fn readAttachRequest(payload: []const u8) !AttachRequest {
 }
 
 fn readRepaintRequest(payload: []const u8) !RepaintRequest {
-    var message = try protocol.decodePayload(pb.RepaintRequest, app_allocator.allocator(), payload);
+    var message = try protocol.decodePayload(pb.TeRepaintRequest, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     return repaintRequestFromMessage(message);
 }
 
-fn repaintRequestFromMessage(message: pb.RepaintRequest) !RepaintRequest {
+fn repaintRequestFromMessage(message: pb.TeRepaintRequest) !RepaintRequest {
     return .{
         .repaint_request_seq = message.repaint_request_seq,
         .scrollback_cursor = if (message.scrollback_cursor) |cursor|
@@ -3268,7 +3268,7 @@ fn flushSessionRenderBarrier(session_agent: *SessionAgent, session_index: usize,
 
 fn feedSessionOutputBytes(session_agent: *SessionAgent, session_index: usize, bytes: []const u8) !void {
     const session = &session_agent.sessions[session_index];
-    queueTtyTranscriptChunkForSession(session_agent, session_index, .TTY_TRANSCRIPT_STREAM_INNER_OUT, bytes);
+    queueTtyTranscriptChunkForSession(session_agent, session_index, .TE_TTY_TRANSCRIPT_STREAM_INNER_OUT, bytes);
     if (session.terminal_model) |model| {
         const starts_at_boundary = model.isPlainTextParserBoundary();
         var barrier_context = RenderBarrierContext{
@@ -3302,9 +3302,9 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
     defer frame.deinit(app_allocator.allocator());
 
     switch (frame.message_type) {
-        .input => handleInputFrame(session_agent, attachment_index, frame.payload),
-        .resize => handleResizeFrame(session_agent, attachment_index, frame.payload),
-        .repaint_request => handleRepaintFrame(session_agent, attachment_index, frame.payload),
+        .te_input => handleInputFrame(session_agent, attachment_index, frame.payload),
+        .te_resize => handleResizeFrame(session_agent, attachment_index, frame.payload),
+        .te_repaint_request => handleRepaintFrame(session_agent, attachment_index, frame.payload),
         .ping, .pong => {
             _ = protocol.handleTransportControlFrame(frame.message_type, frame.payload, attachment.fd) catch {
                 detachAttachment(session_agent, attachment_index);
@@ -3324,7 +3324,7 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
 fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
     const attachment = &session_agent.attachments[attachment_index];
     const session = &session_agent.sessions[attachment.session_index];
-    var input = protocol.decodePayload(pb.Input, app_allocator.allocator(), payload) catch {
+    var input = protocol.decodePayload(pb.TeInput, app_allocator.allocator(), payload) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };
@@ -3332,14 +3332,14 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, paylo
     if (input.data.len == 0) return;
 
     if (input.input_seq != 0) {
-        const ack_payload = protocol.encodePayload(app_allocator.allocator(), pb.InputAck{
+        const ack_payload = protocol.encodePayload(app_allocator.allocator(), pb.TeInputAck{
             .input_seq = input.input_seq,
         }) catch {
             detachAttachment(session_agent, attachment_index);
             return;
         };
         defer app_allocator.allocator().free(ack_payload);
-        queueAttachmentFrame(attachment, .input_ack, ack_payload) catch {
+        queueAttachmentFrame(attachment, .te_input_ack, ack_payload) catch {
             detachAttachment(session_agent, attachment_index);
             return;
         };
@@ -3363,7 +3363,7 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, paylo
     }
     if (translated.items.len == 0) return;
 
-    queueTtyTranscriptChunk(attachment, .TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {
+    queueTtyTranscriptChunk(attachment, .TE_TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {
         detachAttachment(session_agent, attachment_index);
         return;
     };

@@ -5,7 +5,7 @@ layout:
 - `XDG_CONFIG_HOME` for user-defined `sessh` config (TODO: we should support `XDG_CONFIG_DIRS` too)
 - `XDG_CACHE_HOME` for bootstrapping the binary when connecting to a new host
 - `XDG_STATE_HOME` for client routes and session-agent logs
-- `XDG_RUNTIME_DIR` for live session sockets and runtime identity.
+- `XDG_RUNTIME_DIR` for live agent sockets and runtime identity.
 
 # `XDG_RUNTIME_DIR`
 
@@ -20,7 +20,7 @@ exit.
 Each session directory lives under `guid/` followed by the `s-`-prefixed guid
 representation for the session. This directory includes:
 
-- `agent.sock`: symlink to the real socket path under `s/`
+- `agent.sock`: symlink to the real socket path under `a/`
 - `meta.json`: runtime identity for the session agent (`type`, `created_at_unix_ms`, `agent_pid`, `version`)
 - `compat`: symlink to the exact sessh binary for this session agent.
 
@@ -28,18 +28,19 @@ We use a symlink for `agent.sock` because Unix-domain socket path lengths are
 platform-limited; for example, macOS `unix(4)` documents
 `sockaddr_un.sun_path` as 104 bytes: https://manpages.org/unix/4
 
-The actual session socket path lives under `s/` followed by a compact
+The actual agent socket path lives under `a/` followed by a compact
 representation of the guid (or random hex bytes if `XDG_RUNTIME_DIR` is too
-long to allow the full guid to fit). Tty stream agent sockets use the same
-scheme under `t/`; proxy stream agent sockets use `p/`.
+long to allow the full guid to fit). Both terminal-emulator session agents and
+proxy stream agents use this namespace. Future client-side sockets for local
+client-to-ProxyCommand coordination should live under `c/`.
 
 Runtime guid directories include small metadata files so `sesshmux list --all`
 can explain what each live guid represents. Local session directories use
-`meta.json` with `type: local-session`. Client, tty stream, and proxy stream
+`meta.json` with `type: local-session`. Client and proxy stream
 directories can be owned from both sides of a connection at once, so each side
 writes its own file: `incoming-meta.json` for incoming entries and
-`outgoing-meta.json` for outgoing entries. Tty streams use `t-` GUIDs; proxy
-streams use `p-` GUIDs. Teardown removes only the metadata file it owns; the
+`outgoing-meta.json` for outgoing entries. Proxy streams use `p-` GUIDs.
+Teardown removes only the metadata file it owns; the
 last side to leave removes the now-empty directory.
 
 On the session host, each client hint contains an `agent.sock` symlink to the
