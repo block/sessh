@@ -58,6 +58,9 @@ if [ ! -x "$real" ]; then
 fi
 
 if [ "$name" = "sessh" ]; then
+  if [ "${1:-}" = "-V" ]; then
+    exec "$real" :internal-sessh: --version
+  fi
   if [ "${1:-}" = "." ]; then
     printf 'sessh: "." is not a valid ssh host\n' >&2
     exit 64

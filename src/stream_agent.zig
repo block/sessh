@@ -3119,6 +3119,22 @@ test "stream reconnect status uses plain stderr lines" {
     );
 }
 
+test "disabled stream reconnect status emits no UI" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var status = StreamReconnectStatus.initForTest(fds[1], .disabled, true, "test-host");
+    status.showRetry(1_000);
+    status.showReconnecting();
+    status.showEscapeHelp();
+    status.clear();
+    posix.close(fds[1]);
+
+    var buf: [16]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
 test "stream reconnect status restores tracked application title" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);

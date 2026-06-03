@@ -43,7 +43,7 @@ fn runMain() !void {
     if (args.len == 1) return usage(0, entrypoint);
     if (entrypoint == .sessh and args.len == 2) return usage(0, entrypoint);
     if (topLevelArgIs(args, entrypoint, &.{ "--help", "-h" })) return usage(0, entrypoint);
-    if (topLevelArgIs(args, entrypoint, &.{"--version"})) {
+    if (topLevelArgIs(args, entrypoint, &.{"--version"}) or sesshShortVersionRequested(args, entrypoint)) {
         try io.writeAll(1, entrypointName(entrypoint));
         try io.writeAll(1, " " ++ config.version ++ "\n");
         return;
@@ -126,9 +126,15 @@ test "internal sessh modality removes sentinel" {
 
 test "sessh top-level options do not match remote command arguments" {
     try std.testing.expect(topLevelArgIs(&.{ "sesshmux-dev", ":internal-sessh:", "--version" }, .sessh, &.{"--version"}));
+    try std.testing.expect(sesshShortVersionRequested(&.{ "sesshmux-dev", ":internal-sessh:", "-V" }, .sessh));
+    try std.testing.expect(sesshShortVersionRequested(&.{ "sesshmux-dev", ":internal-sessh:", "-vV", "example.com" }, .sessh));
+    try std.testing.expect(sesshShortVersionRequested(&.{ "sesshmux-dev", ":internal-sessh:", "--no-terminal-emulator", "-V", "example.com" }, .sessh));
     try std.testing.expect(!topLevelArgIs(&.{ "sesshmux-dev", ":internal-sessh:", "example.com", "--version" }, .sessh, &.{"--version"}));
+    try std.testing.expect(!sesshShortVersionRequested(&.{ "sesshmux-dev", ":internal-sessh:", "example.com", "-V" }, .sessh));
+    try std.testing.expect(!sesshShortVersionRequested(&.{ "sesshmux-dev", ":internal-sessh:", "-F", "-V", "example.com" }, .sessh));
     try std.testing.expect(topLevelArgIs(&.{ "sesshmux-dev", "--version" }, .sesshmux, &.{"--version"}));
     try std.testing.expect(!topLevelArgIs(&.{ "sesshmux-dev", "list", "--version" }, .sesshmux, &.{"--version"}));
+    try std.testing.expect(!sesshShortVersionRequested(&.{ "sesshmux-dev", "-V" }, .sesshmux));
 }
 
 fn usage(code: u8, entrypoint: EntryPoint) !void {
@@ -188,6 +194,56 @@ fn topLevelArgIs(args: []const []const u8, entrypoint: EntryPoint, needles: []co
         if (std.mem.eql(u8, args[index], needle)) return true;
     }
     return false;
+}
+
+// `ssh -V` is a pre-host option that exits before any connection attempt. Scan
+// only that pre-host region; after the host, `-V` is remote command text. The
+// value-skipping keeps cases such as `sessh -F -V host` from treating the
+// config filename as a version request.
+fn sesshShortVersionRequested(args: []const []const u8, entrypoint: EntryPoint) bool {
+    if (entrypoint != .sessh) return false;
+
+    var index: usize = 2;
+    while (index < args.len) {
+        const arg = args[index];
+        if (arg.len == 0) return false;
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (!std.mem.startsWith(u8, arg, "-") or std.mem.eql(u8, arg, "-")) return false;
+        if (std.mem.eql(u8, arg, "-V")) return true;
+
+        if (std.mem.startsWith(u8, arg, "--")) {
+            index += if (sesshLongOptionConsumesValue(arg)) 2 else 1;
+            continue;
+        }
+
+        var pos: usize = 1;
+        var consumed_value = false;
+        while (pos < arg.len) : (pos += 1) {
+            const option = arg[pos];
+            if (option == 'V') return true;
+            if (sshShortOptionConsumesValueForVersionScan(option)) {
+                index += if (pos + 1 < arg.len) 1 else 2;
+                consumed_value = true;
+                break;
+            }
+        }
+        if (!consumed_value) index += 1;
+    }
+    return false;
+}
+
+fn sesshLongOptionConsumesValue(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--leader") or
+        std.mem.eql(u8, arg, "--scrollback-limit") or
+        std.mem.eql(u8, arg, "--initial-scrollback") or
+        std.mem.eql(u8, arg, "--log-level") or
+        std.mem.eql(u8, arg, "--alias") or
+        std.mem.eql(u8, arg, "--ssh-options") or
+        std.mem.eql(u8, arg, "--capture-tty-transcript");
+}
+
+fn sshShortOptionConsumesValueForVersionScan(option: u8) bool {
+    return std.mem.indexOfScalar(u8, "BbcDEeFIiJLlmOPpRSwWQ", option) != null;
 }
 
 test {

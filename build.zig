@@ -33,8 +33,8 @@ pub fn build(b: *std.Build) void {
     });
     exe.step.dependOn(&protoc_step.step);
 
-    installWrapper(b, "bin/sessh");
-    installWrapper(b, "bin/sesshmux");
+    const sessh_wrapper_step = installWrapper(b, "bin/sessh");
+    const sesshmux_wrapper_step = installWrapper(b, "bin/sesshmux");
 
     const run_step = b.step("run", "Run sesshmux");
     const run_cmd = b.addRunArtifact(exe);
@@ -47,6 +47,8 @@ pub fn build(b: *std.Build) void {
         .dest_sub_path = "bin/sesshmux-dev",
     });
     install_dev_step.dependOn(&install_dev.step);
+    install_dev_step.dependOn(sessh_wrapper_step);
+    install_dev_step.dependOn(sesshmux_wrapper_step);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -70,7 +72,7 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(artifacts_step);
 }
 
-fn installWrapper(b: *std.Build, dest_sub_path: []const u8) void {
+fn installWrapper(b: *std.Build, dest_sub_path: []const u8) *std.Build.Step {
     const wrapper_install = b.addInstallFileWithDir(
         b.path("src/sessh-wrapper.sh"),
         .prefix,
@@ -80,6 +82,7 @@ fn installWrapper(b: *std.Build, dest_sub_path: []const u8) void {
     const chmod_wrapper = b.addSystemCommand(&.{ "chmod", "755", wrapper_path });
     chmod_wrapper.step.dependOn(&wrapper_install.step);
     b.getInstallStep().dependOn(&chmod_wrapper.step);
+    return &chmod_wrapper.step;
 }
 
 const ArtifactTarget = struct {

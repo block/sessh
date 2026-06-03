@@ -3359,6 +3359,14 @@ fn streamReconnectStatusMode(stdout_is_tty: bool) stream_agent.StreamReconnectSt
     return if (stdout_is_tty) .title else .stderr_plain;
 }
 
+fn proxyStreamReconnectStatusMode() stream_agent.StreamReconnectStatusMode {
+    // Proxy mode is a byte-clean ProxyCommand for an outer OpenSSH process.
+    // Status text written by the proxy can reach the user's terminal while the
+    // outer ssh has changed tty modes, which can leave staircased output behind.
+    // Keep proxy mode quiet by default; the outer ssh owns the visible session.
+    return .disabled;
+}
+
 fn shouldUseProxyStream(parsed_ssh_args: ParsedSshArgs) bool {
     return parsed_ssh_args.action == .new and
         parsed_ssh_args.command_argv.len == 0 and
@@ -3536,7 +3544,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
         .source_fd = 0,
         .sink_fd = 1,
         .stderr_fd = 2,
-        .status_mode = .stderr_plain,
+        .status_mode = proxyStreamReconnectStatusMode(),
         .intercept_ctrl_r = false,
         .receive_stderr = false,
         .expect_exit_status = false,
@@ -6282,6 +6290,10 @@ test "brokerArgsForAction uses broker subcommands" {
 test "stream reconnect status uses stderr when stdout is redirected" {
     try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.title, streamReconnectStatusMode(true));
     try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, streamReconnectStatusMode(false));
+}
+
+test "proxy stream reconnect status is disabled by default" {
+    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.disabled, proxyStreamReconnectStatusMode());
 }
 
 test "parseSshArgs accepts translated persistent command argv after delimiter" {

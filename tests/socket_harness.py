@@ -3787,6 +3787,9 @@ def main():
             internal_sessh_version = run([":internal-sessh:", "--version"], env, timeout=5.0)
             if internal_sessh_version.returncode != 0 or internal_sessh_version.stdout != f"sessh {sessh_version()}\n":
                 raise AssertionError(internal_sessh_version)
+            internal_sessh_short_version = run([":internal-sessh:", "-V"], env, timeout=5.0)
+            if internal_sessh_short_version.returncode != 0 or internal_sessh_short_version.stdout != f"sessh {sessh_version()}\n":
+                raise AssertionError(internal_sessh_short_version)
             internal_local = run([":internal-sessh:", "."], env, timeout=5.0)
             if internal_local.returncode != 64 or '"." is not a valid ssh host' not in internal_local.stderr:
                 raise AssertionError(internal_local)
@@ -3850,6 +3853,19 @@ def main():
                 )
                 if sessh_version_text.returncode != 0 or sessh_version_text.stdout != f"sessh {sessh_version()}\n":
                     raise AssertionError(sessh_version_text)
+                sessh_short_version_text = subprocess.run(
+                    [str(sessh_wrapper), "-V"],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5.0,
+                    check=False,
+                )
+                if sessh_short_version_text.returncode != 0 or sessh_short_version_text.stdout != f"sessh {sessh_version()}\n":
+                    raise AssertionError(sessh_short_version_text)
             sesshmux_wrapper = ROOT / "zig-out" / "bin" / "sesshmux"
             if sesshmux_wrapper.exists():
                 sesshmux_version_text = subprocess.run(
