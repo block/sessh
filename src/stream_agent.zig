@@ -27,6 +27,11 @@ const StreamOutcome = union(enum) {
     replacement: c.fd_t,
 };
 
+pub const StreamProtocol = enum {
+    proxy,
+    tty,
+};
+
 pub const StreamReconnectStatusMode = enum {
     disabled,
     stderr_plain,
@@ -34,6 +39,7 @@ pub const StreamReconnectStatusMode = enum {
 };
 
 pub const LocalStreamOptions = struct {
+    protocol: StreamProtocol,
     source_fd: c.fd_t,
     sink_fd: c.fd_t,
     stderr_fd: c.fd_t,
@@ -46,9 +52,8 @@ pub const LocalStreamOptions = struct {
     expect_exit_status: bool = true,
 };
 
-// Stream channel ids are wire values, not a closed enum. The standard channels
-// intentionally match Unix fd numbers; positive ids above stderr stay available
-// for future byte streams without reshaping the protocol.
+// Stream channels are internal fd-shaped identities. The wire protocol maps
+// these differently for proxy and tty streams.
 const StreamChannel = i32;
 const stream_channel_undefined: StreamChannel = -1;
 const stream_channel_stdin: StreamChannel = 0;
@@ -119,11 +124,12 @@ const StreamChannelState = struct {
     }
 };
 
-// Tracks byte offsets independently for stdin, stdout, and stderr. That is
-// what lets a replacement ssh transport resume without dropping or replaying
-// bytes while still preserving non-tty stdout/stderr separation.
+// Tracks byte offsets independently for the internal stdin/stdout/stderr
+// identities. Proxy streams use one active channel; tty streams use stdin for
+// PTY input and stdout for PTY output.
 const StreamState = struct {
     allocator: std.mem.Allocator,
+    protocol: StreamProtocol,
     channels: [channel_count]StreamChannelState = .{ .{}, .{}, .{} },
     active_outbound: ChannelMask,
     active_inbound: ChannelMask,
@@ -138,9 +144,10 @@ const StreamState = struct {
     outbound_exit_status_acked: bool = false,
     inbound_exit_status: ?pb.ExitStatus = null,
 
-    fn init(allocator: std.mem.Allocator, active_outbound: ChannelMask, active_inbound: ChannelMask) StreamState {
+    fn init(allocator: std.mem.Allocator, stream_protocol: StreamProtocol, active_outbound: ChannelMask, active_inbound: ChannelMask) StreamState {
         var state = StreamState{
             .allocator = allocator,
+            .protocol = stream_protocol,
             .active_outbound = active_outbound,
             .active_inbound = active_inbound,
         };
@@ -165,14 +172,6 @@ const StreamState = struct {
 
     fn constChannel(self: *const StreamState, stream_channel: StreamChannel) *const StreamChannelState {
         return &self.channels[channelIndex(stream_channel)];
-    }
-
-    fn resumeMessage(self: *const StreamState) pb.StreamResume {
-        return .{
-            .stdin_recv_next_offset = self.constChannel(stream_channel_stdin).recv_next_offset,
-            .stdout_recv_next_offset = self.constChannel(stream_channel_stdout).recv_next_offset,
-            .stderr_recv_next_offset = self.constChannel(stream_channel_stderr).recv_next_offset,
-        };
     }
 
     fn appendOutbound(self: *StreamState, stream_channel: StreamChannel, bytes: []const u8) !void {
@@ -247,22 +246,39 @@ fn channelIndex(channel: StreamChannel) usize {
     };
 }
 
-fn streamChannelFromWire(channel: i32) !StreamChannel {
+fn singleActiveChannel(mask: ChannelMask) !StreamChannel {
+    var channel: StreamChannel = stream_channel_undefined;
+    var count: usize = 0;
+    for (stream_channels) |candidate| {
+        if (!mask.contains(candidate)) continue;
+        channel = candidate;
+        count += 1;
+    }
+    if (count != 1) return error.StreamInvalidChannel;
+    return channel;
+}
+
+fn ttyDirectionFromChannel(channel: StreamChannel) !pb.TtyStreamDirection {
     return switch (channel) {
-        stream_channel_stdin,
-        stream_channel_stdout,
-        stream_channel_stderr,
-        => channel,
+        stream_channel_stdin => .TTY_STREAM_DIRECTION_INPUT,
+        stream_channel_stdout => .TTY_STREAM_DIRECTION_OUTPUT,
         else => error.StreamInvalidChannel,
     };
 }
 
-fn recvNextFromResume(message: pb.StreamResume, channel: StreamChannel) u64 {
+fn channelFromTtyDirection(direction: pb.TtyStreamDirection) !StreamChannel {
+    return switch (direction) {
+        .TTY_STREAM_DIRECTION_INPUT => stream_channel_stdin,
+        .TTY_STREAM_DIRECTION_OUTPUT => stream_channel_stdout,
+        else => error.StreamInvalidChannel,
+    };
+}
+
+fn recvNextFromTtyResume(message: pb.TtyStreamResume, channel: StreamChannel) u64 {
     return switch (channel) {
-        stream_channel_stdin => message.stdin_recv_next_offset,
-        stream_channel_stdout => message.stdout_recv_next_offset,
-        stream_channel_stderr => message.stderr_recv_next_offset,
-        else => unreachable,
+        stream_channel_stdin => message.input_recv_next_offset,
+        stream_channel_stdout => message.output_recv_next_offset,
+        else => 0,
     };
 }
 
@@ -467,7 +483,7 @@ const StreamAttachment = struct {
             }
         }
         state.outbound_exit_status_sent = false;
-        sendStreamMessage(state.allocator, transport_write_fd, .stream_resume, state.resumeMessage()) catch return error.StreamTransportClosed;
+        sendResumeMessage(state, transport_write_fd) catch return error.StreamTransportClosed;
         var last_resize_size: ?terminal.WindowSize = null;
         if (options.forward_resize) {
             const size = terminal.currentWindowSize();
@@ -584,8 +600,8 @@ const StreamAttachment = struct {
                 else => return err,
             };
             // A transport frame can make source bytes or EOF immediately useful
-            // without any new source readiness. For example, StreamResume tells
-            // us the peer is ready for retransmission, and inbound EOF can mark
+            // without any new source readiness. For example, a resume frame
+            // tells us the peer is ready for retransmission, and inbound EOF can mark
             // our outbound side closed. Drain child-backed sources once before
             // sleeping again so short commands finish on actual EOF/status
             // events instead of an unrelated later wakeup.
@@ -744,7 +760,7 @@ fn reapStreamSourceChildIfExited(options: *const StreamAttachmentOptions) void {
     if (exited.*) return;
 
     // Reap only after the source fds reached EOF. The byte stream is ordered as
-    // source data followed by StreamEof; child status is cleanup bookkeeping,
+    // source data followed by stream EOF; child status is cleanup bookkeeping,
     // not evidence that the source buffers have been drained.
     var status: c_int = 0;
     const result = c.waitpid(pid, &status, 1);
@@ -1011,10 +1027,16 @@ fn cleanupReplacementResult(comptime Transport: type, result: *reconnect.AsyncRe
 }
 
 const StreamMode = enum {
-    pty,
-    pipe,
+    tty,
     proxy,
 };
+
+fn streamProtocolForMode(mode: StreamMode) StreamProtocol {
+    return switch (mode) {
+        .tty => .tty,
+        .proxy => .proxy,
+    };
+}
 
 const StreamAgentConfig = struct {
     guid: []const u8,
@@ -1035,14 +1057,12 @@ const StreamAgentConfig = struct {
 };
 
 const StreamEndpoint = union(enum) {
-    pty: PtyEndpoint,
-    pipe: PipeEndpoint,
+    tty: PtyEndpoint,
     proxy: ProxyEndpoint,
 
     fn activeOutbound(self: *const StreamEndpoint) ChannelMask {
         return switch (self.*) {
-            .pty => .{ .stdout = true },
-            .pipe => .{ .stdout = true, .stderr = true },
+            .tty => .{ .stdout = true },
             .proxy => .{ .stdout = true },
         };
     }
@@ -1054,7 +1074,7 @@ const StreamEndpoint = union(enum) {
 
     fn attachmentOptions(self: *StreamEndpoint, listen_fd: c.fd_t) StreamAttachmentOptions {
         return switch (self.*) {
-            .pty => |*pty| .{
+            .tty => |*pty| .{
                 .source_count = 1,
                 .sources = .{
                     .{
@@ -1070,18 +1090,6 @@ const StreamEndpoint = union(enum) {
                 .source_exit_pid = pty.child.pid,
                 .source_exit_seen = &pty.exited,
                 .source_exit_status = &pty.exit_status,
-            },
-            .pipe => |*pipe| .{
-                .source_count = 2,
-                .sources = .{
-                    .{ .fd = pipe.stdout_fd, .channel = stream_channel_stdout },
-                    .{ .fd = pipe.stderr_fd, .channel = stream_channel_stderr },
-                },
-                .sinks = sinksWithStdin(pipe.stdin_fd, &pipe.stdin_fd),
-                .replacement_listen_fd = listen_fd,
-                .source_exit_pid = pipe.child.id,
-                .source_exit_seen = &pipe.exited,
-                .source_exit_status = &pipe.exit_status,
             },
             .proxy => |*proxy| .{
                 .source_count = 1,
@@ -1104,8 +1112,7 @@ const StreamEndpoint = union(enum) {
 
     fn deinit(self: *StreamEndpoint) void {
         switch (self.*) {
-            .pty => |*pty| pty.deinit(),
-            .pipe => |*pipe| pipe.deinit(),
+            .tty => |*pty| pty.deinit(),
             .proxy => |*proxy| proxy.deinit(),
         }
         self.* = undefined;
@@ -1123,62 +1130,6 @@ const PtyEndpoint = struct {
         } else {
             self.child.terminate();
         }
-        self.* = undefined;
-    }
-};
-
-const PipeEndpoint = struct {
-    child: std.process.Child,
-    stdin_fd: c.fd_t,
-    stdout_fd: c.fd_t,
-    stderr_fd: c.fd_t,
-    exited: bool = false,
-    exit_status: ?pb.ExitStatus = null,
-
-    fn spawn(allocator: std.mem.Allocator, shell_command: ?[]const u8) !PipeEndpoint {
-        const shell = pty_process.defaultShellPath();
-        var argv_buf: [3][]const u8 = undefined;
-        argv_buf[0] = shell;
-        var argv_len: usize = 1;
-        if (shell_command) |command| {
-            argv_buf[1] = "-c";
-            argv_buf[2] = command;
-            argv_len = 3;
-        }
-
-        var child = std.process.Child.init(argv_buf[0..argv_len], allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        try child.spawn();
-        const stdin_fd = child.stdin.?.handle;
-        const stdout_fd = child.stdout.?.handle;
-        const stderr_fd = child.stderr.?.handle;
-        return .{
-            .child = child,
-            .stdin_fd = stdin_fd,
-            .stdout_fd = stdout_fd,
-            .stderr_fd = stderr_fd,
-        };
-    }
-
-    fn deinit(self: *PipeEndpoint) void {
-        if (self.stdin_fd >= 0) {
-            _ = c.close(self.stdin_fd);
-            self.stdin_fd = -1;
-            self.child.stdin = null;
-        }
-        if (self.stdout_fd >= 0) {
-            _ = c.close(self.stdout_fd);
-            self.stdout_fd = -1;
-            self.child.stdout = null;
-        }
-        if (self.stderr_fd >= 0) {
-            _ = c.close(self.stderr_fd);
-            self.stderr_fd = -1;
-            self.child.stderr = null;
-        }
-        _ = self.child.wait() catch {};
         self.* = undefined;
     }
 };
@@ -1207,8 +1158,8 @@ const ProxyEndpoint = struct {
 /// The stream broker is bound to one ssh transport. It connects that transport
 /// to the durable stream agent socket for the stream GUID, starting the agent
 /// when needed, then relays bytes between ssh stdio and the agent socket.
-/// Direct command streams use `r-` GUIDs; proxy streams use `p-` GUIDs so
-/// runtime listings can distinguish them without inspecting agent state.
+/// TTY streams use `t-` GUIDs and proxy streams use `p-` GUIDs so runtime
+/// listings can distinguish them without inspecting agent state.
 pub fn runBroker(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     var config = try parseStreamAgentConfig(allocator, args);
     defer config.deinit(allocator);
@@ -1243,7 +1194,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
     var endpoint = try startStreamEndpoint(allocator, config);
     defer endpoint.deinit();
 
-    var state = StreamState.init(allocator, endpoint.activeOutbound(), endpoint.activeInbound());
+    var state = StreamState.init(allocator, streamProtocolForMode(config.mode), endpoint.activeOutbound(), endpoint.activeInbound());
     state.require_outbound_exit_status = endpointHasExitStatus(&endpoint);
     defer state.deinit();
 
@@ -1340,6 +1291,7 @@ pub fn runLocalStream(
 
     var state = StreamState.init(
         allocator,
+        options.protocol,
         .{ .stdin = true },
         .{ .stdout = true, .stderr = options.receive_stderr },
     );
@@ -1409,12 +1361,11 @@ pub fn runLocalStream(
                     .sinks = localStreamSinks(options.sink_fd, options.stderr_fd, options.receive_stderr),
                     .reconnect_status = &reconnect_status,
                     .forward_resize = options.forward_resize,
-                    // A direct stream represents one remote command, not
-                    // an interactive session. Once the remote side has
-                    // closed its output stream there is no process left to
-                    // consume more local input, so match OpenSSH and let
-                    // the command finish even if local stdin is still a
-                    // live terminal.
+                    // A tty stream represents one sessh-owned PTY process, not
+                    // an interactive session. Once the remote side has closed
+                    // its output stream there is no process left to consume
+                    // more local input, so match OpenSSH and let the command
+                    // finish even if local stdin is still a live terminal.
                     .close_outbound_on_inbound_eof = true,
                 },
             ) catch {
@@ -1626,116 +1577,101 @@ fn handleFrame(
     defer mutable.deinit(state.allocator);
 
     switch (mutable.message_type) {
-        .stream_resume => {
-            var message = try protocol.decodePayload(pb.StreamResume, state.allocator, mutable.payload);
+        .proxy_stream_resume => {
+            try ensureStreamProtocol(state, .proxy);
+            var message = try protocol.decodePayload(pb.ProxyStreamResume, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            state.peer_ready = true;
+            try handleResumeOffset(state, try singleActiveChannel(state.active_outbound), message.recv_next_offset);
+            sendPending(state, transport_write_fd) catch |err| switch (err) {
+                error.WriteFailed => return error.StreamTransportWriteFailed,
+                else => return err,
+            };
+        },
+        .proxy_stream_ack => {
+            try ensureStreamProtocol(state, .proxy);
+            var message = try protocol.decodePayload(pb.ProxyStreamAck, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            try handleAck(state, try singleActiveChannel(state.active_outbound), message.offset);
+        },
+        .proxy_stream_eof_ack => {
+            try ensureStreamProtocol(state, .proxy);
+            var message = try protocol.decodePayload(pb.ProxyStreamEofAck, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            try handleEofAck(state, try singleActiveChannel(state.active_outbound), message.offset);
+        },
+        .proxy_stream_data => {
+            try ensureStreamProtocol(state, .proxy);
+            var message = try protocol.decodePayload(pb.ProxyStreamData, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            try handleInboundData(
+                state,
+                transport_write_fd,
+                options,
+                try singleActiveChannel(state.active_inbound),
+                message.offset,
+                message.data,
+            );
+        },
+        .proxy_stream_eof => {
+            try ensureStreamProtocol(state, .proxy);
+            var message = try protocol.decodePayload(pb.ProxyStreamEof, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            try handleInboundEof(
+                state,
+                transport_write_fd,
+                options,
+                try singleActiveChannel(state.active_inbound),
+                message.offset,
+            );
+        },
+        .tty_stream_resume => {
+            try ensureStreamProtocol(state, .tty);
+            var message = try protocol.decodePayload(pb.TtyStreamResume, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
             state.peer_ready = true;
             for (stream_channels) |channel| {
                 if (!state.active_outbound.contains(channel)) continue;
-                const offset = recvNextFromResume(message, channel);
-                const channel_state = state.channel(channel);
-                channel_state.peer_recv = offset;
-                try state.dropOutboundThrough(channel, offset);
-                channel_state.outbound_sent_next = offset;
+                try handleResumeOffset(state, channel, recvNextFromTtyResume(message, channel));
             }
             sendPending(state, transport_write_fd) catch |err| switch (err) {
                 error.WriteFailed => return error.StreamTransportWriteFailed,
                 else => return err,
             };
         },
-        .stream_ack => {
-            var message = try protocol.decodePayload(pb.StreamAck, state.allocator, mutable.payload);
+        .tty_stream_ack => {
+            try ensureStreamProtocol(state, .tty);
+            var message = try protocol.decodePayload(pb.TtyStreamAck, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
-            const channel = try streamChannelFromWire(message.channel);
-            if (!state.active_outbound.contains(channel)) return error.StreamInactiveChannel;
-            const channel_state = state.channel(channel);
-            channel_state.peer_recv = message.offset;
-            try state.dropOutboundThrough(channel, message.offset);
-            if (channel_state.outbound_sent_next < message.offset) channel_state.outbound_sent_next = message.offset;
+            try handleAck(state, try channelFromTtyDirection(message.stream), message.offset);
         },
-        .stream_eof_ack => {
-            var message = try protocol.decodePayload(pb.StreamEofAck, state.allocator, mutable.payload);
+        .tty_stream_eof_ack => {
+            try ensureStreamProtocol(state, .tty);
+            var message = try protocol.decodePayload(pb.TtyStreamEofAck, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
-            const channel = try streamChannelFromWire(message.channel);
-            if (!state.active_outbound.contains(channel)) return error.StreamInactiveChannel;
-            const channel_state = state.channel(channel);
-            channel_state.peer_recv = message.offset;
-            try state.dropOutboundThrough(channel, message.offset);
-            if (channel_state.outbound_sent_next < message.offset) channel_state.outbound_sent_next = message.offset;
-            if (message.offset == channel_state.outboundNext()) channel_state.outbound_eof_acked = true;
+            try handleEofAck(state, try channelFromTtyDirection(message.stream), message.offset);
         },
-        .stream_data => {
-            var message = try protocol.decodePayload(pb.StreamData, state.allocator, mutable.payload);
+        .tty_stream_input => {
+            try ensureStreamProtocol(state, .tty);
+            var message = try protocol.decodePayload(pb.TtyStreamInput, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
-            const channel = try streamChannelFromWire(message.channel);
-            if (!state.active_inbound.contains(channel)) return error.StreamInactiveChannel;
-            const channel_state = state.channel(channel);
-            const sink = options.sink(channel);
-            if (message.offset < channel_state.recv_next_offset) {
-                // Reconnect retransmits from the peer's last confirmed offset.
-                // If a frame overlaps bytes we already delivered, keep any new
-                // suffix instead of discarding the whole frame as a duplicate.
-                const already_received: usize = @intCast(channel_state.recv_next_offset - message.offset);
-                if (already_received < message.data.len) {
-                    const new_data = message.data[already_received..];
-                    if (sink.fd < 0) return error.StreamSinkClosed;
-                    try deliverInboundData(options, channel, sink.fd, new_data);
-                    channel_state.recv_next_offset += new_data.len;
-                }
-                sendStreamMessage(state.allocator, transport_write_fd, .stream_ack, pb.StreamAck{
-                    .channel = channel,
-                    .offset = channel_state.recv_next_offset,
-                }) catch |err| switch (err) {
-                    error.WriteFailed => return error.StreamTransportWriteFailed,
-                    else => return err,
-                };
-                return;
-            }
-            if (message.offset != channel_state.recv_next_offset) return error.StreamOffsetGap;
-            if (message.data.len != 0 and sink.fd < 0) return error.StreamSinkClosed;
-            if (message.data.len != 0) try deliverInboundData(options, channel, sink.fd, message.data);
-            channel_state.recv_next_offset += message.data.len;
-            sendStreamMessage(state.allocator, transport_write_fd, .stream_ack, pb.StreamAck{
-                .channel = channel,
-                .offset = channel_state.recv_next_offset,
-            }) catch |err| switch (err) {
-                error.WriteFailed => return error.StreamTransportWriteFailed,
-                else => return err,
-            };
+            try handleInboundData(state, transport_write_fd, options, stream_channel_stdin, message.offset, message.data);
         },
-        .stream_eof => {
-            var message = try protocol.decodePayload(pb.StreamEof, state.allocator, mutable.payload);
+        .tty_stream_output => {
+            try ensureStreamProtocol(state, .tty);
+            var message = try protocol.decodePayload(pb.TtyStreamOutput, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
-            const channel = try streamChannelFromWire(message.channel);
-            if (!state.active_inbound.contains(channel)) return error.StreamInactiveChannel;
-            const channel_state = state.channel(channel);
-            if (message.offset > channel_state.recv_next_offset) return error.StreamOffsetGap;
-            channel_state.inbound_eof = true;
-            const sink = options.sink(channel);
-            if (sink.shutdown_on_eof and sink.fd >= 0) _ = c.shutdown(sink.fd, c.SHUT.WR);
-            if (sink.close_fd_on_eof) |sink_fd_ptr| {
-                if (sink_fd_ptr.* >= 0) {
-                    _ = c.close(sink_fd_ptr.*);
-                    sink_fd_ptr.* = -1;
-                }
-            }
-            if (options.close_outbound_on_inbound_eof and state.allActiveInboundEof()) {
-                for (stream_channels) |outbound_channel| {
-                    if (state.active_outbound.contains(outbound_channel)) {
-                        state.channel(outbound_channel).outbound_eof = true;
-                    }
-                }
-            }
-            sendStreamMessage(state.allocator, transport_write_fd, .stream_eof_ack, pb.StreamEofAck{
-                .channel = channel,
-                .offset = channel_state.recv_next_offset,
-            }) catch |err| switch (err) {
-                error.WriteFailed => return error.StreamTransportWriteFailed,
-                else => return err,
-            };
+            try handleInboundData(state, transport_write_fd, options, stream_channel_stdout, message.offset, message.data);
         },
-        .resize => {
-            var message = try protocol.decodePayload(pb.Resize, state.allocator, mutable.payload);
+        .tty_stream_eof => {
+            try ensureStreamProtocol(state, .tty);
+            var message = try protocol.decodePayload(pb.TtyStreamEof, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            try handleInboundEof(state, transport_write_fd, options, try channelFromTtyDirection(message.stream), message.offset);
+        },
+        .tty_stream_resize => {
+            try ensureStreamProtocol(state, .tty);
+            var message = try protocol.decodePayload(pb.TtyStreamResize, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
             if (message.terminal_rows == 0 or message.terminal_cols == 0) return error.StreamInvalidResize;
             if (message.terminal_rows > std.math.maxInt(u16) or
@@ -1751,17 +1687,19 @@ fn handleFrame(
                 );
             }
         },
-        .stream_exit_status => {
-            var message = try protocol.decodePayload(pb.StreamExitStatus, state.allocator, mutable.payload);
+        .tty_stream_exit_status => {
+            try ensureStreamProtocol(state, .tty);
+            var message = try protocol.decodePayload(pb.TtyStreamExitStatus, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
             state.inbound_exit_status = message.exit_status orelse return error.StreamMissingExitStatus;
-            sendStreamMessage(state.allocator, transport_write_fd, .stream_exit_status_ack, pb.StreamExitStatusAck{}) catch |err| switch (err) {
+            sendStreamMessage(state.allocator, transport_write_fd, .tty_stream_exit_status_ack, pb.TtyStreamExitStatusAck{}) catch |err| switch (err) {
                 error.WriteFailed => return error.StreamTransportWriteFailed,
                 else => return err,
             };
         },
-        .stream_exit_status_ack => {
-            var message = try protocol.decodePayload(pb.StreamExitStatusAck, state.allocator, mutable.payload);
+        .tty_stream_exit_status_ack => {
+            try ensureStreamProtocol(state, .tty);
+            var message = try protocol.decodePayload(pb.TtyStreamExitStatusAck, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
             state.outbound_exit_status_acked = true;
         },
@@ -1775,9 +1713,193 @@ fn handleFrame(
     }
 }
 
+fn ensureStreamProtocol(state: *const StreamState, expected: StreamProtocol) !void {
+    if (state.protocol != expected) return error.StreamUnexpectedFrame;
+}
+
+fn handleResumeOffset(state: *StreamState, channel: StreamChannel, offset: u64) !void {
+    if (!state.active_outbound.contains(channel)) return error.StreamInactiveChannel;
+    const channel_state = state.channel(channel);
+    channel_state.peer_recv = offset;
+    try state.dropOutboundThrough(channel, offset);
+    channel_state.outbound_sent_next = offset;
+}
+
+fn handleAck(state: *StreamState, channel: StreamChannel, offset: u64) !void {
+    if (!state.active_outbound.contains(channel)) return error.StreamInactiveChannel;
+    const channel_state = state.channel(channel);
+    channel_state.peer_recv = offset;
+    try state.dropOutboundThrough(channel, offset);
+    if (channel_state.outbound_sent_next < offset) channel_state.outbound_sent_next = offset;
+}
+
+fn handleEofAck(state: *StreamState, channel: StreamChannel, offset: u64) !void {
+    try handleAck(state, channel, offset);
+    const channel_state = state.channel(channel);
+    if (offset == channel_state.outboundNext()) channel_state.outbound_eof_acked = true;
+}
+
+fn handleInboundData(
+    state: *StreamState,
+    transport_write_fd: c.fd_t,
+    options: *const StreamAttachmentOptions,
+    channel: StreamChannel,
+    offset: u64,
+    data: []const u8,
+) !void {
+    if (!state.active_inbound.contains(channel)) return error.StreamInactiveChannel;
+    const channel_state = state.channel(channel);
+    const sink = options.sink(channel);
+    if (offset < channel_state.recv_next_offset) {
+        // Reconnect retransmits from the peer's last confirmed offset. If a
+        // frame overlaps bytes already delivered, keep only the new suffix.
+        const already_received: usize = @intCast(channel_state.recv_next_offset - offset);
+        if (already_received < data.len) {
+            const new_data = data[already_received..];
+            if (sink.fd < 0) return error.StreamSinkClosed;
+            try deliverInboundData(options, channel, sink.fd, new_data);
+            channel_state.recv_next_offset += new_data.len;
+        }
+        sendAckForChannel(state, transport_write_fd, channel, channel_state.recv_next_offset) catch |err| switch (err) {
+            error.WriteFailed => return error.StreamTransportWriteFailed,
+            else => return err,
+        };
+        return;
+    }
+    if (offset != channel_state.recv_next_offset) return error.StreamOffsetGap;
+    if (data.len != 0 and sink.fd < 0) return error.StreamSinkClosed;
+    if (data.len != 0) try deliverInboundData(options, channel, sink.fd, data);
+    channel_state.recv_next_offset += data.len;
+    sendAckForChannel(state, transport_write_fd, channel, channel_state.recv_next_offset) catch |err| switch (err) {
+        error.WriteFailed => return error.StreamTransportWriteFailed,
+        else => return err,
+    };
+}
+
+fn handleInboundEof(
+    state: *StreamState,
+    transport_write_fd: c.fd_t,
+    options: *const StreamAttachmentOptions,
+    channel: StreamChannel,
+    offset: u64,
+) !void {
+    if (!state.active_inbound.contains(channel)) return error.StreamInactiveChannel;
+    const channel_state = state.channel(channel);
+    if (offset > channel_state.recv_next_offset) return error.StreamOffsetGap;
+    channel_state.inbound_eof = true;
+    const sink = options.sink(channel);
+    if (sink.shutdown_on_eof and sink.fd >= 0) _ = c.shutdown(sink.fd, c.SHUT.WR);
+    if (sink.close_fd_on_eof) |sink_fd_ptr| {
+        if (sink_fd_ptr.* >= 0) {
+            _ = c.close(sink_fd_ptr.*);
+            sink_fd_ptr.* = -1;
+        }
+    }
+    if (options.close_outbound_on_inbound_eof and state.allActiveInboundEof()) {
+        for (stream_channels) |outbound_channel| {
+            if (state.active_outbound.contains(outbound_channel)) {
+                state.channel(outbound_channel).outbound_eof = true;
+            }
+        }
+    }
+    sendEofAckForChannel(state, transport_write_fd, channel, channel_state.recv_next_offset) catch |err| switch (err) {
+        error.WriteFailed => return error.StreamTransportWriteFailed,
+        else => return err,
+    };
+}
+
 fn deliverInboundData(options: *const StreamAttachmentOptions, channel: StreamChannel, sink_fd: c.fd_t, bytes: []const u8) !void {
     if (options.reconnect_status) |status| status.observeInbound(channel, bytes);
     try io.writeAll(sink_fd, bytes);
+}
+
+fn sendResumeMessage(state: *StreamState, fd: c.fd_t) !void {
+    switch (state.protocol) {
+        .proxy => {
+            const channel = try singleActiveChannel(state.active_inbound);
+            try sendStreamMessage(state.allocator, fd, .proxy_stream_resume, pb.ProxyStreamResume{
+                .recv_next_offset = state.constChannel(channel).recv_next_offset,
+            });
+        },
+        .tty => try sendStreamMessage(state.allocator, fd, .tty_stream_resume, pb.TtyStreamResume{
+            .input_recv_next_offset = state.constChannel(stream_channel_stdin).recv_next_offset,
+            .output_recv_next_offset = state.constChannel(stream_channel_stdout).recv_next_offset,
+        }),
+    }
+}
+
+fn sendAckForChannel(state: *StreamState, fd: c.fd_t, channel: StreamChannel, offset: u64) !void {
+    switch (state.protocol) {
+        .proxy => {
+            if (channel != try singleActiveChannel(state.active_inbound)) return error.StreamInvalidChannel;
+            try sendStreamMessage(state.allocator, fd, .proxy_stream_ack, pb.ProxyStreamAck{
+                .offset = offset,
+            });
+        },
+        .tty => try sendStreamMessage(state.allocator, fd, .tty_stream_ack, pb.TtyStreamAck{
+            .stream = try ttyDirectionFromChannel(channel),
+            .offset = offset,
+        }),
+    }
+}
+
+fn sendEofAckForChannel(state: *StreamState, fd: c.fd_t, channel: StreamChannel, offset: u64) !void {
+    switch (state.protocol) {
+        .proxy => {
+            if (channel != try singleActiveChannel(state.active_inbound)) return error.StreamInvalidChannel;
+            try sendStreamMessage(state.allocator, fd, .proxy_stream_eof_ack, pb.ProxyStreamEofAck{
+                .offset = offset,
+            });
+        },
+        .tty => try sendStreamMessage(state.allocator, fd, .tty_stream_eof_ack, pb.TtyStreamEofAck{
+            .stream = try ttyDirectionFromChannel(channel),
+            .offset = offset,
+        }),
+    }
+}
+
+fn sendDataForChannel(
+    state: *StreamState,
+    fd: c.fd_t,
+    channel: StreamChannel,
+    offset: u64,
+    data: []const u8,
+) !void {
+    switch (state.protocol) {
+        .proxy => {
+            if (channel != try singleActiveChannel(state.active_outbound)) return error.StreamInvalidChannel;
+            try sendStreamMessage(state.allocator, fd, .proxy_stream_data, pb.ProxyStreamData{
+                .offset = offset,
+                .data = data,
+            });
+        },
+        .tty => switch (channel) {
+            stream_channel_stdin => try sendStreamMessage(state.allocator, fd, .tty_stream_input, pb.TtyStreamInput{
+                .offset = offset,
+                .data = data,
+            }),
+            stream_channel_stdout => try sendStreamMessage(state.allocator, fd, .tty_stream_output, pb.TtyStreamOutput{
+                .offset = offset,
+                .data = data,
+            }),
+            else => return error.StreamInvalidChannel,
+        },
+    }
+}
+
+fn sendEofForChannel(state: *StreamState, fd: c.fd_t, channel: StreamChannel, offset: u64) !void {
+    switch (state.protocol) {
+        .proxy => {
+            if (channel != try singleActiveChannel(state.active_outbound)) return error.StreamInvalidChannel;
+            try sendStreamMessage(state.allocator, fd, .proxy_stream_eof, pb.ProxyStreamEof{
+                .offset = offset,
+            });
+        },
+        .tty => try sendStreamMessage(state.allocator, fd, .tty_stream_eof, pb.TtyStreamEof{
+            .stream = try ttyDirectionFromChannel(channel),
+            .offset = offset,
+        }),
+    }
 }
 
 fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
@@ -1798,38 +1920,26 @@ fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
         // ACKs tell us what the peer has durably received. Separately remember
         // how far this transport has already been sent so appending new source
         // bytes does not cause an overlapping resend on the same still-live
-        // transport. On a replacement transport, StreamResume resets
+        // transport. On a replacement transport, the resume frame resets
         // outbound_sent_next to the peer's reported receive offset, which is
         // when retransmission is needed.
         var index: usize = @intCast(channel_state.outbound_sent_next - channel_state.outbound_base);
         while (index < channel_state.outbound.items.len) {
             const len = @min(max_chunk_bytes, channel_state.outbound.items.len - index);
             const offset = channel_state.outbound_base + index;
-            try sendStreamMessage(
-                state.allocator,
-                transport_write_fd,
-                .stream_data,
-                pb.StreamData{
-                    .channel = channel,
-                    .offset = offset,
-                    .data = channel_state.outbound.items[index .. index + len],
-                },
-            );
+            try sendDataForChannel(state, transport_write_fd, channel, offset, channel_state.outbound.items[index .. index + len]);
             index += len;
             channel_state.outbound_sent_next = offset + len;
         }
         if (channel_state.outbound_eof and !channel_state.outbound_eof_acked and !channel_state.outbound_eof_sent) {
-            try sendStreamMessage(state.allocator, transport_write_fd, .stream_eof, pb.StreamEof{
-                .channel = channel,
-                .offset = channel_state.outboundNext(),
-            });
+            try sendEofForChannel(state, transport_write_fd, channel, channel_state.outboundNext());
             channel_state.outbound_eof_sent = true;
         }
     }
-    if (!state.outbound_exit_status_acked) {
+    if (state.protocol == .tty and !state.outbound_exit_status_acked) {
         if (state.outbound_exit_status) |exit_status| {
             if (!state.outbound_exit_status_sent) {
-                try sendStreamMessage(state.allocator, transport_write_fd, .stream_exit_status, pb.StreamExitStatus{
+                try sendStreamMessage(state.allocator, transport_write_fd, .tty_stream_exit_status, pb.TtyStreamExitStatus{
                     .exit_status = exit_status,
                 });
                 state.outbound_exit_status_sent = true;
@@ -1850,7 +1960,7 @@ fn sendStreamMessage(
 }
 
 fn sendResizeMessage(allocator: std.mem.Allocator, fd: c.fd_t, size: terminal.WindowSize) !void {
-    try sendStreamMessage(allocator, fd, .resize, pb.Resize{
+    try sendStreamMessage(allocator, fd, .tty_stream_resize, pb.TtyStreamResize{
         .terminal_rows = size.rows,
         .terminal_cols = size.cols,
     });
@@ -1990,17 +2100,15 @@ fn parseStreamAgentConfig(allocator: std.mem.Allocator, args: []const []const u8
         try io.writeAll(2, "sessh: :internal-stream-broker: requires GUID MODE ROWS COLS COMMAND TERM TTYMODES\n");
         return error.InvalidStreamArgs;
     }
-    const mode: StreamMode = if (std.mem.eql(u8, args[1], "pty"))
-        .pty
-    else if (std.mem.eql(u8, args[1], "pipe"))
-        .pipe
+    const mode: StreamMode = if (std.mem.eql(u8, args[1], "tty"))
+        .tty
     else if (std.mem.eql(u8, args[1], "proxy"))
         .proxy
     else
         return error.InvalidStreamMode;
 
     switch (mode) {
-        .pty, .pipe => if (!session_registry.isValidReconnectGuid(args[0])) return error.InvalidStreamGuid,
+        .tty => if (!session_registry.isValidTtyGuid(args[0])) return error.InvalidStreamGuid,
         .proxy => if (!session_registry.isValidProxyGuid(args[0])) return error.InvalidStreamGuid,
     }
 
@@ -2081,21 +2189,20 @@ fn decodeTermArg(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
 
 fn startStreamEndpoint(allocator: std.mem.Allocator, config: StreamAgentConfig) !StreamEndpoint {
     return switch (config.mode) {
-        .pty => .{ .pty = .{ .child = try pty_process.spawn(allocator, .{
+        .tty => .{ .tty = .{ .child = try pty_process.spawn(allocator, .{
             .rows = config.rows,
             .cols = config.cols,
             .shell_command = config.shell_command,
             .session_guid = config.guid,
             .tty_settings = config.tty_settings,
         }) } },
-        .pipe => .{ .pipe = try PipeEndpoint.spawn(allocator, config.shell_command) },
         .proxy => .{ .proxy = try ProxyEndpoint.connect(allocator, config.proxy_host.?, config.proxy_port) },
     };
 }
 
 fn endpointHasExitStatus(endpoint: *const StreamEndpoint) bool {
     return switch (endpoint.*) {
-        .pty, .pipe => true,
+        .tty => true,
         .proxy => false,
     };
 }
@@ -2350,7 +2457,7 @@ const TerminalTitleTracker = struct {
     }
 };
 
-// Direct streams must keep application bytes clean. When stdout is a terminal we
+// TTY streams must keep application bytes clean. When stdout is a terminal we
 // can use the window title for reconnect status; otherwise the caller may allow
 // append-only stderr lines. Title mode tracks app OSC titles in the byte stream
 // so reconnect status can be restored without inventing a second UI channel.
@@ -2580,7 +2687,7 @@ test "proxy stream config uses proxy guid and tcp target" {
     try std.testing.expect(config.tty_settings == null);
 
     try std.testing.expectError(error.InvalidStreamGuid, parseStreamAgentConfig(std.testing.allocator, &.{
-        "r-550e8400-e29b-41d4-a716-446655440000",
+        "t-550e8400-e29b-41d4-a716-446655440000",
         "proxy",
         "1",
         "1",
@@ -2595,18 +2702,16 @@ test "stream frames round trip through a pipe" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    try sendStreamMessage(std.testing.allocator, fds[1], .stream_data, pb.StreamData{
-        .channel = stream_channel_stdout,
+    try sendStreamMessage(std.testing.allocator, fds[1], .proxy_stream_data, pb.ProxyStreamData{
         .offset = 42,
         .data = "hello",
     });
     var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(protocol.MessageType.stream_data, frame.message_type);
-    var message = try protocol.decodePayload(pb.StreamData, std.testing.allocator, frame.payload);
+    try std.testing.expectEqual(protocol.MessageType.proxy_stream_data, frame.message_type);
+    var message = try protocol.decodePayload(pb.ProxyStreamData, std.testing.allocator, frame.payload);
     defer message.deinit(std.testing.allocator);
-    try std.testing.expectEqual(stream_channel_stdout, message.channel);
     try std.testing.expectEqual(@as(u64, 42), message.offset);
     try std.testing.expectEqualStrings("hello", message.data);
 }
@@ -2616,7 +2721,7 @@ test "stream ping receives pong without changing offsets" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{ .stdout = true });
+    var state = StreamState.init(std.testing.allocator, .proxy, .{ .stdin = true }, .{ .stdout = true });
     defer state.deinit();
     const payload = try protocol.encodePayload(std.testing.allocator, pb.Ping{});
     const options = StreamAttachmentOptions{};
@@ -2637,7 +2742,7 @@ test "stream sender sends only newly appended bytes on a live transport" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{});
+    var state = StreamState.init(std.testing.allocator, .tty, .{ .stdin = true }, .{});
     defer state.deinit();
     state.peer_ready = true;
 
@@ -2645,9 +2750,9 @@ test "stream sender sends only newly appended bytes on a live transport" {
     try sendPending(&state, fds[1]);
     var first_frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer first_frame.deinit(std.testing.allocator);
-    var first = try protocol.decodePayload(pb.StreamData, std.testing.allocator, first_frame.payload);
+    try std.testing.expectEqual(protocol.MessageType.tty_stream_input, first_frame.message_type);
+    var first = try protocol.decodePayload(pb.TtyStreamInput, std.testing.allocator, first_frame.payload);
     defer first.deinit(std.testing.allocator);
-    try std.testing.expectEqual(stream_channel_stdin, first.channel);
     try std.testing.expectEqual(@as(u64, 0), first.offset);
     try std.testing.expectEqualStrings("first", first.data);
 
@@ -2655,9 +2760,9 @@ test "stream sender sends only newly appended bytes on a live transport" {
     try sendPending(&state, fds[1]);
     var second_frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer second_frame.deinit(std.testing.allocator);
-    var second = try protocol.decodePayload(pb.StreamData, std.testing.allocator, second_frame.payload);
+    try std.testing.expectEqual(protocol.MessageType.tty_stream_input, second_frame.message_type);
+    var second = try protocol.decodePayload(pb.TtyStreamInput, std.testing.allocator, second_frame.payload);
     defer second.deinit(std.testing.allocator);
-    try std.testing.expectEqual(stream_channel_stdin, second.channel);
     try std.testing.expectEqual(@as(u64, 5), second.offset);
     try std.testing.expectEqualStrings("second", second.data);
 }
@@ -2670,19 +2775,18 @@ test "stream receiver keeps suffix from overlapping data frame" {
     defer posix.close(ack[0]);
     defer posix.close(ack[1]);
 
-    var state = StreamState.init(std.testing.allocator, .{}, .{ .stdout = true });
+    var state = StreamState.init(std.testing.allocator, .tty, .{}, .{ .stdout = true });
     defer state.deinit();
     state.channel(stream_channel_stdout).recv_next_offset = 5;
 
-    const payload = try protocol.encodePayload(std.testing.allocator, pb.StreamData{
-        .channel = stream_channel_stdout,
+    const payload = try protocol.encodePayload(std.testing.allocator, pb.TtyStreamOutput{
         .offset = 0,
         .data = "firstsecond",
     });
     var options = StreamAttachmentOptions{};
     options.sinks[channelIndex(stream_channel_stdout)] = .{ .fd = sink[1] };
     try handleFrame(&state, ack[1], &options, .{
-        .message_type = .stream_data,
+        .message_type = .tty_stream_output,
         .payload = payload,
     });
 
@@ -2692,9 +2796,9 @@ test "stream receiver keeps suffix from overlapping data frame" {
 
     var ack_frame = try protocol.readFrameAlloc(std.testing.allocator, ack[0]);
     defer ack_frame.deinit(std.testing.allocator);
-    var ack_message = try protocol.decodePayload(pb.StreamAck, std.testing.allocator, ack_frame.payload);
+    var ack_message = try protocol.decodePayload(pb.TtyStreamAck, std.testing.allocator, ack_frame.payload);
     defer ack_message.deinit(std.testing.allocator);
-    try std.testing.expectEqual(stream_channel_stdout, ack_message.channel);
+    try std.testing.expectEqual(pb.TtyStreamDirection.TTY_STREAM_DIRECTION_OUTPUT, ack_message.stream);
     try std.testing.expectEqual(@as(u64, 11), ack_message.offset);
 }
 
@@ -2706,16 +2810,16 @@ test "stream inbound eof promptly flushes generated outbound eof" {
     defer posix.close(transport_out[0]);
     defer posix.close(transport_out[1]);
 
-    var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{ .stdout = true });
+    var state = StreamState.init(std.testing.allocator, .tty, .{ .stdin = true }, .{ .stdout = true });
     defer state.deinit();
     state.peer_ready = true;
 
-    const payload = try protocol.encodePayload(std.testing.allocator, pb.StreamEof{
-        .channel = stream_channel_stdout,
+    const payload = try protocol.encodePayload(std.testing.allocator, pb.TtyStreamEof{
+        .stream = .TTY_STREAM_DIRECTION_OUTPUT,
         .offset = 0,
     });
     defer std.testing.allocator.free(payload);
-    try protocol.sendFrame(transport_in[1], .stream_eof, payload);
+    try protocol.sendFrame(transport_in[1], .tty_stream_eof, payload);
 
     var attachment = StreamAttachment{
         .state = &state,
@@ -2731,7 +2835,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
 
     var ack_frame = try protocol.readFrameAlloc(std.testing.allocator, transport_out[0]);
     defer ack_frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.stream_eof_ack, ack_frame.message_type);
+    try std.testing.expectEqual(protocol.MessageType.tty_stream_eof_ack, ack_frame.message_type);
 
     var pollfds = [_]posix.pollfd{.{
         .fd = transport_out[0],
@@ -2742,10 +2846,10 @@ test "stream inbound eof promptly flushes generated outbound eof" {
 
     var eof_frame = try protocol.readFrameAlloc(std.testing.allocator, transport_out[0]);
     defer eof_frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.stream_eof, eof_frame.message_type);
-    var eof = try protocol.decodePayload(pb.StreamEof, std.testing.allocator, eof_frame.payload);
+    try std.testing.expectEqual(protocol.MessageType.tty_stream_eof, eof_frame.message_type);
+    var eof = try protocol.decodePayload(pb.TtyStreamEof, std.testing.allocator, eof_frame.payload);
     defer eof.deinit(std.testing.allocator);
-    try std.testing.expectEqual(stream_channel_stdin, eof.channel);
+    try std.testing.expectEqual(pb.TtyStreamDirection.TTY_STREAM_DIRECTION_INPUT, eof.stream);
 }
 
 test "stream resume drains already-exited child source without waiting for source poll" {
@@ -2772,14 +2876,14 @@ test "stream resume drains already-exited child source without waiting for sourc
     defer posix.close(transport_out[0]);
     defer posix.close(transport_out[1]);
 
-    var state = StreamState.init(std.testing.allocator, .{ .stdout = true }, .{ .stdin = true });
+    var state = StreamState.init(std.testing.allocator, .tty, .{ .stdout = true }, .{ .stdin = true });
     defer state.deinit();
     var exited = false;
     var exit_status: ?pb.ExitStatus = null;
 
-    const resume_payload = try protocol.encodePayload(std.testing.allocator, pb.StreamResume{});
+    const resume_payload = try protocol.encodePayload(std.testing.allocator, pb.TtyStreamResume{});
     defer std.testing.allocator.free(resume_payload);
-    try protocol.sendFrame(transport_in[1], .stream_resume, resume_payload);
+    try protocol.sendFrame(transport_in[1], .tty_stream_resume, resume_payload);
 
     var attachment = StreamAttachment{
         .state = &state,
@@ -2813,10 +2917,10 @@ test "stream resume drains already-exited child source without waiting for sourc
 
     var eof_frame = try protocol.readFrameAlloc(std.testing.allocator, transport_out[0]);
     defer eof_frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.stream_eof, eof_frame.message_type);
-    var eof = try protocol.decodePayload(pb.StreamEof, std.testing.allocator, eof_frame.payload);
+    try std.testing.expectEqual(protocol.MessageType.tty_stream_eof, eof_frame.message_type);
+    var eof = try protocol.decodePayload(pb.TtyStreamEof, std.testing.allocator, eof_frame.payload);
     defer eof.deinit(std.testing.allocator);
-    try std.testing.expectEqual(stream_channel_stdout, eof.channel);
+    try std.testing.expectEqual(pb.TtyStreamDirection.TTY_STREAM_DIRECTION_OUTPUT, eof.stream);
 
     try std.testing.expect(exited);
     try std.testing.expect(exit_status != null);
@@ -2952,19 +3056,19 @@ test "pending stream replacement notifies failed preparation" {
 }
 
 test "stream completion waits for eof acknowledgement" {
-    var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{});
+    var state = StreamState.init(std.testing.allocator, .tty, .{ .stdin = true }, .{});
     defer state.deinit();
     state.channel(stream_channel_stdin).outbound_eof = true;
 
     try std.testing.expect(!state.complete());
 
-    const payload = try protocol.encodePayload(std.testing.allocator, pb.StreamEofAck{
-        .channel = stream_channel_stdin,
+    const payload = try protocol.encodePayload(std.testing.allocator, pb.TtyStreamEofAck{
+        .stream = .TTY_STREAM_DIRECTION_INPUT,
         .offset = 0,
     });
     const options = StreamAttachmentOptions{};
     try handleFrame(&state, -1, &options, .{
-        .message_type = .stream_eof_ack,
+        .message_type = .tty_stream_eof_ack,
         .payload = payload,
     });
     try std.testing.expect(state.complete());
@@ -2978,7 +3082,7 @@ test "stream exit code matches OpenSSH for remote signal death" {
 }
 
 test "stream eof is not delayed waiting for exit status" {
-    var state = StreamState.init(std.testing.allocator, .{ .stdout = true }, .{});
+    var state = StreamState.init(std.testing.allocator, .tty, .{ .stdout = true }, .{});
     defer state.deinit();
     state.peer_ready = true;
     state.require_outbound_exit_status = true;
@@ -3000,11 +3104,11 @@ test "stream eof is not delayed waiting for exit status" {
 
     var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.stream_eof, frame.message_type);
+    try std.testing.expectEqual(protocol.MessageType.tty_stream_eof, frame.message_type);
 }
 
 test "stream completion waits for exit status acknowledgement" {
-    var state = StreamState.init(std.testing.allocator, .{ .stdout = true }, .{});
+    var state = StreamState.init(std.testing.allocator, .tty, .{ .stdout = true }, .{});
     defer state.deinit();
     state.require_outbound_exit_status = true;
     state.outbound_exit_status = .{
@@ -3016,10 +3120,10 @@ test "stream completion waits for exit status acknowledgement" {
 
     try std.testing.expect(!state.complete());
 
-    const payload = try protocol.encodePayload(std.testing.allocator, pb.StreamExitStatusAck{});
+    const payload = try protocol.encodePayload(std.testing.allocator, pb.TtyStreamExitStatusAck{});
     const options = StreamAttachmentOptions{};
     try handleFrame(&state, -1, &options, .{
-        .message_type = .stream_exit_status_ack,
+        .message_type = .tty_stream_exit_status_ack,
         .payload = payload,
     });
     try std.testing.expect(state.complete());
@@ -3062,7 +3166,7 @@ test "stream child sources drain before child status is checked" {
     try std.testing.expect(ready == 1);
     try std.testing.expect((pollfds[0].revents & posix.POLL.IN) != 0);
 
-    var state = StreamState.init(std.testing.allocator, .{ .stdout = true }, .{});
+    var state = StreamState.init(std.testing.allocator, .tty, .{ .stdout = true }, .{});
     defer state.deinit();
     var exited = false;
     const options = StreamAttachmentOptions{

@@ -28,17 +28,19 @@ We use a symlink for `agent.sock` because Unix-domain socket path lengths are
 platform-limited; for example, macOS `unix(4)` documents
 `sockaddr_un.sun_path` as 104 bytes: https://manpages.org/unix/4
 
-The actual socket path lives under `s/` followed by a compact representation of
-the guid (or random hex bytes if `XDG_RUNTIME_DIR` is too long to allow the
-full guid to fit).
+The actual session socket path lives under `s/` followed by a compact
+representation of the guid (or random hex bytes if `XDG_RUNTIME_DIR` is too
+long to allow the full guid to fit). Tty stream agent sockets use the same
+scheme under `t/`; proxy stream agent sockets use `p/`.
 
 Runtime guid directories include small metadata files so `sesshmux list --all`
 can explain what each live guid represents. Local session directories use
-`meta.json` with `type: local-session`. Client and reconnectable stream
+`meta.json` with `type: local-session`. Client, tty stream, and proxy stream
 directories can be owned from both sides of a connection at once, so each side
-writes its own file: `incoming-meta.json` for incoming clients or streams, and
-`outgoing-meta.json` for outgoing clients or streams. Teardown removes only the
-metadata file it owns; the last side to leave removes the now-empty directory.
+writes its own file: `incoming-meta.json` for incoming entries and
+`outgoing-meta.json` for outgoing entries. Tty streams use `t-` GUIDs; proxy
+streams use `p-` GUIDs. Teardown removes only the metadata file it owns; the
+last side to leave removes the now-empty directory.
 
 On the session host, each client hint contains an `agent.sock` symlink to the
 session agent so commands like `sesshmux detach c-...` can reach the right agent

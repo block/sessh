@@ -254,6 +254,35 @@ if [ -n "$proxy_command" ]; then
   if [ "$#" -gt 0 ]; then
     printf 'proxy_remote_command=%s\\n' "$*" >>"$SESSH_FAKE_SSH_LOG"
   fi
+  export SESSH_TEST_HOST=$host
+  if [ -n "${SESSH_FAKE_SSH_REMOTE_PATH:-}" ]; then
+    PATH=$SESSH_FAKE_SSH_REMOTE_PATH:$PATH
+    export PATH
+  fi
+  if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR:-}" ]; then
+    XDG_RUNTIME_DIR=$SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR
+    export XDG_RUNTIME_DIR
+  fi
+  if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME:-}" ]; then
+    XDG_STATE_HOME=$SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME
+    export XDG_STATE_HOME
+  fi
+  if [ -n "${SESSH_FAKE_SSH_REMOTE_SHELL:-}" ]; then
+    SHELL=$SESSH_FAKE_SSH_REMOTE_SHELL
+    export SHELL
+  fi
+  if [ "$#" -gt 0 ]; then
+    if [ "$*" = "tty" ]; then
+      if [ "$request_tty" -eq 1 ] && { [ "$plain_option" = "-tt" ] || { [ "$plain_option" = "-t" ] && [ -t 0 ]; }; }; then
+        printf '/dev/pts/5\\n'
+        exit 0
+      else
+        printf 'not a tty\\n'
+        exit 1
+      fi
+    fi
+    exec sh -c "$*"
+  fi
   printf 'PROXY_SSH host=%s\\n' "$host"
   exit 0
 fi
@@ -1732,7 +1761,7 @@ def test_ssh_x11_uses_proxy_stream(tmp):
         raise AssertionError(result)
     if "fallback to plain-ssh" in result.stderr:
         raise AssertionError(result.stderr)
-    if "PROXY_SSH host=test-host" not in result.stdout:
+    if result.stdout != "hello\n":
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if "proxy_ssh=1" not in log_text:
@@ -1834,13 +1863,13 @@ def test_ssh_no_force_proxy_mode_overrides_config(tmp):
     if result.stdout != "hello\n":
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "proxy_ssh=1" in log_text or ":internal-proxy-stream:" in log_text:
+    if "proxy_ssh=1" not in log_text or ":internal-proxy-stream:" not in log_text:
         raise AssertionError(log_text)
-    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+    if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
-def test_ssh_remote_command_uses_direct_stream(tmp):
+def test_ssh_remote_command_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1858,7 +1887,9 @@ def test_ssh_remote_command_uses_direct_stream(tmp):
     if "fallback to plain-ssh" in result.stderr:
         raise AssertionError(result.stderr)
     log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text:
+    if "proxy_ssh=1" not in log_text:
+        raise AssertionError(log_text)
+    if ":internal-proxy-stream:" not in log_text:
         raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
@@ -1895,7 +1926,7 @@ def test_ssh_remote_command_option_after_host_is_remote_arg(tmp):
     if "sessh " in result.stdout:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
@@ -1975,7 +2006,7 @@ def test_ssh_tty_stdin_remote_command_does_not_allocate_tty_without_t(tmp):
     if result.returncode != 1:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
@@ -2026,7 +2057,7 @@ def test_ssh_terminal_emulator_tty_propagates_resize(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_remote_command_uses_direct_stream(tmp):
+def test_ssh_no_terminal_emulator_remote_command_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2044,7 +2075,7 @@ def test_ssh_no_terminal_emulator_remote_command_uses_direct_stream(tmp):
     if "fallback to plain-ssh" in result.stderr:
         raise AssertionError(result.stderr)
     log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text or "plain_ssh=1" in log_text:
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
@@ -2244,7 +2275,7 @@ def test_ssh_no_terminal_emulator_tty_uses_single_stream_guid(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_no_terminal_emulator_command_in_tty_uses_single_stream_guid(tmp):
+def test_ssh_no_terminal_emulator_command_in_tty_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2263,7 +2294,9 @@ def test_ssh_no_terminal_emulator_command_in_tty_uses_single_stream_guid(tmp):
     if result.returncode != 0:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text:
+    if "proxy_ssh=1" not in log_text:
+        raise AssertionError(log_text)
+    if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
@@ -2506,7 +2539,7 @@ def test_ssh_terminal_emulator_release_artifact_restores_local_tty_on_exit(tmp):
         )
 
 
-def test_ssh_remote_command_stream_reconnects_after_transport_loss(tmp):
+def test_ssh_forced_tty_remote_command_stream_reconnects_after_transport_loss(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2523,7 +2556,7 @@ def test_ssh_remote_command_stream_reconnects_after_transport_loss(tmp):
         "sleep 0.2; "
         "printf 'STREAM_AFTER\\n'"
     )
-    result = run_sessh(["test-host", command], env, timeout=40.0)
+    result = run_sessh(["-tt", "test-host", command], env, timeout=40.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -2804,7 +2837,7 @@ def test_ssh_requested_tty_remote_command_allocates_pty_with_tty_stdin(tmp):
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
-def test_ssh_single_tty_remote_command_with_stdin_null_uses_direct_stream(tmp):
+def test_ssh_single_requested_tty_remote_command_with_stdin_null_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2822,7 +2855,7 @@ def test_ssh_single_tty_remote_command_with_stdin_null_uses_direct_stream(tmp):
     if "fallback to plain-ssh" in result.stderr:
         raise AssertionError(result.stderr)
     log_text = fake_log.read_text()
-    if "batch_mode=1" not in log_text:
+    if "proxy_ssh=1" not in log_text:
         raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
@@ -4841,8 +4874,8 @@ def main(argv=None):
             test_ssh_no_force_proxy_mode_overrides_config,
         ),
         (
-            "ssh remote command uses direct stream",
-            test_ssh_remote_command_uses_direct_stream,
+            "ssh remote command uses proxy stream",
+            test_ssh_remote_command_uses_proxy_stream,
         ),
         (
             "ssh remote command option after host is remote arg",
@@ -4873,8 +4906,8 @@ def main(argv=None):
             test_ssh_terminal_emulator_tty_propagates_resize,
         ),
         (
-            "ssh no-terminal-emulator remote command uses direct stream",
-            test_ssh_no_terminal_emulator_remote_command_uses_direct_stream,
+            "ssh no-terminal-emulator remote command uses proxy stream",
+            test_ssh_no_terminal_emulator_remote_command_uses_proxy_stream,
         ),
         (
             "ssh no-terminal-emulator remote command preserves exit status",
@@ -4913,12 +4946,12 @@ def main(argv=None):
             test_ssh_no_terminal_emulator_tty_uses_single_stream_guid,
         ),
         (
-            "ssh no-terminal-emulator command in tty uses single stream guid",
-            test_ssh_no_terminal_emulator_command_in_tty_uses_single_stream_guid,
+            "ssh no-terminal-emulator command in tty uses proxy stream",
+            test_ssh_no_terminal_emulator_command_in_tty_uses_proxy_stream,
         ),
         (
-            "ssh remote command stream reconnects after transport loss",
-            test_ssh_remote_command_stream_reconnects_after_transport_loss,
+            "ssh forced tty remote command stream reconnects after transport loss",
+            test_ssh_forced_tty_remote_command_stream_reconnects_after_transport_loss,
         ),
         (
             "ssh no-terminal-emulator tty reconnect title restores app title",
@@ -4985,8 +5018,8 @@ def main(argv=None):
             test_ssh_requested_tty_remote_command_allocates_pty_with_tty_stdin,
         ),
         (
-            "ssh single tty remote command with stdin null uses direct stream",
-            test_ssh_single_tty_remote_command_with_stdin_null_uses_direct_stream,
+            "ssh single requested tty remote command with stdin null uses proxy stream",
+            test_ssh_single_requested_tty_remote_command_with_stdin_null_uses_proxy_stream,
         ),
         (
             "ssh tty empty remote command starts interactive session",

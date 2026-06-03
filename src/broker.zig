@@ -1755,7 +1755,7 @@ test "list all rows include runtime metadata and cached remote sessions" {
     const local_guid = "s-11111111-1111-4111-8111-111111111111";
     const client_guid = "c-22222222-2222-4222-8222-222222222222";
     const remote_guid = "s-33333333-3333-4333-8333-333333333333";
-    const stream_guid = "r-44444444-4444-4444-8444-444444444444";
+    const stream_guid = "t-44444444-4444-4444-8444-444444444444";
     const proxy_guid = "p-55555555-5555-4555-8555-555555555555";
     const local_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, local_guid });
     defer allocator.free(local_dir);
@@ -1783,7 +1783,7 @@ test "list all rows include runtime metadata and cached remote sessions" {
     try writeTestFile(local_meta, "{\"type\":\"local-session\",\"created_at_unix_ms\":1000}\n");
     try writeTestFile(incoming_client_meta, "{\"type\":\"incoming-client\",\"created_at_unix_ms\":1500}\n");
     try writeTestFile(outgoing_client_meta, "{\"type\":\"outgoing-client\",\"created_at_unix_ms\":2000}\n");
-    try writeTestFile(stream_meta, "{\"type\":\"outgoing-stream\",\"created_at_unix_ms\":3000}\n");
+    try writeTestFile(stream_meta, "{\"type\":\"outgoing-tty-stream\",\"created_at_unix_ms\":3000}\n");
     try writeTestFile(proxy_meta, "{\"type\":\"outgoing-proxy\",\"created_at_unix_ms\":3500}\n");
 
     const remote_route_dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ state_root, remote_guid });
@@ -1802,7 +1802,7 @@ test "list all rows include runtime metadata and cached remote sessions" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"s-11111111\",\"guid\":\"s-11111111-1111-4111-8111-111111111111\",\"type\":\"local-session\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"c-22222222\",\"guid\":\"c-22222222-2222-4222-8222-222222222222\",\"type\":\"incoming-client\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"c-22222222\",\"guid\":\"c-22222222-2222-4222-8222-222222222222\",\"type\":\"outgoing-client\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"r-44444444\",\"guid\":\"r-44444444-4444-4444-8444-444444444444\",\"type\":\"outgoing-stream\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"t-44444444\",\"guid\":\"t-44444444-4444-4444-8444-444444444444\",\"type\":\"outgoing-tty-stream\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"p-55555555\",\"guid\":\"p-55555555-5555-4555-8555-555555555555\",\"type\":\"outgoing-proxy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"s-33333333\",\"guid\":\"s-33333333-3333-4333-8333-333333333333\",\"type\":\"remote-session\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "host=work.example version=0.6.0-test") != null);

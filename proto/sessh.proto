@@ -42,74 +42,124 @@ message Frame {
     SessionClientRepaintRequest session_client_repaint_request = 31;
     SessionClientDebugSeverConnectionRequest session_client_debug_sever_connection_request = 32;
     SessionClientDebugUnresponsiveConnectionRequest session_client_debug_unresponsive_connection_request = 33;
-    StreamResume stream_resume = 34;
-    StreamData stream_data = 35;
-    StreamAck stream_ack = 36;
-    StreamEof stream_eof = 37;
-    StreamEofAck stream_eof_ack = 38;
     Ping ping = 39;
     Pong pong = 40;
-    StreamExitStatus stream_exit_status = 41;
-    StreamExitStatusAck stream_exit_status_ack = 42;
+    ProxyStreamResume proxy_stream_resume = 43;
+    ProxyStreamData proxy_stream_data = 44;
+    ProxyStreamAck proxy_stream_ack = 45;
+    ProxyStreamEof proxy_stream_eof = 46;
+    ProxyStreamEofAck proxy_stream_eof_ack = 47;
+    TtyStreamResume tty_stream_resume = 48;
+    TtyStreamInput tty_stream_input = 49;
+    TtyStreamOutput tty_stream_output = 50;
+    TtyStreamAck tty_stream_ack = 51;
+    TtyStreamEof tty_stream_eof = 52;
+    TtyStreamEofAck tty_stream_eof_ack = 53;
+    TtyStreamResize tty_stream_resize = 54;
+    TtyStreamExitStatus tty_stream_exit_status = 55;
+    TtyStreamExitStatusAck tty_stream_exit_status_ack = 56;
   }
 }
 
-// Sent at the start of every ssh transport that carries reconnectable byte
-// streams. The receiver uses the per-channel offsets to drop bytes that the
-// peer already received and resume each channel from its first unacknowledged
-// byte.
-message StreamResume {
-  uint64 stdin_recv_next_offset = 1;
-  uint64 stdout_recv_next_offset = 2;
-  uint64 stderr_recv_next_offset = 3;
+// Sent at the start of every ssh transport that carries an opaque proxy stream.
+// The receiver uses the offset to drop bytes that the peer already received and
+// resume from the first unacknowledged byte.
+message ProxyStreamResume {
+  uint64 recv_next_offset = 1;
 }
 
-// Raw bytes from this peer's outbound stream on one logical channel.
-message StreamData {
-  // Logical byte-stream id. -1 is undefined; 0, 1, and 2 match the standard
-  // stdin, stdout, and stderr file descriptor numbers. Other positive values
-  // are reserved for future channels.
-  int32 channel = 1;
-  // Offset of data[0] in this peer's outbound byte stream for this channel.
+// Raw bytes from this peer's outbound opaque proxy stream.
+message ProxyStreamData {
+  // Offset of data[0] in this peer's outbound byte stream.
+  uint64 offset = 1;
+  bytes data = 2;
+}
+
+// Acknowledges received ProxyStreamData bytes.
+message ProxyStreamAck {
+  // First byte offset not yet received from the sender.
+  uint64 offset = 1;
+}
+
+// Marks the end of this peer's outbound opaque proxy stream.
+message ProxyStreamEof {
+  // Offset of the end of the sender's byte stream.
+  uint64 offset = 1;
+}
+
+// Acknowledges that ProxyStreamEof was received.
+message ProxyStreamEofAck {
+  // Offset of the end of the sender's byte stream.
+  uint64 offset = 1;
+}
+
+// TTY streams carry one PTY input byte stream and one PTY output byte stream.
+enum TtyStreamDirection {
+  TTY_STREAM_DIRECTION_UNSPECIFIED = 0;
+  TTY_STREAM_DIRECTION_INPUT = 1;
+  TTY_STREAM_DIRECTION_OUTPUT = 2;
+}
+
+// Sent at the start of every ssh transport that carries a sessh-owned PTY
+// stream. The receiver uses the offsets to resume PTY input and output from the
+// first unacknowledged byte in each direction.
+message TtyStreamResume {
+  uint64 input_recv_next_offset = 1;
+  uint64 output_recv_next_offset = 2;
+}
+
+// Raw bytes written toward the remote PTY.
+message TtyStreamInput {
+  uint64 offset = 1;
+  bytes data = 2;
+}
+
+// Raw bytes read from the remote PTY.
+message TtyStreamOutput {
+  uint64 offset = 1;
+  bytes data = 2;
+}
+
+// Acknowledges received TtyStreamInput or TtyStreamOutput bytes.
+message TtyStreamAck {
+  TtyStreamDirection stream = 1;
+  // First byte offset not yet received from the sender for this stream.
   uint64 offset = 2;
-  bytes data = 3;
 }
 
-// Acknowledges received StreamData bytes.
-message StreamAck {
-  // Logical byte-stream id; see StreamData.channel.
-  int32 channel = 1;
-  // First byte offset not yet received from the sender for this channel.
+// Marks the end of this peer's outbound PTY input or output stream.
+message TtyStreamEof {
+  TtyStreamDirection stream = 1;
+  // Offset of the end of the sender's byte stream.
   uint64 offset = 2;
 }
 
-// Marks the end of this peer's outbound stream.
-message StreamEof {
-  // Logical byte-stream id; see StreamData.channel.
-  int32 channel = 1;
-  // Offset of the end of the sender's byte stream for this channel.
+// Acknowledges that TtyStreamEof was received.
+message TtyStreamEofAck {
+  TtyStreamDirection stream = 1;
+  // Offset of the end of the sender's byte stream.
   uint64 offset = 2;
 }
 
-// Acknowledges that StreamEof was received.
-message StreamEofAck {
-  // Logical byte-stream id; see StreamData.channel.
-  int32 channel = 1;
-  // Offset of the end of the sender's byte stream for this channel.
-  uint64 offset = 2;
+// PTY size update for a sessh-owned TTY stream.
+message TtyStreamResize {
+  // Rows visible in the local terminal. The stream agent bounds this to u16.
+  uint32 terminal_rows = 1;
+  // Columns visible in the local terminal. The stream agent bounds this to u16.
+  uint32 terminal_cols = 2;
 }
 
-// Exit status for the remote process behind a reconnectable stream. This is
-// separate from StreamEof because stdout/stderr can close before the process
-// exits. The sender waits for StreamExitStatusAck before it lets the stream
+// Exit status for the remote process behind a sessh-owned TTY stream. This is
+// separate from TtyStreamEof because PTY output can close before the process
+// exits. The sender waits for TtyStreamExitStatusAck before it lets the stream
 // finish, otherwise a reconnect between the status write and the peer's read
 // could lose the exit code.
-message StreamExitStatus {
+message TtyStreamExitStatus {
   ExitStatus exit_status = 1;
 }
 
-// Acknowledges that StreamExitStatus was received.
-message StreamExitStatusAck {
+// Acknowledges that TtyStreamExitStatus was received.
+message TtyStreamExitStatusAck {
 }
 
 // A transport liveness probe. This is not application input and must not change

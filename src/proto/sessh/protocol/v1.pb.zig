@@ -7,6 +7,14 @@ const fd = protobuf.fd;
 /// import package sessh.handshake.v1
 const sessh_handshake_v1 = @import("../handshake/v1.pb.zig");
 
+/// TTY streams carry one PTY input byte stream and one PTY output byte stream.
+pub const TtyStreamDirection = enum(i32) {
+    TTY_STREAM_DIRECTION_UNSPECIFIED = 0,
+    TTY_STREAM_DIRECTION_INPUT = 1,
+    TTY_STREAM_DIRECTION_OUTPUT = 2,
+    _,
+};
+
 pub const ClientControlTargetKind = enum(i32) {
     CLIENT_CONTROL_TARGET_KIND_UNSPECIFIED = 0,
     CLIENT_CONTROL_TARGET_KIND_DEFAULT = 1,
@@ -75,15 +83,22 @@ pub const Frame = struct {
         session_client_repaint_request,
         session_client_debug_sever_connection_request,
         session_client_debug_unresponsive_connection_request,
-        stream_resume,
-        stream_data,
-        stream_ack,
-        stream_eof,
-        stream_eof_ack,
         ping,
         pong,
-        stream_exit_status,
-        stream_exit_status_ack,
+        proxy_stream_resume,
+        proxy_stream_data,
+        proxy_stream_ack,
+        proxy_stream_eof,
+        proxy_stream_eof_ack,
+        tty_stream_resume,
+        tty_stream_input,
+        tty_stream_output,
+        tty_stream_ack,
+        tty_stream_eof,
+        tty_stream_eof_ack,
+        tty_stream_resize,
+        tty_stream_exit_status,
+        tty_stream_exit_status_ack,
     };
     pub const payload_union = union(_payload_case) {
         @"error": sessh_handshake_v1.Error,
@@ -108,15 +123,22 @@ pub const Frame = struct {
         session_client_repaint_request: SessionClientRepaintRequest,
         session_client_debug_sever_connection_request: SessionClientDebugSeverConnectionRequest,
         session_client_debug_unresponsive_connection_request: SessionClientDebugUnresponsiveConnectionRequest,
-        stream_resume: StreamResume,
-        stream_data: StreamData,
-        stream_ack: StreamAck,
-        stream_eof: StreamEof,
-        stream_eof_ack: StreamEofAck,
         ping: Ping,
         pong: Pong,
-        stream_exit_status: StreamExitStatus,
-        stream_exit_status_ack: StreamExitStatusAck,
+        proxy_stream_resume: ProxyStreamResume,
+        proxy_stream_data: ProxyStreamData,
+        proxy_stream_ack: ProxyStreamAck,
+        proxy_stream_eof: ProxyStreamEof,
+        proxy_stream_eof_ack: ProxyStreamEofAck,
+        tty_stream_resume: TtyStreamResume,
+        tty_stream_input: TtyStreamInput,
+        tty_stream_output: TtyStreamOutput,
+        tty_stream_ack: TtyStreamAck,
+        tty_stream_eof: TtyStreamEof,
+        tty_stream_eof_ack: TtyStreamEofAck,
+        tty_stream_resize: TtyStreamResize,
+        tty_stream_exit_status: TtyStreamExitStatus,
+        tty_stream_exit_status_ack: TtyStreamExitStatusAck,
         pub const _desc_table = .{
             .@"error" = fd(10, .submessage),
             .session_create = fd(11, .submessage),
@@ -140,15 +162,22 @@ pub const Frame = struct {
             .session_client_repaint_request = fd(31, .submessage),
             .session_client_debug_sever_connection_request = fd(32, .submessage),
             .session_client_debug_unresponsive_connection_request = fd(33, .submessage),
-            .stream_resume = fd(34, .submessage),
-            .stream_data = fd(35, .submessage),
-            .stream_ack = fd(36, .submessage),
-            .stream_eof = fd(37, .submessage),
-            .stream_eof_ack = fd(38, .submessage),
             .ping = fd(39, .submessage),
             .pong = fd(40, .submessage),
-            .stream_exit_status = fd(41, .submessage),
-            .stream_exit_status_ack = fd(42, .submessage),
+            .proxy_stream_resume = fd(43, .submessage),
+            .proxy_stream_data = fd(44, .submessage),
+            .proxy_stream_ack = fd(45, .submessage),
+            .proxy_stream_eof = fd(46, .submessage),
+            .proxy_stream_eof_ack = fd(47, .submessage),
+            .tty_stream_resume = fd(48, .submessage),
+            .tty_stream_input = fd(49, .submessage),
+            .tty_stream_output = fd(50, .submessage),
+            .tty_stream_ack = fd(51, .submessage),
+            .tty_stream_eof = fd(52, .submessage),
+            .tty_stream_eof_ack = fd(53, .submessage),
+            .tty_stream_resize = fd(54, .submessage),
+            .tty_stream_exit_status = fd(55, .submessage),
+            .tty_stream_exit_status_ack = fd(56, .submessage),
         };
     };
 
@@ -215,19 +244,14 @@ pub const Frame = struct {
     }
 };
 
-/// Sent at the start of every ssh transport that carries reconnectable byte
-/// streams. The receiver uses the per-channel offsets to drop bytes that the
-/// peer already received and resume each channel from its first unacknowledged
-/// byte.
-pub const StreamResume = struct {
-    stdin_recv_next_offset: u64 = 0,
-    stdout_recv_next_offset: u64 = 0,
-    stderr_recv_next_offset: u64 = 0,
+/// Sent at the start of every ssh transport that carries an opaque proxy stream.
+/// The receiver uses the offset to drop bytes that the peer already received and
+/// resume from the first unacknowledged byte.
+pub const ProxyStreamResume = struct {
+    recv_next_offset: u64 = 0,
 
     pub const _desc_table = .{
-        .stdin_recv_next_offset = fd(1, .{ .scalar = .uint64 }),
-        .stdout_recv_next_offset = fd(2, .{ .scalar = .uint64 }),
-        .stderr_recv_next_offset = fd(3, .{ .scalar = .uint64 }),
+        .recv_next_offset = fd(1, .{ .scalar = .uint64 }),
     };
 
     /// Encodes the message to the writer
@@ -289,16 +313,14 @@ pub const StreamResume = struct {
     }
 };
 
-/// Raw bytes from this peer's outbound stream on one logical channel.
-pub const StreamData = struct {
-    channel: i32 = 0,
+/// Raw bytes from this peer's outbound opaque proxy stream.
+pub const ProxyStreamData = struct {
     offset: u64 = 0,
     data: []const u8 = &.{},
 
     pub const _desc_table = .{
-        .channel = fd(1, .{ .scalar = .int32 }),
-        .offset = fd(2, .{ .scalar = .uint64 }),
-        .data = fd(3, .{ .scalar = .bytes }),
+        .offset = fd(1, .{ .scalar = .uint64 }),
+        .data = fd(2, .{ .scalar = .bytes }),
     };
 
     /// Encodes the message to the writer
@@ -360,14 +382,12 @@ pub const StreamData = struct {
     }
 };
 
-/// Acknowledges received StreamData bytes.
-pub const StreamAck = struct {
-    channel: i32 = 0,
+/// Acknowledges received ProxyStreamData bytes.
+pub const ProxyStreamAck = struct {
     offset: u64 = 0,
 
     pub const _desc_table = .{
-        .channel = fd(1, .{ .scalar = .int32 }),
-        .offset = fd(2, .{ .scalar = .uint64 }),
+        .offset = fd(1, .{ .scalar = .uint64 }),
     };
 
     /// Encodes the message to the writer
@@ -429,14 +449,12 @@ pub const StreamAck = struct {
     }
 };
 
-/// Marks the end of this peer's outbound stream.
-pub const StreamEof = struct {
-    channel: i32 = 0,
+/// Marks the end of this peer's outbound opaque proxy stream.
+pub const ProxyStreamEof = struct {
     offset: u64 = 0,
 
     pub const _desc_table = .{
-        .channel = fd(1, .{ .scalar = .int32 }),
-        .offset = fd(2, .{ .scalar = .uint64 }),
+        .offset = fd(1, .{ .scalar = .uint64 }),
     };
 
     /// Encodes the message to the writer
@@ -498,13 +516,289 @@ pub const StreamEof = struct {
     }
 };
 
-/// Acknowledges that StreamEof was received.
-pub const StreamEofAck = struct {
-    channel: i32 = 0,
+/// Acknowledges that ProxyStreamEof was received.
+pub const ProxyStreamEofAck = struct {
     offset: u64 = 0,
 
     pub const _desc_table = .{
-        .channel = fd(1, .{ .scalar = .int32 }),
+        .offset = fd(1, .{ .scalar = .uint64 }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Sent at the start of every ssh transport that carries a sessh-owned PTY
+/// stream. The receiver uses the offsets to resume PTY input and output from the
+/// first unacknowledged byte in each direction.
+pub const TtyStreamResume = struct {
+    input_recv_next_offset: u64 = 0,
+    output_recv_next_offset: u64 = 0,
+
+    pub const _desc_table = .{
+        .input_recv_next_offset = fd(1, .{ .scalar = .uint64 }),
+        .output_recv_next_offset = fd(2, .{ .scalar = .uint64 }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Raw bytes written toward the remote PTY.
+pub const TtyStreamInput = struct {
+    offset: u64 = 0,
+    data: []const u8 = &.{},
+
+    pub const _desc_table = .{
+        .offset = fd(1, .{ .scalar = .uint64 }),
+        .data = fd(2, .{ .scalar = .bytes }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Raw bytes read from the remote PTY.
+pub const TtyStreamOutput = struct {
+    offset: u64 = 0,
+    data: []const u8 = &.{},
+
+    pub const _desc_table = .{
+        .offset = fd(1, .{ .scalar = .uint64 }),
+        .data = fd(2, .{ .scalar = .bytes }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Acknowledges received TtyStreamInput or TtyStreamOutput bytes.
+pub const TtyStreamAck = struct {
+    stream: TtyStreamDirection = @enumFromInt(0),
+    offset: u64 = 0,
+
+    pub const _desc_table = .{
+        .stream = fd(1, .@"enum"),
         .offset = fd(2, .{ .scalar = .uint64 }),
     };
 
@@ -567,12 +861,219 @@ pub const StreamEofAck = struct {
     }
 };
 
-/// Exit status for the remote process behind a reconnectable stream. This is
-/// separate from StreamEof because stdout/stderr can close before the process
-/// exits. The sender waits for StreamExitStatusAck before it lets the stream
+/// Marks the end of this peer's outbound PTY input or output stream.
+pub const TtyStreamEof = struct {
+    stream: TtyStreamDirection = @enumFromInt(0),
+    offset: u64 = 0,
+
+    pub const _desc_table = .{
+        .stream = fd(1, .@"enum"),
+        .offset = fd(2, .{ .scalar = .uint64 }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Acknowledges that TtyStreamEof was received.
+pub const TtyStreamEofAck = struct {
+    stream: TtyStreamDirection = @enumFromInt(0),
+    offset: u64 = 0,
+
+    pub const _desc_table = .{
+        .stream = fd(1, .@"enum"),
+        .offset = fd(2, .{ .scalar = .uint64 }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// PTY size update for a sessh-owned TTY stream.
+pub const TtyStreamResize = struct {
+    terminal_rows: u32 = 0,
+    terminal_cols: u32 = 0,
+
+    pub const _desc_table = .{
+        .terminal_rows = fd(1, .{ .scalar = .uint32 }),
+        .terminal_cols = fd(2, .{ .scalar = .uint32 }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Exit status for the remote process behind a sessh-owned TTY stream. This is
+/// separate from TtyStreamEof because PTY output can close before the process
+/// exits. The sender waits for TtyStreamExitStatusAck before it lets the stream
 /// finish, otherwise a reconnect between the status write and the peer's read
 /// could lose the exit code.
-pub const StreamExitStatus = struct {
+pub const TtyStreamExitStatus = struct {
     exit_status: ?ExitStatus = null,
 
     pub const _desc_table = .{
@@ -638,8 +1139,8 @@ pub const StreamExitStatus = struct {
     }
 };
 
-/// Acknowledges that StreamExitStatus was received.
-pub const StreamExitStatusAck = struct {
+/// Acknowledges that TtyStreamExitStatus was received.
+pub const TtyStreamExitStatusAck = struct {
     pub const _desc_table = .{};
 
     /// Encodes the message to the writer

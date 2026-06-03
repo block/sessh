@@ -8,10 +8,11 @@ like `ssh`:
 sessh [ssh-option ...] destination [command [argument ...]]
 ```
 
-`sessh` connection recovery is strongest for interactive sessions, but remote
-commands can also use sessh's reconnectable stream path when their stdin/stdout
-shape can be preserved. If sessh cannot safely preserve ssh behavior, it falls
-back to plain `ssh`.
+`sessh` connection recovery is strongest for interactive sessions. Non-tty
+commands use a ProxyCommand-based stream so OpenSSH still owns ssh semantics,
+while tty-shaped commands can use sessh's PTY stream path when their terminal
+behavior can be preserved. If sessh cannot safely preserve ssh behavior, it
+falls back to plain `ssh`.
 
 If the `ssh` disconnects while `sessh` is running interactively then it will
 retry the connection in the background (with exponential backoff) and reattach
@@ -44,9 +45,10 @@ sessh [[ssh-option|sessh-option] ...] destination [command [argument ...]]
 - `--log-level quiet|error|warn|info|debug|verbose`: override
   `client-log-level` for the local client.
 - `--terminal-emulator` / `--no-terminal-emulator`: enable or disable sessh's
-  terminal emulator for this connection. Disabling it carries bytes over the
-  reconnectable stream directly, which better preserves terminal features sessh
-  does not model. The positive form is mainly useful for overriding config.
+  terminal emulator for this connection. Disabling it uses a stream path instead
+  of sessh's terminal renderer, which better preserves terminal features sessh
+  does not model. Non-tty cases use the ProxyCommand stream; tty cases use
+  sessh's PTY stream. The positive form is mainly useful for overriding config.
 - `--force-proxy-mode` / `--no-force-proxy-mode`: force, or explicitly do not
   force, the ProxyCommand-based stream path for this connection. Sessh still
   enables proxy mode automatically when an ssh option requires OpenSSH to own

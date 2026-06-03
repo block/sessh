@@ -34,15 +34,22 @@ pub const MessageType = enum {
     session_client_repaint_request,
     session_client_debug_sever_connection_request,
     session_client_debug_unresponsive_connection_request,
-    stream_resume,
-    stream_data,
-    stream_ack,
-    stream_eof,
-    stream_eof_ack,
     ping,
     pong,
-    stream_exit_status,
-    stream_exit_status_ack,
+    proxy_stream_resume,
+    proxy_stream_data,
+    proxy_stream_ack,
+    proxy_stream_eof,
+    proxy_stream_eof_ack,
+    tty_stream_resume,
+    tty_stream_input,
+    tty_stream_output,
+    tty_stream_ack,
+    tty_stream_eof,
+    tty_stream_eof_ack,
+    tty_stream_resize,
+    tty_stream_exit_status,
+    tty_stream_exit_status_ack,
 };
 
 pub const frame_header_len = 4;
@@ -172,15 +179,22 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .session_client_repaint_request => |message| ownedFrameFromMessage(allocator, .session_client_repaint_request, message),
             .session_client_debug_sever_connection_request => |message| ownedFrameFromMessage(allocator, .session_client_debug_sever_connection_request, message),
             .session_client_debug_unresponsive_connection_request => |message| ownedFrameFromMessage(allocator, .session_client_debug_unresponsive_connection_request, message),
-            .stream_resume => |message| ownedFrameFromMessage(allocator, .stream_resume, message),
-            .stream_data => |message| ownedFrameFromMessage(allocator, .stream_data, message),
-            .stream_ack => |message| ownedFrameFromMessage(allocator, .stream_ack, message),
-            .stream_eof => |message| ownedFrameFromMessage(allocator, .stream_eof, message),
-            .stream_eof_ack => |message| ownedFrameFromMessage(allocator, .stream_eof_ack, message),
             .ping => |message| ownedFrameFromMessage(allocator, .ping, message),
             .pong => |message| ownedFrameFromMessage(allocator, .pong, message),
-            .stream_exit_status => |message| ownedFrameFromMessage(allocator, .stream_exit_status, message),
-            .stream_exit_status_ack => |message| ownedFrameFromMessage(allocator, .stream_exit_status_ack, message),
+            .proxy_stream_resume => |message| ownedFrameFromMessage(allocator, .proxy_stream_resume, message),
+            .proxy_stream_data => |message| ownedFrameFromMessage(allocator, .proxy_stream_data, message),
+            .proxy_stream_ack => |message| ownedFrameFromMessage(allocator, .proxy_stream_ack, message),
+            .proxy_stream_eof => |message| ownedFrameFromMessage(allocator, .proxy_stream_eof, message),
+            .proxy_stream_eof_ack => |message| ownedFrameFromMessage(allocator, .proxy_stream_eof_ack, message),
+            .tty_stream_resume => |message| ownedFrameFromMessage(allocator, .tty_stream_resume, message),
+            .tty_stream_input => |message| ownedFrameFromMessage(allocator, .tty_stream_input, message),
+            .tty_stream_output => |message| ownedFrameFromMessage(allocator, .tty_stream_output, message),
+            .tty_stream_ack => |message| ownedFrameFromMessage(allocator, .tty_stream_ack, message),
+            .tty_stream_eof => |message| ownedFrameFromMessage(allocator, .tty_stream_eof, message),
+            .tty_stream_eof_ack => |message| ownedFrameFromMessage(allocator, .tty_stream_eof_ack, message),
+            .tty_stream_resize => |message| ownedFrameFromMessage(allocator, .tty_stream_resize, message),
+            .tty_stream_exit_status => |message| ownedFrameFromMessage(allocator, .tty_stream_exit_status, message),
+            .tty_stream_exit_status_ack => |message| ownedFrameFromMessage(allocator, .tty_stream_exit_status_ack, message),
         };
     }
 
@@ -334,31 +348,6 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .session_client_debug_unresponsive_connection_request = message } });
         },
-        .stream_resume => blk: {
-            var message = try decodePayload(pb.StreamResume, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_resume = message } });
-        },
-        .stream_data => blk: {
-            var message = try decodePayload(pb.StreamData, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_data = message } });
-        },
-        .stream_ack => blk: {
-            var message = try decodePayload(pb.StreamAck, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_ack = message } });
-        },
-        .stream_eof => blk: {
-            var message = try decodePayload(pb.StreamEof, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_eof = message } });
-        },
-        .stream_eof_ack => blk: {
-            var message = try decodePayload(pb.StreamEofAck, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_eof_ack = message } });
-        },
         .ping => blk: {
             var message = try decodePayload(pb.Ping, allocator, payload);
             defer message.deinit(allocator);
@@ -369,15 +358,75 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .pong = message } });
         },
-        .stream_exit_status => blk: {
-            var message = try decodePayload(pb.StreamExitStatus, allocator, payload);
+        .proxy_stream_resume => blk: {
+            var message = try decodePayload(pb.ProxyStreamResume, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_exit_status = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_resume = message } });
         },
-        .stream_exit_status_ack => blk: {
-            var message = try decodePayload(pb.StreamExitStatusAck, allocator, payload);
+        .proxy_stream_data => blk: {
+            var message = try decodePayload(pb.ProxyStreamData, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .stream_exit_status_ack = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_data = message } });
+        },
+        .proxy_stream_ack => blk: {
+            var message = try decodePayload(pb.ProxyStreamAck, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_ack = message } });
+        },
+        .proxy_stream_eof => blk: {
+            var message = try decodePayload(pb.ProxyStreamEof, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_eof = message } });
+        },
+        .proxy_stream_eof_ack => blk: {
+            var message = try decodePayload(pb.ProxyStreamEofAck, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_eof_ack = message } });
+        },
+        .tty_stream_resume => blk: {
+            var message = try decodePayload(pb.TtyStreamResume, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_resume = message } });
+        },
+        .tty_stream_input => blk: {
+            var message = try decodePayload(pb.TtyStreamInput, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_input = message } });
+        },
+        .tty_stream_output => blk: {
+            var message = try decodePayload(pb.TtyStreamOutput, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_output = message } });
+        },
+        .tty_stream_ack => blk: {
+            var message = try decodePayload(pb.TtyStreamAck, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_ack = message } });
+        },
+        .tty_stream_eof => blk: {
+            var message = try decodePayload(pb.TtyStreamEof, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_eof = message } });
+        },
+        .tty_stream_eof_ack => blk: {
+            var message = try decodePayload(pb.TtyStreamEofAck, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_eof_ack = message } });
+        },
+        .tty_stream_resize => blk: {
+            var message = try decodePayload(pb.TtyStreamResize, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_resize = message } });
+        },
+        .tty_stream_exit_status => blk: {
+            var message = try decodePayload(pb.TtyStreamExitStatus, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_exit_status = message } });
+        },
+        .tty_stream_exit_status_ack => blk: {
+            var message = try decodePayload(pb.TtyStreamExitStatusAck, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .tty_stream_exit_status_ack = message } });
         },
     };
 }
@@ -430,35 +479,35 @@ test "frame envelope round trip" {
 
 test "hello compatibility accepts peer max protocol when it satisfies local minimum" {
     try std.testing.expect(helloRequestIsCompatible(.{
-        .protocol_major = 2,
-        .protocol_minor = 4,
-        .version = "0.5.0-dev",
-    }, 2, 3));
-    try std.testing.expect(!helloRequestIsCompatible(.{
-        .protocol_major = 2,
-        .protocol_minor = 2,
-        .version = "0.5.0-dev",
-    }, 2, 3));
-    try std.testing.expect(!helloRequestIsCompatible(.{
-        .protocol_major = 1,
-        .protocol_minor = 4,
-        .version = "0.5.0-dev",
-    }, 2, 3));
-    try std.testing.expect(helloRequestIsCompatible(.{
         .protocol_major = 3,
-        .protocol_minor = 0,
-        .version = "0.5.0-dev",
-    }, 2, 3));
-    try std.testing.expect(helloRequestIsCompatible(.{
-        .protocol_major = 2,
         .protocol_minor = 1,
         .version = "0.5.0-dev",
-    }, 2, 0));
-    try std.testing.expect(helloRequestIsCompatible(.{
+    }, 3, 0));
+    try std.testing.expect(!helloRequestIsCompatible(.{
+        .protocol_major = 2,
+        .protocol_minor = 9,
+        .version = "0.5.0-dev",
+    }, 3, 0));
+    try std.testing.expect(!helloRequestIsCompatible(.{
         .protocol_major = 2,
         .protocol_minor = 4,
+        .version = "0.5.0-dev",
+    }, 3, 0));
+    try std.testing.expect(helloRequestIsCompatible(.{
+        .protocol_major = 4,
+        .protocol_minor = 0,
+        .version = "0.5.0-dev",
+    }, 3, 0));
+    try std.testing.expect(helloRequestIsCompatible(.{
+        .protocol_major = 3,
+        .protocol_minor = 1,
+        .version = "0.5.0-dev",
+    }, 3, 0));
+    try std.testing.expect(helloRequestIsCompatible(.{
+        .protocol_major = 3,
+        .protocol_minor = 1,
         .version = "0.6.0-dev",
-    }, 2, 3));
+    }, 3, 0));
 }
 
 test "session ended exit status is optional" {
