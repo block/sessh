@@ -735,6 +735,7 @@ pub const Route = struct {
     attached_count: ?u32,
     last_input_at_unix_ms: ?u64,
     detached_at_unix_ms: ?u64,
+    kill_requested: bool,
 
     pub fn deinit(self: *Route, allocator: std.mem.Allocator) void {
         for (self.ssh_options) |option| allocator.free(option);
@@ -789,6 +790,15 @@ pub const Tombstone = struct {
         allocator.free(self.session_dir);
         allocator.free(self.primary_alias);
         allocator.free(self.guid);
+        self.* = undefined;
+    }
+};
+
+pub const PendingKills = struct {
+    guids: []const []const u8,
+
+    pub fn deinit(self: *PendingKills, allocator: std.mem.Allocator) void {
+        freeStringArray(allocator, self.guids);
         self.* = undefined;
     }
 };
@@ -851,6 +861,7 @@ const RouteStatus = struct {
     attached_count: ?u32 = null,
     last_input_at_unix_ms: ?u64 = null,
     detached_at_unix_ms: ?u64 = null,
+    kill_requested: bool = false,
 };
 
 fn writeRoute(
@@ -875,7 +886,7 @@ fn writeRoute(
     defer text.deinit(allocator);
     const writer = text.writer(allocator);
     try writer.print(
-        "{{\"guid\":{f},\"primary_alias\":{f},\"session_dir\":{f},\"host\":{f},\"agent_version\":{f},\"alive\":{},\"attached_count\":",
+        "{{\"guid\":{f},\"primary_alias\":{f},\"session_dir\":{f},\"host\":{f},\"agent_version\":{f},\"alive\":{},\"kill_requested\":{},\"attached_count\":",
         .{
             std.json.fmt(canonical, .{}),
             std.json.fmt(primary_alias, .{}),
@@ -883,6 +894,7 @@ fn writeRoute(
             std.json.fmt(host, .{}),
             std.json.fmt(status.agent_version, .{}),
             status.last_known_alive,
+            status.kill_requested,
         },
     );
     if (status.attached_count) |count| {
@@ -943,8 +955,110 @@ pub fn updateRouteStatus(allocator: std.mem.Allocator, guid: []const u8, last_kn
             .attached_count = live.attached_count,
             .last_input_at_unix_ms = live.last_input_at_unix_ms,
             .detached_at_unix_ms = live.detached_at_unix_ms,
+            .kill_requested = route.kill_requested,
         },
     );
+}
+
+pub fn markRouteKillRequested(allocator: std.mem.Allocator, guid: []const u8) !void {
+    var route = try readRouteForRef(allocator, guid);
+    defer route.deinit(allocator);
+    try writeRoute(
+        allocator,
+        route.guid,
+        route.primary_alias,
+        route.session_dir,
+        route.host,
+        route.ssh_options,
+        .{
+            .last_known_alive = route.last_known_alive,
+            .agent_version = route.agent_version,
+            .attached_count = route.attached_count,
+            .last_input_at_unix_ms = route.last_input_at_unix_ms,
+            .detached_at_unix_ms = route.detached_at_unix_ms,
+            .kill_requested = true,
+        },
+    );
+}
+
+pub fn queuePendingKill(allocator: std.mem.Allocator, host: []const u8, guid: []const u8) !void {
+    const canonical = try canonicalPendingKillGuid(allocator, guid);
+    defer allocator.free(canonical);
+
+    var pending = readPendingKillsForHost(allocator, host) catch |err| switch (err) {
+        error.FileNotFound => PendingKills{ .guids = try allocator.alloc([]const u8, 0) },
+        else => return err,
+    };
+    defer pending.deinit(allocator);
+
+    if (stringArrayContains(pending.guids, canonical)) return;
+    const updated = try allocator.alloc([]const u8, pending.guids.len + 1);
+    errdefer allocator.free(updated);
+    for (pending.guids, 0..) |value, i| updated[i] = try allocator.dupe(u8, value);
+    errdefer {
+        for (updated[0..pending.guids.len]) |value| allocator.free(value);
+    }
+    updated[pending.guids.len] = try allocator.dupe(u8, canonical);
+    var updated_pending = PendingKills{ .guids = updated };
+    defer updated_pending.deinit(allocator);
+    try writePendingKillsForHost(allocator, host, &updated_pending);
+}
+
+pub fn readPendingKillsForHost(allocator: std.mem.Allocator, host: []const u8) !PendingKills {
+    const path = try pendingKillPathForHost(allocator, host);
+    defer allocator.free(path);
+    return readPendingKills(allocator, path);
+}
+
+pub fn removePendingKill(allocator: std.mem.Allocator, host: []const u8, guid: []const u8) !void {
+    const canonical = try canonicalPendingKillGuid(allocator, guid);
+    defer allocator.free(canonical);
+    var pending = readPendingKillsForHost(allocator, host) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer pending.deinit(allocator);
+    if (!stringArrayContains(pending.guids, canonical)) return;
+
+    var retained: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (retained.items) |value| allocator.free(value);
+        retained.deinit(allocator);
+    }
+    for (pending.guids) |value| {
+        if (std.mem.eql(u8, value, canonical)) continue;
+        try retained.append(allocator, try allocator.dupe(u8, value));
+    }
+
+    const path = try pendingKillPathForHost(allocator, host);
+    defer allocator.free(path);
+    if (retained.items.len == 0) {
+        try unlinkIfExists(path);
+        return;
+    }
+
+    var updated = PendingKills{ .guids = try retained.toOwnedSlice(allocator) };
+    defer updated.deinit(allocator);
+    try writePendingKillsForHost(allocator, host, &updated);
+}
+
+fn writePendingKillsForHost(allocator: std.mem.Allocator, host: []const u8, pending: *const PendingKills) !void {
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    try ensurePendingKillDir(allocator, root);
+    const path = try pendingKillPathForHostInRoot(allocator, root, host);
+    defer allocator.free(path);
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    const writer = text.writer(allocator);
+    try writer.print("{{\"host\":{f},\"guids\":[", .{std.json.fmt(host, .{})});
+    for (pending.guids, 0..) |guid, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.print("{f}", .{std.json.fmt(guid, .{})});
+    }
+    try writer.writeAll("]}\n");
+    try writeAtomicFile(path, text.items);
 }
 
 pub fn markRouteAttached(allocator: std.mem.Allocator, guid: []const u8) !void {
@@ -1569,8 +1683,18 @@ pub fn tombstonesDir(allocator: std.mem.Allocator) ![]u8 {
     return tombstonesDirInRoot(allocator, root);
 }
 
+pub fn pendingKillsDir(allocator: std.mem.Allocator) ![]u8 {
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    return pendingKillsDirInRoot(allocator, root);
+}
+
 fn tombstonesDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/tombstone", .{root});
+}
+
+fn pendingKillsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/pending", .{root});
 }
 
 fn tombstonePathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
@@ -1579,9 +1703,27 @@ fn tombstonePathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, gu
     return std.fmt.allocPrint(allocator, "{s}/tombstone/{s}.json", .{ root, canonical });
 }
 
+fn pendingKillPathForHost(allocator: std.mem.Allocator, host: []const u8) ![]u8 {
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    return pendingKillPathForHostInRoot(allocator, root, host);
+}
+
+fn pendingKillPathForHostInRoot(allocator: std.mem.Allocator, root: []const u8, host: []const u8) ![]u8 {
+    const name = pendingKillHostHash(host);
+    return std.fmt.allocPrint(allocator, "{s}/pending/{s}.json", .{ root, &name });
+}
+
 fn ensureTombstoneDir(allocator: std.mem.Allocator, root: []const u8) !void {
     try ensureRegistryRoot(allocator, root);
     const dir = try tombstonesDirInRoot(allocator, root);
+    defer allocator.free(dir);
+    try mkdirIgnoreExists(allocator, dir);
+}
+
+fn ensurePendingKillDir(allocator: std.mem.Allocator, root: []const u8) !void {
+    try ensureRegistryRoot(allocator, root);
+    const dir = try pendingKillsDirInRoot(allocator, root);
     defer allocator.free(dir);
     try mkdirIgnoreExists(allocator, dir);
 }
@@ -1734,6 +1876,7 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
         .attached_count = attached_count,
         .last_input_at_unix_ms = try jsonOptionalU64(object, "last_input_at_unix_ms"),
         .detached_at_unix_ms = try jsonOptionalU64(object, "detached_at_unix_ms"),
+        .kill_requested = (try jsonOptionalBool(object, "kill_requested")) orelse false,
     };
 }
 
@@ -1837,9 +1980,48 @@ fn jsonStringArrayField(allocator: std.mem.Allocator, object: std.json.ObjectMap
     return out;
 }
 
+fn readPendingKills(allocator: std.mem.Allocator, path: []const u8) !PendingKills {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024);
+    defer allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const object = try jsonObject(parsed.value);
+
+    const guids = try jsonStringArrayField(allocator, object, "guids");
+    errdefer freeStringArray(allocator, guids);
+    for (guids) |guid| {
+        if (!isValidPendingKillGuid(guid)) return error.InvalidPendingKill;
+    }
+    return .{ .guids = guids };
+}
+
 fn freeStringArray(allocator: std.mem.Allocator, strings: []const []const u8) void {
     for (strings) |string| allocator.free(string);
     allocator.free(strings);
+}
+
+fn isValidPendingKillGuid(guid: []const u8) bool {
+    return isValidSessionGuid(guid) or isValidProxyGuid(guid);
+}
+
+fn canonicalPendingKillGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (isValidSessionGuid(guid)) return canonicalGuid(allocator, guid);
+    if (isValidProxyGuid(guid)) return canonicalProxyGuid(allocator, guid);
+    return error.InvalidPendingKillGuid;
+}
+
+fn pendingKillHostHash(host: []const u8) [64]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(host, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn stringArrayContains(strings: []const []const u8, needle: []const u8) bool {
+    for (strings) |string| {
+        if (std.mem.eql(u8, string, needle)) return true;
+    }
+    return false;
 }
 
 fn writeAtomicFile(path: []const u8, contents: []const u8) !void {
@@ -2968,6 +3150,7 @@ test "tombstone snapshots aliases, removes route, and releases aliases" {
         .attached_count = null,
         .last_input_at_unix_ms = null,
         .detached_at_unix_ms = null,
+        .kill_requested = false,
     };
     defer route.deinit(allocator);
 
@@ -3026,6 +3209,7 @@ test "expired tombstone cleanup removes only recorded aliases" {
         .attached_count = null,
         .last_input_at_unix_ms = null,
         .detached_at_unix_ms = null,
+        .kill_requested = false,
     };
     defer route.deinit(allocator);
 

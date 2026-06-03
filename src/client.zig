@@ -21,7 +21,6 @@ const tty_transcript = @import("tty_transcript.zig");
 const pb = protocol.pb;
 const hpb = protocol.hpb;
 const WindowSize = terminal.WindowSize;
-const Leader = terminal.Leader;
 
 var next_repaint_request_seq: u64 = 1;
 
@@ -71,8 +70,6 @@ const LocalOptions = struct {
     client_repaint_scrollback: bool = false,
     debug_client_action: ?DebugClientAction = null,
     debug_unresponsive_seconds: ?u32 = null,
-    leader: Leader = .none,
-    leader_set: bool = false,
     banner_args: DetachBannerArgs = .{},
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     scrollback_row_count_set: bool = false,
@@ -89,7 +86,6 @@ pub const LocalNewSessionRequest = struct {
     new_detached: bool = false,
     alias: ?[]const u8 = null,
     scrollback_row_count: u32 = config.default_scrollback_row_count,
-    leader: Leader = .none,
     banner_args: []const []const u8 = &.{},
     capture_tty_transcript: ?[]const u8 = null,
     command_argv: []const []const u8 = &.{},
@@ -112,7 +108,6 @@ pub const DetachBannerArgs = struct {
 };
 
 pub const FileConfig = struct {
-    leader: ?Leader = null,
     scrollback_row_count: ?u32 = null,
     initial_scrollback_row_count: ?u32 = null,
     initial_scrollback_row_count_set: bool = false,
@@ -169,9 +164,7 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
         const value = unquoteEnvValue(trimEnv(line[eq + 1 ..])) catch return error.InvalidConfigValue;
         if (key.len == 0) return error.InvalidConfigLine;
 
-        if (keyMatches(key, "leader")) {
-            parsed.leader = try parseLeader(value);
-        } else if (keyMatches(key, "scrollback-limit")) {
+        if (keyMatches(key, "scrollback-limit")) {
             parsed.scrollback_row_count = try parseScrollbackRowCount(value);
         } else if (keyMatches(key, "initial-scrollback")) {
             parsed.initial_scrollback_row_count = try parseInitialScrollbackRowCount(value);
@@ -251,7 +244,8 @@ const ErrorPayload = struct {
 
 pub const RelayEnd = enum {
     detach,
-    reconnect,
+    kill_detach,
+    kill_wait,
     unresponsive,
     transport_closed,
     session_ended,
@@ -261,12 +255,16 @@ pub const ReconnectDecision = enum {
     wait_elapsed,
     reconnect_now,
     detach,
+    kill_detach,
+    kill_wait,
 };
 
 pub const ReconnectInputPumpResult = enum {
     wait_elapsed,
     reconnect_now,
     detach,
+    kill_detach,
+    kill_wait,
     transport_closed,
 };
 
@@ -492,6 +490,7 @@ pub const RuntimeSession = struct {
     input_escape_filter: terminal.EscapeFilter = .{},
     paste_like_input_classifier: PasteLikeInputClassifier = .{},
     ended_tombstone_details: ?session_registry.TombstoneDetails = null,
+    kill_requested: bool = false,
     /// Local-only fallback for the terminal title while this session is active.
     /// For remote sessh this is the host string the user passed locally. We do
     /// not send it to the session agent because ssh aliases can reveal local
@@ -635,11 +634,125 @@ fn tombstoneDetailsFromSessionEnded(ended: pb.TeSessionEnded) session_registry.T
             else => .unknown,
         },
         .exit_status = if (ended.exit_status) |status| switch (status.kind) {
-            .TE_EXIT_STATUS_KIND_EXITED => .{ .kind = .exited, .status = status.status },
-            .TE_EXIT_STATUS_KIND_SIGNALLED => .{ .kind = .signalled, .status = status.status },
+            .EXIT_STATUS_KIND_EXITED => .{ .kind = .exited, .status = status.status },
+            .EXIT_STATUS_KIND_SIGNALLED => .{ .kind = .signalled, .status = status.status },
             else => null,
         } else null,
     };
+}
+
+fn tombstoneDetailsFromPendingKilled(killed: pb.PendingKilled) session_registry.TombstoneDetails {
+    return .{
+        .ended_at_unix_ms = if (killed.ended_at_unix_ms == 0) nowUnixMs() else killed.ended_at_unix_ms,
+        .end_reason = .killed_by_request,
+        .exit_status = if (killed.exit_status) |status| switch (status.kind) {
+            .EXIT_STATUS_KIND_EXITED => .{ .kind = .exited, .status = status.status },
+            .EXIT_STATUS_KIND_SIGNALLED => .{ .kind = .signalled, .status = status.status },
+            else => null,
+        } else null,
+    };
+}
+
+pub fn recordRuntimeSessionKillRequested(allocator: std.mem.Allocator, host: []const u8, session: *RuntimeSession) void {
+    session.kill_requested = true;
+    if (session.guidSlice().len == 0) return;
+    session_registry.markRouteKillRequested(allocator, session.guidSlice()) catch |err| {
+        client_log.debug("event=route_kill_requested_mark_failed session={s} error={t}", .{ session.guidSlice(), err });
+    };
+    if (host.len == 0 or std.mem.eql(u8, host, ".")) return;
+    session_registry.queuePendingKill(allocator, host, session.guidSlice()) catch |err| {
+        client_log.debug("event=pending_kill_queue_failed host={s} session={s} error={t}", .{ host, session.guidSlice(), err });
+    };
+}
+
+pub fn drainPendingKillsOnRuntime(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t, host: []const u8) !void {
+    if (host.len == 0 or std.mem.eql(u8, host, ".")) return;
+    var pending = session_registry.readPendingKillsForHost(allocator, host) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer pending.deinit(allocator);
+    for (pending.guids) |guid| {
+        try sendPendingKillRequest(write_fd, guid);
+        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
+        defer frame.deinit(app_allocator.allocator());
+        if (frame.message_type != .pending_kill_response) return error.UnexpectedFrame;
+        var response = try protocol.decodePayload(pb.PendingKillResponse, app_allocator.allocator(), frame.payload);
+        defer response.deinit(app_allocator.allocator());
+        try processPendingKillResponse(allocator, host, response);
+    }
+}
+
+pub fn processPendingKillResponse(allocator: std.mem.Allocator, host: []const u8, response: pb.PendingKillResponse) !void {
+    const result = response.result orelse return error.InvalidPendingKillResponse;
+    switch (result) {
+        .killed => |killed| {
+            if (session_registry.isValidSessionGuid(response.guid)) {
+                tombstoneLocalRouteForPendingKill(allocator, response.guid, tombstoneDetailsFromPendingKilled(killed)) catch |err| {
+                    client_log.debug("event=pending_kill_tombstone_failed host={s} session={s} error={t}", .{ host, response.guid, err });
+                };
+            }
+            try session_registry.removePendingKill(allocator, host, response.guid);
+        },
+        .missing => {
+            if (session_registry.isValidSessionGuid(response.guid)) {
+                tombstoneLocalRouteForPendingKill(allocator, response.guid, .{
+                    .ended_at_unix_ms = nowUnixMs(),
+                    .end_reason = .killed_by_request,
+                }) catch |err| {
+                    client_log.debug("event=pending_kill_missing_tombstone_failed host={s} session={s} error={t}", .{ host, response.guid, err });
+                };
+            }
+            try session_registry.removePendingKill(allocator, host, response.guid);
+        },
+        .failure => |failure| {
+            client_log.userDiagnosticInfo("pending kill failed for {s}: {s}", .{ response.guid, failure.reason });
+        },
+    }
+}
+
+pub fn waitForRuntimePendingKillConfirmation(
+    allocator: std.mem.Allocator,
+    read_fd: c.fd_t,
+    host: []const u8,
+    session: *RuntimeSession,
+) !void {
+    while (true) {
+        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .pending_kill_response => {
+                var response = try protocol.decodePayload(pb.PendingKillResponse, app_allocator.allocator(), frame.payload);
+                defer response.deinit(app_allocator.allocator());
+                if (!std.mem.eql(u8, response.guid, session.guidSlice())) {
+                    try processPendingKillResponse(allocator, host, response);
+                    continue;
+                }
+                if (response.result) |result| switch (result) {
+                    .killed => |killed| session.ended_tombstone_details = tombstoneDetailsFromPendingKilled(killed),
+                    else => {},
+                };
+                try processPendingKillResponse(allocator, host, response);
+                return;
+            },
+            .te_session_ended => {
+                try session.recordSessionEndedPayload(frame.payload);
+                return;
+            },
+            .te_draw => {},
+            .ping, .pong => {},
+            else => return error.UnexpectedFrame,
+        }
+    }
+}
+
+fn tombstoneLocalRouteForPendingKill(allocator: std.mem.Allocator, guid: []const u8, details: session_registry.TombstoneDetails) !void {
+    var route = session_registry.readRouteForRef(allocator, guid) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer route.deinit(allocator);
+    try session_registry.writeTombstoneForRoute(allocator, &route, details);
 }
 
 fn processExitCodeFromTombstoneDetails(details: ?session_registry.TombstoneDetails) u8 {
@@ -683,6 +796,7 @@ pub const ReconnectUi = struct {
     cursor_hidden: bool = false,
     reconnect_acknowledged: bool = false,
     input_during_disconnect: bool = false,
+    kill_escape_filter: terminal.EscapeFilter = .{},
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     title_enabled: bool = false,
     title_fd: c.fd_t = 1,
@@ -762,7 +876,7 @@ pub const ReconnectUi = struct {
             const decision = try self.pollInput(wait_ms);
             try self.refreshBannerIfDiagnosticsChanged();
             switch (decision) {
-                .detach => return .detach,
+                .detach, .kill_detach, .kill_wait => return decision,
                 .reconnect_now => {
                     self.showReconnectingTitle();
                     try self.drawReconnectStaticBanner(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
@@ -783,6 +897,26 @@ pub const ReconnectUi = struct {
     pub fn showDisconnectedReconnectInProgress(self: *ReconnectUi) !void {
         self.showReconnectingTitle();
         try self.drawReconnectStaticBanner(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
+    }
+
+    pub fn showKillingRemoteSession(self: *ReconnectUi) !void {
+        self.showKillingTitle();
+        try self.drawStaticBanner("--- Killing remote session. ~. to detach immediately ---");
+    }
+
+    pub fn waitForKillConfirmation(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
+        try self.showKillingRemoteSession();
+        var timer = try std.time.Timer.start();
+        while (true) {
+            const elapsed_ms = elapsedTimerMs(&timer);
+            if (elapsed_ms >= delay_ms) return .wait_elapsed;
+            const wait_ms: i32 = @intCast(@min(delay_ms - elapsed_ms, @as(u64, 50)));
+            switch (try self.pollKillingDecision(wait_ms)) {
+                .detach, .kill_detach, .kill_wait => |decision| return decision,
+                .reconnect_now => unreachable,
+                .wait_elapsed => {},
+            }
+        }
     }
 
     pub fn showUnresponsiveReconnectInProgressTitle(self: *ReconnectUi) void {
@@ -821,7 +955,7 @@ pub const ReconnectUi = struct {
         try self.showReconnectReady(disposition);
         while (true) {
             switch (try self.pollDecision(-1)) {
-                .detach => return .detach,
+                .detach, .kill_detach, .kill_wait => |decision| return decision,
                 .reconnect_now => return .reconnect_now,
                 .wait_elapsed => {},
             }
@@ -841,7 +975,7 @@ pub const ReconnectUi = struct {
             const next_wake_ms = @min(delay_ms, next_banner_update_ms);
             const wait_ms: i32 = @intCast(@min(next_wake_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
             switch (try self.pollDecision(wait_ms)) {
-                .detach => return .detach,
+                .detach, .kill_detach, .kill_wait => |decision| return decision,
                 .reconnect_now => return .reconnect_now,
                 .wait_elapsed => {},
             }
@@ -858,7 +992,7 @@ pub const ReconnectUi = struct {
     pub fn pollDetach(self: *ReconnectUi, timeout_ms: i32) !bool {
         const decision = try self.pollDecision(timeout_ms);
         return switch (decision) {
-            .detach => true,
+            .detach, .kill_detach, .kill_wait => true,
             .reconnect_now, .wait_elapsed => false,
         };
     }
@@ -867,6 +1001,14 @@ pub const ReconnectUi = struct {
         if (self.isCancelled()) return .detach;
         try self.refreshBannerIfDiagnosticsChanged();
         const decision = try self.pollInput(timeout_ms);
+        try self.refreshBannerIfDiagnosticsChanged();
+        return decision;
+    }
+
+    pub fn pollKillingDecision(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
+        if (self.isCancelled()) return .detach;
+        try self.refreshBannerIfDiagnosticsChanged();
+        const decision = try self.pollKillingInput(timeout_ms);
         try self.refreshBannerIfDiagnosticsChanged();
         return decision;
     }
@@ -906,6 +1048,7 @@ pub const ReconnectUi = struct {
         if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
 
         var input: [256]u8 = undefined;
+        var filtered: [512]u8 = undefined;
         const n = c.read(0, &input, input.len);
         if (n <= 0) return .detach;
         io_helpers.noteRead(0, input[0..@intCast(n)]);
@@ -919,10 +1062,57 @@ pub const ReconnectUi = struct {
             },
             .none => {},
         }
+        const result = self.kill_escape_filter.filter(bytes, &filtered);
+        if (result.end) |end| switch (end) {
+            .detach => return .detach,
+            .kill => return .kill_detach,
+            .kill_wait => return .kill_wait,
+            .help => {},
+            .repaint => {},
+        };
         if (bytes.len > 0) {
             self.input_during_disconnect = true;
             try self.alertDisconnectedInput();
         }
+        return .wait_elapsed;
+    }
+
+    fn pollKillingInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
+        var pollfds = [_]posix.pollfd{
+            .{
+                .fd = 0,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = self.diagnostic_notify_read_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+        const poll_count: usize = if (self.diagnostic_notify_read_fd >= 0) 2 else 1;
+        const ready = try posix.poll(pollfds[0..poll_count], timeout_ms);
+        if (ready == 0) return .wait_elapsed;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .detach;
+        if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
+            self.drainDiagnosticNotifier();
+        }
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
+
+        var input: [256]u8 = undefined;
+        var filtered: [512]u8 = undefined;
+        const n = c.read(0, &input, input.len);
+        if (n <= 0) return .detach;
+        const bytes = input[0..@intCast(n)];
+        io_helpers.noteRead(0, bytes);
+        const result = self.kill_escape_filter.filter(bytes, &filtered);
+        if (result.end) |end| switch (end) {
+            .detach, .kill => return .detach,
+            .kill_wait => return .kill_wait,
+            .help => {},
+            .repaint => {},
+        };
+        if (bytes.len > 0) try self.alertDisconnectedInput();
         return .wait_elapsed;
     }
 
@@ -1160,6 +1350,12 @@ pub const ReconnectUi = struct {
         self.title_visible = true;
     }
 
+    fn showKillingTitle(self: *ReconnectUi) void {
+        if (!self.title_enabled or self.title_fd < 0) return;
+        reconnect_title.writeTitle(self.title_fd, "killing remote session") catch return;
+        self.title_visible = true;
+    }
+
     fn showSwitchCountdownTitle(self: *ReconnectUi, delay_ms: u64) void {
         if (!self.title_enabled or self.title_fd < 0) return;
         reconnect_title.writeSwitchCountdownTitle(self.title_fd, delay_ms) catch return;
@@ -1195,11 +1391,22 @@ const BannerDiagnosticLine = struct {
     }
 };
 
-const max_banner_line_count = 1 + ReconnectUi.max_diagnostic_banner_lines;
+const max_banner_diagnostic_line_count = 1 + ReconnectUi.max_diagnostic_banner_lines;
+const max_banner_line_count = if (max_banner_diagnostic_line_count > terminal.escape_help_banner_lines.len)
+    max_banner_diagnostic_line_count
+else
+    terminal.escape_help_banner_lines.len;
 const max_banner_render_line_bytes = if (ReconnectUi.max_banner_message_bytes > client_log.max_user_diagnostic_display_bytes)
     ReconnectUi.max_banner_message_bytes
 else
     client_log.max_user_diagnostic_display_bytes;
+
+comptime {
+    std.debug.assert(max_banner_line_count >= terminal.escape_help_banner_lines.len);
+    for (terminal.escape_help_banner_lines) |line| {
+        std.debug.assert(max_banner_render_line_bytes >= line.len);
+    }
+}
 
 const InputAckTracker = struct {
     next_seq: u64 = 1,
@@ -1595,7 +1802,6 @@ const DrawPayload = struct {
 
 test "parseEnvConfig accepts sessh env keys" {
     const parsed = try parseEnvConfig(
-        \\leader=CTRL-B
         \\scrollback-limit=42
         \\initial-scrollback=0
         \\client-log-level=debug
@@ -1605,10 +1811,6 @@ test "parseEnvConfig accepts sessh env keys" {
         \\
     );
 
-    switch (parsed.leader.?) {
-        .ctrl => |byte| try std.testing.expectEqual(@as(u8, 'B'), byte),
-        .none => return error.ExpectedLeader,
-    }
     try std.testing.expectEqual(@as(?u32, 42), parsed.scrollback_row_count);
     try std.testing.expect(parsed.initial_scrollback_row_count_set);
     try std.testing.expectEqual(@as(?u32, 0), parsed.initial_scrollback_row_count);
@@ -1978,6 +2180,7 @@ test "relay drains pending session end before monitor timeout" {
     var app_title_present: ?bool = null;
     var input_escape_filter = terminal.EscapeFilter{};
     var paste_like_input_classifier = PasteLikeInputClassifier{};
+    var kill_requested = false;
 
     try std.testing.expectEqual(
         RelayEnd.session_ended,
@@ -1993,6 +2196,7 @@ test "relay drains pending session end before monitor timeout" {
             &relay_end_restore,
             &input_ack_tracker,
             &paste_like_input_classifier,
+            &kill_requested,
             null,
             &app_title_present,
             .{ .monitor_connection = true },
@@ -2017,6 +2221,7 @@ test "relay treats input write failure as transport closed" {
     var input_ack_tracker = InputAckTracker{};
     var input_escape_filter = terminal.EscapeFilter{};
     var paste_like_input_classifier = PasteLikeInputClassifier{};
+    var kill_requested = false;
     var app_title_present: ?bool = null;
 
     try io_helpers.writeAll(input[1], "typed");
@@ -2035,6 +2240,7 @@ test "relay treats input write failure as transport closed" {
             &relay_end_restore,
             &input_ack_tracker,
             &paste_like_input_classifier,
+            &kill_requested,
             null,
             &app_title_present,
             .{ .monitor_connection = true },
@@ -2051,9 +2257,6 @@ test "relay keeps relay-end restore bytes while reconnecting" {
     try std.testing.expectEqualStrings("restore-primary", relay_end_restore.items);
 
     try std.testing.expectEqual(RelayEnd.unresponsive, finishRelay(.unresponsive, &relay_end_restore));
-    try std.testing.expectEqualStrings("restore-primary", relay_end_restore.items);
-
-    try std.testing.expectEqual(RelayEnd.reconnect, finishRelay(.reconnect, &relay_end_restore));
     try std.testing.expectEqualStrings("restore-primary", relay_end_restore.items);
 }
 
@@ -2505,6 +2708,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
             generated_alias.?,
             request.command_argv,
             request.shell_command,
+            null,
         ) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
@@ -2534,6 +2738,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
         generated_alias.?,
         request.command_argv,
         request.shell_command,
+        null,
     ) catch |err| {
         if (process_exit.is(err)) return err;
         terminateChild(&child);
@@ -2552,7 +2757,6 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
             child.stdout.?.handle,
             child.stdin.?.handle,
             &session,
-            request.leader,
             .{},
         ) catch |err| {
             if (process_exit.is(err)) return err;
@@ -2569,6 +2773,25 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
                 markRouteDetachedForSession(allocator, &session);
                 try tty_transcript.finishActiveOrReport();
                 writeDetachBannerForTarget(&.{}, ".", request.banner_args, session.idSlice());
+                if (session.kill_requested) writeUnconfirmedKillDetachWarningForSessionRef(session.guidSlice());
+                return;
+            },
+            .kill_detach => {
+                recordRuntimeSessionKillRequested(allocator, ".", &session);
+                requestRuntimeSessionKill(child.stdin.?.handle, session.guidSlice(), &session.kill_requested) catch {};
+                session.restoreRelayEndPresentation();
+                terminateChild(&child);
+                try tty_transcript.finishActiveOrReport();
+                return;
+            },
+            .kill_wait => {
+                recordRuntimeSessionKillRequested(allocator, ".", &session);
+                try requestRuntimeSessionKill(child.stdin.?.handle, session.guidSlice(), &session.kill_requested);
+                try waitForRuntimePendingKillConfirmation(allocator, child.stdout.?.handle, ".", &session);
+                session.restoreRelayEndPresentation();
+                closeChildStdin(&child);
+                _ = child.wait() catch {};
+                try tty_transcript.finishActiveOrReport();
                 return;
             },
             .session_ended => {
@@ -2577,9 +2800,6 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
                 _ = child.wait() catch {};
                 try tty_transcript.finishActiveOrReport();
                 return;
-            },
-            .reconnect => {
-                terminateChild(&child);
             },
             .unresponsive => {
                 terminateChild(&child);
@@ -2692,7 +2912,6 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             .new_detached = options.new_detached,
             .alias = options.alias,
             .scrollback_row_count = options.scrollback_row_count,
-            .leader = options.leader,
             .banner_args = options.banner_args.slice(),
             .capture_tty_transcript = options.capture_tty_transcript,
         });
@@ -2733,6 +2952,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             options.attach_id orelse compat_attach_id orelse "",
             "",
             options.initial_scrollback_row_count,
+            null,
         ),
         .new, .list, .kill, .kill_all, .detach_client, .repaint_client, .debug_client => unreachable,
     }) catch |err| {
@@ -2755,7 +2975,6 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             child.stdout.?.handle,
             child.stdin.?.handle,
             &session,
-            options.leader,
             .{},
         ) catch |err| {
             if (process_exit.is(err)) return err;
@@ -2771,6 +2990,25 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                 markRouteDetachedForSession(allocator, &session);
                 try tty_transcript.finishActiveOrReport();
                 writeDetachBannerForTarget(&.{}, ".", options.banner_args.slice(), session.idSlice());
+                if (session.kill_requested) writeUnconfirmedKillDetachWarningForSessionRef(session.guidSlice());
+                return;
+            },
+            .kill_detach => {
+                recordRuntimeSessionKillRequested(allocator, ".", &session);
+                requestRuntimeSessionKill(child.stdin.?.handle, session.guidSlice(), &session.kill_requested) catch {};
+                session.restoreRelayEndPresentation();
+                terminateChild(&child);
+                try tty_transcript.finishActiveOrReport();
+                return;
+            },
+            .kill_wait => {
+                recordRuntimeSessionKillRequested(allocator, ".", &session);
+                try requestRuntimeSessionKill(child.stdin.?.handle, session.guidSlice(), &session.kill_requested);
+                try waitForRuntimePendingKillConfirmation(allocator, child.stdout.?.handle, ".", &session);
+                session.restoreRelayEndPresentation();
+                closeChildStdin(&child);
+                _ = child.wait() catch {};
+                try tty_transcript.finishActiveOrReport();
                 return;
             },
             .session_ended => {
@@ -2779,9 +3017,6 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                 _ = child.wait() catch {};
                 try tty_transcript.finishActiveOrReport();
                 return;
-            },
-            .reconnect => {
-                terminateChild(&child);
             },
             .unresponsive => {
                 terminateChild(&child);
@@ -3772,17 +4007,6 @@ fn parseLocalCommonSessionOption(args: []const []const u8, index: *usize, option
     // Compat-mode delegates every command to an older local client and appends
     // these session-presentation options after the command. SESSH_COMPAT is the
     // behavior switch; SESSH_CLIENT_VERSION is only metadata for diagnostics.
-    if (std.mem.eql(u8, arg, "--leader")) {
-        if (!options.compat_mode) return error.UnsupportedConfigOrEnvOnlyOption;
-        index.* += 1;
-        if (index.* >= args.len) return error.MissingLeader;
-        options.leader = try parseLeader(args[index.*]);
-        options.leader_set = true;
-        try options.banner_args.append(arg);
-        try options.banner_args.append(args[index.*]);
-        index.* += 1;
-        return true;
-    }
     if (std.mem.eql(u8, arg, "--scrollback-limit")) {
         if (!options.compat_mode) return error.UnsupportedConfigOrEnvOnlyOption;
         index.* += 1;
@@ -3878,9 +4102,6 @@ fn setClientTarget(options: *LocalOptions, target: ClientTarget, client_guid: ?[
 
 fn applyFileConfigToLocal(allocator: std.mem.Allocator, options: *LocalOptions) !void {
     const file_config = try loadFileConfig(allocator);
-    if (!options.leader_set) {
-        if (file_config.leader) |leader| options.leader = leader;
-    }
     if (!options.scrollback_row_count_set) {
         if (file_config.scrollback_row_count) |count| options.scrollback_row_count = count;
     }
@@ -3896,32 +4117,6 @@ fn setAction(options: *LocalOptions, action: LocalAction) !void {
     if (options.action_set) return error.MultipleActions;
     options.action = action;
     options.action_set = true;
-}
-
-pub fn parseLeader(value: []const u8) !Leader {
-    if (std.ascii.eqlIgnoreCase(value, "None")) return .none;
-    if (!std.ascii.startsWithIgnoreCase(value, "CTRL-")) return error.InvalidLeader;
-
-    const key = value["CTRL-".len..];
-    if (key.len != 1) return error.InvalidLeader;
-    const upper = std.ascii.toUpper(key[0]);
-    if (upper == 'C' or upper == 'D' or upper == 'Z' or upper == '\\') return error.DangerousLeader;
-    if (upper >= '@' and upper <= '_') return .{ .ctrl = upper };
-    return error.InvalidLeader;
-}
-
-test "parseLeader accepts case-insensitive spelling" {
-    switch (try parseLeader("ctrl-b")) {
-        .ctrl => |byte| try std.testing.expectEqual(@as(u8, 'B'), byte),
-        .none => return error.ExpectedLeader,
-    }
-
-    switch (try parseLeader("Ctrl-B")) {
-        .ctrl => |byte| try std.testing.expectEqual(@as(u8, 'B'), byte),
-        .none => return error.ExpectedLeader,
-    }
-
-    try std.testing.expectEqual(Leader.none, try parseLeader("none"));
 }
 
 test "parseLocalOptions keeps command flags command-specific" {
@@ -3972,28 +4167,25 @@ test "parseLocalOptions supports compatibility options before local commands" {
         ".",
         "attach",
         "s1",
-        "--leader",
-        "CTRL-B",
+        "--scrollback-limit",
+        "42",
     }, true);
 
     try std.testing.expectEqual(LocalAction.attach, attach.action);
     try std.testing.expect(attach.compat_mode);
     try std.testing.expectEqualStrings("s1", attach.attach_id.?);
-    switch (attach.leader) {
-        .ctrl => |byte| try std.testing.expectEqual(@as(u8, 'B'), byte),
-        .none => return error.ExpectedLeader,
-    }
+    try std.testing.expectEqual(@as(u32, 42), attach.scrollback_row_count);
 
     const list = try parseLocalOptionsWithCompatMode(&.{
         "sesshmux",
         ".",
         "list",
-        "--leader",
-        "CTRL-B",
+        "--initial-scrollback",
+        "0",
     }, true);
 
     try std.testing.expectEqual(LocalAction.list, list.action);
-    try std.testing.expect(list.leader_set);
+    try std.testing.expectEqual(@as(?u32, 0), list.initial_scrollback_row_count);
 }
 
 test "parseLocalOptions uses current session only when explicit" {
@@ -4027,6 +4219,7 @@ pub fn startNewSessionOnRuntime(
     session_alias: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
+    pending_kill_host: ?[]const u8,
 ) !RuntimeSession {
     const size = terminal.currentWindowSize();
     const viewport_offset = queryInitialViewportOffset();
@@ -4039,6 +4232,7 @@ pub fn startNewSessionOnRuntime(
         session_alias,
         command_argv,
         shell_command,
+        pending_kill_host,
     );
     defer created.deinit();
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
@@ -4059,6 +4253,7 @@ pub fn createSessionOnRuntime(
     session_alias: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
+    pending_kill_host: ?[]const u8,
 ) !CreatedSession {
     return createSessionOnRuntimeWithSize(
         read_fd,
@@ -4069,6 +4264,7 @@ pub fn createSessionOnRuntime(
         session_alias,
         command_argv,
         shell_command,
+        pending_kill_host,
     );
 }
 
@@ -4081,8 +4277,10 @@ fn createSessionOnRuntimeWithSize(
     session_alias: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
+    pending_kill_host: ?[]const u8,
 ) !CreatedSession {
     const peer_protocol = try runtimeHandshakeWithPeerProtocol(read_fd, write_fd);
+    if (pending_kill_host) |host| try drainPendingKillsOnRuntime(app_allocator.allocator(), read_fd, write_fd, host);
     const peer_supports_command_oneof = peerSupportsSessionCreateCommandOneof(peer_protocol);
     if (shell_command != null and !peer_supports_command_oneof) return error.VersionMismatch;
     return sendSessionCreateAndReadCreated(
@@ -4104,9 +4302,11 @@ pub fn startAttachSessionOnRuntime(
     session_ref: []const u8,
     session_dir: []const u8,
     initial_scrollback_row_count: ?u32,
+    pending_kill_host: ?[]const u8,
 ) !RuntimeSession {
     const viewport_offset = queryInitialViewportOffset();
     try runtimeHandshake(read_fd, write_fd);
+    if (pending_kill_host) |host| try drainPendingKillsOnRuntime(app_allocator.allocator(), read_fd, write_fd, host);
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
     defer app_allocator.allocator().free(client_guid);
     const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, client_guid, session_dir);
@@ -4346,10 +4546,8 @@ pub fn relayRuntimeSession(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     session: *RuntimeSession,
-    leader: Leader,
     options: RelayOptions,
 ) !RelayEnd {
-    session.input_escape_filter.setLeader(terminal.leaderByte(leader));
     return relayInteractive(
         read_fd,
         write_fd,
@@ -4360,6 +4558,7 @@ pub fn relayRuntimeSession(
         &session.relay_end_restore,
         &session.input_ack_tracker,
         &session.paste_like_input_classifier,
+        &session.kill_requested,
         &session.ended_tombstone_details,
         &session.app_title_present,
         .{
@@ -4440,11 +4639,9 @@ pub fn pollAndForwardReconnectInput(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     session: *RuntimeSession,
-    leader: Leader,
     reconnect_ui: *ReconnectUi,
     timeout_ms: i32,
 ) !ReconnectInputPumpResult {
-    session.input_escape_filter.setLeader(terminal.leaderByte(leader));
     try reconnect_ui.refreshBannerIfDiagnosticsChanged();
 
     var pollfds = [_]posix.pollfd{.{
@@ -4463,6 +4660,11 @@ pub fn pollAndForwardReconnectInput(
     if (n <= 0) return .detach;
     const bytes = input[0..@intCast(n)];
     io_helpers.noteRead(0, bytes);
+
+    if (session.kill_requested) {
+        if (inputRequestsImmediateKillDetach(&session.input_escape_filter, bytes, &filtered)) return .detach;
+        return .wait_elapsed;
+    }
 
     for (bytes) |byte| {
         if (byte == 0x03) return .detach;
@@ -4491,7 +4693,8 @@ pub fn pollAndForwardReconnectInput(
             error.WriteFailed => return .transport_closed,
             else => return err,
         },
-        .reconnect => return .reconnect_now,
+        .kill => return .kill_detach,
+        .kill_wait => return .kill_wait,
     };
 
     try reconnect_ui.refreshBannerIfDiagnosticsChanged();
@@ -4512,6 +4715,11 @@ pub fn writeDetachBannerForSessionRef(sessh_options: []const []const u8, session
     writeDetachBannerForSessionRefInner(session_ref) catch {};
 }
 
+pub fn writeUnconfirmedKillDetachWarningForSessionRef(session_ref: []const u8) void {
+    if (c.isatty(1) == 0) return;
+    writeUnconfirmedKillDetachWarningForSessionRefInner(session_ref) catch {};
+}
+
 fn writeDetachBannerForSessionRefInner(session_ref: []const u8) !void {
     try io_helpers.writeAll(1, "--- sessh: detached. Re-attach: `");
     try writeShellArg(1, "sesshmux");
@@ -4522,6 +4730,18 @@ fn writeDetachBannerForSessionRefInner(session_ref: []const u8) !void {
         try writeShellArg(1, session_ref);
     }
     try io_helpers.writeAll(1, "` / Kill: `");
+    try writeShellArg(1, "sesshmux");
+    try io_helpers.writeAll(1, " ");
+    try writeShellArg(1, "kill");
+    if (session_ref.len > 0) {
+        try io_helpers.writeAll(1, " ");
+        try writeShellArg(1, session_ref);
+    }
+    try io_helpers.writeAll(1, "` ---\r\n");
+}
+
+fn writeUnconfirmedKillDetachWarningForSessionRefInner(session_ref: []const u8) !void {
+    try io_helpers.writeAll(1, "--- sessh: remote session might still be alive. Kill it with `");
     try writeShellArg(1, "sesshmux");
     try io_helpers.writeAll(1, " ");
     try writeShellArg(1, "kill");
@@ -5055,6 +5275,7 @@ fn relayInteractive(
     relay_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
+    kill_requested: *bool,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     app_title_present: *?bool,
     options: RelayOptions,
@@ -5086,6 +5307,7 @@ fn relayInteractive(
         relay_end_restore,
         input_ack_tracker,
         paste_like_input_classifier,
+        kill_requested,
         ended_tombstone_details,
         app_title_present,
         options,
@@ -5119,10 +5341,12 @@ fn relayTerminal(
     relay_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
+    kill_requested: *bool,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     app_title_present: *?bool,
     options: RelayOptions,
 ) !RelayEnd {
+    _ = kill_requested;
     var pollfds = [_]posix.pollfd{
         .{ .fd = input_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = read_fd, .events = posix.POLL.IN, .revents = 0 },
@@ -5179,6 +5403,8 @@ fn relayTerminal(
             }
             if (result.end) |end| switch (end) {
                 .detach => return finishRelay(requestSessionDetach(read_fd, write_fd), relay_end_restore),
+                .kill => return finishRelay(.kill_detach, relay_end_restore),
+                .kill_wait => return finishRelay(.kill_wait, relay_end_restore),
                 .help => {
                     if (try showEscapeHelpModal(
                         input_fd,
@@ -5204,7 +5430,6 @@ fn relayTerminal(
                     ),
                     else => return err,
                 },
-                .reconnect => return .reconnect,
             };
         }
 
@@ -5771,6 +5996,25 @@ fn sendScreenRepaint(socket_fd: c.fd_t, pending_repaint: *PendingRepaint) !void 
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(socket_fd, .te_repaint_request, payload);
+}
+
+pub fn requestRuntimeSessionKill(socket_fd: c.fd_t, session_guid: []const u8, kill_requested: *bool) !void {
+    kill_requested.* = true;
+    try sendPendingKillRequest(socket_fd, session_guid);
+}
+
+pub fn sendPendingKillRequest(socket_fd: c.fd_t, guid: []const u8) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.PendingKillRequest{ .guid = guid });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(socket_fd, .pending_kill_request, payload);
+}
+
+fn inputRequestsImmediateKillDetach(filter: *terminal.EscapeFilter, input: []const u8, scratch: []u8) bool {
+    for (input) |byte| {
+        if (byte == 0x03) return true;
+    }
+    const result = filter.filter(input, scratch);
+    return if (result.end) |end| end == .kill else false;
 }
 
 fn allocateRepaintRequestSeq() u64 {

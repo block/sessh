@@ -228,6 +228,12 @@ def read_until_count(fd, needle, count, timeout=5.0):
     raise AssertionError(f"did not see {count} copies of {needle!r}; saw {data!r}")
 
 
+def send_escape_detach(fd):
+    os.write(fd, b"\n")
+    time.sleep(0.05)
+    os.write(fd, b"~d\n")
+
+
 def read_available(fd, timeout=0.2):
     end = time.monotonic() + timeout
     data = b""
@@ -1532,7 +1538,7 @@ def run_session_ended_payload_protocol_test(base_env):
                 raise AssertionError(f"unexpected process-exit reason: {ended!r}")
             if not ended.HasField("exit_status"):
                 raise AssertionError(f"missing process exit status: {ended!r}")
-            if ended.exit_status.kind != pb.TE_EXIT_STATUS_KIND_EXITED or ended.exit_status.status != 7:
+            if ended.exit_status.kind != pb.EXIT_STATUS_KIND_EXITED or ended.exit_status.status != 7:
                 raise AssertionError(f"unexpected process exit status: {ended!r}")
             if not ended.HasField("ended_at_unix_ms"):
                 raise AssertionError(f"missing end timestamp: {ended!r}")
@@ -3621,9 +3627,7 @@ def run_env_config_client_test(tmp_root):
 
     config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
     config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "sessh.env").write_text(
-        "leader=CTRL-B\nscrollback-limit=80\ninitial-scrollback=0\n"
-    )
+    (config_dir / "sessh.env").write_text("scrollback-limit=80\ninitial-scrollback=0\n")
 
     try:
         pid, fd = spawn_client(env, ["--alias", "s1"])
@@ -3634,7 +3638,7 @@ def run_env_config_client_test(tmp_root):
                 b"i=1; while [ $i -le 40 ]; do printf 'cfg_%03d\\n' $i; i=$((i + 1)); done\n",
             )
             read_until(fd, b"cfg_040")
-            os.write(fd, b"\x02d")
+            send_escape_detach(fd)
             read_until(fd, b"sessh: detached")
         finally:
             close_client(pid, fd)
@@ -3648,7 +3652,7 @@ def run_env_config_client_test(tmp_root):
                 raise AssertionError(f"initial-scrollback=0 replayed retained history: {attached!r}")
             if b"cfg_040" not in attached:
                 raise AssertionError(f"initial-scrollback=0 did not draw current screen: {attached!r}")
-            os.write(fd, b"~.")
+            send_escape_detach(fd)
         finally:
             close_client(pid, fd)
 
@@ -3656,11 +3660,11 @@ def run_env_config_client_test(tmp_root):
         if "ENDED s1" not in killed.stdout:
             raise AssertionError(killed.stdout)
 
-        (config_dir / "sessh.env").write_text("leader=CTRL-B\n")
+        (config_dir / "sessh.env").write_text("")
         pid, fd = spawn_client(env, ["--alias", "s2"])
         try:
             read_until(fd, b"$ ")
-            os.write(fd, b"\x02d")
+            send_escape_detach(fd)
             read_until(fd, b"sessh: detached")
         finally:
             close_client(pid, fd)
@@ -3686,7 +3690,7 @@ def run_tty_transcript_capture_test(tmp_root):
                 raise AssertionError(f"missing transcript warning: {startup!r}")
             os.write(fd, b"printf 'transcript_inner_marker\\n'\n")
             read_until_count(fd, b"transcript_inner_marker", 2)
-            os.write(fd, b"~.")
+            send_escape_detach(fd)
             read_until(fd, b"sessh: detached")
         finally:
             close_client(pid, fd)
@@ -3744,7 +3748,7 @@ def run_initial_kitty_keyboard_restore_test(tmp_root):
         pid, fd = spawn_client(env, ["--alias", "s1"])
         try:
             read_until(fd, b"$ ")
-            os.write(fd, b"~.")
+            send_escape_detach(fd)
             output = read_until(fd, b"sessh: detached")
             output += read_available(fd, timeout=0.5)
             if b"\x1b[=7u" not in output:
@@ -3900,10 +3904,6 @@ def main():
             if missing.returncode != 1 or "ERROR session not found" not in missing.stderr:
                 raise AssertionError(missing)
 
-            bad = run([".", "--leader", "CTRL-C", "list"], env, timeout=5.0)
-            if bad.returncode != 64:
-                raise AssertionError(bad)
-
             bad = run([".", "--scrollback-limit", "0"], env, timeout=5.0)
             if bad.returncode != 64:
                 raise AssertionError(bad)
@@ -4004,7 +4004,7 @@ def main():
                 read_until(fd, b"SESSH_GUID=")
                 os.write(fd, b"echo sessh_before_reconnect\n")
                 read_until_count(fd, b"sessh_before_reconnect", 2)
-                os.write(fd, b"~.")
+                send_escape_detach(fd)
                 read_until(fd, startup_cwd_title_sequence(), timeout=2.0)
             finally:
                 close_client(pid, fd)
@@ -4047,7 +4047,7 @@ def main():
             pid, fd = spawn_client(env, ["--alias", "s2"])
             try:
                 read_until(fd, b"$ ")
-                os.write(fd, b"~.")
+                send_escape_detach(fd)
             finally:
                 close_client(pid, fd)
 
@@ -4068,11 +4068,10 @@ def main():
             if missing.returncode != 1 or "ERROR session not found" not in missing.stderr:
                 raise AssertionError(missing)
 
-            (config_dir / "sessh.env").write_text("leader=CTRL-B\n")
             pid, fd = spawn_client(env, ["--alias", "s3"])
             try:
                 read_until(fd, b"$ ")
-                os.write(fd, b"\x02d")
+                send_escape_detach(fd)
             finally:
                 close_client(pid, fd)
 
@@ -4088,7 +4087,7 @@ def main():
                 read_until(fd, b"$ ")
                 os.write(fd, b"echo sessh_runtime_route_attach\n")
                 read_until_count(fd, b"sessh_runtime_route_attach", 2)
-                os.write(fd, b"~.")
+                send_escape_detach(fd)
             finally:
                 close_client(pid, fd)
 
@@ -4096,19 +4095,20 @@ def main():
             if "ENDED s3" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
-            (config_dir / "sessh.env").write_text("leader=CTRL-B\n")
             pid, fd = spawn_client(env, ["--alias", "s4"])
             try:
                 read_until(fd, b"$ ")
                 os.write(fd, b"echo sessh_before_sever\n")
                 read_until_count(fd, b"sessh_before_sever", 2)
-                os.write(fd, b"\x02s")
+                severed = run([".", "debug", "sever-connection", "--last-input", "s4"], env, check=True, timeout=5.0)
+                if "SEVERED" not in severed.stdout:
+                    raise AssertionError(severed.stdout)
                 read_until(fd, b"sessh: disconnected: Reconnecting")
                 os.write(fd, b"\x12")
                 read_until(fd, b"$ ")
                 os.write(fd, b"echo sessh_after_sever\n")
                 read_until_count(fd, b"sessh_after_sever", 2)
-                os.write(fd, b"~.")
+                send_escape_detach(fd)
             finally:
                 close_client(pid, fd)
 
@@ -4131,10 +4131,10 @@ def main():
                     read_until_count(fd1, b"sessh_multi_from_second", 2)
                     os.write(fd1, b"echo sessh_multi_attach\n")
                     read_until_count(fd2, b"sessh_multi_attach", 2)
-                    os.write(fd2, b"~.")
+                    send_escape_detach(fd2)
                 finally:
                     close_client(pid2, fd2)
-                os.write(fd1, b"~.")
+                send_escape_detach(fd1)
             finally:
                 close_client(pid1, fd1)
 
@@ -4153,7 +4153,7 @@ def main():
                 # Wait for real command output, not text from the echoed command
                 # line; PTY wrapping can split the path substring.
                 read_until(fd, b"x" * 64)
-                os.write(fd, b"~.")
+                send_escape_detach(fd)
             finally:
                 close_client(pid, fd)
             wait_file(drain_done)

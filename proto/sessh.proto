@@ -52,6 +52,8 @@ message Frame {
     ProxyControlCapabilities proxy_control_capabilities = 48;
     ProxyControlDiagnostic proxy_control_diagnostic = 49;
     ProxyControlCtrlR proxy_control_ctrl_r = 50;
+    PendingKillRequest pending_kill_request = 51;
+    PendingKillResponse pending_kill_response = 52;
   }
 }
 
@@ -322,6 +324,40 @@ message TeRepaintRequest {
   optional uint32 initial_scrollback_rows = 3;
 }
 
+// Framed payload, client -> remote sessh.
+//
+// Requests that the remote host terminate the target. Session targets use s-*
+// GUIDs and proxy stream targets use p-* GUIDs.
+message PendingKillRequest {
+  string guid = 1;
+}
+
+// Framed payload, remote sessh -> client.
+//
+// Reports the outcome for one pending kill request.
+message PendingKillResponse {
+  string guid = 1;
+
+  oneof result {
+    PendingKilled killed = 2;
+    PendingMissing missing = 3;
+    PendingFailure failure = 4;
+  }
+}
+
+message PendingKilled {
+  uint64 ended_at_unix_ms = 1;
+  optional ExitStatus exit_status = 2;
+}
+
+message PendingMissing {
+}
+
+message PendingFailure {
+  string reason = 1;
+}
+
+
 // Framed payload, session agent -> client.
 //
 // Requests that an attached client initiate its normal repaint flow by sending
@@ -450,14 +486,14 @@ enum TeSessionEndReason {
   TE_SESSION_END_REASON_AGENT_SHUTDOWN = 3;
 }
 
-enum TeExitStatusKind {
-  TE_EXIT_STATUS_KIND_UNSPECIFIED = 0;
-  TE_EXIT_STATUS_KIND_EXITED = 1;
-  TE_EXIT_STATUS_KIND_SIGNALLED = 2;
+enum ExitStatusKind {
+  EXIT_STATUS_KIND_UNSPECIFIED = 0;
+  EXIT_STATUS_KIND_EXITED = 1;
+  EXIT_STATUS_KIND_SIGNALLED = 2;
 }
 
-message TeExitStatus {
-  TeExitStatusKind kind = 1;
+message ExitStatus {
+  ExitStatusKind kind = 1;
   // Process exit status when kind is EXITED, or signal number when kind is
   // SIGNALLED.
   sint32 status = 2;
@@ -470,7 +506,7 @@ message TeSessionEnded {
   TeSessionEndReason reason = 1;
   // Absent means the session agent did not observe a wait status, for example
   // because it is shutting down and synthesized the end notification.
-  optional TeExitStatus exit_status = 2;
+  optional ExitStatus exit_status = 2;
   optional uint64 ended_at_unix_ms = 3;
 }
 

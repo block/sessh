@@ -75,7 +75,6 @@ directories used by sessh.
 Config keys are case-insensitive. Supported keys with their default values:
 
 ```dotenv
-leader=None
 scrollback-limit=2000
 initial-scrollback=-1
 client-log-level=warn
@@ -84,8 +83,6 @@ terminal-emulator=true
 filter-level=emulated
 ```
 
-- `leader`: set the leader key for client commands or disable with `None`. The
-  leader key is must be in the form `CTRL-<letter>`.
 - `scrollback-limit`: set the maximum number of retained scrollback lines.
 - `initial-scrollback`: set how many retained scrollback lines are drawn when
   attaching to an existing session. `-1` means all retained scrollback, `0`
@@ -179,22 +176,27 @@ through the session stream. The session is still attachable with
 
 ## Interacting with attached sessions
 
-You may detach from a session in any of 3 ways:
+You may detach from a session in either of 2 ways:
 
-1. The standard ssh disconnect key sequence: `Enter ~ .`
-2. If you have defined a leader: `<leader> d` (same as tmux)
-3. While the session is reconnecting: `<CTRL-C>`
+1. The ssh-style escape sequence: `Enter ~ d`
+2. While the session is reconnecting: `<CTRL-C>`
 
 After detaching, sessh will print the command to re-attach to that session.
 
-If you have a leader defined, there are two additionals commands available:
+Additional ssh-style escape sequences are available at the beginning of a line:
 
-1. You may request repaint: `<leader> r`. This will erase your current
-   scrollback and draw all available scrollback, followed by the current
-   screen. This is primarily useful if you have set initial-scrollback to a
-   value >=0 and you want to see the rest of scrollback.
-2. You may simulate network disconnection: `<leader> s`. You can use this to
-   see `sessh` reconnections in action.
+1. `~.` requests that the sessh session be killed and detaches immediately. If
+   the remote host is unreachable, sessh records the kill request locally and
+   sends it automatically the next time you connect to that host.
+2. `~k` requests that the sessh session be killed and waits until the remote
+   host confirms the kill. While waiting, `~.` detaches immediately; the kill
+   request remains queued.
+3. `~p` requests repaint. This erases your current scrollback and draws all
+   available scrollback, followed by the current screen. This is primarily
+   useful if you have set initial-scrollback to a value >=0 and you want to see
+   the rest of scrollback.
+4. `~?` shows escape help.
+5. `~~` sends a literal `~`.
 
 ## Plain SSH and Compat-Fallback
 

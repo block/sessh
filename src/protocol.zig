@@ -17,6 +17,8 @@ pub const MessageType = enum {
     te_input,
     te_resize,
     te_repaint_request,
+    pending_kill_request,
+    pending_kill_response,
 
     te_session_created,
     te_session_attached,
@@ -157,6 +159,8 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .te_input => |message| ownedFrameFromMessage(allocator, .te_input, message),
             .te_resize => |message| ownedFrameFromMessage(allocator, .te_resize, message),
             .te_repaint_request => |message| ownedFrameFromMessage(allocator, .te_repaint_request, message),
+            .pending_kill_request => |message| ownedFrameFromMessage(allocator, .pending_kill_request, message),
+            .pending_kill_response => |message| ownedFrameFromMessage(allocator, .pending_kill_response, message),
             .te_session_created => |message| ownedFrameFromMessage(allocator, .te_session_created, message),
             .te_session_attached => |message| ownedFrameFromMessage(allocator, .te_session_attached, message),
             .te_session_ended => |message| ownedFrameFromMessage(allocator, .te_session_ended, message),
@@ -255,6 +259,16 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.TeRepaintRequest, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_repaint_request = message } });
+        },
+        .pending_kill_request => blk: {
+            var message = try decodePayload(pb.PendingKillRequest, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .pending_kill_request = message } });
+        },
+        .pending_kill_response => blk: {
+            var message = try decodePayload(pb.PendingKillResponse, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .pending_kill_response = message } });
         },
         .te_session_created => blk: {
             var message = try decodePayload(pb.TeSessionCreated, allocator, payload);
@@ -478,6 +492,6 @@ test "session ended exit status is optional" {
     var decoded = try decodePayload(pb.TeSessionEnded, std.testing.allocator, payload);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(pb.TeSessionEndReason.TE_SESSION_END_REASON_KILLED_BY_REQUEST, decoded.reason);
-    try std.testing.expectEqual(@as(?pb.TeExitStatus, null), decoded.exit_status);
+    try std.testing.expectEqual(@as(?pb.ExitStatus, null), decoded.exit_status);
     try std.testing.expectEqual(@as(?u64, 42), decoded.ended_at_unix_ms);
 }

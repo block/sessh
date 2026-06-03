@@ -173,8 +173,6 @@ const ParsedSshArgs = struct {
     shell_command_args: []const []const u8 = &.{},
     tty_request: SshTtyRequest = .none,
     alias: ?[]const u8 = null,
-    leader: terminal.Leader = .none,
-    leader_set: bool = false,
     banner_args: client.DetachBannerArgs = .{},
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     scrollback_row_count_set: bool = false,
@@ -631,8 +629,7 @@ fn translateMuxNew(translated: *TranslatedMuxArgs, args: []const []const u8, inv
 }
 
 fn isConfigOrEnvOnlySesshOption(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--leader") or
-        std.mem.eql(u8, arg, "--scrollback-limit") or
+    return std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
@@ -1168,8 +1165,7 @@ fn appendShellSplitWords(
 }
 
 fn sesshLongOptionRequiresValue(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--leader") or
-        std.mem.eql(u8, arg, "--scrollback-limit") or
+    return std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--alias") or
@@ -1178,7 +1174,6 @@ fn sesshLongOptionRequiresValue(arg: []const u8) bool {
 }
 
 fn sesshLongOptionMissingValueError(arg: []const u8) anyerror {
-    if (std.mem.eql(u8, arg, "--leader")) return error.MissingLeader;
     if (std.mem.eql(u8, arg, "--scrollback-limit")) return error.MissingScrollbackRowCount;
     if (std.mem.eql(u8, arg, "--initial-scrollback")) return error.MissingInitialScrollback;
     if (std.mem.eql(u8, arg, "--log-level")) return error.MissingClientLogLevel;
@@ -1253,7 +1248,6 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             .new_detached = parsed_ssh_args.new_detached,
             .alias = parsed_ssh_args.alias,
             .scrollback_row_count = parsed_ssh_args.scrollback_row_count,
-            .leader = parsed_ssh_args.leader,
             .banner_args = parsed_ssh_args.banner_args.slice(),
             .capture_tty_transcript = parsed_ssh_args.capture_tty_transcript,
             .command_argv = parsed_ssh_args.command_argv,
@@ -1424,6 +1418,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             new_alias.?,
             parsed_ssh_args.command_argv,
             shell_command,
+            parsed_ssh_args.host,
         ) catch |err| {
             if (err == error.VersionMismatch) {
                 child.closeStdin();
@@ -1464,6 +1459,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             new_alias.?,
             parsed_ssh_args.command_argv,
             shell_command,
+            parsed_ssh_args.host,
         ),
         .attach => client.startAttachSessionOnRuntime(
             child.child.stdout.?.handle,
@@ -1471,6 +1467,7 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             parsed_ssh_args.attach_id orelse "",
             parsed_ssh_args.attach_session_dir,
             parsed_ssh_args.initial_scrollback_row_count,
+            parsed_ssh_args.host,
         ),
         .list, .kill, .kill_all, .detach_client, .repaint_client, .debug_client => unreachable,
     }) catch |err| {
@@ -1510,7 +1507,6 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
             &session,
-            parsed_ssh_args.leader,
             .{ .monitor_connection = true },
         ) catch |err| {
             waitAfterRuntimeAttachFailure(&child, "relay");
@@ -1527,14 +1523,35 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                 try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
                 return;
             },
+            .kill_detach => {
+                client_log.debug("event=kill_detach host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
+                client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                client.requestRuntimeSessionKill(child.child.stdin.?.handle, session.guidSlice(), &session.kill_requested) catch {};
+                child.terminate();
+                try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
+                return;
+            },
+            .kill_wait => {
+                client_log.debug("event=kill_wait host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
+                client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                var kill_send_failed = false;
+                client.requestRuntimeSessionKill(child.child.stdin.?.handle, session.guidSlice(), &session.kill_requested) catch |err| switch (err) {
+                    error.WriteFailed => kill_send_failed = true,
+                    else => return err,
+                };
+                if (kill_send_failed) {
+                    child.terminate();
+                    race_existing_connection = true;
+                } else {
+                    try client.waitForRuntimePendingKillConfirmation(allocator, child.child.stdout.?.handle, parsed_ssh_args.host, &session);
+                    const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
+                    return process_exit.request(exit_status);
+                }
+            },
             .session_ended => {
                 client_log.debug("event=session_ended host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
                 return process_exit.request(exit_status);
-            },
-            .reconnect => {
-                client_log.debug("event=disconnect reason=leader_sever host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
-                child.terminate();
             },
             .unresponsive => {
                 client_log.debug("event=disconnect reason=unresponsive host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
@@ -1562,7 +1579,9 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
         var reconnect_ui_active = true;
         defer if (reconnect_ui_active) reconnect_ui.deinit();
 
-        if (race_existing_connection) {
+        if (race_existing_connection and session.kill_requested) {
+            child.terminate();
+        } else if (race_existing_connection) {
             switch (try raceExistingConnectionWithReconnect(
                 parsed_ssh_args,
                 artifacts,
@@ -1654,7 +1673,11 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                 reconnect_attempt,
                 delay_ms,
             });
-            switch (try reconnect_ui.waitForReconnect(delay_ms)) {
+            const wait_decision = if (session.kill_requested)
+                try reconnect_ui.waitForKillConfirmation(delay_ms)
+            else
+                try reconnect_ui.waitForReconnect(delay_ms);
+            switch (wait_decision) {
                 .detach => {
                     client_log.debug("event=reconnect_detach host={s} session={s} attempt={}", .{
                         parsed_ssh_args.host,
@@ -1665,12 +1688,39 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                     try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
                     return;
                 },
-                .reconnect_now, .wait_elapsed => {
-                    client_log.debug("event=reconnect_attempt host={s} session={s} attempt={}", .{
+                .kill_detach => {
+                    client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                    client_log.debug("event=reconnect_kill_detach host={s} session={s} attempt={}", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
                         reconnect_attempt,
                     });
+                    finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
+                    try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
+                    return;
+                },
+                .kill_wait => {
+                    client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                    client_log.debug("event=reconnect_kill_wait host={s} session={s} attempt={}", .{
+                        parsed_ssh_args.host,
+                        session.idSlice(),
+                        reconnect_attempt,
+                    });
+                },
+                .reconnect_now, .wait_elapsed => {
+                    if (session.kill_requested) {
+                        client_log.debug("event=kill_reconnect_attempt host={s} session={s} attempt={}", .{
+                            parsed_ssh_args.host,
+                            session.idSlice(),
+                            reconnect_attempt,
+                        });
+                    } else {
+                        client_log.debug("event=reconnect_attempt host={s} session={s} attempt={}", .{
+                            parsed_ssh_args.host,
+                            session.idSlice(),
+                            reconnect_attempt,
+                        });
+                    }
                 },
             }
 
@@ -1708,6 +1758,49 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
             };
 
             session.viewport_offset = reconnect_ui.currentViewportOffset();
+            if (session.kill_requested) {
+                client.runtimeHandshake(child.child.stdout.?.handle, child.child.stdin.?.handle) catch |err| {
+                    child.closeStdin();
+                    _ = child.wait() catch {};
+                    switch (err) {
+                        error.OutOfMemory => return err,
+                        else => {
+                            client_log.debug("event=kill_failed stage=handshake host={s} session={s} attempt={} error={t}", .{
+                                parsed_ssh_args.host,
+                                session.idSlice(),
+                                reconnect_attempt,
+                                err,
+                            });
+                            reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
+                            continue;
+                        },
+                    }
+                };
+                client.drainPendingKillsOnRuntime(allocator, child.child.stdout.?.handle, child.child.stdin.?.handle, parsed_ssh_args.host) catch |err| {
+                    child.closeStdin();
+                    _ = child.wait() catch {};
+                    switch (err) {
+                        error.OutOfMemory => return err,
+                        else => {
+                            client_log.debug("event=kill_failed stage=pending host={s} session={s} attempt={} error={t}", .{
+                                parsed_ssh_args.host,
+                                session.idSlice(),
+                                reconnect_attempt,
+                                err,
+                            });
+                            reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
+                            continue;
+                        },
+                    }
+                };
+                child.closeStdin();
+                _ = child.wait() catch {};
+                reconnect_ui.restoreTitleAfterReconnect(&session);
+                reconnect_ui.deinit();
+                reconnect_ui_active = false;
+                return process_exit.request(0);
+            }
+
             client.reconnectSessionOnRuntimeCancellable(
                 child.child.stdout.?.handle,
                 child.child.stdin.?.handle,
@@ -1743,6 +1836,31 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
                     try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
                     return;
+                },
+                .kill_detach => {
+                    client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                    client.requestRuntimeSessionKill(child.child.stdin.?.handle, session.guidSlice(), &session.kill_requested) catch {};
+                    child.terminate();
+                    finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
+                    try finishDetachedSshSession(allocator, parsed_ssh_args, &session);
+                    return;
+                },
+                .kill_wait => {
+                    client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                    var kill_send_failed = false;
+                    client.requestRuntimeSessionKill(child.child.stdin.?.handle, session.guidSlice(), &session.kill_requested) catch |err| switch (err) {
+                        error.WriteFailed => kill_send_failed = true,
+                        else => return err,
+                    };
+                    if (kill_send_failed) {
+                        child.closeStdin();
+                        _ = child.wait() catch {};
+                        reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
+                        continue;
+                    }
+                    try client.waitForRuntimePendingKillConfirmation(allocator, child.child.stdout.?.handle, parsed_ssh_args.host, &session);
+                    const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
+                    return process_exit.request(exit_status);
                 },
                 .reconnect_now, .wait_elapsed => {},
             }
@@ -1803,6 +1921,7 @@ fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: Parse
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
     client.writeDetachBannerForSessionRef(parsed_ssh_args.banner_args.slice(), session.idSlice());
+    if (session.kill_requested) client.writeUnconfirmedKillDetachWarningForSessionRef(session.guidSlice());
 }
 
 fn finishEndedRemoteSession(
@@ -2308,11 +2427,6 @@ fn localCompatArgs(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs)
         .detach_client, .repaint_client, .debug_client => return error.UnsupportedCompatCommand,
     }
 
-    var leader_buf: [8]u8 = undefined;
-    const leader = resolvedLeaderArg(parsed_ssh_args.leader, &leader_buf);
-    try appendCompatArg(allocator, &out, "--leader");
-    try appendCompatArg(allocator, &out, leader);
-
     var scrollback_buf: [16]u8 = undefined;
     const scrollback_count = try std.fmt.bufPrint(&scrollback_buf, "{}", .{parsed_ssh_args.scrollback_row_count});
     try appendCompatArg(allocator, &out, "--scrollback-limit");
@@ -2375,18 +2489,8 @@ fn appendCompatArg(allocator: std.mem.Allocator, out: *std.ArrayList(u8), arg: [
     try out.appendSlice(allocator, quoted);
 }
 
-fn resolvedLeaderArg(leader: terminal.Leader, buf: []u8) []const u8 {
-    return switch (leader) {
-        .none => "None",
-        .ctrl => |byte| std.fmt.bufPrint(buf, "CTRL-{c}", .{byte}) catch unreachable,
-    };
-}
-
 fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !void {
     const file_config = try client.loadFileConfig(allocator);
-    if (!parsed.leader_set) {
-        if (file_config.leader) |leader| parsed.leader = leader;
-    }
     if (!parsed.scrollback_row_count_set) {
         if (file_config.scrollback_row_count) |count| parsed.scrollback_row_count = count;
     }
@@ -2416,9 +2520,6 @@ fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !v
 // path. Apply only the fields that already make sense for local mux sessions.
 fn applyFileConfigToLocalNew(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !void {
     const file_config = try client.loadFileConfig(allocator);
-    if (!parsed.leader_set) {
-        if (file_config.leader) |leader| parsed.leader = leader;
-    }
     if (!parsed.scrollback_row_count_set) {
         if (file_config.scrollback_row_count) |count| parsed.scrollback_row_count = count;
     }
@@ -2561,7 +2662,6 @@ fn raceExistingConnectionWithReconnect(
                 if (try waitForUnresponsiveReconnectRetry(
                     old_child,
                     session,
-                    parsed_ssh_args.leader,
                     reconnect_ui,
                     delay_ms,
                 )) |retry_outcome| return retry_outcome;
@@ -2575,7 +2675,6 @@ fn raceExistingConnectionWithReconnect(
 fn waitForUnresponsiveReconnectRetry(
     old_child: *RuntimeConnection,
     session: *client.RuntimeSession,
-    leader: terminal.Leader,
     reconnect_ui: *client.ReconnectUi,
     delay_ms: u64,
 ) !?ReconnectRaceOutcome {
@@ -2603,12 +2702,13 @@ fn waitForUnresponsiveReconnectRetry(
             old_child.child.stdout.?.handle,
             old_child.child.stdin.?.handle,
             session,
-            leader,
             reconnect_ui,
             poll_ms,
         )) {
             .wait_elapsed => {},
             .detach => return .detach,
+            .kill_detach => return .detach,
+            .kill_wait => return null,
             .reconnect_now => return null,
             .transport_closed => {
                 old_child.closeStdin();
@@ -2669,6 +2769,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                             reconnect_ui,
                             pending_input_at_disconnect,
                             pending_paste_like_input_at_disconnect,
+                            parsed_ssh_args.host,
                         );
                     }
                     const disposition = reconnect_ui.reconnectSwitchDisposition(
@@ -2735,6 +2836,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                                 reconnect_ui,
                                 pending_input_at_disconnect,
                                 pending_paste_like_input_at_disconnect,
+                                parsed_ssh_args.host,
                             );
                         }
                         try reconnect_ui.showDisconnectedReconnectInProgress();
@@ -2746,7 +2848,6 @@ fn raceExistingConnectionWithReconnectAttempt(
                     old_child.child.stdout.?.handle,
                     old_child.child.stdin.?.handle,
                     session,
-                    parsed_ssh_args.leader,
                     reconnect_ui,
                     50,
                 )) {
@@ -2770,6 +2871,27 @@ fn raceExistingConnectionWithReconnectAttempt(
                             );
                         }
                     },
+                    .kill_detach => {
+                        client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                        reconnect_ui.cancel();
+                        if (!joined) {
+                            joined = true;
+                            thread.join();
+                            cleanupParallelReconnectResult(&state);
+                        }
+                        return .detach;
+                    },
+                    .kill_wait => {
+                        client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                        if (ready_connection != null) {
+                            return try attachReadyReconnectConnection(
+                                &ready_connection,
+                                &ready_session,
+                                session,
+                                reconnect_ui,
+                            );
+                        }
+                    },
                     .transport_closed => {
                         old_child.closeStdin();
                         _ = old_child.wait() catch {};
@@ -2782,6 +2904,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                                 reconnect_ui,
                                 pending_input_at_disconnect,
                                 pending_paste_like_input_at_disconnect,
+                                parsed_ssh_args.host,
                             );
                         }
                         try reconnect_ui.showDisconnectedReconnectInProgress();
@@ -2798,6 +2921,23 @@ fn raceExistingConnectionWithReconnectAttempt(
                         cleanupParallelReconnectResult(&state);
                     }
                     return .detach;
+                },
+                .kill_detach => {
+                    client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                    reconnect_ui.cancel();
+                    if (!joined) {
+                        joined = true;
+                        thread.join();
+                        cleanupParallelReconnectResult(&state);
+                    }
+                    return .detach;
+                },
+                .kill_wait => {
+                    client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                    if (ready_connection) |connection| {
+                        ready_connection = null;
+                        return .{ .reconnected = connection };
+                    }
                 },
                 .reconnect_now => {
                     if (ready_connection) |connection| {
@@ -2819,6 +2959,7 @@ fn attachReadyReconnectConnectionAfterTransportClosed(
     reconnect_ui: *client.ReconnectUi,
     pending_input_at_disconnect: bool,
     pending_paste_like_input_at_disconnect: bool,
+    host: []const u8,
 ) !ReconnectRaceOutcome {
     switch (try waitForReconnectSwitchIfNeeded(
         reconnect_ui,
@@ -2827,6 +2968,11 @@ fn attachReadyReconnectConnectionAfterTransportClosed(
         false,
     )) {
         .detach => return .detach,
+        .kill_detach => {
+            client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, host, session);
+            return .detach;
+        },
+        .kill_wait => client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, host, session),
         .reconnect_now, .wait_elapsed => {},
     }
     return attachReadyReconnectConnection(ready_connection, ready_session, session, reconnect_ui);
@@ -3635,6 +3781,8 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
         .ctrl_r_status_enabled = proxy_control_ctrl_r_available and client_control_fd >= 0,
         .proxy_control_output_mode = proxy_control_output_mode,
         .title_fallback = invocation.host,
+        .pending_kill_host = invocation.host,
+        .pending_kill_guid = proxy_guid,
     }) catch |err| {
         session_registry.removeOutgoingProxyHint(allocator, proxy_guid) catch |remove_err| {
             client_log.debug("event=outgoing_proxy_hint_remove_failed proxy={s} error={t}", .{ proxy_guid, remove_err });
@@ -4409,14 +4557,6 @@ fn parseRouteRefArgs(
             try parsed.banner_args.append(arg);
             try parsed.banner_args.append(args[i]);
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--leader")) {
-            i += 1;
-            if (i >= args.len) return error.MissingLeader;
-            parsed.leader = try client.parseLeader(args[i]);
-            parsed.leader_set = true;
-            try parsed.banner_args.append(arg);
-            try parsed.banner_args.append(args[i]);
-            i += 1;
         } else if (std.mem.eql(u8, arg, "--log-level")) {
             i += 1;
             if (i >= args.len) return error.MissingClientLogLevel;
@@ -4629,15 +4769,7 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
         if (!isSesshLongOption(arg)) return;
         if (isConfigOrEnvOnlySesshOption(arg)) return error.UnsupportedSesshOption;
 
-        if (std.mem.eql(u8, arg, "--leader")) {
-            index.* += 1;
-            if (index.* >= args.len) return error.MissingLeader;
-            parsed.leader = try client.parseLeader(args[index.*]);
-            parsed.leader_set = true;
-            try parsed.banner_args.append(arg);
-            try parsed.banner_args.append(args[index.*]);
-            index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--scrollback-limit")) {
+        if (std.mem.eql(u8, arg, "--scrollback-limit")) {
             index.* += 1;
             if (index.* >= args.len) return error.MissingScrollbackRowCount;
             parsed.scrollback_row_count = try client.parseScrollbackRowCount(args[index.*]);
@@ -4794,16 +4926,6 @@ fn parseCommonSesshOptionAfterHost(args: []const []const u8, index: *usize, pars
     if (std.mem.eql(u8, arg, "--detached")) {
         if (!parse_options.allow_mux_command_words or parsed.action != .new) return false;
         parsed.new_detached = true;
-        index.* += 1;
-        return true;
-    }
-    if (std.mem.eql(u8, arg, "--leader")) {
-        index.* += 1;
-        if (index.* >= args.len) return error.MissingLeader;
-        parsed.leader = try client.parseLeader(args[index.*]);
-        parsed.leader_set = true;
-        try parsed.banner_args.append(arg);
-        try parsed.banner_args.append(args[index.*]);
         index.* += 1;
         return true;
     }
@@ -5042,8 +5164,7 @@ fn parseTranslatedClientControlTail(
 }
 
 fn isSesshLongOption(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--leader") or
-        std.mem.eql(u8, arg, "--scrollback-limit") or
+    return std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--alias") or
@@ -5292,7 +5413,6 @@ fn printSshArgError(err: anyerror) !void {
         error.MissingKillTarget => try io.writeAll(2, "sesshmux: kill requires --all, a guid, or --current\n"),
         error.MissingKillId => try io.writeAll(2, "sesshmux: kill requires an id\n"),
         error.MissingAlias => try io.writeAll(2, "sessh: --alias requires a value\n"),
-        error.MissingLeader => try io.writeAll(2, "sessh: --leader requires a value\n"),
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),
         error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
@@ -5308,8 +5428,6 @@ fn printSshArgError(err: anyerror) !void {
         error.UnsupportedMuxCommand => try io.writeAll(2, "sesshmux: unsupported command\n"),
         error.UnsupportedMuxOption => try io.writeAll(2, "sesshmux: unsupported option for this command\n"),
         error.ConflictingSesshAction => try io.writeAll(2, "sessh: conflicting sessh actions\n"),
-        error.DangerousLeader => try io.writeAll(2, "sessh: dangerous leader\n"),
-        error.InvalidLeader => try io.writeAll(2, "sessh: invalid leader\n"),
         error.InvalidScrollbackRowCount => try io.writeAll(2, "sessh: invalid scrollback row count\n"),
         error.InvalidInitialScrollback => try io.writeAll(2, "sessh: invalid initial scrollback\n"),
         error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
@@ -5916,12 +6034,6 @@ test "parseSshArgs treats every direct post-host token as remote command" {
 test "parseSshArgs rejects config-only sessh options on direct ssh transport" {
     try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "--leader",
-        "CTRL-B",
-        "example.com",
-    }, .{}));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
         "--scrollback-limit",
         "100",
         "example.com",
@@ -6288,8 +6400,6 @@ test "parseSshArgs accepts translated attach options after host" {
         "example.com",
         "attach",
         "s12",
-        "--leader",
-        "CTRL-B",
         "--scrollback-limit",
         "42",
         "--initial-scrollback",
@@ -6303,20 +6413,14 @@ test "parseSshArgs accepts translated attach options after host" {
     try std.testing.expectEqual(@as(usize, 2), parsed.options.len);
     try std.testing.expectEqual(SshAction.attach, parsed.action);
     try std.testing.expectEqualStrings("s12", parsed.attach_id.?);
-    switch (parsed.leader) {
-        .ctrl => |byte| try std.testing.expectEqual(@as(u8, 'B'), byte),
-        .none => return error.ExpectedLeader,
-    }
-    try std.testing.expectEqual(@as(usize, 9), parsed.banner_args.len);
-    try std.testing.expectEqualStrings("--leader", parsed.banner_args.buf[0]);
-    try std.testing.expectEqualStrings("CTRL-B", parsed.banner_args.buf[1]);
-    try std.testing.expectEqualStrings("--scrollback-limit", parsed.banner_args.buf[2]);
-    try std.testing.expectEqualStrings("42", parsed.banner_args.buf[3]);
-    try std.testing.expectEqualStrings("--initial-scrollback", parsed.banner_args.buf[4]);
-    try std.testing.expectEqualStrings("0", parsed.banner_args.buf[5]);
-    try std.testing.expectEqualStrings("--log-level", parsed.banner_args.buf[6]);
-    try std.testing.expectEqualStrings("debug", parsed.banner_args.buf[7]);
-    try std.testing.expectEqualStrings("--bootstrap", parsed.banner_args.buf[8]);
+    try std.testing.expectEqual(@as(usize, 7), parsed.banner_args.len);
+    try std.testing.expectEqualStrings("--scrollback-limit", parsed.banner_args.buf[0]);
+    try std.testing.expectEqualStrings("42", parsed.banner_args.buf[1]);
+    try std.testing.expectEqualStrings("--initial-scrollback", parsed.banner_args.buf[2]);
+    try std.testing.expectEqualStrings("0", parsed.banner_args.buf[3]);
+    try std.testing.expectEqualStrings("--log-level", parsed.banner_args.buf[4]);
+    try std.testing.expectEqualStrings("debug", parsed.banner_args.buf[5]);
+    try std.testing.expectEqualStrings("--bootstrap", parsed.banner_args.buf[6]);
     try std.testing.expectEqual(@as(u32, 42), parsed.scrollback_row_count);
     try std.testing.expectEqual(@as(?u32, 0), parsed.initial_scrollback_row_count);
     try std.testing.expectEqual(client_log.Level.debug, parsed.client_log_level);
@@ -6328,13 +6432,13 @@ test "parseSshArgs accepts translated attach options after host" {
 test "explicit compat args are forwarded after local target" {
     const local_args = try localCompatArgsForExplicitCommand(std.testing.allocator, &.{
         "attach",
-        "--leader",
-        "CTRL-B",
+        "--scrollback-limit",
+        "42",
         "two words",
     }, "s1");
     defer std.testing.allocator.free(local_args);
 
-    try std.testing.expectEqualStrings(" 'attach' 's1' '--leader' 'CTRL-B' 'two words'", local_args);
+    try std.testing.expectEqualStrings(" 'attach' 's1' '--scrollback-limit' '42' 'two words'", local_args);
 }
 
 test "explicit compat args keep explicit attach target" {
@@ -6926,19 +7030,12 @@ test "translateMuxArgs rejects sessh options after host" {
         "sesshmux",
         "new",
         "example.com",
-        "--leader",
-        "CTRL-B",
+        "--filter-level",
+        "raw",
     }));
 }
 
 test "translateMuxArgs rejects config and env only options" {
-    try std.testing.expectError(error.UnsupportedSesshCliOption, translateMuxArgs(std.testing.allocator, &.{
-        "sesshmux",
-        "new",
-        "--leader",
-        "CTRL-B",
-        "example.com",
-    }));
     try std.testing.expectError(error.UnsupportedSesshCliOption, translateMuxArgs(std.testing.allocator, &.{
         "sesshmux",
         "new",
@@ -6964,13 +7061,6 @@ test "translateMuxArgs rejects config and env only options" {
         "new",
         "--no-bootstrap",
         "example.com",
-    }));
-    try std.testing.expectError(error.UnsupportedSesshCliOption, translateMuxArgs(std.testing.allocator, &.{
-        "sesshmux",
-        "attach",
-        "--leader",
-        "CTRL-B",
-        "s1",
     }));
 }
 

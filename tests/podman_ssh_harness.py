@@ -1100,8 +1100,6 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         set_remote_login_shell(container, remote_shell)
         config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
         config_dir.mkdir(parents=True, exist_ok=True)
-        (config_dir / "sessh.env").write_text("leader=CTRL-B\n")
-
         reconnected = run_reconnect_probe(
             [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias],
             env,

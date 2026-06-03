@@ -57,16 +57,12 @@ var cached_probe: ?TerminalProbe = null;
 var cached_probe_input_fd: c.fd_t = -1;
 var cached_probe_output_fd: c.fd_t = -1;
 
-pub const Leader = union(enum) {
-    none,
-    ctrl: u8,
-};
-
 pub const FilterEnd = enum {
     detach,
     help,
+    kill,
+    kill_wait,
     repaint,
-    reconnect,
 };
 
 pub const FilterResult = struct {
@@ -76,56 +72,40 @@ pub const FilterResult = struct {
 
 pub const escape_help_lines = [_][]const u8{
     "Supported escape sequences:",
-    "~.  disconnect",
+    "~.  kill session and detach",
+    "~k  kill session and wait",
+    "~d  detach",
+    "~p  repaint",
     "~?  show this help",
     "~~  send ~",
 };
 
 pub const escape_help_banner_lines = [_][]const u8{
     "Supported escape sequences. Any key to dismiss",
-    "~.  detach",
+    "~.  kill session and detach",
+    "~k  kill session and wait",
+    "~d  detach",
+    "~p  repaint",
     "~?  show this help",
     "~~  send ~",
 };
 
 /// Removes local sessh escape sequences from terminal input before forwarding
-/// bytes to the remote PTY. This mirrors ssh's line-start `~.`/`~?`/`~~`
-/// escapes and the optional sessh leader commands.
+/// bytes to the remote PTY. These are ssh-style line-start escapes so input
+/// such as `~r`, which OpenSSH already owns, still reaches the remote side.
 pub const EscapeFilter = struct {
-    leader_byte: ?u8 = null,
     at_line_start: bool = true,
     pending_tilde: bool = false,
-    pending_leader: bool = false,
-
-    pub fn setLeader(self: *EscapeFilter, leader_byte: ?u8) void {
-        if (self.leader_byte == leader_byte) return;
-        self.* = .{ .leader_byte = leader_byte };
-    }
 
     pub fn filter(self: *EscapeFilter, input: []const u8, out: []u8) FilterResult {
         var written: usize = 0;
-        for (input) |byte| {
-            if (self.pending_leader) {
-                self.pending_leader = false;
-                if (byte == 'd' or byte == 'D') {
-                    return .{ .bytes = out[0..written], .end = .detach };
-                }
-                if (byte == 'r' or byte == 'R') {
-                    return .{ .bytes = out[0..written], .end = .repaint };
-                }
-                if (byte == 's' or byte == 'S') {
-                    return .{ .bytes = out[0..written], .end = .reconnect };
-                }
-                if (self.leader_byte) |leader| {
-                    out[written] = leader;
-                    written += 1;
-                    self.at_line_start = false;
-                }
-            }
-
+        for (input, 0..) |byte, index| {
             if (self.pending_tilde) {
                 self.pending_tilde = false;
-                if (byte == '.') return .{ .bytes = out[0..written], .end = .detach };
+                if (byte == '.') return .{ .bytes = out[0..written], .end = .kill };
+                if (byte == 'k') return .{ .bytes = out[0..written], .end = .kill_wait };
+                if (byte == 'd') return .{ .bytes = out[0..written], .end = .detach };
+                if (byte == 'p') return .{ .bytes = out[0..written], .end = .repaint };
                 if (byte == '?') return .{ .bytes = out[0..written], .end = .help };
                 if (byte == '~') {
                     out[written] = '~';
@@ -138,16 +118,9 @@ pub const EscapeFilter = struct {
                 self.at_line_start = false;
             }
 
-            if (self.at_line_start and byte == '~') {
+            if ((self.at_line_start or index == 0) and byte == '~') {
                 self.pending_tilde = true;
                 continue;
-            }
-
-            if (self.leader_byte) |leader| {
-                if (byte == leader) {
-                    self.pending_leader = true;
-                    continue;
-                }
             }
 
             out[written] = byte;
@@ -159,20 +132,28 @@ pub const EscapeFilter = struct {
     }
 };
 
-pub fn leaderByte(leader: Leader) ?u8 {
-    return switch (leader) {
-        .none => null,
-        .ctrl => |key| key & 0x1f,
-    };
-}
-
 test "EscapeFilter handles ssh line-start escapes" {
     var filter = EscapeFilter{};
     var out: [16]u8 = undefined;
 
     var result = filter.filter("~.", &out);
     try std.testing.expectEqualStrings("", result.bytes);
+    try std.testing.expectEqual(FilterEnd.kill, result.end.?);
+
+    filter = .{};
+    result = filter.filter("~k", &out);
+    try std.testing.expectEqualStrings("", result.bytes);
+    try std.testing.expectEqual(FilterEnd.kill_wait, result.end.?);
+
+    filter = .{};
+    result = filter.filter("~d", &out);
+    try std.testing.expectEqualStrings("", result.bytes);
     try std.testing.expectEqual(FilterEnd.detach, result.end.?);
+
+    filter = .{};
+    result = filter.filter("~p", &out);
+    try std.testing.expectEqualStrings("", result.bytes);
+    try std.testing.expectEqual(FilterEnd.repaint, result.end.?);
 
     filter = .{};
     result = filter.filter("~?", &out);
@@ -193,6 +174,16 @@ test "EscapeFilter handles ssh line-start escapes" {
     result = filter.filter("x~?", &out);
     try std.testing.expectEqualStrings("x~?", result.bytes);
     try std.testing.expectEqual(@as(?FilterEnd, null), result.end);
+
+    filter = .{};
+    result = filter.filter("~r", &out);
+    try std.testing.expectEqualStrings("~r", result.bytes);
+    try std.testing.expectEqual(@as(?FilterEnd, null), result.end);
+
+    filter = .{ .at_line_start = false };
+    result = filter.filter("~d\n", &out);
+    try std.testing.expectEqualStrings("", result.bytes);
+    try std.testing.expectEqual(FilterEnd.detach, result.end.?);
 }
 
 /// Restores local tty mode even when the remote PTY leaves itself in raw/no-echo

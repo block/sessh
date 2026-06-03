@@ -32,6 +32,10 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .te_resize => continue,
+            .pending_kill_request => {
+                try handlePendingKillRequest(allocator, frame.payload);
+                continue;
+            },
             .te_session_attach => {
                 const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
                     error.NoSessions => {
@@ -110,6 +114,88 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
         return runClientControlCommand(allocator, client_command);
     }
     return finishCommand(64, "", "ERROR unknown broker command\n");
+}
+
+fn handlePendingKillRequest(allocator: std.mem.Allocator, payload: []const u8) !void {
+    var request = try protocol.decodePayload(pb.PendingKillRequest, allocator, payload);
+    defer request.deinit(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const response_allocator = arena.allocator();
+    const response = pendingKillTarget(response_allocator, request.guid) catch |err| pb.PendingKillResponse{
+        .guid = request.guid,
+        .result = .{ .failure = .{ .reason = @errorName(err) } },
+    };
+    const response_payload = try protocol.encodePayload(allocator, response);
+    defer allocator.free(response_payload);
+    try protocol.sendFrame(1, .pending_kill_response, response_payload);
+}
+
+fn pendingKillTarget(allocator: std.mem.Allocator, guid: []const u8) !pb.PendingKillResponse {
+    if (session_registry.isValidSessionGuid(guid)) return pendingKillSession(allocator, guid);
+    if (session_registry.isValidProxyGuid(guid)) return pendingKillProxyStream(allocator, guid);
+    return error.InvalidPendingKillGuid;
+}
+
+fn pendingKillSession(allocator: std.mem.Allocator, guid: []const u8) !pb.PendingKillResponse {
+    var paths = pathsForLocalSessionRef(allocator, guid) catch |err| switch (err) {
+        error.FileNotFound, error.SessionAlreadyExited => return pb.PendingKillResponse{
+            .guid = guid,
+            .result = .{ .missing = .{} },
+        },
+        else => return err,
+    };
+    defer paths.deinit(allocator);
+
+    const fd = socket_transport.connectSocket(paths.socket) catch |err| switch (err) {
+        error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => return pb.PendingKillResponse{
+            .guid = guid,
+            .result = .{ .missing = .{} },
+        },
+        else => return err,
+    };
+    defer _ = c.close(fd);
+
+    try initiateRuntimeHandshake(allocator, fd);
+    try sendPendingKillRequestFrame(allocator, fd, guid);
+    return readPendingKillResponseFrame(allocator, fd);
+}
+
+fn pendingKillProxyStream(allocator: std.mem.Allocator, guid: []const u8) !pb.PendingKillResponse {
+    var socket_paths = session_registry.runtimeAgentSocketPathsForGuid(allocator, guid) catch |err| switch (err) {
+        error.InvalidProxyId => return err,
+        else => return pb.PendingKillResponse{
+            .guid = guid,
+            .result = .{ .missing = .{} },
+        },
+    };
+    defer socket_paths.deinit(allocator);
+
+    const fd = socket_transport.connectSocket(socket_paths.socket) catch |err| switch (err) {
+        error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => return pb.PendingKillResponse{
+            .guid = guid,
+            .result = .{ .missing = .{} },
+        },
+        else => return err,
+    };
+    defer _ = c.close(fd);
+
+    try sendPendingKillRequestFrame(allocator, fd, guid);
+    return readPendingKillResponseFrame(allocator, fd);
+}
+
+fn sendPendingKillRequestFrame(allocator: std.mem.Allocator, fd: c.fd_t, guid: []const u8) !void {
+    const payload = try protocol.encodePayload(allocator, pb.PendingKillRequest{ .guid = guid });
+    defer allocator.free(payload);
+    try protocol.sendFrame(fd, .pending_kill_request, payload);
+}
+
+fn readPendingKillResponseFrame(allocator: std.mem.Allocator, fd: c.fd_t) !pb.PendingKillResponse {
+    var frame = try protocol.readFrameAlloc(allocator, fd);
+    defer frame.deinit(allocator);
+    if (frame.message_type != .pending_kill_response) return error.UnexpectedFrame;
+    return protocol.decodePayload(pb.PendingKillResponse, allocator, frame.payload);
 }
 
 fn isClientControlCommandName(command: []const u8) bool {

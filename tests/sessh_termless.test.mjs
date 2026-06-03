@@ -110,7 +110,7 @@ test("sessh initial-scrollback=0 attach clears stale outer row tails", async () 
       env,
     });
     await waitForText(starter, "OK", 12000);
-    starter.type("\r~.");
+    starter.type("\r~d");
     await waitForText(starter, "sessh: detached", 12000);
     await starter.close();
     starter = null;

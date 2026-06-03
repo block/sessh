@@ -44,6 +44,8 @@ pub const LocalStreamOptions = struct {
     ctrl_r_status_enabled: ?bool = null,
     proxy_control_output_mode: proxy_control.OutputMode = .update,
     title_fallback: []const u8 = "",
+    pending_kill_host: []const u8 = "",
+    pending_kill_guid: []const u8 = "",
 };
 
 // Stream channels are internal fd-shaped identities. The proxy stream protocol
@@ -212,6 +214,17 @@ const StreamState = struct {
         }
         return false;
     }
+
+    fn markKilledComplete(self: *StreamState) void {
+        for (stream_channels) |stream_channel| {
+            const channel_state = self.channel(stream_channel);
+            channel_state.inbound_eof = true;
+            channel_state.outbound_eof = true;
+            channel_state.outbound_eof_sent = true;
+            channel_state.outbound_eof_acked = true;
+            channel_state.outbound.clearRetainingCapacity();
+        }
+    }
 };
 
 fn channelIndex(channel: StreamChannel) usize {
@@ -286,6 +299,7 @@ const StreamAttachmentOptions = struct {
     control_input: ?*StreamInputControl = null,
     replacement_listen_fd: ?c.fd_t = null,
     close_outbound_on_inbound_eof: bool = false,
+    kill_guid: []const u8 = "",
 
     fn sink(self: *const StreamAttachmentOptions, channel: StreamChannel) ChannelSink {
         return self.sinks[channelIndex(channel)];
@@ -298,6 +312,8 @@ const StreamInputControl = struct {
     status_visible: bool = false,
     reconnect_requested: bool = false,
     disconnect_requested: bool = false,
+    kill_detach_requested: bool = false,
+    kill_wait_requested: bool = false,
     help_requested: bool = false,
     escape_filter: terminal.EscapeFilter = .{},
 
@@ -308,8 +324,10 @@ const StreamInputControl = struct {
             const result = self.escape_filter.filter(bytes, &scratch);
             if (result.end) |end| switch (end) {
                 .detach => self.disconnect_requested = true,
+                .kill => self.kill_detach_requested = true,
+                .kill_wait => self.kill_wait_requested = true,
                 .help => self.help_requested = true,
-                .repaint, .reconnect => {},
+                .repaint => {},
             };
             input = result.bytes;
         }
@@ -334,8 +352,22 @@ const StreamInputControl = struct {
         if (self.disconnect_requested) {
             self.disconnect_requested = false;
             self.reconnect_requested = false;
+            self.kill_detach_requested = false;
+            self.kill_wait_requested = false;
             self.help_requested = false;
             return .disconnect;
+        }
+        if (self.kill_detach_requested) {
+            self.kill_detach_requested = false;
+            self.reconnect_requested = false;
+            self.help_requested = false;
+            return .kill_detach;
+        }
+        if (self.kill_wait_requested) {
+            self.kill_wait_requested = false;
+            self.reconnect_requested = false;
+            self.help_requested = false;
+            return .kill_wait;
         }
         if (self.help_requested) {
             self.help_requested = false;
@@ -351,6 +383,8 @@ const StreamControlAction = enum {
     none,
     reconnect,
     disconnect,
+    kill_detach,
+    kill_wait,
     help,
     interrupt,
 };
@@ -890,7 +924,7 @@ const ProxyEndpoint = struct {
         };
     }
 
-    fn attachmentOptions(self: *ProxyEndpoint, listen_fd: c.fd_t) StreamAttachmentOptions {
+    fn attachmentOptions(self: *ProxyEndpoint, listen_fd: c.fd_t, kill_guid: []const u8) StreamAttachmentOptions {
         return .{
             .source_count = 1,
             .sources = .{
@@ -906,6 +940,7 @@ const ProxyEndpoint = struct {
                 break :blk sinks;
             },
             .replacement_listen_fd = listen_fd,
+            .kill_guid = kill_guid,
         };
     }
 
@@ -932,7 +967,54 @@ pub fn runBroker(allocator: std.mem.Allocator, exe: []const u8, args: []const []
 
     const fd = try connectOrStartAgent(allocator, exe, args, socket_paths.socket);
     defer _ = c.close(fd);
+    try relayPendingKillsBeforeStream(allocator, fd);
     try relayRawDuplex(0, 1, fd);
+}
+
+fn relayPendingKillsBeforeStream(allocator: std.mem.Allocator, current_agent_fd: c.fd_t) !void {
+    while (true) {
+        var frame = try protocol.readFrameAlloc(allocator, 0);
+        defer frame.deinit(allocator);
+        if (frame.message_type != .pending_kill_request) {
+            try protocol.sendFrame(current_agent_fd, frame.message_type, frame.payload);
+            return;
+        }
+
+        var request = try protocol.decodePayload(pb.PendingKillRequest, allocator, frame.payload);
+        defer request.deinit(allocator);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const response_allocator = arena.allocator();
+        const response = pendingKillStreamTarget(response_allocator, request.guid) catch |err| pb.PendingKillResponse{
+            .guid = request.guid,
+            .result = .{ .failure = .{ .reason = @errorName(err) } },
+        };
+        const payload = try protocol.encodePayload(allocator, response);
+        defer allocator.free(payload);
+        try protocol.sendFrame(1, .pending_kill_response, payload);
+    }
+}
+
+fn pendingKillStreamTarget(allocator: std.mem.Allocator, guid: []const u8) !pb.PendingKillResponse {
+    if (!session_registry.isValidProxyGuid(guid)) return pb.PendingKillResponse{
+        .guid = guid,
+        .result = .{ .missing = .{} },
+    };
+    var socket_paths = session_registry.runtimeAgentSocketPathsForGuid(allocator, guid) catch return pb.PendingKillResponse{
+        .guid = guid,
+        .result = .{ .missing = .{} },
+    };
+    defer socket_paths.deinit(allocator);
+    const fd = socket_transport.connectSocket(socket_paths.socket) catch return pb.PendingKillResponse{
+        .guid = guid,
+        .result = .{ .missing = .{} },
+    };
+    defer _ = c.close(fd);
+    try sendStreamMessage(allocator, fd, .pending_kill_request, pb.PendingKillRequest{ .guid = guid });
+    var frame = try protocol.readFrameAlloc(allocator, fd);
+    defer frame.deinit(allocator);
+    if (frame.message_type != .pending_kill_response) return error.StreamUnexpectedFrame;
+    return protocol.decodePayload(pb.PendingKillResponse, allocator, frame.payload);
 }
 
 pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
@@ -966,7 +1048,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
     }
     while (true) {
         if (attach_fd < 0) {
-            var detached_options = endpoint.attachmentOptions(listen_fd);
+            var detached_options = endpoint.attachmentOptions(listen_fd, config.guid);
             attach_fd = try waitForReplacementWhileDetached(&state, listen_fd, &detached_options);
         }
 
@@ -974,7 +1056,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
             &state,
             attach_fd,
             attach_fd,
-            endpoint.attachmentOptions(listen_fd),
+            endpoint.attachmentOptions(listen_fd, config.guid),
         );
         switch (outcome) {
             .complete => return,
@@ -1098,6 +1180,10 @@ pub fn runLocalStream(
                 const delay_ms = reconnect.delayMs(attempt);
                 const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
                 if (action == .disconnect) return 0;
+                if (action == .kill_detach or action == .kill_wait) {
+                    queueLocalPendingKill(options);
+                    return 0;
+                }
                 if (action == .interrupt) return 255;
                 attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                 retrying = true;
@@ -1105,6 +1191,9 @@ pub fn runLocalStream(
             };
         }
         had_transport = true;
+        drainPendingProxyKillsOverTransport(allocator, transport.readFd(), transport.writeFd(), options.pending_kill_host) catch |err| {
+            client_log.userDiagnosticInfo("pending proxy cleanup failed: {t}", .{err});
+        };
         reconnect_status.flushDiagnostics();
         reconnect_status.clear();
         input_control.status_visible = false;
@@ -1195,6 +1284,24 @@ pub fn runLocalStream(
                         abortTransport(&transport);
                         return 0;
                     },
+                    .kill_detach => {
+                        queueLocalPendingKill(options);
+                        sendBestEffortPendingKill(allocator, transport.writeFd(), options.pending_kill_guid);
+                        abortTransport(&transport);
+                        return 0;
+                    },
+                    .kill_wait => {
+                        queueLocalPendingKill(options);
+                        if (!old_unresponsive) {
+                            waitForLocalPendingKill(allocator, transport.readFd(), transport.writeFd(), options) catch |err| {
+                                client_log.userDiagnosticInfo("pending proxy cleanup confirmation failed: {t}", .{err});
+                            };
+                        } else {
+                            sendBestEffortPendingKill(allocator, transport.writeFd(), options.pending_kill_guid);
+                        }
+                        abortTransport(&transport);
+                        return 0;
+                    },
                     .reconnect => if (old_unresponsive and pending == null) {
                         pending = Pending.start(allocator, start_transport) catch |err| {
                             client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
@@ -1282,6 +1389,10 @@ pub fn runLocalStream(
                     if (pollfds[index].revents != 0) {
                         switch (readReconnectInput(&state, options.source_fd, &input_control)) {
                             .disconnect => return 0,
+                            .kill_detach, .kill_wait => {
+                                queueLocalPendingKill(options);
+                                return 0;
+                            },
                             .help => reconnect_status.showEscapeHelp(),
                             .none, .reconnect => {},
                             .interrupt => unreachable,
@@ -1312,6 +1423,10 @@ pub fn runLocalStream(
         const delay_ms = reconnect.delayMs(attempt);
         const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
         if (action == .disconnect) return 0;
+        if (action == .kill_detach or action == .kill_wait) {
+            queueLocalPendingKill(options);
+            return 0;
+        }
         if (action == .interrupt) return 255;
         attempt = reconnect.nextAttempt(attempt, action == .reconnect);
         retrying = true;
@@ -1396,6 +1511,11 @@ fn handleFrame(
                 message.offset,
             );
         },
+        .pending_kill_request => {
+            var message = try protocol.decodePayload(pb.PendingKillRequest, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            try handlePendingKillRequest(state, transport_write_fd, options, message.guid);
+        },
         .ping, .pong => {
             _ = protocol.handleTransportControlFrame(mutable.message_type, mutable.payload, transport_write_fd) catch |err| switch (err) {
                 error.WriteFailed => return error.StreamTransportWriteFailed,
@@ -1404,6 +1524,24 @@ fn handleFrame(
         },
         else => return error.StreamUnexpectedFrame,
     }
+}
+
+fn handlePendingKillRequest(
+    state: *StreamState,
+    transport_write_fd: c.fd_t,
+    options: *const StreamAttachmentOptions,
+    guid: []const u8,
+) !void {
+    const matched = options.kill_guid.len > 0 and std.mem.eql(u8, guid, options.kill_guid);
+    const result: pb.PendingKillResponse.result_union = if (matched)
+        .{ .killed = .{ .ended_at_unix_ms = nowUnixMs() } }
+    else
+        .{ .missing = .{} };
+    try sendStreamMessage(state.allocator, transport_write_fd, .pending_kill_response, pb.PendingKillResponse{
+        .guid = guid,
+        .result = result,
+    });
+    if (matched) state.markKilledComplete();
 }
 
 fn handleResumeOffset(state: *StreamState, channel: StreamChannel, offset: u64) !void {
@@ -1776,6 +1914,12 @@ fn nowMillis() u64 {
     return @intCast(std.time.milliTimestamp());
 }
 
+fn nowUnixMs() u64 {
+    const ms = std.time.milliTimestamp();
+    if (ms <= 0) return 0;
+    return @intCast(ms);
+}
+
 fn elapsedMs(start_ms: u64, end_ms: u64) u64 {
     return if (end_ms >= start_ms) end_ms - start_ms else 0;
 }
@@ -1897,6 +2041,73 @@ fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl) bool
         else => {},
     }
     return true;
+}
+
+fn queueLocalPendingKill(options: LocalStreamOptions) void {
+    if (options.pending_kill_host.len == 0 or options.pending_kill_guid.len == 0) return;
+    session_registry.queuePendingKill(std.heap.smp_allocator, options.pending_kill_host, options.pending_kill_guid) catch |err| {
+        client_log.debug("event=stream_pending_kill_queue_failed host={s} guid={s} error={t}", .{
+            options.pending_kill_host,
+            options.pending_kill_guid,
+            err,
+        });
+    };
+}
+
+fn sendBestEffortPendingKill(allocator: std.mem.Allocator, fd: c.fd_t, guid: []const u8) void {
+    if (guid.len == 0) return;
+    sendStreamMessage(allocator, fd, .pending_kill_request, pb.PendingKillRequest{ .guid = guid }) catch {};
+}
+
+fn waitForLocalPendingKill(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t, options: LocalStreamOptions) !void {
+    if (options.pending_kill_guid.len == 0) return;
+    try sendStreamMessage(allocator, write_fd, .pending_kill_request, pb.PendingKillRequest{ .guid = options.pending_kill_guid });
+
+    while (true) {
+        var frame = try protocol.readFrameAlloc(allocator, read_fd);
+        defer frame.deinit(allocator);
+        switch (frame.message_type) {
+            .pending_kill_response => {
+                var response = try protocol.decodePayload(pb.PendingKillResponse, allocator, frame.payload);
+                defer response.deinit(allocator);
+                const done = std.mem.eql(u8, response.guid, options.pending_kill_guid);
+                try processPendingProxyKillResponse(allocator, options.pending_kill_host, response);
+                if (done) return;
+            },
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
+            },
+            else => {},
+        }
+    }
+}
+
+fn drainPendingProxyKillsOverTransport(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t, host: []const u8) !void {
+    if (host.len == 0) return;
+    var pending = session_registry.readPendingKillsForHost(allocator, host) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer pending.deinit(allocator);
+
+    for (pending.guids) |guid| {
+        if (!session_registry.isValidProxyGuid(guid)) continue;
+        try sendStreamMessage(allocator, write_fd, .pending_kill_request, pb.PendingKillRequest{ .guid = guid });
+        var frame = try protocol.readFrameAlloc(allocator, read_fd);
+        defer frame.deinit(allocator);
+        if (frame.message_type != .pending_kill_response) return error.StreamUnexpectedFrame;
+        var response = try protocol.decodePayload(pb.PendingKillResponse, allocator, frame.payload);
+        defer response.deinit(allocator);
+        try processPendingProxyKillResponse(allocator, host, response);
+    }
+}
+
+fn processPendingProxyKillResponse(allocator: std.mem.Allocator, host: []const u8, response: pb.PendingKillResponse) !void {
+    const result = response.result orelse return error.StreamUnexpectedFrame;
+    switch (result) {
+        .killed, .missing => if (host.len > 0) try session_registry.removePendingKill(allocator, host, response.guid),
+        .failure => |failure| client_log.userDiagnosticInfo("pending proxy cleanup failed for {s}: {s}", .{ response.guid, failure.reason }),
+    }
 }
 
 pub const TerminalTitleTracker = struct {
@@ -2551,7 +2762,7 @@ test "stream input control intercepts only reconnect UI controls" {
     try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
 }
 
-test "stream input control uses ssh escape to disconnect no-terminal-emulator streams" {
+test "stream input control uses ssh kill escapes for no-terminal-emulator streams" {
     var control = StreamInputControl{
         .enabled = true,
         .escape_enabled = true,
@@ -2560,7 +2771,10 @@ test "stream input control uses ssh escape to disconnect no-terminal-emulator st
     var out: [16]u8 = undefined;
 
     try std.testing.expectEqualStrings("", control.filter("~.", &out));
-    try std.testing.expectEqual(StreamControlAction.disconnect, control.consumeAction());
+    try std.testing.expectEqual(StreamControlAction.kill_detach, control.consumeAction());
+
+    try std.testing.expectEqualStrings("", control.filter("~k", &out));
+    try std.testing.expectEqual(StreamControlAction.kill_wait, control.consumeAction());
 }
 
 test "stream input control supports ssh help and doubled tilde escapes" {

@@ -2154,9 +2154,9 @@ fn sessionDirSlice(session_agent: *const SessionAgent) []const u8 {
 }
 
 fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !void {
-    const exit_status: ?pb.TeExitStatus = switch (exit_info.kind) {
-        1 => .{ .kind = .TE_EXIT_STATUS_KIND_EXITED, .status = exit_info.status },
-        2 => .{ .kind = .TE_EXIT_STATUS_KIND_SIGNALLED, .status = exit_info.status },
+    const exit_status: ?pb.ExitStatus = switch (exit_info.kind) {
+        1 => .{ .kind = .EXIT_STATUS_KIND_EXITED, .status = exit_info.status },
+        2 => .{ .kind = .EXIT_STATUS_KIND_SIGNALLED, .status = exit_info.status },
         else => null,
     };
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionEnded{
@@ -3305,6 +3305,7 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
         .te_input => handleInputFrame(session_agent, attachment_index, frame.payload),
         .te_resize => handleResizeFrame(session_agent, attachment_index, frame.payload),
         .te_repaint_request => handleRepaintFrame(session_agent, attachment_index, frame.payload),
+        .pending_kill_request => handlePendingKillRequest(session_agent, attachment_index, frame.payload),
         .ping, .pong => {
             _ = protocol.handleTransportControlFrame(frame.message_type, frame.payload, attachment.fd) catch {
                 detachAttachment(session_agent, attachment_index);
@@ -3319,6 +3320,43 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
             closeAttachmentAfterFlush(session_agent, attachment_index);
         },
     }
+}
+
+fn handlePendingKillRequest(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
+    var request = protocol.decodePayload(pb.PendingKillRequest, app_allocator.allocator(), payload) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    defer request.deinit(app_allocator.allocator());
+
+    const attachment = &session_agent.attachments[attachment_index];
+    if (!attachment.active) return;
+    const session_index = attachment.session_index;
+    const session = &session_agent.sessions[session_index];
+    if (!session.alive or !std.mem.eql(u8, request.guid, session.idSlice())) {
+        sendPendingKillResponse(attachment, .{
+            .guid = request.guid,
+            .result = .{ .missing = .{} },
+        }) catch {
+            detachAttachment(session_agent, attachment_index);
+        };
+        return;
+    }
+    const ended_at_unix_ms = nowUnixMs();
+    sendPendingKillResponse(attachment, .{
+        .guid = request.guid,
+        .result = .{ .killed = .{ .ended_at_unix_ms = ended_at_unix_ms } },
+    }) catch {
+        detachAttachment(session_agent, attachment_index);
+        return;
+    };
+    endSession(session_agent, session_index, 1, .{ .ended_at_unix_ms = ended_at_unix_ms });
+}
+
+fn sendPendingKillResponse(attachment: *Attachment, response: pb.PendingKillResponse) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), response);
+    defer app_allocator.allocator().free(payload);
+    try queueAttachmentFrame(attachment, .pending_kill_response, payload);
 }
 
 fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {

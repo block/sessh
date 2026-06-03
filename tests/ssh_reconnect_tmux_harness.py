@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import json
 import shutil
 import shlex
 import stat
@@ -111,6 +112,25 @@ def run(env, args, **kwargs):
         stderr=subprocess.PIPE,
         check=True,
         **kwargs,
+    )
+
+
+def latest_remote_session_ref(env, host="test-host"):
+    guid_root = Path(env["XDG_STATE_HOME"]) / "sessh" / "guid"
+    routes = sorted(guid_root.glob("s-*/route.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for route_path in routes:
+        route = json.loads(route_path.read_text())
+        if route.get("host") == host and route.get("alive", False):
+            return route["guid"]
+    raise AssertionError(f"no live route found for host {host}")
+
+
+def sever_attached_clients(env, timeout=10.0):
+    session_ref = latest_remote_session_ref(env)
+    run(
+        env,
+        [str(MUX_BIN), "debug", "sever-connection", "--host", "test-host", "--all", session_ref],
+        timeout=timeout,
     )
 
 
@@ -249,7 +269,7 @@ def main():
         child_env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "1"
         config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
         config_dir.mkdir(parents=True, exist_ok=True)
-        (config_dir / "sessh.env").write_text("leader=CTRL-A\nscrollback-limit=321\n")
+        (config_dir / "sessh.env").write_text("scrollback-limit=321\n")
         sessh_wrapper = tmp / "run-sessh"
         sessh_wrapper.write_text(
             "#!/bin/sh\n"
@@ -289,7 +309,7 @@ def main():
                 raise AssertionError(f"REMOTE_TOP not found in pane:\n{before}")
             remote_top_index = before_lines.index("REMOTE_TOP")
 
-            run(env, [*TMUX_ARGS, "send-keys", "-t", session, "C-a", "s"])
+            sever_attached_clients(child_env)
             wait_capture(env, session, "sessh: disconnected: Retry connecting 10sec")
             wait_capture(env, session, "sessh: disconnected: Retry connecting 9sec", timeout=2.0)
             banner = capture_visible(env, session).splitlines()
@@ -332,7 +352,7 @@ def main():
             wait_capture(env, reconnect_detach_session, PROMPT)
             run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, sessh_cmd, "Enter"])
             wait_capture(env, reconnect_detach_session, "REMOTE_PROMPT$")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, "C-a", "s"])
+            sever_attached_clients(child_env)
             wait_capture(env, reconnect_detach_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, "C-c"])
             reconnect_detached = wait_capture(env, reconnect_detach_session, "sessh: detached", timeout=5.0)
@@ -367,7 +387,7 @@ def main():
             if bottom_remote_top_index < len(bottom_before_lines) - 3:
                 raise AssertionError(f"bottom regression did not place sessh near pane bottom:\n{bottom_before}")
 
-            run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_session, "C-a", "s"])
+            sever_attached_clients(child_env)
             wait_capture(env, bottom_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_session, "C-r"])
             wait_capture(env, bottom_session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=2.0)
@@ -406,7 +426,7 @@ def main():
                 raise AssertionError(f"REMOTE_TOP not found in bottom failure pane:\n{bottom_failure_before}")
 
             fail_batch_count_file.write_text("1\n")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, "C-a", "s"])
+            sever_attached_clients(child_env)
             wait_capture(env, bottom_failure_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, "C-r"])
             wait_capture(env, bottom_failure_session, "planned batch reconnect failure", timeout=6.0)
@@ -426,7 +446,7 @@ def main():
             wait_capture(env, idle_detach_session, PROMPT)
             run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, sessh_cmd, "Enter"])
             wait_capture(env, idle_detach_session, "REMOTE_PROMPT$")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "C-a", "d"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "Enter", "~d"])
             time.sleep(0.5)
             idle_after = capture(env, idle_detach_session)
             if (
@@ -448,7 +468,7 @@ def main():
             wait_capture(env, detach_session, "REMOTE_PROMPT$")
             run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, "spam", "Enter"])
             wait_capture(env, detach_session, "REMOTE_SPAM_")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, "C-a", "d"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, "Enter", "~d"])
             time.sleep(0.5)
             immediate_after_detach = capture_visible(env, detach_session)
             if "REMOTE_SPAM_" not in immediate_after_detach:
@@ -469,7 +489,7 @@ def main():
             wait_capture(env, alt_detach_session, "REMOTE_PROMPT$")
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "enter-alt", "Enter"])
             wait_capture(env, alt_detach_session, "ALT_SCREEN_READY")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "C-a", "d"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "Enter", "~d"])
             time.sleep(0.5)
             alt_after = capture_visible(env, alt_detach_session)
             if "ALT_SCREEN_READY" in alt_after:
@@ -485,7 +505,7 @@ def main():
             wait_capture(env, alt_reconnect_detach_session, "REMOTE_PROMPT$")
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, "enter-alt", "Enter"])
             wait_capture(env, alt_reconnect_detach_session, "ALT_SCREEN_READY")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, "C-a", "s"])
+            sever_attached_clients(child_env)
             wait_capture(env, alt_reconnect_detach_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, "C-c"])
             alt_reconnect_detached = wait_capture(env, alt_reconnect_detach_session, "sessh: detached", timeout=5.0)

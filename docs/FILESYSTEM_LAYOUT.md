@@ -82,3 +82,7 @@ Tombstones keep the display route, aliases that pointed at the session, end
 time, end reason, and exit or signal status when available. `sesshmux list`
 keeps them around for one week, which is long enough to answer "what happened
 to that session?" without turning state into a junk drawer.
+
+Queued remote cleanup lives beside tombstones under `pending/`. Each file is
+keyed by a hash of the ssh host string and contains the `s-` session and `p-`
+proxy stream GUIDs that should be killed the next time sessh reaches that host.

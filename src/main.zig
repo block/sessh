@@ -146,8 +146,9 @@ fn usage(code: u8, entrypoint: EntryPoint) !void {
         \\sessh wraps ssh, making sessions persistent and automatically
         \\reconnecting when ssh drops.
         \\
-        \\sessh changes the meaning of `ENTER ~ .`: It detaches the local client
-        \\but leaves the session running, printing the session ID to stderr.
+        \\sessh supports ssh-style escape controls. `ENTER ~ d` detaches the
+        \\local client and leaves the session running. `ENTER ~ .` requests
+        \\that the session be killed, then detaches immediately.
         \\After detach you may run one of the following:
         \\  sesshmux attach ID
         \\  sesshmux kill ID
@@ -233,8 +234,7 @@ fn sesshShortVersionRequested(args: []const []const u8, entrypoint: EntryPoint) 
 }
 
 fn sesshLongOptionConsumesValue(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--leader") or
-        std.mem.eql(u8, arg, "--scrollback-limit") or
+    return std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--alias") or
