@@ -5,14 +5,20 @@ const posix = std.posix;
 
 const client = @import("client.zig");
 const client_log = @import("client_log.zig");
+const proxy_control = @import("proxy_control.zig");
 const config = @import("config.zig");
 const io = @import("io.zig");
 const process_exit = @import("process_exit.zig");
 const protocol = @import("protocol.zig");
+const pty_process = @import("pty_process.zig");
 const reconnect = @import("reconnect.zig");
+const reconnect_control = @import("reconnect_control.zig");
+const reconnect_title = @import("reconnect_title.zig");
 const session_registry = @import("session_registry.zig");
+const socket_transport = @import("socket_transport.zig");
 const stream_agent = @import("stream_agent.zig");
 const terminal = @import("terminal.zig");
+const tty_settings = @import("tty_settings.zig");
 const tty_transcript = @import("tty_transcript.zig");
 const pb = protocol.pb;
 
@@ -182,6 +188,8 @@ const ParsedSshArgs = struct {
     terminal_emulator_set: bool = false,
     force_proxy_mode: bool = false,
     force_proxy_mode_set: bool = false,
+    connection_diagnostics: config.ConnectionDiagnostics = config.default_connection_diagnostics,
+    connection_diagnostics_set: bool = false,
     proxy_required: bool = false,
     default_ipqos_option: ?[]const u8 = null,
     capture_tty_transcript: ?[]const u8 = null,
@@ -1167,6 +1175,7 @@ fn sesshLongOptionRequiresValue(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--alias") or
+        std.mem.eql(u8, arg, "--connection-diagnostics") or
         std.mem.eql(u8, arg, "--capture-tty-transcript");
 }
 
@@ -1176,6 +1185,7 @@ fn sesshLongOptionMissingValueError(arg: []const u8) anyerror {
     if (std.mem.eql(u8, arg, "--initial-scrollback")) return error.MissingInitialScrollback;
     if (std.mem.eql(u8, arg, "--log-level")) return error.MissingClientLogLevel;
     if (std.mem.eql(u8, arg, "--alias")) return error.MissingAlias;
+    if (std.mem.eql(u8, arg, "--connection-diagnostics")) return error.MissingConnectionDiagnostics;
     if (std.mem.eql(u8, arg, "--capture-tty-transcript")) return error.MissingTtyTranscriptPath;
     return error.UnsupportedMuxOption;
 }
@@ -1547,7 +1557,10 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8, p
 
         const pending_input_at_disconnect = session.hasPendingInputAck();
         const pending_paste_like_input_at_disconnect = session.hasPendingPasteLikeInputAck();
-        var reconnect_ui = try client.ReconnectUi.begin(session.viewport_offset);
+        var reconnect_ui = try client.ReconnectUi.beginWithPresentation(
+            session.viewport_offset,
+            reconnectPresentationForDiagnostics(parsed_ssh_args.connection_diagnostics),
+        );
         var reconnect_ui_active = true;
         defer if (reconnect_ui_active) reconnect_ui.deinit();
 
@@ -1818,6 +1831,15 @@ fn finishReconnectUiForDetach(reconnect_ui: *client.ReconnectUi, active: *bool) 
     reconnect_ui.restoreTitleForDetach();
     reconnect_ui.deinit();
     active.* = false;
+}
+
+fn reconnectPresentationForDiagnostics(mode: config.ConnectionDiagnostics) client.ReconnectPresentation {
+    return switch (mode) {
+        .none => .none,
+        .unhygienic => .stderr_plain,
+        .hygienic => .title,
+        .overlay => .overlay,
+    };
 }
 
 fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshArgs, reason: CompatModeReason) !noreturn {
@@ -2381,6 +2403,9 @@ fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *ParsedSshArgs) !v
     }
     if (!parsed.force_proxy_mode_set) {
         if (file_config.force_proxy_mode) |enabled| parsed.force_proxy_mode = enabled;
+    }
+    if (!parsed.connection_diagnostics_set) {
+        if (file_config.connection_diagnostics) |mode| parsed.connection_diagnostics = mode;
     }
     if (!parsed.client_log_level_set) {
         if (file_config.client_log_level) |level| {
@@ -3228,12 +3253,12 @@ const StreamClientStarter = struct {
     }
 };
 
-fn proxyStreamReconnectStatusMode() stream_agent.StreamReconnectStatusMode {
-    // Proxy mode is a byte-clean ProxyCommand for an outer OpenSSH process.
-    // Status text written by the proxy can reach the user's terminal while the
-    // outer ssh has changed tty modes, which can leave staircased output behind.
-    // Keep proxy mode quiet by default; the outer ssh owns the visible session.
-    return .disabled;
+fn proxyStreamReconnectStatusMode(mode: config.ConnectionDiagnostics, has_client_socket: bool) stream_agent.StreamReconnectStatusMode {
+    return switch (mode) {
+        .none => .disabled,
+        .unhygienic => .stderr_plain,
+        .hygienic, .overlay => if (has_client_socket) .client_control else .stderr_plain,
+    };
 }
 
 fn shouldUseProxyStream(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
@@ -3250,7 +3275,36 @@ fn shouldUseProxyStream(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool
 // byte-clean stream to a remote stream agent, and the remote stream agent then
 // opens a TCP connection to sshd on the remote machine.
 fn runProxyStreamSsh(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_args: ParsedSshArgs) !noreturn {
-    const proxy_command_option = try proxyCommandOption(allocator, exe, parsed_ssh_args);
+    const diagnostics_plan = proxyDiagnosticsPlan(
+        parsed_ssh_args,
+        c.isatty(0) != 0,
+        c.isatty(1) != 0,
+    );
+    var client_socket_guid: ?[]u8 = null;
+    defer if (client_socket_guid) |guid| allocator.free(guid);
+    var client_socket_allocation: ?session_registry.SocketPathAllocation = null;
+    defer if (client_socket_allocation) |*allocation| allocation.deinit(allocator);
+    var client_socket_listen_fd: c.fd_t = -1;
+    defer if (client_socket_listen_fd >= 0) posix.close(client_socket_listen_fd);
+    if (diagnostics_plan.use_client_socket) {
+        const runtime_root = try socket_transport.runtimeRoot(allocator);
+        defer allocator.free(runtime_root);
+        client_socket_guid = try session_registry.generateProxyGuid(allocator);
+        client_socket_allocation = try session_registry.allocateClientSocketPathForGuidInRoot(allocator, runtime_root, client_socket_guid.?);
+        client_socket_listen_fd = try socket_transport.listenSocket(client_socket_allocation.?.path);
+    }
+    defer if (client_socket_allocation) |allocation| {
+        std.fs.deleteFileAbsolute(allocation.path) catch {};
+    };
+
+    const proxy_command_option = try proxyCommandOption(
+        allocator,
+        exe,
+        parsed_ssh_args,
+        if (client_socket_allocation) |allocation| allocation.path else null,
+        diagnostics_plan.command_mode,
+        diagnostics_plan.client_ctrl_r,
+    );
     defer allocator.free(proxy_command_option);
 
     const default_options = defaultSshOptionsLen(parsed_ssh_args);
@@ -3271,10 +3325,129 @@ fn runProxyStreamSsh(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_a
     index += 1;
     @memcpy(ssh_args[index..], parsed_ssh_args.shell_command_args);
 
+    if (diagnostics_plan.wrap_visible_ssh and client_socket_listen_fd >= 0) {
+        try runPlainSshArgvUnderLocalPty(allocator, ssh_args, client_socket_listen_fd, diagnostics_plan.client_ctrl_r, "proxy-stream");
+    }
+    if (diagnostics_plan.use_client_socket and client_socket_listen_fd >= 0) {
+        try runPlainSshArgvWithDiagnosticsThread(allocator, ssh_args, client_socket_listen_fd, "proxy-stream");
+    }
     try runPlainSshArgv(allocator, ssh_args, "proxy-stream");
 }
 
-fn proxyCommandOption(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_args: ParsedSshArgs) ![]u8 {
+const ProxyDiagnosticsPlan = struct {
+    command_mode: config.ConnectionDiagnostics,
+    use_client_socket: bool,
+    wrap_visible_ssh: bool,
+    client_ctrl_r: bool,
+};
+
+fn proxyDiagnosticsPlan(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool, stdout_is_tty: bool) ProxyDiagnosticsPlan {
+    return switch (parsed_ssh_args.connection_diagnostics) {
+        .none => .{
+            .command_mode = .none,
+            .use_client_socket = false,
+            .wrap_visible_ssh = false,
+            .client_ctrl_r = false,
+        },
+        .unhygienic => .{
+            .command_mode = .unhygienic,
+            .use_client_socket = false,
+            .wrap_visible_ssh = false,
+            .client_ctrl_r = false,
+        },
+        .hygienic, .overlay => blk: {
+            if (!stdout_is_tty) break :blk .{
+                .command_mode = .unhygienic,
+                .use_client_socket = false,
+                .wrap_visible_ssh = false,
+                .client_ctrl_r = false,
+            };
+            const wrap_visible_ssh = outerSshAllocatesTty(parsed_ssh_args, stdin_is_tty);
+            break :blk .{
+                .command_mode = .hygienic,
+                .use_client_socket = true,
+                .wrap_visible_ssh = wrap_visible_ssh,
+                .client_ctrl_r = wrap_visible_ssh and stdin_is_tty,
+            };
+        },
+    };
+}
+
+fn outerSshAllocatesTty(parsed_ssh_args: ParsedSshArgs, stdin_is_tty: bool) bool {
+    const explicit = explicitTtyRequest(parsed_ssh_args.options);
+    if (explicit) |request| return switch (request) {
+        .none => false,
+        .requested => stdin_is_tty,
+        .forced => true,
+    };
+    return switch (parsed_ssh_args.tty_request) {
+        .none => stdin_is_tty and parsed_ssh_args.shell_command_args.len == 0,
+        .requested => stdin_is_tty,
+        .forced => true,
+    };
+}
+
+fn explicitTtyRequest(options: []const []const u8) ?SshTtyRequest {
+    var result: ?SshTtyRequest = null;
+    var i: usize = 0;
+    while (i < options.len) {
+        const arg = options[i];
+        if (std.mem.startsWith(u8, arg, "--") or arg.len < 2 or arg[0] != '-') {
+            i += 1;
+            continue;
+        }
+        var pos: usize = 1;
+        while (pos < arg.len) {
+            const option = arg[pos];
+            if (option == 'T') {
+                result = .none;
+                pos += 1;
+                continue;
+            }
+            if (option == 't') {
+                if (result != null and result.? == .requested) {
+                    result = .forced;
+                } else if (result == null or result.? != .forced) {
+                    result = .requested;
+                }
+                pos += 1;
+                continue;
+            }
+            if (option == 'o') {
+                const value = optionValueFromOptions(options, i, pos) orelse return result;
+                if (sshConfigKeyIs(value, "RequestTTY")) {
+                    const key = sshConfigKey(value);
+                    if (sshConfigValueIs(value, key.len, "no")) {
+                        result = .none;
+                    } else if (sshConfigValueIs(value, key.len, "force")) {
+                        result = .forced;
+                    } else if (sshConfigValueIs(value, key.len, "yes")) {
+                        result = .requested;
+                    }
+                }
+                i = if (pos + 1 < arg.len) i + 1 else i + 2;
+                break;
+            }
+            if (sshOptionRequiresValue(option) or isUnsafeSshOptionWithValue(option) or isProxyRequiredSshOptionWithValue(option)) {
+                i = if (pos + 1 < arg.len) i + 1 else i + 2;
+                break;
+            }
+            pos += 1;
+        } else {
+            i += 1;
+        }
+    }
+    return result;
+}
+
+fn proxyCommandOption(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    parsed_ssh_args: ParsedSshArgs,
+    client_socket: ?[]const u8,
+    diagnostics_mode: config.ConnectionDiagnostics,
+    client_ctrl_r: bool,
+) ![]u8 {
     var command: std.ArrayList(u8) = .empty;
     defer command.deinit(allocator);
 
@@ -3286,6 +3459,14 @@ fn proxyCommandOption(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_
     try appendShellToken(allocator, &command, "%p");
     try appendShellToken(allocator, &command, "--user");
     try appendShellToken(allocator, &command, "%r");
+    try appendShellToken(allocator, &command, "--connection-diagnostics");
+    try appendShellToken(allocator, &command, diagnostics_mode.label());
+    if (client_socket) |path| {
+        try appendShellToken(allocator, &command, "--client-socket");
+        try appendShellToken(allocator, &command, path);
+        try appendShellToken(allocator, &command, "--client-ctrl-r");
+        try appendShellToken(allocator, &command, if (client_ctrl_r) "1" else "0");
+    }
     try appendProxyTransportSshOptions(allocator, &command, parsed_ssh_args.options);
 
     return std.fmt.allocPrint(allocator, "-oProxyCommand={s}", .{command.items});
@@ -3348,6 +3529,9 @@ const ProxyStreamInvocation = struct {
     host: []const u8,
     port: []const u8,
     user: []const u8 = "",
+    client_socket: ?[]const u8 = null,
+    connection_diagnostics: config.ConnectionDiagnostics = .none,
+    client_ctrl_r: bool = false,
     ssh_options: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *ProxyStreamInvocation, allocator: std.mem.Allocator) void {
@@ -3413,11 +3597,41 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
         .stderr_mode = .forward,
     };
 
+    var client_control_fd: c.fd_t = -1;
+    var proxy_control_output_mode: proxy_control.OutputMode = .none;
+    var proxy_control_ctrl_r_available = false;
+    if (invocation.client_socket) |path| {
+        client_control_fd = socket_transport.connectSocket(path) catch |err| blk: {
+            client_log.userDiagnosticInfo("proxy control socket unavailable: {t}", .{err});
+            break :blk -1;
+        };
+        if (client_control_fd >= 0) {
+            const capabilities = proxy_control.clientHandshake(allocator, client_control_fd) catch |err| blk: {
+                client_log.userDiagnosticInfo("proxy control unavailable: {t}", .{err});
+                posix.close(client_control_fd);
+                client_control_fd = -1;
+                break :blk null;
+            };
+            if (capabilities) |payload| {
+                proxy_control_output_mode = payload.output_mode;
+                proxy_control_ctrl_r_available = payload.ctrl_r_available;
+            }
+        }
+    }
+    defer if (client_control_fd >= 0) posix.close(client_control_fd);
+    const status_mode = proxyStreamReconnectStatusMode(
+        invocation.connection_diagnostics,
+        client_control_fd >= 0 and proxy_control_output_mode != .none,
+    );
+
     const exit_status = stream_agent.runLocalStream(allocator, &starter, .{
         .source_fd = 0,
         .sink_fd = 1,
-        .status_mode = proxyStreamReconnectStatusMode(),
+        .status_mode = status_mode,
         .intercept_ctrl_r = false,
+        .control_fd = client_control_fd,
+        .ctrl_r_status_enabled = proxy_control_ctrl_r_available and client_control_fd >= 0,
+        .proxy_control_output_mode = proxy_control_output_mode,
         .title_fallback = invocation.host,
     }) catch |err| {
         session_registry.removeOutgoingProxyHint(allocator, proxy_guid) catch |remove_err| {
@@ -3463,6 +3677,21 @@ fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []cons
             if (i >= args.len) return error.MissingSshOptionValue;
             try invocation.ssh_options.append(allocator, args[i]);
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--client-socket")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingClientSocket;
+            invocation.client_socket = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--connection-diagnostics")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingConnectionDiagnostics;
+            invocation.connection_diagnostics = try config.parseConnectionDiagnostics(args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--client-ctrl-r")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingClientCtrlR;
+            invocation.client_ctrl_r = parseProxyBool(args[i]) catch return error.InvalidClientCtrlR;
+            i += 1;
         } else {
             return error.InvalidProxyStreamArgs;
         }
@@ -3479,8 +3708,19 @@ fn printProxyStreamArgError(err: anyerror) !void {
         error.MissingProxyPort => try io.writeAll(2, "sessh: :internal-proxy-stream: requires --port PORT\n"),
         error.MissingProxyUser => try io.writeAll(2, "sessh: :internal-proxy-stream: --user requires a value\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: :internal-proxy-stream: --ssh-option requires a value\n"),
+        error.MissingClientSocket => try io.writeAll(2, "sessh: :internal-proxy-stream: --client-socket requires a path\n"),
+        error.MissingConnectionDiagnostics => try io.writeAll(2, "sessh: :internal-proxy-stream: --connection-diagnostics requires a value\n"),
+        error.InvalidConnectionDiagnostics => try io.writeAll(2, "sessh: :internal-proxy-stream: invalid connection diagnostics mode\n"),
+        error.MissingClientCtrlR => try io.writeAll(2, "sessh: :internal-proxy-stream: --client-ctrl-r requires a value\n"),
+        error.InvalidClientCtrlR => try io.writeAll(2, "sessh: :internal-proxy-stream: --client-ctrl-r must be 0 or 1\n"),
         else => try io.stderrPrint("sessh: invalid :internal-proxy-stream: arguments: {t}\n", .{err}),
     }
+}
+
+fn parseProxyBool(value: []const u8) !bool {
+    if (std.mem.eql(u8, value, "1")) return true;
+    if (std.mem.eql(u8, value, "0")) return false;
+    return error.InvalidBool;
 }
 
 fn encodeBase64Arg(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
@@ -3545,6 +3785,413 @@ fn runPlainSshFallback(allocator: std.mem.Allocator, parsed_ssh_args: ParsedSshA
 
     try runPlainSshArgv(allocator, ssh_argv, "plain-ssh-fallback");
 }
+
+const ProxyClientControl = struct {
+    const max_title_bytes = 128;
+    const max_status_bytes = 192;
+    const max_cleanup_title_bytes = 512;
+
+    control_fd: c.fd_t = -1,
+    title_tracker: stream_agent.TerminalTitleTracker = .{},
+    pending_title: [max_title_bytes]u8 = undefined,
+    pending_title_len: usize = 0,
+    status_line: [max_status_bytes]u8 = undefined,
+    status_line_len: usize = 0,
+    cleanup_title: [max_cleanup_title_bytes]u8 = [_]u8{0} ** max_cleanup_title_bytes,
+    cleanup_title_len: usize = 0,
+    title_visible: bool = false,
+    status_visible: bool = false,
+    intercept_requested: bool = false,
+    ctrl_r_allowed: bool = false,
+    output_mode: proxy_control.OutputMode = .update,
+    onscreen_status: bool = false,
+
+    fn init(allocator: std.mem.Allocator, ctrl_r_allowed: bool, onscreen_status: bool) ProxyClientControl {
+        var diagnostics = ProxyClientControl{
+            .ctrl_r_allowed = ctrl_r_allowed,
+            .onscreen_status = onscreen_status,
+        };
+        const cwd = std.process.getCwdAlloc(allocator) catch null;
+        if (cwd) |title| {
+            defer allocator.free(title);
+            diagnostics.cleanup_title_len = copyBytes(&diagnostics.cleanup_title, title);
+        }
+        return diagnostics;
+    }
+
+    fn setControlFd(self: *ProxyClientControl, fd: c.fd_t) void {
+        if (self.control_fd >= 0) posix.close(self.control_fd);
+        self.control_fd = fd;
+        proxy_control.serverHandshake(std.heap.smp_allocator, fd, .{
+            .output_mode = self.output_mode,
+            .ctrl_r_available = self.ctrl_r_allowed,
+        }) catch {
+            self.closeControl();
+            return;
+        };
+        setNonBlockingFd(fd) catch {};
+    }
+
+    fn closeControl(self: *ProxyClientControl) void {
+        if (self.control_fd >= 0) {
+            posix.close(self.control_fd);
+            self.control_fd = -1;
+        }
+    }
+
+    fn observeOutput(self: *ProxyClientControl, bytes: []const u8) void {
+        self.title_tracker.observe(bytes);
+        self.flushPendingTitle();
+    }
+
+    fn readControl(self: *ProxyClientControl) void {
+        if (self.control_fd < 0) return;
+        var message = proxy_control.readMessage(std.heap.smp_allocator, self.control_fd) catch {
+            self.closeControl();
+            return;
+        };
+        defer message.deinit(std.heap.smp_allocator);
+        self.handleMessage(message.message);
+    }
+
+    fn handleMessage(self: *ProxyClientControl, message: proxy_control.Message) void {
+        switch (message) {
+            .diagnostic => |diagnostic| self.handleDiagnostic(diagnostic),
+            .ctrl_r => {},
+        }
+    }
+
+    fn handleDiagnostic(self: *ProxyClientControl, diagnostic: proxy_control.Diagnostic) void {
+        if (diagnostic.update) |line| {
+            self.showUpdate(line);
+        } else if (diagnostic.diagnostic_line == null) {
+            self.clearUpdate();
+        }
+        if (diagnostic.diagnostic_line) |line| self.showDiagnostic(line);
+        self.intercept_requested = diagnostic.intercept_ctrl_r;
+    }
+
+    fn shouldInterceptCtrlR(self: *const ProxyClientControl) bool {
+        return self.ctrl_r_allowed and self.intercept_requested and self.control_fd >= 0;
+    }
+
+    fn sendCtrlR(self: *ProxyClientControl) void {
+        if (self.control_fd < 0) return;
+        proxy_control.writeCtrlR(self.control_fd) catch {};
+    }
+
+    fn showUpdate(self: *ProxyClientControl, line: []const u8) void {
+        self.showTitle(line);
+        self.showStatus(line);
+    }
+
+    fn showStatus(self: *ProxyClientControl, line: []const u8) void {
+        self.status_line_len = copyBytes(&self.status_line, line);
+        if (!self.onscreen_status) return;
+        self.status_visible = true;
+        self.redrawStatusLine();
+    }
+
+    fn showDiagnostic(self: *ProxyClientControl, line: []const u8) void {
+        if (!self.onscreen_status) return;
+        if (self.status_visible) io.writeAll(2, "\r\x1b[K") catch {};
+        io.writeAll(2, line) catch {};
+        io.writeAll(2, "\r\n") catch {};
+        if (self.status_visible) self.redrawStatusLine();
+    }
+
+    fn showTitle(self: *ProxyClientControl, title: []const u8) void {
+        self.pending_title_len = copyBytes(&self.pending_title, title);
+        self.flushPendingTitle();
+    }
+
+    fn flushPendingTitle(self: *ProxyClientControl) void {
+        if (self.pending_title_len == 0) return;
+        if (!self.title_tracker.safeForLocalTitle()) return;
+        reconnect_title.writeTitle(1, self.pending_title[0..self.pending_title_len]) catch return;
+        self.title_visible = true;
+        self.pending_title_len = 0;
+    }
+
+    fn clear(self: *ProxyClientControl) void {
+        self.intercept_requested = false;
+        self.clearUpdate();
+    }
+
+    fn clearUpdate(self: *ProxyClientControl) void {
+        self.pending_title_len = 0;
+        if (self.onscreen_status and self.status_visible) {
+            io.writeAll(2, "\r\x1b[K") catch {};
+            self.status_visible = false;
+        }
+        self.restoreTitle();
+    }
+
+    fn restoreTitle(self: *ProxyClientControl) void {
+        if (!self.title_visible) return;
+        const title = if (self.title_tracker.titlePresent())
+            self.title_tracker.titleSlice()
+        else
+            self.cleanup_title[0..self.cleanup_title_len];
+        reconnect_title.writeTitle(1, title) catch {};
+        self.title_visible = false;
+    }
+
+    fn redrawStatusLine(self: *ProxyClientControl) void {
+        if (!self.status_visible) return;
+        io.writeAll(2, "\r\x1b[K") catch {};
+        io.writeAll(2, self.status_line[0..self.status_line_len]) catch {};
+    }
+};
+
+fn copyBytes(dest: []u8, source: []const u8) usize {
+    const len = @min(dest.len, source.len);
+    @memcpy(dest[0..len], source[0..len]);
+    return len;
+}
+
+const DiagnosticsThreadState = struct {
+    listen_fd: c.fd_t,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn diagnosticsThreadMain(state: *DiagnosticsThreadState, allocator: std.mem.Allocator) void {
+    var diagnostics = ProxyClientControl.init(allocator, false, true);
+    defer {
+        diagnostics.clear();
+        diagnostics.closeControl();
+    }
+
+    while (!state.done.load(.acquire)) {
+        var pollfds: [2]posix.pollfd = undefined;
+        var count: usize = 0;
+        pollfds[count] = .{ .fd = state.listen_fd, .events = posix.POLL.IN, .revents = 0 };
+        count += 1;
+        var control_index: ?usize = null;
+        if (diagnostics.control_fd >= 0) {
+            control_index = count;
+            pollfds[count] = .{ .fd = diagnostics.control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+            count += 1;
+        }
+        _ = posix.poll(pollfds[0..count], 100) catch continue;
+        if ((pollfds[0].revents & posix.POLL.IN) != 0) {
+            const fd = c.accept(state.listen_fd, null, null);
+            if (fd >= 0) diagnostics.setControlFd(fd);
+        }
+        if (control_index) |index| {
+            if (pollfds[index].revents != 0) diagnostics.readControl();
+        }
+    }
+}
+
+fn runPlainSshArgvWithDiagnosticsThread(
+    allocator: std.mem.Allocator,
+    ssh_args: []const []const u8,
+    client_socket_listen_fd: c.fd_t,
+    diagnostic_name: []const u8,
+) !noreturn {
+    var state = DiagnosticsThreadState{ .listen_fd = client_socket_listen_fd };
+    const thread_allocator = std.heap.smp_allocator;
+    var thread = try std.Thread.spawn(.{}, diagnosticsThreadMain, .{ &state, thread_allocator });
+    var joined = false;
+    defer if (!joined) {
+        state.done.store(true, .release);
+        thread.join();
+    };
+
+    const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
+    defer allocator.free(ssh_argv);
+    ssh_argv[0] = "ssh";
+    @memcpy(ssh_argv[1..], ssh_args);
+
+    var child = std.process.Child.init(ssh_argv, allocator);
+    child.expand_arg0 = .expand;
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+
+    const term = try child.wait();
+    state.done.store(true, .release);
+    thread.join();
+    joined = true;
+    switch (term) {
+        .Exited => |code| return process_exit.request(code),
+        .Signal => |signal| {
+            try io.stderrPrint("sessh: {s} ended by signal {}\n", .{ diagnostic_name, signal });
+            return process_exit.request(255);
+        },
+        else => {
+            try io.stderrPrint("sessh: {s} ended unexpectedly: {t}\n", .{ diagnostic_name, term });
+            return process_exit.request(255);
+        },
+    }
+}
+
+fn runPlainSshArgvUnderLocalPty(
+    allocator: std.mem.Allocator,
+    ssh_args: []const []const u8,
+    client_socket_listen_fd: c.fd_t,
+    client_ctrl_r: bool,
+    diagnostic_name: []const u8,
+) !noreturn {
+    const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
+    defer allocator.free(ssh_argv);
+    ssh_argv[0] = "ssh";
+    @memcpy(ssh_argv[1..], ssh_args);
+
+    var size = terminal.currentWindowSize();
+    var captured_tty_settings: ?tty_settings.Settings = try tty_settings.capture(allocator, 0, .{});
+    defer if (captured_tty_settings) |*settings| settings.deinit(allocator);
+
+    var child = try pty_process.spawn(allocator, .{
+        .rows = size.rows,
+        .cols = size.cols,
+        .command_argv = ssh_argv,
+        .tty_settings = if (captured_tty_settings) |settings| settings else null,
+    });
+    defer child.terminate();
+
+    var mode_guard = try terminal.TerminalModeGuard.enable(0);
+    defer mode_guard.restore();
+
+    var stdin_flags_guard = try FdStatusFlagsGuard.setNonBlocking(0);
+    defer stdin_flags_guard.restore();
+    setNonBlockingFd(child.master_fd) catch {};
+
+    var diagnostics = ProxyClientControl.init(allocator, client_ctrl_r, false);
+    defer {
+        diagnostics.clear();
+        diagnostics.closeControl();
+    }
+
+    while (true) {
+        const current_size = terminal.currentWindowSize();
+        if (current_size.rows != size.rows or current_size.cols != size.cols) {
+            _ = terminal.setPtySize(child.master_fd, current_size.rows, current_size.cols);
+            size = current_size;
+        }
+
+        var pollfds: [3]posix.pollfd = undefined;
+        var count: usize = 0;
+        const pty_index = count;
+        pollfds[count] = .{ .fd = child.master_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+        count += 1;
+        const stdin_index = count;
+        pollfds[count] = .{ .fd = 0, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+        count += 1;
+        var control_index: ?usize = null;
+        const control_fd = if (diagnostics.control_fd >= 0) diagnostics.control_fd else client_socket_listen_fd;
+        control_index = count;
+        pollfds[count] = .{ .fd = control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+        count += 1;
+
+        _ = posix.poll(pollfds[0..count], -1) catch continue;
+
+        if ((pollfds[pty_index].revents & posix.POLL.IN) != 0) {
+            var buf: [8192]u8 = undefined;
+            switch (try pty_process.readMaster(child.master_fd, &buf)) {
+                .bytes => |bytes| {
+                    diagnostics.observeOutput(bytes);
+                    try io.writeAll(1, bytes);
+                },
+                .would_block => {},
+                .eof => {
+                    const term = child.wait();
+                    child.closeMaster();
+                    diagnostics.clear();
+                    return exitAfterPlainSshTerm(term, diagnostic_name);
+                },
+            }
+        }
+        if ((pollfds[pty_index].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfds[pty_index].revents & posix.POLL.IN) == 0)
+        {
+            const term = child.wait();
+            child.closeMaster();
+            diagnostics.clear();
+            return exitAfterPlainSshTerm(term, diagnostic_name);
+        }
+
+        if ((pollfds[stdin_index].revents & posix.POLL.IN) != 0) {
+            var input: [4096]u8 = undefined;
+            const n = c.read(0, &input, input.len);
+            if (n > 0) {
+                const bytes = input[0..@intCast(n)];
+                try writePtyInput(child.master_fd, bytes, &diagnostics);
+            }
+        }
+
+        if (control_index) |index| {
+            if (pollfds[index].revents != 0) {
+                if (diagnostics.control_fd >= 0) {
+                    diagnostics.readControl();
+                } else {
+                    const fd = c.accept(client_socket_listen_fd, null, null);
+                    if (fd >= 0) diagnostics.setControlFd(fd);
+                }
+            }
+        }
+    }
+}
+
+fn writePtyInput(pty_fd: c.fd_t, bytes: []const u8, diagnostics: *ProxyClientControl) !void {
+    if (!diagnostics.shouldInterceptCtrlR()) {
+        try io.writeAll(pty_fd, bytes);
+        return;
+    }
+    var start: usize = 0;
+    for (bytes, 0..) |byte, index| {
+        if (byte != reconnect_control.ctrl_r) continue;
+        if (index > start) try io.writeAll(pty_fd, bytes[start..index]);
+        diagnostics.sendCtrlR();
+        start = index + 1;
+    }
+    if (start < bytes.len) try io.writeAll(pty_fd, bytes[start..]);
+}
+
+fn exitAfterPlainSshTerm(term: std.process.Child.Term, diagnostic_name: []const u8) !noreturn {
+    switch (term) {
+        .Exited => |code| return process_exit.request(code),
+        .Signal => |signal| {
+            try io.stderrPrint("sessh: {s} ended by signal {}\n", .{ diagnostic_name, signal });
+            return process_exit.request(255);
+        },
+        else => {
+            try io.stderrPrint("sessh: {s} ended unexpectedly: {t}\n", .{ diagnostic_name, term });
+            return process_exit.request(255);
+        },
+    }
+}
+
+fn setNonBlockingFd(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
+    if ((flags & nonblocking_flag) != 0) return;
+    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
+}
+
+const FdStatusFlagsGuard = struct {
+    fd: c.fd_t,
+    original: c_int,
+    active: bool = false,
+
+    fn setNonBlocking(fd: c.fd_t) !FdStatusFlagsGuard {
+        const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+        if (flags < 0) return error.FcntlFailed;
+        const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
+        if ((flags & nonblocking_flag) != 0) return .{ .fd = fd, .original = flags };
+        if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
+        return .{ .fd = fd, .original = flags, .active = true };
+    }
+
+    fn restore(self: *FdStatusFlagsGuard) void {
+        if (!self.active) return;
+        _ = c.fcntl(self.fd, c.F.SETFL, self.original);
+        self.active = false;
+    }
+};
 
 fn runPlainSshArgv(allocator: std.mem.Allocator, ssh_args: []const []const u8, diagnostic_name: []const u8) !noreturn {
     const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
@@ -4044,6 +4691,12 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
             parsed.force_proxy_mode = false;
             parsed.force_proxy_mode_set = true;
             index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--connection-diagnostics")) {
+            index.* += 1;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingConnectionDiagnostics;
+            parsed.connection_diagnostics = try config.parseConnectionDiagnostics(args[index.*]);
+            parsed.connection_diagnostics_set = true;
+            index.* += 1;
         } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
             index.* += 1;
             if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingTtyTranscriptPath;
@@ -4236,6 +4889,14 @@ fn parseCommonSesshOptionAfterHost(args: []const []const u8, index: *usize, pars
         index.* += 1;
         return true;
     }
+    if (std.mem.eql(u8, arg, "--connection-diagnostics")) {
+        index.* += 1;
+        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingConnectionDiagnostics;
+        parsed.connection_diagnostics = try config.parseConnectionDiagnostics(args[index.*]);
+        parsed.connection_diagnostics_set = true;
+        index.* += 1;
+        return true;
+    }
     if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
         index.* += 1;
         if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingTtyTranscriptPath;
@@ -4410,6 +5071,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--no-terminal-emulator") or
         std.mem.eql(u8, arg, "--force-proxy-mode") or
         std.mem.eql(u8, arg, "--no-force-proxy-mode") or
+        std.mem.eql(u8, arg, "--connection-diagnostics") or
         std.mem.eql(u8, arg, "--ssh-options") or
         std.mem.eql(u8, arg, "--capture-tty-transcript") or
         std.mem.eql(u8, arg, "--refresh") or
@@ -4654,6 +5316,7 @@ fn printSshArgError(err: anyerror) !void {
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),
         error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
+        error.MissingConnectionDiagnostics => try io.writeAll(2, "sessh: --connection-diagnostics requires one of: none, unhygienic, hygienic, overlay\n"),
         error.MissingTtyTranscriptPath => try io.writeAll(2, "sessh: --capture-tty-transcript requires a path\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: ssh option is missing its value\n"),
         error.MissingSshOptions => try io.writeAll(2, "sesshmux: --ssh-options requires a value\n"),
@@ -4670,6 +5333,7 @@ fn printSshArgError(err: anyerror) !void {
         error.InvalidScrollbackRowCount => try io.writeAll(2, "sessh: invalid scrollback row count\n"),
         error.InvalidInitialScrollback => try io.writeAll(2, "sessh: invalid initial scrollback\n"),
         error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
+        error.InvalidConnectionDiagnostics => try io.writeAll(2, "sessh: invalid connection diagnostics mode; expected one of: none, unhygienic, hygienic, overlay\n"),
         error.InvalidAlias => try io.writeAll(2, "sessh: invalid alias\n"),
         error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
         error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands require -t or -tt for persistent sessions\n"),
@@ -5423,13 +6087,18 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     }, .{});
     try std.testing.expect(shouldUseProxyStream(parsed, true));
 
-    const option = try proxyCommandOption(std.testing.allocator, "sesshmux-dev", parsed);
+    const option = try proxyCommandOption(std.testing.allocator, "sesshmux-dev", parsed, "/tmp/sessh-test/c/abc", .hygienic, true);
     defer std.testing.allocator.free(option);
 
     try std.testing.expect(std.mem.indexOf(u8, option, ":internal-proxy-stream:") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%h") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%p") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "--connection-diagnostics") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "hygienic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "--client-socket") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "/tmp/sessh-test/c/abc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "--client-ctrl-r") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "BatchMode=yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "-v") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "ForwardAgent=yes") == null);
@@ -5973,8 +6642,80 @@ test "brokerArgsForAction uses broker subcommands" {
     }, &buf));
 }
 
-test "proxy stream reconnect status is disabled by default" {
-    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.disabled, proxyStreamReconnectStatusMode());
+test "proxy stream reconnect status follows diagnostics mode" {
+    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.disabled, proxyStreamReconnectStatusMode(.none, false));
+    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, proxyStreamReconnectStatusMode(.unhygienic, false));
+    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, proxyStreamReconnectStatusMode(.hygienic, false));
+    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.hygienic, true));
+    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.overlay, true));
+}
+
+test "terminal reconnect presentation follows diagnostics mode" {
+    try std.testing.expectEqual(client.ReconnectPresentation.none, reconnectPresentationForDiagnostics(.none));
+    try std.testing.expectEqual(client.ReconnectPresentation.stderr_plain, reconnectPresentationForDiagnostics(.unhygienic));
+    try std.testing.expectEqual(client.ReconnectPresentation.title, reconnectPresentationForDiagnostics(.hygienic));
+    try std.testing.expectEqual(client.ReconnectPresentation.overlay, reconnectPresentationForDiagnostics(.overlay));
+}
+
+test "proxy diagnostics plan maps overlay to hygienic client socket" {
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "--no-terminal-emulator",
+        "example.com",
+    }, .{});
+
+    const interactive = proxyDiagnosticsPlan(parsed, true, true);
+    try std.testing.expectEqual(config.ConnectionDiagnostics.hygienic, interactive.command_mode);
+    try std.testing.expect(interactive.use_client_socket);
+    try std.testing.expect(interactive.wrap_visible_ssh);
+    try std.testing.expect(interactive.client_ctrl_r);
+
+    const no_stdout = proxyDiagnosticsPlan(parsed, true, false);
+    try std.testing.expectEqual(config.ConnectionDiagnostics.unhygienic, no_stdout.command_mode);
+    try std.testing.expect(!no_stdout.use_client_socket);
+    try std.testing.expect(!no_stdout.wrap_visible_ssh);
+    try std.testing.expect(!no_stdout.client_ctrl_r);
+}
+
+test "proxy diagnostics plan honors quiet and unhygienic modes" {
+    const none = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "--connection-diagnostics",
+        "none",
+        "--no-terminal-emulator",
+        "example.com",
+    }, .{});
+    try std.testing.expectEqual(config.ConnectionDiagnostics.none, none.connection_diagnostics);
+    const none_plan = proxyDiagnosticsPlan(none, true, true);
+    try std.testing.expectEqual(config.ConnectionDiagnostics.none, none_plan.command_mode);
+    try std.testing.expect(!none_plan.use_client_socket);
+
+    const unhygienic = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "--connection-diagnostics",
+        "unhygienic",
+        "--no-terminal-emulator",
+        "example.com",
+    }, .{});
+    try std.testing.expectEqual(config.ConnectionDiagnostics.unhygienic, unhygienic.connection_diagnostics);
+    const noisy_plan = proxyDiagnosticsPlan(unhygienic, true, true);
+    try std.testing.expectEqual(config.ConnectionDiagnostics.unhygienic, noisy_plan.command_mode);
+    try std.testing.expect(!noisy_plan.use_client_socket);
+}
+
+test "proxy diagnostics plan disables ctrl-r when visible ssh is not wrapped" {
+    const parsed = try parseSshArgs(std.testing.allocator, &.{
+        "sessh",
+        "--force-proxy-mode",
+        "-T",
+        "example.com",
+    }, .{});
+
+    const plan = proxyDiagnosticsPlan(parsed, true, true);
+    try std.testing.expectEqual(config.ConnectionDiagnostics.hygienic, plan.command_mode);
+    try std.testing.expect(plan.use_client_socket);
+    try std.testing.expect(!plan.wrap_visible_ssh);
+    try std.testing.expect(!plan.client_ctrl_r);
 }
 
 test "parseSshArgs accepts translated persistent command argv after delimiter" {

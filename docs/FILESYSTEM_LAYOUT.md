@@ -31,8 +31,12 @@ platform-limited; for example, macOS `unix(4)` documents
 The actual agent socket path lives under `a/` followed by a compact
 representation of the guid (or random hex bytes if `XDG_RUNTIME_DIR` is too
 long to allow the full guid to fit). Both terminal-emulator session agents and
-proxy stream agents use this namespace. Future client-side sockets for local
-client-to-ProxyCommand coordination should live under `c/`.
+proxy stream agents use this namespace.
+
+Client-side sockets for local client-to-ProxyCommand coordination live under
+`c/` followed by the same compact-guid naming scheme. These sockets are owned
+by the local client process and are separate from remote agent sockets under
+`a/`.
 
 Runtime guid directories include small metadata files so `sesshmux list --all`
 can explain what each live guid represents. Local session directories use

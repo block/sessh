@@ -2512,7 +2512,7 @@ def test_ssh_terminal_emulator_release_artifact_restores_local_tty_on_exit(tmp):
         )
 
 
-def test_ssh_no_terminal_emulator_tty_uses_proxy_without_diagnostics(tmp):
+def test_ssh_no_terminal_emulator_tty_uses_proxy_with_hygienic_diagnostics(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2544,6 +2544,12 @@ def test_ssh_no_terminal_emulator_tty_uses_proxy_without_diagnostics(tmp):
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+    if "--connection-diagnostics" not in log_text or "hygienic" not in log_text:
+        raise AssertionError(log_text)
+    if "--client-socket" not in log_text or "/c/" not in log_text:
+        raise AssertionError(log_text)
+    if "--client-ctrl-r" not in log_text or ("'1'" not in log_text and " 1" not in log_text):
         raise AssertionError(log_text)
 
 
@@ -4801,8 +4807,8 @@ def main(argv=None):
             test_ssh_no_terminal_emulator_command_in_tty_uses_proxy_stream,
         ),
         (
-            "ssh no-terminal-emulator tty uses proxy without diagnostics",
-            test_ssh_no_terminal_emulator_tty_uses_proxy_without_diagnostics,
+            "ssh no-terminal-emulator tty uses proxy with hygienic diagnostics",
+            test_ssh_no_terminal_emulator_tty_uses_proxy_with_hygienic_diagnostics,
         ),
         (
             "ssh terminal-emulator tty escape doubled tilde",

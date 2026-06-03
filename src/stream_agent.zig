@@ -5,6 +5,7 @@ const posix = std.posix;
 const io = @import("io.zig");
 const protocol = @import("protocol.zig");
 const client_log = @import("client_log.zig");
+const proxy_control = @import("proxy_control.zig");
 const reconnect_control = @import("reconnect_control.zig");
 const reconnect = @import("reconnect.zig");
 const reconnect_title = @import("reconnect_title.zig");
@@ -29,6 +30,7 @@ pub const StreamReconnectStatusMode = enum {
     disabled,
     stderr_plain,
     title,
+    client_control,
 };
 
 pub const LocalStreamOptions = struct {
@@ -37,6 +39,10 @@ pub const LocalStreamOptions = struct {
     status_mode: StreamReconnectStatusMode,
     intercept_ctrl_r: bool,
     intercept_escape: bool = false,
+    control_fd: c.fd_t = -1,
+    status_fd: c.fd_t = -1,
+    ctrl_r_status_enabled: ?bool = null,
+    proxy_control_output_mode: proxy_control.OutputMode = .update,
     title_fallback: []const u8 = "",
 };
 
@@ -276,6 +282,8 @@ const StreamAttachmentOptions = struct {
     sources: [max_stream_sources]StreamSource = .{ .{}, .{} },
     sinks: [channel_count]ChannelSink = .{ .{}, .{}, .{} },
     reconnect_status: ?*StreamReconnectStatus = null,
+    control_fd: c.fd_t = -1,
+    control_input: ?*StreamInputControl = null,
     replacement_listen_fd: ?c.fd_t = null,
     close_outbound_on_inbound_eof: bool = false,
 
@@ -433,7 +441,7 @@ const StreamAttachment = struct {
         if (state.complete()) return .complete;
 
         const now_before_poll_ms = nowMillis();
-        var pollfds: [1 + max_stream_sources + 1 + 2]posix.pollfd = undefined;
+        var pollfds: [1 + max_stream_sources + 1 + 3]posix.pollfd = undefined;
         var count: usize = 0;
         const transport_index = count;
         pollfds[count] = .{ .fd = self.transport_read_fd, .events = posix.POLL.IN, .revents = 0 };
@@ -462,6 +470,12 @@ const StreamAttachment = struct {
         if (self.external_wakeup_fd >= 0) {
             external_wakeup_index = count;
             pollfds[count] = .{ .fd = self.external_wakeup_fd, .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
+        }
+        var control_index: ?usize = null;
+        if (self.options.control_fd >= 0 and self.options.control_input != null) {
+            control_index = count;
+            pollfds[count] = .{ .fd = self.options.control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
             count += 1;
         }
         var interrupt_index: ?usize = null;
@@ -493,6 +507,13 @@ const StreamAttachment = struct {
         }
         if (interrupt_index) |index| {
             if (pollfds[index].revents != 0) return .interrupted;
+        }
+        if (control_index) |index| {
+            if (pollfds[index].revents != 0) {
+                if (self.options.control_input) |control| {
+                    if (!readControlInput(self.options.control_fd, control)) self.options.control_fd = -1;
+                }
+            }
         }
 
         if ((pollfds[transport_index].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
@@ -1025,6 +1046,8 @@ pub fn runLocalStream(
     const Starter = @TypeOf(start_transport);
     const Transport = @TypeOf(start_transport.start() catch unreachable);
     const Pending = PendingReplacement(Starter, Transport);
+    var control_fd = options.control_fd;
+    if (control_fd >= 0) setNonBlockingFd(control_fd) catch {};
 
     var state = StreamState.init(
         allocator,
@@ -1036,7 +1059,15 @@ pub fn runLocalStream(
         .enabled = options.intercept_ctrl_r,
         .escape_enabled = options.intercept_escape,
     };
-    var reconnect_status = StreamReconnectStatus.init(options.status_mode, options.intercept_ctrl_r, options.title_fallback);
+    const ctrl_r_status_enabled = options.ctrl_r_status_enabled orelse options.intercept_ctrl_r;
+    const status_fd = if (options.status_fd >= 0) options.status_fd else control_fd;
+    var reconnect_status = StreamReconnectStatus.init(
+        options.status_mode,
+        ctrl_r_status_enabled,
+        options.title_fallback,
+        status_fd,
+        options.proxy_control_output_mode,
+    );
     defer reconnect_status.deinit();
     var local_interrupt = try LocalStreamInterrupt.install();
     defer local_interrupt.deinit();
@@ -1065,7 +1096,7 @@ pub fn runLocalStream(
                     return err;
                 }
                 const delay_ms = reconnect.delayMs(attempt);
-                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control, &local_interrupt);
+                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
                 if (action == .disconnect) return 0;
                 if (action == .interrupt) return 255;
                 attempt = reconnect.nextAttempt(attempt, action == .reconnect);
@@ -1095,6 +1126,8 @@ pub fn runLocalStream(
                     },
                     .sinks = localStreamSinks(options.sink_fd),
                     .reconnect_status = &reconnect_status,
+                    .control_fd = control_fd,
+                    .control_input = &input_control,
                     // Once the remote side closes its output stream there is
                     // no peer left to consume local input, so close the local
                     // outbound side too.
@@ -1133,7 +1166,7 @@ pub fn runLocalStream(
                             pending = Pending.start(allocator, start_transport) catch |err| {
                                 client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                                 const delay_ms = reconnect.delayMs(attempt);
-                                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control, &local_interrupt);
+                                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
                                 if (action == .disconnect) return 0;
                                 if (action == .interrupt) return 255;
                                 attempt = reconnect.nextAttempt(attempt, action == .reconnect);
@@ -1196,7 +1229,7 @@ pub fn runLocalStream(
                                 client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                                 if (old_unresponsive) {
                                     const delay_ms = reconnect.delayMs(attempt);
-                                    const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control, &local_interrupt);
+                                    const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
                                     if (action == .disconnect) return 0;
                                     if (action == .interrupt) return 255;
                                     attempt = reconnect.nextAttempt(attempt, action == .reconnect);
@@ -1220,7 +1253,7 @@ pub fn runLocalStream(
                 if (result != null) break;
                 reconnect_status.showReconnecting();
                 input_control.status_visible = true;
-                var pollfds: [3]posix.pollfd = undefined;
+                var pollfds: [4]posix.pollfd = undefined;
                 var count: usize = 0;
                 pollfds[count] = .{ .fd = replacement.notifyFd(), .events = posix.POLL.IN, .revents = 0 };
                 count += 1;
@@ -1231,6 +1264,12 @@ pub fn runLocalStream(
                 if (reconnectInputPollEnabled(&input_control)) {
                     input_index = count;
                     pollfds[count] = .{ .fd = options.source_fd, .events = posix.POLL.IN, .revents = 0 };
+                    count += 1;
+                }
+                var control_index: ?usize = null;
+                if (control_fd >= 0) {
+                    control_index = count;
+                    pollfds[count] = .{ .fd = control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
                     count += 1;
                 }
 
@@ -1247,6 +1286,11 @@ pub fn runLocalStream(
                             .none, .reconnect => {},
                             .interrupt => unreachable,
                         }
+                    }
+                }
+                if (control_index) |index| {
+                    if (pollfds[index].revents != 0) {
+                        if (!readControlInput(control_fd, &input_control)) control_fd = -1;
                     }
                 }
                 reconnect_status.flushDiagnostics();
@@ -1266,7 +1310,7 @@ pub fn runLocalStream(
             }
         }
         const delay_ms = reconnect.delayMs(attempt);
-        const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &input_control, &local_interrupt);
+        const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
         if (action == .disconnect) return 0;
         if (action == .interrupt) return 255;
         attempt = reconnect.nextAttempt(attempt, action == .reconnect);
@@ -1741,6 +1785,7 @@ fn waitBeforeReconnect(
     delay_ms: u64,
     state: *StreamState,
     source_fd: c.fd_t,
+    control_fd: *c.fd_t,
     input_control: *StreamInputControl,
     interrupt: ?*LocalStreamInterrupt,
 ) StreamControlAction {
@@ -1749,7 +1794,7 @@ fn waitBeforeReconnect(
         status.showRetry(remaining_ms);
         input_control.status_visible = true;
         const step_ms = @min(remaining_ms, 1_000);
-        const action = pollReconnectInput(state, source_fd, input_control, interrupt, @intCast(step_ms));
+        const action = pollReconnectInput(state, source_fd, control_fd, input_control, interrupt, @intCast(step_ms));
         if (action == .help) {
             status.showEscapeHelp();
             continue;
@@ -1769,11 +1814,12 @@ fn waitBeforeReconnect(
 fn pollReconnectInput(
     state: *StreamState,
     source_fd: c.fd_t,
+    control_fd: *c.fd_t,
     input_control: *StreamInputControl,
     interrupt: ?*LocalStreamInterrupt,
     timeout_ms: i32,
 ) StreamControlAction {
-    var pollfds: [2]posix.pollfd = undefined;
+    var pollfds: [3]posix.pollfd = undefined;
     var count: usize = 0;
     var interrupt_index: ?usize = null;
     if (interrupt) |local_interrupt| {
@@ -1787,6 +1833,12 @@ fn pollReconnectInput(
     if (reconnectInputPollEnabled(input_control)) {
         input_index = count;
         pollfds[count] = .{ .fd = source_fd, .events = posix.POLL.IN, .revents = 0 };
+        count += 1;
+    }
+    var control_index: ?usize = null;
+    if (control_fd.* >= 0) {
+        control_index = count;
+        pollfds[count] = .{ .fd = control_fd.*, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
         count += 1;
     }
 
@@ -1805,6 +1857,11 @@ fn pollReconnectInput(
     if (input_index) |index| {
         if (pollfds[index].revents != 0) {
             return readReconnectInput(state, source_fd, input_control);
+        }
+    }
+    if (control_index) |index| {
+        if (pollfds[index].revents != 0) {
+            if (!readControlInput(control_fd.*, input_control)) control_fd.* = -1;
         }
     }
     return input_control.consumeAction();
@@ -1831,7 +1888,18 @@ fn readReconnectInput(
     return input_control.consumeAction();
 }
 
-const TerminalTitleTracker = struct {
+fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl) bool {
+    if (control_fd < 0) return false;
+    var message = proxy_control.readMessage(std.heap.smp_allocator, control_fd) catch return false;
+    defer message.deinit(std.heap.smp_allocator);
+    switch (message.message) {
+        .ctrl_r => input_control.reconnect_requested = true,
+        else => {},
+    }
+    return true;
+}
+
+pub const TerminalTitleTracker = struct {
     const max_title_bytes = 512;
     const State = enum {
         ground,
@@ -1857,11 +1925,11 @@ const TerminalTitleTracker = struct {
     csi_len: usize = 0,
     synchronized_update_active: bool = false,
 
-    fn observe(self: *TerminalTitleTracker, bytes: []const u8) void {
+    pub fn observe(self: *TerminalTitleTracker, bytes: []const u8) void {
         for (bytes) |byte| self.observeByte(byte);
     }
 
-    fn safeForLocalTitle(self: *const TerminalTitleTracker) bool {
+    pub fn safeForLocalTitle(self: *const TerminalTitleTracker) bool {
         // A finished `CSI ? 2026 h` leaves the parser in ground state, but the
         // terminal is still inside a synchronized update. Title changes made
         // there can be held back by the terminal until the matching `l`, so the
@@ -1869,11 +1937,11 @@ const TerminalTitleTracker = struct {
         return self.state == .ground and !self.synchronized_update_active;
     }
 
-    fn titlePresent(self: *const TerminalTitleTracker) bool {
+    pub fn titlePresent(self: *const TerminalTitleTracker) bool {
         return self.title_present;
     }
 
-    fn titleSlice(self: *const TerminalTitleTracker) []const u8 {
+    pub fn titleSlice(self: *const TerminalTitleTracker) []const u8 {
         return self.title[0..self.title_len];
     }
 
@@ -1995,21 +2063,30 @@ const StreamReconnectStatus = struct {
     diagnostic_cursor: u64,
     live_diagnostic_start_seq: u64,
     rendered_diagnostic_seq: u64,
+    proxy_control_output_mode: proxy_control.OutputMode = .update,
+    proxy_control_retry_line_visible: bool = false,
     title_visible: bool = false,
     escape_help_pending: bool = false,
     title_tracker: TerminalTitleTracker = .{},
     title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
     title_fallback_len: usize = 0,
 
-    fn init(mode: StreamReconnectStatusMode, ctrl_r_enabled: bool, title_fallback: []const u8) StreamReconnectStatus {
+    fn init(
+        mode: StreamReconnectStatusMode,
+        ctrl_r_enabled: bool,
+        title_fallback: []const u8,
+        status_fd: c.fd_t,
+        proxy_control_output_mode: proxy_control.OutputMode,
+    ) StreamReconnectStatus {
         const displayed = client_log.displayedUserDiagnosticSeq();
         var status = StreamReconnectStatus{
-            .fd = if (mode == .title) 1 else 2,
+            .fd = if (status_fd >= 0) status_fd else if (mode == .title) 1 else 2,
             .mode = mode,
             .ctrl_r_enabled = ctrl_r_enabled,
             .diagnostic_cursor = displayed,
             .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
             .rendered_diagnostic_seq = displayed,
+            .proxy_control_output_mode = proxy_control_output_mode,
         };
         status.title_fallback_len = copyTitle(&status.title_fallback, title_fallback);
         return status;
@@ -2042,6 +2119,7 @@ const StreamReconnectStatus = struct {
         self.refreshDiagnostics();
         self.writeTitleRetry(delay_ms);
         self.writePlainStatusLine();
+        self.writeClientRetry(delay_ms);
     }
 
     fn showReconnecting(self: *StreamReconnectStatus) void {
@@ -2054,11 +2132,13 @@ const StreamReconnectStatus = struct {
         self.refreshDiagnostics();
         self.writeTitleReconnecting();
         self.writePlainStatusLine();
+        self.writeClientReconnecting();
     }
 
     fn clear(self: *StreamReconnectStatus) void {
         self.refreshDiagnostics();
         self.restoreTitle();
+        self.writeClientClear();
     }
 
     fn flushDiagnostics(self: *StreamReconnectStatus) void {
@@ -2078,6 +2158,7 @@ const StreamReconnectStatus = struct {
                 self.writeEscapeHelpText();
             },
             .stderr_plain => self.writeEscapeHelpText(),
+            .client_control => {},
             .disabled => {},
         }
     }
@@ -2086,7 +2167,7 @@ const StreamReconnectStatus = struct {
         if (self.mode != .stderr_plain) return;
         const message = self.line[0..self.line_len];
         io.writeAll(self.fd, message) catch return;
-        io.writeAll(self.fd, "\n") catch return;
+        io.writeAll(self.fd, "\r\n") catch return;
     }
 
     fn writeTitleRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
@@ -2107,6 +2188,55 @@ const StreamReconnectStatus = struct {
             reconnect_title.writeReconnectingTitle(self.fd) catch return;
         }
         self.title_visible = true;
+    }
+
+    fn writeClientRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
+        if (self.mode != .client_control or self.fd < 0) return;
+        switch (self.proxy_control_output_mode) {
+            .update => proxy_control.writeDiagnostic(self.fd, .{
+                .update = self.line[0..self.line_len],
+                .intercept_ctrl_r = self.ctrl_r_enabled,
+            }) catch return,
+            .diagnostic_line => {
+                if (self.proxy_control_retry_line_visible) return;
+                var line_buf: [160]u8 = undefined;
+                const line = std.fmt.bufPrint(
+                    &line_buf,
+                    "{s} (retry_at_unix_ms={})",
+                    .{ self.line[0..self.line_len], nowMillis() + delay_ms },
+                ) catch self.line[0..self.line_len];
+                proxy_control.writeDiagnostic(self.fd, .{
+                    .diagnostic_line = line,
+                    .intercept_ctrl_r = self.ctrl_r_enabled,
+                }) catch return;
+                self.proxy_control_retry_line_visible = true;
+            },
+            .none => {},
+        }
+    }
+
+    fn writeClientReconnecting(self: *StreamReconnectStatus) void {
+        if (self.mode != .client_control or self.fd < 0) return;
+        self.proxy_control_retry_line_visible = false;
+        switch (self.proxy_control_output_mode) {
+            .update => proxy_control.writeDiagnostic(self.fd, .{
+                .update = self.line[0..self.line_len],
+                .intercept_ctrl_r = self.ctrl_r_enabled,
+            }) catch return,
+            .diagnostic_line => proxy_control.writeDiagnostic(self.fd, .{
+                .diagnostic_line = self.line[0..self.line_len],
+                .intercept_ctrl_r = self.ctrl_r_enabled,
+            }) catch return,
+            .none => {},
+        }
+    }
+
+    fn writeClientClear(self: *StreamReconnectStatus) void {
+        if (self.mode != .client_control or self.fd < 0) return;
+        self.proxy_control_retry_line_visible = false;
+        proxy_control.writeDiagnostic(self.fd, .{
+            .intercept_ctrl_r = false,
+        }) catch return;
     }
 
     fn canWriteTitle(self: *const StreamReconnectStatus) bool {
@@ -2130,7 +2260,7 @@ const StreamReconnectStatus = struct {
     }
 
     fn refreshDiagnostics(self: *StreamReconnectStatus) void {
-        if (self.mode != .stderr_plain) return;
+        if (self.mode != .stderr_plain and self.mode != .client_control) return;
         if (client_log.currentUserDiagnosticSeq() == self.rendered_diagnostic_seq) return;
 
         var diagnostics = [_]client_log.UserDiagnosticLine{.{}} ** max_diagnostic_lines;
@@ -2149,8 +2279,17 @@ const StreamReconnectStatus = struct {
                 diagnostic,
                 diagnostic.seq <= self.live_diagnostic_start_seq,
             ) catch continue;
-            io.writeAll(self.fd, line) catch return;
-            io.writeAll(self.fd, "\r\n") catch return;
+            switch (self.mode) {
+                .stderr_plain => {
+                    io.writeAll(self.fd, line) catch return;
+                    io.writeAll(self.fd, "\r\n") catch return;
+                },
+                .client_control => proxy_control.writeDiagnostic(self.fd, .{
+                    .diagnostic_line = line,
+                    .intercept_ctrl_r = self.ctrl_r_enabled,
+                }) catch return,
+                .title, .disabled => unreachable,
+            }
         }
 
         self.diagnostic_cursor = new_cursor;
@@ -2545,8 +2684,8 @@ test "stream reconnect status uses plain stderr lines" {
     }
 
     try std.testing.expectEqualStrings(
-        "sessh: disconnected: Retry connecting 1sec\n" ++
-            "sessh: disconnected: Reconnecting...\n",
+        "sessh: disconnected: Retry connecting 1sec\r\n" ++
+            "sessh: disconnected: Reconnecting...\r\n",
         output.items,
     );
 }
@@ -2565,6 +2704,94 @@ test "disabled stream reconnect status emits no UI" {
     var buf: [16]u8 = undefined;
     const n = try posix.read(fds[0], &buf);
     try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "stream reconnect status emits client control messages" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var status = StreamReconnectStatus.initForTest(fds[1], .client_control, true, "");
+    status.showRetry(1_000);
+    status.showReconnecting();
+    status.clear();
+    posix.close(fds[1]);
+
+    var saw_retry_update = false;
+    var saw_reconnecting_update = false;
+    var saw_intercept_enabled = false;
+    var saw_intercept_disabled = false;
+    var saw_clear = false;
+    while (true) {
+        var message = proxy_control.readMessage(std.testing.allocator, fds[0]) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        defer message.deinit(std.testing.allocator);
+
+        switch (message.message) {
+            .diagnostic => |diagnostic| {
+                if (diagnostic.update) |line| {
+                    if (std.mem.eql(u8, line, "sessh: disconnected: Retry connecting 1sec. CTRL-R now")) saw_retry_update = true;
+                    if (std.mem.eql(u8, line, "sessh: disconnected: Reconnecting... CTRL-R now")) saw_reconnecting_update = true;
+                } else if (diagnostic.diagnostic_line == null) {
+                    saw_clear = true;
+                }
+                if (diagnostic.intercept_ctrl_r) {
+                    saw_intercept_enabled = true;
+                } else {
+                    saw_intercept_disabled = true;
+                }
+            },
+            .ctrl_r => {},
+        }
+    }
+
+    try std.testing.expect(saw_retry_update);
+    try std.testing.expect(saw_reconnecting_update);
+    try std.testing.expect(saw_intercept_enabled);
+    try std.testing.expect(saw_clear);
+    try std.testing.expect(saw_intercept_disabled);
+}
+
+test "stream reconnect status emits infrequent diagnostic lines for proxy control" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var status = StreamReconnectStatus.initForTest(fds[1], .client_control, true, "");
+    status.proxy_control_output_mode = .diagnostic_line;
+    status.showRetry(10_000);
+    status.showRetry(9_000);
+    status.showReconnecting();
+    status.clear();
+    posix.close(fds[1]);
+
+    var retry_lines: usize = 0;
+    var reconnecting_lines: usize = 0;
+    while (true) {
+        var message = proxy_control.readMessage(std.testing.allocator, fds[0]) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        defer message.deinit(std.testing.allocator);
+
+        switch (message.message) {
+            .diagnostic => |diagnostic| {
+                try std.testing.expectEqual(@as(?[]const u8, null), diagnostic.update);
+                if (diagnostic.diagnostic_line) |line| {
+                    if (std.mem.startsWith(u8, line, "sessh: disconnected: Retry connecting 10sec. CTRL-R now (retry_at_unix_ms=")) {
+                        retry_lines += 1;
+                    }
+                    if (std.mem.eql(u8, line, "sessh: disconnected: Reconnecting... CTRL-R now")) {
+                        reconnecting_lines += 1;
+                    }
+                }
+            },
+            .ctrl_r => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), retry_lines);
+    try std.testing.expectEqual(@as(usize, 1), reconnecting_lines);
 }
 
 test "stream reconnect status restores tracked application title" {
@@ -2713,7 +2940,7 @@ test "stream reconnect status renders ssh diagnostics before status" {
 
     try std.testing.expectEqualStrings(
         "ssh: control sequence: ?[31mred\r\n" ++
-            "sessh: disconnected: Retry connecting 1sec\n",
+            "sessh: disconnected: Retry connecting 1sec\r\n",
         output.items,
     );
 }
@@ -2740,7 +2967,7 @@ test "stream reconnect status appends diagnostics after status line" {
     }
 
     try std.testing.expectEqualStrings(
-        "sessh: disconnected: Retry connecting 1sec\n" ++
+        "sessh: disconnected: Retry connecting 1sec\r\n" ++
             "ssh: connection failed\r\n",
         output.items,
     );

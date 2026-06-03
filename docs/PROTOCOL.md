@@ -5,6 +5,13 @@ The handshake uses `HelloFrame`, whose `oneof` carries only `HelloRequest`,
 `HelloOk`, or `Error`. Once both sides have accepted the handshake, all
 subsequent frames use the versioned `Frame` envelope from `sessh.proto`.
 
+Local proxy-control sockets under `c/` use the same `HelloFrame` handshake and
+length-prefixed `Frame` envelope. Immediately after the handshake, the visible
+local client sends `ProxyControlCapabilities` so the ProxyCommand process knows
+which diagnostic output shape and CTRL-R behavior are available. The
+ProxyCommand process then sends `ProxyControlDiagnostic` messages, and the
+visible client sends `ProxyControlCtrlR` when it intercepts CTRL-R.
+
 The `HelloFrame`/`Frame` separation is designed to allow us maximum protocol
 flexibility in the future. We could migrate off of protobuf for everything past
 `HelloOk` while still emitting clean `Error` responses for incompatible
@@ -21,7 +28,7 @@ Like normal `ssh` PTY handling, we:
 Our client has 4 additional capabilities:
 1. It tracks sufficient state so that it can seamlessly reconnect
 2. It avoids executing stale rendering operations while resizing
-2. It can render banners independently of the remote
+2. It can render overlays independently of the remote
 3. It can cleanup TTY state independently of the remote
 
 We are able to implement these 4 additional capabilities with minimal client
@@ -64,16 +71,16 @@ rendering operations that were generated for a different sized window.
 agent answers an unknown offset by aligning the viewport in the repaint
 response.
 
-## Client-side banner rendering
+## Client-side overlay rendering
 
-We allow for the possibility of the client to render banners independently of
-the remote, but the client doesn't have the ability to remove the banners by
-itself. It can redraw a different banner, but the only way it can remove a
-banner is by asking the remote to repaint. After requesting repaint, the client
+We allow for the possibility of the client to render overlays independently of
+the remote, but the client doesn't have the ability to remove the overlays by
+itself. It can redraw a different overlay, but the only way it can remove an
+overlay is by asking the remote to repaint. After requesting repaint, the client
 ignores subsequent `TeDraw` packets up until the matching `TeRepaintResponse` so that
-the banner doesn't end up in the outer terminal's scrollback.
+the overlay doesn't end up in the outer terminal's scrollback.
 
-The client uses banners to notify the user when the connection has died or
+The client uses overlays to notify the user when the connection has died or
 become unresponsive.
 
 ## TeInput acknowledgements

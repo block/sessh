@@ -38,7 +38,7 @@ pub const TeTtyTranscriptStream = enum(i32) {
     _,
 };
 
-/// Versioned remote protocol payloads.
+/// Versioned sessh protocol payloads.
 ///
 /// The stable handshake payloads live in sessh_handshake.proto. After both
 /// sides accept the handshake, this file's messages are governed by
@@ -82,6 +82,9 @@ pub const Frame = struct {
         proxy_stream_ack,
         proxy_stream_eof,
         proxy_stream_eof_ack,
+        proxy_control_capabilities,
+        proxy_control_diagnostic,
+        proxy_control_ctrl_r,
     };
     pub const payload_union = union(_payload_case) {
         @"error": sessh_handshake_v1.Error,
@@ -113,6 +116,9 @@ pub const Frame = struct {
         proxy_stream_ack: ProxyStreamAck,
         proxy_stream_eof: ProxyStreamEof,
         proxy_stream_eof_ack: ProxyStreamEofAck,
+        proxy_control_capabilities: ProxyControlCapabilities,
+        proxy_control_diagnostic: ProxyControlDiagnostic,
+        proxy_control_ctrl_r: ProxyControlCtrlR,
         pub const _desc_table = .{
             .@"error" = fd(10, .submessage),
             .te_session_create = fd(11, .submessage),
@@ -143,6 +149,9 @@ pub const Frame = struct {
             .proxy_stream_ack = fd(45, .submessage),
             .proxy_stream_eof = fd(46, .submessage),
             .proxy_stream_eof_ack = fd(47, .submessage),
+            .proxy_control_capabilities = fd(48, .submessage),
+            .proxy_control_diagnostic = fd(49, .submessage),
+            .proxy_control_ctrl_r = fd(50, .submessage),
         };
     };
 
@@ -488,6 +497,227 @@ pub const ProxyStreamEofAck = struct {
     pub const _desc_table = .{
         .offset = fd(1, .{ .scalar = .uint64 }),
     };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, visible client -> ProxyCommand process.
+///
+/// Sent immediately after the local `c/` socket's normal HelloFrame handshake so
+/// the ProxyCommand process can choose the right diagnostic stream shape.
+pub const ProxyControlCapabilities = struct {
+    output_mode: ProxyControlCapabilities.OutputMode = @enumFromInt(0),
+    ctrl_r_available: bool = false,
+
+    pub const _desc_table = .{
+        .output_mode = fd(1, .@"enum"),
+        .ctrl_r_available = fd(2, .{ .scalar = .bool }),
+    };
+
+    pub const OutputMode = enum(i32) {
+        OUTPUT_MODE_NONE = 0,
+        OUTPUT_MODE_UPDATE = 1,
+        OUTPUT_MODE_DIAGNOSTIC_LINE = 2,
+        _,
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, ProxyCommand process -> visible client.
+///
+/// One diagnostic item in the proxy-control stream. `update` is replaceable
+/// connection state. `diagnostic_line` is append-only and should be emitted
+/// infrequently. When both text fields are absent, the client clears any
+/// previous update.
+pub const ProxyControlDiagnostic = struct {
+    update: ?[]const u8 = null,
+    diagnostic_line: ?[]const u8 = null,
+    intercept_ctrl_r: bool = false,
+
+    pub const _desc_table = .{
+        .update = fd(1, .{ .scalar = .string }),
+        .diagnostic_line = fd(2, .{ .scalar = .string }),
+        .intercept_ctrl_r = fd(3, .{ .scalar = .bool }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, visible client -> ProxyCommand process.
+///
+/// Requests an immediate reconnect attempt after the visible client intercepted
+/// CTRL-R.
+pub const ProxyControlCtrlR = struct {
+    pub const _desc_table = .{};
 
     /// Encodes the message to the writer
     /// The allocator is used to generate submessages internally.

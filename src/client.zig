@@ -120,6 +120,7 @@ pub const FileConfig = struct {
     bootstrap: ?bool = null,
     terminal_emulator: ?bool = null,
     force_proxy_mode: ?bool = null,
+    connection_diagnostics: ?config.ConnectionDiagnostics = null,
 };
 
 pub fn loadFileConfig(allocator: std.mem.Allocator) !FileConfig {
@@ -184,6 +185,8 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
             parsed.terminal_emulator = try parseBool(value);
         } else if (keyMatches(key, "force-proxy-mode")) {
             parsed.force_proxy_mode = try parseBool(value);
+        } else if (keyMatches(key, "connection-diagnostics")) {
+            parsed.connection_diagnostics = try config.parseConnectionDiagnostics(value);
         } else {
             return error.UnknownConfigKey;
         }
@@ -656,6 +659,13 @@ fn copyTitleFallback(dest: []u8, title: []const u8) usize {
     return len;
 }
 
+pub const ReconnectPresentation = enum {
+    none,
+    stderr_plain,
+    title,
+    overlay,
+};
+
 pub const ReconnectUi = struct {
     const max_diagnostic_banner_lines = 3;
     const max_banner_message_bytes = 256;
@@ -680,13 +690,19 @@ pub const ReconnectUi = struct {
     title_enabled: bool = false,
     title_fd: c.fd_t = 1,
     title_visible: bool = false,
+    presentation: ReconnectPresentation = .overlay,
     cleanup_title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
     cleanup_title_fallback_len: usize = 0,
 
     pub fn begin(viewport_offset: i32) !ReconnectUi {
+        return beginWithPresentation(viewport_offset, .overlay);
+    }
+
+    pub fn beginWithPresentation(viewport_offset: i32, presentation: ReconnectPresentation) !ReconnectUi {
         var ui = ReconnectUi{
             .mode_guard = try terminal.TerminalModeGuard.enable(0),
-            .title_enabled = c.isatty(1) != 0,
+            .title_enabled = (presentation == .overlay or presentation == .title) and c.isatty(1) != 0,
+            .presentation = presentation,
         };
         errdefer ui.mode_guard.restore();
         ui.viewport_offset = if (viewport_offset > 0) @intCast(viewport_offset) else 0;
@@ -712,7 +728,7 @@ pub const ReconnectUi = struct {
         client_log.registerUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
         errdefer client_log.unregisterUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
         try ui.consumeDiagnostics();
-        try ui.hideCursor();
+        if (presentation == .overlay) try ui.hideCursor();
         return ui;
     }
 
@@ -923,6 +939,7 @@ pub const ReconnectUi = struct {
     }
 
     pub fn clearBanner(self: *ReconnectUi) !i32 {
+        if (self.presentation != .overlay) return @intCast(self.viewport_offset);
         if (c.isatty(1) == 0) return @intCast(self.viewport_offset);
         const banner = self.banner_state orelse return @intCast(self.viewport_offset);
         const renderer = client_renderer.Renderer.init(1);
@@ -988,6 +1005,15 @@ pub const ReconnectUi = struct {
 
     fn drawCurrentBanner(self: *ReconnectUi) !void {
         const message = self.banner_message[0..self.banner_message_len];
+        switch (self.presentation) {
+            .none, .title => return,
+            .stderr_plain => {
+                try io_helpers.writeAll(2, message);
+                try io_helpers.writeAll(2, "\r\n");
+                return;
+            },
+            .overlay => {},
+        }
 
         if (c.isatty(1) == 0) {
             try io_helpers.writeAll(1, "\r\n");
@@ -1041,11 +1067,23 @@ pub const ReconnectUi = struct {
 
         for (&diagnostics) |*diagnostic| {
             if (diagnostic.seq == 0) continue;
-            self.appendDiagnosticLine(diagnostic);
+            switch (self.presentation) {
+                .overlay => self.appendDiagnosticLine(diagnostic),
+                .stderr_plain => self.writePlainDiagnosticLine(diagnostic),
+                .title, .none => {},
+            }
         }
         self.diagnostic_cursor = new_cursor;
         self.rendered_diagnostic_seq = new_cursor;
         client_log.markUserDiagnosticsDisplayedThrough(new_cursor);
+    }
+
+    fn writePlainDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
+        const delayed = diagnostic.seq <= self.live_diagnostic_start_seq;
+        var line_buf: [client_log.max_user_diagnostic_display_bytes]u8 = undefined;
+        const len = formatBannerDiagnostic(line_buf[0..], diagnostic, delayed);
+        io_helpers.writeAll(2, line_buf[0..len]) catch return;
+        io_helpers.writeAll(2, "\r\n") catch {};
     }
 
     fn appendDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
@@ -1567,6 +1605,7 @@ test "parseEnvConfig accepts sessh env keys" {
         \\bootstrap=false
         \\terminal-emulator=no
         \\force-proxy-mode=yes
+        \\connection-diagnostics=hygienic
         \\
     );
 
@@ -1581,6 +1620,7 @@ test "parseEnvConfig accepts sessh env keys" {
     try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
     try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
     try std.testing.expectEqual(@as(?bool, true), parsed.force_proxy_mode);
+    try std.testing.expectEqual(@as(?config.ConnectionDiagnostics, .hygienic), parsed.connection_diagnostics);
 }
 
 test "parseEnvConfig maps initial scrollback minus one to all retained rows" {

@@ -41,6 +41,9 @@ pub const MessageType = enum {
     proxy_stream_ack,
     proxy_stream_eof,
     proxy_stream_eof_ack,
+    proxy_control_capabilities,
+    proxy_control_diagnostic,
+    proxy_control_ctrl_r,
 };
 
 pub const frame_header_len = 4;
@@ -177,6 +180,9 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .proxy_stream_ack => |message| ownedFrameFromMessage(allocator, .proxy_stream_ack, message),
             .proxy_stream_eof => |message| ownedFrameFromMessage(allocator, .proxy_stream_eof, message),
             .proxy_stream_eof_ack => |message| ownedFrameFromMessage(allocator, .proxy_stream_eof_ack, message),
+            .proxy_control_capabilities => |message| ownedFrameFromMessage(allocator, .proxy_control_capabilities, message),
+            .proxy_control_diagnostic => |message| ownedFrameFromMessage(allocator, .proxy_control_diagnostic, message),
+            .proxy_control_ctrl_r => |message| ownedFrameFromMessage(allocator, .proxy_control_ctrl_r, message),
         };
     }
 
@@ -364,6 +370,21 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.ProxyStreamEofAck, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_eof_ack = message } });
+        },
+        .proxy_control_capabilities => blk: {
+            var message = try decodePayload(pb.ProxyControlCapabilities, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_control_capabilities = message } });
+        },
+        .proxy_control_diagnostic => blk: {
+            var message = try decodePayload(pb.ProxyControlDiagnostic, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_control_diagnostic = message } });
+        },
+        .proxy_control_ctrl_r => blk: {
+            var message = try decodePayload(pb.ProxyControlCtrlR, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_control_ctrl_r = message } });
         },
     };
 }

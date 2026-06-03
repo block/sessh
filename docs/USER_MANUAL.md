@@ -16,14 +16,14 @@ falls back to plain `ssh` without persistence.
 
 If the `ssh` disconnects while `sessh` is running interactively then it will
 retry the connection in the background (with exponential backoff) and reattach
-to the same session. While disconnected, `sessh` shows a temporary banner:
+to the same session. While disconnected, `sessh` shows a temporary overlay:
 
 ```text
 --- sessh: disconnected: Retry connecting 10min. CTRL-R now. CTRL-C detach ---
 ```
 
 `sessh` will switch to prepared connections automatically when it can do so
-without a confusing user experience. Otherwise it displays a temporary banner
+without a confusing user experience. Otherwise it displays a temporary overlay
 like:
 
 ```text
@@ -54,6 +54,11 @@ sessh [[ssh-option|sessh-option] ...] destination [command [argument ...]]
   force, the ProxyCommand-based stream path for this connection. Sessh still
   enables proxy mode automatically when an ssh option requires OpenSSH to own
   the outer session.
+- `--connection-diagnostics none|unhygienic|hygienic|overlay`: choose how
+  reconnect diagnostics are displayed. `overlay` is the default terminal
+  emulator UI. In proxy mode, `overlay` uses the hygienic side-channel path.
+  `unhygienic` prints direct stderr diagnostics with CRLF line endings, and
+  `none` suppresses reconnect diagnostics.
 
 Sessh-specific behavior is configured in the config file documented below.
 
@@ -79,6 +84,7 @@ client-log-level=warn
 bootstrap=true
 terminal-emulator=true
 force-proxy-mode=false
+connection-diagnostics=overlay
 ```
 
 - `leader`: set the leader key for client commands or disable with `None`. The
@@ -102,6 +108,9 @@ force-proxy-mode=false
   `false`/`no` and `true`/`yes` are accepted. It defaults to `false`;
   `--force-proxy-mode` and `--no-force-proxy-mode` override it for a single
   invocation.
+- `connection-diagnostics`: configure reconnect diagnostics. Supported values
+  are `none`, `unhygienic`, `hygienic`, and `overlay`. The command-line
+  `--connection-diagnostics` option overrides it for a single invocation.
 
 ## Mux Commands
 

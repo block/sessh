@@ -182,6 +182,10 @@ pub fn agentSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]
     return std.fmt.allocPrint(allocator, "{s}/a", .{root});
 }
 
+pub fn clientSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/c", .{root});
+}
+
 pub fn clientHintsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     return sessionsDirInRoot(allocator, root);
 }
@@ -2257,11 +2261,11 @@ fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8, max_len: usize)
     return allocator.dupe(u8, buf[0..@intCast(n)]);
 }
 
-const SocketPathAllocation = struct {
+pub const SocketPathAllocation = struct {
     name: []u8,
     path: []u8,
 
-    fn deinit(self: *SocketPathAllocation, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *SocketPathAllocation, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         allocator.free(self.name);
         self.* = undefined;
@@ -2276,6 +2280,12 @@ fn allocateSocketPathForGuidInRoot(allocator: std.mem.Allocator, root: []const u
 
 fn allocateRuntimeAgentSocketPathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !SocketPathAllocation {
     const socket_dir = try agentSocketsDirInRoot(allocator, root);
+    defer allocator.free(socket_dir);
+    return allocateSocketPathForGuidInDir(allocator, socket_dir, guid);
+}
+
+pub fn allocateClientSocketPathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !SocketPathAllocation {
+    const socket_dir = try clientSocketsDirInRoot(allocator, root);
     defer allocator.free(socket_dir);
     return allocateSocketPathForGuidInDir(allocator, socket_dir, guid);
 }
@@ -2614,6 +2624,20 @@ test "runtime agent socket paths use typed guid directories and socket directory
     paths.removeRuntimeFiles();
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.meta));
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.dir));
+}
+
+test "client socket paths use client socket directory" {
+    const allocator = std.testing.allocator;
+    const root = "zig-cache/client-socket-path-test";
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+
+    const guid = "p-550e8400-e29b-41d4-a716-446655440000";
+    var allocation = try allocateClientSocketPathForGuidInRoot(allocator, root, guid);
+    defer allocation.deinit(allocator);
+
+    try std.testing.expectEqualStrings("550e8400e29b41d4a716446655440000", allocation.name);
+    try std.testing.expectEqualStrings("zig-cache/client-socket-path-test/c/550e8400e29b41d4a716446655440000", allocation.path);
 }
 
 test "outgoing proxy hints use proxy runtime metadata without stealing incoming proxy cleanup" {

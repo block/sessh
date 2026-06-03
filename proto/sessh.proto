@@ -4,7 +4,7 @@ package sessh.protocol.v1;
 
 import "sessh_handshake.proto";
 
-// Versioned remote protocol payloads.
+// Versioned sessh protocol payloads.
 //
 // The stable handshake payloads live in sessh_handshake.proto. After both
 // sides accept the handshake, this file's messages are governed by
@@ -49,6 +49,9 @@ message Frame {
     ProxyStreamAck proxy_stream_ack = 45;
     ProxyStreamEof proxy_stream_eof = 46;
     ProxyStreamEofAck proxy_stream_eof_ack = 47;
+    ProxyControlCapabilities proxy_control_capabilities = 48;
+    ProxyControlDiagnostic proxy_control_diagnostic = 49;
+    ProxyControlCtrlR proxy_control_ctrl_r = 50;
   }
 }
 
@@ -82,6 +85,46 @@ message ProxyStreamEof {
 message ProxyStreamEofAck {
   // Offset of the end of the sender's byte stream.
   uint64 offset = 1;
+}
+
+// Framed payload, visible client -> ProxyCommand process.
+//
+// Sent immediately after the local `c/` socket's normal HelloFrame handshake so
+// the ProxyCommand process can choose the right diagnostic stream shape.
+message ProxyControlCapabilities {
+  enum OutputMode {
+    OUTPUT_MODE_NONE = 0;
+    // Client can render replaceable connection-state updates. The client owns
+    // presentation and may show this in a title, an on-screen status line, or
+    // both.
+    OUTPUT_MODE_UPDATE = 1;
+    // Client can only emit infrequent diagnostic lines. These cannot erase
+    // prior output, so countdown-style status must be collapsed into one line
+    // with an absolute retry time.
+    OUTPUT_MODE_DIAGNOSTIC_LINE = 2;
+  }
+
+  OutputMode output_mode = 1;
+  bool ctrl_r_available = 2;
+}
+
+// Framed payload, ProxyCommand process -> visible client.
+//
+// One diagnostic item in the proxy-control stream. `update` is replaceable
+// connection state. `diagnostic_line` is append-only and should be emitted
+// infrequently. When both text fields are absent, the client clears any
+// previous update.
+message ProxyControlDiagnostic {
+  optional string update = 1;
+  optional string diagnostic_line = 2;
+  bool intercept_ctrl_r = 3;
+}
+
+// Framed payload, visible client -> ProxyCommand process.
+//
+// Requests an immediate reconnect attempt after the visible client intercepted
+// CTRL-R.
+message ProxyControlCtrlR {
 }
 
 // A transport liveness probe. This is not application input and must not change
