@@ -284,7 +284,7 @@ if [ -n "$proxy_command" ]; then
         exit 1
       fi
     fi
-    exec sh -c "$*"
+    exec "${SHELL:-sh}" -c "$*"
   fi
   printf 'PROXY_SSH host=%s\\n' "$host"
   exit 0
@@ -534,6 +534,10 @@ def optional_text(path):
     return path.read_text() if path.exists() else "<missing>"
 
 
+def ssh_invocation_count(path):
+    return optional_text(path).splitlines().count("invoked=1")
+
+
 def process_diagnostics(result):
     return (
         f"returncode={result.returncode}\n"
@@ -543,11 +547,18 @@ def process_diagnostics(result):
     )
 
 
-def sever_last_input_client(env, timeout=30.0):
+def env_with_session_guid(env, session_ref):
+    route = json.loads(route_file(env, session_ref).read_text())
+    scoped = env.copy()
+    scoped["SESSH_GUID"] = route["guid"]
+    return scoped
+
+
+def sever_session_clients(env, timeout=30.0, session_ref="s1"):
     result = run_sesshmux(
-        ["debug", "sever-connection", "--host", "test-host", "--last-input"],
-        env,
-        timeout=timeout,
+        ["debug", "sever-connection", "--host", "test-host", "--all"],
+        env_with_session_guid(env, session_ref),
+        timeout=max(timeout, 30.0),
     )
     if result.returncode != 0:
         raise AssertionError(process_diagnostics(result))
@@ -885,7 +896,7 @@ def run_sessh_reconnect_probe(
         stderr=subprocess.PIPE,
     )
     stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
-    sever_last_input_client(env, timeout)
+    sever_session_clients(env, timeout)
     stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
     if expect_countdown:
         stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 9sec", timeout)
@@ -954,7 +965,7 @@ def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, tim
         proc.stdin.write(b"enter-alt\n")
         proc.stdin.flush()
         read_until_pipe(proc.stdout, alt_ready.encode("utf-8"), timeout)
-        sever_last_input_client(env, timeout)
+        sever_session_clients(env, timeout)
         stdout = read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
         proc.stdin.write(b"\x03")
         proc.stdin.flush()
@@ -984,7 +995,7 @@ def run_sessh_detach_reconnect_probe(args, env, ready, detach_bytes=b"\x03", tim
         stderr=subprocess.PIPE,
     )
     stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
-    sever_last_input_client(env, timeout)
+    sever_session_clients(env, timeout)
     stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
     proc.stdin.write(detach_bytes)
     proc.stdin.flush()
@@ -3476,11 +3487,14 @@ def test_ssh_list_refresh_drains_pending_session_kill(tmp):
     if not host_guid:
         raise AssertionError(route)
     pending = write_pending_kills(env, "test-host", [guid], host_guid=host_guid)
+    invocations_before_refresh = ssh_invocation_count(fake_log)
 
     listed = run_sesshmux(["list", "--refresh", "--exited", "--jsonl"], env, timeout=30.0)
 
     if listed.returncode != 0:
         raise AssertionError(listed)
+    if ssh_invocation_count(fake_log) != invocations_before_refresh + 1:
+        raise AssertionError(f"list --refresh did not piggy-back list and kill on one ssh connection:\n{optional_text(fake_log)}")
     if pending.exists():
         raise AssertionError("pending session kill was not removed")
     rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
@@ -3531,11 +3545,14 @@ def test_ssh_list_refresh_skips_pending_session_kill_after_attach(tmp):
         if attached.returncode != 0:
             raise AssertionError(attached)
         time.sleep(0.05)
+        invocations_before_refresh = ssh_invocation_count(fake_log)
 
         listed = run_sesshmux(["list", "--refresh", "--jsonl"], env, timeout=30.0)
 
         if listed.returncode != 0:
             raise AssertionError(listed)
+        if ssh_invocation_count(fake_log) != invocations_before_refresh + 1:
+            raise AssertionError(f"list --refresh did not piggy-back list and stale kill on one ssh connection:\n{optional_text(fake_log)}")
         if pending.exists():
             raise AssertionError("stale pending session kill was not removed")
         rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
@@ -3586,8 +3603,8 @@ def test_ssh_list_refresh_drains_pending_proxy_kill_without_route(tmp):
     if pending.exists():
         raise AssertionError("pending live proxy kill without a cached route was not removed")
     log_text = optional_text(fake_log)
-    if "invoked=1" not in log_text:
-        raise AssertionError(f"pending-only refresh did not contact ssh:\n{log_text}")
+    if ssh_invocation_count(fake_log) != 1:
+        raise AssertionError(f"pending-only refresh should use one ssh connection:\n{log_text}")
 
 
 def test_ssh_remote_default_alias_is_remote_generated(tmp):
@@ -3657,7 +3674,7 @@ def test_ssh_debug_sever_reconnects_with_countdown(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_reconnect_probe(
-        ["test-host"],
+        ["--alias", "s1", "test-host"],
         env,
         marker,
         "after-reconnect",
@@ -4393,7 +4410,7 @@ def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_reconnect_probe(
-        ["test-host"],
+        ["--alias", "s1", "test-host"],
         env,
         marker,
         "after-reconnect",
@@ -4444,7 +4461,7 @@ def test_ssh_log_level_quiet_suppresses_buffered_stderr_display(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_reconnect_probe(
-        ["--log-level", "quiet", "test-host"],
+        ["--log-level", "quiet", "--alias", "s1", "test-host"],
         env,
         marker,
         "after-reconnect",
@@ -4545,7 +4562,7 @@ def test_ssh_reconnect_does_not_apply_active_screen_cleanup(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_enter_alt_then_reconnect_banner(
-        ["test-host"],
+        ["--alias", "s1", "test-host"],
         env,
         primary_marker,
         alt_marker,
@@ -4575,7 +4592,7 @@ def test_ssh_reconnect_can_detach_while_bootstrapping(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_detach_reconnect_probe(
-        ["test-host"],
+        ["--alias", "s1", "test-host"],
         env,
         marker,
         timeout=10.0,
@@ -4606,7 +4623,7 @@ def test_ssh_reconnect_can_detach_with_ctrl_c(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_detach_reconnect_probe(
-        ["test-host"],
+        ["--alias", "s1", "test-host"],
         env,
         marker,
         detach_bytes=b"\x03",

@@ -59,6 +59,8 @@ SESSION_CLIENT_REPAINT_REQUEST = "te_session_client_repaint_request"
 SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST = "te_session_client_debug_sever_connection_request"
 SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST = "te_session_client_debug_unresponsive_connection_request"
 HOST_GUID = "host_guid"
+RUN_REQUEST = "run_request"
+RUN_RESPONSE = "run_response"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -88,6 +90,8 @@ _FRAME_FIELDS = {
     SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
     SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST,
     HOST_GUID: HOST_GUID,
+    RUN_REQUEST: RUN_REQUEST,
+    RUN_RESPONSE: RUN_RESPONSE,
 }
 
 
@@ -156,10 +160,12 @@ def local_mux_args(args):
     if command == "attach":
         return ["attach", "--host", ".", *rest]
     if command == "list":
-        return ["list", *rest]
+        if any(arg == "--client" or arg.startswith("--client=") for arg in rest):
+            return ["list", *rest]
+        return ["list", *rest, "."]
     if command == "kill":
         if rest and rest[0] == "--all":
-            return ["kill", "--all", *rest[1:], "."]
+            return ["kill", "--host", ".", "--all", *rest[1:]]
         return ["kill", ".", *rest]
     if command in {"force-compat", "detach", "repaint", "debug"}:
         return [command, *rest]
@@ -3071,7 +3077,7 @@ def run_broker_registry_commands_test(base_env):
                 proc.wait(timeout=2.0)
 
         missing = run([":internal-session-broker:", "kill", "s1"], env, timeout=5.0)
-        if missing.returncode != 1 or "session already exited" not in missing.stderr:
+        if missing.returncode != 1 or "ERROR s1 not found" not in missing.stderr:
             raise AssertionError(missing)
 
         proc = subprocess.Popen(
@@ -3508,7 +3514,7 @@ def run_broker_kill_edge_cases_test(base_env):
             if killed.stdout or killed.stderr:
                 raise AssertionError(killed)
             lines = compat_log.read_text().splitlines()
-            if f". kill {guid_for_ref('s1')}" not in lines:
+            if f"kill {guid_for_ref('s1')}" not in lines:
                 raise AssertionError(lines)
             if f"env_guid={guid_for_ref('s1')}" not in lines:
                 raise AssertionError(lines)
@@ -3542,7 +3548,7 @@ def run_broker_kill_edge_cases_test(base_env):
                 raise AssertionError(stopped)
             lines = compat_log.read_text().splitlines()
             for session_id in ("s1", "s2"):
-                if f". kill {guid_for_ref(session_id)}" not in lines:
+                if f"kill {guid_for_ref(session_id)}" not in lines:
                     raise AssertionError(lines)
                 if f"env_guid={guid_for_ref(session_id)}" not in lines:
                     raise AssertionError(lines)
@@ -3910,7 +3916,7 @@ def main():
             assert_list_header(listed.stdout)
 
             missing = run([".", "kill", "s1"], env, timeout=5.0)
-            if missing.returncode != 1 or "ERROR session not found" not in missing.stderr:
+            if missing.returncode != 1 or "ERROR s1 not found" not in missing.stderr:
                 raise AssertionError(missing)
 
             bad = run([".", "--scrollback-limit", "0"], env, timeout=5.0)
@@ -3970,7 +3976,7 @@ def main():
 
             remote_guid = guid_for_ref("s7")
             write_cached_remote_route(env, "remote8", "example.com", remote_guid)
-            listed = run([".", "list"], env, check=True, timeout=5.0)
+            listed = run(["list"], env, check=True, timeout=5.0)
             if "cached remote session status may be out of date" not in listed.stderr:
                 raise AssertionError(listed)
             current_sessions = sessions(listed.stdout)
@@ -3984,7 +3990,7 @@ def main():
                 or remote_route.get("input") != "???"
             ):
                 raise AssertionError(listed.stdout)
-            listed_jsonl = run([".", "list", "--jsonl"], env, check=True, timeout=5.0)
+            listed_jsonl = run(["list", "--jsonl"], env, check=True, timeout=5.0)
             if "cached remote session status may be out of date" not in listed_jsonl.stderr:
                 raise AssertionError(listed_jsonl)
             jsonl_route = jsonl_sessions(listed_jsonl.stdout).get("remote8")
@@ -4074,7 +4080,7 @@ def main():
                 raise AssertionError(listed.stdout)
 
             missing = run([".", "kill", "missing"], env, timeout=5.0)
-            if missing.returncode != 1 or "ERROR session not found" not in missing.stderr:
+            if missing.returncode != 1 or "ERROR missing not found" not in missing.stderr:
                 raise AssertionError(missing)
 
             pid, fd = spawn_client(env, ["--alias", "s3"])

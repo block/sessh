@@ -87,6 +87,8 @@ pub const Frame = struct {
         proxy_control_diagnostic,
         proxy_control_ctrl_r,
         host_guid,
+        run_request,
+        run_response,
     };
     pub const payload_union = union(_payload_case) {
         @"error": sessh_handshake_v1.Error,
@@ -122,6 +124,8 @@ pub const Frame = struct {
         proxy_control_diagnostic: ProxyControlDiagnostic,
         proxy_control_ctrl_r: ProxyControlCtrlR,
         host_guid: HostGuid,
+        run_request: RunRequest,
+        run_response: RunResponse,
         pub const _desc_table = .{
             .@"error" = fd(10, .submessage),
             .te_session_create = fd(11, .submessage),
@@ -156,6 +160,8 @@ pub const Frame = struct {
             .proxy_control_diagnostic = fd(49, .submessage),
             .proxy_control_ctrl_r = fd(50, .submessage),
             .host_guid = fd(51, .submessage),
+            .run_request = fd(52, .submessage),
+            .run_response = fd(53, .submessage),
         };
     };
 
@@ -232,6 +238,151 @@ pub const HostGuid = struct {
 
     pub const _desc_table = .{
         .host_guid = fd(1, .{ .scalar = .string }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed argv execution over a control transport. The argv includes argv[0];
+/// callers typically send ["sesshmux", "list", "--jsonl"] or
+/// ["sesshmux", "kill", "--jsonl", "--request", "..."].
+pub const RunRequest = struct {
+    request_id: u64 = 0,
+    argv: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    pub const _desc_table = .{
+        .request_id = fd(1, .{ .scalar = .uint64 }),
+        .argv = fd(2, .{ .repeated = .{ .scalar = .string } }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Process-like result for RunRequest. stdout is the command output the caller
+/// normally parses; stderr and exit_code preserve command-line behavior.
+pub const RunResponse = struct {
+    request_id: u64 = 0,
+    exit_code: i32 = 0,
+    stdout: []const u8 = &.{},
+    stderr: []const u8 = &.{},
+
+    pub const _desc_table = .{
+        .request_id = fd(1, .{ .scalar = .uint64 }),
+        .exit_code = fd(2, .{ .scalar = .int32 }),
+        .stdout = fd(3, .{ .scalar = .bytes }),
+        .stderr = fd(4, .{ .scalar = .bytes }),
     };
 
     /// Encodes the message to the writer

@@ -45,6 +45,8 @@ pub const MessageType = enum {
     proxy_control_diagnostic,
     proxy_control_ctrl_r,
     host_guid,
+    run_request,
+    run_response,
 };
 
 pub const frame_header_len = 4;
@@ -193,6 +195,8 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .proxy_control_diagnostic => |message| ownedFrameFromMessage(allocator, .proxy_control_diagnostic, message),
             .proxy_control_ctrl_r => |message| ownedFrameFromMessage(allocator, .proxy_control_ctrl_r, message),
             .host_guid => |message| ownedFrameFromMessage(allocator, .host_guid, message),
+            .run_request => |message| ownedFrameFromMessage(allocator, .run_request, message),
+            .run_response => |message| ownedFrameFromMessage(allocator, .run_response, message),
         };
     }
 
@@ -400,6 +404,16 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.HostGuid, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .host_guid = message } });
+        },
+        .run_request => blk: {
+            var message = try decodePayload(pb.RunRequest, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .run_request = message } });
+        },
+        .run_response => blk: {
+            var message = try decodePayload(pb.RunResponse, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .run_response = message } });
         },
     };
 }

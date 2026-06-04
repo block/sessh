@@ -27,6 +27,39 @@ var next_repaint_request_seq: u64 = 1;
 const unknown_viewport_offset: i32 = -1;
 const client_list_target_help = "incoming, outgoing, session, or a guid/alias";
 
+pub const RemoteCommandResult = struct {
+    stdout: []u8,
+    stderr: []u8,
+    exit_code: u8,
+
+    pub fn deinit(self: *RemoteCommandResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.stderr);
+        allocator.free(self.stdout);
+        self.* = undefined;
+    }
+};
+
+pub const RemoteCommandRunner = struct {
+    context: *anyopaque,
+    runFn: *const fn (
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        ssh_options: []const []const u8,
+        argv: []const []const u8,
+    ) anyerror!RemoteCommandResult,
+
+    pub fn run(
+        self: *RemoteCommandRunner,
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        ssh_options: []const []const u8,
+        argv: []const []const u8,
+    ) !RemoteCommandResult {
+        return self.runFn(self.context, allocator, host, ssh_options, argv);
+    }
+};
+
 const LocalAction = enum {
     new,
     attach,
@@ -58,6 +91,7 @@ const LocalOptions = struct {
     kill_id: ?[]const u8 = null,
     kill_ids: []const []const u8 = &.{},
     kill_current: bool = false,
+    kill_request_args: []const []const u8 = &.{},
     kill_jsonl: bool = false,
     alias: ?[]const u8 = null,
     list_refresh: bool = false,
@@ -2629,9 +2663,8 @@ test "client detach request uses normal detach relay end" {
     );
 }
 
-/// Implements sesshmux-local commands after the mux translator has selected the
-/// local "." target. The sessh entrypoint does not call this directly for ".";
-/// there, "." is rejected as an invalid ssh host.
+/// Implements sesshmux-local commands after the public mux parser has selected
+/// the local endpoint.
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var options = parseLocalOptions(args) catch |err| {
         try writeLocalArgError(err);
@@ -2651,6 +2684,8 @@ fn writeLocalArgError(err: anyerror) !void {
         error.MissingClientListTarget => try io_helpers.writeAll(2, "sessh: --client requires a value: " ++ client_list_target_help ++ "\n"),
         error.MissingKillTarget => try io_helpers.writeAll(2, "sesshmux: kill requires --all, a guid, or --current\n"),
         error.MissingCurrentSession => try io_helpers.writeAll(2, "sesshmux: --current requires $SESSH_GUID\n"),
+        error.MissingHost => try io_helpers.writeAll(2, "sesshmux: --host requires a value\n"),
+        error.InvalidLocalHost => try io_helpers.writeAll(2, "sesshmux: local commands only accept --host .\n"),
         error.DetachedCaptureUnsupported => try io_helpers.writeAll(2, "sesshmux: new --detached does not support --capture-tty-transcript\n"),
         else => try io_helpers.stderrPrint("sessh: invalid . arguments: {t}\n", .{err}),
     }
@@ -2854,29 +2889,33 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                 if (exit_status != 0) return process_exit.request(exit_status);
                 return;
             }
-            const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl, options.list_exited, options.list_all);
+            const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl, options.list_exited, options.list_all, null);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
         .kill => {
-            var kill_refs = resolveLocalKillRefs(allocator, options) catch |err| switch (err) {
-                error.MissingCurrentSession => {
-                    try writeLocalArgError(err);
-                    return process_exit.request(64);
-                },
-                error.MissingKillTarget => {
-                    try writeLocalArgError(err);
-                    return process_exit.request(64);
-                },
-                else => return err,
-            };
-            defer kill_refs.deinit(allocator);
+            var kill_refs: ?LocalKillRefs = null;
+            defer if (kill_refs) |*refs| refs.deinit(allocator);
+            if (options.kill_request_args.len == 0) {
+                kill_refs = resolveLocalKillRefs(allocator, options) catch |err| switch (err) {
+                    error.MissingCurrentSession => {
+                        try writeLocalArgError(err);
+                        return process_exit.request(64);
+                    },
+                    error.MissingKillTarget => {
+                        try writeLocalArgError(err);
+                        return process_exit.request(64);
+                    },
+                    else => return err,
+                };
+            }
             var command_args: std.ArrayList([]const u8) = .empty;
             defer command_args.deinit(allocator);
             try command_args.appendSlice(allocator, runtime_broker_args);
             try command_args.append(allocator, "kill");
             if (options.kill_jsonl) try command_args.append(allocator, "--jsonl");
-            try command_args.appendSlice(allocator, kill_refs.refs);
+            try command_args.appendSlice(allocator, options.kill_request_args);
+            if (kill_refs) |refs| try command_args.appendSlice(allocator, refs.refs);
             const exit_status = try runLocalBrokerCommand(allocator, args[0], command_args.items);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
@@ -3405,8 +3444,9 @@ pub fn runLocalListCommand(
     jsonl: bool,
     exited: bool,
     all: bool,
+    remote_runner: ?*RemoteCommandRunner,
 ) !u8 {
-    if (include_cached_routes and refresh) try refreshCachedRemoteRoutes(allocator, exe);
+    if (include_cached_routes and refresh) try refreshCachedRemoteRoutes(allocator, exe, remote_runner);
 
     var command_args_buf: [8][]const u8 = undefined;
     const command_args = appendBrokerCommand(runtime_broker_args, "list", null, &command_args_buf);
@@ -3545,7 +3585,7 @@ fn loadCachedRemoteRoutes(allocator: std.mem.Allocator, routes: *std.ArrayList(s
     }
 }
 
-fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !void {
+fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8, remote_runner: ?*RemoteCommandRunner) !void {
     var routes: std.ArrayList(session_registry.Route) = .empty;
     defer {
         for (routes.items) |*route| route.deinit(allocator);
@@ -3555,7 +3595,7 @@ fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !voi
 
     for (routes.items, 0..) |*route, i| {
         if (routeConnectionWasAlreadyRefreshed(routes.items[0..i], route)) continue;
-        const stdout = queryRemoteRouteList(allocator, exe, route, false, false) catch |err| {
+        const stdout = queryRemoteRouteList(allocator, exe, remote_runner, route, false, false) catch |err| {
             try io_helpers.stderrPrint("sessh: list refresh failed for {s}: {t}\n", .{ route.host, err });
             continue;
         };
@@ -3578,7 +3618,7 @@ fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !voi
                 );
             }
         }
-        try drainPendingRemoteRequests(allocator, exe, route.host, route.ssh_options, route.host_guid);
+        try drainPendingRemoteRequests(allocator, exe, remote_runner, route.host, route.ssh_options, route.host_guid);
         for (routes.items) |*candidate| {
             if (!sameRouteConnection(route, candidate)) continue;
             if (!try cachedRouteStillExists(allocator, candidate.guid)) continue;
@@ -3596,7 +3636,7 @@ fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !voi
             );
         }
     }
-    try refreshPendingKillsWithoutCachedRoute(allocator, exe, routes.items);
+    try refreshPendingKillsWithoutCachedRoute(allocator, exe, remote_runner, routes.items);
 }
 
 fn cachedRouteStillExists(allocator: std.mem.Allocator, guid: []const u8) !bool {
@@ -3627,7 +3667,12 @@ fn sameRouteConnection(a: *const session_registry.Route, b: *const session_regis
     return true;
 }
 
-fn refreshPendingKillsWithoutCachedRoute(allocator: std.mem.Allocator, exe: []const u8, routes: []const session_registry.Route) !void {
+fn refreshPendingKillsWithoutCachedRoute(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    remote_runner: ?*RemoteCommandRunner,
+    routes: []const session_registry.Route,
+) !void {
     var pending_hosts = try session_registry.readPendingKillHosts(allocator);
     defer pending_hosts.deinit(allocator);
     for (pending_hosts.hosts) |host| {
@@ -3639,7 +3684,7 @@ fn refreshPendingKillsWithoutCachedRoute(allocator: std.mem.Allocator, exe: []co
             ssh_options = .{ "-p", host.port };
             break :blk ssh_options[0..];
         };
-        try drainPendingRemoteRequests(allocator, exe, host.name, options, host.guid);
+        try drainPendingRemoteRequests(allocator, exe, remote_runner, host.name, options, host.guid);
     }
 }
 
@@ -3650,18 +3695,53 @@ fn hostMatchesAnyRoute(routes: []const session_registry.Route, host_guid: []cons
     return false;
 }
 
-fn queryRemoteRouteList(allocator: std.mem.Allocator, exe: []const u8, route: *const session_registry.Route, exited: bool, all: bool) ![]u8 {
-    return queryRemoteHostList(allocator, exe, route.host, route.ssh_options, exited, all);
+fn queryRemoteRouteList(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    remote_runner: ?*RemoteCommandRunner,
+    route: *const session_registry.Route,
+    exited: bool,
+    all: bool,
+) ![]u8 {
+    return queryRemoteHostList(allocator, exe, remote_runner, route.host, route.ssh_options, exited, all);
 }
 
 fn queryRemoteHostList(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    remote_runner: ?*RemoteCommandRunner,
     host: []const u8,
     ssh_options: []const []const u8,
     exited: bool,
     all: bool,
 ) ![]u8 {
+    if (remote_runner) |runner| {
+        const extra_args: usize = 4 + (if (exited) @as(usize, 1) else 0) + (if (all) @as(usize, 1) else 0);
+        const argv = try allocator.alloc([]const u8, extra_args);
+        defer allocator.free(argv);
+        argv[0] = "sesshmux";
+        argv[1] = ":internal-session-broker:";
+        argv[2] = "list";
+        argv[3] = "--jsonl";
+        var arg_index: usize = 4;
+        if (exited) {
+            argv[arg_index] = "--exited";
+            arg_index += 1;
+        }
+        if (all) {
+            argv[arg_index] = "--all";
+            arg_index += 1;
+        }
+        var result = try runner.run(allocator, host, ssh_options, argv);
+        errdefer result.deinit(allocator);
+        if (result.exit_code == 0) {
+            allocator.free(result.stderr);
+            return result.stdout;
+        }
+        if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
+        return error.RemoteListFailed;
+    }
+
     const extra_args: usize = (if (exited) @as(usize, 1) else 0) +
         (if (all) @as(usize, 1) else 0);
     const ssh_options_arg = if (ssh_options.len > 0) try shellJoinArgs(allocator, ssh_options) else null;
@@ -3716,12 +3796,13 @@ fn queryRemoteHostKillJsonl(
     ssh_options: []const []const u8,
     targets: []const []const u8,
 ) ![]u8 {
-    return queryRemoteHostKillJsonlWithRequests(allocator, exe, host, ssh_options, targets, &.{});
+    return queryRemoteHostKillJsonlWithRequests(allocator, exe, null, host, ssh_options, targets, &.{});
 }
 
 pub fn drainPendingRemoteRequests(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    remote_runner: ?*RemoteCommandRunner,
     host: []const u8,
     ssh_options: []const []const u8,
     pending_host_guid: []const u8,
@@ -3755,7 +3836,7 @@ pub fn drainPendingRemoteRequests(
     }
     if (request_jsons.items.len == 0) return;
 
-    const stdout = queryRemoteHostKillJsonlWithRequests(allocator, exe, host, ssh_options, &.{}, request_jsons.items) catch |err| {
+    const stdout = queryRemoteHostKillJsonlWithRequests(allocator, exe, remote_runner, host, ssh_options, &.{}, request_jsons.items) catch |err| {
         try io_helpers.stderrPrint("sessh: pending cleanup failed for {s}: {t}\n", .{ host, err });
         return;
     };
@@ -3771,11 +3852,39 @@ pub fn drainPendingRemoteRequests(
 fn queryRemoteHostKillJsonlWithRequests(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    remote_runner: ?*RemoteCommandRunner,
     host: []const u8,
     ssh_options: []const []const u8,
     targets: []const []const u8,
     request_jsons: []const []const u8,
 ) ![]u8 {
+    if (remote_runner) |runner| {
+        const request_args = request_jsons.len * 2;
+        const argv = try allocator.alloc([]const u8, 4 + request_args + targets.len);
+        defer allocator.free(argv);
+        argv[0] = "sesshmux";
+        argv[1] = ":internal-session-broker:";
+        argv[2] = "kill";
+        argv[3] = "--jsonl";
+        var arg_index: usize = 4;
+        for (request_jsons) |request_json| {
+            argv[arg_index] = "--request";
+            arg_index += 1;
+            argv[arg_index] = request_json;
+            arg_index += 1;
+        }
+        @memcpy(argv[arg_index..], targets);
+
+        var result = try runner.run(allocator, host, ssh_options, argv);
+        errdefer result.deinit(allocator);
+        if (result.exit_code == 0 or result.stdout.len > 0) {
+            allocator.free(result.stderr);
+            return result.stdout;
+        }
+        if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
+        return error.RemoteKillFailed;
+    }
+
     const ssh_options_arg = if (ssh_options.len > 0) try shellJoinArgs(allocator, ssh_options) else null;
     defer if (ssh_options_arg) |value| allocator.free(value);
     const ssh_option_args: usize = if (ssh_options_arg != null) 2 else 0;
@@ -4214,7 +4323,7 @@ fn compatModeFromEnv() bool {
 fn parseLocalOptionsWithCompatMode(args: []const []const u8, compat_mode: bool) !LocalOptions {
     var options = LocalOptions{};
     options.compat_mode = compat_mode;
-    var i: usize = 2;
+    var i: usize = 1;
 
     // Process-wide options may appear before the command word. Command flags
     // are parsed only after the command is known, so one command's flags do not
@@ -4229,7 +4338,11 @@ fn parseLocalOptionsWithCompatMode(args: []const []const u8, compat_mode: bool) 
     // Pick the command before parsing command flags. This keeps options such as
     // `--all` scoped to the commands that actually understand them.
     const command = args[i];
-    if (std.mem.eql(u8, command, "list")) {
+    if (std.mem.eql(u8, command, "new")) {
+        try setAction(&options, .new);
+        i += 1;
+        try parseLocalNewOptions(args, &i, &options);
+    } else if (std.mem.eql(u8, command, "list")) {
         try setAction(&options, .list);
         i += 1;
         try parseLocalListOptions(args, &i, &options);
@@ -4289,11 +4402,13 @@ fn parseLocalNewOptions(args: []const []const u8, index: *usize, options: *Local
 }
 
 fn parseLocalAttachOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
+    while (index.* < args.len and try parseLocalHostTargetOption(args, index)) {}
     if (index.* < args.len and !std.mem.startsWith(u8, args[index.*], "--")) {
         options.attach_id = args[index.*];
         index.* += 1;
     }
     while (index.* < args.len) {
+        if (try parseLocalHostTargetOption(args, index)) continue;
         if (try parseLocalCommonSessionOption(args, index, options)) continue;
         return error.UnknownArgument;
     }
@@ -4329,6 +4444,10 @@ fn parseLocalListOptions(args: []const []const u8, index: *usize, options: *Loca
         } else if (std.mem.eql(u8, arg, "--exited")) {
             options.list_exited = true;
             index.* += 1;
+        } else if (try parseLocalHostTargetOption(args, index)) {
+            continue;
+        } else if (std.mem.eql(u8, arg, ".")) {
+            index.* += 1;
         } else if (try parseLocalCommonSessionOption(args, index, options)) {
             continue;
         } else {
@@ -4345,19 +4464,41 @@ fn parseLocalKillOptions(args: []const []const u8, index: *usize, options: *Loca
             options.kill_jsonl = true;
             index.* += 1;
         } else if (std.mem.eql(u8, arg, "--all")) {
-            if (options.kill_current or options.kill_ids.len > 0) return error.MultipleTargets;
-            try setAction(options, .kill_all);
+            if (options.action == .kill_all or options.kill_current or options.kill_ids.len > 0 or options.kill_request_args.len > 0) return error.MultipleTargets;
+            options.action = .kill_all;
             index.* += 1;
         } else if (std.mem.eql(u8, arg, "--current")) {
-            if (options.action == .kill_all or options.kill_ids.len > 0) return error.MultipleTargets;
+            if (options.action == .kill_all or options.kill_ids.len > 0 or options.kill_request_args.len > 0) return error.MultipleTargets;
             options.kill_current = true;
+            index.* += 1;
+        } else if (std.mem.startsWith(u8, arg, "--request=") or std.mem.eql(u8, arg, "--request")) {
+            if (options.action == .kill_all or options.kill_current or options.kill_ids.len > 0) return error.MultipleTargets;
+            if (options.kill_request_args.len > 0) return error.MultipleTargets;
+            const start = index.*;
+            while (index.* < args.len) {
+                if (std.mem.startsWith(u8, args[index.*], "--request=")) {
+                    index.* += 1;
+                    continue;
+                }
+                if (std.mem.eql(u8, args[index.*], "--request")) {
+                    index.* += 1;
+                    if (index.* >= args.len) return error.MissingKillTarget;
+                    index.* += 1;
+                    continue;
+                }
+                break;
+            }
+            options.kill_request_args = args[start..index.*];
+        } else if (try parseLocalHostTargetOption(args, index)) {
+            continue;
+        } else if (std.mem.eql(u8, arg, ".") and options.action == .kill and !options.kill_current and options.kill_ids.len == 0 and options.kill_request_args.len == 0) {
             index.* += 1;
         } else if (try parseLocalCommonSessionOption(args, index, options)) {
             continue;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.UnknownArgument;
         } else {
-            if (options.action == .kill_all or options.kill_current or options.kill_ids.len > 0) return error.MultipleTargets;
+            if (options.action == .kill_all or options.kill_current or options.kill_ids.len > 0 or options.kill_request_args.len > 0) return error.MultipleTargets;
             const start = index.*;
             while (index.* < args.len and !std.mem.startsWith(u8, args[index.*], "--")) {
                 index.* += 1;
@@ -4400,6 +4541,10 @@ fn parseLocalClientControlOptions(args: []const []const u8, index: *usize, optio
             if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingDebugSeconds;
             options.debug_unresponsive_seconds = try parseDebugUnresponsiveSeconds(args[index.*]);
             index.* += 1;
+        } else if (try parseLocalHostTargetOption(args, index)) {
+            continue;
+        } else if (std.mem.eql(u8, arg, ".")) {
+            index.* += 1;
         } else if (try parseLocalCommonSessionOption(args, index, options)) {
             continue;
         } else if (!std.mem.startsWith(u8, arg, "--") and options.client_target == .default and std.mem.startsWith(u8, arg, session_registry.client_guid_prefix)) {
@@ -4412,6 +4557,15 @@ fn parseLocalClientControlOptions(args: []const []const u8, index: *usize, optio
             return error.UnknownArgument;
         }
     }
+}
+
+fn parseLocalHostTargetOption(args: []const []const u8, index: *usize) !bool {
+    if (!std.mem.eql(u8, args[index.*], "--host")) return false;
+    index.* += 1;
+    if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingHost;
+    if (!std.mem.eql(u8, args[index.*], ".")) return error.InvalidLocalHost;
+    index.* += 1;
+    return true;
 }
 
 fn parseLocalCommonSessionOption(args: []const []const u8, index: *usize, options: *LocalOptions) !bool {
@@ -4492,8 +4646,11 @@ fn validateLocalOptions(options: LocalOptions) !LocalOptions {
     if (options.new_detached and options.action != .new) return error.UnsupportedClientTarget;
     if (options.new_detached and options.capture_tty_transcript != null) return error.DetachedCaptureUnsupported;
     if (options.action == .kill) {
-        if (options.kill_ids.len > 0 and options.kill_current) return error.MultipleTargets;
-        if (options.kill_ids.len == 0 and !options.kill_current) return error.MissingKillTarget;
+        const target_modes: u8 = (if (options.kill_ids.len > 0) @as(u8, 1) else 0) +
+            (if (options.kill_current) @as(u8, 1) else 0) +
+            (if (options.kill_request_args.len > 0) @as(u8, 1) else 0);
+        if (target_modes > 1) return error.MultipleTargets;
+        if (target_modes == 0) return error.MissingKillTarget;
     }
     return options;
 }
@@ -4538,40 +4695,35 @@ fn setAction(options: *LocalOptions, action: LocalAction) !void {
 test "parseLocalOptions keeps command flags command-specific" {
     const list_all = try parseLocalOptions(&.{
         "sesshmux",
-        ".",
         "list",
         "--all",
     });
     try std.testing.expect(list_all.list_all);
     try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
         "sesshmux",
-        ".",
         "list",
         "--current",
     }));
     try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
         "sesshmux",
-        ".",
         "kill",
         "--refresh",
     }));
     try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
         "sesshmux",
-        ".",
         "attach",
         "s1",
         "--exited",
     }));
     const detached_new = try parseLocalOptions(&.{
         "sesshmux",
-        ".",
+        "new",
         "--detached",
     });
     try std.testing.expect(detached_new.new_detached);
     try std.testing.expectEqual(LocalAction.new, detached_new.action);
     try std.testing.expectError(error.UnsupportedClientTarget, parseLocalOptions(&.{
         "sesshmux",
-        ".",
         "detach",
         "--scrollback",
     }));
@@ -4580,8 +4732,9 @@ test "parseLocalOptions keeps command flags command-specific" {
 test "parseLocalOptions supports compatibility options before local commands" {
     const attach = try parseLocalOptionsWithCompatMode(&.{
         "sesshmux",
-        ".",
         "attach",
+        "--host",
+        ".",
         "s1",
         "--scrollback-limit",
         "42",
@@ -4594,7 +4747,6 @@ test "parseLocalOptions supports compatibility options before local commands" {
 
     const list = try parseLocalOptionsWithCompatMode(&.{
         "sesshmux",
-        ".",
         "list",
         "--initial-scrollback",
         "0",
@@ -4607,24 +4759,52 @@ test "parseLocalOptions supports compatibility options before local commands" {
 test "parseLocalOptions uses current session only when explicit" {
     try std.testing.expectError(error.MissingKillTarget, parseLocalOptionsWithCompatMode(&.{
         "sesshmux",
-        ".",
         "kill",
     }, false));
 
     const current = try parseLocalOptionsWithCompatMode(&.{
         "sesshmux",
-        ".",
         "kill",
         "--current",
     }, false);
     try std.testing.expectEqual(LocalAction.kill, current.action);
     try std.testing.expect(current.kill_current);
 
+    const all = try parseLocalOptionsWithCompatMode(&.{
+        "sesshmux",
+        "kill",
+        "--all",
+    }, false);
+    try std.testing.expectEqual(LocalAction.kill_all, all.action);
+
     try std.testing.expectError(error.MissingKillTarget, parseLocalOptionsWithCompatMode(&.{
         "sesshmux",
-        ".",
         "kill",
     }, true));
+}
+
+test "parseLocalOptions supports kill request mode" {
+    const request_json = "{\"guid\":\"s-00000000-0000-4000-8000-000000000001\",\"requested_age_ms\":123}";
+    const request = try parseLocalOptions(&.{
+        "sesshmux",
+        "kill",
+        "--jsonl",
+        "--request",
+        request_json,
+    });
+    try std.testing.expectEqual(LocalAction.kill, request.action);
+    try std.testing.expect(request.kill_jsonl);
+    try std.testing.expectEqual(@as(usize, 2), request.kill_request_args.len);
+    try std.testing.expectEqualStrings("--request", request.kill_request_args[0]);
+    try std.testing.expectEqualStrings(request_json, request.kill_request_args[1]);
+
+    try std.testing.expectError(error.MultipleTargets, parseLocalOptions(&.{
+        "sesshmux",
+        "kill",
+        "--request",
+        request_json,
+        "s-00000000-0000-4000-8000-000000000001",
+    }));
 }
 
 pub fn startNewSessionOnRuntime(

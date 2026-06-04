@@ -67,6 +67,14 @@ fn runMain() !void {
         return broker.run(allocator, args[0], args[2..]);
     }
 
+    if (std.mem.eql(u8, args[1], ":internal-control:")) {
+        if (args.len != 2) {
+            try io.writeAll(2, "sessh: :internal-control: does not accept arguments\n");
+            return process_exit.request(64);
+        }
+        return broker.runControl(allocator);
+    }
+
     if (std.mem.eql(u8, args[1], ":internal-stream-broker:")) {
         return stream_agent.runBroker(allocator, args[0], args[2..]);
     }
@@ -252,6 +260,7 @@ test {
     _ = @import("broker.zig");
     _ = @import("proxy_control.zig");
     _ = @import("client_renderer.zig");
+    _ = @import("mux_cli.zig");
     _ = @import("pty_process.zig");
     _ = @import("process_exit.zig");
     _ = @import("runtime_refresher.zig");
