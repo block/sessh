@@ -1702,6 +1702,9 @@ fn acceptRemoteHandshake(session_agent: *SessionAgent, fd: c.fd_t) !HandshakeRes
         });
         return .mismatch;
     }
+    const host_guid = try session_registry.ensureHostGuid(app_allocator.allocator());
+    defer app_allocator.allocator().free(host_guid);
+    try protocol.sendHostGuid(fd, host_guid);
     return .accepted;
 }
 

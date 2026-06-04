@@ -83,15 +83,13 @@ time, end reason, expiration time, and exit or signal status when available.
 The expiration time is derived from the `tombstone-hours` value recorded in the
 route when the agent was created.
 
-Queued remote cleanup lives beside tombstones under `pending/`. Each resolved
-ssh endpoint gets a directory. Sessh asks `ssh -G` for the endpoint name and
-port so aliases that resolve to the same place share cleanup. Safe endpoint
-names use a readable `<name>-<port>` directory; unsafe names fall back to
-`:<sha256(name, port)>`. The directory has a `meta.json` with `name` and
-`port`, and entries inside are one JSON file per request, such as
+Queued remote cleanup lives beside tombstones under `pending/`. Each remote
+sessh host gets a directory named by the `h-` GUID stored in that host's state
+directory. The directory has a `meta.json` with the best-known connection
+`name` and `port`, and entries inside are one JSON file per request, such as
 `kill-s-<guid>.json` or `kill-p-<guid>.json`. The filename deduplicates
 repeated requests without any enqueue-time lock. Entry JSON has a local `type`
 field so future clients can add other bookkeeping. Today `type: "kill"` entries
-contain the resolved host, port, an `s-` session or `p-` proxy-stream GUID, and
-when the kill was requested. The client draining a host takes that host
-directory's lock and removes only the request files it handled.
+contain the host GUID, best-known host and port, an `s-` session or `p-`
+proxy-stream GUID, and when the kill was requested. The client draining a host
+takes that host directory's lock and removes only the request files it handled.

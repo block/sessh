@@ -1106,40 +1106,29 @@ def pending_dir(env):
     return state_root(env) / "pending"
 
 
-def pending_host_dir_name(host, port="22"):
-    if (
-        host
-        and len(host) <= 160
-        and not host.startswith(".")
-        and all(ch.isalnum() or ch in "._-@+%" for ch in host)
-        and port.isdigit()
-        and int(port) > 0
-        and int(port) <= 65535
-    ):
-        return f"{host}-{port}"
-    digest = hashlib.sha256(host.encode("utf-8") + b"\0" + port.encode("utf-8")).hexdigest()
-    return f":{digest}"
+DEFAULT_HOST_GUID = "h-00000000-0000-4000-8000-000000000001"
 
 
-def pending_host_dir(env, host, port="22"):
-    return pending_dir(env) / pending_host_dir_name(host, port)
+def pending_host_dir(env, host_guid):
+    return pending_dir(env) / host_guid
 
 
-def pending_entry_for_host_guid(env, host, guid, port="22"):
-    return pending_host_dir(env, host, port) / f"kill-{guid}.json"
+def pending_entry_for_host_guid(env, host_guid, guid):
+    return pending_host_dir(env, host_guid) / f"kill-{guid}.json"
 
 
-def write_pending_kills(env, host, guids, requested_at_unix_ms=None, port="22"):
-    host_dir = pending_host_dir(env, host, port)
+def write_pending_kills(env, host, guids, requested_at_unix_ms=None, port="22", host_guid=DEFAULT_HOST_GUID):
+    host_dir = pending_host_dir(env, host_guid)
     host_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (host_dir / "meta.json").write_text(json.dumps({"name": host, "port": port}, separators=(",", ":")) + "\n")
+    (host_dir / "meta.json").write_text(json.dumps({"guid": host_guid, "name": host, "port": port}, separators=(",", ":")) + "\n")
     if requested_at_unix_ms is None:
         requested_at_unix_ms = int(time.time() * 1000)
     first_path = None
     for guid in guids:
-        path = pending_entry_for_host_guid(env, host, guid, port)
+        path = pending_entry_for_host_guid(env, host_guid, guid)
         row = {
             "type": "kill",
+            "host_guid": host_guid,
             "host": host,
             "port": port,
             "guid": guid,
@@ -1247,7 +1236,7 @@ def ensure_alias(env, alias, guid=None):
     alias_path.symlink_to(Path("../guid") / guid)
 
 
-def write_ssh_route(env, alias, guid, host, ssh_options=(), detached_at_unix_ms=None, resolved_host=None, port="22"):
+def write_ssh_route(env, alias, guid, host, ssh_options=(), detached_at_unix_ms=None, resolved_host=None, port="22", host_guid=DEFAULT_HOST_GUID):
     guid = canonical_guid(guid)
     ensure_alias(env, alias, guid)
     session = state_sessions_dir(env) / guid
@@ -1259,6 +1248,7 @@ def write_ssh_route(env, alias, guid, host, ssh_options=(), detached_at_unix_ms=
                 "guid": guid,
                 "primary_alias": alias,
                 "session_dir": str(remote_session_dir),
+                "host_guid": host_guid,
                 "host": host,
                 "resolved_host": resolved_host or host,
                 "port": port,
@@ -3208,7 +3198,7 @@ def test_mux_new_detached_creates_remote_route_without_attach(tmp):
         raise AssertionError(attached)
 
 
-def test_mux_new_detached_records_resolved_ssh_endpoint(tmp):
+def test_mux_new_detached_records_remote_host_identity(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -3238,6 +3228,8 @@ def test_mux_new_detached_records_resolved_ssh_endpoint(tmp):
     if route.get("host") != "alias-host":
         raise AssertionError(route)
     if route.get("resolved_host") != "resolved.example" or route.get("port") != "2200":
+        raise AssertionError(route)
+    if not str(route.get("host_guid", "")).startswith("h-"):
         raise AssertionError(route)
     run_sesshmux(["kill", "alias-host", guid], env, timeout=30.0)
 
@@ -3479,7 +3471,11 @@ def test_ssh_list_refresh_drains_pending_session_kill(tmp):
     if created.returncode != 0 or not created.stdout.startswith("CREATED s-"):
         raise AssertionError(created)
     guid = created.stdout.strip().split()[-1]
-    pending = write_pending_kills(env, "test-host", [guid])
+    route = json.loads((state_sessions_dir(env) / guid / "route.json").read_text())
+    host_guid = route.get("host_guid")
+    if not host_guid:
+        raise AssertionError(route)
+    pending = write_pending_kills(env, "test-host", [guid], host_guid=host_guid)
 
     listed = run_sesshmux(["list", "--refresh", "--exited", "--jsonl"], env, timeout=30.0)
 
@@ -3522,8 +3518,12 @@ def test_ssh_list_refresh_skips_pending_session_kill_after_attach(tmp):
     if created.returncode != 0 or not created.stdout.startswith("CREATED s-"):
         raise AssertionError(created)
     guid = created.stdout.strip().split()[-1]
+    route = json.loads((state_sessions_dir(env) / guid / "route.json").read_text())
+    host_guid = route.get("host_guid")
+    if not host_guid:
+        raise AssertionError(route)
     requested_at_unix_ms = int(time.time() * 1000)
-    pending = write_pending_kills(env, "test-host", [guid], requested_at_unix_ms=requested_at_unix_ms)
+    pending = write_pending_kills(env, "test-host", [guid], requested_at_unix_ms=requested_at_unix_ms, host_guid=host_guid)
     time.sleep(0.05)
 
     try:
@@ -5203,8 +5203,8 @@ def main(argv=None):
             test_mux_new_detached_creates_remote_route_without_attach,
         ),
         (
-            "mux new detached records resolved ssh endpoint",
-            test_mux_new_detached_records_resolved_ssh_endpoint,
+            "mux new detached records remote host identity",
+            test_mux_new_detached_records_remote_host_identity,
         ),
         (
             "ssh no-host attach uses local route",

@@ -52,7 +52,17 @@ message Frame {
     ProxyControlCapabilities proxy_control_capabilities = 48;
     ProxyControlDiagnostic proxy_control_diagnostic = 49;
     ProxyControlCtrlR proxy_control_ctrl_r = 50;
+    HostGuid host_guid = 51;
   }
+}
+
+// Connection-level identity for the sessh host on the sending side.
+//
+// On runtime transports this is the first regular Frame sent by the remote
+// immediately after the HelloFrame exchange is accepted. Proxy-stream transports
+// do not currently run HelloFrame, so they send HostGuid before ProxyStreamResume.
+message HostGuid {
+  string host_guid = 1;
 }
 
 // Sent at the start of every ssh transport that carries an opaque proxy stream.

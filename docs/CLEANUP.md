@@ -62,7 +62,7 @@ connection in response to a signal like SIGTERM.
 Before exiting the client process, we make a best effort to kill the remote
 agent, but we only wait 100ms in order to keep things snappy. If we don't get
 an ACK in time, we write one pending request file under the pending directory
-for the resolved ssh endpoint. The filename contains the target guid, so
+for the remote host GUID. The filename contains the target guid, so
 enqueue naturally deduplicates without taking a lock or rewriting shared state.
 
 When running `list --refresh`, we'll ask each reachable host for its live
@@ -72,12 +72,14 @@ decline the stale kill and the local client can drop the pending row without
 tombstoning the session. We use advisory file-locking so simultaneous refreshes
 do not all attempt the same kill work.
 
-The pending directory for a host is keyed by the endpoint name and port reported
-by `ssh -G`. Safe names are readable; unsafe names fall back to a `:`-prefixed
-SHA-256 digest. A `meta.json` records the endpoint `name` and `port`; action
-files ignore it. Request files are currently named `kill-s-<guid>.json` or
+The pending directory for a host is keyed by an `h-` GUID reported by the
+remote agent. The remote stores that GUID in its state directory, so different
+local aliases, config files, or client machines can still agree that they are
+talking to the same sessh host. A `meta.json` records the best-known connection
+`name` and `port`; action files ignore it except as a fallback when there is no
+cached route. Request files are currently named `kill-s-<guid>.json` or
 `kill-p-<guid>.json`. Each entry has a local `type` field, currently `kill`,
-plus the guid and the time at which kill was requested.
+plus the host GUID, target guid, and the time at which kill was requested.
 
 We kill by invoking `sesshmux kill --jsonl --request {...} --request {...} ...`.
 The local client converts the recorded request time into a request age before

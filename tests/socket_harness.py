@@ -58,6 +58,7 @@ SESSION_CLIENT_DETACH_REQUEST = "te_session_client_detach_request"
 SESSION_CLIENT_REPAINT_REQUEST = "te_session_client_repaint_request"
 SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST = "te_session_client_debug_sever_connection_request"
 SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST = "te_session_client_debug_unresponsive_connection_request"
+HOST_GUID = "host_guid"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -86,6 +87,7 @@ _FRAME_FIELDS = {
     SESSION_CLIENT_REPAINT_REQUEST: SESSION_CLIENT_REPAINT_REQUEST,
     SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
     SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST,
+    HOST_GUID: HOST_GUID,
 }
 
 
@@ -1240,6 +1242,13 @@ def send_hello(conn, major_delta=0, minor_delta=0, version_override=None, expect
     if peer.protocol_major != major or peer.protocol_minor != minor or peer.version != version:
         raise AssertionError(f"unexpected peer HELLO_REQUEST: {peer!r}")
     send_frame(conn, HELLO_OK, sessh_hpb().HelloOk().SerializeToString())
+    message_type, payload = recv_frame(conn)
+    if message_type != HOST_GUID:
+        raise AssertionError(f"expected HOST_GUID, got {message_type}")
+    host_guid = sessh_pb().HostGuid()
+    host_guid.ParseFromString(payload)
+    if not host_guid.host_guid.startswith("h-"):
+        raise AssertionError(f"unexpected HOST_GUID: {host_guid!r}")
     return message_type, payload
 
 

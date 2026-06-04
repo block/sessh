@@ -316,13 +316,22 @@ pub const CreatedSession = struct {
     guid: []u8,
     alias: []u8,
     session_dir: []u8,
+    host_guid: []u8,
 
     pub fn deinit(self: *CreatedSession) void {
         const allocator = app_allocator.allocator();
+        allocator.free(self.host_guid);
         allocator.free(self.session_dir);
         allocator.free(self.alias);
         allocator.free(self.guid);
         self.* = undefined;
+    }
+
+    fn setHostGuid(self: *CreatedSession, host_guid: []const u8) !void {
+        if (!session_registry.isValidHostGuid(host_guid)) return error.InvalidHostGuid;
+        const copy = try app_allocator.allocator().dupe(u8, host_guid);
+        app_allocator.allocator().free(self.host_guid);
+        self.host_guid = copy;
     }
 };
 
@@ -504,6 +513,8 @@ pub const RuntimeSession = struct {
 
     guid: [session_registry.session_guid_len]u8 = [_]u8{0} ** session_registry.session_guid_len,
     guid_len: usize = 0,
+    host_guid: [session_registry.host_guid_len]u8 = [_]u8{0} ** session_registry.host_guid_len,
+    host_guid_len: usize = 0,
     client_guid: [session_registry.client_guid_len]u8 = [_]u8{0} ** session_registry.client_guid_len,
     client_guid_len: usize = 0,
     primary_alias: [128]u8 = [_]u8{0} ** 128,
@@ -572,6 +583,10 @@ pub const RuntimeSession = struct {
         return self.guid[0..self.guid_len];
     }
 
+    pub fn hostGuidSlice(self: *const RuntimeSession) []const u8 {
+        return self.host_guid[0..self.host_guid_len];
+    }
+
     pub fn clientGuidSlice(self: *const RuntimeSession) []const u8 {
         return self.client_guid[0..self.client_guid_len];
     }
@@ -599,6 +614,17 @@ pub const RuntimeSession = struct {
         if (client_guid.len > self.client_guid.len) return error.ClientGuidTooLarge;
         @memcpy(self.client_guid[0..client_guid.len], client_guid);
         self.client_guid_len = client_guid.len;
+    }
+
+    pub fn setHostGuid(self: *RuntimeSession, host_guid: []const u8) !void {
+        if (host_guid.len == 0) {
+            self.host_guid_len = 0;
+            return;
+        }
+        if (!session_registry.isValidHostGuid(host_guid)) return error.InvalidHostGuid;
+        if (host_guid.len > self.host_guid.len) return error.HostGuidTooLarge;
+        @memcpy(self.host_guid[0..host_guid.len], host_guid);
+        self.host_guid_len = host_guid.len;
     }
 
     pub fn setSessionDir(self: *RuntimeSession, session_dir: []const u8) !void {
@@ -681,10 +707,15 @@ pub fn recordRuntimeSessionKillRequested(allocator: std.mem.Allocator, host: []c
     if (host.len == 0 or std.mem.eql(u8, host, ".")) return;
     var route = session_registry.readRouteForRef(allocator, session.guidSlice()) catch null;
     defer if (route) |*value| value.deinit(allocator);
+    const pending_host_guid = if (route) |*value| value.host_guid else session.hostGuidSlice();
+    if (pending_host_guid.len == 0) {
+        client_log.debug("event=pending_kill_queue_skipped_missing_host_guid host={s} session={s}", .{ host, session.guidSlice() });
+        return;
+    }
     const pending_host = if (route) |*value| value.resolved_host else host;
     const pending_port = if (route) |*value| value.port else session_registry.default_pending_port;
-    session_registry.queuePendingKill(allocator, pending_host, pending_port, session.guidSlice()) catch |err| {
-        client_log.debug("event=pending_kill_queue_failed host={s} port={s} session={s} error={t}", .{ pending_host, pending_port, session.guidSlice(), err });
+    session_registry.queuePendingKill(allocator, pending_host_guid, pending_host, pending_port, session.guidSlice()) catch |err| {
+        client_log.debug("event=pending_kill_queue_failed host_guid={s} host={s} port={s} session={s} error={t}", .{ pending_host_guid, pending_host, pending_port, session.guidSlice(), err });
     };
 }
 
@@ -2379,6 +2410,12 @@ test "reconnect waits for repaint response before returning" {
     defer app_allocator.allocator().free(hello_request);
     try protocol.sendFrame(remote_to_client[1], .hello_request, hello_request);
 
+    const host_guid = try protocol.encodePayload(app_allocator.allocator(), pb.HostGuid{
+        .host_guid = "h-550e8400-e29b-41d4-a716-446655440001",
+    });
+    defer app_allocator.allocator().free(host_guid);
+    try protocol.sendFrame(remote_to_client[1], .host_guid, host_guid);
+
     const session_attached = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionAttached{});
     defer app_allocator.allocator().free(session_attached);
     try protocol.sendFrame(remote_to_client[1], .te_session_attached, session_attached);
@@ -3539,9 +3576,15 @@ fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !voi
                         .last_input_at_unix_ms = status.last_input_at_unix_ms,
                     },
                 );
-                continue;
             }
-
+        }
+        try drainPendingRemoteRequests(allocator, exe, route.host, route.ssh_options, route.host_guid);
+        for (routes.items) |*candidate| {
+            if (!sameRouteConnection(route, candidate)) continue;
+            if (!try cachedRouteStillExists(allocator, candidate.guid)) continue;
+            const remote_status = try remoteListStatusForGuid(allocator, stdout, candidate.guid);
+            defer if (remote_status) |status| allocator.free(status.version);
+            if (remote_status != null) continue;
             try session_registry.writeTombstoneForRoute(
                 allocator,
                 candidate,
@@ -3552,7 +3595,6 @@ fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !voi
                 },
             );
         }
-        try drainPendingRemoteRequests(allocator, exe, route.host, route.ssh_options, route.resolved_host, route.port);
     }
     try refreshPendingKillsWithoutCachedRoute(allocator, exe, routes.items);
 }
@@ -3574,6 +3616,9 @@ fn routeConnectionWasAlreadyRefreshed(previous: []const session_registry.Route, 
 }
 
 fn sameRouteConnection(a: *const session_registry.Route, b: *const session_registry.Route) bool {
+    if (a.host_guid.len != 0 and b.host_guid.len != 0) {
+        return std.mem.eql(u8, a.host_guid, b.host_guid);
+    }
     if (!std.mem.eql(u8, a.host, b.host)) return false;
     if (a.ssh_options.len != b.ssh_options.len) return false;
     for (a.ssh_options, b.ssh_options) |a_option, b_option| {
@@ -3586,7 +3631,7 @@ fn refreshPendingKillsWithoutCachedRoute(allocator: std.mem.Allocator, exe: []co
     var pending_hosts = try session_registry.readPendingKillHosts(allocator);
     defer pending_hosts.deinit(allocator);
     for (pending_hosts.hosts) |host| {
-        if (hostMatchesAnyRoute(routes, host.name, host.port)) continue;
+        if (hostMatchesAnyRoute(routes, host.guid)) continue;
         var ssh_options: [2][]const u8 = undefined;
         const options = if (std.mem.eql(u8, host.port, session_registry.default_pending_port))
             &.{}
@@ -3594,13 +3639,13 @@ fn refreshPendingKillsWithoutCachedRoute(allocator: std.mem.Allocator, exe: []co
             ssh_options = .{ "-p", host.port };
             break :blk ssh_options[0..];
         };
-        try drainPendingRemoteRequests(allocator, exe, host.name, options, host.name, host.port);
+        try drainPendingRemoteRequests(allocator, exe, host.name, options, host.guid);
     }
 }
 
-fn hostMatchesAnyRoute(routes: []const session_registry.Route, host: []const u8, port: []const u8) bool {
+fn hostMatchesAnyRoute(routes: []const session_registry.Route, host_guid: []const u8) bool {
     for (routes) |*route| {
-        if (std.mem.eql(u8, route.resolved_host, host) and std.mem.eql(u8, route.port, port)) return true;
+        if (std.mem.eql(u8, route.host_guid, host_guid)) return true;
     }
     return false;
 }
@@ -3679,11 +3724,11 @@ pub fn drainPendingRemoteRequests(
     exe: []const u8,
     host: []const u8,
     ssh_options: []const []const u8,
-    pending_host: []const u8,
-    pending_port: []const u8,
+    pending_host_guid: []const u8,
 ) !void {
     if (host.len == 0 or std.mem.eql(u8, host, ".")) return;
-    var lock = (try session_registry.tryLockPendingKillsForHost(allocator, pending_host, pending_port)) orelse return;
+    if (pending_host_guid.len == 0) return;
+    var lock = (try session_registry.tryLockPendingKillsForHost(allocator, pending_host_guid)) orelse return;
     defer lock.deinit();
     var pending = try lock.read();
     defer pending.deinit(allocator);
@@ -3955,10 +4000,10 @@ fn processKillJsonl(allocator: std.mem.Allocator, host: []const u8, stdout: []co
                     client_log.debug("event=pending_kill_tombstone_failed host={s} session={s} error={t}", .{ host, guid, err });
                 };
             }
-            try removePendingKillForResult(allocator, host, guid);
+            try removePendingKillForResult(allocator, guid);
         } else if (std.mem.eql(u8, status, "skipped")) {
             if (matches_expected) expected_succeeded = true;
-            try removePendingKillForResult(allocator, host, guid);
+            try removePendingKillForResult(allocator, guid);
         } else if (std.mem.eql(u8, status, "failure")) {
             const reason = jsonStringField(object, "reason") orelse "unknown";
             client_log.userDiagnosticInfo("pending kill failed for {s}: {s}", .{ guid, reason });
@@ -3967,13 +4012,12 @@ fn processKillJsonl(allocator: std.mem.Allocator, host: []const u8, stdout: []co
     return expected_seen and expected_succeeded;
 }
 
-fn removePendingKillForResult(allocator: std.mem.Allocator, fallback_host: []const u8, guid: []const u8) !void {
-    if (fallback_host.len == 0 or std.mem.eql(u8, fallback_host, ".")) return;
+fn removePendingKillForResult(allocator: std.mem.Allocator, guid: []const u8) !void {
     var route = session_registry.readRouteForRef(allocator, guid) catch null;
     defer if (route) |*value| value.deinit(allocator);
-    const pending_host = if (route) |*value| value.resolved_host else fallback_host;
-    const pending_port = if (route) |*value| value.port else session_registry.default_pending_port;
-    try session_registry.removePendingKill(allocator, pending_host, pending_port, guid);
+    const pending_host_guid = if (route) |*value| value.host_guid else return;
+    if (pending_host_guid.len == 0) return;
+    try session_registry.removePendingKill(allocator, pending_host_guid, guid);
 }
 
 const RemoteListStatus = struct {
@@ -4616,6 +4660,7 @@ pub fn startNewSessionOnRuntime(
     const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid, client_guid, "");
     var session = try readRuntimeSession(read_fd);
     try session.setClientGuid(client_guid);
+    try session.setHostGuid(created.host_guid);
     session.viewport_offset = viewport_offset orelse 0;
     session.pending_repaint.repaint_request_seq = repaint_request_seq;
     return session;
@@ -4661,11 +4706,11 @@ fn createSessionOnRuntimeWithSize(
     reap_ms: u64,
     tombstone_retention_ms: u64,
 ) !CreatedSession {
-    const peer_protocol = try runtimeHandshakeWithPeerProtocol(read_fd, write_fd);
+    const handshake = try runtimeHandshakeWithPeerProtocol(read_fd, write_fd);
     _ = pending_kill_host;
-    const peer_supports_command_oneof = peerSupportsSessionCreateCommandOneof(peer_protocol);
+    const peer_supports_command_oneof = peerSupportsSessionCreateCommandOneof(handshake.peer_protocol);
     if (shell_command != null and !peer_supports_command_oneof) return error.VersionMismatch;
-    return sendSessionCreateAndReadCreated(
+    var created = try sendSessionCreateAndReadCreated(
         read_fd,
         write_fd,
         size,
@@ -4678,6 +4723,9 @@ fn createSessionOnRuntimeWithSize(
         reap_ms,
         tombstone_retention_ms,
     );
+    errdefer created.deinit();
+    try created.setHostGuid(handshake.hostGuidSlice());
+    return created;
 }
 
 pub fn startAttachSessionOnRuntime(
@@ -4689,13 +4737,14 @@ pub fn startAttachSessionOnRuntime(
     pending_kill_host: ?[]const u8,
 ) !RuntimeSession {
     const viewport_offset = queryInitialViewportOffset();
-    try runtimeHandshake(read_fd, write_fd);
+    const handshake = try runtimeHandshakeResult(read_fd, write_fd);
     _ = pending_kill_host;
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
     defer app_allocator.allocator().free(client_guid);
     const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, client_guid, session_dir);
     var session = try readRuntimeSession(read_fd);
     try session.setClientGuid(client_guid);
+    try session.setHostGuid(handshake.hostGuidSlice());
     session.viewport_offset = viewport_offset orelse 0;
     session.pending_repaint.repaint_request_seq = repaint_request_seq;
     return session;
@@ -4720,6 +4769,7 @@ pub fn ensureLocalRouteForRemoteSession(
         session.guidSlice(),
         alias,
         session.sessionDirSlice(),
+        session.hostGuidSlice(),
         host,
         resolved_host,
         port,
@@ -4753,6 +4803,7 @@ pub fn ensureLocalRouteForCreatedRemoteSession(
         created.guid,
         created.alias,
         created.session_dir,
+        created.host_guid,
         host,
         resolved_host,
         port,
@@ -4862,7 +4913,8 @@ fn reconnectSessionOnRuntimeInner(
     cancelled: ?*const std.atomic.Value(bool),
     wait_for_repaint: bool,
 ) !void {
-    _ = try runtimeHandshakeInner(read_fd, write_fd, cancelled);
+    const handshake = try runtimeHandshakeInner(read_fd, write_fd, cancelled);
+    try session.setHostGuid(handshake.hostGuidSlice());
     try attachReconnectRuntimeInner(read_fd, write_fd, session, cancelled, wait_for_repaint);
 }
 
@@ -5258,6 +5310,7 @@ fn readSessionCreated(read_fd: c.fd_t, write_fd: c.fd_t) !CreatedSession {
                     .guid = try app_allocator.allocator().dupe(u8, message.session_guid),
                     .alias = try app_allocator.allocator().dupe(u8, message.session_alias),
                     .session_dir = try app_allocator.allocator().dupe(u8, message.session_dir),
+                    .host_guid = try app_allocator.allocator().alloc(u8, 0),
                 };
             },
             .ping, .pong => {
@@ -5351,11 +5404,32 @@ const PeerProtocol = struct {
     minor: u32,
 };
 
+const RuntimeHandshakeResult = struct {
+    peer_protocol: PeerProtocol,
+    host_guid: [session_registry.host_guid_len]u8 = [_]u8{0} ** session_registry.host_guid_len,
+    host_guid_len: usize = 0,
+
+    fn setHostGuid(self: *RuntimeHandshakeResult, host_guid: []const u8) !void {
+        if (!session_registry.isValidHostGuid(host_guid)) return error.InvalidHostGuid;
+        if (host_guid.len > self.host_guid.len) return error.HostGuidTooLarge;
+        @memcpy(self.host_guid[0..host_guid.len], host_guid);
+        self.host_guid_len = host_guid.len;
+    }
+
+    fn hostGuidSlice(self: *const RuntimeHandshakeResult) []const u8 {
+        return self.host_guid[0..self.host_guid_len];
+    }
+};
+
 pub fn runtimeHandshake(read_fd: c.fd_t, write_fd: c.fd_t) !void {
-    _ = try runtimeHandshakeInner(read_fd, write_fd, null);
+    _ = try runtimeHandshakeResult(read_fd, write_fd);
 }
 
-fn runtimeHandshakeWithPeerProtocol(read_fd: c.fd_t, write_fd: c.fd_t) !PeerProtocol {
+fn runtimeHandshakeResult(read_fd: c.fd_t, write_fd: c.fd_t) !RuntimeHandshakeResult {
+    return runtimeHandshakeInner(read_fd, write_fd, null);
+}
+
+fn runtimeHandshakeWithPeerProtocol(read_fd: c.fd_t, write_fd: c.fd_t) !RuntimeHandshakeResult {
     return runtimeHandshakeInner(read_fd, write_fd, null);
 }
 
@@ -5363,7 +5437,7 @@ fn runtimeHandshakeInner(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     cancelled: ?*const std.atomic.Value(bool),
-) !PeerProtocol {
+) !RuntimeHandshakeResult {
     try sendHelloRequest(write_fd);
     var hello_error = try readHelloReply(read_fd, cancelled);
     defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
@@ -5376,9 +5450,11 @@ fn runtimeHandshakeInner(
 
     var peer_hello = try readHelloRequest(read_fd, write_fd, cancelled);
     defer peer_hello.deinit(app_allocator.allocator());
-    const peer_protocol = PeerProtocol{
-        .major = peer_hello.protocol_major,
-        .minor = peer_hello.protocol_minor,
+    var result = RuntimeHandshakeResult{
+        .peer_protocol = .{
+            .major = peer_hello.protocol_major,
+            .minor = peer_hello.protocol_minor,
+        },
     };
     if (helloRequestIsCompatible(peer_hello)) {
         try sendHelloOk(write_fd);
@@ -5386,7 +5462,8 @@ fn runtimeHandshakeInner(
         try sendHelloError(write_fd, "VERSION_MISMATCH", "existing remote sessh is incompatible with this client", "");
         return error.VersionMismatch;
     }
-    return peer_protocol;
+    try readHostGuidFrame(read_fd, write_fd, cancelled, &result);
+    return result;
 }
 
 fn peerSupportsSessionCreateCommandOneof(peer: PeerProtocol) bool {
@@ -5462,6 +5539,30 @@ fn readHelloRequest(
                 try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
                 return error.UnexpectedFrame;
             },
+        }
+    }
+}
+
+fn readHostGuidFrame(
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    cancelled: ?*const std.atomic.Value(bool),
+    result: *RuntimeHandshakeResult,
+) !void {
+    while (true) {
+        var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .host_guid => {
+                var message = try protocol.decodePayload(pb.HostGuid, app_allocator.allocator(), frame.payload);
+                defer message.deinit(app_allocator.allocator());
+                try result.setHostGuid(message.host_guid);
+                return;
+            },
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
+            },
+            else => return error.UnexpectedFrame,
         }
     }
 }

@@ -2022,6 +2022,9 @@ fn acceptRuntimeHandshake(allocator: std.mem.Allocator, read_fd: c.fd_t, write_f
         if (std.mem.eql(u8, err.code, "VERSION_MISMATCH")) return error.VersionMismatch;
         return error.HandshakeFailed;
     }
+    const host_guid = try session_registry.ensureHostGuid(allocator);
+    defer allocator.free(host_guid);
+    try protocol.sendHostGuid(write_fd, host_guid);
     return .accepted;
 }
 
@@ -2040,6 +2043,16 @@ fn initiateRuntimeHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
         return error.VersionMismatch;
     }
     try sendHelloOk(fd);
+    try readHostGuidFrame(allocator, fd);
+}
+
+fn readHostGuidFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    var frame = try protocol.readFrameAlloc(allocator, fd);
+    defer frame.deinit(allocator);
+    if (frame.message_type != .host_guid) return error.UnexpectedFrame;
+    var message = try protocol.decodePayload(pb.HostGuid, allocator, frame.payload);
+    defer message.deinit(allocator);
+    if (!session_registry.isValidHostGuid(message.host_guid)) return error.InvalidHostGuid;
 }
 
 fn readHelloRequest(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !hpb.HelloRequest {
