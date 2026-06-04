@@ -28,14 +28,13 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     if (handshake_result == .mismatch) return;
 
     while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, 0);
+        var frame = protocol.readFrameAlloc(allocator, 0) catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return err,
+        };
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .te_resize => continue,
-            .pending_kill_request => {
-                try handlePendingKillRequest(allocator, frame.payload);
-                continue;
-            },
             .te_session_attach => {
                 const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
                     error.NoSessions => {
@@ -100,102 +99,16 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
         return process_exit.request(exit_status);
     }
     if (std.mem.eql(u8, command, "kill")) {
-        if (args.len == 1) {
-            return finishCommand(64, "", "ERROR kill requires --all, a guid, or --current\n");
-        }
-        if (args.len != 2) return finishCommand(64, "", "ERROR usage: kill --all | kill ID | kill --current\n");
-        if (std.mem.eql(u8, args[1], "--all")) return killAllAgents(allocator);
-        if (std.mem.eql(u8, args[1], "--current")) return killCurrentAgent(allocator);
-        if (std.mem.startsWith(u8, args[1], "--")) return finishCommand(64, "", "ERROR usage: kill --all | kill ID | kill --current\n");
-        return killOneAgent(allocator, args[1]);
+        const options = parseKillOptions(args) catch {
+            return finishCommand(64, "", "ERROR usage: kill [--jsonl] (--all | --current | ID...)\n");
+        };
+        return killAgents(allocator, options);
     }
     if (isClientControlCommandName(command)) {
         const client_command = parseClientControlCommand(args) catch return finishCommand(64, "", "ERROR usage: detach|repaint|debug [options] ID\n");
         return runClientControlCommand(allocator, client_command);
     }
     return finishCommand(64, "", "ERROR unknown broker command\n");
-}
-
-fn handlePendingKillRequest(allocator: std.mem.Allocator, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.PendingKillRequest, allocator, payload);
-    defer request.deinit(allocator);
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const response_allocator = arena.allocator();
-    const response = pendingKillTarget(response_allocator, request.guid) catch |err| pb.PendingKillResponse{
-        .guid = request.guid,
-        .result = .{ .failure = .{ .reason = @errorName(err) } },
-    };
-    const response_payload = try protocol.encodePayload(allocator, response);
-    defer allocator.free(response_payload);
-    try protocol.sendFrame(1, .pending_kill_response, response_payload);
-}
-
-fn pendingKillTarget(allocator: std.mem.Allocator, guid: []const u8) !pb.PendingKillResponse {
-    if (session_registry.isValidSessionGuid(guid)) return pendingKillSession(allocator, guid);
-    if (session_registry.isValidProxyGuid(guid)) return pendingKillProxyStream(allocator, guid);
-    return error.InvalidPendingKillGuid;
-}
-
-fn pendingKillSession(allocator: std.mem.Allocator, guid: []const u8) !pb.PendingKillResponse {
-    var paths = pathsForLocalSessionRef(allocator, guid) catch |err| switch (err) {
-        error.FileNotFound, error.SessionAlreadyExited => return pb.PendingKillResponse{
-            .guid = guid,
-            .result = .{ .missing = .{} },
-        },
-        else => return err,
-    };
-    defer paths.deinit(allocator);
-
-    const fd = socket_transport.connectSocket(paths.socket) catch |err| switch (err) {
-        error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => return pb.PendingKillResponse{
-            .guid = guid,
-            .result = .{ .missing = .{} },
-        },
-        else => return err,
-    };
-    defer _ = c.close(fd);
-
-    try initiateRuntimeHandshake(allocator, fd);
-    try sendPendingKillRequestFrame(allocator, fd, guid);
-    return readPendingKillResponseFrame(allocator, fd);
-}
-
-fn pendingKillProxyStream(allocator: std.mem.Allocator, guid: []const u8) !pb.PendingKillResponse {
-    var socket_paths = session_registry.runtimeAgentSocketPathsForGuid(allocator, guid) catch |err| switch (err) {
-        error.InvalidProxyId => return err,
-        else => return pb.PendingKillResponse{
-            .guid = guid,
-            .result = .{ .missing = .{} },
-        },
-    };
-    defer socket_paths.deinit(allocator);
-
-    const fd = socket_transport.connectSocket(socket_paths.socket) catch |err| switch (err) {
-        error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => return pb.PendingKillResponse{
-            .guid = guid,
-            .result = .{ .missing = .{} },
-        },
-        else => return err,
-    };
-    defer _ = c.close(fd);
-
-    try sendPendingKillRequestFrame(allocator, fd, guid);
-    return readPendingKillResponseFrame(allocator, fd);
-}
-
-fn sendPendingKillRequestFrame(allocator: std.mem.Allocator, fd: c.fd_t, guid: []const u8) !void {
-    const payload = try protocol.encodePayload(allocator, pb.PendingKillRequest{ .guid = guid });
-    defer allocator.free(payload);
-    try protocol.sendFrame(fd, .pending_kill_request, payload);
-}
-
-fn readPendingKillResponseFrame(allocator: std.mem.Allocator, fd: c.fd_t) !pb.PendingKillResponse {
-    var frame = try protocol.readFrameAlloc(allocator, fd);
-    defer frame.deinit(allocator);
-    if (frame.message_type != .pending_kill_response) return error.UnexpectedFrame;
-    return protocol.decodePayload(pb.PendingKillResponse, allocator, frame.payload);
 }
 
 fn isClientControlCommandName(command: []const u8) bool {
@@ -236,6 +149,31 @@ const ListOptions = struct {
     all: bool = false,
     local_only: bool = false,
     client_selector: ClientListSelector = .none,
+};
+
+const KillFormat = enum {
+    text,
+    jsonl,
+};
+
+const KillOptions = struct {
+    format: KillFormat = .text,
+    all: bool = false,
+    current: bool = false,
+    targets: []const []const u8 = &.{},
+};
+
+const KillStatus = enum {
+    killed,
+    missing,
+    failure,
+};
+
+const KillResult = struct {
+    guid: []const u8,
+    status: KillStatus,
+    ended_at_unix_ms: ?u64 = null,
+    reason: []const u8 = "",
 };
 
 const ClientControlTarget = struct {
@@ -339,6 +277,39 @@ fn parseListOptions(args: []const []const u8) !ListOptions {
     }
     if (options.client_selector != .none and (options.mode == .exited or options.local_only)) return error.InvalidListArgs;
     if (options.all and (options.mode == .exited or options.client_selector != .none)) return error.InvalidListArgs;
+    return options;
+}
+
+fn parseKillOptions(args: []const []const u8) !KillOptions {
+    var options = KillOptions{};
+    var targets_start: ?usize = null;
+    var i: usize = 1;
+    while (i < args.len) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--jsonl")) {
+            options.format = .jsonl;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--all")) {
+            if (options.all or options.current or targets_start != null) return error.InvalidKillArgs;
+            options.all = true;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--current")) {
+            if (options.all or options.current or targets_start != null) return error.InvalidKillArgs;
+            options.current = true;
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.InvalidKillArgs;
+        } else {
+            if (options.all or options.current) return error.InvalidKillArgs;
+            targets_start = i;
+            i = args.len;
+        }
+    }
+    if (targets_start) |start| options.targets = args[start..];
+    const target_modes: u8 = (if (options.all) @as(u8, 1) else 0) +
+        (if (options.current) @as(u8, 1) else 0) +
+        (if (options.targets.len > 0) @as(u8, 1) else 0);
+    if (target_modes != 1) return error.MissingKillTarget;
     return options;
 }
 
@@ -723,6 +694,7 @@ fn tombstoneDisplayId(allocator: std.mem.Allocator, tombstone: *const session_re
 
 fn formatTombstoneStatus(buf: []u8, tombstone: *const session_registry.Tombstone) []const u8 {
     if (tombstone.end_reason == .killed_by_request) return "KILLED";
+    if (tombstone.end_reason == .disconnected_timeout) return "DISCONNECTED TIMEOUT";
     if (tombstone.exit_status) |status| {
         return switch (status.kind) {
             .exited => std.fmt.bufPrint(buf, "EXIT {}", .{status.status}) catch "UNKNOWN",
@@ -1308,13 +1280,49 @@ fn writeCommandErrorForAgentFailure(err: anyerror) !void {
     try io.writeAll(2, message);
 }
 
-fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
+fn killAgents(allocator: std.mem.Allocator, options: KillOptions) !void {
+    if (options.all) return killAllAgents(allocator, options.format);
+    if (options.current) {
+        const session_id = currentSessionId(allocator) catch |err| switch (err) {
+            error.MissingCurrentSession => return finishCommand(64, "", "ERROR --current requires $SESSH_GUID\n"),
+            else => return err,
+        };
+        defer allocator.free(session_id);
+        const result = try killTarget(allocator, session_id);
+        return finishKillResults(allocator, options.format, &.{result});
+    }
+
+    var results: std.ArrayList(KillResult) = .empty;
+    defer results.deinit(allocator);
+    for (options.targets) |target| {
+        const result = killTarget(allocator, target) catch |err| KillResult{
+            .guid = target,
+            .status = .failure,
+            .reason = @errorName(err),
+        };
+        try results.append(allocator, result);
+    }
+    return finishKillResults(allocator, options.format, results.items);
+}
+
+fn currentSessionId(allocator: std.mem.Allocator) ![]u8 {
+    const session_id = std.process.getEnvVarOwned(allocator, config.session_guid_env) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return error.MissingCurrentSession,
+        else => return err,
+    };
+    return session_id;
+}
+
+fn killTarget(allocator: std.mem.Allocator, target: []const u8) !KillResult {
+    if (session_registry.isValidProxyGuid(target)) return killProxyTarget(allocator, target);
+    return killSessionTarget(allocator, target);
+}
+
+fn killSessionTarget(allocator: std.mem.Allocator, session_id: []const u8) !KillResult {
     var paths = pathsForLocalSessionRef(allocator, session_id) catch |err| switch (err) {
-        error.SessionAlreadyExited => {
-            return finishCommand(1, "", "ERROR session already exited\n");
-        },
-        error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => {
-            return finishCommand(1, "", "ERROR session not found\n");
+        error.SessionAlreadyExited, error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => return .{
+            .guid = session_id,
+            .status = .missing,
         },
         else => return err,
     };
@@ -1322,33 +1330,113 @@ fn killOneAgent(allocator: std.mem.Allocator, session_id: []const u8) !void {
 
     var meta = session_registry.readMeta(allocator, paths) catch {
         session_registry.removeStaleHints(paths) catch {};
-        return finishCommand(1, "", "ERROR session not found\n");
+        return .{
+            .guid = session_id,
+            .status = .missing,
+        };
     };
     defer meta.deinit(allocator);
     if (!processExists(meta.agent_pid)) {
         session_registry.removeStaleHints(paths) catch {};
-        return finishCommand(1, "", "ERROR session not found\n");
+        return .{
+            .guid = session_id,
+            .status = .missing,
+        };
     }
     if (!std.mem.eql(u8, meta.version, config.version)) {
-        const session_guid = std.fs.path.basename(paths.dir);
-        const exit_status = try runCompatCommand(allocator, paths, session_guid, &.{ "kill", session_guid });
-        return process_exit.request(exit_status);
+        return .{
+            .guid = session_id,
+            .status = .failure,
+            .reason = "VersionMismatch",
+        };
     }
     if (!terminateAgent(meta.agent_pid)) {
-        return finishCommand(1, "", "ERROR failed to kill session agent\n");
+        return .{
+            .guid = session_id,
+            .status = .failure,
+            .reason = "KillFailed",
+        };
     }
-    var stdout_buf: [128]u8 = undefined;
-    const stdout = try std.fmt.bufPrint(&stdout_buf, "ENDED {s}\n", .{session_id});
-    return finishCommand(0, stdout, "");
+    return .{
+        .guid = session_id,
+        .status = .killed,
+        .ended_at_unix_ms = nowUnixMs(),
+    };
 }
 
-fn killCurrentAgent(allocator: std.mem.Allocator) !void {
-    const session_id = std.process.getEnvVarOwned(allocator, config.session_guid_env) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return finishCommand(64, "", "ERROR --current requires $SESSH_GUID\n"),
-        else => return err,
+fn killProxyTarget(allocator: std.mem.Allocator, guid: []const u8) !KillResult {
+    var socket_paths = session_registry.runtimeAgentSocketPathsForGuid(allocator, guid) catch return .{
+        .guid = guid,
+        .status = .missing,
     };
-    defer allocator.free(session_id);
-    return killOneAgent(allocator, session_id);
+    defer socket_paths.deinit(allocator);
+    if (!pathExists(socket_paths.socket)) {
+        socket_paths.removeRuntimeFiles();
+        return .{
+            .guid = guid,
+            .status = .missing,
+        };
+    }
+    const meta = session_registry.readRuntimeGuidMeta(allocator, socket_paths.meta) catch {
+        socket_paths.removeRuntimeFiles();
+        return .{
+            .guid = guid,
+            .status = .missing,
+        };
+    };
+    const agent_pid = meta.agent_pid orelse return .{
+        .guid = guid,
+        .status = .failure,
+        .reason = "MissingAgentPid",
+    };
+    if (!processExists(agent_pid)) {
+        socket_paths.removeRuntimeFiles();
+        return .{
+            .guid = guid,
+            .status = .missing,
+        };
+    }
+    if (!terminateAgent(agent_pid)) return .{
+        .guid = guid,
+        .status = .failure,
+        .reason = "KillFailed",
+    };
+    socket_paths.removeRuntimeFiles();
+    return .{
+        .guid = guid,
+        .status = .killed,
+        .ended_at_unix_ms = nowUnixMs(),
+    };
+}
+
+fn finishKillResults(allocator: std.mem.Allocator, format: KillFormat, results: []const KillResult) !void {
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+    const out = stdout.writer(allocator);
+    const err = stderr.writer(allocator);
+    var exit_status: u8 = 0;
+    for (results) |result| {
+        if (result.status != .killed) exit_status = 1;
+        switch (format) {
+            .jsonl => try list_format.writeKillJsonlRow(out, result.guid, killStatusName(result.status), result.ended_at_unix_ms, result.reason),
+            .text => switch (result.status) {
+                .killed => try out.print("ENDED {s}\n", .{result.guid}),
+                .missing => try err.print("ERROR {s} not found\n", .{result.guid}),
+                .failure => try err.print("ERROR failed to kill {s}: {s}\n", .{ result.guid, result.reason }),
+            },
+        }
+    }
+    return finishCommand(exit_status, stdout.items, stderr.items);
+}
+
+fn killStatusName(status: KillStatus) []const u8 {
+    return switch (status) {
+        .killed => "killed",
+        .missing => "missing",
+        .failure => "failure",
+    };
 }
 
 const KillTarget = struct {
@@ -1356,11 +1444,11 @@ const KillTarget = struct {
     agent_pid: c.pid_t,
 };
 
-fn killAllAgents(allocator: std.mem.Allocator) !void {
+fn killAllAgents(allocator: std.mem.Allocator, format: KillFormat) !void {
     const sessions_dir = try session_registry.sessionsDir(allocator);
     defer allocator.free(sessions_dir);
     var dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return finishCommand(0, "KILLING_ALL\n", ""),
+        error.FileNotFound => return finishCommand(0, if (format == .text) "KILLING_ALL\n" else "", ""),
         else => return err,
     };
     defer dir.close();
@@ -1372,6 +1460,8 @@ fn killAllAgents(allocator: std.mem.Allocator) !void {
     }
 
     var exit_status: u8 = 0;
+    var results: std.ArrayList(KillResult) = .empty;
+    defer results.deinit(allocator);
     var iterator = dir.iterate();
     while (try iterator.next()) |entry| {
         if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
@@ -1390,6 +1480,12 @@ fn killAllAgents(allocator: std.mem.Allocator) !void {
         if (!std.mem.eql(u8, meta.version, config.version)) {
             const compat_status = try runCompatCommand(allocator, paths, entry.name, &.{ "kill", entry.name });
             if (compat_status != 0) exit_status = compat_status;
+            try results.append(allocator, .{
+                .guid = entry.name,
+                .status = if (compat_status == 0) .killed else .failure,
+                .ended_at_unix_ms = if (compat_status == 0) nowUnixMs() else null,
+                .reason = if (compat_status == 0) "" else "CompatKillFailed",
+            });
             continue;
         }
         try targets.append(allocator, .{
@@ -1400,17 +1496,35 @@ fn killAllAgents(allocator: std.mem.Allocator) !void {
 
     for (targets.items) |target| {
         if (!signalProcess(target.agent_pid, c.SIG.TERM) and processExists(target.agent_pid)) {
-            try io.writeAll(2, "ERROR failed to signal session agent\n");
+            if (format == .text) try io.writeAll(2, "ERROR failed to signal session agent\n");
             exit_status = 1;
+            try results.append(allocator, .{
+                .guid = target.id,
+                .status = .failure,
+                .reason = "SignalFailed",
+            });
         }
     }
     waitForAgents(targets.items, command_timeout_ms);
     for (targets.items) |target| {
-        if (!processExists(target.agent_pid)) continue;
+        if (!processExists(target.agent_pid)) {
+            try results.append(allocator, .{
+                .guid = target.id,
+                .status = .killed,
+                .ended_at_unix_ms = nowUnixMs(),
+            });
+            continue;
+        }
         _ = signalProcess(target.agent_pid, c.SIG.KILL);
         exit_status = 1;
+        try results.append(allocator, .{
+            .guid = target.id,
+            .status = .failure,
+            .reason = "KillTimeout",
+        });
     }
     waitForAgents(targets.items, 500);
+    if (format == .jsonl) return finishKillResults(allocator, format, results.items);
     try io.writeAll(1, "KILLING_ALL\n");
     return process_exit.request(exit_status);
 }
@@ -1424,6 +1538,13 @@ fn fileExists(path: []const u8) bool {
     const file = std.fs.openFileAbsolute(path, .{}) catch return false;
     file.close();
     return true;
+}
+
+fn pathExists(path: []const u8) bool {
+    const path_z = app_allocator.allocator().dupeZ(u8, path) catch return false;
+    defer app_allocator.allocator().free(path_z);
+    var stat: c.Stat = undefined;
+    return posix.errno(c.fstatat(c.AT.FDCWD, path_z.ptr, &stat, c.AT.SYMLINK_NOFOLLOW)) == .SUCCESS;
 }
 
 fn signalProcess(pid: c.pid_t, signal: u8) bool {

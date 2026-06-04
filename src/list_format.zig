@@ -169,6 +169,22 @@ pub fn writeExitedJsonlRow(
     try writer.writeAll("}\n");
 }
 
+pub fn writeKillJsonlRow(writer: anytype, guid: []const u8, status: []const u8, ended_at_unix_ms: ?u64, reason: []const u8) !void {
+    try writer.writeAll("{\"guid\":");
+    try writeJsonString(writer, guid);
+    try writer.writeAll(",\"status\":");
+    try writeJsonString(writer, status);
+    try writer.writeAll(",\"ended_at_unix_ms\":");
+    if (ended_at_unix_ms) |ts| {
+        try writer.print("{}", .{ts});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"reason\":");
+    try writeJsonString(writer, reason);
+    try writer.writeAll("}\n");
+}
+
 fn writePadded(writer: anytype, value: []const u8, width: usize) !void {
     try writer.writeAll(value);
     var i = value.len;

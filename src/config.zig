@@ -5,6 +5,7 @@ pub const version = "0.7.0-dev";
 pub const default_scrollback_row_count = 2000;
 pub const default_debug_unresponsive_seconds = 10;
 pub const default_filter_level: FilterLevel = .emulated;
+pub const default_max_disconnected_ms: u64 = 0;
 
 pub const session_guid_env = "SESSH_GUID";
 pub const client_version_env = "SESSH_CLIENT_VERSION";

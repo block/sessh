@@ -215,16 +215,6 @@ const StreamState = struct {
         return false;
     }
 
-    fn markKilledComplete(self: *StreamState) void {
-        for (stream_channels) |stream_channel| {
-            const channel_state = self.channel(stream_channel);
-            channel_state.inbound_eof = true;
-            channel_state.outbound_eof = true;
-            channel_state.outbound_eof_sent = true;
-            channel_state.outbound_eof_acked = true;
-            channel_state.outbound.clearRetainingCapacity();
-        }
-    }
 };
 
 fn channelIndex(channel: StreamChannel) usize {
@@ -299,7 +289,6 @@ const StreamAttachmentOptions = struct {
     control_input: ?*StreamInputControl = null,
     replacement_listen_fd: ?c.fd_t = null,
     close_outbound_on_inbound_eof: bool = false,
-    kill_guid: []const u8 = "",
 
     fn sink(self: *const StreamAttachmentOptions, channel: StreamChannel) ChannelSink {
         return self.sinks[channelIndex(channel)];
@@ -924,7 +913,7 @@ const ProxyEndpoint = struct {
         };
     }
 
-    fn attachmentOptions(self: *ProxyEndpoint, listen_fd: c.fd_t, kill_guid: []const u8) StreamAttachmentOptions {
+    fn attachmentOptions(self: *ProxyEndpoint, listen_fd: c.fd_t) StreamAttachmentOptions {
         return .{
             .source_count = 1,
             .sources = .{
@@ -940,7 +929,6 @@ const ProxyEndpoint = struct {
                 break :blk sinks;
             },
             .replacement_listen_fd = listen_fd,
-            .kill_guid = kill_guid,
         };
     }
 
@@ -967,54 +955,7 @@ pub fn runBroker(allocator: std.mem.Allocator, exe: []const u8, args: []const []
 
     const fd = try connectOrStartAgent(allocator, exe, args, socket_paths.socket);
     defer _ = c.close(fd);
-    try relayPendingKillsBeforeStream(allocator, fd);
     try relayRawDuplex(0, 1, fd);
-}
-
-fn relayPendingKillsBeforeStream(allocator: std.mem.Allocator, current_agent_fd: c.fd_t) !void {
-    while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, 0);
-        defer frame.deinit(allocator);
-        if (frame.message_type != .pending_kill_request) {
-            try protocol.sendFrame(current_agent_fd, frame.message_type, frame.payload);
-            return;
-        }
-
-        var request = try protocol.decodePayload(pb.PendingKillRequest, allocator, frame.payload);
-        defer request.deinit(allocator);
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const response_allocator = arena.allocator();
-        const response = pendingKillStreamTarget(response_allocator, request.guid) catch |err| pb.PendingKillResponse{
-            .guid = request.guid,
-            .result = .{ .failure = .{ .reason = @errorName(err) } },
-        };
-        const payload = try protocol.encodePayload(allocator, response);
-        defer allocator.free(payload);
-        try protocol.sendFrame(1, .pending_kill_response, payload);
-    }
-}
-
-fn pendingKillStreamTarget(allocator: std.mem.Allocator, guid: []const u8) !pb.PendingKillResponse {
-    if (!session_registry.isValidProxyGuid(guid)) return pb.PendingKillResponse{
-        .guid = guid,
-        .result = .{ .missing = .{} },
-    };
-    var socket_paths = session_registry.runtimeAgentSocketPathsForGuid(allocator, guid) catch return pb.PendingKillResponse{
-        .guid = guid,
-        .result = .{ .missing = .{} },
-    };
-    defer socket_paths.deinit(allocator);
-    const fd = socket_transport.connectSocket(socket_paths.socket) catch return pb.PendingKillResponse{
-        .guid = guid,
-        .result = .{ .missing = .{} },
-    };
-    defer _ = c.close(fd);
-    try sendStreamMessage(allocator, fd, .pending_kill_request, pb.PendingKillRequest{ .guid = guid });
-    var frame = try protocol.readFrameAlloc(allocator, fd);
-    defer frame.deinit(allocator);
-    if (frame.message_type != .pending_kill_response) return error.StreamUnexpectedFrame;
-    return protocol.decodePayload(pb.PendingKillResponse, allocator, frame.payload);
 }
 
 pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
@@ -1032,6 +973,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
         socket_paths.removeRuntimeFiles();
         socket_paths.deinit(allocator);
     }
+    try session_registry.writeRuntimeAgentPidForGuid(allocator, config.guid, c.getpid());
 
     const listen_fd = try socket_transport.listenSocket(socket_path);
     defer _ = c.close(listen_fd);
@@ -1048,7 +990,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
     }
     while (true) {
         if (attach_fd < 0) {
-            var detached_options = endpoint.attachmentOptions(listen_fd, config.guid);
+            var detached_options = endpoint.attachmentOptions(listen_fd);
             attach_fd = try waitForReplacementWhileDetached(&state, listen_fd, &detached_options);
         }
 
@@ -1056,7 +998,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
             &state,
             attach_fd,
             attach_fd,
-            endpoint.attachmentOptions(listen_fd, config.guid),
+            endpoint.attachmentOptions(listen_fd),
         );
         switch (outcome) {
             .complete => return,
@@ -1191,9 +1133,6 @@ pub fn runLocalStream(
             };
         }
         had_transport = true;
-        drainPendingProxyKillsOverTransport(allocator, transport.readFd(), transport.writeFd(), options.pending_kill_host) catch |err| {
-            client_log.userDiagnosticInfo("pending proxy cleanup failed: {t}", .{err});
-        };
         reconnect_status.flushDiagnostics();
         reconnect_status.clear();
         input_control.status_visible = false;
@@ -1286,19 +1225,11 @@ pub fn runLocalStream(
                     },
                     .kill_detach => {
                         queueLocalPendingKill(options);
-                        sendBestEffortPendingKill(allocator, transport.writeFd(), options.pending_kill_guid);
                         abortTransport(&transport);
                         return 0;
                     },
                     .kill_wait => {
                         queueLocalPendingKill(options);
-                        if (!old_unresponsive) {
-                            waitForLocalPendingKill(allocator, transport.readFd(), transport.writeFd(), options) catch |err| {
-                                client_log.userDiagnosticInfo("pending proxy cleanup confirmation failed: {t}", .{err});
-                            };
-                        } else {
-                            sendBestEffortPendingKill(allocator, transport.writeFd(), options.pending_kill_guid);
-                        }
                         abortTransport(&transport);
                         return 0;
                     },
@@ -1511,11 +1442,6 @@ fn handleFrame(
                 message.offset,
             );
         },
-        .pending_kill_request => {
-            var message = try protocol.decodePayload(pb.PendingKillRequest, state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
-            try handlePendingKillRequest(state, transport_write_fd, options, message.guid);
-        },
         .ping, .pong => {
             _ = protocol.handleTransportControlFrame(mutable.message_type, mutable.payload, transport_write_fd) catch |err| switch (err) {
                 error.WriteFailed => return error.StreamTransportWriteFailed,
@@ -1524,24 +1450,6 @@ fn handleFrame(
         },
         else => return error.StreamUnexpectedFrame,
     }
-}
-
-fn handlePendingKillRequest(
-    state: *StreamState,
-    transport_write_fd: c.fd_t,
-    options: *const StreamAttachmentOptions,
-    guid: []const u8,
-) !void {
-    const matched = options.kill_guid.len > 0 and std.mem.eql(u8, guid, options.kill_guid);
-    const result: pb.PendingKillResponse.result_union = if (matched)
-        .{ .killed = .{ .ended_at_unix_ms = nowUnixMs() } }
-    else
-        .{ .missing = .{} };
-    try sendStreamMessage(state.allocator, transport_write_fd, .pending_kill_response, pb.PendingKillResponse{
-        .guid = guid,
-        .result = result,
-    });
-    if (matched) state.markKilledComplete();
 }
 
 fn handleResumeOffset(state: *StreamState, channel: StreamChannel, offset: u64) !void {
@@ -2052,62 +1960,6 @@ fn queueLocalPendingKill(options: LocalStreamOptions) void {
             err,
         });
     };
-}
-
-fn sendBestEffortPendingKill(allocator: std.mem.Allocator, fd: c.fd_t, guid: []const u8) void {
-    if (guid.len == 0) return;
-    sendStreamMessage(allocator, fd, .pending_kill_request, pb.PendingKillRequest{ .guid = guid }) catch {};
-}
-
-fn waitForLocalPendingKill(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t, options: LocalStreamOptions) !void {
-    if (options.pending_kill_guid.len == 0) return;
-    try sendStreamMessage(allocator, write_fd, .pending_kill_request, pb.PendingKillRequest{ .guid = options.pending_kill_guid });
-
-    while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, read_fd);
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .pending_kill_response => {
-                var response = try protocol.decodePayload(pb.PendingKillResponse, allocator, frame.payload);
-                defer response.deinit(allocator);
-                const done = std.mem.eql(u8, response.guid, options.pending_kill_guid);
-                try processPendingProxyKillResponse(allocator, options.pending_kill_host, response);
-                if (done) return;
-            },
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
-            },
-            else => {},
-        }
-    }
-}
-
-fn drainPendingProxyKillsOverTransport(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t, host: []const u8) !void {
-    if (host.len == 0) return;
-    var pending = session_registry.readPendingKillsForHost(allocator, host) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer pending.deinit(allocator);
-
-    for (pending.guids) |guid| {
-        if (!session_registry.isValidProxyGuid(guid)) continue;
-        try sendStreamMessage(allocator, write_fd, .pending_kill_request, pb.PendingKillRequest{ .guid = guid });
-        var frame = try protocol.readFrameAlloc(allocator, read_fd);
-        defer frame.deinit(allocator);
-        if (frame.message_type != .pending_kill_response) return error.StreamUnexpectedFrame;
-        var response = try protocol.decodePayload(pb.PendingKillResponse, allocator, frame.payload);
-        defer response.deinit(allocator);
-        try processPendingProxyKillResponse(allocator, host, response);
-    }
-}
-
-fn processPendingProxyKillResponse(allocator: std.mem.Allocator, host: []const u8, response: pb.PendingKillResponse) !void {
-    const result = response.result orelse return error.StreamUnexpectedFrame;
-    switch (result) {
-        .killed, .missing => if (host.len > 0) try session_registry.removePendingKill(allocator, host, response.guid),
-        .failure => |failure| client_log.userDiagnosticInfo("pending proxy cleanup failed for {s}: {s}", .{ response.guid, failure.reason }),
-    }
 }
 
 pub const TerminalTitleTracker = struct {

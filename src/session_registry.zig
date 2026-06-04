@@ -635,6 +635,7 @@ fn runtimeGuidTypeFromName(value: []const u8) !RuntimeGuidType {
 pub const RuntimeGuidMeta = struct {
     guid_type: RuntimeGuidType,
     created_at_unix_ms: ?u64,
+    agent_pid: ?c.pid_t = null,
 };
 
 pub fn writeMeta(paths: SessionPaths, agent_pid: c.pid_t, version: []const u8) !void {
@@ -661,14 +662,25 @@ fn writeRuntimeGuidMetaInDir(allocator: std.mem.Allocator, dir: []const u8, guid
 }
 
 fn writeRuntimeGuidMetaPath(allocator: std.mem.Allocator, path: []const u8, guid_type: RuntimeGuidType) !void {
+    return writeRuntimeGuidMetaPathWithPid(allocator, path, guid_type, null);
+}
+
+fn writeRuntimeGuidMetaPathWithPid(allocator: std.mem.Allocator, path: []const u8, guid_type: RuntimeGuidType, agent_pid: ?c.pid_t) !void {
     const created_at_unix_ms = runtimeGuidMetaCreatedAtUnixMs(allocator, path);
+    const existing_agent_pid = if (agent_pid == null) blk: {
+        const meta = readRuntimeGuidMeta(allocator, path) catch break :blk null;
+        break :blk meta.agent_pid;
+    } else null;
+    const output_agent_pid = agent_pid orelse existing_agent_pid;
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     const writer = text.writer(allocator);
-    try writer.print(
-        "{{\"type\":{f},\"created_at_unix_ms\":{}}}\n",
-        .{ std.json.fmt(runtimeGuidTypeName(guid_type), .{}), created_at_unix_ms },
-    );
+    try writer.print("{{\"type\":{f},\"created_at_unix_ms\":{}", .{
+        std.json.fmt(runtimeGuidTypeName(guid_type), .{}),
+        created_at_unix_ms,
+    });
+    if (output_agent_pid) |pid| try writer.print(",\"agent_pid\":{}", .{pid});
+    try writer.writeAll("}\n");
     try writeAtomicFile(path, text.items);
 }
 
@@ -704,6 +716,7 @@ pub fn readRuntimeGuidMeta(allocator: std.mem.Allocator, path: []const u8) !Runt
     return .{
         .guid_type = guid_type,
         .created_at_unix_ms = try jsonOptionalU64(object, "created_at_unix_ms"),
+        .agent_pid = if (object.get("agent_pid")) |value| try jsonPid(value) else null,
     };
 }
 
@@ -754,6 +767,7 @@ pub const TombstoneEndReason = enum {
     process_exited,
     killed_by_request,
     agent_shutdown,
+    disconnected_timeout,
 };
 
 pub const TombstoneExitStatusKind = enum {
@@ -803,12 +817,22 @@ pub const PendingKills = struct {
     }
 };
 
+pub const PendingKillHosts = struct {
+    hosts: []const []const u8,
+
+    pub fn deinit(self: *PendingKillHosts, allocator: std.mem.Allocator) void {
+        freeStringArray(allocator, self.hosts);
+        self.* = undefined;
+    }
+};
+
 pub fn tombstoneEndReasonName(reason: TombstoneEndReason) []const u8 {
     return switch (reason) {
         .unknown => "unknown",
         .process_exited => "process_exited",
         .killed_by_request => "killed_by_request",
         .agent_shutdown => "agent_shutdown",
+        .disconnected_timeout => "disconnected_timeout",
     };
 }
 
@@ -817,6 +841,7 @@ pub fn tombstoneEndReasonFromName(value: []const u8) !TombstoneEndReason {
     if (std.mem.eql(u8, value, "process_exited")) return .process_exited;
     if (std.mem.eql(u8, value, "killed_by_request")) return .killed_by_request;
     if (std.mem.eql(u8, value, "agent_shutdown")) return .agent_shutdown;
+    if (std.mem.eql(u8, value, "disconnected_timeout")) return .disconnected_timeout;
     return error.InvalidTombstone;
 }
 
@@ -1008,6 +1033,41 @@ pub fn readPendingKillsForHost(allocator: std.mem.Allocator, host: []const u8) !
     const path = try pendingKillPathForHost(allocator, host);
     defer allocator.free(path);
     return readPendingKills(allocator, path);
+}
+
+pub fn readPendingKillHosts(allocator: std.mem.Allocator) !PendingKillHosts {
+    const dir_path = try pendingKillsDir(allocator);
+    defer allocator.free(dir_path);
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return .{ .hosts = try allocator.alloc([]const u8, 0) },
+        else => return err,
+    };
+    defer dir.close();
+
+    var hosts: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (hosts.items) |host| allocator.free(host);
+        hosts.deinit(allocator);
+    }
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+        defer allocator.free(path);
+        const host = readPendingKillHost(allocator, path) catch continue;
+        const value = host orelse continue;
+        if (stringArrayContains(hosts.items, value)) {
+            allocator.free(value);
+            continue;
+        }
+        hosts.append(allocator, value) catch |err| {
+            allocator.free(value);
+            return err;
+        };
+    }
+
+    return .{ .hosts = try hosts.toOwnedSlice(allocator) };
 }
 
 pub fn removePendingKill(allocator: std.mem.Allocator, host: []const u8, guid: []const u8) !void {
@@ -1436,6 +1496,22 @@ pub fn runtimeAgentSocketPathsForGuid(allocator: std.mem.Allocator, guid: []cons
     const runtime_root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(runtime_root);
     return runtimeAgentSocketPathsForGuidInRoot(allocator, runtime_root, guid);
+}
+
+pub fn writeRuntimeAgentPidForGuid(allocator: std.mem.Allocator, guid: []const u8, agent_pid: c.pid_t) !void {
+    const runtime_root = try socket_transport.runtimeRoot(allocator);
+    defer allocator.free(runtime_root);
+    const canonical = try canonicalRuntimeGuid(allocator, guid);
+    defer allocator.free(canonical);
+    const guid_root = try sessionsDirInRoot(allocator, runtime_root);
+    defer allocator.free(guid_root);
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ guid_root, canonical });
+    defer allocator.free(dir);
+    try mkdirIgnoreExists(allocator, dir);
+    const incoming_meta_type = runtimeIncomingMetaTypeForGuid(canonical);
+    const meta = try runtimeGuidMetaPathForTypeInDir(allocator, dir, incoming_meta_type);
+    defer allocator.free(meta);
+    try writeRuntimeGuidMetaPathWithPid(allocator, meta, incoming_meta_type, agent_pid);
 }
 
 pub fn writeOutgoingProxyHint(allocator: std.mem.Allocator, guid: []const u8) !void {
@@ -1994,6 +2070,25 @@ fn readPendingKills(allocator: std.mem.Allocator, path: []const u8) !PendingKill
         if (!isValidPendingKillGuid(guid)) return error.InvalidPendingKill;
     }
     return .{ .guids = guids };
+}
+
+fn readPendingKillHost(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024);
+    defer allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const object = try jsonObject(parsed.value);
+    const host = try jsonRequiredString(object, "host");
+    if (host.len == 0) return null;
+
+    const guids = try jsonStringArrayField(allocator, object, "guids");
+    defer freeStringArray(allocator, guids);
+    if (guids.len == 0) return null;
+    for (guids) |guid| {
+        if (!isValidPendingKillGuid(guid)) return error.InvalidPendingKill;
+    }
+    return try allocator.dupe(u8, host);
 }
 
 fn freeStringArray(allocator: std.mem.Allocator, strings: []const []const u8) void {

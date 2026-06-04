@@ -48,6 +48,7 @@ const Session = struct {
     end_reason: u8 = 0,
     attached: bool = false,
     detached_at_unix_ms: u64 = 0,
+    max_disconnected_ms: u64 = 0,
     last_input_at_unix_ms: u64 = 0,
     alive: bool = false,
     pending_plain_output: std.ArrayList(u8) = .empty,
@@ -701,6 +702,7 @@ const SessionCreateRequest = struct {
     command_argv: [][]u8,
     shell_command: ?[]u8,
     tty_settings: ?tty_settings.Settings,
+    max_disconnected_ms: u64,
 
     fn deinit(self: *SessionCreateRequest) void {
         app_allocator.allocator().free(self.session_alias);
@@ -1306,7 +1308,9 @@ fn chmodPath(path: []const u8, mode: c.mode_t) !void {
 
 fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdown_signal_fd: c.fd_t, runtime_repair_fd: c.fd_t) !void {
     const now_ms = sessionAgentMonotonicMs(session_agent);
+    const now_unix_ms = nowUnixMs();
     clearExpiredDebugUnresponsiveAttachments(session_agent, now_ms);
+    if (endDisconnectedTimeoutSessions(session_agent, now_unix_ms)) return;
 
     var pollfds: [3 + max_sessions + max_attachments]posix.pollfd = undefined;
     var kinds: [3 + max_sessions + max_attachments]PollKind = undefined;
@@ -1343,10 +1347,11 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
         count += 1;
     }
 
-    _ = try posix.poll(pollfds[0..count], sessionAgentPollTimeoutMs(session_agent, now_ms));
+    _ = try posix.poll(pollfds[0..count], sessionAgentPollTimeoutMs(session_agent, now_ms, now_unix_ms));
     const after_poll_ms = sessionAgentMonotonicMs(session_agent);
     clearExpiredDebugUnresponsiveAttachments(session_agent, after_poll_ms);
     flushExpiredSynchronizedOutputSessions(session_agent, after_poll_ms);
+    if (endDisconnectedTimeoutSessions(session_agent, nowUnixMs())) return;
 
     for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
         if (pollfd.revents == 0) continue;
@@ -1379,7 +1384,7 @@ fn clearExpiredDebugUnresponsiveAttachments(session_agent: *SessionAgent, now_ms
     }
 }
 
-fn sessionAgentPollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64) i32 {
+fn sessionAgentPollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64, now_unix_ms: u64) i32 {
     var timeout_ms: ?i64 = null;
     for (&session_agent.attachments) |*attachment| {
         if (!attachment.active or attachment.debug_unresponsive_until_ms <= now_ms) continue;
@@ -1393,8 +1398,58 @@ fn sessionAgentPollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64) i3
         const clamped_remaining_ms = @max(remaining_ms, 0);
         if (timeout_ms == null or clamped_remaining_ms < timeout_ms.?) timeout_ms = clamped_remaining_ms;
     }
+    for (&session_agent.sessions) |*session| {
+        if (!sessionDisconnectedTimeoutEnabled(session)) continue;
+        const deadline_ms = session.detached_at_unix_ms +| session.max_disconnected_ms;
+        const remaining_ms: i64 = if (deadline_ms <= now_unix_ms)
+            0
+        else
+            @intCast(@min(deadline_ms - now_unix_ms, @as(u64, @intCast(std.math.maxInt(i64)))));
+        if (timeout_ms == null or remaining_ms < timeout_ms.?) timeout_ms = remaining_ms;
+    }
     const ms = timeout_ms orelse return -1;
     return @intCast(@min(ms, std.math.maxInt(i32)));
+}
+
+fn endDisconnectedTimeoutSessions(session_agent: *SessionAgent, now_unix_ms: u64) bool {
+    var ended_any = false;
+    for (&session_agent.sessions, 0..) |*session, session_index| {
+        if (!sessionDisconnectedTimeoutEnabled(session)) continue;
+        const deadline_ms = session.detached_at_unix_ms +| session.max_disconnected_ms;
+        if (now_unix_ms < deadline_ms) continue;
+        logSessionAgent(session_agent, "event=disconnected_timeout id={s} detached_at_ms={} max_disconnected_ms={}", .{
+            session.idSlice(),
+            session.detached_at_unix_ms,
+            session.max_disconnected_ms,
+        });
+        endSession(session_agent, session_index, 3, .{ .ended_at_unix_ms = now_unix_ms });
+        ended_any = true;
+    }
+    return ended_any;
+}
+
+fn sessionDisconnectedTimeoutEnabled(session: *const Session) bool {
+    return session.alive and
+        !session.attached and
+        session.detached_at_unix_ms != 0 and
+        session.max_disconnected_ms != 0;
+}
+
+test "session agent poll timeout includes disconnected deadline" {
+    var session_agent = SessionAgent{};
+    session_agent.sessions[0] = .{
+        .alive = true,
+        .attached = false,
+        .detached_at_unix_ms = 1_000,
+        .max_disconnected_ms = 5_000,
+    };
+
+    try std.testing.expectEqual(@as(i32, 5_000), sessionAgentPollTimeoutMs(&session_agent, 0, 1_000));
+    try std.testing.expectEqual(@as(i32, 1), sessionAgentPollTimeoutMs(&session_agent, 0, 5_999));
+    try std.testing.expectEqual(@as(i32, 0), sessionAgentPollTimeoutMs(&session_agent, 0, 6_000));
+
+    session_agent.sessions[0].attached = true;
+    try std.testing.expectEqual(@as(i32, -1), sessionAgentPollTimeoutMs(&session_agent, 0, 6_000));
 }
 
 fn flushExpiredSynchronizedOutputSessions(session_agent: *SessionAgent, now_ms: i64) void {
@@ -1531,6 +1586,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.command_argv,
                     request.shell_command,
                     request.tty_settings,
+                    request.max_disconnected_ms,
                 ) catch |err| {
                     session_registry.removeAlias(app_allocator.allocator(), alias) catch {};
                     return err;
@@ -2163,6 +2219,7 @@ fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !v
         .reason = switch (reason) {
             1 => .TE_SESSION_END_REASON_KILLED_BY_REQUEST,
             2 => .TE_SESSION_END_REASON_AGENT_SHUTDOWN,
+            3 => .TE_SESSION_END_REASON_DISCONNECTED_TIMEOUT,
             else => .TE_SESSION_END_REASON_PROCESS_EXITED,
         },
         .exit_status = exit_status,
@@ -2777,6 +2834,7 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
         else
             null,
         .tty_settings = request_tty_settings,
+        .max_disconnected_ms = message.max_disconnected_ms,
     };
 }
 
@@ -2900,6 +2958,7 @@ fn createSession(
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     settings: ?tty_settings.Settings,
+    max_disconnected_ms: u64,
 ) !usize {
     if (session_agent.fixed_session_id != null and session_agent.started_session) return error.TooManySessions;
 
@@ -2938,6 +2997,7 @@ fn createSession(
             .rows = rows,
             .cols = cols,
             .scrollback_row_count = scrollback_row_count,
+            .max_disconnected_ms = max_disconnected_ms,
             .alive = true,
         };
         @memcpy(session.id[0..session_guid.len], session_guid);
@@ -3305,7 +3365,6 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
         .te_input => handleInputFrame(session_agent, attachment_index, frame.payload),
         .te_resize => handleResizeFrame(session_agent, attachment_index, frame.payload),
         .te_repaint_request => handleRepaintFrame(session_agent, attachment_index, frame.payload),
-        .pending_kill_request => handlePendingKillRequest(session_agent, attachment_index, frame.payload),
         .ping, .pong => {
             _ = protocol.handleTransportControlFrame(frame.message_type, frame.payload, attachment.fd) catch {
                 detachAttachment(session_agent, attachment_index);
@@ -3320,43 +3379,6 @@ fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) v
             closeAttachmentAfterFlush(session_agent, attachment_index);
         },
     }
-}
-
-fn handlePendingKillRequest(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
-    var request = protocol.decodePayload(pb.PendingKillRequest, app_allocator.allocator(), payload) catch {
-        detachAttachment(session_agent, attachment_index);
-        return;
-    };
-    defer request.deinit(app_allocator.allocator());
-
-    const attachment = &session_agent.attachments[attachment_index];
-    if (!attachment.active) return;
-    const session_index = attachment.session_index;
-    const session = &session_agent.sessions[session_index];
-    if (!session.alive or !std.mem.eql(u8, request.guid, session.idSlice())) {
-        sendPendingKillResponse(attachment, .{
-            .guid = request.guid,
-            .result = .{ .missing = .{} },
-        }) catch {
-            detachAttachment(session_agent, attachment_index);
-        };
-        return;
-    }
-    const ended_at_unix_ms = nowUnixMs();
-    sendPendingKillResponse(attachment, .{
-        .guid = request.guid,
-        .result = .{ .killed = .{ .ended_at_unix_ms = ended_at_unix_ms } },
-    }) catch {
-        detachAttachment(session_agent, attachment_index);
-        return;
-    };
-    endSession(session_agent, session_index, 1, .{ .ended_at_unix_ms = ended_at_unix_ms });
-}
-
-fn sendPendingKillResponse(attachment: *Attachment, response: pb.PendingKillResponse) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), response);
-    defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .pending_kill_response, payload);
 }
 
 fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
@@ -4217,6 +4239,7 @@ fn writeEndedSessionTombstone(session_agent: *SessionAgent, session: *const Sess
         .end_reason = switch (reason) {
             1 => .killed_by_request,
             2 => .agent_shutdown,
+            3 => .disconnected_timeout,
             else => .process_exited,
         },
         .exit_status = exit_status,

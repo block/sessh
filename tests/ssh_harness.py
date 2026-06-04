@@ -1090,6 +1090,44 @@ def tombstones_dir(env):
     return state_root(env) / "tombstone"
 
 
+def pending_dir(env):
+    return state_root(env) / "pending"
+
+
+def pending_file_for_host(env, host):
+    return pending_dir(env) / f"{hashlib.sha256(host.encode('utf-8')).hexdigest()}.json"
+
+
+def write_pending_kills(env, host, guids):
+    path = pending_file_for_host(env, host)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(json.dumps({"host": host, "guids": guids}, separators=(",", ":")) + "\n")
+    return path
+
+
+def write_live_proxy_runtime(runtime_root_path, guid, agent_pid):
+    compact = guid[2:].replace("-", "").lower()
+    guid_dir = runtime_root_path / "guid" / guid
+    socket_dir = runtime_root_path / "a"
+    guid_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    socket_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (guid_dir / "incoming-meta.json").write_text(
+        json.dumps(
+            {
+                "type": "incoming-proxy",
+                "created_at_unix_ms": int(time.time() * 1000),
+                "agent_pid": agent_pid,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    os.symlink(f"../../a/{compact}", guid_dir / "agent.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(str(socket_dir / compact))
+    return sock
+
+
 def runtime_root(env):
     return Path(env["XDG_RUNTIME_DIR"])
 
@@ -3030,6 +3068,44 @@ def test_mux_new_detached_creates_local_session_without_attach(tmp):
         raise AssertionError(attached)
 
 
+def test_mux_new_detached_times_out_after_max_disconnected_hours(tmp):
+    env = isolated_env(tmp)
+    config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "sessh.env").write_text("max-disconnected-hours=0.001\n")
+    shell = tmp / "timeout-shell"
+    shell.write_text("#!/bin/sh\nwhile :; do sleep 1; done\n")
+    shell.chmod(0o700)
+    env["SHELL"] = str(shell)
+
+    created = run_sesshmux(["new", "--detached", "--alias", "timeout-local", "."], env, timeout=10.0)
+
+    if created.returncode != 0 or not created.stdout.startswith("CREATED s-"):
+        raise AssertionError(created)
+    guid = created.stdout.strip().split()[-1]
+    tombstone_path = tombstones_dir(env) / f"{guid}.json"
+    wait_for_path(tombstone_path, timeout=8.0)
+
+    listed_jsonl = run_sesshmux(["list", "--exited", "--jsonl"], env, timeout=10.0)
+    if listed_jsonl.returncode != 0:
+        raise AssertionError(listed_jsonl)
+    rows = [json.loads(line) for line in listed_jsonl.stdout.splitlines() if line.strip()]
+    matches = [row for row in rows if row.get("guid") == guid]
+    if len(matches) != 1:
+        raise AssertionError(process_diagnostics(listed_jsonl))
+    row = matches[0]
+    if row.get("id") != "timeout-local" or row.get("end_reason") != "disconnected_timeout":
+        raise AssertionError(row)
+    if row.get("exit_status") is not None:
+        raise AssertionError(row)
+
+    listed_table = run_sesshmux(["list", "--exited"], env, timeout=10.0)
+    if listed_table.returncode != 0 or "DISCONNECTED TIMEOUT" not in listed_table.stdout:
+        raise AssertionError(listed_table)
+    if (state_sessions_dir(env) / guid / "route.json").exists():
+        raise AssertionError("timed-out route was not tombstoned")
+
+
 def test_mux_new_detached_creates_remote_route_without_attach(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -3294,6 +3370,87 @@ def test_ssh_list_refresh_tombstones_missing_remote_route(tmp):
     attached = run_sesshmux(["attach", alias], env, timeout=5.0)
     if attached.returncode == 0 or "session already exited" not in attached.stderr:
         raise AssertionError(attached)
+
+
+def test_ssh_list_refresh_drains_pending_session_kill(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_runtime = tmp / "remote-runtime"
+    remote_state = tmp / "remote-state"
+    remote_shell = tmp / "remote-shell"
+    marker = "PENDING_SESSION_READY"
+    remote_runtime.mkdir(mode=0o700)
+    remote_state.mkdir(mode=0o700)
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\r\\n'\nwhile :; do sleep 1; done\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"] = str(remote_runtime)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"] = str(remote_state)
+    env["SHELL"] = str(remote_shell)
+    seed_remote_artifact_cache(env)
+
+    created = run_sesshmux(["new", "--detached", "--alias", "pending-session", "test-host"], env, timeout=30.0)
+    if created.returncode != 0 or not created.stdout.startswith("CREATED s-"):
+        raise AssertionError(created)
+    guid = created.stdout.strip().split()[-1]
+    pending = write_pending_kills(env, "test-host", [guid])
+
+    listed = run_sesshmux(["list", "--refresh", "--exited", "--jsonl"], env, timeout=30.0)
+
+    if listed.returncode != 0:
+        raise AssertionError(listed)
+    if pending.exists():
+        raise AssertionError("pending session kill was not removed")
+    rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
+    matches = [row for row in rows if row.get("guid") == guid]
+    if len(matches) != 1:
+        raise AssertionError(process_diagnostics(listed))
+    row = matches[0]
+    if row.get("id") != "pending-session" or row.get("end_reason") != "killed_by_request":
+        raise AssertionError(row)
+    if (state_sessions_dir(env) / guid / "route.json").exists():
+        raise AssertionError("pending-killed remote route was not tombstoned")
+
+
+def test_ssh_list_refresh_drains_pending_proxy_kill_without_route(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_runtime = tmp / "remote-runtime"
+    remote_state = tmp / "remote-state"
+    remote_runtime.mkdir(mode=0o700)
+    remote_state.mkdir(mode=0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"] = str(remote_runtime)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"] = str(remote_state)
+    seed_remote_artifact_cache(env)
+
+    pending_guid = "p-00000000-0000-4000-8000-000000000123"
+    agent_pid = int(subprocess.check_output(["sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $!"], text=True).strip())
+    live_proxy_socket = write_live_proxy_runtime(remote_runtime, pending_guid, agent_pid)
+    pending = write_pending_kills(env, "test-host", [pending_guid])
+
+    try:
+        listed = run_sesshmux(["list", "--refresh", "--jsonl"], env, timeout=30.0)
+    finally:
+        live_proxy_socket.close()
+        try:
+            os.kill(agent_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    if listed.returncode != 0:
+        raise AssertionError(listed)
+    if pending.exists():
+        raise AssertionError("pending live proxy kill without a cached route was not removed")
+    log_text = optional_text(fake_log)
+    if "invoked=1" not in log_text:
+        raise AssertionError(f"pending-only refresh did not contact ssh:\n{log_text}")
 
 
 def test_ssh_remote_default_alias_is_remote_generated(tmp):
@@ -4901,6 +5058,10 @@ def main(argv=None):
             test_mux_new_detached_creates_local_session_without_attach,
         ),
         (
+            "mux new detached times out after max disconnected hours",
+            test_mux_new_detached_times_out_after_max_disconnected_hours,
+        ),
+        (
             "mux new detached creates remote route without attach",
             test_mux_new_detached_creates_remote_route_without_attach,
         ),
@@ -4927,6 +5088,14 @@ def main(argv=None):
         (
             "ssh list refresh tombstones missing remote route",
             test_ssh_list_refresh_tombstones_missing_remote_route,
+        ),
+        (
+            "ssh list refresh drains pending session kill",
+            test_ssh_list_refresh_drains_pending_session_kill,
+        ),
+        (
+            "ssh list refresh drains pending proxy kill without route",
+            test_ssh_list_refresh_drains_pending_proxy_kill_without_route,
         ),
         (
             "ssh remote default alias is remote generated",

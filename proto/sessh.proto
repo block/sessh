@@ -52,8 +52,6 @@ message Frame {
     ProxyControlCapabilities proxy_control_capabilities = 48;
     ProxyControlDiagnostic proxy_control_diagnostic = 49;
     ProxyControlCtrlR proxy_control_ctrl_r = 50;
-    PendingKillRequest pending_kill_request = 51;
-    PendingKillResponse pending_kill_response = 52;
   }
 }
 
@@ -244,6 +242,9 @@ message TeSessionCreate {
   }
   // Portable local tty settings to apply to the newly created remote PTY.
   TeTtySettings tty_settings = 10;
+  // Maximum time the session may remain detached before the agent ends it.
+  // Zero means disabled.
+  uint64 max_disconnected_ms = 11;
 }
 
 // Framed payload, client -> session agent.
@@ -324,38 +325,6 @@ message TeRepaintRequest {
   optional uint32 initial_scrollback_rows = 3;
 }
 
-// Framed payload, client -> remote sessh.
-//
-// Requests that the remote host terminate the target. Session targets use s-*
-// GUIDs and proxy stream targets use p-* GUIDs.
-message PendingKillRequest {
-  string guid = 1;
-}
-
-// Framed payload, remote sessh -> client.
-//
-// Reports the outcome for one pending kill request.
-message PendingKillResponse {
-  string guid = 1;
-
-  oneof result {
-    PendingKilled killed = 2;
-    PendingMissing missing = 3;
-    PendingFailure failure = 4;
-  }
-}
-
-message PendingKilled {
-  uint64 ended_at_unix_ms = 1;
-  optional ExitStatus exit_status = 2;
-}
-
-message PendingMissing {
-}
-
-message PendingFailure {
-  string reason = 1;
-}
 
 
 // Framed payload, session agent -> client.
@@ -484,6 +453,7 @@ enum TeSessionEndReason {
   TE_SESSION_END_REASON_PROCESS_EXITED = 1;
   TE_SESSION_END_REASON_KILLED_BY_REQUEST = 2;
   TE_SESSION_END_REASON_AGENT_SHUTDOWN = 3;
+  TE_SESSION_END_REASON_DISCONNECTED_TIMEOUT = 4;
 }
 
 enum ExitStatusKind {

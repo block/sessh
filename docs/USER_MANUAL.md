@@ -81,6 +81,7 @@ client-log-level=warn
 bootstrap=true
 terminal-emulator=true
 filter-level=emulated
+max-disconnected-hours=-1
 ```
 
 - `scrollback-limit`: set the maximum number of retained scrollback lines.
@@ -101,6 +102,9 @@ filter-level=emulated
 - `filter-level`: configure the default stream filtering level. Supported
   values are `raw`, `unhygienic`, `hygienic`, and `emulated`. The command-line
   `--filter-level` option overrides it for a single invocation.
+- `max-disconnected-hours`: set how long a detached session may remain without
+  an attached client before its session agent ends it. Values less than or equal
+  to zero disable the timeout. Fractional hours are accepted.
 
 ## Mux Commands
 
@@ -113,19 +117,22 @@ Use `sesshmux` for session management:
 - `sesshmux force-compat --host HOST ID command ...`: run `command ...` through the
   exact sessh binary that started `ID`. If `ID` has a cached remote route, the
   `--host HOST` part can be omitted.
-- `sesshmux list [--refresh] [--exited] [--jsonl] [HOST]`: list attachable sessions locally or on
-  `HOST`. Without `HOST`, local sessions and cached remote routes are shown.
-  Use `sesshmux list .` to show only local sessions. `--refresh` checks cached
-  remote routes that were alive the last time sessh checked them. Without
-  `--refresh`, cached remote status such as attached count and input time may be
-  stale. `--exited` shows recently exited sessions instead of live sessions,
-  including exit code, signal, or kill status when sessh observed it. Exited
-  sessions are retained for one week and cleaned up by `list`; with `--refresh`,
-  remote tombstones are cleaned up too. `--jsonl` emits one JSON object per
-  session in the selected live/exited mode.
-- `sesshmux kill [HOST] ID`: terminate the specified local or remote session.
-- `sesshmux kill --all [HOST]`: terminate all local sessions or all sessions on
-  `HOST`.
+- `sesshmux list [--refresh] [--exited] [--jsonl] [HOST]`: list attachable
+  sessions locally or on `HOST`. Without `HOST`, local sessions and cached
+  remote routes are shown. Use `sesshmux list .` to show only local sessions.
+  `--refresh` asks each cached remote host for its current live connection list.
+  If that live list overlaps with the local pending-kill queue, sessh runs a
+  remote kill for those targets and updates the local queue and tombstones.
+  Without `--refresh`, cached remote status such as attached count and input time
+  may be stale. `--exited` shows recently exited sessions instead of live
+  sessions, including exit code, signal, or kill status when sessh observed it.
+  Exited sessions are retained for one week and cleaned up by `list`. `--jsonl`
+  emits one JSON object per session in the selected live/exited mode.
+- `sesshmux kill [--jsonl] [HOST] ID...`: terminate one or more local or remote
+  targets. `ID` may be an `s-` session GUID or a `p-` proxy-stream GUID; local
+  session aliases are also accepted.
+- `sesshmux kill [--jsonl] --all [HOST]`: terminate all local sessions or all
+  sessions on `HOST`.
 
 For remote commands, pass ssh options through `--ssh-options "..."`, for
 example `sesshmux list --ssh-options "-F cfg" HOST`.
@@ -186,8 +193,9 @@ After detaching, sessh will print the command to re-attach to that session.
 Additional ssh-style escape sequences are available at the beginning of a line:
 
 1. `~.` requests that the sessh session be killed and detaches immediately. If
-   the remote host is unreachable, sessh records the kill request locally and
-   sends it automatically the next time you connect to that host.
+   the remote host is unreachable, sessh records the kill request locally.
+   `sesshmux list --refresh` will later kill any queued target still reported
+   live by that host.
 2. `~k` requests that the sessh session be killed and waits until the remote
    host confirms the kill. While waiting, `~.` detaches immediately; the kill
    request remains queued.
