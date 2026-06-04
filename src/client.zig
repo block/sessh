@@ -77,7 +77,8 @@ const LocalOptions = struct {
     scrollback_row_count_set: bool = false,
     initial_scrollback_row_count: ?u32 = null,
     initial_scrollback_row_count_set: bool = false,
-    max_disconnected_ms: u64 = config.default_max_disconnected_ms,
+    reap_ms: u64 = config.default_reap_ms,
+    tombstone_retention_ms: u64 = config.default_tombstone_retention_ms,
     client_log_level: client_log.Level = .warn,
     client_log_level_set: bool = false,
     compat_mode: bool = false,
@@ -89,7 +90,8 @@ pub const LocalNewSessionRequest = struct {
     new_detached: bool = false,
     alias: ?[]const u8 = null,
     scrollback_row_count: u32 = config.default_scrollback_row_count,
-    max_disconnected_ms: u64 = config.default_max_disconnected_ms,
+    reap_ms: u64 = config.default_reap_ms,
+    tombstone_retention_ms: u64 = config.default_tombstone_retention_ms,
     banner_args: []const []const u8 = &.{},
     capture_tty_transcript: ?[]const u8 = null,
     command_argv: []const []const u8 = &.{},
@@ -119,7 +121,8 @@ pub const FileConfig = struct {
     bootstrap: ?bool = null,
     terminal_emulator: ?bool = null,
     filter_level: ?config.FilterLevel = null,
-    max_disconnected_ms: ?u64 = null,
+    reap_ms: ?u64 = null,
+    tombstone_retention_ms: ?u64 = null,
 };
 
 pub fn loadFileConfig(allocator: std.mem.Allocator) !FileConfig {
@@ -182,8 +185,10 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
             parsed.terminal_emulator = try parseBool(value);
         } else if (keyMatches(key, "filter-level")) {
             parsed.filter_level = try config.parseFilterLevel(value);
-        } else if (keyMatches(key, "max-disconnected-hours")) {
-            parsed.max_disconnected_ms = try parseMaxDisconnectedHours(value);
+        } else if (keyMatches(key, "reap-hours")) {
+            parsed.reap_ms = try parseReapHours(value);
+        } else if (keyMatches(key, "tombstone-hours")) {
+            parsed.tombstone_retention_ms = try parseTombstoneHours(value);
         } else {
             return error.UnknownConfigKey;
         }
@@ -227,12 +232,20 @@ pub fn parseInitialScrollbackRowCount(value: []const u8) !?u32 {
     return @intCast(parsed);
 }
 
-pub fn parseMaxDisconnectedHours(value: []const u8) !u64 {
-    const parsed = std.fmt.parseFloat(f64, value) catch return error.InvalidMaxDisconnectedHours;
-    if (parsed != parsed) return error.InvalidMaxDisconnectedHours;
+pub fn parseReapHours(value: []const u8) !u64 {
+    return parseHoursMs(value, error.InvalidReapHours);
+}
+
+pub fn parseTombstoneHours(value: []const u8) !u64 {
+    return parseHoursMs(value, error.InvalidTombstoneHours);
+}
+
+fn parseHoursMs(value: []const u8, invalid_error: anyerror) !u64 {
+    const parsed = std.fmt.parseFloat(f64, value) catch return invalid_error;
+    if (parsed != parsed) return invalid_error;
     if (parsed <= 0) return 0;
-    if (parsed > 1.0e9) return error.InvalidMaxDisconnectedHours;
-    const ms = @ceil(parsed * 3_600_000.0);
+    if (parsed > 1.0e9) return invalid_error;
+    const ms = @ceil(parsed * @as(f64, @floatFromInt(config.hour_ms)));
     if (ms < 1) return 1;
     return @intFromFloat(ms);
 }
@@ -648,7 +661,7 @@ fn tombstoneDetailsFromSessionEnded(ended: pb.TeSessionEnded) session_registry.T
             .TE_SESSION_END_REASON_PROCESS_EXITED => .process_exited,
             .TE_SESSION_END_REASON_KILLED_BY_REQUEST => .killed_by_request,
             .TE_SESSION_END_REASON_AGENT_SHUTDOWN => .agent_shutdown,
-            .TE_SESSION_END_REASON_DISCONNECTED_TIMEOUT => .disconnected_timeout,
+            .TE_SESSION_END_REASON_REAPED => .reaped,
             else => .unknown,
         },
         .exit_status = if (ended.exit_status) |status| switch (status.kind) {
@@ -666,8 +679,12 @@ pub fn recordRuntimeSessionKillRequested(allocator: std.mem.Allocator, host: []c
         client_log.debug("event=route_kill_requested_mark_failed session={s} error={t}", .{ session.guidSlice(), err });
     };
     if (host.len == 0 or std.mem.eql(u8, host, ".")) return;
-    session_registry.queuePendingKill(allocator, host, session.guidSlice()) catch |err| {
-        client_log.debug("event=pending_kill_queue_failed host={s} session={s} error={t}", .{ host, session.guidSlice(), err });
+    var route = session_registry.readRouteForRef(allocator, session.guidSlice()) catch null;
+    defer if (route) |*value| value.deinit(allocator);
+    const pending_host = if (route) |*value| value.resolved_host else host;
+    const pending_port = if (route) |*value| value.port else session_registry.default_pending_port;
+    session_registry.queuePendingKill(allocator, pending_host, pending_port, session.guidSlice()) catch |err| {
+        client_log.debug("event=pending_kill_queue_failed host={s} port={s} session={s} error={t}", .{ pending_host, pending_port, session.guidSlice(), err });
     };
 }
 
@@ -1733,7 +1750,8 @@ test "parseEnvConfig accepts sessh env keys" {
         \\bootstrap=false
         \\terminal-emulator=no
         \\filter-level=hygienic
-        \\max-disconnected-hours=1.5
+        \\reap-hours=1.5
+        \\tombstone-hours=2
         \\
     );
 
@@ -1744,7 +1762,8 @@ test "parseEnvConfig accepts sessh env keys" {
     try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
     try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
     try std.testing.expectEqual(@as(?config.FilterLevel, .hygienic), parsed.filter_level);
-    try std.testing.expectEqual(@as(?u64, 5_400_000), parsed.max_disconnected_ms);
+    try std.testing.expectEqual(@as(?u64, 5_400_000), parsed.reap_ms);
+    try std.testing.expectEqual(@as(?u64, 7_200_000), parsed.tombstone_retention_ms);
 }
 
 test "parseEnvConfig maps initial scrollback minus one to all retained rows" {
@@ -1754,12 +1773,15 @@ test "parseEnvConfig maps initial scrollback minus one to all retained rows" {
     try std.testing.expectEqual(@as(?u32, null), parsed.initial_scrollback_row_count);
 }
 
-test "parseEnvConfig maps non-positive disconnected timeout to disabled" {
-    const negative = try parseEnvConfig("max-disconnected-hours=-1\n");
-    try std.testing.expectEqual(@as(?u64, 0), negative.max_disconnected_ms);
+test "parseEnvConfig maps non-positive reap and tombstone hours to disabled" {
+    const negative = try parseEnvConfig("reap-hours=-1\n");
+    try std.testing.expectEqual(@as(?u64, 0), negative.reap_ms);
 
-    const zero = try parseEnvConfig("max_disconnected_hours=0\n");
-    try std.testing.expectEqual(@as(?u64, 0), zero.max_disconnected_ms);
+    const zero = try parseEnvConfig("reap_hours=0\n");
+    try std.testing.expectEqual(@as(?u64, 0), zero.reap_ms);
+
+    const tombstone_zero = try parseEnvConfig("tombstone-hours=0\n");
+    try std.testing.expectEqual(@as(?u64, 0), tombstone_zero.tombstone_retention_ms);
 }
 
 test "formatDelay uses compact reconnect labels" {
@@ -2644,7 +2666,8 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
             request.command_argv,
             request.shell_command,
             null,
-            request.max_disconnected_ms,
+            request.reap_ms,
+            request.tombstone_retention_ms,
         ) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
@@ -2653,7 +2676,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
         };
         defer created.deinit();
         try session_registry.ensureAliasForGuid(allocator, created.alias, created.guid);
-        try session_registry.writeLocalRoute(allocator, created.guid, created.alias, created.session_dir, config.version);
+        try session_registry.writeLocalRoute(allocator, created.guid, created.alias, created.session_dir, config.version, request.tombstone_retention_ms);
         session_registry.markRouteDetachedNow(allocator, created.guid) catch |err| {
             client_log.debug("event=local_route_detached_mark_failed session={s} error={t}", .{ created.guid, err });
         };
@@ -2675,7 +2698,8 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
         request.command_argv,
         request.shell_command,
         null,
-        request.max_disconnected_ms,
+        request.reap_ms,
+        request.tombstone_retention_ms,
     ) catch |err| {
         if (process_exit.is(err)) return err;
         terminateChild(&child);
@@ -2684,7 +2708,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
     };
     defer session.deinit();
     try session_registry.ensureAliasForGuid(allocator, session.idSlice(), session.guidSlice());
-    try session_registry.writeLocalRoute(allocator, session.guidSlice(), session.idSlice(), session.sessionDirSlice(), config.version);
+    try session_registry.writeLocalRoute(allocator, session.guidSlice(), session.idSlice(), session.sessionDirSlice(), config.version, request.tombstone_retention_ms);
     local_alias_created = true;
     writeClientRouteHintForSession(allocator, &session);
     defer removeClientRouteHintForSession(allocator, &session);
@@ -2859,7 +2883,8 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             .new_detached = options.new_detached,
             .alias = options.alias,
             .scrollback_row_count = options.scrollback_row_count,
-            .max_disconnected_ms = options.max_disconnected_ms,
+            .reap_ms = options.reap_ms,
+            .tombstone_retention_ms = options.tombstone_retention_ms,
             .banner_args = options.banner_args.slice(),
             .capture_tty_transcript = options.capture_tty_transcript,
         });
@@ -3498,7 +3523,6 @@ fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !voi
             continue;
         };
         defer allocator.free(stdout);
-        try killPendingTargetsSeenOnRemote(allocator, exe, route.host, route.ssh_options, stdout, null);
         for (routes.items) |*candidate| {
             if (!sameRouteConnection(route, candidate)) continue;
             if (!try cachedRouteStillExists(allocator, candidate.guid)) continue;
@@ -3528,6 +3552,7 @@ fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8) !voi
                 },
             );
         }
+        try drainPendingRemoteRequests(allocator, exe, route.host, route.ssh_options, route.resolved_host, route.port);
     }
     try refreshPendingKillsWithoutCachedRoute(allocator, exe, routes.items);
 }
@@ -3561,19 +3586,21 @@ fn refreshPendingKillsWithoutCachedRoute(allocator: std.mem.Allocator, exe: []co
     var pending_hosts = try session_registry.readPendingKillHosts(allocator);
     defer pending_hosts.deinit(allocator);
     for (pending_hosts.hosts) |host| {
-        if (hostMatchesAnyRoute(routes, host)) continue;
-        const stdout = queryRemoteHostList(allocator, exe, host, &.{}, false, true) catch |err| {
-            try io_helpers.stderrPrint("sessh: list refresh pending cleanup failed for {s}: {t}\n", .{ host, err });
-            continue;
+        if (hostMatchesAnyRoute(routes, host.name, host.port)) continue;
+        var ssh_options: [2][]const u8 = undefined;
+        const options = if (std.mem.eql(u8, host.port, session_registry.default_pending_port))
+            &.{}
+        else blk: {
+            ssh_options = .{ "-p", host.port };
+            break :blk ssh_options[0..];
         };
-        try killPendingTargetsSeenOnRemote(allocator, exe, host, &.{}, "", stdout);
-        allocator.free(stdout);
+        try drainPendingRemoteRequests(allocator, exe, host.name, options, host.name, host.port);
     }
 }
 
-fn hostMatchesAnyRoute(routes: []const session_registry.Route, host: []const u8) bool {
+fn hostMatchesAnyRoute(routes: []const session_registry.Route, host: []const u8, port: []const u8) bool {
     for (routes) |*route| {
-        if (std.mem.eql(u8, route.host, host)) return true;
+        if (std.mem.eql(u8, route.resolved_host, host) and std.mem.eql(u8, route.port, port)) return true;
     }
     return false;
 }
@@ -3637,82 +3664,6 @@ fn queryRemoteHostList(
     }
 }
 
-fn killPendingTargetsSeenOnRemote(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    host: []const u8,
-    ssh_options: []const []const u8,
-    session_stdout: []const u8,
-    provided_all_stdout: ?[]const u8,
-) !void {
-    if (host.len == 0 or std.mem.eql(u8, host, ".")) return;
-    var pending = session_registry.readPendingKillsForHost(allocator, host) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer pending.deinit(allocator);
-    if (pending.guids.len == 0) return;
-
-    var targets: std.ArrayList([]const u8) = .empty;
-    defer targets.deinit(allocator);
-    try appendPendingTargetsSeenInJsonl(allocator, &targets, pending.guids, session_stdout);
-
-    var owned_all_stdout: ?[]u8 = null;
-    defer if (owned_all_stdout) |value| allocator.free(value);
-    const all_stdout = provided_all_stdout orelse blk: {
-        if (!pendingContainsProxyGuid(pending.guids)) break :blk null;
-        owned_all_stdout = queryRemoteHostList(allocator, exe, host, ssh_options, false, true) catch |err| {
-            client_log.debug("event=list_refresh_pending_all_query_failed host={s} error={t}", .{ host, err });
-            break :blk null;
-        };
-        break :blk owned_all_stdout.?;
-    };
-    if (all_stdout) |stdout| try appendPendingTargetsSeenInJsonl(allocator, &targets, pending.guids, stdout);
-    if (targets.items.len == 0) return;
-
-    const kill_stdout = queryRemoteHostKillJsonl(allocator, exe, host, ssh_options, targets.items) catch |err| {
-        try io_helpers.stderrPrint("sessh: list refresh pending kill failed for {s}: {t}\n", .{ host, err });
-        return;
-    };
-    defer allocator.free(kill_stdout);
-    try processRemoteKillJsonl(allocator, host, kill_stdout);
-}
-
-fn appendPendingTargetsSeenInJsonl(allocator: std.mem.Allocator, out: *std.ArrayList([]const u8), pending_guids: []const []const u8, stdout: []const u8) !void {
-    var lines = std.mem.splitScalar(u8, stdout, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |object| object,
-            else => continue,
-        };
-        const guid = jsonStringField(object, "guid") orelse continue;
-        const pending_guid = stringSliceFind(pending_guids, guid) orelse continue;
-        if (stringSliceContains(out.items, pending_guid)) continue;
-        try out.append(allocator, pending_guid);
-    }
-}
-
-fn pendingContainsProxyGuid(pending_guids: []const []const u8) bool {
-    for (pending_guids) |guid| {
-        if (session_registry.isValidProxyGuid(guid)) return true;
-    }
-    return false;
-}
-
-fn stringSliceContains(strings: []const []const u8, needle: []const u8) bool {
-    return stringSliceFind(strings, needle) != null;
-}
-
-fn stringSliceFind(strings: []const []const u8, needle: []const u8) ?[]const u8 {
-    for (strings) |value| {
-        if (std.mem.eql(u8, value, needle)) return value;
-    }
-    return null;
-}
-
 fn queryRemoteHostKillJsonl(
     allocator: std.mem.Allocator,
     exe: []const u8,
@@ -3720,10 +3671,71 @@ fn queryRemoteHostKillJsonl(
     ssh_options: []const []const u8,
     targets: []const []const u8,
 ) ![]u8 {
+    return queryRemoteHostKillJsonlWithRequests(allocator, exe, host, ssh_options, targets, &.{});
+}
+
+pub fn drainPendingRemoteRequests(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    host: []const u8,
+    ssh_options: []const []const u8,
+    pending_host: []const u8,
+    pending_port: []const u8,
+) !void {
+    if (host.len == 0 or std.mem.eql(u8, host, ".")) return;
+    var lock = (try session_registry.tryLockPendingKillsForHost(allocator, pending_host, pending_port)) orelse return;
+    defer lock.deinit();
+    var pending = try lock.read();
+    defer pending.deinit(allocator);
+    if (pending.entries.len == 0) {
+        try lock.cleanupIfEmpty();
+        return;
+    }
+
+    var request_jsons: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (request_jsons.items) |json| allocator.free(json);
+        request_jsons.deinit(allocator);
+    }
+    const now_ms = nowUnixMs();
+    for (pending.entries) |*entry| {
+        if (!std.mem.eql(u8, entry.type_name, "kill")) continue;
+        if (entry.guid.len == 0) continue;
+        const requested_age_ms: u64 = if (now_ms >= entry.requested_at_unix_ms) now_ms - entry.requested_at_unix_ms else 0;
+        try request_jsons.append(allocator, try std.fmt.allocPrint(
+            allocator,
+            "{{\"guid\":{f},\"requested_age_ms\":{}}}",
+            .{ std.json.fmt(entry.guid, .{}), requested_age_ms },
+        ));
+    }
+    if (request_jsons.items.len == 0) return;
+
+    const stdout = queryRemoteHostKillJsonlWithRequests(allocator, exe, host, ssh_options, &.{}, request_jsons.items) catch |err| {
+        try io_helpers.stderrPrint("sessh: pending cleanup failed for {s}: {t}\n", .{ host, err });
+        return;
+    };
+    defer allocator.free(stdout);
+
+    var handled: std.ArrayList([]const u8) = .empty;
+    defer handled.deinit(allocator);
+    try processKillJsonlForPendingDrain(allocator, host, stdout, &pending, &handled);
+    if (handled.items.len == 0) return;
+    try lock.removeHandled(&pending, handled.items);
+}
+
+fn queryRemoteHostKillJsonlWithRequests(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    host: []const u8,
+    ssh_options: []const []const u8,
+    targets: []const []const u8,
+    request_jsons: []const []const u8,
+) ![]u8 {
     const ssh_options_arg = if (ssh_options.len > 0) try shellJoinArgs(allocator, ssh_options) else null;
     defer if (ssh_options_arg) |value| allocator.free(value);
     const ssh_option_args: usize = if (ssh_options_arg != null) 2 else 0;
-    const argv = try allocator.alloc([]const u8, 2 + ssh_option_args + 1 + 1 + targets.len);
+    const request_args = request_jsons.len * 2;
+    const argv = try allocator.alloc([]const u8, 2 + ssh_option_args + 1 + 1 + request_args + targets.len);
     defer allocator.free(argv);
     argv[0] = exe;
     argv[1] = "kill";
@@ -3738,6 +3750,12 @@ fn queryRemoteHostKillJsonl(
     arg_index += 1;
     argv[arg_index] = "--jsonl";
     arg_index += 1;
+    for (request_jsons) |request_json| {
+        argv[arg_index] = "--request";
+        arg_index += 1;
+        argv[arg_index] = request_json;
+        arg_index += 1;
+    }
     @memcpy(argv[arg_index..], targets);
 
     const result = try std.process.Child.run(.{
@@ -3862,6 +3880,55 @@ fn processRemoteKillJsonl(allocator: std.mem.Allocator, host: []const u8, stdout
     _ = try processKillJsonl(allocator, host, stdout, null);
 }
 
+fn processKillJsonlForPendingDrain(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    stdout: []const u8,
+    pending: *const session_registry.PendingKills,
+    handled: *std.ArrayList([]const u8),
+) !void {
+    var lines = std.mem.splitScalar(u8, stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |object| object,
+            else => continue,
+        };
+        const guid = jsonStringField(object, "guid") orelse continue;
+        const status = jsonStringField(object, "status") orelse continue;
+        const entry = pendingKillEntryForGuid(pending, guid) orelse continue;
+        if (std.mem.eql(u8, status, "killed") or std.mem.eql(u8, status, "missing")) {
+            try handled.append(allocator, entry.guid);
+            if (session_registry.isValidSessionGuid(entry.guid)) {
+                tombstoneLocalRouteForPendingKill(allocator, entry.guid, .{
+                    .ended_at_unix_ms = (try jsonU64Field(object, "ended_at_unix_ms")) orelse pendingKillFallbackEndedAt(entry),
+                    .end_reason = .killed_by_request,
+                }) catch |err| {
+                    client_log.debug("event=pending_kill_tombstone_failed host={s} session={s} error={t}", .{ host, entry.guid, err });
+                };
+            }
+        } else if (std.mem.eql(u8, status, "skipped")) {
+            try handled.append(allocator, entry.guid);
+        } else if (std.mem.eql(u8, status, "failure")) {
+            const reason = jsonStringField(object, "reason") orelse "unknown";
+            client_log.userDiagnosticInfo("pending kill failed for {s}: {s}", .{ guid, reason });
+        }
+    }
+}
+
+fn pendingKillEntryForGuid(pending: *const session_registry.PendingKills, guid: []const u8) ?*const session_registry.PendingKillEntry {
+    for (pending.entries) |*entry| {
+        if (std.mem.eql(u8, entry.type_name, "kill") and std.mem.eql(u8, entry.guid, guid)) return entry;
+    }
+    return null;
+}
+
+fn pendingKillFallbackEndedAt(entry: *const session_registry.PendingKillEntry) u64 {
+    return if (entry.requested_at_unix_ms == 0) nowUnixMs() else entry.requested_at_unix_ms;
+}
+
 fn processKillJsonl(allocator: std.mem.Allocator, host: []const u8, stdout: []const u8, expected_guid: ?[]const u8) !bool {
     var expected_seen = expected_guid == null;
     var expected_succeeded = expected_guid == null;
@@ -3888,13 +3955,25 @@ fn processKillJsonl(allocator: std.mem.Allocator, host: []const u8, stdout: []co
                     client_log.debug("event=pending_kill_tombstone_failed host={s} session={s} error={t}", .{ host, guid, err });
                 };
             }
-            if (host.len > 0 and !std.mem.eql(u8, host, ".")) try session_registry.removePendingKill(allocator, host, guid);
+            try removePendingKillForResult(allocator, host, guid);
+        } else if (std.mem.eql(u8, status, "skipped")) {
+            if (matches_expected) expected_succeeded = true;
+            try removePendingKillForResult(allocator, host, guid);
         } else if (std.mem.eql(u8, status, "failure")) {
             const reason = jsonStringField(object, "reason") orelse "unknown";
             client_log.userDiagnosticInfo("pending kill failed for {s}: {s}", .{ guid, reason });
         }
     }
     return expected_seen and expected_succeeded;
+}
+
+fn removePendingKillForResult(allocator: std.mem.Allocator, fallback_host: []const u8, guid: []const u8) !void {
+    if (fallback_host.len == 0 or std.mem.eql(u8, fallback_host, ".")) return;
+    var route = session_registry.readRouteForRef(allocator, guid) catch null;
+    defer if (route) |*value| value.deinit(allocator);
+    const pending_host = if (route) |*value| value.resolved_host else fallback_host;
+    const pending_port = if (route) |*value| value.port else session_registry.default_pending_port;
+    try session_registry.removePendingKill(allocator, pending_host, pending_port, guid);
 }
 
 const RemoteListStatus = struct {
@@ -4399,7 +4478,8 @@ fn applyFileConfigToLocal(allocator: std.mem.Allocator, options: *LocalOptions) 
     if (!options.initial_scrollback_row_count_set and file_config.initial_scrollback_row_count_set) {
         options.initial_scrollback_row_count = file_config.initial_scrollback_row_count;
     }
-    if (file_config.max_disconnected_ms) |ms| options.max_disconnected_ms = ms;
+    if (file_config.reap_ms) |ms| options.reap_ms = ms;
+    if (file_config.tombstone_retention_ms) |ms| options.tombstone_retention_ms = ms;
     if (!options.client_log_level_set) {
         if (file_config.client_log_level) |level| options.client_log_level = level;
     }
@@ -4512,7 +4592,8 @@ pub fn startNewSessionOnRuntime(
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     pending_kill_host: ?[]const u8,
-    max_disconnected_ms: u64,
+    reap_ms: u64,
+    tombstone_retention_ms: u64,
 ) !RuntimeSession {
     const size = terminal.currentWindowSize();
     const viewport_offset = queryInitialViewportOffset();
@@ -4526,7 +4607,8 @@ pub fn startNewSessionOnRuntime(
         command_argv,
         shell_command,
         pending_kill_host,
-        max_disconnected_ms,
+        reap_ms,
+        tombstone_retention_ms,
     );
     defer created.deinit();
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
@@ -4548,7 +4630,8 @@ pub fn createSessionOnRuntime(
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     pending_kill_host: ?[]const u8,
-    max_disconnected_ms: u64,
+    reap_ms: u64,
+    tombstone_retention_ms: u64,
 ) !CreatedSession {
     return createSessionOnRuntimeWithSize(
         read_fd,
@@ -4560,7 +4643,8 @@ pub fn createSessionOnRuntime(
         command_argv,
         shell_command,
         pending_kill_host,
-        max_disconnected_ms,
+        reap_ms,
+        tombstone_retention_ms,
     );
 }
 
@@ -4574,7 +4658,8 @@ fn createSessionOnRuntimeWithSize(
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     pending_kill_host: ?[]const u8,
-    max_disconnected_ms: u64,
+    reap_ms: u64,
+    tombstone_retention_ms: u64,
 ) !CreatedSession {
     const peer_protocol = try runtimeHandshakeWithPeerProtocol(read_fd, write_fd);
     _ = pending_kill_host;
@@ -4590,7 +4675,8 @@ fn createSessionOnRuntimeWithSize(
         command_argv,
         shell_command,
         peer_supports_command_oneof,
-        max_disconnected_ms,
+        reap_ms,
+        tombstone_retention_ms,
     );
 }
 
@@ -4620,7 +4706,10 @@ pub fn ensureLocalRouteForRemoteSession(
     session: *const RuntimeSession,
     requested_ref: []const u8,
     host: []const u8,
+    resolved_host: []const u8,
+    port: []const u8,
     ssh_options: []const []const u8,
+    tombstone_retention_ms: u64,
 ) !void {
     if (session.guidSlice().len == 0) return;
     const alias = try localAliasForRemoteSession(allocator, session, requested_ref);
@@ -4632,8 +4721,11 @@ pub fn ensureLocalRouteForRemoteSession(
         alias,
         session.sessionDirSlice(),
         host,
+        resolved_host,
+        port,
         ssh_options,
         config.version,
+        tombstone_retention_ms,
     );
     if (session.clientGuidSlice().len > 0) {
         session_registry.writeClientRouteHint(allocator, session.clientGuidSlice(), session.guidSlice()) catch |err| {
@@ -4650,7 +4742,10 @@ pub fn ensureLocalRouteForCreatedRemoteSession(
     allocator: std.mem.Allocator,
     created: *const CreatedSession,
     host: []const u8,
+    resolved_host: []const u8,
+    port: []const u8,
     ssh_options: []const []const u8,
+    tombstone_retention_ms: u64,
 ) !void {
     try session_registry.ensureAliasForGuid(allocator, created.alias, created.guid);
     try session_registry.writeSshRoute(
@@ -4659,8 +4754,11 @@ pub fn ensureLocalRouteForCreatedRemoteSession(
         created.alias,
         created.session_dir,
         host,
+        resolved_host,
+        port,
         ssh_options,
         config.version,
+        tombstone_retention_ms,
     );
 }
 
@@ -5390,9 +5488,10 @@ fn sendSessionCreateAndReadCreated(
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     peer_supports_command_oneof: bool,
-    max_disconnected_ms: u64,
+    reap_ms: u64,
+    tombstone_retention_ms: u64,
 ) !CreatedSession {
-    try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid, session_alias, command_argv, shell_command, peer_supports_command_oneof, max_disconnected_ms);
+    try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid, session_alias, command_argv, shell_command, peer_supports_command_oneof, reap_ms, tombstone_retention_ms);
     return readSessionCreated(read_fd, write_fd);
 }
 
@@ -5405,7 +5504,8 @@ fn sendSessionCreate(
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     peer_supports_command_oneof: bool,
-    max_disconnected_ms: u64,
+    reap_ms: u64,
+    tombstone_retention_ms: u64,
 ) !void {
     if (command_argv.len > 0 and shell_command != null) return error.InvalidSessionCommand;
     var message = pb.TeSessionCreate{
@@ -5416,7 +5516,8 @@ fn sendSessionCreate(
         .scrollback_row_limit = scrollback_row_count,
         .session_guid = session_guid,
         .session_alias = session_alias,
-        .max_disconnected_ms = max_disconnected_ms,
+        .reap_ms = reap_ms,
+        .tombstone_retention_ms = tombstone_retention_ms,
     };
     defer message.environment.deinit(app_allocator.allocator());
     defer message.legacy_command_argv.deinit(app_allocator.allocator());

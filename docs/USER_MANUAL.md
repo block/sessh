@@ -81,7 +81,8 @@ client-log-level=warn
 bootstrap=true
 terminal-emulator=true
 filter-level=emulated
-max-disconnected-hours=-1
+reap-hours=168
+tombstone-hours=168
 ```
 
 - `scrollback-limit`: set the maximum number of retained scrollback lines.
@@ -102,9 +103,12 @@ max-disconnected-hours=-1
 - `filter-level`: configure the default stream filtering level. Supported
   values are `raw`, `unhygienic`, `hygienic`, and `emulated`. The command-line
   `--filter-level` option overrides it for a single invocation.
-- `max-disconnected-hours`: set how long a detached session may remain without
+- `reap-hours`: set how long a detached session may remain without
   an attached client before its session agent ends it. Values less than or equal
   to zero disable the timeout. Fractional hours are accepted.
+- `tombstone-hours`: set how long exited-session tombstones are retained after
+  a session ends. The value is recorded when the agent is created. Values less
+  than or equal to zero disable automatic tombstone cleanup.
 
 ## Mux Commands
 
@@ -120,14 +124,14 @@ Use `sesshmux` for session management:
 - `sesshmux list [--refresh] [--exited] [--jsonl] [HOST]`: list attachable
   sessions locally or on `HOST`. Without `HOST`, local sessions and cached
   remote routes are shown. Use `sesshmux list .` to show only local sessions.
-  `--refresh` asks each cached remote host for its current live connection list.
-  If that live list overlaps with the local pending-kill queue, sessh runs a
-  remote kill for those targets and updates the local queue and tombstones.
+  `--refresh` asks each cached remote host for its current live connection list,
+  then drains any pending remote cleanup requests for that host.
   Without `--refresh`, cached remote status such as attached count and input time
   may be stale. `--exited` shows recently exited sessions instead of live
   sessions, including exit code, signal, or kill status when sessh observed it.
-  Exited sessions are retained for one week and cleaned up by `list`. `--jsonl`
-  emits one JSON object per session in the selected live/exited mode.
+  Exited sessions are retained according to their recorded `tombstone-hours`
+  setting and cleaned up by `list`. `--jsonl` emits one JSON object per session
+  in the selected live/exited mode.
 - `sesshmux kill [--jsonl] [HOST] ID...`: terminate one or more local or remote
   targets. `ID` may be an `s-` session GUID or a `p-` proxy-stream GUID; local
   session aliases are also accepted.

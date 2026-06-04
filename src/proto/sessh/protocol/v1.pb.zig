@@ -21,7 +21,7 @@ pub const TeSessionEndReason = enum(i32) {
     TE_SESSION_END_REASON_PROCESS_EXITED = 1,
     TE_SESSION_END_REASON_KILLED_BY_REQUEST = 2,
     TE_SESSION_END_REASON_AGENT_SHUTDOWN = 3,
-    TE_SESSION_END_REASON_DISCONNECTED_TIMEOUT = 4,
+    TE_SESSION_END_REASON_REAPED = 4,
     _,
 };
 
@@ -1418,7 +1418,8 @@ pub const TeSessionCreate = struct {
     session_alias: []const u8 = &.{},
     legacy_command_argv: std.ArrayListUnmanaged([]const u8) = .empty,
     tty_settings: ?TeTtySettings = null,
-    max_disconnected_ms: u64 = 0,
+    reap_ms: u64 = 0,
+    tombstone_retention_ms: u64 = 0,
     command: ?command_union = null,
 
     pub const _command_case = enum {
@@ -1443,7 +1444,8 @@ pub const TeSessionCreate = struct {
         .session_alias = fd(6, .{ .scalar = .string }),
         .legacy_command_argv = fd(7, .{ .repeated = .{ .scalar = .string } }),
         .tty_settings = fd(10, .submessage),
-        .max_disconnected_ms = fd(11, .{ .scalar = .uint64 }),
+        .reap_ms = fd(11, .{ .scalar = .uint64 }),
+        .tombstone_retention_ms = fd(12, .{ .scalar = .uint64 }),
         .command = fd(null, .{ .oneof = command_union }),
     };
 

@@ -45,6 +45,7 @@ pub const LocalStreamOptions = struct {
     proxy_control_output_mode: proxy_control.OutputMode = .update,
     title_fallback: []const u8 = "",
     pending_kill_host: []const u8 = "",
+    pending_kill_port: []const u8 = session_registry.default_pending_port,
     pending_kill_guid: []const u8 = "",
 };
 
@@ -214,7 +215,6 @@ const StreamState = struct {
         }
         return false;
     }
-
 };
 
 fn channelIndex(channel: StreamChannel) usize {
@@ -1953,9 +1953,10 @@ fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl) bool
 
 fn queueLocalPendingKill(options: LocalStreamOptions) void {
     if (options.pending_kill_host.len == 0 or options.pending_kill_guid.len == 0) return;
-    session_registry.queuePendingKill(std.heap.smp_allocator, options.pending_kill_host, options.pending_kill_guid) catch |err| {
-        client_log.debug("event=stream_pending_kill_queue_failed host={s} guid={s} error={t}", .{
+    session_registry.queuePendingKill(std.heap.smp_allocator, options.pending_kill_host, options.pending_kill_port, options.pending_kill_guid) catch |err| {
+        client_log.debug("event=stream_pending_kill_queue_failed host={s} port={s} guid={s} error={t}", .{
             options.pending_kill_host,
+            options.pending_kill_port,
             options.pending_kill_guid,
             err,
         });

@@ -50,6 +50,7 @@ batch_mode=0
 verbose=
 plain_option=
 ipqos_option=
+port_option=
 proxy_command=
 x11_option=
 agent_option=
@@ -97,6 +98,12 @@ record_o_option() {
       if [ -z "$ipqos_option" ]; then
         ipqos_option=${1#* }
       fi
+      ;;
+    [Pp][Oo][Rr][Tt]=*)
+      port_option=${1#*=}
+      ;;
+    [Pp][Oo][Rr][Tt]\\ *)
+      port_option=${1#* }
       ;;
   esac
 }
@@ -176,6 +183,7 @@ while [ "$#" -gt 0 ]; do
         printf 'fake ssh: missing -p argument\\n' >&2
         exit 97
       fi
+      port_option=$1
       shift
       ;;
     -v*)
@@ -214,14 +222,18 @@ if [ "$config_query" -eq 1 ]; then
   if [ -n "${SESSH_FAKE_SSH_G_FAIL:-}" ]; then
     exit "$SESSH_FAKE_SSH_G_FAIL"
   fi
+  config_hostname=${SESSH_FAKE_SSH_G_HOSTNAME:-$host}
+  config_port=${SESSH_FAKE_SSH_G_PORT:-${port_option:-22}}
   if [ -n "$ipqos_option" ]; then
-    printf 'hostname %s\\n' "$host"
+    printf 'hostname %s\\n' "$config_hostname"
+    printf 'port %s\\n' "$config_port"
     case "$ipqos_option" in
       *\\ *) printf 'ipqos %s\\n' "$ipqos_option" ;;
       *) printf 'ipqos %s %s\\n' "$ipqos_option" "$ipqos_option" ;;
     esac
   else
-    printf 'hostname %s\\n' "$host"
+    printf 'hostname %s\\n' "$config_hostname"
+    printf 'port %s\\n' "$config_port"
     printf 'ipqos %s\\n' "${SESSH_FAKE_SSH_G_IPQOS:-af21 cs1}"
   fi
   exit 0
@@ -1094,15 +1106,49 @@ def pending_dir(env):
     return state_root(env) / "pending"
 
 
-def pending_file_for_host(env, host):
-    return pending_dir(env) / f"{hashlib.sha256(host.encode('utf-8')).hexdigest()}.json"
+def pending_host_dir_name(host, port="22"):
+    if (
+        host
+        and len(host) <= 160
+        and not host.startswith(".")
+        and all(ch.isalnum() or ch in "._-@+%" for ch in host)
+        and port.isdigit()
+        and int(port) > 0
+        and int(port) <= 65535
+    ):
+        return f"{host}-{port}"
+    digest = hashlib.sha256(host.encode("utf-8") + b"\0" + port.encode("utf-8")).hexdigest()
+    return f":{digest}"
 
 
-def write_pending_kills(env, host, guids):
-    path = pending_file_for_host(env, host)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.write_text(json.dumps({"host": host, "guids": guids}, separators=(",", ":")) + "\n")
-    return path
+def pending_host_dir(env, host, port="22"):
+    return pending_dir(env) / pending_host_dir_name(host, port)
+
+
+def pending_entry_for_host_guid(env, host, guid, port="22"):
+    return pending_host_dir(env, host, port) / f"kill-{guid}.json"
+
+
+def write_pending_kills(env, host, guids, requested_at_unix_ms=None, port="22"):
+    host_dir = pending_host_dir(env, host, port)
+    host_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (host_dir / "meta.json").write_text(json.dumps({"name": host, "port": port}, separators=(",", ":")) + "\n")
+    if requested_at_unix_ms is None:
+        requested_at_unix_ms = int(time.time() * 1000)
+    first_path = None
+    for guid in guids:
+        path = pending_entry_for_host_guid(env, host, guid, port)
+        row = {
+            "type": "kill",
+            "host": host,
+            "port": port,
+            "guid": guid,
+            "requested_at_unix_ms": requested_at_unix_ms,
+        }
+        path.write_text(json.dumps(row, separators=(",", ":")) + "\n")
+        if first_path is None:
+            first_path = path
+    return first_path if first_path is not None else host_dir
 
 
 def write_live_proxy_runtime(runtime_root_path, guid, agent_pid):
@@ -1201,7 +1247,7 @@ def ensure_alias(env, alias, guid=None):
     alias_path.symlink_to(Path("../guid") / guid)
 
 
-def write_ssh_route(env, alias, guid, host, ssh_options=(), detached_at_unix_ms=None):
+def write_ssh_route(env, alias, guid, host, ssh_options=(), detached_at_unix_ms=None, resolved_host=None, port="22"):
     guid = canonical_guid(guid)
     ensure_alias(env, alias, guid)
     session = state_sessions_dir(env) / guid
@@ -1214,11 +1260,14 @@ def write_ssh_route(env, alias, guid, host, ssh_options=(), detached_at_unix_ms=
                 "primary_alias": alias,
                 "session_dir": str(remote_session_dir),
                 "host": host,
+                "resolved_host": resolved_host or host,
+                "port": port,
                 "agent_version": "cached-test",
                 "alive": True,
                 "attached_count": None,
                 "last_input_at_unix_ms": None,
                 "detached_at_unix_ms": detached_at_unix_ms,
+                "tombstone_retention_ms": 604800000,
                 "ssh_options": list(ssh_options),
             },
             separators=(",", ":"),
@@ -3068,11 +3117,11 @@ def test_mux_new_detached_creates_local_session_without_attach(tmp):
         raise AssertionError(attached)
 
 
-def test_mux_new_detached_times_out_after_max_disconnected_hours(tmp):
+def test_mux_new_detached_times_out_after_reap_hours(tmp):
     env = isolated_env(tmp)
     config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
     config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "sessh.env").write_text("max-disconnected-hours=0.001\n")
+    (config_dir / "sessh.env").write_text("reap-hours=0.001\n")
     shell = tmp / "timeout-shell"
     shell.write_text("#!/bin/sh\nwhile :; do sleep 1; done\n")
     shell.chmod(0o700)
@@ -3094,13 +3143,13 @@ def test_mux_new_detached_times_out_after_max_disconnected_hours(tmp):
     if len(matches) != 1:
         raise AssertionError(process_diagnostics(listed_jsonl))
     row = matches[0]
-    if row.get("id") != "timeout-local" or row.get("end_reason") != "disconnected_timeout":
+    if row.get("id") != "timeout-local" or row.get("end_reason") != "reaped":
         raise AssertionError(row)
     if row.get("exit_status") is not None:
         raise AssertionError(row)
 
     listed_table = run_sesshmux(["list", "--exited"], env, timeout=10.0)
-    if listed_table.returncode != 0 or "DISCONNECTED TIMEOUT" not in listed_table.stdout:
+    if listed_table.returncode != 0 or "REAPED" not in listed_table.stdout:
         raise AssertionError(listed_table)
     if (state_sessions_dir(env) / guid / "route.json").exists():
         raise AssertionError("timed-out route was not tombstoned")
@@ -3157,6 +3206,40 @@ def test_mux_new_detached_creates_remote_route_without_attach(tmp):
         raise AssertionError(attached)
     if marker not in attached.stdout:
         raise AssertionError(attached)
+
+
+def test_mux_new_detached_records_resolved_ssh_endpoint(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_runtime = tmp / "remote-runtime"
+    remote_state = tmp / "remote-state"
+    remote_shell = tmp / "remote-resolved-shell"
+    remote_runtime.mkdir(mode=0o700)
+    remote_state.mkdir(mode=0o700)
+    remote_shell.write_text("#!/bin/sh\nwhile :; do sleep 1; done\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"] = str(remote_runtime)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"] = str(remote_state)
+    env["SESSH_FAKE_SSH_G_HOSTNAME"] = "resolved.example"
+    env["SESSH_FAKE_SSH_G_PORT"] = "2200"
+    env["SHELL"] = str(remote_shell)
+    seed_remote_artifact_cache(env)
+
+    created = run_sesshmux(["new", "--detached", "--alias", "resolved-route", "alias-host"], env, timeout=30.0)
+
+    if created.returncode != 0 or not created.stdout.startswith("CREATED s-"):
+        raise AssertionError(created)
+    guid = created.stdout.strip().split()[-1]
+    route = json.loads((state_sessions_dir(env) / guid / "route.json").read_text())
+    if route.get("host") != "alias-host":
+        raise AssertionError(route)
+    if route.get("resolved_host") != "resolved.example" or route.get("port") != "2200":
+        raise AssertionError(route)
+    run_sesshmux(["kill", "alias-host", guid], env, timeout=30.0)
 
 
 def test_ssh_no_host_attach_uses_local_route(tmp):
@@ -3413,6 +3496,60 @@ def test_ssh_list_refresh_drains_pending_session_kill(tmp):
         raise AssertionError(row)
     if (state_sessions_dir(env) / guid / "route.json").exists():
         raise AssertionError("pending-killed remote route was not tombstoned")
+
+
+def test_ssh_list_refresh_skips_pending_session_kill_after_attach(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_runtime = tmp / "remote-runtime"
+    remote_state = tmp / "remote-state"
+    remote_shell = tmp / "remote-shell"
+    marker = "PENDING_STALE_READY"
+    remote_runtime.mkdir(mode=0o700)
+    remote_state.mkdir(mode=0o700)
+    remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\r\\n'\nwhile :; do sleep 1; done\n")
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"] = str(remote_runtime)
+    env["SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"] = str(remote_state)
+    env["SHELL"] = str(remote_shell)
+    seed_remote_artifact_cache(env)
+
+    created = run_sesshmux(["new", "--detached", "--alias", "pending-stale", "test-host"], env, timeout=30.0)
+    if created.returncode != 0 or not created.stdout.startswith("CREATED s-"):
+        raise AssertionError(created)
+    guid = created.stdout.strip().split()[-1]
+    requested_at_unix_ms = int(time.time() * 1000)
+    pending = write_pending_kills(env, "test-host", [guid], requested_at_unix_ms=requested_at_unix_ms)
+    time.sleep(0.05)
+
+    try:
+        attached = run_sesshmux_until_stdout(["attach", "--host", "test-host", "pending-stale"], env, marker, timeout=30.0)
+        if attached.returncode != 0:
+            raise AssertionError(attached)
+        time.sleep(0.05)
+
+        listed = run_sesshmux(["list", "--refresh", "--jsonl"], env, timeout=30.0)
+
+        if listed.returncode != 0:
+            raise AssertionError(listed)
+        if pending.exists():
+            raise AssertionError("stale pending session kill was not removed")
+        rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
+        matches = [row for row in rows if row.get("guid") == guid]
+        if len(matches) != 1:
+            raise AssertionError(process_diagnostics(listed))
+        if matches[0].get("id") != "pending-stale":
+            raise AssertionError(matches[0])
+        if not (state_sessions_dir(env) / guid / "route.json").exists():
+            raise AssertionError("stale pending kill tombstoned a live remote route")
+        if (tombstones_dir(env) / f"{guid}.json").exists():
+            raise AssertionError("stale pending kill wrote a tombstone")
+    finally:
+        run_sesshmux(["kill", "test-host", guid], env, timeout=30.0)
 
 
 def test_ssh_list_refresh_drains_pending_proxy_kill_without_route(tmp):
@@ -5058,12 +5195,16 @@ def main(argv=None):
             test_mux_new_detached_creates_local_session_without_attach,
         ),
         (
-            "mux new detached times out after max disconnected hours",
-            test_mux_new_detached_times_out_after_max_disconnected_hours,
+            "mux new detached times out after reap hours",
+            test_mux_new_detached_times_out_after_reap_hours,
         ),
         (
             "mux new detached creates remote route without attach",
             test_mux_new_detached_creates_remote_route_without_attach,
+        ),
+        (
+            "mux new detached records resolved ssh endpoint",
+            test_mux_new_detached_records_resolved_ssh_endpoint,
         ),
         (
             "ssh no-host attach uses local route",
@@ -5092,6 +5233,10 @@ def main(argv=None):
         (
             "ssh list refresh drains pending session kill",
             test_ssh_list_refresh_drains_pending_session_kill,
+        ),
+        (
+            "ssh list refresh skips pending session kill after attach",
+            test_ssh_list_refresh_skips_pending_session_kill_after_attach,
         ),
         (
             "ssh list refresh drains pending proxy kill without route",

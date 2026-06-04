@@ -48,7 +48,8 @@ const Session = struct {
     end_reason: u8 = 0,
     attached: bool = false,
     detached_at_unix_ms: u64 = 0,
-    max_disconnected_ms: u64 = 0,
+    reap_ms: u64 = 0,
+    tombstone_retention_ms: u64 = 0,
     last_input_at_unix_ms: u64 = 0,
     alive: bool = false,
     pending_plain_output: std.ArrayList(u8) = .empty,
@@ -702,7 +703,8 @@ const SessionCreateRequest = struct {
     command_argv: [][]u8,
     shell_command: ?[]u8,
     tty_settings: ?tty_settings.Settings,
-    max_disconnected_ms: u64,
+    reap_ms: u64,
+    tombstone_retention_ms: u64,
 
     fn deinit(self: *SessionCreateRequest) void {
         app_allocator.allocator().free(self.session_alias);
@@ -1310,7 +1312,7 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
     const now_ms = sessionAgentMonotonicMs(session_agent);
     const now_unix_ms = nowUnixMs();
     clearExpiredDebugUnresponsiveAttachments(session_agent, now_ms);
-    if (endDisconnectedTimeoutSessions(session_agent, now_unix_ms)) return;
+    if (endReapedSessions(session_agent, now_unix_ms)) return;
 
     var pollfds: [3 + max_sessions + max_attachments]posix.pollfd = undefined;
     var kinds: [3 + max_sessions + max_attachments]PollKind = undefined;
@@ -1351,7 +1353,7 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
     const after_poll_ms = sessionAgentMonotonicMs(session_agent);
     clearExpiredDebugUnresponsiveAttachments(session_agent, after_poll_ms);
     flushExpiredSynchronizedOutputSessions(session_agent, after_poll_ms);
-    if (endDisconnectedTimeoutSessions(session_agent, nowUnixMs())) return;
+    if (endReapedSessions(session_agent, nowUnixMs())) return;
 
     for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
         if (pollfd.revents == 0) continue;
@@ -1399,8 +1401,8 @@ fn sessionAgentPollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64, no
         if (timeout_ms == null or clamped_remaining_ms < timeout_ms.?) timeout_ms = clamped_remaining_ms;
     }
     for (&session_agent.sessions) |*session| {
-        if (!sessionDisconnectedTimeoutEnabled(session)) continue;
-        const deadline_ms = session.detached_at_unix_ms +| session.max_disconnected_ms;
+        if (!sessionReapEnabled(session)) continue;
+        const deadline_ms = session.detached_at_unix_ms +| session.reap_ms;
         const remaining_ms: i64 = if (deadline_ms <= now_unix_ms)
             0
         else
@@ -1411,16 +1413,16 @@ fn sessionAgentPollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64, no
     return @intCast(@min(ms, std.math.maxInt(i32)));
 }
 
-fn endDisconnectedTimeoutSessions(session_agent: *SessionAgent, now_unix_ms: u64) bool {
+fn endReapedSessions(session_agent: *SessionAgent, now_unix_ms: u64) bool {
     var ended_any = false;
     for (&session_agent.sessions, 0..) |*session, session_index| {
-        if (!sessionDisconnectedTimeoutEnabled(session)) continue;
-        const deadline_ms = session.detached_at_unix_ms +| session.max_disconnected_ms;
+        if (!sessionReapEnabled(session)) continue;
+        const deadline_ms = session.detached_at_unix_ms +| session.reap_ms;
         if (now_unix_ms < deadline_ms) continue;
-        logSessionAgent(session_agent, "event=disconnected_timeout id={s} detached_at_ms={} max_disconnected_ms={}", .{
+        logSessionAgent(session_agent, "event=reaped id={s} detached_at_ms={} reap_ms={}", .{
             session.idSlice(),
             session.detached_at_unix_ms,
-            session.max_disconnected_ms,
+            session.reap_ms,
         });
         endSession(session_agent, session_index, 3, .{ .ended_at_unix_ms = now_unix_ms });
         ended_any = true;
@@ -1428,20 +1430,20 @@ fn endDisconnectedTimeoutSessions(session_agent: *SessionAgent, now_unix_ms: u64
     return ended_any;
 }
 
-fn sessionDisconnectedTimeoutEnabled(session: *const Session) bool {
+fn sessionReapEnabled(session: *const Session) bool {
     return session.alive and
         !session.attached and
         session.detached_at_unix_ms != 0 and
-        session.max_disconnected_ms != 0;
+        session.reap_ms != 0;
 }
 
-test "session agent poll timeout includes disconnected deadline" {
+test "session agent poll timeout includes reap deadline" {
     var session_agent = SessionAgent{};
     session_agent.sessions[0] = .{
         .alive = true,
         .attached = false,
         .detached_at_unix_ms = 1_000,
-        .max_disconnected_ms = 5_000,
+        .reap_ms = 5_000,
     };
 
     try std.testing.expectEqual(@as(i32, 5_000), sessionAgentPollTimeoutMs(&session_agent, 0, 1_000));
@@ -1586,14 +1588,15 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.command_argv,
                     request.shell_command,
                     request.tty_settings,
-                    request.max_disconnected_ms,
+                    request.reap_ms,
+                    request.tombstone_retention_ms,
                 ) catch |err| {
                     session_registry.removeAlias(app_allocator.allocator(), alias) catch {};
                     return err;
                 };
                 const session = &session_agent.sessions[session_index];
                 if (session_agent.session_paths) |paths| {
-                    try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), alias, paths.dir, config.version);
+                    try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), alias, paths.dir, config.version, session.tombstone_retention_ms);
                     session.detached_at_unix_ms = nowUnixMs();
                 }
                 try sendSessionCreatedForSession(session_agent, fd, session, alias);
@@ -2219,7 +2222,7 @@ fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !v
         .reason = switch (reason) {
             1 => .TE_SESSION_END_REASON_KILLED_BY_REQUEST,
             2 => .TE_SESSION_END_REASON_AGENT_SHUTDOWN,
-            3 => .TE_SESSION_END_REASON_DISCONNECTED_TIMEOUT,
+            3 => .TE_SESSION_END_REASON_REAPED,
             else => .TE_SESSION_END_REASON_PROCESS_EXITED,
         },
         .exit_status = exit_status,
@@ -2834,7 +2837,8 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
         else
             null,
         .tty_settings = request_tty_settings,
-        .max_disconnected_ms = message.max_disconnected_ms,
+        .reap_ms = message.reap_ms,
+        .tombstone_retention_ms = message.tombstone_retention_ms,
     };
 }
 
@@ -2958,7 +2962,8 @@ fn createSession(
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     settings: ?tty_settings.Settings,
-    max_disconnected_ms: u64,
+    reap_ms: u64,
+    tombstone_retention_ms: u64,
 ) !usize {
     if (session_agent.fixed_session_id != null and session_agent.started_session) return error.TooManySessions;
 
@@ -2997,7 +3002,8 @@ fn createSession(
             .rows = rows,
             .cols = cols,
             .scrollback_row_count = scrollback_row_count,
-            .max_disconnected_ms = max_disconnected_ms,
+            .reap_ms = reap_ms,
+            .tombstone_retention_ms = tombstone_retention_ms,
             .alive = true,
         };
         @memcpy(session.id[0..session_guid.len], session_guid);
@@ -4239,7 +4245,7 @@ fn writeEndedSessionTombstone(session_agent: *SessionAgent, session: *const Sess
         .end_reason = switch (reason) {
             1 => .killed_by_request,
             2 => .agent_shutdown,
-            3 => .disconnected_timeout,
+            3 => .reaped,
             else => .process_exited,
         },
         .exit_status = exit_status,

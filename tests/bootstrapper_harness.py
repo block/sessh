@@ -100,6 +100,40 @@ def test_cache_hit_execs_explicit_internal_command(tmp):
         raise AssertionError(result.stdout)
 
 
+def test_cache_hit_decodes_encoded_exec_args(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-bin"
+    fake_bin.mkdir()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    artifact = (
+        b"#!/bin/sh\n"
+        b"printf 'CACHED argc=%s\\n' \"$#\"\n"
+        b"for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n"
+    )
+    artifact_hash = sha256(artifact)
+    write_executable(artifact_path(env, artifact_hash), artifact)
+    request = '{"guid":"s-00000000-0000-4000-8000-000000000001","requested_age_ms":1000,"note":"alpha beta \' gamma"}'
+    encoded_request = "b64:" + base64.b64encode(request.encode()).decode()
+
+    result = run_bootstrapper(
+        f"EXEC test-set {artifact_hash} -- :internal-session-broker: kill --jsonl --request {encoded_request}\n",
+        env,
+    )
+
+    assert_ok(result)
+    expected = (
+        "OK\n"
+        "CACHED argc=5\n"
+        "<:internal-session-broker:>\n"
+        "<kill>\n"
+        "<--jsonl>\n"
+        "<--request>\n"
+        f"<{request}>\n"
+    )
+    if result.stdout != expected:
+        raise AssertionError(result.stdout)
+
+
 def test_upload_installs_and_execs(tmp):
     env = isolated_env(tmp)
     artifact = b"#!/bin/sh\nprintf 'UPLOADED %s\\n' \"$*\"\n"
@@ -248,6 +282,7 @@ def main():
     tests = (
         ("cache hit execs without platform or tool probe", test_cache_hit_execs_without_platform_or_tool_probe),
         ("cache hit execs explicit internal command", test_cache_hit_execs_explicit_internal_command),
+        ("cache hit decodes encoded exec args", test_cache_hit_decodes_encoded_exec_args),
         ("upload installs and execs", test_upload_installs_and_execs),
         ("invalid artifact set is rejected", test_invalid_artifact_set_is_rejected),
         ("exec command is required", test_exec_command_is_required),

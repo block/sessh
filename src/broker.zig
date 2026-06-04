@@ -99,9 +99,10 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
         return process_exit.request(exit_status);
     }
     if (std.mem.eql(u8, command, "kill")) {
-        const options = parseKillOptions(args) catch {
-            return finishCommand(64, "", "ERROR usage: kill [--jsonl] (--all | --current | ID...)\n");
+        var options = parseKillOptions(allocator, args) catch {
+            return finishCommand(64, "", "ERROR usage: kill [--jsonl] (--all | --current | ID... | --request JSON...)\n");
         };
+        defer options.deinit(allocator);
         return killAgents(allocator, options);
     }
     if (isClientControlCommandName(command)) {
@@ -161,11 +162,29 @@ const KillOptions = struct {
     all: bool = false,
     current: bool = false,
     targets: []const []const u8 = &.{},
+    requests: []KillRequest = &.{},
+
+    fn deinit(self: *KillOptions, allocator: std.mem.Allocator) void {
+        for (self.requests) |*request| request.deinit(allocator);
+        allocator.free(self.requests);
+        self.* = undefined;
+    }
+};
+
+const KillRequest = struct {
+    guid: []u8,
+    requested_age_ms: u64,
+
+    fn deinit(self: *KillRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.guid);
+        self.* = undefined;
+    }
 };
 
 const KillStatus = enum {
     killed,
     missing,
+    skipped,
     failure,
 };
 
@@ -280,8 +299,14 @@ fn parseListOptions(args: []const []const u8) !ListOptions {
     return options;
 }
 
-fn parseKillOptions(args: []const []const u8) !KillOptions {
+fn parseKillOptions(allocator: std.mem.Allocator, args: []const []const u8) !KillOptions {
     var options = KillOptions{};
+    errdefer options.deinit(allocator);
+    var requests: std.ArrayList(KillRequest) = .empty;
+    errdefer {
+        for (requests.items) |*request| request.deinit(allocator);
+        requests.deinit(allocator);
+    }
     var targets_start: ?usize = null;
     var i: usize = 1;
     while (i < args.len) {
@@ -289,28 +314,79 @@ fn parseKillOptions(args: []const []const u8) !KillOptions {
         if (std.mem.eql(u8, arg, "--jsonl")) {
             options.format = .jsonl;
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--all")) {
+        } else if (std.mem.startsWith(u8, arg, "--request=")) {
             if (options.all or options.current or targets_start != null) return error.InvalidKillArgs;
+            try requests.append(allocator, try parseKillRequestJson(allocator, arg["--request=".len..]));
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--request")) {
+            if (options.all or options.current or targets_start != null) return error.InvalidKillArgs;
+            i += 1;
+            if (i >= args.len) return error.InvalidKillArgs;
+            try requests.append(allocator, try parseKillRequestJson(allocator, args[i]));
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--all")) {
+            if (options.all or options.current or targets_start != null or requests.items.len > 0) return error.InvalidKillArgs;
             options.all = true;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--current")) {
-            if (options.all or options.current or targets_start != null) return error.InvalidKillArgs;
+            if (options.all or options.current or targets_start != null or requests.items.len > 0) return error.InvalidKillArgs;
             options.current = true;
             i += 1;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.InvalidKillArgs;
         } else {
-            if (options.all or options.current) return error.InvalidKillArgs;
+            if (options.all or options.current or requests.items.len > 0) return error.InvalidKillArgs;
             targets_start = i;
             i = args.len;
         }
     }
     if (targets_start) |start| options.targets = args[start..];
+    options.requests = try requests.toOwnedSlice(allocator);
     const target_modes: u8 = (if (options.all) @as(u8, 1) else 0) +
         (if (options.current) @as(u8, 1) else 0) +
-        (if (options.targets.len > 0) @as(u8, 1) else 0);
+        (if (options.targets.len > 0) @as(u8, 1) else 0) +
+        (if (options.requests.len > 0) @as(u8, 1) else 0);
     if (target_modes != 1) return error.MissingKillTarget;
     return options;
+}
+
+fn parseKillRequestJson(allocator: std.mem.Allocator, bytes: []const u8) !KillRequest {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const object = try jsonObject(parsed.value);
+    const guid_value = jsonStringField(object, "guid") orelse return error.InvalidKillArgs;
+    if (!session_registry.isValidSessionGuid(guid_value) and !session_registry.isValidProxyGuid(guid_value)) return error.InvalidKillArgs;
+    return .{
+        .guid = try allocator.dupe(u8, guid_value),
+        .requested_age_ms = (try jsonU64Field(object, "requested_age_ms")) orelse return error.InvalidKillArgs,
+    };
+}
+
+fn jsonObject(value: std.json.Value) !std.json.ObjectMap {
+    return switch (value) {
+        .object => |object| object,
+        else => error.InvalidKillArgs,
+    };
+}
+
+fn jsonStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .string => |string| string,
+        else => null,
+    };
+}
+
+fn jsonU64Field(object: std.json.ObjectMap, key: []const u8) !?u64 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |integer| blk: {
+            if (integer < 0) return error.InvalidKillArgs;
+            break :blk @as(u64, @intCast(integer));
+        },
+        else => error.InvalidKillArgs,
+    };
 }
 
 fn parseClientListSelector(value: []const u8) ClientListSelector {
@@ -694,7 +770,7 @@ fn tombstoneDisplayId(allocator: std.mem.Allocator, tombstone: *const session_re
 
 fn formatTombstoneStatus(buf: []u8, tombstone: *const session_registry.Tombstone) []const u8 {
     if (tombstone.end_reason == .killed_by_request) return "KILLED";
-    if (tombstone.end_reason == .disconnected_timeout) return "DISCONNECTED TIMEOUT";
+    if (tombstone.end_reason == .reaped) return "REAPED";
     if (tombstone.exit_status) |status| {
         return switch (status.kind) {
             .exited => std.fmt.bufPrint(buf, "EXIT {}", .{status.status}) catch "UNKNOWN",
@@ -1291,6 +1367,19 @@ fn killAgents(allocator: std.mem.Allocator, options: KillOptions) !void {
         const result = try killTarget(allocator, session_id);
         return finishKillResults(allocator, options.format, &.{result});
     }
+    if (options.requests.len > 0) {
+        var results: std.ArrayList(KillResult) = .empty;
+        defer results.deinit(allocator);
+        for (options.requests) |request| {
+            const result = killRequestTarget(allocator, request) catch |err| KillResult{
+                .guid = request.guid,
+                .status = .failure,
+                .reason = @errorName(err),
+            };
+            try results.append(allocator, result);
+        }
+        return finishKillResults(allocator, options.format, results.items);
+    }
 
     var results: std.ArrayList(KillResult) = .empty;
     defer results.deinit(allocator);
@@ -1316,6 +1405,11 @@ fn currentSessionId(allocator: std.mem.Allocator) ![]u8 {
 fn killTarget(allocator: std.mem.Allocator, target: []const u8) !KillResult {
     if (session_registry.isValidProxyGuid(target)) return killProxyTarget(allocator, target);
     return killSessionTarget(allocator, target);
+}
+
+fn killRequestTarget(allocator: std.mem.Allocator, request: KillRequest) !KillResult {
+    if (session_registry.isValidProxyGuid(request.guid)) return killProxyTarget(allocator, request.guid);
+    return killSessionTargetForRequest(allocator, request);
 }
 
 fn killSessionTarget(allocator: std.mem.Allocator, session_id: []const u8) !KillResult {
@@ -1359,6 +1453,77 @@ fn killSessionTarget(allocator: std.mem.Allocator, session_id: []const u8) !Kill
     }
     return .{
         .guid = session_id,
+        .status = .killed,
+        .ended_at_unix_ms = nowUnixMs(),
+    };
+}
+
+fn killSessionTargetForRequest(allocator: std.mem.Allocator, request: KillRequest) !KillResult {
+    var paths = pathsForLocalSessionRef(allocator, request.guid) catch |err| switch (err) {
+        error.SessionAlreadyExited, error.InvalidSessionId, error.FileNotFound, error.SessionRefNotLocal => return .{
+            .guid = request.guid,
+            .status = .missing,
+        },
+        else => return err,
+    };
+    defer paths.deinit(allocator);
+
+    var meta = session_registry.readMeta(allocator, paths) catch {
+        session_registry.removeStaleHints(paths) catch {};
+        return .{
+            .guid = request.guid,
+            .status = .missing,
+        };
+    };
+    defer meta.deinit(allocator);
+    if (!processExists(meta.agent_pid)) {
+        session_registry.removeStaleHints(paths) catch {};
+        return .{
+            .guid = request.guid,
+            .status = .missing,
+        };
+    }
+    if (!std.mem.eql(u8, meta.version, config.version)) {
+        return .{
+            .guid = request.guid,
+            .status = .failure,
+            .reason = "VersionMismatch",
+        };
+    }
+
+    var live_state = querySessionLiveState(allocator, paths) catch |err| return .{
+        .guid = request.guid,
+        .status = .failure,
+        .reason = @errorName(err),
+    };
+    defer live_state.deinit(allocator);
+    if (live_state.attached_clients.items.len > 0) return .{
+        .guid = request.guid,
+        .status = .skipped,
+        .reason = "currently_attached",
+    };
+    const now_ms = nowUnixMs();
+    const requested_remote_time_ms: u64 = if (request.requested_age_ms >= now_ms) 0 else now_ms - request.requested_age_ms;
+    const detached_at = live_state.detached_at_unix_ms orelse return .{
+        .guid = request.guid,
+        .status = .skipped,
+        .reason = "attached_since_request",
+    };
+    if (detached_at > requested_remote_time_ms) return .{
+        .guid = request.guid,
+        .status = .skipped,
+        .reason = "attached_since_request",
+    };
+
+    if (!terminateAgent(meta.agent_pid)) {
+        return .{
+            .guid = request.guid,
+            .status = .failure,
+            .reason = "KillFailed",
+        };
+    }
+    return .{
+        .guid = request.guid,
         .status = .killed,
         .ended_at_unix_ms = nowUnixMs(),
     };
@@ -1418,11 +1583,12 @@ fn finishKillResults(allocator: std.mem.Allocator, format: KillFormat, results: 
     const err = stderr.writer(allocator);
     var exit_status: u8 = 0;
     for (results) |result| {
-        if (result.status != .killed) exit_status = 1;
+        if (result.status != .killed and result.status != .skipped) exit_status = 1;
         switch (format) {
             .jsonl => try list_format.writeKillJsonlRow(out, result.guid, killStatusName(result.status), result.ended_at_unix_ms, result.reason),
             .text => switch (result.status) {
                 .killed => try out.print("ENDED {s}\n", .{result.guid}),
+                .skipped => try out.print("SKIPPED {s} {s}\n", .{ result.guid, result.reason }),
                 .missing => try err.print("ERROR {s} not found\n", .{result.guid}),
                 .failure => try err.print("ERROR failed to kill {s}: {s}\n", .{ result.guid, result.reason }),
             },
@@ -1435,6 +1601,7 @@ fn killStatusName(status: KillStatus) []const u8 {
     return switch (status) {
         .killed => "killed",
         .missing => "missing",
+        .skipped => "skipped",
         .failure => "failure",
     };
 }
@@ -1946,6 +2113,20 @@ fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .error_message, payload);
+}
+
+test "parseKillOptions accepts request json" {
+    const request_json = "{\"guid\":\"s-00000000-0000-4000-8000-000000000001\",\"requested_age_ms\":123}";
+    var options = try parseKillOptions(std.testing.allocator, &.{ "kill", "--jsonl", "--request", request_json });
+    defer options.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(KillFormat.jsonl, options.format);
+    try std.testing.expectEqual(@as(usize, 1), options.requests.len);
+    try std.testing.expectEqualStrings("s-00000000-0000-4000-8000-000000000001", options.requests[0].guid);
+    try std.testing.expectEqual(@as(u64, 123), options.requests[0].requested_age_ms);
+    try std.testing.expectEqual(@as(usize, 0), options.targets.len);
+
+    try std.testing.expectError(error.InvalidKillArgs, parseKillOptions(std.testing.allocator, &.{ "kill", "--request", request_json, "s1" }));
 }
 
 test "list all rows include runtime metadata and cached remote sessions" {

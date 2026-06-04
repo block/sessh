@@ -123,6 +123,66 @@ decode_base64_to_file() {
   esac
 }
 
+decode_base64_to_stdout() {
+  payload=$1
+  case "$BASE64_TOOL" in
+    base64_d)
+      printf '%s\n' "$payload" | base64 -d
+      ;;
+    base64_D)
+      printf '%s\n' "$payload" | base64 -D
+      ;;
+    openssl)
+      printf '%s\n' "$payload" | openssl base64 -d
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+shell_quote() {
+  value=$1
+  printf "'"
+  while [ -n "$value" ]; do
+    case "$value" in
+      *"'"*)
+        prefix=${value%%"'"*}
+        printf '%s' "$prefix"
+        printf '%s' "'\\''"
+        value=${value#*"'"}
+        ;;
+      *)
+        printf '%s' "$value"
+        value=
+        ;;
+    esac
+  done
+  printf "'"
+}
+
+append_exec_arg() {
+  arg=$1
+  case "$arg" in
+    b64:*)
+      probe_base64 || err MISSING_TOOL base64
+      payload=${arg#b64:}
+      decoded=$(decode_base64_to_stdout "$payload") || err INVALID_EXEC base64_decode_failed
+      ;;
+    *)
+      decoded=$arg
+      ;;
+  esac
+  quoted=$(shell_quote "$decoded") || err INVALID_EXEC quote_failed
+  exec_args="${exec_args}${exec_args:+ }$quoted"
+}
+
+exec_candidate() {
+  candidate=$1
+  quoted_candidate=$(shell_quote "$candidate") || err INVALID_EXEC quote_failed
+  eval "exec $quoted_candidate $exec_args"
+}
+
 canonical_platform() {
   os_raw=$(uname -s 2>/dev/null) || err UNSUPPORTED_PLATFORM uname_failed
   arch_raw=$(uname -m 2>/dev/null) || err UNSUPPORTED_PLATFORM uname_failed
@@ -159,7 +219,10 @@ while [ "$#" -gt 0 ]; do
   if [ "$1" = "--" ]; then
     shift
     [ "$#" -gt 0 ] || err INVALID_EXEC missing_exec_command
-    exec_args="$*"
+    while [ "$#" -gt 0 ]; do
+      append_exec_arg "$1"
+      shift
+    done
     break
   fi
   is_sha256 "$1" || err INVALID_EXEC invalid_sha256
@@ -177,7 +240,7 @@ for hash in $hashes; do
   candidate=$cache_dir/$hash/sesshmux
   if [ -f "$candidate" ] && [ -x "$candidate" ]; then
     printf 'OK\n'
-    exec "$candidate" $exec_args
+    exec_candidate "$candidate" || err EXEC_FAILED exec_failed
   fi
 done
 
@@ -209,4 +272,4 @@ mv "$tmp" "$artifact_dir/sesshmux" || err INSTALL_FAILED rename
 trap - EXIT HUP INT TERM
 
 printf 'OK\n'
-exec "$artifact_dir/sesshmux" $exec_args
+exec_candidate "$artifact_dir/sesshmux" || err EXEC_FAILED exec_failed

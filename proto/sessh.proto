@@ -244,7 +244,10 @@ message TeSessionCreate {
   TeTtySettings tty_settings = 10;
   // Maximum time the session may remain detached before the agent ends it.
   // Zero means disabled.
-  uint64 max_disconnected_ms = 11;
+  uint64 reap_ms = 11;
+  // How long tombstones for this session should be retained after it exits.
+  // Zero means no automatic tombstone cleanup.
+  uint64 tombstone_retention_ms = 12;
 }
 
 // Framed payload, client -> session agent.
@@ -453,7 +456,7 @@ enum TeSessionEndReason {
   TE_SESSION_END_REASON_PROCESS_EXITED = 1;
   TE_SESSION_END_REASON_KILLED_BY_REQUEST = 2;
   TE_SESSION_END_REASON_AGENT_SHUTDOWN = 3;
-  TE_SESSION_END_REASON_DISCONNECTED_TIMEOUT = 4;
+  TE_SESSION_END_REASON_REAPED = 4;
 }
 
 enum ExitStatusKind {

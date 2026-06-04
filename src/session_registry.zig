@@ -3,6 +3,7 @@ const app_allocator = @import("app_allocator.zig");
 const c = std.c;
 const posix = std.posix;
 
+const config = @import("config.zig");
 const socket_transport = @import("socket_transport.zig");
 
 pub const guid_body_len = 36;
@@ -15,7 +16,7 @@ pub const client_guid_len = client_guid_prefix.len + guid_body_len;
 pub const proxy_guid_len = proxy_guid_prefix.len + guid_body_len;
 pub const generated_alias_hex_len = 8;
 pub const generated_alias_len = session_guid_prefix.len + generated_alias_hex_len;
-pub const tombstone_retention_ms: u64 = 7 * 24 * 60 * 60 * 1000;
+pub const default_pending_port = "22";
 
 pub const SessionPaths = struct {
     dir: []u8,
@@ -742,6 +743,8 @@ pub const Route = struct {
     primary_alias: []u8,
     session_dir: []u8,
     host: []u8,
+    resolved_host: []u8,
+    port: []u8,
     agent_version: []u8,
     ssh_options: []const []const u8,
     last_known_alive: bool,
@@ -749,11 +752,14 @@ pub const Route = struct {
     last_input_at_unix_ms: ?u64,
     detached_at_unix_ms: ?u64,
     kill_requested: bool,
+    tombstone_retention_ms: u64,
 
     pub fn deinit(self: *Route, allocator: std.mem.Allocator) void {
         for (self.ssh_options) |option| allocator.free(option);
         allocator.free(self.ssh_options);
         allocator.free(self.agent_version);
+        allocator.free(self.port);
+        allocator.free(self.resolved_host);
         allocator.free(self.host);
         allocator.free(self.session_dir);
         allocator.free(self.primary_alias);
@@ -767,7 +773,7 @@ pub const TombstoneEndReason = enum {
     process_exited,
     killed_by_request,
     agent_shutdown,
-    disconnected_timeout,
+    reaped,
 };
 
 pub const TombstoneExitStatusKind = enum {
@@ -794,6 +800,7 @@ pub const Tombstone = struct {
     host: []u8,
     agent_version: []u8,
     ended_at_unix_ms: u64,
+    expires_at_unix_ms: ?u64,
     end_reason: TombstoneEndReason,
     exit_status: ?TombstoneExitStatus,
 
@@ -808,20 +815,93 @@ pub const Tombstone = struct {
     }
 };
 
-pub const PendingKills = struct {
-    guids: []const []const u8,
+pub const PendingKillEntry = struct {
+    type_name: []u8,
+    host: []u8,
+    port: []u8,
+    guid: []u8,
+    requested_at_unix_ms: u64 = 0,
+    raw_line: []u8,
+    filename: []u8,
 
-    pub fn deinit(self: *PendingKills, allocator: std.mem.Allocator) void {
-        freeStringArray(allocator, self.guids);
+    pub fn deinit(self: *PendingKillEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.filename);
+        allocator.free(self.raw_line);
+        allocator.free(self.guid);
+        allocator.free(self.port);
+        allocator.free(self.host);
+        allocator.free(self.type_name);
         self.* = undefined;
     }
 };
 
+pub const PendingKills = struct {
+    entries: []PendingKillEntry,
+
+    pub fn deinit(self: *PendingKills, allocator: std.mem.Allocator) void {
+        for (self.entries) |*entry| entry.deinit(allocator);
+        allocator.free(self.entries);
+        self.* = undefined;
+    }
+};
+
+pub const PendingKillFileLock = struct {
+    allocator: std.mem.Allocator,
+    file: std.fs.File,
+    dir_path: []u8,
+    lock_path: []u8,
+
+    pub fn deinit(self: *PendingKillFileLock) void {
+        self.file.unlock();
+        self.file.close();
+        self.allocator.free(self.lock_path);
+        self.allocator.free(self.dir_path);
+        self.* = undefined;
+    }
+
+    pub fn read(self: *PendingKillFileLock) !PendingKills {
+        return readPendingKillsFromDir(self.allocator, self.dir_path);
+    }
+
+    pub fn removeHandled(self: *PendingKillFileLock, pending: *const PendingKills, handled: []const []const u8) !void {
+        for (pending.entries) |*entry| {
+            if (!std.mem.eql(u8, entry.type_name, "kill")) continue;
+            if (!stringArrayContains(handled, entry.guid)) continue;
+            if (entry.filename.len == 0) continue;
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir_path, entry.filename });
+            defer self.allocator.free(path);
+            try unlinkIfExists(path);
+        }
+        try self.cleanupIfEmpty();
+    }
+
+    pub fn cleanupIfEmpty(self: *PendingKillFileLock) !void {
+        if (try pendingKillDirHasEntries(self.dir_path)) return;
+        try unlinkIfExists(self.lock_path);
+        removeDirIfEmpty(self.dir_path) catch |err| switch (err) {
+            error.DirNotEmpty => {},
+            else => return err,
+        };
+    }
+};
+
 pub const PendingKillHosts = struct {
-    hosts: []const []const u8,
+    hosts: []PendingKillHost,
 
     pub fn deinit(self: *PendingKillHosts, allocator: std.mem.Allocator) void {
-        freeStringArray(allocator, self.hosts);
+        for (self.hosts) |*host| host.deinit(allocator);
+        allocator.free(self.hosts);
+        self.* = undefined;
+    }
+};
+
+pub const PendingKillHost = struct {
+    name: []u8,
+    port: []u8,
+
+    pub fn deinit(self: *PendingKillHost, allocator: std.mem.Allocator) void {
+        allocator.free(self.port);
+        allocator.free(self.name);
         self.* = undefined;
     }
 };
@@ -832,7 +912,7 @@ pub fn tombstoneEndReasonName(reason: TombstoneEndReason) []const u8 {
         .process_exited => "process_exited",
         .killed_by_request => "killed_by_request",
         .agent_shutdown => "agent_shutdown",
-        .disconnected_timeout => "disconnected_timeout",
+        .reaped => "reaped",
     };
 }
 
@@ -841,7 +921,8 @@ pub fn tombstoneEndReasonFromName(value: []const u8) !TombstoneEndReason {
     if (std.mem.eql(u8, value, "process_exited")) return .process_exited;
     if (std.mem.eql(u8, value, "killed_by_request")) return .killed_by_request;
     if (std.mem.eql(u8, value, "agent_shutdown")) return .agent_shutdown;
-    if (std.mem.eql(u8, value, "disconnected_timeout")) return .disconnected_timeout;
+    if (std.mem.eql(u8, value, "reaped")) return .reaped;
+    if (std.mem.eql(u8, value, "disconnected_timeout")) return .reaped;
     return error.InvalidTombstone;
 }
 
@@ -864,10 +945,18 @@ pub fn writeSshRoute(
     primary_alias: []const u8,
     session_dir: []const u8,
     host: []const u8,
+    resolved_host: []const u8,
+    port: []const u8,
     ssh_options: []const []const u8,
     agent_version: []const u8,
+    tombstone_retention_ms: u64,
 ) !void {
-    return writeRoute(allocator, guid, primary_alias, session_dir, host, ssh_options, .{ .agent_version = agent_version });
+    return writeRoute(allocator, guid, primary_alias, session_dir, host, ssh_options, .{
+        .port = port,
+        .resolved_host = resolved_host,
+        .agent_version = agent_version,
+        .tombstone_retention_ms = tombstone_retention_ms,
+    });
 }
 
 pub fn writeLocalRoute(
@@ -876,17 +965,24 @@ pub fn writeLocalRoute(
     primary_alias: []const u8,
     session_dir: []const u8,
     agent_version: []const u8,
+    tombstone_retention_ms: u64,
 ) !void {
-    return writeRoute(allocator, guid, primary_alias, session_dir, ".", &.{}, .{ .agent_version = agent_version });
+    return writeRoute(allocator, guid, primary_alias, session_dir, ".", &.{}, .{
+        .agent_version = agent_version,
+        .tombstone_retention_ms = tombstone_retention_ms,
+    });
 }
 
 const RouteStatus = struct {
     last_known_alive: bool = true,
+    port: []const u8 = default_pending_port,
+    resolved_host: []const u8 = "",
     agent_version: []const u8 = "",
     attached_count: ?u32 = null,
     last_input_at_unix_ms: ?u64 = null,
     detached_at_unix_ms: ?u64 = null,
     kill_requested: bool = false,
+    tombstone_retention_ms: u64 = config.default_tombstone_retention_ms,
 };
 
 fn writeRoute(
@@ -910,16 +1006,20 @@ fn writeRoute(
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     const writer = text.writer(allocator);
+    const resolved_host = if (status.resolved_host.len == 0) host else status.resolved_host;
     try writer.print(
-        "{{\"guid\":{f},\"primary_alias\":{f},\"session_dir\":{f},\"host\":{f},\"agent_version\":{f},\"alive\":{},\"kill_requested\":{},\"attached_count\":",
+        "{{\"guid\":{f},\"primary_alias\":{f},\"session_dir\":{f},\"host\":{f},\"resolved_host\":{f},\"port\":{f},\"agent_version\":{f},\"alive\":{},\"kill_requested\":{},\"tombstone_retention_ms\":{},\"attached_count\":",
         .{
             std.json.fmt(canonical, .{}),
             std.json.fmt(primary_alias, .{}),
             std.json.fmt(session_dir, .{}),
             std.json.fmt(host, .{}),
+            std.json.fmt(resolved_host, .{}),
+            std.json.fmt(status.port, .{}),
             std.json.fmt(status.agent_version, .{}),
             status.last_known_alive,
             status.kill_requested,
+            status.tombstone_retention_ms,
         },
     );
     if (status.attached_count) |count| {
@@ -981,6 +1081,9 @@ pub fn updateRouteStatus(allocator: std.mem.Allocator, guid: []const u8, last_kn
             .last_input_at_unix_ms = live.last_input_at_unix_ms,
             .detached_at_unix_ms = live.detached_at_unix_ms,
             .kill_requested = route.kill_requested,
+            .port = route.port,
+            .resolved_host = route.resolved_host,
+            .tombstone_retention_ms = route.tombstone_retention_ms,
         },
     );
 }
@@ -1002,67 +1105,75 @@ pub fn markRouteKillRequested(allocator: std.mem.Allocator, guid: []const u8) !v
             .last_input_at_unix_ms = route.last_input_at_unix_ms,
             .detached_at_unix_ms = route.detached_at_unix_ms,
             .kill_requested = true,
+            .port = route.port,
+            .resolved_host = route.resolved_host,
+            .tombstone_retention_ms = route.tombstone_retention_ms,
         },
     );
 }
 
-pub fn queuePendingKill(allocator: std.mem.Allocator, host: []const u8, guid: []const u8) !void {
+pub fn queuePendingKill(allocator: std.mem.Allocator, name: []const u8, port: []const u8, guid: []const u8) !void {
     const canonical = try canonicalPendingKillGuid(allocator, guid);
     defer allocator.free(canonical);
+    const canonical_port = try canonicalPendingPort(allocator, port);
+    defer allocator.free(canonical_port);
 
-    var pending = readPendingKillsForHost(allocator, host) catch |err| switch (err) {
-        error.FileNotFound => PendingKills{ .guids = try allocator.alloc([]const u8, 0) },
-        else => return err,
-    };
-    defer pending.deinit(allocator);
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    try ensurePendingKillDir(allocator, root);
+    const host_dir = try pendingKillHostDirForHostInRoot(allocator, root, name, canonical_port);
+    defer allocator.free(host_dir);
+    try mkdirIgnoreExists(allocator, host_dir);
+    try writePendingKillHostMeta(allocator, host_dir, name, canonical_port);
 
-    if (stringArrayContains(pending.guids, canonical)) return;
-    const updated = try allocator.alloc([]const u8, pending.guids.len + 1);
-    errdefer allocator.free(updated);
-    for (pending.guids, 0..) |value, i| updated[i] = try allocator.dupe(u8, value);
-    errdefer {
-        for (updated[0..pending.guids.len]) |value| allocator.free(value);
-    }
-    updated[pending.guids.len] = try allocator.dupe(u8, canonical);
-    var updated_pending = PendingKills{ .guids = updated };
-    defer updated_pending.deinit(allocator);
-    try writePendingKillsForHost(allocator, host, &updated_pending);
+    const path = try pendingKillEntryPathForGuidInHostDir(allocator, host_dir, canonical);
+    defer allocator.free(path);
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try writePendingKillEntryJson(text.writer(allocator), name, canonical_port, canonical, currentUnixMs());
+    try writeAtomicFile(path, text.items);
 }
 
-pub fn readPendingKillsForHost(allocator: std.mem.Allocator, host: []const u8) !PendingKills {
-    const path = try pendingKillPathForHost(allocator, host);
-    defer allocator.free(path);
-    return readPendingKills(allocator, path);
+pub fn readPendingKillsForHost(allocator: std.mem.Allocator, name: []const u8, port: []const u8) !PendingKills {
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    const canonical_port = try canonicalPendingPort(allocator, port);
+    defer allocator.free(canonical_port);
+    const host_dir = try pendingKillHostDirForHostInRoot(allocator, root, name, canonical_port);
+    defer allocator.free(host_dir);
+    return readPendingKillsFromDir(allocator, host_dir);
 }
 
 pub fn readPendingKillHosts(allocator: std.mem.Allocator) !PendingKillHosts {
     const dir_path = try pendingKillsDir(allocator);
     defer allocator.free(dir_path);
     var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return .{ .hosts = try allocator.alloc([]const u8, 0) },
+        error.FileNotFound => return .{ .hosts = try allocator.alloc(PendingKillHost, 0) },
         else => return err,
     };
     defer dir.close();
 
-    var hosts: std.ArrayList([]const u8) = .empty;
+    var hosts: std.ArrayList(PendingKillHost) = .empty;
     errdefer {
-        for (hosts.items) |host| allocator.free(host);
+        for (hosts.items) |*host| host.deinit(allocator);
         hosts.deinit(allocator);
     }
 
     var iterator = dir.iterate();
     while (try iterator.next()) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        if (entry.kind != .directory) continue;
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
         defer allocator.free(path);
-        const host = readPendingKillHost(allocator, path) catch continue;
-        const value = host orelse continue;
-        if (stringArrayContains(hosts.items, value)) {
-            allocator.free(value);
+        const value = readPendingKillHostFromDir(allocator, path) catch continue;
+        if (pendingKillHostArrayContains(hosts.items, value.name, value.port)) {
+            var duplicate = value;
+            duplicate.deinit(allocator);
             continue;
         }
         hosts.append(allocator, value) catch |err| {
-            allocator.free(value);
+            var failed = value;
+            failed.deinit(allocator);
             return err;
         };
     }
@@ -1070,55 +1181,63 @@ pub fn readPendingKillHosts(allocator: std.mem.Allocator) !PendingKillHosts {
     return .{ .hosts = try hosts.toOwnedSlice(allocator) };
 }
 
-pub fn removePendingKill(allocator: std.mem.Allocator, host: []const u8, guid: []const u8) !void {
+pub fn removePendingKill(allocator: std.mem.Allocator, name: []const u8, port: []const u8, guid: []const u8) !void {
     const canonical = try canonicalPendingKillGuid(allocator, guid);
     defer allocator.free(canonical);
-    var pending = readPendingKillsForHost(allocator, host) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer pending.deinit(allocator);
-    if (!stringArrayContains(pending.guids, canonical)) return;
+    const canonical_port = try canonicalPendingPort(allocator, port);
+    defer allocator.free(canonical_port);
 
-    var retained: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (retained.items) |value| allocator.free(value);
-        retained.deinit(allocator);
-    }
-    for (pending.guids) |value| {
-        if (std.mem.eql(u8, value, canonical)) continue;
-        try retained.append(allocator, try allocator.dupe(u8, value));
-    }
-
-    const path = try pendingKillPathForHost(allocator, host);
-    defer allocator.free(path);
-    if (retained.items.len == 0) {
-        try unlinkIfExists(path);
-        return;
-    }
-
-    var updated = PendingKills{ .guids = try retained.toOwnedSlice(allocator) };
-    defer updated.deinit(allocator);
-    try writePendingKillsForHost(allocator, host, &updated);
-}
-
-fn writePendingKillsForHost(allocator: std.mem.Allocator, host: []const u8, pending: *const PendingKills) !void {
     const root = try socket_transport.stateRoot(allocator);
     defer allocator.free(root);
-    try ensurePendingKillDir(allocator, root);
-    const path = try pendingKillPathForHostInRoot(allocator, root, host);
+    const host_dir = try pendingKillHostDirForHostInRoot(allocator, root, name, canonical_port);
+    defer allocator.free(host_dir);
+    const path = try pendingKillEntryPathForGuidInHostDir(allocator, host_dir, canonical);
     defer allocator.free(path);
-
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
-    const writer = text.writer(allocator);
-    try writer.print("{{\"host\":{f},\"guids\":[", .{std.json.fmt(host, .{})});
-    for (pending.guids, 0..) |guid, i| {
-        if (i > 0) try writer.writeAll(",");
-        try writer.print("{f}", .{std.json.fmt(guid, .{})});
+    try unlinkIfExists(path);
+    if (!try pendingKillDirHasEntries(host_dir)) {
+        const lock_path = try pendingKillLockPathForHostDir(allocator, host_dir);
+        defer allocator.free(lock_path);
+        try unlinkIfExists(lock_path);
+        removeDirIfEmpty(host_dir) catch |err| switch (err) {
+            error.DirNotEmpty => {},
+            else => return err,
+        };
     }
-    try writer.writeAll("]}\n");
-    try writeAtomicFile(path, text.items);
+}
+
+pub fn tryLockPendingKillsForHost(allocator: std.mem.Allocator, name: []const u8, port: []const u8) !?PendingKillFileLock {
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    const canonical_port = try canonicalPendingPort(allocator, port);
+    defer allocator.free(canonical_port);
+    const host_dir = try pendingKillHostDirForHostInRoot(allocator, root, name, canonical_port);
+    errdefer allocator.free(host_dir);
+    if (!try pathExists(host_dir)) {
+        allocator.free(host_dir);
+        return null;
+    }
+    const lock_path = try pendingKillLockPathForHostDir(allocator, host_dir);
+    errdefer allocator.free(lock_path);
+    const file = std.fs.createFileAbsolute(lock_path, .{
+        .read = true,
+        .truncate = false,
+        .mode = 0o600,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.WouldBlock => {
+            allocator.free(lock_path);
+            allocator.free(host_dir);
+            return null;
+        },
+        error.FileNotFound => {
+            allocator.free(lock_path);
+            allocator.free(host_dir);
+            return null;
+        },
+        else => return err,
+    };
+    return .{ .allocator = allocator, .file = file, .dir_path = host_dir, .lock_path = lock_path };
 }
 
 pub fn markRouteAttached(allocator: std.mem.Allocator, guid: []const u8) !void {
@@ -1158,6 +1277,10 @@ fn writeTombstoneForRouteInRoot(allocator: std.mem.Allocator, root: []const u8, 
     try ensureTombstoneDir(allocator, root);
     const path = try tombstonePathForGuidInRoot(allocator, root, canonical);
     defer allocator.free(path);
+    const expires_at_unix_ms: ?u64 = if (route.tombstone_retention_ms == 0)
+        null
+    else
+        details.ended_at_unix_ms +| route.tombstone_retention_ms;
 
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
@@ -1178,15 +1301,20 @@ fn writeTombstoneForRouteInRoot(allocator: std.mem.Allocator, root: []const u8, 
         try writer.print("{f}", .{std.json.fmt(route.primary_alias, .{})});
     }
     try writer.print(
-        "],\"session_dir\":{f},\"host\":{f},\"agent_version\":{f},\"ended_at_unix_ms\":{},\"end_reason\":{f},\"exit_status\":",
+        "],\"session_dir\":{f},\"host\":{f},\"agent_version\":{f},\"ended_at_unix_ms\":{},\"expires_at_unix_ms\":",
         .{
             std.json.fmt(route.session_dir, .{}),
             std.json.fmt(route.host, .{}),
             std.json.fmt(route.agent_version, .{}),
             details.ended_at_unix_ms,
-            std.json.fmt(tombstoneEndReasonName(details.end_reason), .{}),
         },
     );
+    if (expires_at_unix_ms) |ts| {
+        try writer.print("{}", .{ts});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.print(",\"end_reason\":{f},\"exit_status\":", .{std.json.fmt(tombstoneEndReasonName(details.end_reason), .{})});
     if (details.exit_status) |status| {
         try writer.print(
             "{{\"kind\":{f},\"status\":{}}}",
@@ -1264,6 +1392,7 @@ pub fn readTombstone(allocator: std.mem.Allocator, path: []const u8) !Tombstone 
     errdefer allocator.free(agent_version);
 
     const ended_at_unix_ms = try jsonRequiredU64(object, "ended_at_unix_ms");
+    const expires_at_unix_ms = try tombstoneExpiryFromJson(object, ended_at_unix_ms);
     const end_reason = try tombstoneEndReasonFromName(jsonOptionalString(object, "end_reason") orelse "unknown");
     const exit_status = try jsonOptionalTombstoneExitStatus(object, "exit_status");
 
@@ -1275,8 +1404,21 @@ pub fn readTombstone(allocator: std.mem.Allocator, path: []const u8) !Tombstone 
         .host = host,
         .agent_version = agent_version,
         .ended_at_unix_ms = ended_at_unix_ms,
+        .expires_at_unix_ms = expires_at_unix_ms,
         .end_reason = end_reason,
         .exit_status = exit_status,
+    };
+}
+
+fn tombstoneExpiryFromJson(object: std.json.ObjectMap, ended_at_unix_ms: u64) !?u64 {
+    const value = object.get("expires_at_unix_ms") orelse return ended_at_unix_ms +| config.default_tombstone_retention_ms;
+    return switch (value) {
+        .null => null,
+        .integer => |integer| blk: {
+            if (integer < 0) return error.InvalidTombstone;
+            break :blk @as(u64, @intCast(integer));
+        },
+        else => error.InvalidTombstone,
     };
 }
 
@@ -1304,7 +1446,8 @@ fn cleanupExpiredTombstonesInRoot(allocator: std.mem.Allocator, root: []const u8
         defer allocator.free(path);
         var tombstone = readTombstone(allocator, path) catch continue;
         defer tombstone.deinit(allocator);
-        if (now_ms < tombstone.ended_at_unix_ms or now_ms - tombstone.ended_at_unix_ms < tombstone_retention_ms) continue;
+        const expires_at = tombstone.expires_at_unix_ms orelse continue;
+        if (now_ms < expires_at) continue;
         try removeRecordedAliasesForTombstoneInRoot(allocator, root, &tombstone);
         try unlinkIfExists(path);
     }
@@ -1779,15 +1922,41 @@ fn tombstonePathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, gu
     return std.fmt.allocPrint(allocator, "{s}/tombstone/{s}.json", .{ root, canonical });
 }
 
-fn pendingKillPathForHost(allocator: std.mem.Allocator, host: []const u8) ![]u8 {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return pendingKillPathForHostInRoot(allocator, root, host);
+fn pendingKillHostDirForHostInRoot(allocator: std.mem.Allocator, root: []const u8, name: []const u8, port: []const u8) ![]u8 {
+    const dir_name = try pendingKillHostDirName(allocator, name, port);
+    defer allocator.free(dir_name);
+    return std.fmt.allocPrint(allocator, "{s}/pending/{s}", .{ root, dir_name });
 }
 
-fn pendingKillPathForHostInRoot(allocator: std.mem.Allocator, root: []const u8, host: []const u8) ![]u8 {
-    const name = pendingKillHostHash(host);
-    return std.fmt.allocPrint(allocator, "{s}/pending/{s}.json", .{ root, &name });
+fn pendingKillEntryPathForGuidInHostDir(allocator: std.mem.Allocator, host_dir: []const u8, guid: []const u8) ![]u8 {
+    const filename = try pendingKillEntryFilenameForGuid(allocator, guid);
+    defer allocator.free(filename);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ host_dir, filename });
+}
+
+fn pendingKillLockPathForHostDir(allocator: std.mem.Allocator, host_dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/.lock", .{host_dir});
+}
+
+fn pendingKillMetaPathForHostDir(allocator: std.mem.Allocator, host_dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/meta.json", .{host_dir});
+}
+
+fn pendingKillHostDirName(allocator: std.mem.Allocator, name: []const u8, port: []const u8) ![]u8 {
+    if (isSafePendingHostName(name) and isValidPendingPort(port)) {
+        return std.fmt.allocPrint(allocator, "{s}-{s}", .{ name, port });
+    }
+    const hash = pendingKillHostHash(name, port);
+    return std.fmt.allocPrint(allocator, ":{s}", .{&hash});
+}
+
+fn pendingKillEntryFilenameForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
+    if (!isValidPendingKillGuid(guid)) return error.InvalidPendingKillGuid;
+    return std.fmt.allocPrint(allocator, "kill-{s}.json", .{guid});
+}
+
+fn pendingKillEntryFilename(filename: []const u8) bool {
+    return std.mem.startsWith(u8, filename, "kill-") and std.mem.endsWith(u8, filename, ".json");
 }
 
 fn ensureTombstoneDir(allocator: std.mem.Allocator, root: []const u8) !void {
@@ -1930,6 +2099,14 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
     const host = try allocator.dupe(u8, jsonOptionalString(object, "host") orelse "");
     errdefer allocator.free(host);
 
+    const resolved_host = try allocator.dupe(u8, jsonOptionalString(object, "resolved_host") orelse host);
+    errdefer allocator.free(resolved_host);
+
+    const port_value = jsonOptionalString(object, "port") orelse default_pending_port;
+    if (!isValidPendingPort(port_value)) return error.InvalidRoute;
+    const port = try allocator.dupe(u8, port_value);
+    errdefer allocator.free(port);
+
     const agent_version = try allocator.dupe(u8, jsonOptionalString(object, "agent_version") orelse "");
     errdefer allocator.free(agent_version);
 
@@ -1946,6 +2123,8 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
         .primary_alias = primary_alias,
         .session_dir = session_dir,
         .host = host,
+        .resolved_host = resolved_host,
+        .port = port,
         .agent_version = agent_version,
         .ssh_options = options,
         .last_known_alive = (try jsonOptionalBool(object, "alive")) orelse true,
@@ -1953,6 +2132,7 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
         .last_input_at_unix_ms = try jsonOptionalU64(object, "last_input_at_unix_ms"),
         .detached_at_unix_ms = try jsonOptionalU64(object, "detached_at_unix_ms"),
         .kill_requested = (try jsonOptionalBool(object, "kill_requested")) orelse false,
+        .tombstone_retention_ms = (try jsonOptionalU64(object, "tombstone_retention_ms")) orelse config.default_tombstone_retention_ms,
     };
 }
 
@@ -2056,39 +2236,161 @@ fn jsonStringArrayField(allocator: std.mem.Allocator, object: std.json.ObjectMap
     return out;
 }
 
-fn readPendingKills(allocator: std.mem.Allocator, path: []const u8) !PendingKills {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024);
-    defer allocator.free(bytes);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
-    defer parsed.deinit();
-    const object = try jsonObject(parsed.value);
-
-    const guids = try jsonStringArrayField(allocator, object, "guids");
-    errdefer freeStringArray(allocator, guids);
-    for (guids) |guid| {
-        if (!isValidPendingKillGuid(guid)) return error.InvalidPendingKill;
+fn readPendingKillsFromDir(allocator: std.mem.Allocator, dir_path: []const u8) !PendingKills {
+    var entries: std.ArrayList(PendingKillEntry) = .empty;
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(allocator);
+        entries.deinit(allocator);
     }
-    return .{ .guids = guids };
+
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return .{ .entries = try allocator.alloc(PendingKillEntry, 0) },
+        else => return err,
+    };
+    defer dir.close();
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .file or !pendingKillEntryFilename(entry.name)) continue;
+        const parsed = readPendingKillEntryFile(allocator, dir_path, entry.name) catch continue;
+        try entries.append(allocator, parsed);
+    }
+    return .{ .entries = try entries.toOwnedSlice(allocator) };
 }
 
-fn readPendingKillHost(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+fn readPendingKillEntryFile(allocator: std.mem.Allocator, dir_path: []const u8, filename: []const u8) !PendingKillEntry {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, filename });
+    defer allocator.free(path);
     const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024);
     defer allocator.free(bytes);
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidPendingKill;
+    return parsePendingKillEntry(allocator, trimmed, filename);
+}
 
+fn parsePendingKillEntry(allocator: std.mem.Allocator, line: []const u8, filename: []const u8) !PendingKillEntry {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+        return rawPendingKillEntry(allocator, line, filename);
+    };
+    defer parsed.deinit();
+    const object = jsonObject(parsed.value) catch return rawPendingKillEntry(allocator, line, filename);
+    const type_name_value = jsonOptionalString(object, "type") orelse return rawPendingKillEntry(allocator, line, filename);
+    const host_value = jsonOptionalString(object, "host") orelse "";
+    const port_value = jsonOptionalString(object, "port") orelse default_pending_port;
+    if (!isValidPendingPort(port_value)) return error.InvalidPendingKill;
+    const raw_line = try allocator.dupe(u8, line);
+    errdefer allocator.free(raw_line);
+    const filename_copy = try allocator.dupe(u8, filename);
+    errdefer allocator.free(filename_copy);
+    const type_name = try allocator.dupe(u8, type_name_value);
+    errdefer allocator.free(type_name);
+    const host = try allocator.dupe(u8, host_value);
+    errdefer allocator.free(host);
+    const port = try allocator.dupe(u8, port_value);
+    errdefer allocator.free(port);
+
+    if (!std.mem.eql(u8, type_name_value, "kill")) {
+        return .{
+            .type_name = type_name,
+            .host = host,
+            .port = port,
+            .guid = try allocator.alloc(u8, 0),
+            .requested_at_unix_ms = 0,
+            .raw_line = raw_line,
+            .filename = filename_copy,
+        };
+    }
+
+    const guid_value = jsonOptionalString(object, "guid") orelse return error.InvalidPendingKill;
+    if (!isValidPendingKillGuid(guid_value)) return error.InvalidPendingKill;
+    const guid = try canonicalPendingKillGuid(allocator, guid_value);
+    errdefer allocator.free(guid);
+    return .{
+        .type_name = type_name,
+        .host = host,
+        .port = port,
+        .guid = guid,
+        .requested_at_unix_ms = (try jsonOptionalU64(object, "requested_at_unix_ms")) orelse 0,
+        .raw_line = raw_line,
+        .filename = filename_copy,
+    };
+}
+
+fn rawPendingKillEntry(allocator: std.mem.Allocator, line: []const u8, filename: []const u8) !PendingKillEntry {
+    const type_name = try allocator.alloc(u8, 0);
+    errdefer allocator.free(type_name);
+    const host = try allocator.alloc(u8, 0);
+    errdefer allocator.free(host);
+    const port = try allocator.alloc(u8, 0);
+    errdefer allocator.free(port);
+    const guid = try allocator.alloc(u8, 0);
+    errdefer allocator.free(guid);
+    const raw_line = try allocator.dupe(u8, line);
+    errdefer allocator.free(raw_line);
+    const filename_copy = try allocator.dupe(u8, filename);
+    return .{
+        .type_name = type_name,
+        .host = host,
+        .port = port,
+        .guid = guid,
+        .requested_at_unix_ms = 0,
+        .raw_line = raw_line,
+        .filename = filename_copy,
+    };
+}
+
+fn writePendingKillEntryJson(writer: anytype, host: []const u8, port: []const u8, guid: []const u8, requested_at_unix_ms: u64) !void {
+    try writer.print(
+        "{{\"type\":\"kill\",\"host\":{f},\"port\":{f},\"guid\":{f},\"requested_at_unix_ms\":{}}}\n",
+        .{
+            std.json.fmt(host, .{}),
+            std.json.fmt(port, .{}),
+            std.json.fmt(guid, .{}),
+            requested_at_unix_ms,
+        },
+    );
+}
+
+fn writePendingKillHostMeta(allocator: std.mem.Allocator, host_dir: []const u8, name: []const u8, port: []const u8) !void {
+    const path = try pendingKillMetaPathForHostDir(allocator, host_dir);
+    defer allocator.free(path);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.writer(allocator).print(
+        "{{\"name\":{f},\"port\":{f}}}\n",
+        .{ std.json.fmt(name, .{}), std.json.fmt(port, .{}) },
+    );
+    try writeAtomicFile(path, text.items);
+}
+
+fn readPendingKillHostFromDir(allocator: std.mem.Allocator, dir_path: []const u8) !PendingKillHost {
+    const path = try pendingKillMetaPathForHostDir(allocator, dir_path);
+    defer allocator.free(path);
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 4096);
+    defer allocator.free(bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
     const object = try jsonObject(parsed.value);
-    const host = try jsonRequiredString(object, "host");
-    if (host.len == 0) return null;
+    const name_value = try jsonRequiredString(object, "name");
+    const port_value = jsonOptionalString(object, "port") orelse default_pending_port;
+    if (!isValidPendingPort(port_value)) return error.InvalidPendingKill;
+    return .{
+        .name = try allocator.dupe(u8, name_value),
+        .port = try allocator.dupe(u8, port_value),
+    };
+}
 
-    const guids = try jsonStringArrayField(allocator, object, "guids");
-    defer freeStringArray(allocator, guids);
-    if (guids.len == 0) return null;
-    for (guids) |guid| {
-        if (!isValidPendingKillGuid(guid)) return error.InvalidPendingKill;
+fn pendingKillDirHasEntries(dir_path: []const u8) !bool {
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer dir.close();
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind == .file and pendingKillEntryFilename(entry.name)) return true;
     }
-    return try allocator.dupe(u8, host);
+    return false;
 }
 
 fn freeStringArray(allocator: std.mem.Allocator, strings: []const []const u8) void {
@@ -2100,21 +2402,56 @@ fn isValidPendingKillGuid(guid: []const u8) bool {
     return isValidSessionGuid(guid) or isValidProxyGuid(guid);
 }
 
+fn canonicalPendingPort(allocator: std.mem.Allocator, port: []const u8) ![]u8 {
+    if (port.len == 0) return allocator.dupe(u8, default_pending_port);
+    if (!isValidPendingPort(port)) return error.InvalidPendingPort;
+    return allocator.dupe(u8, port);
+}
+
+fn isValidPendingPort(port: []const u8) bool {
+    if (port.len == 0) return false;
+    const value = std.fmt.parseInt(u16, port, 10) catch return false;
+    return value != 0;
+}
+
 fn canonicalPendingKillGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidSessionGuid(guid)) return canonicalGuid(allocator, guid);
     if (isValidProxyGuid(guid)) return canonicalProxyGuid(allocator, guid);
     return error.InvalidPendingKillGuid;
 }
 
-fn pendingKillHostHash(host: []const u8) [64]u8 {
+fn pendingKillHostHash(name: []const u8, port: []const u8) [64]u8 {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(host, &digest, .{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(name);
+    hasher.update(&.{0});
+    hasher.update(port);
+    hasher.final(&digest);
     return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn isSafePendingHostName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 160) return false;
+    if (name[0] == '.') return false;
+    for (name) |byte| {
+        switch (byte) {
+            'A'...'Z', 'a'...'z', '0'...'9', '.', '-', '_', '@', '+', '%' => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 fn stringArrayContains(strings: []const []const u8, needle: []const u8) bool {
     for (strings) |string| {
         if (std.mem.eql(u8, string, needle)) return true;
+    }
+    return false;
+}
+
+fn pendingKillHostArrayContains(hosts: []const PendingKillHost, name: []const u8, port: []const u8) bool {
+    for (hosts) |*host| {
+        if (std.mem.eql(u8, host.name, name) and std.mem.eql(u8, host.port, port)) return true;
     }
     return false;
 }
@@ -3239,6 +3576,8 @@ test "tombstone snapshots aliases, removes route, and releases aliases" {
         .primary_alias = try allocator.dupe(u8, "alpha"),
         .session_dir = try allocator.dupe(u8, "/tmp/sessh-runtime-test/guid/s-550e8400-e29b-41d4-a716-446655440000"),
         .host = try allocator.dupe(u8, "work.example"),
+        .resolved_host = try allocator.dupe(u8, "resolved.example"),
+        .port = try allocator.dupe(u8, default_pending_port),
         .agent_version = try allocator.dupe(u8, "0.5.0-test"),
         .ssh_options = try allocator.alloc([]const u8, 0),
         .last_known_alive = true,
@@ -3246,6 +3585,7 @@ test "tombstone snapshots aliases, removes route, and releases aliases" {
         .last_input_at_unix_ms = null,
         .detached_at_unix_ms = null,
         .kill_requested = false,
+        .tombstone_retention_ms = 500,
     };
     defer route.deinit(allocator);
 
@@ -3298,6 +3638,8 @@ test "expired tombstone cleanup removes only recorded aliases" {
         .primary_alias = try allocator.dupe(u8, "recorded"),
         .session_dir = try allocator.dupe(u8, "/tmp/sessh-runtime-test/guid/s-550e8400-e29b-41d4-a716-446655440000"),
         .host = try allocator.dupe(u8, "."),
+        .resolved_host = try allocator.dupe(u8, "."),
+        .port = try allocator.dupe(u8, default_pending_port),
         .agent_version = try allocator.dupe(u8, "0.5.0-test"),
         .ssh_options = try allocator.alloc([]const u8, 0),
         .last_known_alive = true,
@@ -3305,6 +3647,7 @@ test "expired tombstone cleanup removes only recorded aliases" {
         .last_input_at_unix_ms = null,
         .detached_at_unix_ms = null,
         .kill_requested = false,
+        .tombstone_retention_ms = 500,
     };
     defer route.deinit(allocator);
 
@@ -3315,17 +3658,66 @@ test "expired tombstone cleanup removes only recorded aliases" {
     });
     try createAliasInRoot(allocator, root, "late", guid);
 
-    try cleanupExpiredTombstonesInRoot(allocator, root, 100 + tombstone_retention_ms - 1);
+    try cleanupExpiredTombstonesInRoot(allocator, root, 599);
     const retained_path = try tombstonePathForGuidInRoot(allocator, root, guid);
     defer allocator.free(retained_path);
     _ = try std.fs.cwd().statFile(retained_path);
 
-    try cleanupExpiredTombstonesInRoot(allocator, root, 100 + tombstone_retention_ms);
+    try cleanupExpiredTombstonesInRoot(allocator, root, 600);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(retained_path));
     try std.testing.expectError(error.FileNotFound, resolveRefToGuidInRoot(allocator, root, "recorded"));
     const late = try resolveRefToGuidInRoot(allocator, root, "late");
     defer allocator.free(late);
     try std.testing.expectEqualStrings(guid, late);
+}
+
+test "pending kills use per-host entry files" {
+    const allocator = std.testing.allocator;
+    const root = try std.fmt.allocPrint(allocator, "/tmp/sessh-pending-kill-test-{}", .{c.getpid()});
+    defer allocator.free(root);
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+
+    const host = "work.example";
+    const port = "2222";
+    const guid = "s-550e8400-e29b-41d4-a716-446655440000";
+    try ensurePendingKillDir(allocator, root);
+    const host_dir = try pendingKillHostDirForHostInRoot(allocator, root, host, port);
+    defer allocator.free(host_dir);
+    try mkdirIgnoreExists(allocator, host_dir);
+    try writePendingKillHostMeta(allocator, host_dir, host, port);
+    try std.testing.expect(std.mem.endsWith(u8, host_dir, "/pending/work.example-2222"));
+
+    const entry_path = try pendingKillEntryPathForGuidInHostDir(allocator, host_dir, guid);
+    defer allocator.free(entry_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(entry_path));
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try writePendingKillEntryJson(text.writer(allocator), host, port, guid, 1234);
+    try writeAtomicFile(entry_path, text.items);
+    text.clearRetainingCapacity();
+    try writePendingKillEntryJson(text.writer(allocator), host, port, guid, 5678);
+    try writeAtomicFile(entry_path, text.items);
+
+    var pending_host = try readPendingKillHostFromDir(allocator, host_dir);
+    defer pending_host.deinit(allocator);
+    try std.testing.expectEqualStrings(host, pending_host.name);
+    try std.testing.expectEqualStrings(port, pending_host.port);
+
+    var pending = try readPendingKillsFromDir(allocator, host_dir);
+    defer pending.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), pending.entries.len);
+    try std.testing.expectEqualStrings("kill", pending.entries[0].type_name);
+    try std.testing.expectEqualStrings(host, pending.entries[0].host);
+    try std.testing.expectEqualStrings(port, pending.entries[0].port);
+    try std.testing.expectEqualStrings(guid, pending.entries[0].guid);
+    try std.testing.expectEqual(@as(u64, 5678), pending.entries[0].requested_at_unix_ms);
+    try std.testing.expectEqualStrings("kill-s-550e8400-e29b-41d4-a716-446655440000.json", pending.entries[0].filename);
+
+    const unsafe_host_dir = try pendingKillHostDirForHostInRoot(allocator, root, "bad/name", port);
+    defer allocator.free(unsafe_host_dir);
+    try std.testing.expect(std.mem.indexOf(u8, unsafe_host_dir, "/pending/:") != null);
 }
 
 test "registry writes json metadata" {
