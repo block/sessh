@@ -3851,6 +3851,12 @@ const FdStatusFlagsGuard = struct {
     original: c_int,
     active: bool = false,
 
+    // We use F_SETFL to put stdin into non-blocking mode so that we can
+    // process IO across multiple file descriptors without additional threads.
+    // But the open file description of stdin is shared with the invoking
+    // shell, so we need to restore it prior to exiting. Otherwise the shell
+    // might get EAGAIN instead of waiting for input, which could cause all
+    // kinds of problems.
     fn setNonBlocking(fd: c.fd_t) !FdStatusFlagsGuard {
         const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
         if (flags < 0) return error.FcntlFailed;
