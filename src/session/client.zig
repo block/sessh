@@ -4,15 +4,17 @@ const c = std.c;
 const posix = std.posix;
 
 const config = @import("../core/config.zig");
+const client_config = @import("client_config.zig");
 const client_log = @import("../core/client_log.zig");
 const client_renderer = @import("renderer.zig");
+const client_ui = @import("client_ui.zig");
 const io_helpers = @import("../core/io.zig");
-const list_format = @import("list_format.zig");
 const protocol = @import("../protocol/mod.zig");
 const process_exit = @import("../core/process_exit.zig");
-const reconnect_control = @import("../reconnect/control.zig");
 const reconnect_title = @import("../reconnect/title.zig");
+const route_commands = @import("../runtime/route_commands.zig");
 const session_registry = @import("../runtime/session_registry.zig");
+const shell = @import("../core/shell.zig");
 const socket_transport = @import("../transport/socket.zig");
 const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
@@ -26,39 +28,6 @@ var next_repaint_request_seq: u64 = 1;
 
 const unknown_viewport_offset: i32 = -1;
 const client_list_target_help = "incoming, outgoing, session, or a guid";
-
-pub const RemoteCommandResult = struct {
-    stdout: []u8,
-    stderr: []u8,
-    exit_code: u8,
-
-    pub fn deinit(self: *RemoteCommandResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.stderr);
-        allocator.free(self.stdout);
-        self.* = undefined;
-    }
-};
-
-pub const RemoteCommandRunner = struct {
-    context: *anyopaque,
-    runFn: *const fn (
-        context: *anyopaque,
-        allocator: std.mem.Allocator,
-        host: []const u8,
-        ssh_options: []const []const u8,
-        argv: []const []const u8,
-    ) anyerror!RemoteCommandResult,
-
-    pub fn run(
-        self: *RemoteCommandRunner,
-        allocator: std.mem.Allocator,
-        host: []const u8,
-        ssh_options: []const []const u8,
-        argv: []const []const u8,
-    ) !RemoteCommandResult {
-        return self.runFn(self.context, allocator, host, ssh_options, argv);
-    }
-};
 
 const LocalAction = enum {
     new,
@@ -106,7 +75,7 @@ const LocalOptions = struct {
     client_repaint_scrollback: bool = false,
     debug_client_action: ?DebugClientAction = null,
     debug_unresponsive_seconds: ?u32 = null,
-    banner_args: DetachBannerArgs = .{},
+    overlay_args: client_ui.DetachOverlayArgs = .{},
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     scrollback_row_count_set: bool = false,
     initial_scrollback_row_count: ?u32 = null,
@@ -131,179 +100,11 @@ pub const LocalNewSessionRequest = struct {
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     reap_ms: u64 = config.default_reap_ms,
     tombstone_retention_ms: u64 = config.default_tombstone_retention_ms,
-    banner_args: []const []const u8 = &.{},
+    overlay_args: []const []const u8 = &.{},
     capture_tty_transcript: ?[]const u8 = null,
     command_argv: []const []const u8 = &.{},
     shell_command: ?[]const u8 = null,
 };
-
-pub const DetachBannerArgs = struct {
-    buf: [16][]const u8 = undefined,
-    len: usize = 0,
-
-    pub fn append(self: *DetachBannerArgs, arg: []const u8) !void {
-        if (self.len >= self.buf.len) return error.TooManyDetachBannerArgs;
-        self.buf[self.len] = arg;
-        self.len += 1;
-    }
-
-    pub fn slice(self: *const DetachBannerArgs) []const []const u8 {
-        return self.buf[0..self.len];
-    }
-};
-
-pub const FileConfig = struct {
-    scrollback_row_count: ?u32 = null,
-    initial_scrollback_row_count: ?u32 = null,
-    initial_scrollback_row_count_set: bool = false,
-    client_log_level: ?client_log.Level = null,
-    bootstrap: ?bool = null,
-    terminal_emulator: ?bool = null,
-    filter_level: ?config.FilterLevel = null,
-    reap_ms: ?u64 = null,
-    tombstone_retention_ms: ?u64 = null,
-};
-
-pub fn loadFileConfig(allocator: std.mem.Allocator) !FileConfig {
-    const maybe_path = try configPath(allocator);
-    const path = maybe_path orelse return .{};
-    defer allocator.free(path);
-
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => return err,
-    };
-    defer file.close();
-
-    const bytes = try file.readToEndAlloc(allocator, 64 * 1024);
-    defer allocator.free(bytes);
-    return parseEnvConfig(bytes);
-}
-
-fn configPath(allocator: std.mem.Allocator) !?[]u8 {
-    if (c.getenv("XDG_CONFIG_HOME")) |xdg_z| {
-        const xdg = std.mem.span(xdg_z);
-        if (xdg.len > 0) {
-            const path = try std.fs.path.join(allocator, &.{ xdg, "sessh", "sessh.env" });
-            return path;
-        }
-    }
-    if (c.getenv("HOME")) |home_z| {
-        const home = std.mem.span(home_z);
-        if (home.len > 0) {
-            const path = try std.fs.path.join(allocator, &.{ home, ".config", "sessh", "sessh.env" });
-            return path;
-        }
-    }
-    return null;
-}
-
-fn parseEnvConfig(bytes: []const u8) !FileConfig {
-    var parsed = FileConfig{};
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |raw_line| {
-        var line = trimEnv(raw_line);
-        if (line.len == 0 or line[0] == '#') continue;
-        if (std.mem.startsWith(u8, line, "export ")) line = trimEnv(line["export ".len..]);
-
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidConfigLine;
-        const key = trimEnv(line[0..eq]);
-        const value = unquoteEnvValue(trimEnv(line[eq + 1 ..])) catch return error.InvalidConfigValue;
-        if (key.len == 0) return error.InvalidConfigLine;
-
-        if (keyMatches(key, "scrollback-limit")) {
-            parsed.scrollback_row_count = try parseScrollbackRowCount(value);
-        } else if (keyMatches(key, "initial-scrollback")) {
-            parsed.initial_scrollback_row_count = try parseInitialScrollbackRowCount(value);
-            parsed.initial_scrollback_row_count_set = true;
-        } else if (keyMatches(key, "client-log-level")) {
-            parsed.client_log_level = try client_log.parseLevel(value);
-        } else if (keyMatches(key, "bootstrap")) {
-            parsed.bootstrap = try parseBool(value);
-        } else if (keyMatches(key, "terminal-emulator")) {
-            parsed.terminal_emulator = try parseBool(value);
-        } else if (keyMatches(key, "filter-level")) {
-            parsed.filter_level = try config.parseFilterLevel(value);
-        } else if (keyMatches(key, "reap-hours")) {
-            parsed.reap_ms = try parseReapHours(value);
-        } else if (keyMatches(key, "tombstone-hours")) {
-            parsed.tombstone_retention_ms = try parseTombstoneHours(value);
-        } else {
-            return error.UnknownConfigKey;
-        }
-    }
-    return parsed;
-}
-
-fn trimEnv(value: []const u8) []const u8 {
-    return std.mem.trim(u8, value, " \t\r");
-}
-
-fn unquoteEnvValue(value: []const u8) ![]const u8 {
-    if (value.len < 2) return value;
-    const first = value[0];
-    const last = value[value.len - 1];
-    if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) return value[1 .. value.len - 1];
-    if (first == '"' or first == '\'' or last == '"' or last == '\'') return error.InvalidConfigValue;
-    return value;
-}
-
-fn keyMatches(key: []const u8, canonical: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(key, canonical)) return true;
-    var normalized_buf: [64]u8 = undefined;
-    if (key.len > normalized_buf.len) return false;
-    for (key, 0..) |byte, i| {
-        normalized_buf[i] = if (byte == '_') '-' else std.ascii.toLower(byte);
-    }
-    return std.mem.eql(u8, normalized_buf[0..key.len], canonical);
-}
-
-pub fn parseScrollbackRowCount(value: []const u8) !u32 {
-    const parsed = std.fmt.parseInt(u32, value, 10) catch return error.InvalidScrollbackRowCount;
-    if (parsed == 0) return error.InvalidScrollbackRowCount;
-    return parsed;
-}
-
-pub fn parseInitialScrollbackRowCount(value: []const u8) !?u32 {
-    const parsed = std.fmt.parseInt(i64, value, 10) catch return error.InvalidInitialScrollback;
-    if (parsed == -1) return null;
-    if (parsed < 0 or parsed > std.math.maxInt(u32)) return error.InvalidInitialScrollback;
-    return @intCast(parsed);
-}
-
-pub fn parseReapHours(value: []const u8) !u64 {
-    return parseHoursMs(value, error.InvalidReapHours);
-}
-
-pub fn parseTombstoneHours(value: []const u8) !u64 {
-    return parseHoursMs(value, error.InvalidTombstoneHours);
-}
-
-fn parseHoursMs(value: []const u8, invalid_error: anyerror) !u64 {
-    const parsed = std.fmt.parseFloat(f64, value) catch return invalid_error;
-    if (parsed != parsed) return invalid_error;
-    if (parsed <= 0) return 0;
-    if (parsed > 1.0e9) return invalid_error;
-    const ms = @ceil(parsed * @as(f64, @floatFromInt(config.hour_ms)));
-    if (ms < 1) return 1;
-    return @intFromFloat(ms);
-}
-
-pub fn parseBool(value: []const u8) !bool {
-    if (std.ascii.eqlIgnoreCase(value, "true") or
-        std.mem.eql(u8, value, "1") or
-        std.ascii.eqlIgnoreCase(value, "yes"))
-    {
-        return true;
-    }
-    if (std.ascii.eqlIgnoreCase(value, "false") or
-        std.mem.eql(u8, value, "0") or
-        std.ascii.eqlIgnoreCase(value, "no"))
-    {
-        return false;
-    }
-    return error.InvalidBool;
-}
 
 const ErrorPayload = struct {
     code: []const u8,
@@ -320,14 +121,6 @@ pub const RelayEnd = enum {
     session_ended,
 };
 
-pub const ReconnectDecision = enum {
-    wait_elapsed,
-    reconnect_now,
-    detach,
-    kill_detach,
-    kill_wait,
-};
-
 pub const ReconnectInputPumpResult = enum {
     wait_elapsed,
     reconnect_now,
@@ -335,13 +128,6 @@ pub const ReconnectInputPumpResult = enum {
     kill_detach,
     kill_wait,
     transport_closed,
-};
-
-pub const ReconnectSwitchDisposition = enum {
-    automatic,
-    delayed,
-    manual_disconnected,
-    manual_unresponsive,
 };
 
 pub const RuntimeRecovery = enum {
@@ -789,687 +575,16 @@ fn processExitCodeFromTombstoneDetails(details: ?session_registry.TombstoneDetai
     };
 }
 
+fn nowUnixMs() u64 {
+    const ms = std.time.milliTimestamp();
+    if (ms <= 0) return 0;
+    return @intCast(ms);
+}
+
 fn copyTitleFallback(dest: []u8, title: []const u8) usize {
     const len = @min(dest.len, title.len);
     @memcpy(dest[0..len], title[0..len]);
     return len;
-}
-
-pub const ReconnectPresentation = enum {
-    none,
-    stderr_plain,
-    title,
-    overlay,
-};
-
-pub const ReconnectUi = struct {
-    const max_diagnostic_banner_lines = 3;
-    const max_banner_message_bytes = 256;
-    const max_title_fallback_bytes = 512;
-
-    mode_guard: terminal.TerminalModeGuard,
-    viewport_offset: u16 = 0,
-    banner_state: ?BannerDrawState = null,
-    banner_message: [max_banner_message_bytes]u8 = undefined,
-    banner_message_len: usize = 0,
-    diagnostic_notify_read_fd: c.fd_t = -1,
-    diagnostic_notify_write_fd: c.fd_t = -1,
-    diagnostic_cursor: u64 = 0,
-    live_diagnostic_start_seq: u64 = 0,
-    rendered_diagnostic_seq: u64 = 0,
-    diagnostic_lines: [max_diagnostic_banner_lines]BannerDiagnosticLine = [_]BannerDiagnosticLine{.{}} ** max_diagnostic_banner_lines,
-    diagnostic_line_count: usize = 0,
-    cursor_hidden: bool = false,
-    reconnect_acknowledged: bool = false,
-    input_during_disconnect: bool = false,
-    kill_escape_filter: terminal.EscapeFilter = .{},
-    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    title_enabled: bool = false,
-    title_fd: c.fd_t = 1,
-    title_visible: bool = false,
-    presentation: ReconnectPresentation = .overlay,
-    cleanup_title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
-    cleanup_title_fallback_len: usize = 0,
-    last_size: WindowSize = .{},
-    resize_generation: u64 = 0,
-    forwarded_resize_generation: u64 = 0,
-
-    pub fn begin(viewport_offset: i32) !ReconnectUi {
-        return beginWithPresentation(viewport_offset, .overlay);
-    }
-
-    pub fn beginWithPresentation(viewport_offset: i32, presentation: ReconnectPresentation) !ReconnectUi {
-        var ui = ReconnectUi{
-            .mode_guard = try terminal.TerminalModeGuard.enable(0),
-            .title_enabled = (presentation == .overlay or presentation == .title) and c.isatty(1) != 0,
-            .presentation = presentation,
-            .last_size = terminal.currentWindowSize(),
-        };
-        errdefer ui.mode_guard.restore();
-        ui.viewport_offset = if (viewport_offset > 0) @intCast(viewport_offset) else 0;
-        if (ui.title_enabled) {
-            const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
-            if (cleanup_title) |title| {
-                defer app_allocator.allocator().free(title);
-                ui.cleanup_title_fallback_len = copyTitleFallback(&ui.cleanup_title_fallback, title);
-            }
-        }
-        ui.diagnostic_cursor = client_log.displayedUserDiagnosticSeq();
-        ui.live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq();
-        ui.rendered_diagnostic_seq = ui.diagnostic_cursor;
-        const notify_pipe = try posix.pipe();
-        ui.diagnostic_notify_read_fd = notify_pipe[0];
-        ui.diagnostic_notify_write_fd = notify_pipe[1];
-        errdefer {
-            posix.close(ui.diagnostic_notify_read_fd);
-            posix.close(ui.diagnostic_notify_write_fd);
-        }
-        try setNonBlocking(ui.diagnostic_notify_read_fd);
-        try setNonBlocking(ui.diagnostic_notify_write_fd);
-        client_log.registerUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
-        errdefer client_log.unregisterUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
-        try ui.consumeDiagnostics();
-        if (presentation == .overlay) try ui.hideCursor();
-        return ui;
-    }
-
-    pub fn deinit(self: *ReconnectUi) void {
-        self.restoreTitleForDetach();
-        if (self.diagnostic_notify_write_fd >= 0) {
-            client_log.unregisterUserDiagnosticNotifier(self.diagnostic_notify_write_fd);
-            posix.close(self.diagnostic_notify_write_fd);
-            self.diagnostic_notify_write_fd = -1;
-        }
-        if (self.diagnostic_notify_read_fd >= 0) {
-            posix.close(self.diagnostic_notify_read_fd);
-            self.diagnostic_notify_read_fd = -1;
-        }
-        self.showCursor() catch {};
-        self.mode_guard.restore();
-    }
-
-    pub fn waitForReconnect(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
-        try self.drawBanner(delay_ms);
-        var timer = try std.time.Timer.start();
-        var next_banner_update_ms = nextBannerUpdateDelayMs(delay_ms);
-
-        while (true) {
-            const elapsed_ms = elapsedTimerMs(&timer);
-            if (elapsed_ms >= delay_ms) {
-                self.showReconnectingTitle();
-                try self.drawReconnectStaticBanner(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
-                return .wait_elapsed;
-            }
-
-            const next_wake_ms = @min(delay_ms, next_banner_update_ms);
-            const wait_ms: i32 = @intCast(@min(next_wake_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
-            const decision = try self.pollInput(wait_ms);
-            try self.refreshForResize();
-            try self.refreshBannerIfDiagnosticsChanged();
-            switch (decision) {
-                .detach, .kill_detach, .kill_wait => return decision,
-                .reconnect_now => {
-                    self.showReconnectingTitle();
-                    try self.drawReconnectStaticBanner(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
-                    return .reconnect_now;
-                },
-                .wait_elapsed => {},
-            }
-
-            const after_poll_ms = elapsedTimerMs(&timer);
-            if (after_poll_ms >= next_banner_update_ms and after_poll_ms < delay_ms) {
-                const remaining_ms = delay_ms - after_poll_ms;
-                try self.drawBanner(remaining_ms);
-                next_banner_update_ms = after_poll_ms + nextBannerUpdateDelayMs(remaining_ms);
-            }
-        }
-    }
-
-    pub fn showDisconnectedReconnectInProgress(self: *ReconnectUi) !void {
-        self.showReconnectingTitle();
-        try self.drawReconnectStaticBanner(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
-    }
-
-    pub fn showKillingRemoteSession(self: *ReconnectUi) !void {
-        self.showKillingTitle();
-        try self.drawStaticBanner("--- Killing remote session. ~. to detach immediately ---");
-    }
-
-    pub fn waitForKillConfirmation(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
-        try self.showKillingRemoteSession();
-        var timer = try std.time.Timer.start();
-        while (true) {
-            const elapsed_ms = elapsedTimerMs(&timer);
-            if (elapsed_ms >= delay_ms) return .wait_elapsed;
-            const wait_ms: i32 = @intCast(@min(delay_ms - elapsed_ms, @as(u64, 50)));
-            switch (try self.pollKillingDecision(wait_ms)) {
-                .detach, .kill_detach, .kill_wait => |decision| return decision,
-                .reconnect_now => unreachable,
-                .wait_elapsed => {},
-            }
-        }
-    }
-
-    pub fn showUnresponsiveReconnectInProgressTitle(self: *ReconnectUi) void {
-        self.showReconnectingNowTitle();
-    }
-
-    pub fn showReconnectReady(self: *ReconnectUi, disposition: ReconnectSwitchDisposition) !void {
-        self.showConnectionReadyTitle();
-        try self.drawReconnectReadyBanner(disposition, 0);
-    }
-
-    pub fn hasReconnectAcknowledgement(self: *const ReconnectUi) bool {
-        return self.reconnect_acknowledged;
-    }
-
-    pub fn consumeReconnectAcknowledgement(self: *ReconnectUi) bool {
-        const acknowledged = self.reconnect_acknowledged;
-        self.reconnect_acknowledged = false;
-        return acknowledged;
-    }
-
-    pub fn reconnectSwitchDisposition(
-        self: *const ReconnectUi,
-        pending_input_at_disconnect: bool,
-        pending_paste_like_input_at_disconnect: bool,
-        unresponsive: bool,
-    ) ReconnectSwitchDisposition {
-        if (unresponsive) return .manual_unresponsive;
-        if (pending_paste_like_input_at_disconnect) return .manual_disconnected;
-        if (pending_input_at_disconnect or self.input_during_disconnect) return .delayed;
-        return .automatic;
-    }
-
-    pub fn waitForReconnectSwitch(self: *ReconnectUi, disposition: ReconnectSwitchDisposition) !ReconnectDecision {
-        if (self.hasReconnectAcknowledgement()) return .reconnect_now;
-        try self.showReconnectReady(disposition);
-        while (true) {
-            switch (try self.pollDecision(-1)) {
-                .detach, .kill_detach, .kill_wait => |decision| return decision,
-                .reconnect_now => return .reconnect_now,
-                .wait_elapsed => {},
-            }
-        }
-    }
-
-    pub fn waitForReconnectSwitchOrTimeout(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
-        if (self.hasReconnectAcknowledgement()) return .reconnect_now;
-        try self.drawReconnectReadyBanner(.delayed, delay_ms);
-        var timer = try std.time.Timer.start();
-        var next_banner_update_ms = nextBannerUpdateDelayMs(delay_ms);
-
-        while (true) {
-            const elapsed_ms = elapsedTimerMs(&timer);
-            if (elapsed_ms >= delay_ms) return .wait_elapsed;
-
-            const next_wake_ms = @min(delay_ms, next_banner_update_ms);
-            const wait_ms: i32 = @intCast(@min(next_wake_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
-            switch (try self.pollDecision(wait_ms)) {
-                .detach, .kill_detach, .kill_wait => |decision| return decision,
-                .reconnect_now => return .reconnect_now,
-                .wait_elapsed => {},
-            }
-
-            const after_poll_ms = elapsedTimerMs(&timer);
-            if (after_poll_ms >= next_banner_update_ms and after_poll_ms < delay_ms) {
-                const remaining_ms = delay_ms - after_poll_ms;
-                try self.drawReconnectReadyBanner(.delayed, remaining_ms);
-                next_banner_update_ms = after_poll_ms + nextBannerUpdateDelayMs(remaining_ms);
-            }
-        }
-    }
-
-    pub fn pollDetach(self: *ReconnectUi, timeout_ms: i32) !bool {
-        const decision = try self.pollDecision(timeout_ms);
-        return switch (decision) {
-            .detach, .kill_detach, .kill_wait => true,
-            .reconnect_now, .wait_elapsed => false,
-        };
-    }
-
-    pub fn pollDecision(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        if (self.isCancelled()) return .detach;
-        try self.refreshForResize();
-        try self.refreshBannerIfDiagnosticsChanged();
-        const decision = try self.pollInput(timeout_ms);
-        try self.refreshForResize();
-        try self.refreshBannerIfDiagnosticsChanged();
-        return decision;
-    }
-
-    pub fn pollKillingDecision(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        if (self.isCancelled()) return .detach;
-        try self.refreshForResize();
-        try self.refreshBannerIfDiagnosticsChanged();
-        const decision = try self.pollKillingInput(timeout_ms);
-        try self.refreshForResize();
-        try self.refreshBannerIfDiagnosticsChanged();
-        return decision;
-    }
-
-    pub fn cancel(self: *ReconnectUi) void {
-        self.cancelled.store(true, .release);
-    }
-
-    pub fn isCancelled(self: *ReconnectUi) bool {
-        return self.cancelled.load(.acquire);
-    }
-
-    pub fn cancellationFlag(self: *const ReconnectUi) *const std.atomic.Value(bool) {
-        return &self.cancelled;
-    }
-
-    pub fn consumeResizeForRuntime(self: *ReconnectUi) bool {
-        if (self.forwarded_resize_generation == self.resize_generation) return false;
-        self.forwarded_resize_generation = self.resize_generation;
-        return true;
-    }
-
-    fn effectivePollTimeout(self: *const ReconnectUi, timeout_ms: i32) i32 {
-        if (timeout_ms >= 0) return timeout_ms;
-        if (self.presentation != .overlay) return timeout_ms;
-        return 250;
-    }
-
-    fn refreshForResize(self: *ReconnectUi) !void {
-        const size = terminal.currentWindowSize();
-        if (size.rows == self.last_size.rows and size.cols == self.last_size.cols) return;
-        self.last_size = size;
-        self.resize_generation +%= 1;
-        if (self.resize_generation == 0) self.resize_generation = 1;
-        if (self.presentation != .overlay or c.isatty(1) == 0) return;
-
-        const renderer = client_renderer.Renderer.init(1);
-        try renderer.restorePresentation(queryInitialKittyKeyboardFlags());
-        try renderer.clearVisible();
-        self.banner_state = null;
-        self.viewport_offset = 0;
-        if (self.banner_message_len > 0) try self.drawCurrentBanner();
-    }
-
-    fn pollInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        var pollfds = [_]posix.pollfd{
-            .{
-                .fd = 0,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-            .{
-                .fd = self.diagnostic_notify_read_fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-        };
-        const poll_count: usize = if (self.diagnostic_notify_read_fd >= 0) 2 else 1;
-        const ready = try posix.poll(pollfds[0..poll_count], self.effectivePollTimeout(timeout_ms));
-        if (ready == 0) return .wait_elapsed;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .detach;
-        if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
-            self.drainDiagnosticNotifier();
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
-
-        var input: [256]u8 = undefined;
-        var filtered: [512]u8 = undefined;
-        const n = c.read(0, &input, input.len);
-        if (n <= 0) return .detach;
-        io_helpers.noteRead(0, input[0..@intCast(n)]);
-
-        const bytes = input[0..@intCast(n)];
-        switch (reconnect_control.scanInput(bytes, .{ .ctrl_c_detaches = true })) {
-            .detach => return .detach,
-            .reconnect_now => {
-                self.reconnect_acknowledged = true;
-                return .reconnect_now;
-            },
-            .none => {},
-        }
-        const result = self.kill_escape_filter.filter(bytes, &filtered);
-        if (result.end) |end| switch (end) {
-            .detach => return .detach,
-            .kill => return .kill_detach,
-            .kill_wait => return .kill_wait,
-            .help => {},
-            .repaint => {},
-        };
-        if (bytes.len > 0) {
-            self.input_during_disconnect = true;
-            try self.alertDisconnectedInput();
-        }
-        return .wait_elapsed;
-    }
-
-    fn pollKillingInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        var pollfds = [_]posix.pollfd{
-            .{
-                .fd = 0,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-            .{
-                .fd = self.diagnostic_notify_read_fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-        };
-        const poll_count: usize = if (self.diagnostic_notify_read_fd >= 0) 2 else 1;
-        const ready = try posix.poll(pollfds[0..poll_count], self.effectivePollTimeout(timeout_ms));
-        if (ready == 0) return .wait_elapsed;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .detach;
-        if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
-            self.drainDiagnosticNotifier();
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
-
-        var input: [256]u8 = undefined;
-        var filtered: [512]u8 = undefined;
-        const n = c.read(0, &input, input.len);
-        if (n <= 0) return .detach;
-        const bytes = input[0..@intCast(n)];
-        io_helpers.noteRead(0, bytes);
-        const result = self.kill_escape_filter.filter(bytes, &filtered);
-        if (result.end) |end| switch (end) {
-            .detach, .kill => return .detach,
-            .kill_wait => return .kill_wait,
-            .help => {},
-            .repaint => {},
-        };
-        if (bytes.len > 0) try self.alertDisconnectedInput();
-        return .wait_elapsed;
-    }
-
-    fn alertDisconnectedInput(self: *ReconnectUi) !void {
-        _ = self;
-        try io_helpers.writeAll(1, "\x07");
-        if (c.isatty(1) == 0) return;
-        try io_helpers.writeAll(1, "\x1b[?5h");
-        defer io_helpers.writeAll(1, "\x1b[?5l") catch {};
-        std.Thread.sleep(35 * std.time.ns_per_ms);
-    }
-
-    pub fn clearBanner(self: *ReconnectUi) !i32 {
-        if (self.presentation != .overlay) return @intCast(self.viewport_offset);
-        if (c.isatty(1) == 0) return @intCast(self.viewport_offset);
-        const banner = self.banner_state orelse return @intCast(self.viewport_offset);
-        const renderer = client_renderer.Renderer.init(1);
-        const size = terminal.currentWindowSize();
-        try eraseBannerRows(renderer, banner, size.rows, size.cols);
-        try restoreBannerExpansion(renderer, banner, size.rows);
-        self.viewport_offset = clearedViewportOffset(banner);
-        self.banner_state = null;
-        try renderer.moveCursor(self.viewport_offset, 0);
-        return @intCast(self.viewport_offset);
-    }
-
-    pub fn currentViewportOffset(self: *const ReconnectUi) i32 {
-        return @intCast(self.viewport_offset);
-    }
-
-    fn drawBanner(self: *ReconnectUi, delay_ms: u64) !void {
-        self.showRetryTitle(delay_ms);
-        var status_buf: [96]u8 = undefined;
-        const status = try reconnect_title.retryStatus(
-            &status_buf,
-            delay_ms,
-            .{ .ctrl_r = true, .ctrl_c_detach = true },
-        );
-        var message_buf: [128]u8 = undefined;
-        const message = try std.fmt.bufPrint(&message_buf, "--- {s} ---", .{status});
-        try self.drawStaticBanner(message);
-    }
-
-    fn drawReconnectReadyBanner(self: *ReconnectUi, disposition: ReconnectSwitchDisposition, delay_ms: u64) !void {
-        if (disposition == .delayed) self.showSwitchCountdownTitle(delay_ms);
-        var message_buf: [128]u8 = undefined;
-        const message = switch (disposition) {
-            .delayed => blk: {
-                var delay_buf: [16]u8 = undefined;
-                const delay = try formatSwitchDelay(delay_ms, &delay_buf);
-                break :blk try std.fmt.bufPrint(
-                    &message_buf,
-                    "--- sessh: disconnected: Connection ready. Switch {s}. CTRL-R now. CTRL-C detach ---",
-                    .{delay},
-                );
-            },
-            .manual_disconnected => "--- sessh: disconnected: Connection ready. CTRL-R switch. CTRL-C detach ---",
-            .manual_unresponsive => "--- sessh: unresponsive: Connection ready. CTRL-R switch. CTRL-C detach ---",
-            .automatic => "--- sessh: disconnected: Connection ready. CTRL-R switch. CTRL-C detach ---",
-        };
-        try self.drawStaticBanner(message);
-    }
-
-    fn drawStaticBanner(self: *ReconnectUi, message: []const u8) !void {
-        const copy_len = @min(message.len, self.banner_message.len);
-        @memcpy(self.banner_message[0..copy_len], message[0..copy_len]);
-        self.banner_message_len = copy_len;
-        try self.consumeDiagnostics();
-        try self.drawCurrentBanner();
-    }
-
-    fn drawReconnectStaticBanner(self: *ReconnectUi, status: []const u8) !void {
-        var message_buf: [max_banner_message_bytes]u8 = undefined;
-        const message = try std.fmt.bufPrint(&message_buf, "--- {s} ---", .{status});
-        try self.drawStaticBanner(message);
-    }
-
-    fn drawCurrentBanner(self: *ReconnectUi) !void {
-        const message = self.banner_message[0..self.banner_message_len];
-        switch (self.presentation) {
-            .none, .title => return,
-            .stderr_plain => {
-                try io_helpers.writeAll(2, message);
-                try io_helpers.writeAll(2, "\r\n");
-                return;
-            },
-            .overlay => {},
-        }
-
-        if (c.isatty(1) == 0) {
-            try io_helpers.writeAll(1, "\r\n");
-            try io_helpers.writeAll(1, message);
-            try io_helpers.writeAll(1, "\r\n");
-            for (self.diagnostic_lines[0..self.diagnostic_line_count]) |*line| {
-                if (line.len == 0) continue;
-                try io_helpers.writeAll(1, line.slice());
-                try io_helpers.writeAll(1, "\r\n");
-            }
-            return;
-        }
-
-        const size = terminal.currentWindowSize();
-        self.last_size = size;
-        const max_visible_diagnostic_lines: usize = if (size.rows > 1)
-            @min(max_diagnostic_banner_lines, @as(usize, size.rows - 1))
-        else
-            0;
-        const diagnostic_start = if (self.diagnostic_line_count > max_visible_diagnostic_lines)
-            self.diagnostic_line_count - max_visible_diagnostic_lines
-        else
-            0;
-        var banner_lines: [1 + max_diagnostic_banner_lines]BannerLine = undefined;
-        var banner_line_count: usize = 0;
-        banner_lines[banner_line_count] = .{ .text = message, .alignment = .center };
-        banner_line_count += 1;
-        for (self.diagnostic_lines[diagnostic_start..self.diagnostic_line_count]) |*line| {
-            banner_lines[banner_line_count] = .{ .text = line.slice(), .alignment = .left };
-            banner_line_count += 1;
-        }
-        const renderer = client_renderer.Renderer.init(1);
-        const state = try drawBannerLines(renderer, size, self.viewport_offset, self.banner_state, banner_lines[0..banner_line_count]);
-        self.viewport_offset = state.viewport_offset;
-        self.banner_state = state;
-    }
-
-    fn refreshBannerIfDiagnosticsChanged(self: *ReconnectUi) !void {
-        if (self.banner_message_len == 0) return;
-        if (client_log.currentUserDiagnosticSeq() == self.rendered_diagnostic_seq) return;
-        try self.consumeDiagnostics();
-        try self.drawCurrentBanner();
-    }
-
-    fn consumeDiagnostics(self: *ReconnectUi) !void {
-        var diagnostics = [_]client_log.UserDiagnosticLine{.{}} ** max_diagnostic_banner_lines;
-        const new_cursor = client_log.copyUserDiagnosticsSince(self.diagnostic_cursor, &diagnostics);
-        if (new_cursor == self.diagnostic_cursor) {
-            self.rendered_diagnostic_seq = new_cursor;
-            return;
-        }
-
-        for (&diagnostics) |*diagnostic| {
-            if (diagnostic.seq == 0) continue;
-            switch (self.presentation) {
-                .overlay => self.appendDiagnosticLine(diagnostic),
-                .stderr_plain => self.writePlainDiagnosticLine(diagnostic),
-                .title, .none => {},
-            }
-        }
-        self.diagnostic_cursor = new_cursor;
-        self.rendered_diagnostic_seq = new_cursor;
-        client_log.markUserDiagnosticsDisplayedThrough(new_cursor);
-    }
-
-    fn writePlainDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
-        const delayed = diagnostic.seq <= self.live_diagnostic_start_seq;
-        var line_buf: [client_log.max_user_diagnostic_display_bytes]u8 = undefined;
-        const len = formatBannerDiagnostic(line_buf[0..], diagnostic, delayed);
-        io_helpers.writeAll(2, line_buf[0..len]) catch return;
-        io_helpers.writeAll(2, "\r\n") catch {};
-    }
-
-    fn appendDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
-        if (self.diagnostic_line_count == self.diagnostic_lines.len) {
-            var i: usize = 1;
-            while (i < self.diagnostic_lines.len) : (i += 1) self.diagnostic_lines[i - 1] = self.diagnostic_lines[i];
-            self.diagnostic_line_count -= 1;
-        }
-        const delayed = diagnostic.seq <= self.live_diagnostic_start_seq;
-        const target = &self.diagnostic_lines[self.diagnostic_line_count];
-        target.len = formatBannerDiagnostic(target.bytes[0..], diagnostic, delayed);
-        self.diagnostic_line_count += 1;
-    }
-
-    fn drainDiagnosticNotifier(self: *ReconnectUi) void {
-        if (self.diagnostic_notify_read_fd < 0) return;
-        var buf: [128]u8 = undefined;
-        while (true) {
-            const n = c.read(self.diagnostic_notify_read_fd, &buf, buf.len);
-            if (n > 0) continue;
-            if (n == 0) return;
-            switch (posix.errno(n)) {
-                .AGAIN => return,
-                .INTR => continue,
-                else => return,
-            }
-        }
-    }
-
-    fn hideCursor(self: *ReconnectUi) !void {
-        if (c.isatty(1) == 0) return;
-        try io_helpers.writeAll(1, "\x1b[?25l");
-        self.cursor_hidden = true;
-    }
-
-    fn showCursor(self: *ReconnectUi) !void {
-        if (!self.cursor_hidden) return;
-        self.cursor_hidden = false;
-        try io_helpers.writeAll(1, "\x1b[?25h");
-    }
-
-    pub fn restoreTitleAfterReconnect(self: *ReconnectUi, session: *const RuntimeSession) void {
-        if (!self.title_visible) return;
-        if (session.app_title_present != true) {
-            self.restoreTitleTo(session.titleFallbackSlice());
-        }
-        self.title_visible = false;
-    }
-
-    pub fn restoreTitleForDetach(self: *ReconnectUi) void {
-        if (!self.title_visible) return;
-        self.restoreTitleTo(self.cleanupTitleFallback());
-        self.title_visible = false;
-    }
-
-    fn showRetryTitle(self: *ReconnectUi, delay_ms: u64) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeRetryNowTitle(self.title_fd, delay_ms) catch return;
-        self.title_visible = true;
-    }
-
-    fn showReconnectingTitle(self: *ReconnectUi) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeReconnectingTitle(self.title_fd) catch return;
-        self.title_visible = true;
-    }
-
-    fn showReconnectingNowTitle(self: *ReconnectUi) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeReconnectingNowTitle(self.title_fd) catch return;
-        self.title_visible = true;
-    }
-
-    fn showConnectionReadyTitle(self: *ReconnectUi) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeConnectionReadyTitle(self.title_fd) catch return;
-        self.title_visible = true;
-    }
-
-    fn showKillingTitle(self: *ReconnectUi) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeTitle(self.title_fd, "killing remote session") catch return;
-        self.title_visible = true;
-    }
-
-    fn showSwitchCountdownTitle(self: *ReconnectUi, delay_ms: u64) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeSwitchCountdownTitle(self.title_fd, delay_ms) catch return;
-        self.title_visible = true;
-    }
-
-    fn restoreTitleTo(self: *ReconnectUi, title: []const u8) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeTitle(self.title_fd, title) catch {};
-    }
-
-    fn cleanupTitleFallback(self: *const ReconnectUi) []const u8 {
-        return self.cleanup_title_fallback[0..self.cleanup_title_fallback_len];
-    }
-};
-
-const BannerAlign = enum {
-    left,
-    center,
-};
-
-const BannerLine = struct {
-    text: []const u8,
-    alignment: BannerAlign,
-};
-
-const BannerDiagnosticLine = struct {
-    bytes: [client_log.max_user_diagnostic_display_bytes]u8 = undefined,
-    len: usize = 0,
-
-    fn slice(self: *const BannerDiagnosticLine) []const u8 {
-        return self.bytes[0..self.len];
-    }
-};
-
-const max_banner_diagnostic_line_count = 1 + ReconnectUi.max_diagnostic_banner_lines;
-const max_banner_line_count = if (max_banner_diagnostic_line_count > terminal.escape_help_banner_lines.len)
-    max_banner_diagnostic_line_count
-else
-    terminal.escape_help_banner_lines.len;
-const max_banner_render_line_bytes = if (ReconnectUi.max_banner_message_bytes > client_log.max_user_diagnostic_display_bytes)
-    ReconnectUi.max_banner_message_bytes
-else
-    client_log.max_user_diagnostic_display_bytes;
-
-comptime {
-    std.debug.assert(max_banner_line_count >= terminal.escape_help_banner_lines.len);
-    for (terminal.escape_help_banner_lines) |line| {
-        std.debug.assert(max_banner_render_line_bytes >= line.len);
-    }
 }
 
 const InputAckTracker = struct {
@@ -1508,354 +623,6 @@ const InputAckTracker = struct {
     }
 };
 
-const RenderedBannerLine = struct {
-    start_col: u16 = 0,
-    len: u16 = 0,
-    bytes: [max_banner_render_line_bytes]u8 = undefined,
-
-    fn slice(self: *const RenderedBannerLine) []const u8 {
-        return self.bytes[0..self.len];
-    }
-
-    fn endCol(self: *const RenderedBannerLine) u16 {
-        return self.start_col + self.len;
-    }
-
-    fn eql(self: *const RenderedBannerLine, other: *const RenderedBannerLine) bool {
-        return self.start_col == other.start_col and
-            self.len == other.len and
-            std.mem.eql(u8, self.slice(), other.slice());
-    }
-};
-
-const BannerDrawState = struct {
-    rows: u16,
-    cols: u16,
-    start_row: u16,
-    line_count: u16,
-    viewport_offset: u16,
-    restore_viewport_offset: u16,
-    scroll_top: u16,
-    scroll_lines: u16,
-    restores_expansion: bool = true,
-    lines: [max_banner_line_count]RenderedBannerLine = [_]RenderedBannerLine{.{}} ** max_banner_line_count,
-};
-
-const BannerLayout = struct {
-    start_row: u16,
-    visible_line_count: u16,
-    scroll_lines: u16,
-    viewport_offset: u16,
-};
-
-fn drawBannerLines(
-    renderer: client_renderer.Renderer,
-    size: WindowSize,
-    viewport_offset: u16,
-    previous: ?BannerDrawState,
-    lines: []const BannerLine,
-) !BannerDrawState {
-    const terminal_rows = normalizedTerminalRows(size.rows);
-    if (lines.len == 0) {
-        if (previous) |state| try eraseBannerRows(renderer, state, terminal_rows, size.cols);
-        if (previous) |state| try restoreBannerExpansion(renderer, state, terminal_rows);
-        const restored_viewport_offset = if (previous) |state| clearedViewportOffset(state) else viewport_offset;
-        return .{
-            .rows = terminal_rows,
-            .cols = size.cols,
-            .start_row = 0,
-            .line_count = 0,
-            .viewport_offset = restored_viewport_offset,
-            .restore_viewport_offset = restored_viewport_offset,
-            .scroll_top = restored_viewport_offset,
-            .scroll_lines = 0,
-        };
-    }
-
-    const layout = bannerLayoutForSize(terminal_rows, viewport_offset, lines.len);
-    const clamped_viewport_offset = @min(viewport_offset, terminal_rows - 1);
-    const prior_scroll_lines = if (previous) |state| state.scroll_lines else 0;
-    const restore_viewport_offset = if (previous) |state| state.restore_viewport_offset else clamped_viewport_offset;
-    const scroll_lines = prior_scroll_lines +| layout.scroll_lines;
-    const consumes_outer_rows = layout.scroll_lines > 0 and layout.viewport_offset < restore_viewport_offset;
-    const restores_expansion = (if (previous) |state| state.restores_expansion else true) and !consumes_outer_rows;
-    var next_state = BannerDrawState{
-        .rows = terminal_rows,
-        .cols = size.cols,
-        .start_row = layout.start_row,
-        .line_count = layout.visible_line_count,
-        .viewport_offset = layout.viewport_offset,
-        .restore_viewport_offset = restore_viewport_offset,
-        .scroll_top = layout.viewport_offset,
-        .scroll_lines = scroll_lines,
-        .restores_expansion = restores_expansion,
-    };
-    var row_offset: u16 = 0;
-    while (row_offset < layout.visible_line_count) : (row_offset += 1) {
-        next_state.lines[row_offset] = renderBannerLine(size.cols, lines[row_offset]);
-    }
-
-    const can_update_in_place = if (previous) |state|
-        layout.scroll_lines == 0 and
-            state.rows == terminal_rows and
-            state.cols == size.cols and
-            state.start_row == layout.start_row
-    else
-        false;
-
-    if (!can_update_in_place) {
-        if (previous) |state| try eraseBannerRows(renderer, state, terminal_rows, size.cols);
-    }
-    if (layout.scroll_lines > 0) {
-        if (restores_expansion) {
-            try expandBannerRegion(renderer, layout.viewport_offset, terminal_rows, layout.scroll_lines);
-        } else {
-            try expandBannerByScrollingTerminal(renderer, terminal_rows, layout.scroll_lines);
-        }
-    }
-
-    row_offset = 0;
-    while (row_offset < layout.visible_line_count) : (row_offset += 1) {
-        const old_line = if (can_update_in_place and row_offset < previous.?.line_count)
-            previous.?.lines[row_offset]
-        else
-            null;
-        if (old_line) |line| {
-            if (next_state.lines[row_offset].eql(&line)) continue;
-        }
-        try drawRenderedBannerLine(
-            renderer,
-            layout.start_row + row_offset,
-            size.cols,
-            next_state.lines[row_offset],
-            old_line,
-            old_line == null,
-        );
-    }
-    if (can_update_in_place) {
-        row_offset = layout.visible_line_count;
-        while (row_offset < previous.?.line_count) : (row_offset += 1) {
-            try eraseRenderedBannerLine(renderer, layout.start_row + row_offset, size.cols, previous.?.lines[row_offset]);
-        }
-    }
-    try renderer.restoreBannerPresentation();
-    try renderer.moveCursor(layout.viewport_offset, 0);
-    return next_state;
-}
-
-fn clearedViewportOffset(self: BannerDrawState) u16 {
-    return if (self.restores_expansion) self.restore_viewport_offset else self.viewport_offset;
-}
-
-fn eraseBannerRows(renderer: client_renderer.Renderer, state: BannerDrawState, rows: u16, cols: u16) !void {
-    const terminal_rows = normalizedTerminalRows(rows);
-    try renderer.restoreBannerPresentation();
-    var i: u16 = 0;
-    while (i < state.line_count) : (i += 1) {
-        const row = state.start_row +| i;
-        if (row >= terminal_rows) break;
-        try eraseRenderedBannerLine(renderer, row, cols, state.lines[i]);
-    }
-}
-
-fn expandBannerRegion(renderer: client_renderer.Renderer, top: u16, rows: u16, count: u16) !void {
-    if (count == 0) return;
-    const terminal_rows = normalizedTerminalRows(rows);
-    const bottom = terminal_rows - 1;
-    try renderer.restoreBannerPresentation();
-    try renderer.setScrollRegion(top, bottom);
-    try renderer.moveCursor(bottom, 0);
-    var i: u16 = 0;
-    while (i < count) : (i += 1) try renderer.newline();
-    try renderer.resetScrollRegion();
-}
-
-fn expandBannerByScrollingTerminal(renderer: client_renderer.Renderer, rows: u16, count: u16) !void {
-    if (count == 0) return;
-    const terminal_rows = normalizedTerminalRows(rows);
-    const bottom = terminal_rows - 1;
-    try renderer.restoreBannerPresentation();
-    try renderer.moveCursor(bottom, 0);
-    var i: u16 = 0;
-    while (i < count) : (i += 1) try renderer.newline();
-}
-
-fn restoreBannerExpansion(renderer: client_renderer.Renderer, state: BannerDrawState, rows: u16) !void {
-    if (state.scroll_lines == 0) return;
-    if (!state.restores_expansion) return;
-    const terminal_rows = normalizedTerminalRows(rows);
-    if (terminal_rows != state.rows) return;
-    const bottom = terminal_rows - 1;
-    try renderer.restoreBannerPresentation();
-    try renderer.setScrollRegion(state.scroll_top, bottom);
-    try renderer.moveCursor(state.scroll_top, 0);
-    var i: u16 = 0;
-    while (i < state.scroll_lines) : (i += 1) try renderer.reverseIndex();
-    try renderer.resetScrollRegion();
-}
-
-fn renderBannerLine(cols: u16, line: BannerLine) RenderedBannerLine {
-    const visible_len = @min(@min(line.text.len, @as(usize, cols)), max_banner_render_line_bytes);
-    const col: u16 = switch (line.alignment) {
-        .left => 0,
-        .center => if (cols > visible_len)
-            @intCast((@as(usize, cols) - visible_len) / 2)
-        else
-            0,
-    };
-    var rendered = RenderedBannerLine{
-        .start_col = col,
-        .len = @intCast(visible_len),
-    };
-    for (line.text[0..visible_len], 0..) |byte, i| {
-        rendered.bytes[i] = bannerSafeByte(byte);
-    }
-    return rendered;
-}
-
-fn drawRenderedBannerLine(
-    renderer: client_renderer.Renderer,
-    row: u16,
-    cols: u16,
-    line: RenderedBannerLine,
-    previous: ?RenderedBannerLine,
-    clear_full_row: bool,
-) !void {
-    if (cols == 0) return;
-    const line_end = line.endCol();
-    var cover_start: u16 = if (clear_full_row) 0 else line.start_col;
-    var cover_end: u16 = if (clear_full_row) cols else line_end;
-    if (!clear_full_row) {
-        if (previous) |old| {
-            cover_start = @min(cover_start, old.start_col);
-            cover_end = @max(cover_end, old.endCol());
-        }
-    }
-    if (cover_end <= cover_start) return;
-
-    try renderer.moveCursor(row, cover_start);
-    try renderer.restoreBannerPresentation();
-    try writeSpaces(renderer, line.start_col - cover_start);
-    try renderer.writeRaw("\x1b[7m");
-    try renderer.writeRaw(line.slice());
-    try renderer.writeRaw("\x1b[0m");
-    try writeSpaces(renderer, cover_end - line_end);
-}
-
-fn eraseRenderedBannerLine(renderer: client_renderer.Renderer, row: u16, cols: u16, line: RenderedBannerLine) !void {
-    const start_col = @min(line.start_col, cols);
-    const end_col = @min(line.endCol(), cols);
-    if (end_col <= start_col) return;
-    try renderer.moveCursor(row, start_col);
-    try renderer.restoreBannerPresentation();
-    try writeSpaces(renderer, end_col - start_col);
-}
-
-fn writeSpaces(renderer: client_renderer.Renderer, count: usize) !void {
-    const spaces = "                                                                ";
-    var remaining = count;
-    while (remaining > 0) {
-        const n = @min(remaining, spaces.len);
-        try renderer.writeRaw(spaces[0..n]);
-        remaining -= n;
-    }
-}
-
-fn bannerSafeByte(byte: u8) u8 {
-    return switch (byte) {
-        ' '...'~' => byte,
-        else => '?',
-    };
-}
-
-fn normalizedTerminalRows(rows: u16) u16 {
-    return if (rows == 0) 1 else rows;
-}
-
-fn bannerLayoutForSize(rows: u16, top_row: u16, line_count: usize) BannerLayout {
-    const terminal_rows = normalizedTerminalRows(rows);
-    const visible_line_count: u16 = @intCast(@min(line_count, @as(usize, terminal_rows)));
-    if (visible_line_count == 0) {
-        const viewport_offset = @min(top_row, terminal_rows - 1);
-        return .{ .start_row = viewport_offset, .visible_line_count = 0, .scroll_lines = 0, .viewport_offset = viewport_offset };
-    }
-
-    const clamped_top = @min(top_row, terminal_rows - 1);
-    const preferred_start = @as(usize, clamped_top) + 1;
-    const preferred_end = preferred_start + @as(usize, visible_line_count);
-    if (preferred_end <= terminal_rows) {
-        return .{
-            .start_row = @intCast(preferred_start),
-            .visible_line_count = visible_line_count,
-            .scroll_lines = 0,
-            .viewport_offset = clamped_top,
-        };
-    }
-
-    const scroll_lines: u16 = @intCast(@min(preferred_end - terminal_rows, @as(usize, std.math.maxInt(u16))));
-    const consumed_top = @min(clamped_top, scroll_lines);
-    return .{
-        .start_row = terminal_rows - visible_line_count,
-        .visible_line_count = visible_line_count,
-        .scroll_lines = scroll_lines,
-        .viewport_offset = clamped_top - consumed_top,
-    };
-}
-
-fn countSubstrings(haystack: []const u8, needle: []const u8) usize {
-    if (needle.len == 0) return 0;
-    var count: usize = 0;
-    var index: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, index, needle)) |found| {
-        count += 1;
-        index = found + needle.len;
-    }
-    return count;
-}
-
-fn formatBannerDiagnostic(
-    out: []u8,
-    diagnostic: *const client_log.UserDiagnosticLine,
-    delayed: bool,
-) usize {
-    var stream = std.io.fixedBufferStream(out);
-    const writer = stream.writer();
-    if (delayed) {
-        writer.print("{s} ts_ms={}: ", .{ diagnostic.tag.label(), diagnostic.ts_ms }) catch return stream.pos;
-    } else {
-        writer.print("{s}: ", .{diagnostic.tag.label()}) catch return stream.pos;
-    }
-    writer.writeAll(diagnostic.slice()) catch {};
-    return stream.pos;
-}
-
-fn setNonBlocking(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    if ((flags & nonblocking_flag) != 0) return;
-    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-}
-
-fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
-    return reconnect_title.formatDelay(delay_ms, buf);
-}
-
-fn formatSwitchDelay(delay_ms: u64, buf: []u8) ![]const u8 {
-    const seconds = @max(@divTrunc(delay_ms + 999, 1000), 1);
-    return std.fmt.bufPrint(buf, "{}sec", .{seconds});
-}
-
-fn nextBannerUpdateDelayMs(remaining_ms: u64) u64 {
-    if (remaining_ms <= 1_000) return remaining_ms;
-    if (remaining_ms <= 60_000) return 1_000;
-    return @min(remaining_ms - 59_000, 60_000);
-}
-
-fn elapsedTimerMs(timer: *std.time.Timer) u64 {
-    return timer.read() / std.time.ns_per_ms;
-}
-
 const DrawPayload = struct {
     scrollback_cursor: []const u8,
     viewport_offset: i32,
@@ -1863,313 +630,6 @@ const DrawPayload = struct {
     app_title_present: ?bool,
     relay_end_restore_bytes: ?[]const u8,
 };
-
-test "parseEnvConfig accepts sessh env keys" {
-    const parsed = try parseEnvConfig(
-        \\scrollback-limit=42
-        \\initial-scrollback=0
-        \\client-log-level=debug
-        \\bootstrap=false
-        \\terminal-emulator=no
-        \\filter-level=hygienic
-        \\reap-hours=1.5
-        \\tombstone-hours=2
-        \\
-    );
-
-    try std.testing.expectEqual(@as(?u32, 42), parsed.scrollback_row_count);
-    try std.testing.expect(parsed.initial_scrollback_row_count_set);
-    try std.testing.expectEqual(@as(?u32, 0), parsed.initial_scrollback_row_count);
-    try std.testing.expectEqual(@as(?client_log.Level, .debug), parsed.client_log_level);
-    try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
-    try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
-    try std.testing.expectEqual(@as(?config.FilterLevel, .hygienic), parsed.filter_level);
-    try std.testing.expectEqual(@as(?u64, 5_400_000), parsed.reap_ms);
-    try std.testing.expectEqual(@as(?u64, 7_200_000), parsed.tombstone_retention_ms);
-}
-
-test "parseEnvConfig maps initial scrollback minus one to all retained rows" {
-    const parsed = try parseEnvConfig("INITIAL_SCROLLBACK=-1\n");
-
-    try std.testing.expect(parsed.initial_scrollback_row_count_set);
-    try std.testing.expectEqual(@as(?u32, null), parsed.initial_scrollback_row_count);
-}
-
-test "parseEnvConfig maps non-positive reap and tombstone hours to disabled" {
-    const negative = try parseEnvConfig("reap-hours=-1\n");
-    try std.testing.expectEqual(@as(?u64, 0), negative.reap_ms);
-
-    const zero = try parseEnvConfig("reap_hours=0\n");
-    try std.testing.expectEqual(@as(?u64, 0), zero.reap_ms);
-
-    const tombstone_zero = try parseEnvConfig("tombstone-hours=0\n");
-    try std.testing.expectEqual(@as(?u64, 0), tombstone_zero.tombstone_retention_ms);
-}
-
-test "formatDelay uses compact reconnect labels" {
-    var buf: [16]u8 = undefined;
-
-    try std.testing.expectEqualStrings("5sec", try formatDelay(5_000, &buf));
-    try std.testing.expectEqualStrings("20sec", try formatDelay(20_000, &buf));
-    try std.testing.expectEqualStrings("1min", try formatDelay(60_000, &buf));
-    try std.testing.expectEqualStrings("10min", try formatDelay(600_000, &buf));
-    try std.testing.expectEqualStrings("60sec", try formatSwitchDelay(60_000, &buf));
-}
-
-test "ReconnectUi restores remote fallback title when no app title is present" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var session = RuntimeSession{};
-    session.setTitleFallback("work.blox");
-    session.app_title_present = false;
-
-    var ui = ReconnectUi{
-        .mode_guard = undefined,
-        .title_enabled = true,
-        .title_fd = fds[1],
-    };
-    ui.showRetryTitle(5_000);
-    ui.restoreTitleAfterReconnect(&session);
-    posix.close(fds[1]);
-
-    var buf: [128]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    try std.testing.expectEqualStrings(
-        "\x1b]2;5sec retry CTRL-R\x1b\\\x1b]2;work.blox\x1b\\",
-        buf[0..n],
-    );
-    try std.testing.expect(!ui.title_visible);
-}
-
-test "ReconnectUi leaves restored app title alone after reconnect repaint" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var session = RuntimeSession{};
-    session.setTitleFallback("work.blox");
-    session.app_title_present = true;
-
-    var ui = ReconnectUi{
-        .mode_guard = undefined,
-        .title_enabled = true,
-        .title_fd = fds[1],
-    };
-    ui.showRetryTitle(5_000);
-    ui.restoreTitleAfterReconnect(&session);
-    posix.close(fds[1]);
-
-    var buf: [128]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    try std.testing.expectEqualStrings("\x1b]2;5sec retry CTRL-R\x1b\\", buf[0..n]);
-    try std.testing.expect(!ui.title_visible);
-}
-
-test "ReconnectUi restores local cleanup title on detach" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var ui = ReconnectUi{
-        .mode_guard = undefined,
-        .title_enabled = true,
-        .title_fd = fds[1],
-    };
-    ui.cleanup_title_fallback_len = copyTitleFallback(&ui.cleanup_title_fallback, "/tmp/local");
-    ui.showRetryTitle(5_000);
-    ui.restoreTitleForDetach();
-    posix.close(fds[1]);
-
-    var buf: [128]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    try std.testing.expectEqualStrings(
-        "\x1b]2;5sec retry CTRL-R\x1b\\\x1b]2;/tmp/local\x1b\\",
-        buf[0..n],
-    );
-    try std.testing.expect(!ui.title_visible);
-}
-
-test "ReconnectUi records resize event for runtime forwarding" {
-    var ui = ReconnectUi{
-        .mode_guard = undefined,
-        .presentation = .none,
-        .last_size = .{ .rows = 0, .cols = 0 },
-    };
-
-    try ui.refreshForResize();
-    try std.testing.expect(ui.resize_generation != 0);
-    try std.testing.expect(ui.consumeResizeForRuntime());
-    try std.testing.expect(!ui.consumeResizeForRuntime());
-}
-
-test "reconnect switch disposition distinguishes typing paste and unresponsive" {
-    var ui = ReconnectUi{ .mode_guard = undefined };
-    try std.testing.expectEqual(
-        ReconnectSwitchDisposition.automatic,
-        ui.reconnectSwitchDisposition(false, false, false),
-    );
-    try std.testing.expectEqual(
-        ReconnectSwitchDisposition.delayed,
-        ui.reconnectSwitchDisposition(true, false, false),
-    );
-    ui.input_during_disconnect = true;
-    try std.testing.expectEqual(
-        ReconnectSwitchDisposition.delayed,
-        ui.reconnectSwitchDisposition(false, false, false),
-    );
-    try std.testing.expectEqual(
-        ReconnectSwitchDisposition.manual_disconnected,
-        ui.reconnectSwitchDisposition(false, true, false),
-    );
-    try std.testing.expectEqual(
-        ReconnectSwitchDisposition.manual_unresponsive,
-        ui.reconnectSwitchDisposition(false, false, true),
-    );
-}
-
-test "reconnect banner layout adds rows at terminal bottom" {
-    const single = bannerLayoutForSize(1, 0, 1);
-    try std.testing.expectEqual(@as(u16, 0), single.start_row);
-    try std.testing.expectEqual(@as(u16, 1), single.visible_line_count);
-    try std.testing.expectEqual(@as(u16, 1), single.scroll_lines);
-
-    const normal = bannerLayoutForSize(24, 0, 1);
-    try std.testing.expectEqual(@as(u16, 1), normal.start_row);
-    try std.testing.expectEqual(@as(u16, 0), normal.scroll_lines);
-
-    const bottom = bannerLayoutForSize(24, 23, 1);
-    try std.testing.expectEqual(@as(u16, 23), bottom.start_row);
-    try std.testing.expectEqual(@as(u16, 1), bottom.scroll_lines);
-    try std.testing.expectEqual(@as(u16, 22), bottom.viewport_offset);
-}
-
-test "reconnect banner draws clipped multiline content and pads stale rows" {
-    var single_row = std.ArrayList(u8).empty;
-    defer single_row.deinit(std.testing.allocator);
-    const single_renderer = client_renderer.Renderer.buffered(&single_row, .{ .kind = .xterm_compatible });
-    _ = try drawBannerLines(
-        single_renderer,
-        .{ .rows = 1, .cols = 8 },
-        0,
-        null,
-        &.{.{ .text = "single row", .alignment = .center }},
-    );
-    try std.testing.expect(std.mem.indexOf(u8, single_row.items, "\r\n") != null);
-
-    var first = std.ArrayList(u8).empty;
-    defer first.deinit(std.testing.allocator);
-    const renderer = client_renderer.Renderer.buffered(&first, .{ .kind = .xterm_compatible });
-    const first_state = try drawBannerLines(
-        renderer,
-        .{ .rows = 4, .cols = 8 },
-        0,
-        null,
-        &.{
-            .{ .text = "0123456789", .alignment = .center },
-            .{ .text = "ssh: first", .alignment = .left },
-        },
-    );
-    try std.testing.expect(std.mem.indexOf(u8, first.items, "01234567") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first.items, "ssh: fir") != null);
-    try std.testing.expectEqual(@as(u16, 1), first_state.start_row);
-    try std.testing.expectEqual(@as(u16, 2), first_state.line_count);
-
-    var second = std.ArrayList(u8).empty;
-    defer second.deinit(std.testing.allocator);
-    const second_renderer = client_renderer.Renderer.buffered(&second, .{ .kind = .xterm_compatible });
-    _ = try drawBannerLines(
-        second_renderer,
-        .{ .rows = 4, .cols = 8 },
-        first_state.viewport_offset,
-        first_state,
-        &.{.{ .text = "new", .alignment = .center }},
-    );
-    try std.testing.expectEqual(@as(usize, 0), countSubstrings(second.items, "\x1b[2K"));
-    try std.testing.expect(std.mem.indexOf(u8, second.items, "new") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second.items, "ssh: fir") == null);
-
-    var third = std.ArrayList(u8).empty;
-    defer third.deinit(std.testing.allocator);
-    const third_renderer = client_renderer.Renderer.buffered(&third, .{ .kind = .xterm_compatible });
-    _ = try drawBannerLines(
-        third_renderer,
-        .{ .rows = 4, .cols = 8 },
-        first_state.viewport_offset,
-        first_state,
-        &.{
-            .{ .text = "76543210", .alignment = .center },
-            .{ .text = "ssh: first", .alignment = .left },
-        },
-    );
-    try std.testing.expectEqual(@as(usize, 0), countSubstrings(third.items, "\x1b[2K"));
-    try std.testing.expect(std.mem.indexOf(u8, third.items, "76543210") != null);
-    try std.testing.expect(std.mem.indexOf(u8, third.items, "ssh: fir") == null);
-}
-
-test "reconnect banner restores temporary expansion within sessh-owned rows" {
-    var drawn = std.ArrayList(u8).empty;
-    defer drawn.deinit(std.testing.allocator);
-    const renderer = client_renderer.Renderer.buffered(&drawn, .{ .kind = .xterm_compatible });
-    const state = try drawBannerLines(
-        renderer,
-        .{ .rows = 4, .cols = 16 },
-        0,
-        null,
-        &.{
-            .{ .text = "one", .alignment = .center },
-            .{ .text = "two", .alignment = .left },
-            .{ .text = "three", .alignment = .left },
-            .{ .text = "four", .alignment = .left },
-        },
-    );
-    try std.testing.expectEqual(@as(u16, 1), state.scroll_lines);
-    try std.testing.expect(state.restores_expansion);
-    try std.testing.expectEqual(@as(u16, 0), state.restore_viewport_offset);
-
-    var cleared = std.ArrayList(u8).empty;
-    defer cleared.deinit(std.testing.allocator);
-    const clear_renderer = client_renderer.Renderer.buffered(&cleared, .{ .kind = .xterm_compatible });
-    try eraseBannerRows(clear_renderer, state, 4, 16);
-    try restoreBannerExpansion(clear_renderer, state, 4);
-    try std.testing.expectEqual(@as(usize, 1), countSubstrings(cleared.items, "\x1bM"));
-    try std.testing.expect(std.mem.indexOf(u8, cleared.items, "\x1b[r") != null);
-}
-
-test "reconnect banner scrolls outer rows into scrollback when expansion consumes them" {
-    var drawn = std.ArrayList(u8).empty;
-    defer drawn.deinit(std.testing.allocator);
-    const renderer = client_renderer.Renderer.buffered(&drawn, .{ .kind = .xterm_compatible });
-    const state = try drawBannerLines(
-        renderer,
-        .{ .rows = 4, .cols = 16 },
-        3,
-        null,
-        &.{
-            .{ .text = "one", .alignment = .center },
-            .{ .text = "two", .alignment = .left },
-        },
-    );
-    try std.testing.expectEqual(@as(u16, 2), state.scroll_lines);
-    try std.testing.expect(!state.restores_expansion);
-    try std.testing.expectEqual(@as(u16, 1), state.viewport_offset);
-    try std.testing.expectEqual(@as(u16, 3), state.restore_viewport_offset);
-    try std.testing.expect(std.mem.indexOf(u8, drawn.items, "\x1b[2;4r") == null);
-    try std.testing.expect(std.mem.indexOf(u8, drawn.items, "\x1b[4;1H\r\n\r\n") != null);
-
-    var cleared = std.ArrayList(u8).empty;
-    defer cleared.deinit(std.testing.allocator);
-    const clear_renderer = client_renderer.Renderer.buffered(&cleared, .{ .kind = .xterm_compatible });
-    try eraseBannerRows(clear_renderer, state, 4, 16);
-    try restoreBannerExpansion(clear_renderer, state, 4);
-    try std.testing.expectEqual(@as(usize, 0), countSubstrings(cleared.items, "\x1bM"));
-    try std.testing.expectEqual(@as(u16, 1), clearedViewportOffset(state));
-}
-
-test "reconnect banner updates every second under one minute" {
-    try std.testing.expectEqual(@as(u64, 1_000), nextBannerUpdateDelayMs(59_000));
-    try std.testing.expectEqual(@as(u64, 1_000), nextBannerUpdateDelayMs(60_000));
-    try std.testing.expectEqual(@as(u64, 2_000), nextBannerUpdateDelayMs(61_000));
-    try std.testing.expectEqual(@as(u64, 60_000), nextBannerUpdateDelayMs(600_000));
-}
 
 test "connection monitor starts responsiveness wait after input" {
     var monitor = ConnectionMonitor{ .enabled = true };
@@ -2926,13 +1386,13 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
                 terminateChild(&child);
                 markRouteDetachedForSession(allocator, &session);
                 try tty_transcript.finishActiveOrReport();
-                writeDetachBannerForTarget(&.{}, ".", request.banner_args, session.idSlice());
+                writeDetachOverlayForTarget(&.{}, ".", request.overlay_args, session.idSlice());
                 if (session.kill_requested) writeUnconfirmedKillDetachWarningForSessionRef(session.guidSlice());
                 return;
             },
             .kill_detach => {
                 recordRuntimeSessionKillRequested(allocator, ".", &session);
-                spawnLocalKillJsonl(allocator, request.exe, &.{session.guidSlice()});
+                route_commands.spawnLocalKillJsonl(allocator, request.exe, &.{session.guidSlice()});
                 session.restoreRelayEndPresentationForExit();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
@@ -2940,7 +1400,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
             },
             .kill_wait => {
                 recordRuntimeSessionKillRequested(allocator, ".", &session);
-                const killed = try runLocalKillJsonlAndProcess(allocator, request.exe, &.{session.guidSlice()}, session.guidSlice());
+                const killed = try route_commands.runLocalKillJsonlAndProcess(allocator, request.exe, &.{session.guidSlice()}, session.guidSlice());
                 if (killed) session.ended_tombstone_details = .{
                     .ended_at_unix_ms = nowUnixMs(),
                     .end_reason = .killed_by_request,
@@ -3009,7 +1469,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                 if (exit_status != 0) return process_exit.request(exit_status);
                 return;
             }
-            const exit_status = try runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl, options.list_exited, options.list_all, null);
+            const exit_status = try route_commands.runLocalListCommand(allocator, args[0], runtime_broker_args, options.list_refresh, options.list_include_cached_routes, options.list_jsonl, options.list_exited, options.list_all, null);
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         },
@@ -3080,7 +1540,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             .scrollback_row_count = options.scrollback_row_count,
             .reap_ms = options.reap_ms,
             .tombstone_retention_ms = options.tombstone_retention_ms,
-            .banner_args = options.banner_args.slice(),
+            .overlay_args = options.overlay_args.slice(),
             .capture_tty_transcript = options.capture_tty_transcript,
         });
     }
@@ -3157,13 +1617,13 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                 terminateChild(&child);
                 markRouteDetachedForSession(allocator, &session);
                 try tty_transcript.finishActiveOrReport();
-                writeDetachBannerForTarget(&.{}, ".", options.banner_args.slice(), session.idSlice());
+                writeDetachOverlayForTarget(&.{}, ".", options.overlay_args.slice(), session.idSlice());
                 if (session.kill_requested) writeUnconfirmedKillDetachWarningForSessionRef(session.guidSlice());
                 return;
             },
             .kill_detach => {
                 recordRuntimeSessionKillRequested(allocator, ".", &session);
-                spawnLocalKillJsonl(allocator, args[0], &.{session.guidSlice()});
+                route_commands.spawnLocalKillJsonl(allocator, args[0], &.{session.guidSlice()});
                 session.restoreRelayEndPresentationForExit();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
@@ -3171,7 +1631,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             },
             .kill_wait => {
                 recordRuntimeSessionKillRequested(allocator, ".", &session);
-                const killed = try runLocalKillJsonlAndProcess(allocator, args[0], &.{session.guidSlice()}, session.guidSlice());
+                const killed = try route_commands.runLocalKillJsonlAndProcess(allocator, args[0], &.{session.guidSlice()}, session.guidSlice());
                 if (killed) session.ended_tombstone_details = .{
                     .ended_at_unix_ms = nowUnixMs(),
                     .end_reason = .killed_by_request,
@@ -3561,844 +2021,6 @@ fn runLocalBrokerCommand(allocator: std.mem.Allocator, exe: []const u8, broker_a
     };
 }
 
-pub fn runLocalListCommand(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    runtime_broker_args: []const []const u8,
-    refresh: bool,
-    include_cached_routes: bool,
-    jsonl: bool,
-    exited: bool,
-    all: bool,
-    remote_runner: ?*RemoteCommandRunner,
-) !u8 {
-    if (include_cached_routes and refresh) try refreshCachedRemoteRoutes(allocator, exe, remote_runner);
-
-    var command_args_buf: [8][]const u8 = undefined;
-    const command_args = appendBrokerCommand(runtime_broker_args, "list", null, &command_args_buf);
-    const extra_args: usize = (if (jsonl) @as(usize, 1) else 0) +
-        (if (all) @as(usize, 1) else 0) +
-        (if (exited) @as(usize, 1) else 0) +
-        (if ((all or exited) and !include_cached_routes) @as(usize, 1) else 0);
-    const argv = try allocator.alloc([]const u8, 2 + command_args.len + extra_args);
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = ":internal-session-broker:";
-    @memcpy(argv[2 .. 2 + command_args.len], command_args);
-    var arg_index = 2 + command_args.len;
-    if (jsonl) {
-        argv[arg_index] = "--jsonl";
-        arg_index += 1;
-    }
-    if (all) {
-        argv[arg_index] = "--all";
-        arg_index += 1;
-    }
-    if (exited) {
-        argv[arg_index] = "--exited";
-        arg_index += 1;
-    }
-    if ((all or exited) and !include_cached_routes) {
-        argv[arg_index] = "--local-only";
-        arg_index += 1;
-    }
-
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 1024 * 1024,
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.stdout.len > 0) try io_helpers.writeAll(1, result.stdout);
-    if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
-    const exit_status: u8 = switch (result.term) {
-        .Exited => |code| @intCast(@min(code, std.math.maxInt(u8))),
-        else => 1,
-    };
-    if (exit_status != 0) return exit_status;
-    if (include_cached_routes and !exited and !all) {
-        const appended_cached_routes = try appendCachedRemoteRouteRows(allocator, jsonl);
-        if (appended_cached_routes and !refresh) {
-            try io_helpers.writeAll(2, "sessh: cached remote session status may be out of date; run `sesshmux list --refresh` to update\n");
-        }
-    }
-    return 0;
-}
-
-fn appendCachedRemoteRouteRows(allocator: std.mem.Allocator, jsonl: bool) !bool {
-    var routes: std.ArrayList(session_registry.Route) = .empty;
-    defer {
-        for (routes.items) |*route| route.deinit(allocator);
-        routes.deinit(allocator);
-    }
-    try loadCachedRemoteRoutes(allocator, &routes, true);
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    const writer = out.writer(allocator);
-    for (routes.items) |route| {
-        var input_buf: [32]u8 = undefined;
-        const input = try formatRouteInput(&input_buf, route.last_input_at_unix_ms);
-        var attached_buf: [32]u8 = undefined;
-        const attached = formatRouteAttachedCount(&attached_buf, route.attached_count);
-        const display_id = try session_registry.shortSessionGuid(allocator, route.guid);
-        defer allocator.free(display_id);
-        if (jsonl) {
-            try list_format.writeJsonlRow(
-                writer,
-                display_id,
-                route.host,
-                route.agent_version,
-                route.guid,
-                route.attached_count,
-                route.last_input_at_unix_ms,
-            );
-        } else {
-            try list_format.writeRow(writer, display_id, attached, input, route.host, route.agent_version);
-        }
-    }
-    if (out.items.len > 0) try io_helpers.writeAll(1, out.items);
-    return routes.items.len > 0;
-}
-
-fn formatRouteAttachedCount(buf: []u8, attached_count: ?u32) []const u8 {
-    if (attached_count) |count| return std.fmt.bufPrint(buf, "{}", .{count}) catch "???";
-    return "???";
-}
-
-fn formatRouteInput(buf: []u8, last_input_at_unix_ms: ?u64) ![]const u8 {
-    const ts = last_input_at_unix_ms orelse return "???";
-    return formatRelativeUnixMs(buf, nowUnixMs(), ts);
-}
-
-fn formatRelativeUnixMs(buf: []u8, now_ms: u64, ts_ms: u64) ![]const u8 {
-    const delta_ms = now_ms -| ts_ms;
-    const seconds = delta_ms / std.time.ms_per_s;
-    if (seconds < 60) return std.fmt.bufPrint(buf, "{}s ago", .{seconds});
-    const minutes = seconds / 60;
-    if (minutes < 60) return std.fmt.bufPrint(buf, "{}m ago", .{minutes});
-    const hours = minutes / 60;
-    if (hours < 24) return std.fmt.bufPrint(buf, "{}h ago", .{hours});
-    return std.fmt.bufPrint(buf, "{}d ago", .{hours / 24});
-}
-
-fn nowUnixMs() u64 {
-    const ms = std.time.milliTimestamp();
-    if (ms <= 0) return 0;
-    return @intCast(ms);
-}
-
-fn loadCachedRemoteRoutes(allocator: std.mem.Allocator, routes: *std.ArrayList(session_registry.Route), alive_only: bool) !void {
-    const state_sessions_dir = try session_registry.stateSessionsDir(allocator);
-    defer allocator.free(state_sessions_dir);
-    var dir = std.fs.openDirAbsolute(state_sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer dir.close();
-
-    var iterator = dir.iterate();
-    while (try iterator.next()) |entry| {
-        if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
-        const route_path = try std.fmt.allocPrint(allocator, "{s}/{s}/route.json", .{ state_sessions_dir, entry.name });
-        defer allocator.free(route_path);
-        var route = session_registry.readRoute(allocator, route_path) catch continue;
-        errdefer route.deinit(allocator);
-        if (route.host.len == 0 or std.mem.eql(u8, route.host, ".") or (alive_only and !route.last_known_alive)) {
-            route.deinit(allocator);
-            continue;
-        }
-        try routes.append(allocator, route);
-    }
-}
-
-fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8, remote_runner: ?*RemoteCommandRunner) !void {
-    var routes: std.ArrayList(session_registry.Route) = .empty;
-    defer {
-        for (routes.items) |*route| route.deinit(allocator);
-        routes.deinit(allocator);
-    }
-    try loadCachedRemoteRoutes(allocator, &routes, true);
-
-    for (routes.items, 0..) |*route, i| {
-        if (routeConnectionWasAlreadyRefreshed(routes.items[0..i], route)) continue;
-        const stdout = queryRemoteRouteList(allocator, exe, remote_runner, route, false, false) catch |err| {
-            try io_helpers.stderrPrint("sessh: list refresh failed for {s}: {t}\n", .{ route.host, err });
-            continue;
-        };
-        defer allocator.free(stdout);
-        for (routes.items) |*candidate| {
-            if (!sameRouteConnection(route, candidate)) continue;
-            if (!try cachedRouteStillExists(allocator, candidate.guid)) continue;
-            const remote_status = try remoteListStatusForGuid(allocator, stdout, candidate.guid);
-            defer if (remote_status) |status| allocator.free(status.version);
-            if (remote_status) |status| {
-                try session_registry.updateRouteStatus(
-                    allocator,
-                    candidate.guid,
-                    true,
-                    status.version,
-                    .{
-                        .attached_count = status.attached_count,
-                        .last_input_at_unix_ms = status.last_input_at_unix_ms,
-                    },
-                );
-            }
-        }
-        try drainPendingRemoteRequests(allocator, exe, remote_runner, route.host, route.ssh_options, route.host_guid);
-        for (routes.items) |*candidate| {
-            if (!sameRouteConnection(route, candidate)) continue;
-            if (!try cachedRouteStillExists(allocator, candidate.guid)) continue;
-            const remote_status = try remoteListStatusForGuid(allocator, stdout, candidate.guid);
-            defer if (remote_status) |status| allocator.free(status.version);
-            if (remote_status != null) continue;
-            try session_registry.writeTombstoneForRoute(
-                allocator,
-                candidate,
-                .{
-                    .ended_at_unix_ms = nowUnixMs(),
-                    .end_reason = .unknown,
-                    .exit_status = null,
-                },
-            );
-        }
-    }
-    try refreshPendingKillsWithoutCachedRoute(allocator, exe, remote_runner, routes.items);
-}
-
-fn cachedRouteStillExists(allocator: std.mem.Allocator, guid: []const u8) !bool {
-    var route = session_registry.readRouteForRef(allocator, guid) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    route.deinit(allocator);
-    return true;
-}
-
-fn routeConnectionWasAlreadyRefreshed(previous: []const session_registry.Route, route: *const session_registry.Route) bool {
-    for (previous) |*candidate| {
-        if (sameRouteConnection(candidate, route)) return true;
-    }
-    return false;
-}
-
-fn sameRouteConnection(a: *const session_registry.Route, b: *const session_registry.Route) bool {
-    if (a.host_guid.len != 0 and b.host_guid.len != 0) {
-        return std.mem.eql(u8, a.host_guid, b.host_guid);
-    }
-    if (!std.mem.eql(u8, a.host, b.host)) return false;
-    if (a.ssh_options.len != b.ssh_options.len) return false;
-    for (a.ssh_options, b.ssh_options) |a_option, b_option| {
-        if (!std.mem.eql(u8, a_option, b_option)) return false;
-    }
-    return true;
-}
-
-fn refreshPendingKillsWithoutCachedRoute(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    remote_runner: ?*RemoteCommandRunner,
-    routes: []const session_registry.Route,
-) !void {
-    var pending_hosts = try session_registry.readPendingKillHosts(allocator);
-    defer pending_hosts.deinit(allocator);
-    for (pending_hosts.hosts) |host| {
-        if (hostMatchesAnyRoute(routes, host.guid)) continue;
-        var ssh_options: [2][]const u8 = undefined;
-        const options = if (std.mem.eql(u8, host.port, session_registry.default_pending_port))
-            &.{}
-        else blk: {
-            ssh_options = .{ "-p", host.port };
-            break :blk ssh_options[0..];
-        };
-        try drainPendingRemoteRequests(allocator, exe, remote_runner, host.name, options, host.guid);
-    }
-}
-
-fn hostMatchesAnyRoute(routes: []const session_registry.Route, host_guid: []const u8) bool {
-    for (routes) |*route| {
-        if (std.mem.eql(u8, route.host_guid, host_guid)) return true;
-    }
-    return false;
-}
-
-fn queryRemoteRouteList(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    remote_runner: ?*RemoteCommandRunner,
-    route: *const session_registry.Route,
-    exited: bool,
-    all: bool,
-) ![]u8 {
-    return queryRemoteHostList(allocator, exe, remote_runner, route.host, route.ssh_options, exited, all);
-}
-
-fn queryRemoteHostList(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    remote_runner: ?*RemoteCommandRunner,
-    host: []const u8,
-    ssh_options: []const []const u8,
-    exited: bool,
-    all: bool,
-) ![]u8 {
-    if (remote_runner) |runner| {
-        const extra_args: usize = 4 + (if (exited) @as(usize, 1) else 0) + (if (all) @as(usize, 1) else 0);
-        const argv = try allocator.alloc([]const u8, extra_args);
-        defer allocator.free(argv);
-        argv[0] = "sesshmux";
-        argv[1] = ":internal-session-broker:";
-        argv[2] = "list";
-        argv[3] = "--jsonl";
-        var arg_index: usize = 4;
-        if (exited) {
-            argv[arg_index] = "--exited";
-            arg_index += 1;
-        }
-        if (all) {
-            argv[arg_index] = "--all";
-            arg_index += 1;
-        }
-        var result = try runner.run(allocator, host, ssh_options, argv);
-        errdefer result.deinit(allocator);
-        if (result.exit_code == 0) {
-            allocator.free(result.stderr);
-            return result.stdout;
-        }
-        if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
-        return error.RemoteListFailed;
-    }
-
-    const extra_args: usize = (if (exited) @as(usize, 1) else 0) +
-        (if (all) @as(usize, 1) else 0);
-    const ssh_options_arg = if (ssh_options.len > 0) try shellJoinArgs(allocator, ssh_options) else null;
-    defer if (ssh_options_arg) |value| allocator.free(value);
-    const ssh_option_args: usize = if (ssh_options_arg != null) 2 else 0;
-    const argv = try allocator.alloc([]const u8, 2 + ssh_option_args + 2 + extra_args);
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = "list";
-    var arg_index: usize = 2;
-    if (ssh_options_arg) |value| {
-        argv[arg_index] = "--ssh-options";
-        arg_index += 1;
-        argv[arg_index] = value;
-        arg_index += 1;
-    }
-    argv[arg_index] = host;
-    arg_index += 1;
-    argv[arg_index] = "--jsonl";
-    arg_index += 1;
-    if (exited) {
-        argv[arg_index] = "--exited";
-        arg_index += 1;
-    }
-    if (all) {
-        argv[arg_index] = "--all";
-        arg_index += 1;
-    }
-
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 1024 * 1024,
-        .expand_arg0 = .expand,
-    });
-    errdefer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .Exited => |code| {
-            if (code == 0) return result.stdout;
-            if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
-            return error.RemoteListFailed;
-        },
-        else => return error.RemoteListFailed,
-    }
-}
-
-fn queryRemoteHostKillJsonl(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    host: []const u8,
-    ssh_options: []const []const u8,
-    targets: []const []const u8,
-) ![]u8 {
-    return queryRemoteHostKillJsonlWithRequests(allocator, exe, null, host, ssh_options, targets, &.{});
-}
-
-pub fn drainPendingRemoteRequests(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    remote_runner: ?*RemoteCommandRunner,
-    host: []const u8,
-    ssh_options: []const []const u8,
-    pending_host_guid: []const u8,
-) !void {
-    if (host.len == 0 or std.mem.eql(u8, host, ".")) return;
-    if (pending_host_guid.len == 0) return;
-    var lock = (try session_registry.tryLockPendingKillsForHost(allocator, pending_host_guid)) orelse return;
-    defer lock.deinit();
-    var pending = try lock.read();
-    defer pending.deinit(allocator);
-    if (pending.entries.len == 0) {
-        try lock.cleanupIfEmpty();
-        return;
-    }
-
-    var request_jsons: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (request_jsons.items) |json| allocator.free(json);
-        request_jsons.deinit(allocator);
-    }
-    const now_ms = nowUnixMs();
-    for (pending.entries) |*entry| {
-        if (!std.mem.eql(u8, entry.type_name, "kill")) continue;
-        if (entry.guid.len == 0) continue;
-        const requested_age_ms: u64 = if (now_ms >= entry.requested_at_unix_ms) now_ms - entry.requested_at_unix_ms else 0;
-        try request_jsons.append(allocator, try std.fmt.allocPrint(
-            allocator,
-            "{{\"guid\":{f},\"requested_age_ms\":{}}}",
-            .{ std.json.fmt(entry.guid, .{}), requested_age_ms },
-        ));
-    }
-    if (request_jsons.items.len == 0) return;
-
-    const stdout = queryRemoteHostKillJsonlWithRequests(allocator, exe, remote_runner, host, ssh_options, &.{}, request_jsons.items) catch |err| {
-        try io_helpers.stderrPrint("sessh: pending cleanup failed for {s}: {t}\n", .{ host, err });
-        return;
-    };
-    defer allocator.free(stdout);
-
-    var handled: std.ArrayList([]const u8) = .empty;
-    defer handled.deinit(allocator);
-    try processKillJsonlForPendingDrain(allocator, host, stdout, &pending, &handled);
-    if (handled.items.len == 0) return;
-    try lock.removeHandled(&pending, handled.items);
-}
-
-fn queryRemoteHostKillJsonlWithRequests(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    remote_runner: ?*RemoteCommandRunner,
-    host: []const u8,
-    ssh_options: []const []const u8,
-    targets: []const []const u8,
-    request_jsons: []const []const u8,
-) ![]u8 {
-    if (remote_runner) |runner| {
-        const request_args = request_jsons.len * 2;
-        const argv = try allocator.alloc([]const u8, 4 + request_args + targets.len);
-        defer allocator.free(argv);
-        argv[0] = "sesshmux";
-        argv[1] = ":internal-session-broker:";
-        argv[2] = "kill";
-        argv[3] = "--jsonl";
-        var arg_index: usize = 4;
-        for (request_jsons) |request_json| {
-            argv[arg_index] = "--request";
-            arg_index += 1;
-            argv[arg_index] = request_json;
-            arg_index += 1;
-        }
-        @memcpy(argv[arg_index..], targets);
-
-        var result = try runner.run(allocator, host, ssh_options, argv);
-        errdefer result.deinit(allocator);
-        if (result.exit_code == 0 or result.stdout.len > 0) {
-            allocator.free(result.stderr);
-            return result.stdout;
-        }
-        if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
-        return error.RemoteKillFailed;
-    }
-
-    const ssh_options_arg = if (ssh_options.len > 0) try shellJoinArgs(allocator, ssh_options) else null;
-    defer if (ssh_options_arg) |value| allocator.free(value);
-    const ssh_option_args: usize = if (ssh_options_arg != null) 2 else 0;
-    const request_args = request_jsons.len * 2;
-    const argv = try allocator.alloc([]const u8, 2 + ssh_option_args + 1 + 1 + request_args + targets.len);
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = "kill";
-    var arg_index: usize = 2;
-    if (ssh_options_arg) |value| {
-        argv[arg_index] = "--ssh-options";
-        arg_index += 1;
-        argv[arg_index] = value;
-        arg_index += 1;
-    }
-    argv[arg_index] = host;
-    arg_index += 1;
-    argv[arg_index] = "--jsonl";
-    arg_index += 1;
-    for (request_jsons) |request_json| {
-        argv[arg_index] = "--request";
-        arg_index += 1;
-        argv[arg_index] = request_json;
-        arg_index += 1;
-    }
-    @memcpy(argv[arg_index..], targets);
-
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 1024 * 1024,
-        .expand_arg0 = .expand,
-    });
-    errdefer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .Exited => |code| {
-            if (code == 0 or result.stdout.len > 0) return result.stdout;
-            if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
-            return error.RemoteKillFailed;
-        },
-        else => return error.RemoteKillFailed,
-    }
-}
-
-pub fn runRemoteKillJsonlAndProcess(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    host: []const u8,
-    ssh_options: []const []const u8,
-    targets: []const []const u8,
-    expected_guid: ?[]const u8,
-) !bool {
-    const stdout = try queryRemoteHostKillJsonl(allocator, exe, host, ssh_options, targets);
-    defer allocator.free(stdout);
-    return processKillJsonl(allocator, host, stdout, expected_guid);
-}
-
-pub fn spawnRemoteKillJsonl(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    host: []const u8,
-    ssh_options: []const []const u8,
-    targets: []const []const u8,
-) void {
-    const ssh_options_arg = if (ssh_options.len > 0) shellJoinArgs(allocator, ssh_options) catch return else null;
-    defer if (ssh_options_arg) |value| allocator.free(value);
-    const ssh_option_args: usize = if (ssh_options_arg != null) 2 else 0;
-    const argv = allocator.alloc([]const u8, 2 + ssh_option_args + 1 + 1 + targets.len) catch return;
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = "kill";
-    var arg_index: usize = 2;
-    if (ssh_options_arg) |value| {
-        argv[arg_index] = "--ssh-options";
-        arg_index += 1;
-        argv[arg_index] = value;
-        arg_index += 1;
-    }
-    argv[arg_index] = host;
-    arg_index += 1;
-    argv[arg_index] = "--jsonl";
-    arg_index += 1;
-    @memcpy(argv[arg_index..], targets);
-
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return;
-}
-
-pub fn runLocalKillJsonlAndProcess(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    targets: []const []const u8,
-    expected_guid: ?[]const u8,
-) !bool {
-    const stdout = try queryLocalKillJsonl(allocator, exe, targets);
-    defer allocator.free(stdout);
-    return processKillJsonl(allocator, ".", stdout, expected_guid);
-}
-
-pub fn spawnLocalKillJsonl(allocator: std.mem.Allocator, exe: []const u8, targets: []const []const u8) void {
-    const argv = allocator.alloc([]const u8, 4 + targets.len) catch return;
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = ":internal-session-broker:";
-    argv[2] = "kill";
-    argv[3] = "--jsonl";
-    @memcpy(argv[4..], targets);
-
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return;
-}
-
-fn queryLocalKillJsonl(allocator: std.mem.Allocator, exe: []const u8, targets: []const []const u8) ![]u8 {
-    const argv = try allocator.alloc([]const u8, 4 + targets.len);
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = ":internal-session-broker:";
-    argv[2] = "kill";
-    argv[3] = "--jsonl";
-    @memcpy(argv[4..], targets);
-
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 1024 * 1024,
-    });
-    errdefer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .Exited => |code| {
-            if (code == 0 or result.stdout.len > 0) return result.stdout;
-            if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
-            return error.LocalKillFailed;
-        },
-        else => return error.LocalKillFailed,
-    }
-}
-
-fn processRemoteKillJsonl(allocator: std.mem.Allocator, host: []const u8, stdout: []const u8) !void {
-    _ = try processKillJsonl(allocator, host, stdout, null);
-}
-
-fn processKillJsonlForPendingDrain(
-    allocator: std.mem.Allocator,
-    host: []const u8,
-    stdout: []const u8,
-    pending: *const session_registry.PendingKills,
-    handled: *std.ArrayList([]const u8),
-) !void {
-    var lines = std.mem.splitScalar(u8, stdout, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |object| object,
-            else => continue,
-        };
-        const guid = jsonStringField(object, "guid") orelse continue;
-        const status = jsonStringField(object, "status") orelse continue;
-        const entry = pendingKillEntryForGuid(pending, guid) orelse continue;
-        if (std.mem.eql(u8, status, "killed") or std.mem.eql(u8, status, "missing")) {
-            try handled.append(allocator, entry.guid);
-            if (session_registry.isValidSessionGuid(entry.guid)) {
-                tombstoneLocalRouteForPendingKill(allocator, entry.guid, .{
-                    .ended_at_unix_ms = (try jsonU64Field(object, "ended_at_unix_ms")) orelse pendingKillFallbackEndedAt(entry),
-                    .end_reason = .killed_by_request,
-                }) catch |err| {
-                    client_log.debug("event=pending_kill_tombstone_failed host={s} session={s} error={t}", .{ host, entry.guid, err });
-                };
-            }
-        } else if (std.mem.eql(u8, status, "skipped")) {
-            try handled.append(allocator, entry.guid);
-        } else if (std.mem.eql(u8, status, "failure")) {
-            const reason = jsonStringField(object, "reason") orelse "unknown";
-            client_log.userDiagnosticInfo("pending kill failed for {s}: {s}", .{ guid, reason });
-        }
-    }
-}
-
-fn pendingKillEntryForGuid(pending: *const session_registry.PendingKills, guid: []const u8) ?*const session_registry.PendingKillEntry {
-    for (pending.entries) |*entry| {
-        if (std.mem.eql(u8, entry.type_name, "kill") and std.mem.eql(u8, entry.guid, guid)) return entry;
-    }
-    return null;
-}
-
-fn pendingKillFallbackEndedAt(entry: *const session_registry.PendingKillEntry) u64 {
-    return if (entry.requested_at_unix_ms == 0) nowUnixMs() else entry.requested_at_unix_ms;
-}
-
-fn processKillJsonl(allocator: std.mem.Allocator, host: []const u8, stdout: []const u8, expected_guid: ?[]const u8) !bool {
-    var expected_seen = expected_guid == null;
-    var expected_succeeded = expected_guid == null;
-    var lines = std.mem.splitScalar(u8, stdout, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |object| object,
-            else => continue,
-        };
-        const guid = jsonStringField(object, "guid") orelse continue;
-        const status = jsonStringField(object, "status") orelse continue;
-        const matches_expected = if (expected_guid) |expected| std.mem.eql(u8, expected, guid) else false;
-        if (matches_expected) expected_seen = true;
-        if (std.mem.eql(u8, status, "killed") or std.mem.eql(u8, status, "missing")) {
-            if (matches_expected) expected_succeeded = true;
-            if (session_registry.isValidSessionGuid(guid)) {
-                tombstoneLocalRouteForPendingKill(allocator, guid, .{
-                    .ended_at_unix_ms = (try jsonU64Field(object, "ended_at_unix_ms")) orelse nowUnixMs(),
-                    .end_reason = .killed_by_request,
-                }) catch |err| {
-                    client_log.debug("event=pending_kill_tombstone_failed host={s} session={s} error={t}", .{ host, guid, err });
-                };
-            }
-            try removePendingKillForResult(allocator, guid);
-        } else if (std.mem.eql(u8, status, "skipped")) {
-            if (matches_expected) expected_succeeded = true;
-            try removePendingKillForResult(allocator, guid);
-        } else if (std.mem.eql(u8, status, "failure")) {
-            const reason = jsonStringField(object, "reason") orelse "unknown";
-            client_log.userDiagnosticInfo("pending kill failed for {s}: {s}", .{ guid, reason });
-        }
-    }
-    return expected_seen and expected_succeeded;
-}
-
-fn removePendingKillForResult(allocator: std.mem.Allocator, guid: []const u8) !void {
-    var route = session_registry.readRouteForRef(allocator, guid) catch null;
-    defer if (route) |*value| value.deinit(allocator);
-    const pending_host_guid = if (route) |*value| value.host_guid else return;
-    if (pending_host_guid.len == 0) return;
-    try session_registry.removePendingKill(allocator, pending_host_guid, guid);
-}
-
-const RemoteListStatus = struct {
-    version: []u8,
-    attached_count: ?u32,
-    last_input_at_unix_ms: ?u64,
-};
-
-fn remoteListStatusForGuid(allocator: std.mem.Allocator, stdout: []const u8, guid: []const u8) !?RemoteListStatus {
-    var lines = std.mem.splitScalar(u8, stdout, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |object| object,
-            else => continue,
-        };
-        const row_guid = jsonStringField(object, "guid") orelse continue;
-        if (!std.mem.eql(u8, row_guid, guid)) continue;
-        const version = jsonStringField(object, "version") orelse "";
-        const attached_count = if (try jsonU64Field(object, "attached_count")) |count| blk: {
-            if (count > std.math.maxInt(u32)) break :blk null;
-            break :blk @as(?u32, @intCast(count));
-        } else null;
-        return .{
-            .version = try allocator.dupe(u8, version),
-            .attached_count = attached_count,
-            .last_input_at_unix_ms = try jsonU64Field(object, "last_input_at_unix_ms"),
-        };
-    }
-    return null;
-}
-
-fn remoteTombstoneForGuid(allocator: std.mem.Allocator, stdout: []const u8, guid: []const u8) !?session_registry.TombstoneDetails {
-    var lines = std.mem.splitScalar(u8, stdout, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |object| object,
-            else => continue,
-        };
-        const row_guid = jsonStringField(object, "guid") orelse continue;
-        if (!std.mem.eql(u8, row_guid, guid)) continue;
-        const ended_at_unix_ms = (try jsonU64Field(object, "ended_at_unix_ms")) orelse return null;
-        const end_reason = session_registry.tombstoneEndReasonFromName(jsonStringField(object, "end_reason") orelse "unknown") catch .unknown;
-        return .{
-            .ended_at_unix_ms = ended_at_unix_ms,
-            .end_reason = end_reason,
-            .exit_status = try jsonTombstoneExitStatusField(object, "exit_status"),
-        };
-    }
-    return null;
-}
-
-fn remoteListVersionForGuid(allocator: std.mem.Allocator, stdout: []const u8, guid: []const u8) !?[]u8 {
-    const status = try remoteListStatusForGuid(allocator, stdout, guid);
-    if (status) |value| return value.version;
-    return null;
-}
-
-fn jsonStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .string => |string| string,
-        else => null,
-    };
-}
-
-fn jsonU64Field(object: std.json.ObjectMap, key: []const u8) !?u64 {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .null => null,
-        .integer => |integer| blk: {
-            if (integer < 0) return error.InvalidJson;
-            break :blk @intCast(integer);
-        },
-        else => null,
-    };
-}
-
-fn jsonI32Field(object: std.json.ObjectMap, key: []const u8) !?i32 {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .null => null,
-        .integer => |integer| blk: {
-            if (integer < std.math.minInt(i32) or integer > std.math.maxInt(i32)) return error.InvalidJson;
-            break :blk @as(i32, @intCast(integer));
-        },
-        else => null,
-    };
-}
-
-fn jsonTombstoneExitStatusField(object: std.json.ObjectMap, key: []const u8) !?session_registry.TombstoneExitStatus {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .null => null,
-        .object => |status_object| blk: {
-            const kind_name = jsonStringField(status_object, "kind") orelse return error.InvalidJson;
-            const status = (try jsonI32Field(status_object, "status")) orelse return error.InvalidJson;
-            break :blk .{
-                .kind = try session_registry.tombstoneExitStatusKindFromName(kind_name),
-                .status = status,
-            };
-        },
-        else => null,
-    };
-}
-
-test "remoteListVersionForGuid reads jsonl rows" {
-    const guid = "s-550e8400-e29b-41d4-a716-446655440000";
-    const stdout =
-        \\{"id":"s-550e8400","host":"example.com","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000","attached_count":2,"last_input_at_unix_ms":1234}
-        \\s-550e8400  2         0s ago    example.com                 0.5.0-dev
-        \\
-    ;
-
-    const version = (try remoteListVersionForGuid(std.testing.allocator, stdout, guid)) orelse return error.MissingVersion;
-    defer std.testing.allocator.free(version);
-    try std.testing.expectEqualStrings("0.5.0-dev", version);
-    const status = (try remoteListStatusForGuid(std.testing.allocator, stdout, guid)) orelse return error.MissingStatus;
-    defer std.testing.allocator.free(status.version);
-    try std.testing.expectEqual(@as(?u32, 2), status.attached_count);
-    try std.testing.expectEqual(@as(?u64, 1234), status.last_input_at_unix_ms);
-    try std.testing.expect(try remoteListVersionForGuid(std.testing.allocator, stdout, "s-00000000-0000-4000-8000-000000000000") == null);
-}
-
-test "remoteTombstoneForGuid reads exited jsonl rows" {
-    const guid = "s-550e8400-e29b-41d4-a716-446655440000";
-    const stdout =
-        \\{"id":"s-550e8400","host":"example.com","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000","ended_at_unix_ms":1234,"end_reason":"process_exited","exit_status":{"kind":"exited","status":7}}
-        \\
-    ;
-
-    const tombstone = (try remoteTombstoneForGuid(std.testing.allocator, stdout, guid)) orelse return error.MissingTombstone;
-    try std.testing.expectEqual(@as(u64, 1234), tombstone.ended_at_unix_ms);
-    try std.testing.expectEqual(session_registry.TombstoneEndReason.process_exited, tombstone.end_reason);
-    try std.testing.expectEqual(session_registry.TombstoneExitStatusKind.exited, tombstone.exit_status.?.kind);
-    try std.testing.expectEqual(@as(i32, 7), tombstone.exit_status.?.status);
-    try std.testing.expect(try remoteTombstoneForGuid(std.testing.allocator, stdout, "s-00000000-0000-4000-8000-000000000000") == null);
-}
-
 fn anySessionExistsViaBroker(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8) bool {
     return brokerListMatches(allocator, exe, broker_args, null);
 }
@@ -4745,10 +2367,10 @@ fn parseLocalCommonSessionOption(args: []const []const u8, index: *usize, option
         if (!options.compat_mode) return error.UnsupportedConfigOrEnvOnlyOption;
         index.* += 1;
         if (index.* >= args.len) return error.MissingScrollbackRowCount;
-        options.scrollback_row_count = try parseScrollbackRowCount(args[index.*]);
+        options.scrollback_row_count = try client_config.parseScrollbackRowCount(args[index.*]);
         options.scrollback_row_count_set = true;
-        try options.banner_args.append(arg);
-        try options.banner_args.append(args[index.*]);
+        try options.overlay_args.append(arg);
+        try options.overlay_args.append(args[index.*]);
         index.* += 1;
         return true;
     }
@@ -4756,10 +2378,10 @@ fn parseLocalCommonSessionOption(args: []const []const u8, index: *usize, option
         if (!options.compat_mode) return error.UnsupportedConfigOrEnvOnlyOption;
         index.* += 1;
         if (index.* >= args.len) return error.MissingInitialScrollback;
-        options.initial_scrollback_row_count = try parseInitialScrollbackRowCount(args[index.*]);
+        options.initial_scrollback_row_count = try client_config.parseInitialScrollbackRowCount(args[index.*]);
         options.initial_scrollback_row_count_set = true;
-        try options.banner_args.append(arg);
-        try options.banner_args.append(args[index.*]);
+        try options.overlay_args.append(arg);
+        try options.overlay_args.append(args[index.*]);
         index.* += 1;
         return true;
     }
@@ -4788,8 +2410,8 @@ fn parseLocalLogLevel(args: []const []const u8, index: *usize, options: *LocalOp
     if (index.* >= args.len) return error.MissingClientLogLevel;
     options.client_log_level = try client_log.parseLevel(args[index.*]);
     options.client_log_level_set = true;
-    try options.banner_args.append(arg);
-    try options.banner_args.append(args[index.*]);
+    try options.overlay_args.append(arg);
+    try options.overlay_args.append(args[index.*]);
     index.* += 1;
 }
 
@@ -4838,7 +2460,7 @@ fn setClientTarget(options: *LocalOptions, target: ClientTarget, client_guid: ?[
 }
 
 fn applyFileConfigToLocal(allocator: std.mem.Allocator, options: *LocalOptions) !void {
-    const file_config = try loadFileConfig(allocator);
+    const file_config = try client_config.loadFileConfig(allocator);
     if (!options.scrollback_row_count_set) {
         if (file_config.scrollback_row_count) |count| options.scrollback_row_count = count;
     }
@@ -5438,7 +3060,7 @@ pub fn pollAndForwardReconnectInput(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     session: *RuntimeSession,
-    reconnect_ui: *ReconnectUi,
+    reconnect_ui: *client_ui.ReconnectUi,
     timeout_ms: i32,
 ) !ReconnectInputPumpResult {
     try reconnect_ui.refreshForResize();
@@ -5455,7 +3077,7 @@ pub fn pollAndForwardReconnectInput(
             else => return err,
         };
     }
-    try reconnect_ui.refreshBannerIfDiagnosticsChanged();
+    try reconnect_ui.refreshOverlayIfDiagnosticsChanged();
 
     var pollfds = [_]posix.pollfd{.{
         .fd = 0,
@@ -5510,22 +3132,22 @@ pub fn pollAndForwardReconnectInput(
         .kill_wait => return .kill_wait,
     };
 
-    try reconnect_ui.refreshBannerIfDiagnosticsChanged();
+    try reconnect_ui.refreshOverlayIfDiagnosticsChanged();
     return .wait_elapsed;
 }
 
-pub fn writeDetachBannerForTarget(ssh_options: []const []const u8, target: []const u8, sessh_options: []const []const u8, session_id: []const u8) void {
+pub fn writeDetachOverlayForTarget(ssh_options: []const []const u8, target: []const u8, sessh_options: []const []const u8, session_id: []const u8) void {
     if (c.isatty(1) == 0) return;
     _ = ssh_options;
     _ = target;
     _ = sessh_options;
-    writeDetachBannerForSessionRefInner(session_id) catch {};
+    writeDetachOverlayForSessionRefInner(session_id) catch {};
 }
 
-pub fn writeDetachBannerForSessionRef(sessh_options: []const []const u8, session_ref: []const u8) void {
+pub fn writeDetachOverlayForSessionRef(sessh_options: []const []const u8, session_ref: []const u8) void {
     if (c.isatty(1) == 0) return;
     _ = sessh_options;
-    writeDetachBannerForSessionRefInner(session_ref) catch {};
+    writeDetachOverlayForSessionRefInner(session_ref) catch {};
 }
 
 pub fn writeUnconfirmedKillDetachWarningForSessionRef(session_ref: []const u8) void {
@@ -5533,43 +3155,43 @@ pub fn writeUnconfirmedKillDetachWarningForSessionRef(session_ref: []const u8) v
     writeUnconfirmedKillDetachWarningForSessionRefInner(session_ref) catch {};
 }
 
-fn writeDetachBannerForSessionRefInner(session_ref: []const u8) !void {
+fn writeDetachOverlayForSessionRefInner(session_ref: []const u8) !void {
     var display_ref_storage: [session_registry.session_guid_prefix.len + session_registry.short_guid_hex_len]u8 = undefined;
-    const display_ref = sessionRefForBanner(session_ref, &display_ref_storage);
+    const display_ref = sessionRefForOverlay(session_ref, &display_ref_storage);
     try io_helpers.writeAll(1, "--- sessh: detached. Re-attach: `");
-    try writeShellArg(1, "sesshmux");
+    try shell.writeArg(1, "sesshmux");
     try io_helpers.writeAll(1, " ");
-    try writeShellArg(1, "attach");
+    try shell.writeArg(1, "attach");
     if (display_ref.len > 0) {
         try io_helpers.writeAll(1, " ");
-        try writeShellArg(1, display_ref);
+        try shell.writeArg(1, display_ref);
     }
     try io_helpers.writeAll(1, "` / Kill: `");
-    try writeShellArg(1, "sesshmux");
+    try shell.writeArg(1, "sesshmux");
     try io_helpers.writeAll(1, " ");
-    try writeShellArg(1, "kill");
+    try shell.writeArg(1, "kill");
     if (display_ref.len > 0) {
         try io_helpers.writeAll(1, " ");
-        try writeShellArg(1, display_ref);
+        try shell.writeArg(1, display_ref);
     }
     try io_helpers.writeAll(1, "` ---\r\n");
 }
 
 fn writeUnconfirmedKillDetachWarningForSessionRefInner(session_ref: []const u8) !void {
     var display_ref_storage: [session_registry.session_guid_prefix.len + session_registry.short_guid_hex_len]u8 = undefined;
-    const display_ref = sessionRefForBanner(session_ref, &display_ref_storage);
+    const display_ref = sessionRefForOverlay(session_ref, &display_ref_storage);
     try io_helpers.writeAll(1, "--- sessh: remote session might still be alive. Kill it with `");
-    try writeShellArg(1, "sesshmux");
+    try shell.writeArg(1, "sesshmux");
     try io_helpers.writeAll(1, " ");
-    try writeShellArg(1, "kill");
+    try shell.writeArg(1, "kill");
     if (display_ref.len > 0) {
         try io_helpers.writeAll(1, " ");
-        try writeShellArg(1, display_ref);
+        try shell.writeArg(1, display_ref);
     }
     try io_helpers.writeAll(1, "` ---\r\n");
 }
 
-fn sessionRefForBanner(session_ref: []const u8, storage: *[session_registry.session_guid_prefix.len + session_registry.short_guid_hex_len]u8) []const u8 {
+fn sessionRefForOverlay(session_ref: []const u8, storage: *[session_registry.session_guid_prefix.len + session_registry.short_guid_hex_len]u8) []const u8 {
     if (session_registry.isValidSessionGuid(session_ref)) {
         @memcpy(storage[0..session_registry.session_guid_prefix.len], session_registry.session_guid_prefix);
         var out_index: usize = session_registry.session_guid_prefix.len;
@@ -5589,68 +3211,6 @@ fn sessionRefForBanner(session_ref: []const u8, storage: *[session_registry.sess
         return storage[0..];
     }
     return session_ref;
-}
-
-fn shellJoinArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    for (args, 0..) |arg, i| {
-        if (i > 0) try out.append(allocator, ' ');
-        try appendShellQuotedArg(allocator, &out, arg);
-    }
-
-    return out.toOwnedSlice(allocator);
-}
-
-fn appendShellQuotedArg(allocator: std.mem.Allocator, out: *std.ArrayList(u8), arg: []const u8) !void {
-    try out.append(allocator, '\'');
-    for (arg) |byte| {
-        if (byte == '\'') {
-            try out.appendSlice(allocator, "'\\''");
-        } else {
-            try out.append(allocator, byte);
-        }
-    }
-    try out.append(allocator, '\'');
-}
-
-fn writeShellArg(fd: c.fd_t, arg: []const u8) !void {
-    if (arg.len == 0) {
-        try io_helpers.writeAll(fd, "''");
-        return;
-    }
-    if (isPlainShellArg(arg)) {
-        try io_helpers.writeAll(fd, arg);
-        return;
-    }
-    try io_helpers.writeAll(fd, "'");
-    for (arg) |byte| {
-        if (byte == '\'') {
-            try io_helpers.writeAll(fd, "'\\''");
-        } else {
-            var one = [_]u8{byte};
-            try io_helpers.writeAll(fd, &one);
-        }
-    }
-    try io_helpers.writeAll(fd, "'");
-}
-
-fn isPlainShellArg(arg: []const u8) bool {
-    for (arg) |byte| {
-        switch (byte) {
-            'A'...'Z', 'a'...'z', '0'...'9', '_', '-', '.', '/', ':', '@', '%', '+', '=' => {},
-            else => return false,
-        }
-    }
-    return true;
-}
-
-test "shellJoinArgs produces shell-split ssh options" {
-    const joined = try shellJoinArgs(std.testing.allocator, &.{ "-F", "ssh config", "alpha ' beta", "" });
-    defer std.testing.allocator.free(joined);
-
-    try std.testing.expectEqualStrings("'-F' 'ssh config' 'alpha '\\'' beta' ''", joined);
 }
 
 fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
@@ -6178,6 +3738,14 @@ fn listContainsSession(stdout: []const u8, session_id: []const u8) bool {
     return false;
 }
 
+fn jsonStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .string => |string| string,
+        else => null,
+    };
+}
+
 fn listHasAnySession(stdout: []const u8) bool {
     var lines = std.mem.splitScalar(u8, stdout, '\n');
     while (lines.next()) |line| {
@@ -6201,7 +3769,7 @@ fn relayInteractive(
     app_title_present: *?bool,
     options: RelayOptions,
 ) !RelayEnd {
-    const initial_kitty_keyboard_flags = queryInitialKittyKeyboardFlags();
+    const initial_kitty_keyboard_flags = client_ui.queryInitialKittyKeyboardFlags();
     var mode_guard = try terminal.TerminalModeGuard.enable(0);
     defer mode_guard.restore();
     const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
@@ -6235,19 +3803,6 @@ fn relayInteractive(
     );
     if (end == .detach) writeDetachBoundary();
     return end;
-}
-
-var cached_initial_kitty_keyboard_flags: ?u5 = null;
-
-fn queryInitialKittyKeyboardFlags() u5 {
-    if (cached_initial_kitty_keyboard_flags) |flags| return flags;
-
-    // Reconnects keep using the same outer terminal. Querying it again after
-    // the reconnect banner clears can race with typed-ahead input and consume
-    // those bytes as probe responses.
-    const flags = (terminal.queryKittyKeyboardFlags(0, 1) catch null) orelse 0;
-    cached_initial_kitty_keyboard_flags = flags;
-    return flags;
 }
 
 fn relayTerminal(
@@ -6386,14 +3941,14 @@ fn showEscapeHelpModal(
     input_ack_tracker: *InputAckTracker,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
 ) !?RelayEnd {
-    // The help banner is local UI, not part of the remote terminal model. While
+    // The help overlay is local UI, not part of the remote terminal model. While
     // it is visible, remote draw frames are discarded and a repaint is requested
     // after dismissal so the client resumes from the session agent's latest
     // screen state.
     const renderer = client_renderer.Renderer.init(1);
-    var banner_state: ?BannerDrawState = null;
+    var overlay_state: ?client_ui.OverlayDrawState = null;
     var last_size = terminal.currentWindowSize();
-    try drawEscapeHelpBanner(renderer, last_size, viewport_offset, &banner_state);
+    try drawEscapeHelpOverlay(renderer, last_size, viewport_offset, &overlay_state);
 
     while (true) {
         var pollfds = [_]posix.pollfd{
@@ -6409,7 +3964,7 @@ fn showEscapeHelpModal(
                 input_ack_tracker,
                 ended_tombstone_details,
             )) |end| {
-                try clearEscapeHelpBanner(renderer, viewport_offset, &banner_state);
+                try clearEscapeHelpOverlay(renderer, viewport_offset, &overlay_state);
                 return end;
             }
         }
@@ -6418,7 +3973,7 @@ fn showEscapeHelpModal(
             var input: [256]u8 = undefined;
             const n = c.read(input_fd, &input, input.len);
             if (n <= 0) {
-                try clearEscapeHelpBanner(renderer, viewport_offset, &banner_state);
+                try clearEscapeHelpOverlay(renderer, viewport_offset, &overlay_state);
                 return requestSessionDetach(read_fd, write_fd);
             }
             const bytes = input[0..@intCast(n)];
@@ -6431,11 +3986,11 @@ fn showEscapeHelpModal(
         const size = terminal.currentWindowSize();
         if (size.rows != last_size.rows or size.cols != last_size.cols) {
             last_size = size;
-            try drawEscapeHelpBanner(renderer, size, viewport_offset, &banner_state);
+            try drawEscapeHelpOverlay(renderer, size, viewport_offset, &overlay_state);
         }
     }
 
-    try clearEscapeHelpBanner(renderer, viewport_offset, &banner_state);
+    try clearEscapeHelpOverlay(renderer, viewport_offset, &overlay_state);
     sendScreenRepaint(write_fd, pending_repaint) catch |err| switch (err) {
         error.WriteFailed => return .transport_closed,
         else => return err,
@@ -6443,14 +3998,14 @@ fn showEscapeHelpModal(
     return null;
 }
 
-fn drawEscapeHelpBanner(
+fn drawEscapeHelpOverlay(
     renderer: client_renderer.Renderer,
     size: WindowSize,
     viewport_offset: *i32,
-    banner_state: *?BannerDrawState,
+    overlay_state: *?client_ui.OverlayDrawState,
 ) !void {
-    var lines: [terminal.escape_help_banner_lines.len]BannerLine = undefined;
-    inline for (terminal.escape_help_banner_lines, 0..) |line, index| {
+    var lines: [terminal.escape_help_overlay_lines.len]client_ui.OverlayLine = undefined;
+    inline for (terminal.escape_help_overlay_lines, 0..) |line, index| {
         lines[index] = .{
             .text = line,
             .alignment = if (index == 0) .center else .left,
@@ -6460,23 +4015,23 @@ fn drawEscapeHelpBanner(
         @intCast(@min(@as(usize, @intCast(viewport_offset.*)), @as(usize, std.math.maxInt(u16))))
     else
         0;
-    const next = try drawBannerLines(renderer, size, top, banner_state.*, &lines);
+    const next = try client_ui.drawOverlayLines(renderer, size, top, overlay_state.*, &lines);
     viewport_offset.* = @intCast(next.viewport_offset);
-    banner_state.* = next;
+    overlay_state.* = next;
 }
 
-fn clearEscapeHelpBanner(
+fn clearEscapeHelpOverlay(
     renderer: client_renderer.Renderer,
     viewport_offset: *i32,
-    banner_state: *?BannerDrawState,
+    overlay_state: *?client_ui.OverlayDrawState,
 ) !void {
-    const state = banner_state.* orelse return;
+    const state = overlay_state.* orelse return;
     const size = terminal.currentWindowSize();
-    try eraseBannerRows(renderer, state, size.rows, size.cols);
-    try restoreBannerExpansion(renderer, state, size.rows);
-    const cleared = clearedViewportOffset(state);
+    try client_ui.eraseOverlayRows(renderer, state, size.rows, size.cols);
+    try client_ui.restoreOverlayExpansion(renderer, state, size.rows);
+    const cleared = client_ui.clearedOverlayViewportOffset(state);
     viewport_offset.* = @intCast(cleared);
-    banner_state.* = null;
+    overlay_state.* = null;
     try renderer.moveCursor(cleared, 0);
 }
 
@@ -6514,7 +4069,7 @@ fn handleEscapeHelpRuntimeFrame(
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        // The banner sits on top of the last rendered screen. Applying remote
+        // The overlay sits on top of the last rendered screen. Applying remote
         // draws here would interleave two renderers; repaint-after-dismiss is
         // the boundary that gets us back to a single source of screen truth.
         .te_draw, .te_repaint_response, .te_client_repaint_request => return null,
@@ -6721,7 +4276,7 @@ fn restoreRelayEndPresentationBytesToFd(fd: c.fd_t, relay_end_restore: ?*std.Arr
 
 fn restoreLocalTerminalPresentation() void {
     const renderer = client_renderer.Renderer.init(1);
-    renderer.restorePresentation(queryInitialKittyKeyboardFlags()) catch {};
+    renderer.restorePresentation(client_ui.queryInitialKittyKeyboardFlags()) catch {};
     const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
     if (cleanup_title) |title| {
         defer app_allocator.allocator().free(title);
@@ -6733,7 +4288,7 @@ fn clearVisibleAfterResizeTimeout(viewport_offset: *i32) void {
     viewport_offset.* = 0;
     if (c.isatty(1) == 0) return;
     const renderer = client_renderer.Renderer.init(1);
-    renderer.restorePresentation(queryInitialKittyKeyboardFlags()) catch {};
+    renderer.restorePresentation(client_ui.queryInitialKittyKeyboardFlags()) catch {};
     renderer.clearVisible() catch {};
 }
 

@@ -1,7 +1,8 @@
 const std = @import("std");
 
-const client = @import("../session/client.zig");
+const client_config = @import("../session/client_config.zig");
 const client_log = @import("../core/client_log.zig");
+const client_ui = @import("../session/client_ui.zig");
 const config = @import("../core/config.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 
@@ -132,7 +133,7 @@ pub const DebugAction = enum {
 };
 
 pub const CommonSessionOptions = struct {
-    banner_args: client.DetachBannerArgs = .{},
+    overlay_args: client_ui.DetachOverlayArgs = .{},
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     scrollback_row_count_set: bool = false,
     initial_scrollback_row_count: ?u32 = null,
@@ -303,8 +304,8 @@ pub fn parseCommonOption(args: []const []const u8, index: *usize, common: *Commo
         if (index.* >= args.len) return error.MissingClientLogLevel;
         common.client_log_level = try client_log.parseLevel(args[index.*]);
         common.client_log_level_set = true;
-        try common.banner_args.append(arg);
-        try common.banner_args.append(args[index.*]);
+        try common.overlay_args.append(arg);
+        try common.overlay_args.append(args[index.*]);
         index.* += 1;
         return true;
     }
@@ -331,34 +332,34 @@ pub fn parseCommonOption(args: []const []const u8, index: *usize, common: *Commo
     if (std.mem.eql(u8, arg, "--scrollback-limit")) {
         index.* += 1;
         if (index.* >= args.len) return error.MissingScrollbackRowCount;
-        common.scrollback_row_count = try client.parseScrollbackRowCount(args[index.*]);
+        common.scrollback_row_count = try client_config.parseScrollbackRowCount(args[index.*]);
         common.scrollback_row_count_set = true;
-        try common.banner_args.append(arg);
-        try common.banner_args.append(args[index.*]);
+        try common.overlay_args.append(arg);
+        try common.overlay_args.append(args[index.*]);
         index.* += 1;
         return true;
     }
     if (std.mem.eql(u8, arg, "--initial-scrollback")) {
         index.* += 1;
         if (index.* >= args.len) return error.MissingInitialScrollback;
-        common.initial_scrollback_row_count = try client.parseInitialScrollbackRowCount(args[index.*]);
+        common.initial_scrollback_row_count = try client_config.parseInitialScrollbackRowCount(args[index.*]);
         common.initial_scrollback_row_count_set = true;
-        try common.banner_args.append(arg);
-        try common.banner_args.append(args[index.*]);
+        try common.overlay_args.append(arg);
+        try common.overlay_args.append(args[index.*]);
         index.* += 1;
         return true;
     }
     if (std.mem.eql(u8, arg, "--bootstrap")) {
         common.bootstrap = true;
         common.bootstrap_set = true;
-        try common.banner_args.append(arg);
+        try common.overlay_args.append(arg);
         index.* += 1;
         return true;
     }
     if (std.mem.eql(u8, arg, "--no-bootstrap")) {
         common.bootstrap = false;
         common.bootstrap_set = true;
-        try common.banner_args.append(arg);
+        try common.overlay_args.append(arg);
         index.* += 1;
         return true;
     }

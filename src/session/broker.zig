@@ -5,7 +5,7 @@ const posix = std.posix;
 
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
-const list_format = @import("list_format.zig");
+const list_format = @import("../runtime/list_format.zig");
 const process_exit = @import("../core/process_exit.zig");
 const protocol = @import("../protocol/mod.zig");
 const relay = @import("../transport/relay.zig");

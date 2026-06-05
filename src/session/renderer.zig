@@ -165,7 +165,7 @@ pub const Renderer = struct {
 
     pub fn restorePresentation(self: Renderer, kitty_keyboard_flags: u5) !void {
         if (!self.caps.supportsRendering()) return;
-        try self.restoreBannerPresentation();
+        try self.restoreOverlayPresentation();
         try self.disableMouseTracking();
         try self.setPrivateMode(1, false);
         try self.write("\x1b[?1004l");
@@ -175,7 +175,7 @@ pub const Renderer = struct {
         try self.setCursorStyle(.default);
     }
 
-    pub fn restoreBannerPresentation(self: Renderer) !void {
+    pub fn restoreOverlayPresentation(self: Renderer) !void {
         if (!self.caps.supportsRendering()) return;
         try self.setHyperlink(null);
         try self.write("\x1b[0m");
@@ -815,13 +815,13 @@ test "restore presentation restores initial kitty keyboard flags" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[=0u") == null);
 }
 
-test "restore banner presentation preserves input and event modes" {
+test "restore state presentation preserves input and event modes" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
     const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
-    try renderer.restoreBannerPresentation();
+    try renderer.restoreOverlayPresentation();
 
     var buf: [512]u8 = undefined;
     const len = try posix.read(fds[0], &buf);

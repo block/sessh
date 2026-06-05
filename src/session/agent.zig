@@ -184,7 +184,7 @@ const PresentationState = struct {
 
     // Keep scrollback, but redraw the visible screen from scratch.
     //
-    // The client may have shown a reconnect banner or skipped stale draws, so
+    // The client may have shown a reconnect overlay or skipped stale draws, so
     // cached cursor, mode, and color state is no longer trustworthy. The old
     // height is kept only so the next draw can clear stale rows.
     fn resetForScreenRepaint(self: *PresentationState) void {
@@ -2309,7 +2309,7 @@ fn queueDrawFrame(
 
 fn appendDrawCleanup(draw_bytes: *std.ArrayList(u8)) !void {
     const renderer = client_renderer.Renderer.buffered(draw_bytes, .{ .kind = .xterm_compatible });
-    try renderer.restoreBannerPresentation();
+    try renderer.restoreOverlayPresentation();
 }
 
 fn wrapDrawInSynchronizedUpdate(draw_bytes: *std.ArrayList(u8)) !void {

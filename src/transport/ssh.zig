@@ -4,7 +4,9 @@ const c = std.c;
 const posix = std.posix;
 
 const client = @import("../session/client.zig");
+const client_config = @import("../session/client_config.zig");
 const client_log = @import("../core/client_log.zig");
+const client_ui = @import("../session/client_ui.zig");
 const proxy_control = @import("../stream/proxy_control.zig");
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
@@ -14,6 +16,7 @@ const pty_process = @import("../tty/pty_process.zig");
 const reconnect = @import("../reconnect/mod.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect_title = @import("../reconnect/title.zig");
+const route_commands = @import("../runtime/route_commands.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 const socket_transport = @import("socket.zig");
 const stream_agent = @import("../stream/agent.zig");
@@ -68,7 +71,7 @@ const ArtifactSet = struct {
         fd: c.fd_t,
         entrypoint: BootstrapEntrypoint,
         broker_args: []const []const u8,
-        reconnect_ui: ?*client.ReconnectUi,
+        reconnect_ui: ?*client_ui.ReconnectUi,
         poll_reconnect_input: bool,
     ) !void {
         try writeAllMaybeCancellable(fd, "EXEC ", reconnect_ui, poll_reconnect_input);
@@ -91,7 +94,7 @@ const ArtifactSet = struct {
         self: *const ArtifactSet,
         fd: c.fd_t,
         arg: []const u8,
-        reconnect_ui: ?*client.ReconnectUi,
+        reconnect_ui: ?*client_ui.ReconnectUi,
         poll_reconnect_input: bool,
     ) !void {
         if (!needsEncodedExecArg(arg)) {
@@ -197,7 +200,7 @@ pub const SessionInvocation = struct {
     command_argv: []const []const u8 = &.{},
     shell_command_args: []const []const u8 = &.{},
     tty_request: SshTtyRequest = .none,
-    banner_args: client.DetachBannerArgs = .{},
+    overlay_args: client_ui.DetachOverlayArgs = .{},
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     scrollback_row_count_set: bool = false,
     initial_scrollback_row_count: ?u32 = null,
@@ -313,7 +316,7 @@ const RemoteControlRunner = struct {
     };
 
     fn init(allocator: std.mem.Allocator) !RemoteControlRunner {
-        const file_config = try client.loadFileConfig(allocator);
+        const file_config = try client_config.loadFileConfig(allocator);
         const bootstrap = file_config.bootstrap orelse true;
         return initWithBootstrap(allocator, bootstrap);
     }
@@ -333,7 +336,7 @@ const RemoteControlRunner = struct {
         self.* = undefined;
     }
 
-    fn interface(self: *RemoteControlRunner) client.RemoteCommandRunner {
+    fn interface(self: *RemoteControlRunner) route_commands.RemoteCommandRunner {
         return .{
             .context = self,
             .runFn = runOpaque,
@@ -346,7 +349,7 @@ const RemoteControlRunner = struct {
         host: []const u8,
         ssh_options: []const []const u8,
         argv: []const []const u8,
-    ) anyerror!client.RemoteCommandResult {
+    ) anyerror!route_commands.RemoteCommandResult {
         const self: *RemoteControlRunner = @ptrCast(@alignCast(context));
         return self.run(allocator, host, ssh_options, argv);
     }
@@ -357,7 +360,7 @@ const RemoteControlRunner = struct {
         host: []const u8,
         ssh_options: []const []const u8,
         argv: []const []const u8,
-    ) !client.RemoteCommandResult {
+    ) !route_commands.RemoteCommandResult {
         const active = try self.activeFor(host, ssh_options);
         const request_id = self.next_request_id;
         self.next_request_id +%= 1;
@@ -452,7 +455,7 @@ fn readRunResponse(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     request_id: u64,
-) !client.RemoteCommandResult {
+) !route_commands.RemoteCommandResult {
     while (true) {
         var frame = try protocol.readFrameAlloc(allocator, read_fd);
         defer frame.deinit(allocator);
@@ -494,7 +497,7 @@ const ParallelReconnectState = struct {
     remote_command: []const u8,
     bootstrap_entrypoint: BootstrapEntrypoint,
     broker_args: []const []const u8,
-    reconnect_ui: *client.ReconnectUi,
+    reconnect_ui: *client_ui.ReconnectUi,
     session: client.RuntimeSession,
 
     fn store(self: *ParallelReconnectState, result: ParallelReconnectResult) void {
@@ -656,7 +659,7 @@ pub fn runInvocation(
             .exe = args[0],
             .new_detached = parsed_ssh_args.new_detached,
             .scrollback_row_count = parsed_ssh_args.scrollback_row_count,
-            .banner_args = parsed_ssh_args.banner_args.slice(),
+            .overlay_args = parsed_ssh_args.overlay_args.slice(),
             .capture_tty_transcript = parsed_ssh_args.capture_tty_transcript,
             .command_argv = parsed_ssh_args.command_argv,
             .shell_command = shell_command,
@@ -676,11 +679,11 @@ pub fn runInvocation(
             else
                 null;
             defer if (remote_control_runner) |*runner| runner.deinit();
-            var remote_runner_interface: ?client.RemoteCommandRunner = if (remote_control_runner) |*runner|
+            var remote_runner_interface: ?route_commands.RemoteCommandRunner = if (remote_control_runner) |*runner|
                 runner.interface()
             else
                 null;
-            const exit_status = try client.runLocalListCommand(
+            const exit_status = try route_commands.runLocalListCommand(
                 allocator,
                 args[0],
                 &.{},
@@ -955,7 +958,7 @@ pub fn runInvocation(
             .kill_detach => {
                 client_log.debug("event=kill_detach host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
-                client.spawnRemoteKillJsonl(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()});
+                route_commands.spawnRemoteKillJsonl(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()});
                 child.terminate();
                 try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
                 return;
@@ -963,7 +966,7 @@ pub fn runInvocation(
             .kill_wait => {
                 client_log.debug("event=kill_wait host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
                 client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
-                const killed = try client.runRemoteKillJsonlAndProcess(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()}, session.guidSlice());
+                const killed = try route_commands.runRemoteKillJsonlAndProcess(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()}, session.guidSlice());
                 child.terminate();
                 if (!killed) return process_exit.request(1);
                 session.ended_tombstone_details = .{
@@ -996,7 +999,7 @@ pub fn runInvocation(
 
         const pending_input_at_disconnect = session.hasPendingInputAck();
         const pending_paste_like_input_at_disconnect = session.hasPendingPasteLikeInputAck();
-        var reconnect_ui = try client.ReconnectUi.beginWithPresentation(
+        var reconnect_ui = try client_ui.ReconnectUi.beginWithPresentation(
             session.viewport_offset,
             reconnectPresentationForFilterLevel(parsed_ssh_args.filter_level),
         );
@@ -1020,7 +1023,7 @@ pub fn runInvocation(
                 .recovered => {
                     session.noteUnresponsiveRecovery();
                     session.discardPendingInputAcks();
-                    session.viewport_offset = try reconnect_ui.clearBanner();
+                    session.viewport_offset = try reconnect_ui.clearOverlay();
                     client.repaintRuntimeSession(
                         child.child.stdout.?.handle,
                         child.child.stdin.?.handle,
@@ -1032,7 +1035,7 @@ pub fn runInvocation(
                         },
                         else => return err,
                     };
-                    reconnect_ui.restoreTitleAfterReconnect(&session);
+                    reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
                     reconnect_ui.deinit();
                     reconnect_ui_active = false;
                     continue;
@@ -1041,7 +1044,7 @@ pub fn runInvocation(
                     child.terminate();
                     child = new_child;
                     session.discardPendingInputAcks();
-                    session.viewport_offset = try reconnect_ui.clearBanner();
+                    session.viewport_offset = try reconnect_ui.clearOverlay();
                     client.finishReconnectRepaint(child.child.stdout.?.handle, child.child.stdin.?.handle, &session) catch |err| switch (err) {
                         error.SessionEnded => {
                             const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
@@ -1049,7 +1052,7 @@ pub fn runInvocation(
                         },
                         else => return err,
                     };
-                    reconnect_ui.restoreTitleAfterReconnect(&session);
+                    reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
                     client_log.debug("event=reconnect_success host={s} session={s} attempt=0", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
@@ -1149,7 +1152,7 @@ pub fn runInvocation(
             }
 
             if (session.kill_requested) {
-                const killed = client.runRemoteKillJsonlAndProcess(
+                const killed = route_commands.runRemoteKillJsonlAndProcess(
                     allocator,
                     args[0],
                     parsed_ssh_args.host,
@@ -1168,7 +1171,7 @@ pub fn runInvocation(
                     continue;
                 };
                 if (killed) {
-                    reconnect_ui.restoreTitleAfterReconnect(&session);
+                    reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
                     reconnect_ui.deinit();
                     reconnect_ui_active = false;
                     return process_exit.request(0);
@@ -1254,7 +1257,7 @@ pub fn runInvocation(
                 },
                 .kill_detach => {
                     client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
-                    client.spawnRemoteKillJsonl(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()});
+                    route_commands.spawnRemoteKillJsonl(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()});
                     child.terminate();
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
                     try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
@@ -1262,10 +1265,10 @@ pub fn runInvocation(
                 },
                 .kill_wait => {
                     client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
-                    const killed = try client.runRemoteKillJsonlAndProcess(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()}, session.guidSlice());
+                    const killed = try route_commands.runRemoteKillJsonlAndProcess(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()}, session.guidSlice());
                     child.terminate();
                     if (!killed) return process_exit.request(1);
-                    reconnect_ui.restoreTitleAfterReconnect(&session);
+                    reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
                     reconnect_ui.deinit();
                     reconnect_ui_active = false;
                     return process_exit.request(0);
@@ -1274,7 +1277,7 @@ pub fn runInvocation(
             }
 
             session.discardPendingInputAcks();
-            session.viewport_offset = try reconnect_ui.clearBanner();
+            session.viewport_offset = try reconnect_ui.clearOverlay();
             client.finishReconnectRepaint(
                 child.child.stdout.?.handle,
                 child.child.stdin.?.handle,
@@ -1303,7 +1306,7 @@ pub fn runInvocation(
                 session.idSlice(),
                 reconnect_attempt,
             });
-            reconnect_ui.restoreTitleAfterReconnect(&session);
+            reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
             reconnect_ui.deinit();
             reconnect_ui_active = false;
             break;
@@ -1328,7 +1331,7 @@ fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: Sessi
     client.removeClientRouteHintForRemoteSession(allocator, session);
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
-    client.writeDetachBannerForSessionRef(parsed_ssh_args.banner_args.slice(), session.idSlice());
+    client.writeDetachOverlayForSessionRef(parsed_ssh_args.overlay_args.slice(), session.idSlice());
     if (session.kill_requested) client.writeUnconfirmedKillDetachWarningForSessionRef(session.guidSlice());
 }
 
@@ -1350,15 +1353,15 @@ fn finishEndedRemoteSession(
     return exit_status;
 }
 
-fn finishReconnectUiForDetach(reconnect_ui: *client.ReconnectUi, active: *bool) void {
+fn finishReconnectUiForDetach(reconnect_ui: *client_ui.ReconnectUi, active: *bool) void {
     if (!active.*) return;
-    _ = reconnect_ui.clearBanner() catch {};
+    _ = reconnect_ui.clearOverlay() catch {};
     reconnect_ui.restoreTitleForDetach();
     reconnect_ui.deinit();
     active.* = false;
 }
 
-fn reconnectPresentationForFilterLevel(level: config.FilterLevel) client.ReconnectPresentation {
+fn reconnectPresentationForFilterLevel(level: config.FilterLevel) client_ui.ReconnectPresentation {
     return switch (level) {
         .raw => .none,
         .unhygienic => .stderr_plain,
@@ -1564,7 +1567,7 @@ fn runRemoteBrokerCommandAndForward(connection: *RuntimeConnection) !u8 {
     };
 }
 
-fn showClientBootstrapStatus(visible: *bool, reconnect_ui: ?*client.ReconnectUi) !void {
+fn showClientBootstrapStatus(visible: *bool, reconnect_ui: ?*client_ui.ReconnectUi) !void {
     if (reconnect_ui != null or visible.*) return;
     try io.writeAll(2, "\rsessh: bootstrapping...");
     visible.* = true;
@@ -1877,7 +1880,7 @@ fn appendCompatArg(allocator: std.mem.Allocator, out: *std.ArrayList(u8), arg: [
 }
 
 fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *SessionInvocation) !void {
-    const file_config = try client.loadFileConfig(allocator);
+    const file_config = try client_config.loadFileConfig(allocator);
     if (!parsed.scrollback_row_count_set) {
         if (file_config.scrollback_row_count) |count| parsed.scrollback_row_count = count;
     }
@@ -1908,7 +1911,7 @@ fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *SessionInvocation
 // `terminal-emulator` and `filter-level` must not change its execution
 // path. Apply only the fields that already make sense for local mux sessions.
 fn applyFileConfigToLocalNew(allocator: std.mem.Allocator, parsed: *SessionInvocation) !void {
-    const file_config = try client.loadFileConfig(allocator);
+    const file_config = try client_config.loadFileConfig(allocator);
     if (!parsed.scrollback_row_count_set) {
         if (file_config.scrollback_row_count) |count| parsed.scrollback_row_count = count;
     }
@@ -2128,7 +2131,7 @@ fn raceExistingConnectionWithReconnect(
     broker_args: []const []const u8,
     old_child: *RuntimeConnection,
     session: *client.RuntimeSession,
-    reconnect_ui: *client.ReconnectUi,
+    reconnect_ui: *client_ui.ReconnectUi,
     pending_input_at_disconnect: bool,
     pending_paste_like_input_at_disconnect: bool,
 ) !ReconnectRaceOutcome {
@@ -2179,7 +2182,7 @@ fn raceExistingConnectionWithReconnect(
 fn waitForUnresponsiveReconnectRetry(
     old_child: *RuntimeConnection,
     session: *client.RuntimeSession,
-    reconnect_ui: *client.ReconnectUi,
+    reconnect_ui: *client_ui.ReconnectUi,
     delay_ms: u64,
 ) !?ReconnectRaceOutcome {
     var timer = try std.time.Timer.start();
@@ -2230,7 +2233,7 @@ fn raceExistingConnectionWithReconnectAttempt(
     broker_args: []const []const u8,
     old_child: *RuntimeConnection,
     session: *client.RuntimeSession,
-    reconnect_ui: *client.ReconnectUi,
+    reconnect_ui: *client_ui.ReconnectUi,
     pending_input_at_disconnect: bool,
     pending_paste_like_input_at_disconnect: bool,
 ) !ReconnectRaceOutcome {
@@ -2460,7 +2463,7 @@ fn attachReadyReconnectConnectionAfterTransportClosed(
     ready_connection: *?RuntimeConnection,
     ready_session: *client.RuntimeSession,
     session: *client.RuntimeSession,
-    reconnect_ui: *client.ReconnectUi,
+    reconnect_ui: *client_ui.ReconnectUi,
     pending_input_at_disconnect: bool,
     pending_paste_like_input_at_disconnect: bool,
     host: []const u8,
@@ -2486,7 +2489,7 @@ fn attachReadyReconnectConnection(
     ready_connection: *?RuntimeConnection,
     ready_session: *client.RuntimeSession,
     session: *client.RuntimeSession,
-    reconnect_ui: *client.ReconnectUi,
+    reconnect_ui: *client_ui.ReconnectUi,
 ) !ReconnectRaceOutcome {
     var connection = ready_connection.* orelse return .{ .failed = error.ReconnectNotReady };
     ready_connection.* = null;
@@ -2552,11 +2555,11 @@ fn cleanupParallelReconnectResult(state: *ParallelReconnectState) void {
 }
 
 fn waitForReconnectSwitchIfNeeded(
-    reconnect_ui: *client.ReconnectUi,
+    reconnect_ui: *client_ui.ReconnectUi,
     pending_input_at_disconnect: bool,
     pending_paste_like_input_at_disconnect: bool,
     unresponsive: bool,
-) !client.ReconnectDecision {
+) !client_ui.ReconnectDecision {
     if (reconnect_ui.hasReconnectAcknowledgement()) return .reconnect_now;
     const disposition = reconnect_ui.reconnectSwitchDisposition(
         pending_input_at_disconnect,
@@ -2570,7 +2573,7 @@ fn waitForReconnectSwitchIfNeeded(
     };
 }
 
-fn nextReconnectAttemptAfterFailure(attempt: usize, reconnect_ui: *client.ReconnectUi) usize {
+fn nextReconnectAttemptAfterFailure(attempt: usize, reconnect_ui: *client_ui.ReconnectUi) usize {
     return reconnect.nextAttempt(attempt, reconnect_ui.consumeReconnectAcknowledgement());
 }
 
@@ -2638,7 +2641,7 @@ fn startRuntimeConnection(
     bootstrap_entrypoint: BootstrapEntrypoint,
     broker_args: []const []const u8,
     batch_mode: bool,
-    reconnect_ui: ?*client.ReconnectUi,
+    reconnect_ui: ?*client_ui.ReconnectUi,
     poll_reconnect_input: bool,
     stderr_mode_override: ?SshStderrMode,
     bootstrap_failure_term: ?*?std.process.Child.Term,
@@ -2791,7 +2794,7 @@ fn isUnsupportedPlatformBootstrapError(line: []const u8) bool {
 fn canUsePlainSshFallback(
     parsed_ssh_args: SessionInvocation,
     batch_mode: bool,
-    reconnect_ui: ?*client.ReconnectUi,
+    reconnect_ui: ?*client_ui.ReconnectUi,
 ) bool {
     return parsed_ssh_args.action == .new and
         parsed_ssh_args.command_argv.len == 0 and
@@ -4221,8 +4224,8 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
             if (index.* >= args.len) return error.MissingClientLogLevel;
             parsed.client_log_level = try client_log.parseLevel(args[index.*]);
             parsed.client_log_level_set = true;
-            try parsed.banner_args.append(arg);
-            try parsed.banner_args.append(args[index.*]);
+            try parsed.overlay_args.append(arg);
+            try parsed.overlay_args.append(args[index.*]);
             index.* += 1;
         } else if (std.mem.eql(u8, arg, "--terminal-emulator")) {
             parsed.terminal_emulator = true;
@@ -4771,7 +4774,7 @@ fn sendUpload(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     artifact: *const ArtifactEntry,
-    reconnect_ui: ?*client.ReconnectUi,
+    reconnect_ui: ?*client_ui.ReconnectUi,
     poll_reconnect_input: bool,
 ) !void {
     const file = try std.fs.openFileAbsolute(artifact.path, .{});
@@ -4872,7 +4875,7 @@ fn terminateChild(child: *std.process.Child) void {
 fn writeAllMaybeCancellable(
     fd: c.fd_t,
     bytes: []const u8,
-    reconnect_ui: ?*client.ReconnectUi,
+    reconnect_ui: ?*client_ui.ReconnectUi,
     poll_reconnect_input: bool,
 ) !void {
     if (reconnect_ui == null) {
@@ -4903,7 +4906,7 @@ fn writeAllMaybeCancellable(
 fn readBootstrapLine(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    reconnect_ui: ?*client.ReconnectUi,
+    reconnect_ui: ?*client_ui.ReconnectUi,
     poll_reconnect_input: bool,
 ) ![]u8 {
     var line: std.ArrayList(u8) = .empty;
@@ -4941,7 +4944,7 @@ fn readBootstrapLine(
     return error.BootstrapLineTooLong;
 }
 
-fn reconnectShouldDetach(reconnect_ui: *client.ReconnectUi, poll_reconnect_input: bool) !bool {
+fn reconnectShouldDetach(reconnect_ui: *client_ui.ReconnectUi, poll_reconnect_input: bool) !bool {
     if (!poll_reconnect_input) return reconnect_ui.isCancelled();
     return reconnect_ui.pollDetach(0);
 }
@@ -5671,10 +5674,10 @@ test "proxy stream reconnect status follows filter level" {
 }
 
 test "terminal reconnect presentation follows filter level" {
-    try std.testing.expectEqual(client.ReconnectPresentation.none, reconnectPresentationForFilterLevel(.raw));
-    try std.testing.expectEqual(client.ReconnectPresentation.stderr_plain, reconnectPresentationForFilterLevel(.unhygienic));
-    try std.testing.expectEqual(client.ReconnectPresentation.title, reconnectPresentationForFilterLevel(.hygienic));
-    try std.testing.expectEqual(client.ReconnectPresentation.overlay, reconnectPresentationForFilterLevel(.emulated));
+    try std.testing.expectEqual(client_ui.ReconnectPresentation.none, reconnectPresentationForFilterLevel(.raw));
+    try std.testing.expectEqual(client_ui.ReconnectPresentation.stderr_plain, reconnectPresentationForFilterLevel(.unhygienic));
+    try std.testing.expectEqual(client_ui.ReconnectPresentation.title, reconnectPresentationForFilterLevel(.hygienic));
+    try std.testing.expectEqual(client_ui.ReconnectPresentation.overlay, reconnectPresentationForFilterLevel(.emulated));
 }
 
 test "proxy diagnostics plan maps emulated to hygienic client socket" {

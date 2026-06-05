@@ -80,7 +80,7 @@ pub const escape_help_lines = [_][]const u8{
     "~~  send ~",
 };
 
-pub const escape_help_banner_lines = [_][]const u8{
+pub const escape_help_overlay_lines = [_][]const u8{
     "Supported escape sequences. Any key to dismiss",
     "~.  kill session and detach",
     "~k  kill session and wait",
