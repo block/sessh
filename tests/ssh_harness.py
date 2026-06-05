@@ -286,6 +286,9 @@ if [ -n "$proxy_command" ]; then
     fi
     exec "${SHELL:-sh}" -c "$*"
   fi
+  if [ -n "${SESSH_FAKE_SSH_REMOTE_SHELL:-}" ]; then
+    exec "${SHELL:-sh}"
+  fi
   printf 'PROXY_SSH host=%s\\n' "$host"
   exit 0
 fi
@@ -4188,7 +4191,7 @@ def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["test-host"])
+    argv = sessh_argv(["--alias", "s1", "test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -4200,8 +4203,7 @@ def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
     stdout = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
-        proc.stdin.write(b"\x02s")
-        proc.stdin.flush()
+        sever_session_clients(env, 30.0)
         reconnect_output = read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", 10.0)
         proc.stdin.write(b"during-timer\n")
         proc.stdin.flush()
@@ -4268,7 +4270,7 @@ def test_ssh_retry_elapsed_without_input_switches_automatically(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["test-host"])
+    argv = sessh_argv(["--alias", "s1", "test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -4280,8 +4282,7 @@ def test_ssh_retry_elapsed_without_input_switches_automatically(tmp):
     stdout = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
-        proc.stdin.write(b"\x02s")
-        proc.stdin.flush()
+        sever_session_clients(env, 30.0)
         stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", 10.0)
         stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Reconnecting... CTRL-C detach", 12.0)
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
@@ -4510,7 +4511,7 @@ def test_ssh_session_buffers_and_displays_stderr_after_attach(tmp):
         stdout = read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
         signal_file.write_text("")
         wait_for_path(done_file, 10.0)
-        proc.stdin.write(b"\x02d")
+        proc.stdin.write(b"~d")
         proc.stdin.flush()
         proc.stdin.close()
         returncode = proc.wait(timeout=30.0)

@@ -2915,7 +2915,7 @@ fn shouldUseProxyStream(parsed_ssh_args: SessionInvocation, stdin_is_tty: bool) 
     if (parsed_ssh_args.action != .new) return false;
     if (parsed_ssh_args.command_argv.len != 0) return false;
     if (filterLevelForcesProxy(parsed_ssh_args.filter_level) or parsed_ssh_args.proxy_required) return true;
-    if (!hasRemoteShellCommand(parsed_ssh_args.shell_command_args)) return false;
+    if (!hasRemoteShellCommand(parsed_ssh_args.shell_command_args)) return !parsed_ssh_args.terminal_emulator;
     return shouldUseStreamPath(parsed_ssh_args, stdin_is_tty);
 }
 
@@ -3111,7 +3111,9 @@ fn proxyCommandOption(
     try appendShellToken(allocator, &command, exe);
     try appendShellToken(allocator, &command, ":internal-proxy-stream:");
     try appendShellToken(allocator, &command, "--host");
-    try appendShellToken(allocator, &command, "%h");
+    // Use the original host token so the inner ssh sees the same Host block.
+    // `%h` is already resolved to HostName and can lose alias-scoped options.
+    try appendShellToken(allocator, &command, "%n");
     try appendShellToken(allocator, &command, "--port");
     try appendShellToken(allocator, &command, "%p");
     try appendShellToken(allocator, &command, "--user");
@@ -3682,17 +3684,7 @@ fn runPlainSshArgvWithDiagnosticsThread(
     state.done.store(true, .release);
     thread.join();
     joined = true;
-    switch (term) {
-        .Exited => |code| return process_exit.request(code),
-        .Signal => |signal| {
-            try io.stderrPrint("sessh: {s} ended by signal {}\n", .{ diagnostic_name, signal });
-            return process_exit.request(255);
-        },
-        else => {
-            try io.stderrPrint("sessh: {s} ended unexpectedly: {t}\n", .{ diagnostic_name, term });
-            return process_exit.request(255);
-        },
-    }
+    return exitAfterPlainSshTerm(term, diagnostic_name);
 }
 
 fn runPlainSshArgvUnderLocalPty(
@@ -3733,11 +3725,7 @@ fn runPlainSshArgvUnderLocalPty(
     }
 
     while (true) {
-        const current_size = terminal.currentWindowSize();
-        if (current_size.rows != size.rows or current_size.cols != size.cols) {
-            _ = terminal.setPtySize(child.master_fd, current_size.rows, current_size.cols);
-            size = current_size;
-        }
+        refreshLocalPtySize(child.master_fd, &size);
 
         var pollfds: [3]posix.pollfd = undefined;
         var count: usize = 0;
@@ -3754,6 +3742,7 @@ fn runPlainSshArgvUnderLocalPty(
         count += 1;
 
         _ = posix.poll(pollfds[0..count], -1) catch continue;
+        refreshLocalPtySize(child.master_fd, &size);
 
         if ((pollfds[pty_index].revents & posix.POLL.IN) != 0) {
             var buf: [8192]u8 = undefined;
@@ -3767,7 +3756,7 @@ fn runPlainSshArgvUnderLocalPty(
                     const term = child.wait();
                     child.closeMaster();
                     diagnostics.clear();
-                    return exitAfterPlainSshTerm(term, diagnostic_name);
+                    return exitAfterLocalPtySshTerm(term, diagnostic_name, &mode_guard, &stdin_flags_guard);
                 },
             }
         }
@@ -3777,7 +3766,7 @@ fn runPlainSshArgvUnderLocalPty(
             const term = child.wait();
             child.closeMaster();
             diagnostics.clear();
-            return exitAfterPlainSshTerm(term, diagnostic_name);
+            return exitAfterLocalPtySshTerm(term, diagnostic_name, &mode_guard, &stdin_flags_guard);
         }
 
         if ((pollfds[stdin_index].revents & posix.POLL.IN) != 0) {
@@ -3800,6 +3789,24 @@ fn runPlainSshArgvUnderLocalPty(
             }
         }
     }
+}
+
+fn exitAfterLocalPtySshTerm(
+    term: std.process.Child.Term,
+    diagnostic_name: []const u8,
+    mode_guard: *terminal.TerminalModeGuard,
+    stdin_flags_guard: *FdStatusFlagsGuard,
+) !noreturn {
+    stdin_flags_guard.restore();
+    mode_guard.restore();
+    return exitAfterPlainSshTerm(term, diagnostic_name);
+}
+
+fn refreshLocalPtySize(pty_fd: c.fd_t, size: *terminal.WindowSize) void {
+    const current_size = terminal.currentWindowSize();
+    if (current_size.rows == size.rows and current_size.cols == size.cols) return;
+    _ = terminal.setPtySize(pty_fd, current_size.rows, current_size.cols);
+    size.* = current_size;
 }
 
 fn writePtyInput(pty_fd: c.fd_t, bytes: []const u8, diagnostics: *ProxyClientControl) !void {
@@ -3874,17 +3881,7 @@ fn runPlainSshArgv(allocator: std.mem.Allocator, ssh_args: []const []const u8, d
     try child.spawn();
 
     const term = try child.wait();
-    switch (term) {
-        .Exited => |code| return process_exit.request(code),
-        .Signal => |signal| {
-            try io.stderrPrint("sessh: {s} ended by signal {}\n", .{ diagnostic_name, signal });
-            return process_exit.request(255);
-        },
-        else => {
-            try io.stderrPrint("sessh: {s} ended unexpectedly: {t}\n", .{ diagnostic_name, term });
-            return process_exit.request(255);
-        },
-    }
+    return exitAfterPlainSshTerm(term, diagnostic_name);
 }
 
 fn exitAfterSshBootstrapFailure(
@@ -5290,7 +5287,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     defer std.testing.allocator.free(option);
 
     try std.testing.expect(std.mem.indexOf(u8, option, ":internal-proxy-stream:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, option, "%h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "%n") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%p") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%r") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--filter-level") != null);
@@ -5410,8 +5407,8 @@ test "no terminal emulator forces stream path and preserves ssh tty semantics" {
     try std.testing.expect(interactive.terminal_emulator_set);
     try std.testing.expect(shouldUseStreamPath(interactive, true));
     try std.testing.expect(shouldUseStreamPath(interactive, false));
-    try std.testing.expect(!shouldUseProxyStream(interactive, true));
-    try std.testing.expect(!shouldUseProxyStream(interactive, false));
+    try std.testing.expect(shouldUseProxyStream(interactive, true));
+    try std.testing.expect(shouldUseProxyStream(interactive, false));
 
     const command = try parseSshArgs(std.testing.allocator, &.{
         "sessh",

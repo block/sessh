@@ -8,6 +8,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import tempfile
@@ -41,7 +42,7 @@ RUN printf '\\nAcceptEnv SESSH_TEST_SENDENV\\n' >> /etc/ssh/sshd_config
 COPY authorized_keys /root/.ssh/authorized_keys
 RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
 EXPOSE 22
-CMD ["/usr/sbin/sshd", "-D", "-e", "-o", "PermitRootLogin=yes", "-o", "PasswordAuthentication=no"]
+CMD ["sh", "-c", "exec /usr/sbin/sshd -D -e -o PermitRootLogin=yes -o PasswordAuthentication=no -p ${SSHD_PORT:-22}"]
 """
 
 
@@ -359,7 +360,7 @@ def read_until_pipe(proc, pipe, needle, timeout=30.0):
     return data
 
 
-def run_reconnect_probe(cmd, env, ready, after, timeout=60.0):
+def run_reconnect_probe(cmd, env, ready, after, sever_cmd, timeout=60.0):
     proc = subprocess.Popen(
         cmd,
         cwd=ROOT,
@@ -369,8 +370,10 @@ def run_reconnect_probe(cmd, env, ready, after, timeout=60.0):
         stderr=subprocess.PIPE,
     )
     stdout = read_until_pipe(proc, proc.stdout, ready.encode("utf-8"), timeout)
-    proc.stdin.write(b"\x02s")
-    proc.stdin.flush()
+    severed = run(sever_cmd, env=env, timeout=30.0, check=False)
+    if severed.returncode != 0:
+        proc.kill()
+        raise AssertionError(f"{sever_cmd} failed\nstdout={severed.stdout}\nstderr={severed.stderr}")
     stdout += read_until_pipe(proc, proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
     proc.stdin.write(b"\x12")
     proc.stdin.flush()
@@ -544,13 +547,17 @@ def run_signal_after_stdout(cmd, env, needle, sig=signal.SIGINT, timeout=30.0):
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,
     )
     stdout = read_until_pipe(proc, proc.stdout, needle, timeout)
-    proc.send_signal(sig)
+    os.killpg(proc.pid, sig)
     try:
         returncode = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         raise
     stdout += proc.stdout.read()
     stderr = proc.stderr.read()
@@ -575,7 +582,14 @@ def compare_signal_oracle(name, prefix, config, host_alias, env, *, remote_args,
         needle,
         timeout=timeout,
     )
-    assert_observable_matches(name, ssh_result, sessh_result, compare_stderr=False)
+    ssh_stdout = normalize_output(ssh_result.stdout)
+    sessh_stdout = normalize_output(sessh_result.stdout)
+    if ssh_stdout != sessh_stdout:
+        raise AssertionError(
+            f"OpenSSH signal-output mismatch for {name}\n"
+            f"ssh:   rc={ssh_result.returncode} stdout={ssh_stdout!r} stderr={normalize_output(ssh_result.stderr)!r}\n"
+            f"sessh: rc={sessh_result.returncode} stdout={sessh_stdout!r} stderr={normalize_output(sessh_result.stderr)!r}"
+        )
 
 
 def assert_sendenv_visible(name, results, expected_value):
@@ -702,7 +716,7 @@ def sha256(path):
 
 
 def sessh_version():
-    for line in (ROOT / "src" / "config.zig").read_text().splitlines():
+    for line in (ROOT / "src" / "core" / "config.zig").read_text().splitlines():
         if line.startswith("pub const version = "):
             return line.split('"')[1]
     raise AssertionError("could not find sessh version")
@@ -768,7 +782,13 @@ def build_image(tmp, platform, tag, public_key):
     )
 
 
-def start_container(platform, tag, name):
+def unused_local_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def start_container(platform, tag, name, ssh_port):
     cid = run(
         [
             "podman",
@@ -779,8 +799,10 @@ def start_container(platform, tag, name):
             platform,
             "--name",
             name,
+            "-e",
+            f"SSHD_PORT={ssh_port}",
             "-p",
-            "127.0.0.1::22",
+            f"127.0.0.1:{ssh_port}:{ssh_port}",
             tag,
         ],
         timeout=60.0,
@@ -790,8 +812,8 @@ def start_container(platform, tag, name):
     return cid
 
 
-def mapped_ssh_port(container):
-    output = run(["podman", "port", container, "22/tcp"], timeout=10.0).stdout.strip()
+def mapped_ssh_port(container, ssh_port):
+    output = run(["podman", "port", container, f"{ssh_port}/tcp"], timeout=10.0).stdout.strip()
     host_port = output.rsplit(":", 1)[-1]
     return int(host_port)
 
@@ -1038,11 +1060,12 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
     public_key = (Path(str(key) + ".pub")).read_text()
 
     build_image(tmp, container_platform, tag, public_key)
-    container = start_container(container_platform, tag, name)
+    ssh_port = unused_local_port()
+    container = start_container(container_platform, tag, name, ssh_port)
     env = isolated_env(tmp / f"client-{arch}")
 
     try:
-        port = mapped_ssh_port(container)
+        port = mapped_ssh_port(container, ssh_port)
         config = write_ssh_config(tmp, host_alias, port, key)
         wait_for_ssh(host_alias, config)
 
@@ -1100,11 +1123,25 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         set_remote_login_shell(container, remote_shell)
         config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
         config_dir.mkdir(parents=True, exist_ok=True)
+        reconnect_alias = f"podman-reconnect-{arch}"
+        ssh_options = f"-F {config}"
         reconnected = run_reconnect_probe(
-            [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias],
+            [str(prefix / "bin" / "sessh"), "--alias", reconnect_alias, "-F", str(config), host_alias],
             env,
             reconnect_marker,
             f"after-reconnect-{arch}",
+            [
+                str(prefix / "bin" / "sesshmux"),
+                "debug",
+                "--ssh-options",
+                ssh_options,
+                "--host",
+                host_alias,
+                "--id",
+                reconnect_alias,
+                "sever-connection",
+                "--all",
+            ],
             timeout=90.0,
         )
         if reconnected.returncode != 0:

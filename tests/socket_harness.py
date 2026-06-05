@@ -178,7 +178,7 @@ def run(args, env, **kwargs):
 
 
 def sessh_version():
-    for line in (ROOT / "src" / "config.zig").read_text().splitlines():
+    for line in (ROOT / "src" / "core" / "config.zig").read_text().splitlines():
         if line.startswith("pub const version = "):
             return line.split('"')[1]
     raise AssertionError("could not find sessh version")
@@ -1201,7 +1201,7 @@ def startup_cwd_title_sequence():
 
 
 def config_version():
-    config = (ROOT / "src" / "config.zig").read_text()
+    config = (ROOT / "src" / "core" / "config.zig").read_text()
     version = re.search(r'pub const version = "([^"]+)";', config).group(1)
     major = int(re.search(r"pub const protocol_major = ([0-9]+);", config).group(1))
     minor = int(re.search(r"pub const protocol_minor = ([0-9]+);", config).group(1))
