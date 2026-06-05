@@ -8,7 +8,7 @@ usage: scripts/build [--version VERSION] [--dist DIR]
 Builds the release install tree, archive, and SHA-256 checksum.
 
 Options:
-  --version VERSION  Package directory/archive version. Defaults to src/config.zig.
+  --version VERSION  Package directory/archive version. Defaults to src/core/config.zig.
   --dist DIR         Output directory. Defaults to dist.
 EOF
 }
@@ -55,7 +55,7 @@ EOF
 }
 
 version_from_config() {
-  sed -n 's/^pub const version = "\(.*\)";$/\1/p' src/config.zig
+  sed -n 's/^pub const version = "\(.*\)";$/\1/p' src/core/config.zig
 }
 
 sha256_file() {
@@ -107,7 +107,7 @@ if [ -z "$version" ]; then
   version=$(version_from_config)
 fi
 if [ -z "$version" ]; then
-  echo "scripts/build: could not read version from src/config.zig" >&2
+  echo "scripts/build: could not read version from src/core/config.zig" >&2
   exit 1
 fi
 

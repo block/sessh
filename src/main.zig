@@ -1,19 +1,17 @@
 const std = @import("std");
 const posix = std.posix;
 
-const app_allocator = @import("app_allocator.zig");
-const config = @import("config.zig");
-const io = @import("io.zig");
-const mux = @import("mux.zig");
-const mux_broker = @import("mux_broker.zig");
-const mux_force_compat = @import("mux_force_compat.zig");
-const mux_proxy_stream = @import("mux_proxy_stream.zig");
-const mux_sessh = @import("mux_sessh.zig");
-const mux_session_agent = @import("mux_session_agent.zig");
-const mux_stream_agent = @import("mux_stream_agent.zig");
-const mux_stream_broker = @import("mux_stream_broker.zig");
-const process_exit = @import("process_exit.zig");
-const terminal = @import("terminal.zig");
+const app_allocator = @import("core/app_allocator.zig");
+const config = @import("core/config.zig");
+const io = @import("core/io.zig");
+const mux = @import("mux/mod.zig");
+const mux_force_compat = @import("mux/force_compat.zig");
+const process_exit = @import("core/process_exit.zig");
+const session_agent = @import("session/agent.zig");
+const session_broker = @import("session/broker.zig");
+const stream_agent = @import("stream/agent.zig");
+const terminal = @import("tty/terminal.zig");
+const transport_ssh = @import("transport/ssh.zig");
 
 pub fn main() !void {
     terminal.setSigpipe(posix.SIG.IGN);
@@ -53,31 +51,42 @@ fn runMain() !void {
     }
 
     if (entrypoint == .sessh) {
-        return mux_sessh.run(allocator, args);
+        const sessh_args = try argsFromInternalSessh(allocator, args);
+        defer allocator.free(sessh_args);
+        return transport_ssh.run(allocator, sessh_args);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-session-agent:")) {
-        return mux_session_agent.run(args[2..]);
+        const agent_args = args[2..];
+        if (agent_args.len != 2 or !std.mem.eql(u8, agent_args[0], "--session-dir")) {
+            try io.writeAll(2, "sessh: :internal-session-agent: requires --session-dir DIR\n");
+            return process_exit.request(64);
+        }
+        return session_agent.runSessionAgent(agent_args[1]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-session-broker:")) {
-        return mux_broker.runSessionBroker(allocator, args[0], args[2..]);
+        return session_broker.run(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-control:")) {
-        return mux_broker.runControl(allocator, args[2..]);
+        if (args[2..].len != 0) {
+            try io.writeAll(2, "sessh: :internal-control: does not accept arguments\n");
+            return process_exit.request(64);
+        }
+        return session_broker.runControl(allocator);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-stream-broker:")) {
-        return mux_stream_broker.run(allocator, args[0], args[2..]);
+        return stream_agent.runBroker(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-stream-agent:")) {
-        return mux_stream_agent.run(allocator, args[0], args[2..]);
+        return stream_agent.runAgent(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-proxy-stream:")) {
-        return mux_proxy_stream.run(allocator, args[0], args[2..]);
+        return transport_ssh.runProxyStream(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], "force-compat")) {
@@ -85,6 +94,16 @@ fn runMain() !void {
     }
 
     return mux.run(allocator, args);
+}
+
+fn argsFromInternalSessh(allocator: std.mem.Allocator, args: []const []const u8) ![][]const u8 {
+    std.debug.assert(args.len >= 2);
+    std.debug.assert(std.mem.eql(u8, args[1], ":internal-sessh:"));
+
+    const sessh_args = try allocator.alloc([]const u8, args.len - 1);
+    sessh_args[0] = args[0];
+    @memcpy(sessh_args[1..], args[2..]);
+    return sessh_args;
 }
 
 const EntryPoint = enum {
@@ -115,6 +134,21 @@ test "sessh top-level options do not match remote command arguments" {
     try std.testing.expect(topLevelArgIs(&.{ "sesshmux-dev", "--version" }, .sesshmux, &.{"--version"}));
     try std.testing.expect(!topLevelArgIs(&.{ "sesshmux-dev", "list", "--version" }, .sesshmux, &.{"--version"}));
     try std.testing.expect(!sesshShortVersionRequested(&.{ "sesshmux-dev", "-V" }, .sesshmux));
+}
+
+test "internal sessh modality removes sentinel" {
+    const rewritten = try argsFromInternalSessh(std.testing.allocator, &.{
+        "sesshmux-macos-aarch64",
+        ":internal-sessh:",
+        "-v",
+        "example.com",
+    });
+    defer std.testing.allocator.free(rewritten);
+
+    try std.testing.expectEqual(@as(usize, 3), rewritten.len);
+    try std.testing.expectEqualStrings("sesshmux-macos-aarch64", rewritten[0]);
+    try std.testing.expectEqualStrings("-v", rewritten[1]);
+    try std.testing.expectEqualStrings("example.com", rewritten[2]);
 }
 
 fn usage(code: u8, entrypoint: EntryPoint) !void {
@@ -228,39 +262,44 @@ fn sshShortOptionConsumesValueForVersionScan(option: u8) bool {
 }
 
 test {
-    _ = @import("app_allocator.zig");
-    _ = @import("broker.zig");
-    _ = @import("proxy_control.zig");
-    _ = @import("client_renderer.zig");
-    _ = @import("mux.zig");
-    _ = @import("mux_attach.zig");
-    _ = @import("mux_broker.zig");
-    _ = @import("mux_client_control.zig");
-    _ = @import("mux_common.zig");
-    _ = @import("mux_debug.zig");
-    _ = @import("mux_detach.zig");
-    _ = @import("mux_cli.zig");
-    _ = @import("mux_force_compat.zig");
-    _ = @import("mux_kill.zig");
-    _ = @import("mux_list.zig");
-    _ = @import("mux_new.zig");
-    _ = @import("mux_parser.zig");
-    _ = @import("mux_proxy_stream.zig");
-    _ = @import("mux_repaint.zig");
-    _ = @import("mux_sessh.zig");
-    _ = @import("mux_session_agent.zig");
-    _ = @import("mux_stream_agent.zig");
-    _ = @import("mux_stream_broker.zig");
-    _ = @import("pty_process.zig");
-    _ = @import("process_exit.zig");
-    _ = @import("runtime_refresher.zig");
-    _ = @import("session_agent.zig");
-    _ = @import("relay.zig");
-    _ = @import("session_registry.zig");
-    _ = @import("ssh_client.zig");
-    _ = @import("stream_agent.zig");
-    _ = @import("terminal.zig");
-    _ = @import("tty_settings.zig");
-    _ = @import("tty_transcript.zig");
-    _ = @import("vt.zig");
+    _ = @import("core/app_allocator.zig");
+    _ = @import("core/client_log.zig");
+    _ = @import("core/config.zig");
+    _ = @import("core/io.zig");
+    _ = @import("core/process_exit.zig");
+    _ = @import("mux/attach.zig");
+    _ = @import("mux/cli.zig");
+    _ = @import("mux/client_control.zig");
+    _ = @import("mux/common.zig");
+    _ = @import("mux/debug.zig");
+    _ = @import("mux/detach.zig");
+    _ = @import("mux/force_compat.zig");
+    _ = @import("mux/kill.zig");
+    _ = @import("mux/list.zig");
+    _ = @import("mux/mod.zig");
+    _ = @import("mux/new.zig");
+    _ = @import("mux/parser.zig");
+    _ = @import("mux/repaint.zig");
+    _ = @import("protocol/mod.zig");
+    _ = @import("reconnect/control.zig");
+    _ = @import("reconnect/mod.zig");
+    _ = @import("reconnect/title.zig");
+    _ = @import("runtime/refresher.zig");
+    _ = @import("runtime/session_registry.zig");
+    _ = @import("session/agent.zig");
+    _ = @import("session/broker.zig");
+    _ = @import("session/client.zig");
+    _ = @import("session/list_format.zig");
+    _ = @import("session/renderer.zig");
+    _ = @import("session/vt.zig");
+    _ = @import("stream/agent.zig");
+    _ = @import("stream/proxy_control.zig");
+    _ = @import("tty/pty_process.zig");
+    _ = @import("tty/settings.zig");
+    _ = @import("tty/terminal.zig");
+    _ = @import("tty/transcript.zig");
+    _ = @import("transport/artifact_manifest.zig");
+    _ = @import("transport/relay.zig");
+    _ = @import("transport/socket.zig");
+    _ = @import("transport/ssh.zig");
 }

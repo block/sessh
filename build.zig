@@ -139,7 +139,7 @@ fn addArtifactsStep(b: *std.Build, protoc_step: *std.Build.Step) *std.Build.Step
     };
 
     const manifest_mod = b.createModule(.{
-        .root_source_file = b.path("src/artifact_manifest.zig"),
+        .root_source_file = b.path("src/transport/artifact_manifest.zig"),
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     });

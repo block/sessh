@@ -1091,7 +1091,7 @@ def seed_remote_artifact_cache(env, artifact=None):
 
 
 def sessh_version():
-    for line in (ROOT / "src" / "config.zig").read_text().splitlines():
+    for line in (ROOT / "src" / "core" / "config.zig").read_text().splitlines():
         if line.startswith("pub const version = "):
             return line.split('"')[1]
     raise AssertionError("could not find sessh version")

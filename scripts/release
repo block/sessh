@@ -55,16 +55,16 @@ def release_remote_url() -> str:
 
 
 def read_config_version() -> str:
-    text = Path("src/config.zig").read_text()
+    text = Path("src/core/config.zig").read_text()
     match = re.search(r'^pub const version = "([^"]+)";$', text, flags=re.MULTILINE)
     if not match:
-        fail("could not read version from src/config.zig")
+        fail("could not read version from src/core/config.zig")
     return match.group(1)
 
 
 def parse_release_version(config_version: str) -> tuple[str, str, str]:
     if not config_version.endswith("-dev"):
-        fail(f"src/config.zig version must end in -dev: {config_version}")
+        fail(f"src/core/config.zig version must end in -dev: {config_version}")
 
     release_version = config_version.removesuffix("-dev")
     match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", release_version)
@@ -78,7 +78,7 @@ def parse_release_version(config_version: str) -> tuple[str, str, str]:
 
 
 def update_versions(binary_version: str, package_version: str) -> None:
-    config = Path("src/config.zig")
+    config = Path("src/core/config.zig")
     config_text, config_count = re.subn(
         r'^pub const version = "([^"]+)";$',
         f'pub const version = "{binary_version}";',
@@ -87,7 +87,7 @@ def update_versions(binary_version: str, package_version: str) -> None:
         flags=re.MULTILINE,
     )
     if config_count != 1:
-        fail("could not update src/config.zig version")
+        fail("could not update src/core/config.zig version")
     config.write_text(config_text)
 
     zon = Path("build.zig.zon")
@@ -182,7 +182,7 @@ def main() -> int:
     run("git", "switch", "-C", release_branch, MAIN_BRANCH)
 
     update_versions(release_version, release_version)
-    run("git", "add", "src/config.zig", "build.zig.zon")
+    run("git", "add", "src/core/config.zig", "build.zig.zon")
     commit_staged(f"Release {tag}")
     release_sha = output("git", "rev-parse", "HEAD")
 
@@ -213,7 +213,7 @@ def main() -> int:
         run("git", "cherry-pick", release_sha)
 
     update_versions(next_dev, next_package)
-    run("git", "add", "src/config.zig", "build.zig.zon")
+    run("git", "add", "src/core/config.zig", "build.zig.zon")
     commit_staged(f"Begin {next_dev}")
     run("git", "push", REMOTE, MAIN_BRANCH)
 

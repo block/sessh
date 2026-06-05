@@ -35,8 +35,8 @@ scripts/release
 The release script:
 
 1. creates or resets `release/vX.Y.Z` from the current `main`;
-2. infers `X.Y.Z` from `src/config.zig` by stripping `-dev`;
-3. updates `src/config.zig` and `build.zig.zon` for `X.Y.Z`;
+2. infers `X.Y.Z` from `src/core/config.zig` by stripping `-dev`;
+3. updates `src/core/config.zig` and `build.zig.zon` for `X.Y.Z`;
 4. commits `Release vX.Y.Z`;
 5. tags that commit as `vX.Y.Z`;
 6. pushes the release branch and tag to `origin`;
@@ -44,14 +44,14 @@ The release script:
 8. integrates the release version commit into `main`;
 9. bumps `main` to the next development version and pushes it.
 
-For example, if `src/config.zig` says `0.4.0-dev`, `scripts/release` releases
+For example, if `src/core/config.zig` says `0.4.0-dev`, `scripts/release` releases
 `0.4.0` and bumps `main` to `0.5.0-dev` after the release succeeds.
 
 Before mutating git state, the script prints the inferred release plan and
 requires typing `yes`.
 
 Re-running the same release after CI failure is supported. Commit the fix to
-`main`, then run `scripts/release` again. As long as `src/config.zig` still has
+`main`, then run `scripts/release` again. As long as `src/core/config.zig` still has
 the same `X.Y.Z-dev` version, the script will reset the release branch from the
 updated `main` and move the tag to the new release commit. It refuses to move
 the tag once a GitHub Release already exists for that version.
