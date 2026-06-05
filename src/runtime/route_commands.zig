@@ -3,7 +3,7 @@ const std = @import("std");
 const client_log = @import("../core/client_log.zig");
 const io_helpers = @import("../core/io.zig");
 const list_format = @import("list_format.zig");
-const session_broker = @import("../session/broker.zig");
+const runtime_commands = @import("commands.zig");
 const session_registry = @import("session_registry.zig");
 const shell = @import("../core/shell.zig");
 
@@ -43,7 +43,6 @@ pub const RemoteCommandRunner = struct {
 pub fn runLocalListCommand(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    runtime_broker_args: []const []const u8,
     refresh: bool,
     include_cached_routes: bool,
     jsonl: bool,
@@ -53,8 +52,7 @@ pub fn runLocalListCommand(
 ) !u8 {
     if (include_cached_routes and refresh) try refreshCachedRemoteRoutes(allocator, exe, remote_runner);
 
-    _ = runtime_broker_args;
-    const exit_status = try session_broker.runListCommand(allocator, .{
+    const exit_status = try runtime_commands.runListCommand(allocator, .{
         .format = if (jsonl) .jsonl else .table,
         .mode = if (exited) .exited else .live,
         .all = all,
@@ -288,14 +286,15 @@ fn queryRemoteHostList(
     all: bool,
 ) ![]u8 {
     if (remote_runner) |runner| {
-        const extra_args: usize = 4 + (if (exited) @as(usize, 1) else 0) + (if (all) @as(usize, 1) else 0);
+        const extra_args: usize = 5 + (if (exited) @as(usize, 1) else 0) + (if (all) @as(usize, 1) else 0);
         const argv = try allocator.alloc([]const u8, extra_args);
         defer allocator.free(argv);
         argv[0] = "sesshmux";
-        argv[1] = ":internal-session-broker:";
-        argv[2] = "list";
-        argv[3] = "--jsonl";
-        var arg_index: usize = 4;
+        argv[1] = "list";
+        argv[2] = "--host";
+        argv[3] = ".";
+        argv[4] = "--jsonl";
+        var arg_index: usize = 5;
         if (exited) {
             argv[arg_index] = "--exited";
             arg_index += 1;
@@ -432,13 +431,14 @@ fn queryRemoteHostKillJsonlWithRequests(
 ) ![]u8 {
     if (remote_runner) |runner| {
         const request_args = request_jsons.len * 2;
-        const argv = try allocator.alloc([]const u8, 4 + request_args + targets.len);
+        const argv = try allocator.alloc([]const u8, 5 + request_args + targets.len);
         defer allocator.free(argv);
         argv[0] = "sesshmux";
-        argv[1] = ":internal-session-broker:";
-        argv[2] = "kill";
-        argv[3] = "--jsonl";
-        var arg_index: usize = 4;
+        argv[1] = "kill";
+        argv[2] = "--host";
+        argv[3] = ".";
+        argv[4] = "--jsonl";
+        var arg_index: usize = 5;
         for (request_jsons) |request_json| {
             argv[arg_index] = "--request";
             arg_index += 1;
@@ -551,55 +551,16 @@ pub fn spawnRemoteKillJsonl(
 
 pub fn runLocalKillJsonlAndProcess(
     allocator: std.mem.Allocator,
-    exe: []const u8,
     targets: []const []const u8,
     expected_guid: ?[]const u8,
 ) !bool {
-    const stdout = try queryLocalKillJsonl(allocator, exe, targets);
-    defer allocator.free(stdout);
-    return processKillJsonl(allocator, ".", stdout, expected_guid);
+    const results = try runtime_commands.killTargetsForJsonl(allocator, targets);
+    defer allocator.free(results);
+    return processKillResults(allocator, ".", results, expected_guid);
 }
 
-pub fn spawnLocalKillJsonl(allocator: std.mem.Allocator, exe: []const u8, targets: []const []const u8) void {
-    const argv = allocator.alloc([]const u8, 4 + targets.len) catch return;
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = ":internal-session-broker:";
-    argv[2] = "kill";
-    argv[3] = "--jsonl";
-    @memcpy(argv[4..], targets);
-
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return;
-}
-
-fn queryLocalKillJsonl(allocator: std.mem.Allocator, exe: []const u8, targets: []const []const u8) ![]u8 {
-    const argv = try allocator.alloc([]const u8, 4 + targets.len);
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = ":internal-session-broker:";
-    argv[2] = "kill";
-    argv[3] = "--jsonl";
-    @memcpy(argv[4..], targets);
-
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 1024 * 1024,
-    });
-    errdefer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .Exited => |code| {
-            if (code == 0 or result.stdout.len > 0) return result.stdout;
-            if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
-            return error.LocalKillFailed;
-        },
-        else => return error.LocalKillFailed,
-    }
+pub fn requestLocalKillNoWait(allocator: std.mem.Allocator, targets: []const []const u8) void {
+    runtime_commands.requestKillTargetsNoWait(allocator, targets);
 }
 
 fn processRemoteKillJsonl(allocator: std.mem.Allocator, host: []const u8, stdout: []const u8) !void {
@@ -697,6 +658,43 @@ fn processKillJsonl(allocator: std.mem.Allocator, host: []const u8, stdout: []co
         } else if (std.mem.eql(u8, status, "failure")) {
             const reason = jsonStringField(object, "reason") orelse "unknown";
             client_log.userDiagnosticInfo("pending kill failed for {s}: {s}", .{ guid, reason });
+        }
+    }
+    return expected_seen and expected_succeeded;
+}
+
+fn processKillResults(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    results: []const runtime_commands.KillResult,
+    expected_guid: ?[]const u8,
+) !bool {
+    var expected_seen = expected_guid == null;
+    var expected_succeeded = expected_guid == null;
+    for (results) |result| {
+        const matches_expected = if (expected_guid) |expected| std.mem.eql(u8, expected, result.guid) else false;
+        if (matches_expected) expected_seen = true;
+        switch (result.status) {
+            .killed, .missing => {
+                if (matches_expected) expected_succeeded = true;
+                if (session_registry.isValidSessionGuid(result.guid)) {
+                    tombstoneLocalRouteForPendingKill(allocator, result.guid, .{
+                        .ended_at_unix_ms = result.ended_at_unix_ms orelse nowUnixMs(),
+                        .end_reason = .killed_by_request,
+                    }) catch |err| {
+                        client_log.debug("event=pending_kill_tombstone_failed host={s} session={s} error={t}", .{ host, result.guid, err });
+                    };
+                }
+                try removePendingKillForResult(allocator, result.guid);
+            },
+            .skipped => {
+                if (matches_expected) expected_succeeded = true;
+                try removePendingKillForResult(allocator, result.guid);
+            },
+            .failure => {
+                const reason = if (result.reason.len == 0) "unknown" else result.reason;
+                client_log.userDiagnosticInfo("pending kill failed for {s}: {s}", .{ result.guid, reason });
+            },
         }
     }
     return expected_seen and expected_succeeded;

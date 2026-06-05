@@ -93,6 +93,27 @@ const ArtifactSet = struct {
         try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
     }
 
+    fn sendExecArgs(
+        self: *const ArtifactSet,
+        fd: c.fd_t,
+        exec_args: []const []const u8,
+        reconnect_ui: ?*client_ui.ReconnectUi,
+        poll_reconnect_input: bool,
+    ) !void {
+        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_ui, poll_reconnect_input);
+        for (self.entries) |entry| {
+            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
+            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_ui, poll_reconnect_input);
+        }
+        try writeAllMaybeCancellable(fd, " --", reconnect_ui, poll_reconnect_input);
+        for (exec_args) |arg| {
+            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
+            try self.writeExecArg(fd, arg, reconnect_ui, poll_reconnect_input);
+        }
+        try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
+    }
+
     fn writeExecArg(
         self: *const ArtifactSet,
         fd: c.fd_t,
@@ -700,7 +721,6 @@ pub fn runInvocation(
             const exit_status = try route_commands.runLocalListCommand(
                 allocator,
                 args[0],
-                &.{},
                 parsed_ssh_args.list_refresh,
                 parsed_ssh_args.list_include_cached_routes,
                 parsed_ssh_args.list_jsonl,
@@ -769,27 +789,28 @@ pub fn runInvocation(
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
     const artifacts = if (artifacts_storage) |*value| value else null;
 
-    const broker_args = try brokerArgsForAction(allocator, parsed_ssh_args.*);
-    defer allocator.free(broker_args);
+    const broker_args: []const []const u8 = &.{};
+    const command_args = if (isOneShotBrokerCommandAction(parsed_ssh_args.action))
+        try remoteMuxArgsForAction(allocator, parsed_ssh_args.*)
+    else
+        &.{};
+    defer if (command_args.len > 0) allocator.free(command_args);
     const remote_command = if (parsed_ssh_args.bootstrap)
         try bootstrapCommand(allocator)
+    else if (isOneShotBrokerCommandAction(parsed_ssh_args.action))
+        try directMuxCommand(allocator, command_args)
     else
         try directBrokerCommand(allocator, broker_args);
     defer allocator.free(remote_command);
 
     if (isOneShotBrokerCommandAction(parsed_ssh_args.action)) {
-        const command_remote_command = if (parsed_ssh_args.bootstrap)
-            remote_command
-        else
-            try directBrokerCommand(allocator, broker_args);
-        defer if (!parsed_ssh_args.bootstrap) allocator.free(command_remote_command);
         var command_child = try startRuntimeConnection(
             allocator,
             parsed_ssh_args.*,
             artifacts,
-            command_remote_command,
-            .session_broker,
-            broker_args,
+            remote_command,
+            null,
+            command_args,
             false,
             null,
             false,
@@ -1481,23 +1502,16 @@ pub fn compatSshTtyOptionForLocalArgs(args: []const []const u8, stdin_is_tty: bo
     return "-T";
 }
 
-fn brokerArgsForAction(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation) ![]const []const u8 {
+fn remoteMuxArgsForAction(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation) ![]const []const u8 {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
     switch (parsed_ssh_args.action) {
         .new, .attach => {},
         .list => {
-            try args.append(allocator, "list");
-            if (parsed_ssh_args.host.len > 0) {
-                try args.append(allocator, "--host-display");
-                try args.append(allocator, parsed_ssh_args.host);
-            }
-            if (parsed_ssh_args.list_jsonl) {
-                try args.append(allocator, "--jsonl");
-            }
-            if (parsed_ssh_args.list_all) {
-                try args.append(allocator, "--all");
-            }
+            try args.appendSlice(allocator, &.{ "list", "--host", "." });
+            if (parsed_ssh_args.list_refresh) try args.append(allocator, "--refresh");
+            if (parsed_ssh_args.list_jsonl) try args.append(allocator, "--jsonl");
+            if (parsed_ssh_args.list_all) try args.append(allocator, "--all");
             if (parsed_ssh_args.list_client_target) |target| {
                 if (parsed_ssh_args.list_client_option_arg) |client_arg| {
                     try args.append(allocator, client_arg);
@@ -1509,12 +1523,10 @@ fn brokerArgsForAction(allocator: std.mem.Allocator, parsed_ssh_args: SessionInv
                     try args.append(allocator, target);
                 }
             }
-            if (parsed_ssh_args.list_exited) {
-                try args.append(allocator, "--exited");
-            }
+            if (parsed_ssh_args.list_exited) try args.append(allocator, "--exited");
         },
         .kill => {
-            try args.append(allocator, "kill");
+            try args.appendSlice(allocator, &.{ "kill", "--host", "." });
             if (parsed_ssh_args.kill_jsonl) try args.append(allocator, "--jsonl");
             for (parsed_ssh_args.kill_request_jsons) |request_json| {
                 try args.append(allocator, "--request");
@@ -1523,11 +1535,14 @@ fn brokerArgsForAction(allocator: std.mem.Allocator, parsed_ssh_args: SessionInv
             if (parsed_ssh_args.kill_current) {
                 try args.append(allocator, "--current");
             } else {
-                try args.appendSlice(allocator, parsed_ssh_args.kill_ids);
+                for (parsed_ssh_args.kill_ids) |id| {
+                    try args.append(allocator, "--id");
+                    try args.append(allocator, id);
+                }
             }
         },
         .kill_all => {
-            try args.append(allocator, "kill");
+            try args.appendSlice(allocator, &.{ "kill", "--host", "." });
             if (parsed_ssh_args.kill_jsonl) try args.append(allocator, "--jsonl");
             try args.append(allocator, "--all");
         },
@@ -1538,6 +1553,11 @@ fn brokerArgsForAction(allocator: std.mem.Allocator, parsed_ssh_args: SessionInv
                 .debug_client => "debug",
                 else => unreachable,
             });
+            try args.appendSlice(allocator, &.{ "--host", "." });
+            if (parsed_ssh_args.client_session_ref) |session_ref| {
+                try args.append(allocator, "--id");
+                try args.append(allocator, session_ref);
+            }
             if (parsed_ssh_args.action == .debug_client) {
                 try args.append(allocator, switch (parsed_ssh_args.debug_client_action.?) {
                     .sever_connection => "sever-connection",
@@ -1550,15 +1570,10 @@ fn brokerArgsForAction(allocator: std.mem.Allocator, parsed_ssh_args: SessionInv
                 .last_input => try args.append(allocator, "--last-input"),
                 .client_guid => try args.append(allocator, parsed_ssh_args.client_guid.?),
             }
-            if (parsed_ssh_args.client_repaint_scrollback) {
-                try args.append(allocator, "--scrollback");
-            }
+            if (parsed_ssh_args.client_repaint_scrollback) try args.append(allocator, "--scrollback");
             if (parsed_ssh_args.debug_unresponsive_seconds) |seconds| {
                 try args.append(allocator, "--seconds");
                 try args.append(allocator, seconds);
-            }
-            if (parsed_ssh_args.client_session_ref) |session_ref| {
-                try args.append(allocator, session_ref);
             }
         },
     }
@@ -2655,8 +2670,8 @@ fn startRuntimeConnection(
     parsed_ssh_args: SessionInvocation,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
-    bootstrap_entrypoint: BootstrapEntrypoint,
-    broker_args: []const []const u8,
+    bootstrap_entrypoint: ?BootstrapEntrypoint,
+    exec_args: []const []const u8,
     batch_mode: bool,
     reconnect_ui: ?*client_ui.ReconnectUi,
     poll_reconnect_input: bool,
@@ -2701,16 +2716,30 @@ fn startRuntimeConnection(
 
     const artifact_set = artifacts orelse return connection;
 
-    artifact_set.sendExec(connection.child.stdin.?.handle, bootstrap_entrypoint, broker_args, reconnect_ui, poll_reconnect_input) catch |err| {
-        connection.closeStdin();
-        if (err == error.ReconnectDetached) {
-            connection.terminate();
+    const stdin_fd = connection.child.stdin.?.handle;
+    if (bootstrap_entrypoint) |entrypoint| {
+        artifact_set.sendExec(stdin_fd, entrypoint, exec_args, reconnect_ui, poll_reconnect_input) catch |err| {
+            connection.closeStdin();
+            if (err == error.ReconnectDetached) {
+                connection.terminate();
+                return err;
+            }
+            const term = connection.wait() catch null;
+            if (bootstrap_failure_term) |term_out| term_out.* = term;
             return err;
-        }
-        const term = connection.wait() catch null;
-        if (bootstrap_failure_term) |term_out| term_out.* = term;
-        return err;
-    };
+        };
+    } else {
+        artifact_set.sendExecArgs(stdin_fd, exec_args, reconnect_ui, poll_reconnect_input) catch |err| {
+            connection.closeStdin();
+            if (err == error.ReconnectDetached) {
+                connection.terminate();
+                return err;
+            }
+            const term = connection.wait() catch null;
+            if (bootstrap_failure_term) |term_out| term_out.* = term;
+            return err;
+        };
+    }
 
     var line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
         connection.closeStdin();
@@ -2781,7 +2810,7 @@ fn startRuntimeConnection(
     }
 
     if (std.mem.eql(u8, line, "OK")) {
-        if (broker_args.len == 0) connection.suppressSshStderr();
+        if (exec_args.len == 0) connection.suppressSshStderr();
         return connection;
     }
 
@@ -4032,6 +4061,24 @@ fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
 
 fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []const u8) ![]u8 {
     return directEntrypointCommand(allocator, .session_broker, broker_args);
+}
+
+fn directMuxCommand(allocator: std.mem.Allocator, mux_args: []const []const u8) ![]u8 {
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    const client_version = try shellQuote(allocator, config.version);
+    defer allocator.free(client_version);
+    try script.appendSlice(allocator, "SESSH_CLIENT_VERSION=");
+    try script.appendSlice(allocator, client_version);
+    try script.appendSlice(allocator, " exec sesshmux");
+    for (mux_args) |arg| {
+        const quoted = try shellQuote(allocator, arg);
+        defer allocator.free(quoted);
+        try script.append(allocator, ' ');
+        try script.appendSlice(allocator, quoted);
+    }
+    try script.append(allocator, '\n');
+    return shCommand(allocator, script.items);
 }
 
 fn directControlCommand(allocator: std.mem.Allocator) ![]u8 {
@@ -5543,26 +5590,26 @@ test "parseSshArgs treats post-host mux words as remote command" {
     try expectArgvEqual(&.{ "attach", "s12", "--no-bootstrap" }, parsed.shell_command_args);
 }
 
-test "brokerArgsForAction uses broker subcommands" {
-    try expectBrokerArgs(&.{ "list", "--host-display", "example.com" }, .{
+test "remoteMuxArgsForAction uses public local mux commands" {
+    try expectRemoteMuxArgs(&.{ "list", "--host", "." }, .{
         .options = &.{},
         .host = "example.com",
         .action = .list,
     });
-    try expectBrokerArgs(&.{ "list", "--host-display", "example.com", "--jsonl" }, .{
+    try expectRemoteMuxArgs(&.{ "list", "--host", ".", "--jsonl" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .list,
         .list_jsonl = true,
     });
-    try expectBrokerArgs(&.{ "list", "--host-display", "example.com", "--jsonl", "--all" }, .{
+    try expectRemoteMuxArgs(&.{ "list", "--host", ".", "--jsonl", "--all" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .list,
         .list_jsonl = true,
         .list_all = true,
     });
-    try expectBrokerArgs(&.{ "list", "--host-display", "example.com", "--jsonl", "--exited" }, .{
+    try expectRemoteMuxArgs(&.{ "list", "--host", ".", "--jsonl", "--exited" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .list,
@@ -5570,7 +5617,7 @@ test "brokerArgsForAction uses broker subcommands" {
         .list_exited = true,
     });
 
-    try expectBrokerArgs(&.{ "kill", "s1" }, .{
+    try expectRemoteMuxArgs(&.{ "kill", "--host", ".", "--id", "s1" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .kill,
@@ -5578,7 +5625,7 @@ test "brokerArgsForAction uses broker subcommands" {
         .kill_ids = &.{"s1"},
     });
 
-    try expectBrokerArgs(&.{ "kill", "--jsonl", "s1", "p1" }, .{
+    try expectRemoteMuxArgs(&.{ "kill", "--host", ".", "--jsonl", "--id", "s1", "--id", "p1" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .kill,
@@ -5588,7 +5635,7 @@ test "brokerArgsForAction uses broker subcommands" {
     });
 
     const request_json = "{\"guid\":\"s-00000000-0000-4000-8000-000000000001\",\"requested_age_ms\":123}";
-    try expectBrokerArgs(&.{ "kill", "--jsonl", "--request", request_json }, .{
+    try expectRemoteMuxArgs(&.{ "kill", "--host", ".", "--jsonl", "--request", request_json }, .{
         .options = &.{},
         .host = "example.com",
         .action = .kill,
@@ -5596,20 +5643,20 @@ test "brokerArgsForAction uses broker subcommands" {
         .kill_request_jsons = &.{request_json},
     });
 
-    try expectBrokerArgs(&.{ "kill", "--current" }, .{
+    try expectRemoteMuxArgs(&.{ "kill", "--host", ".", "--current" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .kill,
         .kill_current = true,
     });
 
-    try expectBrokerArgs(&.{ "kill", "--all" }, .{
+    try expectRemoteMuxArgs(&.{ "kill", "--host", ".", "--all" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .kill_all,
     });
 
-    try expectBrokerArgs(&.{ "list", "--host-display", "example.com", "--jsonl", "--client=s1" }, .{
+    try expectRemoteMuxArgs(&.{ "list", "--host", ".", "--jsonl", "--client=s1" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .list,
@@ -5618,7 +5665,7 @@ test "brokerArgsForAction uses broker subcommands" {
         .list_client_option_arg = "--client=s1",
     });
 
-    try expectBrokerArgs(&.{ "list", "--host-display", "example.com", "--jsonl", "--client", "s1" }, .{
+    try expectRemoteMuxArgs(&.{ "list", "--host", ".", "--jsonl", "--client", "s1" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .list,
@@ -5627,7 +5674,7 @@ test "brokerArgsForAction uses broker subcommands" {
         .list_client_option_arg = "--client",
     });
 
-    try expectBrokerArgs(&.{ "debug", "unresponsive-connection", "c1", "s1" }, .{
+    try expectRemoteMuxArgs(&.{ "debug", "--host", ".", "--id", "s1", "unresponsive-connection", "c1" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .debug_client,
@@ -5637,7 +5684,7 @@ test "brokerArgsForAction uses broker subcommands" {
         .client_session_ref = "s1",
     });
 
-    try expectBrokerArgs(&.{ "detach", "c1" }, .{
+    try expectRemoteMuxArgs(&.{ "detach", "--host", ".", "c1" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .detach_client,
@@ -5645,7 +5692,7 @@ test "brokerArgsForAction uses broker subcommands" {
         .client_guid = "c1",
     });
 
-    try expectBrokerArgs(&.{ "debug", "unresponsive-connection", "--last-input", "--seconds", "3", "s1" }, .{
+    try expectRemoteMuxArgs(&.{ "debug", "--host", ".", "--id", "s1", "unresponsive-connection", "--last-input", "--seconds", "3" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .debug_client,
@@ -5655,7 +5702,7 @@ test "brokerArgsForAction uses broker subcommands" {
         .client_session_ref = "s1",
     });
 
-    try expectBrokerArgs(&.{ "repaint", "--last-input", "--scrollback", "s1" }, .{
+    try expectRemoteMuxArgs(&.{ "repaint", "--host", ".", "--id", "s1", "--last-input", "--scrollback" }, .{
         .options = &.{},
         .host = "example.com",
         .action = .repaint_client,
@@ -5665,8 +5712,8 @@ test "brokerArgsForAction uses broker subcommands" {
     });
 }
 
-fn expectBrokerArgs(expected: []const []const u8, parsed: SessionInvocation) !void {
-    const actual = try brokerArgsForAction(std.testing.allocator, parsed);
+fn expectRemoteMuxArgs(expected: []const []const u8, parsed: SessionInvocation) !void {
+    const actual = try remoteMuxArgsForAction(std.testing.allocator, parsed);
     defer std.testing.allocator.free(actual);
     try expectArgvEqual(expected, actual);
 }

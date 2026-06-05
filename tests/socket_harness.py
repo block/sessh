@@ -3054,7 +3054,7 @@ def run_broker_registry_commands_test(base_env):
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        listed = run([":internal-session-broker:", "list"], env, check=True, timeout=5.0)
+        listed = run(["list"], env, check=True, timeout=5.0)
         if session_1_id not in sessions(listed.stdout):
             raise AssertionError(listed.stdout)
 
@@ -3090,7 +3090,7 @@ def run_broker_registry_commands_test(base_env):
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        missing = run([":internal-session-broker:", "kill", session_1_guid], env, timeout=5.0)
+        missing = run(["kill", session_1_guid], env, timeout=5.0)
         if missing.returncode != 1 or f"ERROR {session_1_guid} not found" not in missing.stderr:
             raise AssertionError(missing)
 
@@ -3120,7 +3120,7 @@ def run_broker_registry_commands_test(base_env):
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        killed = run([":internal-session-broker:", "kill", session_2_guid], env, check=True, timeout=5.0)
+        killed = run(["kill", session_2_guid], env, check=True, timeout=5.0)
         if f"ENDED {session_2_guid}" not in killed.stdout or killed.stderr:
             raise AssertionError(killed)
         s2_dir = session_dir(env, session_2_guid)
@@ -3155,7 +3155,7 @@ def run_broker_registry_commands_test(base_env):
                     proc.terminate()
                     proc.wait(timeout=2.0)
 
-        stopped = run([":internal-session-broker:", "kill", "--all"], env, check=True, timeout=5.0)
+        stopped = run(["kill", "--all"], env, check=True, timeout=5.0)
         if "KILLING_ALL" not in stopped.stdout or stopped.stderr:
             raise AssertionError(stopped)
         for expected_guid in (test_session_guid(3), test_session_guid(4)):
@@ -3510,7 +3510,7 @@ def run_broker_kill_edge_cases_test(base_env):
         agent_pid, term_marker = start_sigterm_ignoring_process(tmp, "ignore-term-agent")
         try:
             write_session_meta(env, session_1_guid, agent_pid)
-            killed = run([":internal-session-broker:", "kill", session_1_guid], env, timeout=6.0)
+            killed = run(["kill", session_1_guid], env, timeout=6.0)
             if killed.returncode != 0 or f"ENDED {session_1_guid}" not in killed.stdout:
                 raise AssertionError(killed)
             wait_file(term_marker)
@@ -3531,7 +3531,7 @@ def run_broker_kill_edge_cases_test(base_env):
             compat_log = Path(tmp) / "compat.log"
             write_compat_script(session_path / "compat", compat_log)
 
-            killed = run([":internal-session-broker:", "kill", session_1_guid], env, check=True, timeout=5.0)
+            killed = run(["kill", session_1_guid], env, check=True, timeout=5.0)
             if killed.stdout or killed.stderr:
                 raise AssertionError(killed)
             lines = compat_log.read_text().splitlines()
@@ -3565,7 +3565,7 @@ def run_broker_kill_edge_cases_test(base_env):
                 session_path = write_session_meta(env, session_guid, proc.pid, version="0.0.0-compat-test")
                 write_compat_script(session_path / "compat", compat_log)
 
-            stopped = run([":internal-session-broker:", "kill", "--all"], env, check=True, timeout=5.0)
+            stopped = run(["kill", "--all"], env, check=True, timeout=5.0)
             if stopped.stdout != "KILLING_ALL\n" or stopped.stderr:
                 raise AssertionError(stopped)
             lines = compat_log.read_text().splitlines()

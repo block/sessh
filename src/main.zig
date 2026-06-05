@@ -287,6 +287,7 @@ test {
     _ = @import("reconnect/mod.zig");
     _ = @import("reconnect/title.zig");
     _ = @import("runtime/list_format.zig");
+    _ = @import("runtime/commands.zig");
     _ = @import("runtime/route_commands.zig");
     _ = @import("runtime/refresher.zig");
     _ = @import("runtime/session_registry.zig");

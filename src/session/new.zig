@@ -126,7 +126,7 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
             },
             .kill_detach => {
                 attached_client.recordRuntimeSessionKillRequested(allocator, ".", &session);
-                route_commands.spawnLocalKillJsonl(allocator, request.exe, &.{session.guidSlice()});
+                route_commands.requestLocalKillNoWait(allocator, &.{session.guidSlice()});
                 session.restoreAttachedClientEndPresentationForExit();
                 local_broker.terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
@@ -134,7 +134,7 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
             },
             .kill_wait => {
                 attached_client.recordRuntimeSessionKillRequested(allocator, ".", &session);
-                const killed = try route_commands.runLocalKillJsonlAndProcess(allocator, request.exe, &.{session.guidSlice()}, session.guidSlice());
+                const killed = try route_commands.runLocalKillJsonlAndProcess(allocator, &.{session.guidSlice()}, session.guidSlice());
                 if (killed) session.ended_tombstone_details = .{
                     .ended_at_unix_ms = attached_client.nowUnixMs(),
                     .end_reason = .killed_by_request,
@@ -157,7 +157,7 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
             .transport_closed => {
                 local_broker.closeChildStdin(&child);
                 _ = child.wait() catch {};
-                if (!local_broker.anySessionExists(allocator, request.exe, runtime_broker_args)) {
+                if (!local_broker.anySessionExists(allocator)) {
                     session.restoreAttachedClientEndPresentationForExit();
                     try io.writeAll(2, "\r\nsessh: session agent crashed\r\n");
                     return process_exit.request(1);

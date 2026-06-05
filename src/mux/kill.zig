@@ -156,7 +156,11 @@ pub fn toInvocation(
             if (parsed.kill_ids.len > 0) parsed.kill_id = parsed.kill_ids[0];
         },
         .route_ref_or_local_id => |ref| {
-            if (try mux_common.tryReadRouteForRef(allocator, route_storage, ref)) {
+            const routed = mux_common.tryReadRouteForRef(allocator, route_storage, ref) catch |err| switch (err) {
+                error.SessionAlreadyExited => false,
+                else => return err,
+            };
+            if (routed) {
                 mux_common.fillFromRoute(.kill, &parsed, route_storage.*.?);
             } else {
                 parsed.host = "";

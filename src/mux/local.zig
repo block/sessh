@@ -4,7 +4,7 @@ const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
 const route_commands = @import("../runtime/route_commands.zig");
-const session_broker = @import("../session/broker.zig");
+const runtime_commands = @import("../runtime/commands.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 
 pub fn runInvocation(
@@ -20,7 +20,7 @@ pub fn runInvocation(
     switch (parsed.action) {
         .list => {
             if (parsed.list_client_target) |target| {
-                const exit_status = try session_broker.runListCommand(allocator, .{
+                const exit_status = try runtime_commands.runListCommand(allocator, .{
                     .format = if (parsed.list_jsonl) .jsonl else .table,
                     .client_selector = clientListSelector(target),
                 });
@@ -30,7 +30,6 @@ pub fn runInvocation(
             const exit_status = try route_commands.runLocalListCommand(
                 allocator,
                 exe,
-                &.{},
                 parsed.list_refresh,
                 parsed.list_include_cached_routes,
                 parsed.list_jsonl,
@@ -56,7 +55,7 @@ pub fn runInvocation(
             return runLocalKillCommand(allocator, parsed, if (kill_refs) |refs| refs.refs else &.{});
         },
         .kill_all => {
-            return session_broker.runKillCommand(allocator, .{
+            return runtime_commands.runKillCommand(allocator, .{
                 .format = if (parsed.kill_jsonl) .jsonl else .text,
                 .all = true,
             });
@@ -118,7 +117,7 @@ fn resolveLocalKillRefs(allocator: std.mem.Allocator, parsed: anytype) !LocalKil
     return error.MissingKillTarget;
 }
 
-fn clientListSelector(target: []const u8) session_broker.ClientListSelector {
+fn clientListSelector(target: []const u8) runtime_commands.ClientListSelector {
     if (std.mem.eql(u8, target, "incoming")) return .incoming;
     if (std.mem.eql(u8, target, "outgoing")) return .outgoing;
     if (std.mem.eql(u8, target, "session")) return .session;
@@ -131,15 +130,15 @@ fn runLocalKillCommand(
     parsed: anytype,
     targets: []const []const u8,
 ) !void {
-    var requests: std.ArrayList(session_broker.KillRequest) = .empty;
+    var requests: std.ArrayList(runtime_commands.KillRequest) = .empty;
     defer {
         for (requests.items) |*request| request.deinit(allocator);
         requests.deinit(allocator);
     }
     for (parsed.kill_request_jsons) |request_json| {
-        try requests.append(allocator, try session_broker.parseKillRequestJson(allocator, request_json));
+        try requests.append(allocator, try runtime_commands.parseKillRequestJson(allocator, request_json));
     }
-    return session_broker.runKillCommand(allocator, .{
+    return runtime_commands.runKillCommand(allocator, .{
         .format = if (parsed.kill_jsonl) .jsonl else .text,
         .targets = targets,
         .requests = requests.items,
@@ -152,11 +151,11 @@ fn runLocalClientControlCommand(
 ) !void {
     const session_ref = try resolveClientControlSessionRef(allocator, parsed.client_session_ref, parsed.client_guid);
     defer if (session_ref) |ref| allocator.free(ref);
-    return session_broker.runClientControlCommand(allocator, clientControlCommand(parsed, session_ref));
+    return runtime_commands.runClientControlCommand(allocator, clientControlCommand(parsed, session_ref));
 }
 
-fn clientControlCommand(parsed: anytype, session_ref: ?[]const u8) session_broker.ClientControlCommand {
-    const target = session_broker.ClientControlTarget{
+fn clientControlCommand(parsed: anytype, session_ref: ?[]const u8) runtime_commands.ClientControlCommand {
+    const target = runtime_commands.ClientControlTarget{
         .kind = switch (parsed.client_target) {
             .default => if (parsed.action == .repaint_client)
                 .TE_CLIENT_CONTROL_TARGET_KIND_ALL
