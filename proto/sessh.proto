@@ -286,7 +286,7 @@ message TeSessionAttach {
   // session known to the selected broker.
   string session_ref = 2;
   // When true, the session agent sends raw inner PTY transcript chunks for
-  // this attachment. The client still owns archive creation and storage.
+  // this attached client. The client still owns archive creation and storage.
   bool capture_tty_transcript = 3;
   // Canonical client GUID in c-prefixed hyphenated UUID form. This identifies
   // the attaching client, not the durable session.
@@ -317,7 +317,7 @@ message TeInputAck {
 
 // Framed payload, client -> session agent.
 //
-// Current terminal size for this attachment.
+// Current terminal size for this attached client.
 message TeResize {
   // Rows visible in the local terminal. The session agent bounds this to u16.
   uint32 terminal_rows = 1;
@@ -336,7 +336,7 @@ message TeResize {
 
 // Framed payload, client -> session agent.
 //
-// Requests that the session agent redraw terminal state for this attachment.
+// Requests that the session agent redraw terminal state for this attached client.
 message TeRepaintRequest {
   // Client-local repaint request sequence copied into TeRepaintResponse. While
   // this repaint is outstanding, the client ignores framed TeDraw messages and
@@ -522,7 +522,7 @@ message TeDraw {
   // session view. Transport loss starts reconnect, so the client keeps this
   // payload active; detach or session-end writes it. Present empty clears a
   // previous restore.
-  optional bytes relay_end_restore_bytes = 4;
+  optional bytes attached_client_end_restore_bytes = 4;
   // Present when this draw includes the current screen title state. True means
   // the remote app has set a terminal title, even if that title is the empty
   // string. False means no app title is known. The client needs this bit so a

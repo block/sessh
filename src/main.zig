@@ -301,7 +301,7 @@ test {
     _ = @import("tty/terminal.zig");
     _ = @import("tty/transcript.zig");
     _ = @import("transport/artifact_manifest.zig");
-    _ = @import("transport/relay.zig");
+    _ = @import("transport/frame_forwarder.zig");
     _ = @import("transport/socket.zig");
     _ = @import("transport/ssh.zig");
 }

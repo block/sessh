@@ -1438,7 +1438,7 @@ pub fn readRouteForRef(allocator: std.mem.Allocator, ref: []const u8) !Route {
 ///
 /// This is used by bare `sesshmux attach`: no host means "pick the session I
 /// last detached from", while `sesshmux attach --host .` is the explicit
-/// local-only form. We only exclude attachments from this machine because doing
+/// local-only form. We only exclude attached clients from this machine because doing
 /// more would require connecting to every host with a cached route just to
 /// answer a local command-line default.
 pub fn readLatestDetachedRouteNotAttachedByThisMachine(allocator: std.mem.Allocator) !?Route {

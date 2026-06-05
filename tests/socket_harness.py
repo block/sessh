@@ -580,7 +580,7 @@ def parse_draw(payload):
         "scrollback_cursor_bytes": message.scrollback_cursor,
         "viewport_offset": message.viewport_offset if message.HasField("viewport_offset") else 0,
         "draw_bytes": message.draw_bytes,
-        "relay_end_restore_bytes": message.relay_end_restore_bytes if message.HasField("relay_end_restore_bytes") else None,
+        "attached_client_end_restore_bytes": message.attached_client_end_restore_bytes if message.HasField("attached_client_end_restore_bytes") else None,
     }
 
 
@@ -1780,7 +1780,7 @@ def run_active_screen_protocol_test(base_env):
                     raise AssertionError(f"DRAW should enter outer alternate screen: {draws!r}")
                 if b"\x1b[?1049l" in output:
                     raise AssertionError(f"DRAW should not leave outer alternate screen immediately: {draws!r}")
-                restore = draw["relay_end_restore_bytes"]
+                restore = draw["attached_client_end_restore_bytes"]
                 if restore is None or b"\x1b[?1049l" not in restore:
                     raise AssertionError(f"DRAW should include alternate-screen cleanup: {draw!r}")
             finally:
@@ -2694,18 +2694,18 @@ def run_screen_repaint_after_presentation_reset_clears_rows_test(base_env):
             cleanup_runtime(env)
 
 
-def run_slow_attachment_does_not_block_commands_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-slow-attachment-", dir="/tmp") as tmp:
+def run_slow_attached_client_does_not_block_commands_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-slow-attached-client-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         env["SHELL"] = "/bin/sh"
-        shell = Path(tmp) / "slow-attachment-shell"
+        shell = Path(tmp) / "slow-attached-client-shell"
         shell.write_text(
             "#!/bin/sh\n"
             "printf 'SLOW_READY$ '\n"
             "while IFS= read -r line; do\n"
             "  python3 - <<'PY'\n"
             "import sys\n"
-            "line = 'SLOW_ATTACHMENT_' + ('x' * 180) + '\\n'\n"
+            "line = 'SLOW_ATTACHED_CLIENT_' + ('x' * 180) + '\\n'\n"
             "for _ in range(20000):\n"
             "    sys.stdout.write(line)\n"
             "sys.stdout.flush()\n"
@@ -2742,7 +2742,7 @@ def run_slow_attachment_does_not_block_commands_test(base_env):
                 compat_env["SESSH_COMPAT"] = "1"
                 listed = run([".", "list"], compat_env, check=True, timeout=2.0)
             except subprocess.TimeoutExpired as exc:
-                raise AssertionError("management command path blocked behind a slow attachment") from exc
+                raise AssertionError("management command path blocked behind a slow attached client") from exc
             assert_list_header(listed.stdout)
         finally:
             if conn is not None:
@@ -2887,7 +2887,7 @@ def run_session_agent_registry_test(base_env):
                 raise AssertionError("session agent did not recreate socket link")
             live_state = wait_session_attached(env, session_42_guid, timeout=10.0)
             if live_state.HasField("detached_at_unix_ms"):
-                raise AssertionError(f"live state became detached while an attachment was active: {live_state}")
+                raise AssertionError(f"live state became detached while an attached client was active: {live_state}")
 
             rescued_attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             rescued_attach.settimeout(5.0)
@@ -4003,7 +4003,7 @@ def main():
             run_reconnect_scrollback_gap_protocol_test(env)
             run_resize_epoch_does_not_clear_reconnect_scrollback_test(env)
             run_screen_repaint_after_presentation_reset_clears_rows_test(env)
-            run_slow_attachment_does_not_block_commands_test(env)
+            run_slow_attached_client_does_not_block_commands_test(env)
             run_env_config_client_test(tmp)
             run_tty_transcript_capture_test(tmp)
             run_initial_kitty_keyboard_restore_test(tmp)

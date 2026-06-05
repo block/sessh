@@ -112,7 +112,7 @@ const ErrorPayload = struct {
     hint: []const u8,
 };
 
-pub const RelayEnd = enum {
+pub const AttachedClientEnd = enum {
     detach,
     kill_detach,
     kill_wait,
@@ -158,7 +158,7 @@ pub const CreatedSession = struct {
     }
 };
 
-pub const RelayOptions = struct {
+pub const AttachedClientOptions = struct {
     monitor_connection: bool = false,
     responsiveness_timeout_floor_ms: i64 = default_responsiveness_timeout_ms,
 };
@@ -380,7 +380,7 @@ pub const RuntimeSession = struct {
     viewport_offset: i32 = 0,
     /// Latest outstanding RepaintRequest sequence. Older responses are stale.
     pending_repaint: PendingRepaint = .{},
-    relay_end_restore: std.ArrayList(u8) = .empty,
+    attached_client_end_restore: std.ArrayList(u8) = .empty,
     unresponsive_timeout_floor_ms: i64 = default_responsiveness_timeout_ms,
     input_ack_tracker: InputAckTracker = .{},
     input_escape_filter: terminal.EscapeFilter = .{},
@@ -420,18 +420,18 @@ pub const RuntimeSession = struct {
         self.input_ack_tracker.discardPending();
     }
 
-    pub fn restoreRelayEndPresentation(self: *RuntimeSession) void {
-        restoreRelayEndPresentationBytes(&self.relay_end_restore);
+    pub fn restoreAttachedClientEndPresentation(self: *RuntimeSession) void {
+        restoreAttachedClientEndPresentationBytes(&self.attached_client_end_restore);
     }
 
-    pub fn restoreRelayEndPresentationForExit(self: *RuntimeSession) void {
-        self.restoreRelayEndPresentation();
+    pub fn restoreAttachedClientEndPresentationForExit(self: *RuntimeSession) void {
+        self.restoreAttachedClientEndPresentation();
         restoreLocalTerminalPresentation();
     }
 
     pub fn deinit(self: *RuntimeSession) void {
-        self.relay_end_restore.deinit(app_allocator.allocator());
-        self.relay_end_restore = .empty;
+        self.attached_client_end_restore.deinit(app_allocator.allocator());
+        self.attached_client_end_restore = .empty;
     }
 
     pub fn idSlice(self: *const RuntimeSession) []const u8 {
@@ -628,7 +628,7 @@ const DrawPayload = struct {
     viewport_offset: i32,
     draw_bytes: []const u8,
     app_title_present: ?bool,
-    relay_end_restore_bytes: ?[]const u8,
+    attached_client_end_restore_bytes: ?[]const u8,
 };
 
 test "connection monitor starts responsiveness wait after input" {
@@ -715,26 +715,26 @@ test "resize repaint timeout waits for short grace period" {
     try std.testing.expect(!pending.resizeTimedOut(3_000));
 }
 
-test "resize repaint timeout clears stale relay display and enters unresponsive state" {
+test "resize repaint timeout clears stale attached client display and enters unresponsive state" {
     var pending = PendingRepaint{};
     _ = pending.startResizeAt(1_000);
     var viewport_offset: i32 = 7;
 
     try std.testing.expectEqual(
-        @as(?RelayEnd, null),
+        @as(?AttachedClientEnd, null),
         checkResizeRepaintTimeout(&pending, &viewport_offset, 1_999),
     );
     try std.testing.expectEqual(@as(i32, 7), viewport_offset);
 
     try std.testing.expectEqual(
-        RelayEnd.unresponsive,
+        AttachedClientEnd.unresponsive,
         checkResizeRepaintTimeout(&pending, &viewport_offset, 2_000).?,
     );
     try std.testing.expectEqual(@as(i32, 0), viewport_offset);
     try std.testing.expect(pending.requiresRepaintForRecovery());
 }
 
-test "relay drains pending session end before monitor timeout" {
+test "attached client drains pending session end before monitor timeout" {
     const input = try posix.pipe();
     defer posix.close(input[0]);
     defer posix.close(input[1]);
@@ -758,8 +758,8 @@ test "relay drains pending session end before monitor timeout" {
     var scrollback_cursor = ScrollbackCursor{};
     var viewport_offset: i32 = 0;
     var pending_repaint = PendingRepaint{};
-    var relay_end_restore = std.ArrayList(u8).empty;
-    defer relay_end_restore.deinit(app_allocator.allocator());
+    var attached_client_end_restore = std.ArrayList(u8).empty;
+    defer attached_client_end_restore.deinit(app_allocator.allocator());
     var input_ack_tracker = InputAckTracker{};
     var app_title_present: ?bool = null;
     var input_escape_filter = terminal.EscapeFilter{};
@@ -767,8 +767,8 @@ test "relay drains pending session end before monitor timeout" {
     var kill_requested = false;
 
     try std.testing.expectEqual(
-        RelayEnd.session_ended,
-        try relayTerminal(
+        AttachedClientEnd.session_ended,
+        try runAttachedTerminal(
             input[0],
             remote_to_client[0],
             @as(c.fd_t, -1),
@@ -777,7 +777,7 @@ test "relay drains pending session end before monitor timeout" {
             &scrollback_cursor,
             &viewport_offset,
             &pending_repaint,
-            &relay_end_restore,
+            &attached_client_end_restore,
             &input_ack_tracker,
             &paste_like_input_classifier,
             &kill_requested,
@@ -788,7 +788,7 @@ test "relay drains pending session end before monitor timeout" {
     );
 }
 
-test "relay treats input write failure as transport closed" {
+test "attached client treats input write failure as transport closed" {
     const input = try posix.pipe();
     defer posix.close(input[0]);
     defer posix.close(input[1]);
@@ -800,8 +800,8 @@ test "relay treats input write failure as transport closed" {
     var scrollback_cursor = ScrollbackCursor{};
     var viewport_offset: i32 = 0;
     var pending_repaint = PendingRepaint{};
-    var relay_end_restore = std.ArrayList(u8).empty;
-    defer relay_end_restore.deinit(app_allocator.allocator());
+    var attached_client_end_restore = std.ArrayList(u8).empty;
+    defer attached_client_end_restore.deinit(app_allocator.allocator());
     var input_ack_tracker = InputAckTracker{};
     var input_escape_filter = terminal.EscapeFilter{};
     var paste_like_input_classifier = PasteLikeInputClassifier{};
@@ -811,8 +811,8 @@ test "relay treats input write failure as transport closed" {
     try io_helpers.writeAll(input[1], "typed");
 
     try std.testing.expectEqual(
-        RelayEnd.transport_closed,
-        try relayTerminal(
+        AttachedClientEnd.transport_closed,
+        try runAttachedTerminal(
             input[0],
             remote_to_client[0],
             @as(c.fd_t, -1),
@@ -821,7 +821,7 @@ test "relay treats input write failure as transport closed" {
             &scrollback_cursor,
             &viewport_offset,
             &pending_repaint,
-            &relay_end_restore,
+            &attached_client_end_restore,
             &input_ack_tracker,
             &paste_like_input_classifier,
             &kill_requested,
@@ -832,28 +832,28 @@ test "relay treats input write failure as transport closed" {
     );
 }
 
-test "relay keeps relay-end restore bytes while reconnecting" {
-    var relay_end_restore = std.ArrayList(u8).empty;
-    defer relay_end_restore.deinit(app_allocator.allocator());
-    try relay_end_restore.appendSlice(app_allocator.allocator(), "restore-primary");
+test "attached client keeps attached-client-end restore bytes while reconnecting" {
+    var attached_client_end_restore = std.ArrayList(u8).empty;
+    defer attached_client_end_restore.deinit(app_allocator.allocator());
+    try attached_client_end_restore.appendSlice(app_allocator.allocator(), "restore-primary");
 
-    try std.testing.expectEqual(RelayEnd.transport_closed, finishRelay(.transport_closed, &relay_end_restore));
-    try std.testing.expectEqualStrings("restore-primary", relay_end_restore.items);
+    try std.testing.expectEqual(AttachedClientEnd.transport_closed, finishAttachedClient(.transport_closed, &attached_client_end_restore));
+    try std.testing.expectEqualStrings("restore-primary", attached_client_end_restore.items);
 
-    try std.testing.expectEqual(RelayEnd.unresponsive, finishRelay(.unresponsive, &relay_end_restore));
-    try std.testing.expectEqualStrings("restore-primary", relay_end_restore.items);
+    try std.testing.expectEqual(AttachedClientEnd.unresponsive, finishAttachedClient(.unresponsive, &attached_client_end_restore));
+    try std.testing.expectEqualStrings("restore-primary", attached_client_end_restore.items);
 }
 
-test "final relay-end restore writes and clears saved cleanup bytes" {
+test "final attached-client-end restore writes and clears saved cleanup bytes" {
     const output = try posix.pipe();
     defer posix.close(output[0]);
     defer posix.close(output[1]);
 
-    var relay_end_restore = std.ArrayList(u8).empty;
-    defer relay_end_restore.deinit(app_allocator.allocator());
-    try relay_end_restore.appendSlice(app_allocator.allocator(), "restore-primary");
+    var attached_client_end_restore = std.ArrayList(u8).empty;
+    defer attached_client_end_restore.deinit(app_allocator.allocator());
+    try attached_client_end_restore.appendSlice(app_allocator.allocator(), "restore-primary");
 
-    restoreRelayEndPresentationBytesToFd(output[1], &relay_end_restore);
+    restoreAttachedClientEndPresentationBytesToFd(output[1], &attached_client_end_restore);
 
     var pollfds = [_]posix.pollfd{.{
         .fd = output[0],
@@ -866,7 +866,7 @@ test "final relay-end restore writes and clears saved cleanup bytes" {
     const n = c.read(output[0], &buf, buf.len);
     if (n < 0) return error.ReadFailed;
     try std.testing.expectEqualStrings("restore-primary", buf[0..@intCast(n)]);
-    try std.testing.expectEqual(@as(usize, 0), relay_end_restore.items.len);
+    try std.testing.expectEqual(@as(usize, 0), attached_client_end_restore.items.len);
 }
 
 test "cancelled reconnect frame read returns without input" {
@@ -900,32 +900,32 @@ test "draw payload updates runtime app title presence state" {
         .viewport_offset = 0,
         .draw_bytes = "",
         .app_title_present = false,
-        .relay_end_restore_bytes = null,
+        .attached_client_end_restore_bytes = null,
     }, null, &scrollback_cursor, &viewport_offset, &app_title_present);
 
     try std.testing.expect(app_title_present != null);
     try std.testing.expect(!app_title_present.?);
 }
 
-test "recovery polling stores relay-end restore bytes from draw" {
+test "recovery polling stores attached-client-end restore bytes from draw" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
     var session = RuntimeSession{};
-    defer session.relay_end_restore.deinit(app_allocator.allocator());
+    defer session.attached_client_end_restore.deinit(app_allocator.allocator());
 
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeDraw{
         .scrollback_cursor = "opaque-cursor",
         .viewport_offset = 0,
         .draw_bytes = "",
-        .relay_end_restore_bytes = "restore-primary",
+        .attached_client_end_restore_bytes = "restore-primary",
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fds[1], .te_draw, payload);
 
     try std.testing.expectEqual(RuntimeRecovery.recovered, (try pollRuntimeRecovery(fds[0], &session, 0)).?);
-    try std.testing.expectEqualStrings("restore-primary", session.relay_end_restore.items);
+    try std.testing.expectEqualStrings("restore-primary", session.attached_client_end_restore.items);
 }
 
 test "recovery polling ignores draw while repaint is outstanding" {
@@ -934,7 +934,7 @@ test "recovery polling ignores draw while repaint is outstanding" {
     defer posix.close(fds[1]);
 
     var session = RuntimeSession{ .pending_repaint = .{ .repaint_request_seq = 7 } };
-    defer session.relay_end_restore.deinit(app_allocator.allocator());
+    defer session.attached_client_end_restore.deinit(app_allocator.allocator());
 
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeDraw{
         .scrollback_cursor = "stale-cursor",
@@ -956,7 +956,7 @@ test "recovery polling waits for resize repaint after input ack" {
     defer posix.close(fds[1]);
 
     var session = RuntimeSession{};
-    defer session.relay_end_restore.deinit(app_allocator.allocator());
+    defer session.attached_client_end_restore.deinit(app_allocator.allocator());
     const repaint_seq = session.pending_repaint.startResizeAt(1_000);
 
     const ack_payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeInputAck{
@@ -991,7 +991,7 @@ test "repaint response applies only latest outstanding request" {
             .scrollback_cursor = "cursor-v7",
             .viewport_offset = 4,
             .draw_bytes = "",
-            .relay_end_restore_bytes = "restore-v7",
+            .attached_client_end_restore_bytes = "restore-v7",
         },
     });
     defer app_allocator.allocator().free(payload);
@@ -1062,7 +1062,7 @@ test "reconnect waits for repaint response before returning" {
     try protocol.sendFrame(remote_to_client[1], .te_repaint_response, repaint_response);
 
     var session = RuntimeSession{};
-    defer session.relay_end_restore.deinit(app_allocator.allocator());
+    defer session.attached_client_end_restore.deinit(app_allocator.allocator());
     try session.scrollback_cursor.set("old-cursor");
 
     try reconnectSessionOnRuntime(remote_to_client[0], client_to_remote[1], &session);
@@ -1094,7 +1094,7 @@ test "runtime repaint after local ui requests screen-only repaint" {
     try protocol.sendFrame(remote_to_client[1], .te_repaint_response, repaint_response);
 
     var session = RuntimeSession{};
-    defer session.relay_end_restore.deinit(app_allocator.allocator());
+    defer session.attached_client_end_restore.deinit(app_allocator.allocator());
     try session.scrollback_cursor.set("old-cursor");
     session.viewport_offset = 5;
 
@@ -1134,21 +1134,21 @@ test "client repaint request sends screen-only repaint request" {
     var scrollback_cursor = ScrollbackCursor{};
     var viewport_offset: i32 = 0;
     var pending_repaint = PendingRepaint{};
-    var relay_end_restore = std.ArrayList(u8).empty;
-    defer relay_end_restore.deinit(app_allocator.allocator());
+    var attached_client_end_restore = std.ArrayList(u8).empty;
+    defer attached_client_end_restore.deinit(app_allocator.allocator());
     var input_ack_tracker = InputAckTracker{};
     var app_title_present: ?bool = null;
 
     try std.testing.expectEqual(
-        @as(?RelayEnd, null),
-        try handleRelayRuntimeFrame(
+        @as(?AttachedClientEnd, null),
+        try handleAttachedClientRuntimeFrame(
             remote_to_client[0],
             client_to_remote[1],
             &connection_monitor,
             &scrollback_cursor,
             &viewport_offset,
             &pending_repaint,
-            &relay_end_restore,
+            &attached_client_end_restore,
             &input_ack_tracker,
             null,
             &app_title_present,
@@ -1187,21 +1187,21 @@ test "client repaint request can request retained scrollback" {
     var scrollback_cursor = ScrollbackCursor{};
     var viewport_offset: i32 = 0;
     var pending_repaint = PendingRepaint{};
-    var relay_end_restore = std.ArrayList(u8).empty;
-    defer relay_end_restore.deinit(app_allocator.allocator());
+    var attached_client_end_restore = std.ArrayList(u8).empty;
+    defer attached_client_end_restore.deinit(app_allocator.allocator());
     var input_ack_tracker = InputAckTracker{};
     var app_title_present: ?bool = null;
 
     try std.testing.expectEqual(
-        @as(?RelayEnd, null),
-        try handleRelayRuntimeFrame(
+        @as(?AttachedClientEnd, null),
+        try handleAttachedClientRuntimeFrame(
             remote_to_client[0],
             client_to_remote[1],
             &connection_monitor,
             &scrollback_cursor,
             &viewport_offset,
             &pending_repaint,
-            &relay_end_restore,
+            &attached_client_end_restore,
             &input_ack_tracker,
             null,
             &app_title_present,
@@ -1221,7 +1221,7 @@ test "client repaint request can request retained scrollback" {
     try std.testing.expectEqual(@as(usize, 0), cursor.len);
 }
 
-test "client detach request uses normal detach relay end" {
+test "client detach request uses normal detach attached client end" {
     const remote_to_client = try posix.pipe();
     defer posix.close(remote_to_client[0]);
     defer posix.close(remote_to_client[1]);
@@ -1237,21 +1237,21 @@ test "client detach request uses normal detach relay end" {
     var scrollback_cursor = ScrollbackCursor{};
     var viewport_offset: i32 = 0;
     var pending_repaint = PendingRepaint{};
-    var relay_end_restore = std.ArrayList(u8).empty;
-    defer relay_end_restore.deinit(app_allocator.allocator());
+    var attached_client_end_restore = std.ArrayList(u8).empty;
+    defer attached_client_end_restore.deinit(app_allocator.allocator());
     var input_ack_tracker = InputAckTracker{};
     var app_title_present: ?bool = null;
 
     try std.testing.expectEqual(
-        RelayEnd.detach,
-        (try handleRelayRuntimeFrame(
+        AttachedClientEnd.detach,
+        (try handleAttachedClientRuntimeFrame(
             remote_to_client[0],
             client_to_remote[1],
             &connection_monitor,
             &scrollback_cursor,
             &viewport_offset,
             &pending_repaint,
-            &relay_end_restore,
+            &attached_client_end_restore,
             &input_ack_tracker,
             null,
             &app_title_present,
@@ -1368,7 +1368,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
     defer removeClientRouteHintForSession(allocator, &session);
 
     while (true) {
-        const end = relayRuntimeSession(
+        const end = runAttachedClient(
             child.stdout.?.handle,
             child.stdin.?.handle,
             &session,
@@ -1382,7 +1382,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
 
         switch (end) {
             .detach => {
-                session.restoreRelayEndPresentationForExit();
+                session.restoreAttachedClientEndPresentationForExit();
                 terminateChild(&child);
                 markRouteDetachedForSession(allocator, &session);
                 try tty_transcript.finishActiveOrReport();
@@ -1393,7 +1393,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
             .kill_detach => {
                 recordRuntimeSessionKillRequested(allocator, ".", &session);
                 route_commands.spawnLocalKillJsonl(allocator, request.exe, &.{session.guidSlice()});
-                session.restoreRelayEndPresentationForExit();
+                session.restoreAttachedClientEndPresentationForExit();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 return;
@@ -1405,13 +1405,13 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
                     .ended_at_unix_ms = nowUnixMs(),
                     .end_reason = .killed_by_request,
                 };
-                session.restoreRelayEndPresentationForExit();
+                session.restoreAttachedClientEndPresentationForExit();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 return;
             },
             .session_ended => {
-                session.restoreRelayEndPresentationForExit();
+                session.restoreAttachedClientEndPresentationForExit();
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
                 try tty_transcript.finishActiveOrReport();
@@ -1424,7 +1424,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
                 if (!anySessionExistsViaBroker(allocator, request.exe, runtime_broker_args)) {
-                    session.restoreRelayEndPresentationForExit();
+                    session.restoreAttachedClientEndPresentationForExit();
                     try io_helpers.writeAll(2, "\r\nsessh: session agent crashed\r\n");
                     return process_exit.request(1);
                 }
@@ -1435,14 +1435,14 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
         try io_helpers.writeAll(2, reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
         try io_helpers.writeAll(2, "\r\n");
         child = startLocalBroker(allocator, request.exe, runtime_broker_args) catch |err| {
-            session.restoreRelayEndPresentationForExit();
+            session.restoreAttachedClientEndPresentationForExit();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
         reconnectSessionOnRuntime(child.stdout.?.handle, child.stdin.?.handle, &session) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
-            session.restoreRelayEndPresentationForExit();
+            session.restoreAttachedClientEndPresentationForExit();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -1599,7 +1599,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
     defer removeClientRouteHintForSession(allocator, &session);
 
     while (true) {
-        const end = relayRuntimeSession(
+        const end = runAttachedClient(
             child.stdout.?.handle,
             child.stdin.?.handle,
             &session,
@@ -1613,7 +1613,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
 
         switch (end) {
             .detach => {
-                session.restoreRelayEndPresentationForExit();
+                session.restoreAttachedClientEndPresentationForExit();
                 terminateChild(&child);
                 markRouteDetachedForSession(allocator, &session);
                 try tty_transcript.finishActiveOrReport();
@@ -1624,7 +1624,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             .kill_detach => {
                 recordRuntimeSessionKillRequested(allocator, ".", &session);
                 route_commands.spawnLocalKillJsonl(allocator, args[0], &.{session.guidSlice()});
-                session.restoreRelayEndPresentationForExit();
+                session.restoreAttachedClientEndPresentationForExit();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 return;
@@ -1636,13 +1636,13 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                     .ended_at_unix_ms = nowUnixMs(),
                     .end_reason = .killed_by_request,
                 };
-                session.restoreRelayEndPresentationForExit();
+                session.restoreAttachedClientEndPresentationForExit();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 return;
             },
             .session_ended => {
-                session.restoreRelayEndPresentationForExit();
+                session.restoreAttachedClientEndPresentationForExit();
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
                 try tty_transcript.finishActiveOrReport();
@@ -1655,7 +1655,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
                 if (!anySessionExistsViaBroker(allocator, args[0], runtime_broker_args)) {
-                    session.restoreRelayEndPresentationForExit();
+                    session.restoreAttachedClientEndPresentationForExit();
                     try io_helpers.writeAll(2, "\r\nsessh: session agent crashed\r\n");
                     return process_exit.request(1);
                 }
@@ -1666,14 +1666,14 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         try io_helpers.writeAll(2, reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
         try io_helpers.writeAll(2, "\r\n");
         child = startLocalBroker(allocator, args[0], runtime_broker_args) catch |err| {
-            session.restoreRelayEndPresentationForExit();
+            session.restoreAttachedClientEndPresentationForExit();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
         reconnectSessionOnRuntime(child.stdout.?.handle, child.stdin.?.handle, &session) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
-            session.restoreRelayEndPresentationForExit();
+            session.restoreAttachedClientEndPresentationForExit();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -2934,7 +2934,7 @@ fn finishReconnectRepaintInner(
             .te_repaint_response => {
                 _ = try handleRepaintResponseFrame(
                     frame.payload,
-                    &session.relay_end_restore,
+                    &session.attached_client_end_restore,
                     &session.scrollback_cursor,
                     &session.viewport_offset,
                     &session.pending_repaint,
@@ -2962,20 +2962,20 @@ fn finishReconnectRepaintInner(
     }
 }
 
-pub fn relayRuntimeSession(
+pub fn runAttachedClient(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     session: *RuntimeSession,
-    options: RelayOptions,
-) !RelayEnd {
-    return relayInteractive(
+    options: AttachedClientOptions,
+) !AttachedClientEnd {
+    return runAttachedClientLoop(
         read_fd,
         write_fd,
         &session.input_escape_filter,
         &session.scrollback_cursor,
         &session.viewport_offset,
         &session.pending_repaint,
-        &session.relay_end_restore,
+        &session.attached_client_end_restore,
         &session.input_ack_tracker,
         &session.paste_like_input_classifier,
         &session.kill_requested,
@@ -3012,13 +3012,13 @@ pub fn pollRuntimeRecovery(
     switch (frame.message_type) {
         .te_draw => {
             if (session.pending_repaint.active()) return null;
-            try handleDrawFrame(frame.payload, &session.relay_end_restore, &session.scrollback_cursor, &session.viewport_offset, &session.app_title_present);
+            try handleDrawFrame(frame.payload, &session.attached_client_end_restore, &session.scrollback_cursor, &session.viewport_offset, &session.app_title_present);
             return .recovered;
         },
         .te_repaint_response => {
             const applied = try handleRepaintResponseFrame(
                 frame.payload,
-                &session.relay_end_restore,
+                &session.attached_client_end_restore,
                 &session.scrollback_cursor,
                 &session.viewport_offset,
                 &session.pending_repaint,
@@ -3035,7 +3035,7 @@ pub fn pollRuntimeRecovery(
         .te_client_detach_request => {
             var request = try protocol.decodePayload(pb.TeClientDetachRequest, app_allocator.allocator(), frame.payload);
             defer request.deinit(app_allocator.allocator());
-            _ = finishRelay(.detach, &session.relay_end_restore);
+            _ = finishAttachedClient(.detach, &session.attached_client_end_restore);
             return .detach;
         },
         .te_tty_transcript_chunk => {
@@ -3044,12 +3044,12 @@ pub fn pollRuntimeRecovery(
         },
         .te_session_ended => {
             try session.recordSessionEndedPayload(frame.payload);
-            _ = finishRelay(.session_ended, &session.relay_end_restore);
+            _ = finishAttachedClient(.session_ended, &session.attached_client_end_restore);
             return .session_ended;
         },
         .error_message => {
             try printErrorPayload(frame.payload);
-            _ = finishRelay(.session_ended, &session.relay_end_restore);
+            _ = finishAttachedClient(.session_ended, &session.attached_client_end_restore);
             return .session_ended;
         },
         else => return error.UnexpectedFrame,
@@ -3754,21 +3754,21 @@ fn listHasAnySession(stdout: []const u8) bool {
     return false;
 }
 
-fn relayInteractive(
+fn runAttachedClientLoop(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     input_escape_filter: *terminal.EscapeFilter,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
-    relay_end_restore: *std.ArrayList(u8),
+    attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
     kill_requested: *bool,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     app_title_present: *?bool,
-    options: RelayOptions,
-) !RelayEnd {
+    options: AttachedClientOptions,
+) !AttachedClientEnd {
     const initial_kitty_keyboard_flags = client_ui.queryInitialKittyKeyboardFlags();
     var mode_guard = try terminal.TerminalModeGuard.enable(0);
     defer mode_guard.restore();
@@ -3784,7 +3784,7 @@ fn relayInteractive(
         client_renderer.PresentationGuard.initWithInitialKittyKeyboardFlags(1, initial_kitty_keyboard_flags);
     defer presentation_guard.restore();
 
-    const end = try relayTerminal(
+    const end = try runAttachedTerminal(
         0,
         read_fd,
         write_fd,
@@ -3793,7 +3793,7 @@ fn relayInteractive(
         scrollback_cursor,
         viewport_offset,
         pending_repaint,
-        relay_end_restore,
+        attached_client_end_restore,
         input_ack_tracker,
         paste_like_input_classifier,
         kill_requested,
@@ -3805,7 +3805,7 @@ fn relayInteractive(
     return end;
 }
 
-fn relayTerminal(
+fn runAttachedTerminal(
     input_fd: c.fd_t,
     read_fd: c.fd_t,
     write_fd: c.fd_t,
@@ -3814,14 +3814,14 @@ fn relayTerminal(
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
-    relay_end_restore: *std.ArrayList(u8),
+    attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
     kill_requested: *bool,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     app_title_present: *?bool,
-    options: RelayOptions,
-) !RelayEnd {
+    options: AttachedClientOptions,
+) !AttachedClientEnd {
     _ = kill_requested;
     var pollfds = [_]posix.pollfd{
         .{ .fd = input_fd, .events = posix.POLL.IN, .revents = 0 },
@@ -3840,35 +3840,35 @@ fn relayTerminal(
         _ = try posix.poll(&pollfds, connection_monitor.pollTimeoutMs());
 
         if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (try drainRelayRuntimeFrames(
+            if (try drainAttachedClientRuntimeFrames(
                 read_fd,
                 write_fd,
                 &connection_monitor,
                 scrollback_cursor,
                 viewport_offset,
                 pending_repaint,
-                relay_end_restore,
+                attached_client_end_restore,
                 input_ack_tracker,
                 ended_tombstone_details,
                 app_title_present,
-            )) |end| return finishRelay(end, relay_end_restore);
+            )) |end| return finishAttachedClient(end, attached_client_end_restore);
         }
 
         if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             const n = c.read(input_fd, &buf, buf.len);
-            if (n <= 0) return finishRelay(requestSessionDetach(read_fd, write_fd), relay_end_restore);
+            if (n <= 0) return finishAttachedClient(requestSessionDetach(read_fd, write_fd), attached_client_end_restore);
             io_helpers.noteRead(input_fd, buf[0..@intCast(n)]);
             const result = input_escape_filter.filter(buf[0..@intCast(n)], &filtered);
             if (result.bytes.len > 0) {
                 const paste_like = paste_like_input_classifier.classify(result.bytes.len);
                 sendInputChunks(write_fd, result.bytes, input_ack_tracker, paste_like) catch |err| switch (err) {
-                    error.WriteFailed => return try finishRelayAfterRuntimeWriteFailed(
+                    error.WriteFailed => return try finishAttachedClientAfterRuntimeWriteFailed(
                         read_fd,
                         &connection_monitor,
                         scrollback_cursor,
                         viewport_offset,
                         pending_repaint,
-                        relay_end_restore,
+                        attached_client_end_restore,
                         input_ack_tracker,
                         ended_tombstone_details,
                         app_title_present,
@@ -3878,9 +3878,9 @@ fn relayTerminal(
                 connection_monitor.afterInput();
             }
             if (result.end) |end| switch (end) {
-                .detach => return finishRelay(requestSessionDetach(read_fd, write_fd), relay_end_restore),
-                .kill => return finishRelay(.kill_detach, relay_end_restore),
-                .kill_wait => return finishRelay(.kill_wait, relay_end_restore),
+                .detach => return finishAttachedClient(requestSessionDetach(read_fd, write_fd), attached_client_end_restore),
+                .kill => return finishAttachedClient(.kill_detach, attached_client_end_restore),
+                .kill_wait => return finishAttachedClient(.kill_wait, attached_client_end_restore),
                 .help => {
                     if (try showEscapeHelpModal(
                         input_fd,
@@ -3890,16 +3890,16 @@ fn relayTerminal(
                         pending_repaint,
                         input_ack_tracker,
                         ended_tombstone_details,
-                    )) |modal_end| return finishRelay(modal_end, relay_end_restore);
+                    )) |modal_end| return finishAttachedClient(modal_end, attached_client_end_restore);
                 },
                 .repaint => sendRepaint(write_fd, "", pending_repaint) catch |err| switch (err) {
-                    error.WriteFailed => return try finishRelayAfterRuntimeWriteFailed(
+                    error.WriteFailed => return try finishAttachedClientAfterRuntimeWriteFailed(
                         read_fd,
                         &connection_monitor,
                         scrollback_cursor,
                         viewport_offset,
                         pending_repaint,
-                        relay_end_restore,
+                        attached_client_end_restore,
                         input_ack_tracker,
                         ended_tombstone_details,
                         app_title_present,
@@ -3910,13 +3910,13 @@ fn relayTerminal(
         }
 
         maybeSendResize(write_fd, &last_size, scrollback_cursor, viewport_offset, pending_repaint) catch |err| switch (err) {
-            error.WriteFailed => return try finishRelayAfterRuntimeWriteFailed(
+            error.WriteFailed => return try finishAttachedClientAfterRuntimeWriteFailed(
                 read_fd,
                 &connection_monitor,
                 scrollback_cursor,
                 viewport_offset,
                 pending_repaint,
-                relay_end_restore,
+                attached_client_end_restore,
                 input_ack_tracker,
                 ended_tombstone_details,
                 app_title_present,
@@ -3940,7 +3940,7 @@ fn showEscapeHelpModal(
     pending_repaint: *PendingRepaint,
     input_ack_tracker: *InputAckTracker,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
-) !?RelayEnd {
+) !?AttachedClientEnd {
     // The help overlay is local UI, not part of the remote terminal model. While
     // it is visible, remote draw frames are discarded and a repaint is requested
     // after dismissal so the client resumes from the session agent's latest
@@ -4040,7 +4040,7 @@ fn drainEscapeHelpRuntimeFrames(
     write_fd: c.fd_t,
     input_ack_tracker: *InputAckTracker,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
-) !?RelayEnd {
+) !?AttachedClientEnd {
     while (true) {
         var runtime_poll = [_]posix.pollfd{.{
             .fd = read_fd,
@@ -4065,7 +4065,7 @@ fn handleEscapeHelpRuntimeFrame(
     write_fd: c.fd_t,
     input_ack_tracker: *InputAckTracker,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
-) !?RelayEnd {
+) !?AttachedClientEnd {
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
@@ -4106,18 +4106,18 @@ fn handleEscapeHelpRuntimeFrame(
     }
 }
 
-fn drainRelayRuntimeFrames(
+fn drainAttachedClientRuntimeFrames(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     connection_monitor: *ConnectionMonitor,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
-    relay_end_restore: *std.ArrayList(u8),
+    attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     app_title_present: *?bool,
-) !?RelayEnd {
+) !?AttachedClientEnd {
     while (true) {
         var runtime_poll = [_]posix.pollfd{.{
             .fd = read_fd,
@@ -4133,14 +4133,14 @@ fn drainRelayRuntimeFrames(
         }
         if ((revents & posix.POLL.IN) == 0) return null;
 
-        if (try handleRelayRuntimeFrame(
+        if (try handleAttachedClientRuntimeFrame(
             read_fd,
             write_fd,
             connection_monitor,
             scrollback_cursor,
             viewport_offset,
             pending_repaint,
-            relay_end_restore,
+            attached_client_end_restore,
             input_ack_tracker,
             ended_tombstone_details,
             app_title_present,
@@ -4148,57 +4148,57 @@ fn drainRelayRuntimeFrames(
     }
 }
 
-fn finishRelayAfterRuntimeWriteFailed(
+fn finishAttachedClientAfterRuntimeWriteFailed(
     read_fd: c.fd_t,
     connection_monitor: *ConnectionMonitor,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
-    relay_end_restore: *std.ArrayList(u8),
+    attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     app_title_present: *?bool,
-) !RelayEnd {
-    if (try drainRelayRuntimeFrames(
+) !AttachedClientEnd {
+    if (try drainAttachedClientRuntimeFrames(
         read_fd,
         @as(c.fd_t, -1),
         connection_monitor,
         scrollback_cursor,
         viewport_offset,
         pending_repaint,
-        relay_end_restore,
+        attached_client_end_restore,
         input_ack_tracker,
         ended_tombstone_details,
         app_title_present,
-    )) |end| return finishRelay(end, relay_end_restore);
+    )) |end| return finishAttachedClient(end, attached_client_end_restore);
     return .transport_closed;
 }
 
-fn handleRelayRuntimeFrame(
+fn handleAttachedClientRuntimeFrame(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     connection_monitor: *ConnectionMonitor,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
-    relay_end_restore: *std.ArrayList(u8),
+    attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     app_title_present: *?bool,
-) !?RelayEnd {
+) !?AttachedClientEnd {
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
         .te_draw => {
             if (!pending_repaint.active()) {
-                try handleDrawFrame(frame.payload, relay_end_restore, scrollback_cursor, viewport_offset, app_title_present);
+                try handleDrawFrame(frame.payload, attached_client_end_restore, scrollback_cursor, viewport_offset, app_title_present);
             }
             return null;
         },
         .te_repaint_response => {
             _ = try handleRepaintResponseFrame(
                 frame.payload,
-                relay_end_restore,
+                attached_client_end_restore,
                 scrollback_cursor,
                 viewport_offset,
                 pending_repaint,
@@ -4256,19 +4256,19 @@ fn handleRelayRuntimeFrame(
     }
 }
 
-fn finishRelay(end: RelayEnd, relay_end_restore: ?*std.ArrayList(u8)) RelayEnd {
+fn finishAttachedClient(end: AttachedClientEnd, attached_client_end_restore: ?*std.ArrayList(u8)) AttachedClientEnd {
     if (end == .detach or end == .session_ended) {
-        restoreRelayEndPresentationBytes(relay_end_restore);
+        restoreAttachedClientEndPresentationBytes(attached_client_end_restore);
     }
     return end;
 }
 
-fn restoreRelayEndPresentationBytes(relay_end_restore: ?*std.ArrayList(u8)) void {
-    restoreRelayEndPresentationBytesToFd(1, relay_end_restore);
+fn restoreAttachedClientEndPresentationBytes(attached_client_end_restore: ?*std.ArrayList(u8)) void {
+    restoreAttachedClientEndPresentationBytesToFd(1, attached_client_end_restore);
 }
 
-fn restoreRelayEndPresentationBytesToFd(fd: c.fd_t, relay_end_restore: ?*std.ArrayList(u8)) void {
-    const restore = relay_end_restore orelse return;
+fn restoreAttachedClientEndPresentationBytesToFd(fd: c.fd_t, attached_client_end_restore: ?*std.ArrayList(u8)) void {
+    const restore = attached_client_end_restore orelse return;
     if (restore.items.len == 0) return;
     io_helpers.writeAll(fd, restore.items) catch {};
     restore.clearRetainingCapacity();
@@ -4292,13 +4292,13 @@ fn clearVisibleAfterResizeTimeout(viewport_offset: *i32) void {
     renderer.clearVisible() catch {};
 }
 
-fn checkResizeRepaintTimeout(pending_repaint: *const PendingRepaint, viewport_offset: *i32, now_ms: i64) ?RelayEnd {
+fn checkResizeRepaintTimeout(pending_repaint: *const PendingRepaint, viewport_offset: *i32, now_ms: i64) ?AttachedClientEnd {
     if (!pending_repaint.resizeTimedOut(now_ms)) return null;
     clearVisibleAfterResizeTimeout(viewport_offset);
     return .unresponsive;
 }
 
-fn requestSessionDetach(read_fd: c.fd_t, write_fd: c.fd_t) RelayEnd {
+fn requestSessionDetach(read_fd: c.fd_t, write_fd: c.fd_t) AttachedClientEnd {
     _ = read_fd;
     _ = write_fd;
     return .detach;
@@ -4311,19 +4311,19 @@ fn writeDetachBoundary() void {
 
 fn handleDrawFrame(
     payload: []const u8,
-    relay_end_restore: ?*std.ArrayList(u8),
+    attached_client_end_restore: ?*std.ArrayList(u8),
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     app_title_present: ?*?bool,
 ) !void {
     const draw = try parseDrawPayload(payload);
     defer freeDrawPayload(draw);
-    try handleDrawPayload(draw, relay_end_restore, scrollback_cursor, viewport_offset, app_title_present);
+    try handleDrawPayload(draw, attached_client_end_restore, scrollback_cursor, viewport_offset, app_title_present);
 }
 
 fn handleRepaintResponseFrame(
     payload: []const u8,
-    relay_end_restore: ?*std.ArrayList(u8),
+    attached_client_end_restore: ?*std.ArrayList(u8),
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
@@ -4335,7 +4335,7 @@ fn handleRepaintResponseFrame(
     const response_draw = response.draw orelse return error.MissingDraw;
     const draw = try drawPayloadFromMessage(response_draw);
     defer freeDrawPayload(draw);
-    try handleDrawPayload(draw, relay_end_restore, scrollback_cursor, viewport_offset, app_title_present);
+    try handleDrawPayload(draw, attached_client_end_restore, scrollback_cursor, viewport_offset, app_title_present);
     pending_repaint.clear();
     return true;
 }
@@ -4367,14 +4367,14 @@ fn handleInputAckFrame(payload: []const u8, input_ack_tracker: *InputAckTracker)
 
 fn handleDrawPayload(
     draw: DrawPayload,
-    relay_end_restore: ?*std.ArrayList(u8),
+    attached_client_end_restore: ?*std.ArrayList(u8),
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
     app_title_present: ?*?bool,
 ) !void {
     try io_helpers.writeAll(1, draw.draw_bytes);
-    if (relay_end_restore) |target| {
-        if (draw.relay_end_restore_bytes) |restore| {
+    if (attached_client_end_restore) |target| {
+        if (draw.attached_client_end_restore_bytes) |restore| {
             target.clearRetainingCapacity();
             try target.appendSlice(app_allocator.allocator(), restore);
         }
@@ -4403,7 +4403,7 @@ fn drawPayloadFromMessage(message: pb.TeDraw) !DrawPayload {
         .viewport_offset = message.viewport_offset orelse 0,
         .draw_bytes = try app_allocator.allocator().dupe(u8, message.draw_bytes),
         .app_title_present = message.app_title_present,
-        .relay_end_restore_bytes = if (message.relay_end_restore_bytes) |restore|
+        .attached_client_end_restore_bytes = if (message.attached_client_end_restore_bytes) |restore|
             try app_allocator.allocator().dupe(u8, restore)
         else
             null,
@@ -4413,7 +4413,7 @@ fn drawPayloadFromMessage(message: pb.TeDraw) !DrawPayload {
 fn freeDrawPayload(draw: DrawPayload) void {
     app_allocator.allocator().free(draw.scrollback_cursor);
     app_allocator.allocator().free(draw.draw_bytes);
-    if (draw.relay_end_restore_bytes) |restore| app_allocator.allocator().free(restore);
+    if (draw.attached_client_end_restore_bytes) |restore| app_allocator.allocator().free(restore);
 }
 
 fn maybeSendResize(

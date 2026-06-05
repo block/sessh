@@ -20,7 +20,7 @@ The path when `sessh` connects to a remote for the first time:
 8. The broker reads the request, and fork/execs itself (the
    binary is running in session-agent mode)
 9. The session-agent creates a unix domain socket and listens for requests.
-10. The broker connects to the unix domain socket and relays messages
+10. The broker connects to the unix domain socket and forwards messages
    between the socket and its stdin/stdout (i.e. back to the client)
 11. The session-agent allocates a PTY and implements a
     [headless terminal emulator](TERMINAL_EMULATOR.md) using libghostty-vt.

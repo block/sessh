@@ -5,7 +5,7 @@ const posix = std.posix;
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 
-pub fn relayFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, agent_fd: c.fd_t) !void {
+pub fn forwardFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, agent_fd: c.fd_t) !void {
     var pollfds = [_]posix.pollfd{
         .{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = agent_fd, .events = posix.POLL.IN, .revents = 0 },

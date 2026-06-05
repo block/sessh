@@ -16,8 +16,8 @@ const tty_settings = @import("../tty/settings.zig");
 const vt = @import("vt.zig");
 
 const max_sessions = 64;
-const max_attachments = 128;
-const max_attachment_output_queue_bytes = 64 * 1024 * 1024;
+const max_attached_clients = 128;
+const max_attached_client_output_queue_bytes = 64 * 1024 * 1024;
 const preferred_live_output_batch_bytes = 1024;
 const max_live_output_reads_per_batch = 64;
 const synchronized_output_max_hold_ms: i64 = 1000;
@@ -89,7 +89,7 @@ const Session = struct {
     }
 };
 
-const Attachment = struct {
+const AttachedClient = struct {
     fd: c.fd_t = -1,
     session_index: usize = 0,
     client_guid: [session_registry.client_guid_len]u8 = [_]u8{0} ** session_registry.client_guid_len,
@@ -109,18 +109,18 @@ const Attachment = struct {
     input_pending_len: usize = 0,
     capture_tty_transcript: bool = false,
 
-    fn queuedBytes(self: *const Attachment) usize {
+    fn queuedBytes(self: *const AttachedClient) usize {
         return self.output.items.len - self.output_offset;
     }
 
-    fn clientGuidSlice(self: *const Attachment) []const u8 {
+    fn clientGuidSlice(self: *const AttachedClient) []const u8 {
         return self.client_guid[0..self.client_guid_len];
     }
 };
 
 const SessionAgent = struct {
     sessions: [max_sessions]Session = [_]Session{Session{}} ** max_sessions,
-    attachments: [max_attachments]Attachment = [_]Attachment{Attachment{}} ** max_attachments,
+    attached_clients: [max_attached_clients]AttachedClient = [_]AttachedClient{AttachedClient{}} ** max_attached_clients,
     next_id: usize = 1,
     running: bool = true,
     shutting_down: bool = false,
@@ -136,7 +136,7 @@ const PollKind = union(enum) {
     shutdown_signal,
     runtime_repair,
     session: usize,
-    attachment: usize,
+    attached_client: usize,
 };
 
 const HandshakeResult = enum {
@@ -279,9 +279,9 @@ const PresentationState = struct {
         }
     }
 
-    // Restore a full-height screen before leaving relay mode, so the user does
+    // Restore a full-height screen before leaving attached-client mode, so the user does
     // not return to a partially painted alternate/full-screen app.
-    fn applyRelayEndRestoreScreen(
+    fn applyAttachedClientEndRestoreScreen(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
         session_rows: u16,
@@ -933,7 +933,7 @@ test "active-screen change uses outer alternate screen" {
     try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
 }
 
-test "relay-end restore leaves outer alternate screen" {
+test "attached-client-end restore leaves outer alternate screen" {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
@@ -959,7 +959,7 @@ test "relay-end restore leaves outer alternate screen" {
     );
     defer primary_screen.deinit(std.testing.allocator);
 
-    try presentation.applyRelayEndRestoreScreen(renderer, 4, &primary_screen);
+    try presentation.applyAttachedClientEndRestoreScreen(renderer, 4, &primary_screen);
     try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[?1049l"));
     try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
 }
@@ -1123,7 +1123,7 @@ fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
 /// Run one long-lived agent for exactly one session directory.
 ///
 /// This is the process shape used by the session-agent architecture. It still
-/// reuses the session agent's terminal and attachment machinery, but it fixes the
+/// reuses the session agent's terminal and attached client machinery, but it fixes the
 /// session id to the registry directory name and exits after that session ends.
 pub fn runSessionAgent(session_dir: []const u8) !void {
     closeInheritedFileDescriptorsForSessionAgent();
@@ -1309,11 +1309,11 @@ fn chmodPath(path: []const u8, mode: c.mode_t) !void {
 fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdown_signal_fd: c.fd_t, runtime_repair_fd: c.fd_t) !void {
     const now_ms = sessionAgentMonotonicMs(session_agent);
     const now_unix_ms = nowUnixMs();
-    clearExpiredDebugUnresponsiveAttachments(session_agent, now_ms);
+    clearExpiredDebugUnresponsiveAttachedClients(session_agent, now_ms);
     if (endReapedSessions(session_agent, now_unix_ms)) return;
 
-    var pollfds: [3 + max_sessions + max_attachments]posix.pollfd = undefined;
-    var kinds: [3 + max_sessions + max_attachments]PollKind = undefined;
+    var pollfds: [3 + max_sessions + max_attached_clients]posix.pollfd = undefined;
+    var kinds: [3 + max_sessions + max_attached_clients]PollKind = undefined;
     var count: usize = 0;
 
     pollfds[count] = .{ .fd = shutdown_signal_fd, .events = posix.POLL.IN, .revents = 0 };
@@ -1337,19 +1337,19 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
         count += 1;
     }
 
-    for (&session_agent.attachments, 0..) |*attachment, i| {
-        if (!attachment.active) continue;
-        const debug_unresponsive = attachment.debug_unresponsive_until_ms > now_ms;
-        var events: i16 = if (attachment.close_after_flush or debug_unresponsive) 0 else posix.POLL.IN;
-        if (!debug_unresponsive and attachment.queuedBytes() > 0) events |= posix.POLL.OUT;
-        pollfds[count] = .{ .fd = attachment.fd, .events = events, .revents = 0 };
-        kinds[count] = .{ .attachment = i };
+    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
+        if (!attached_client.active) continue;
+        const debug_unresponsive = attached_client.debug_unresponsive_until_ms > now_ms;
+        var events: i16 = if (attached_client.close_after_flush or debug_unresponsive) 0 else posix.POLL.IN;
+        if (!debug_unresponsive and attached_client.queuedBytes() > 0) events |= posix.POLL.OUT;
+        pollfds[count] = .{ .fd = attached_client.fd, .events = events, .revents = 0 };
+        kinds[count] = .{ .attached_client = i };
         count += 1;
     }
 
     _ = try posix.poll(pollfds[0..count], sessionAgentPollTimeoutMs(session_agent, now_ms, now_unix_ms));
     const after_poll_ms = sessionAgentMonotonicMs(session_agent);
-    clearExpiredDebugUnresponsiveAttachments(session_agent, after_poll_ms);
+    clearExpiredDebugUnresponsiveAttachedClients(session_agent, after_poll_ms);
     flushExpiredSynchronizedOutputSessions(session_agent, after_poll_ms);
     if (endReapedSessions(session_agent, nowUnixMs())) return;
 
@@ -1360,7 +1360,7 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
             .shutdown_signal => handleShutdownSignalEvent(session_agent, shutdown_signal_fd),
             .runtime_repair => handleRuntimeRepairEvent(session_agent, listen_fd, runtime_repair_fd),
             .session => |session_index| drainSessionOutput(session_agent, session_index),
-            .attachment => |attachment_index| handleAttachmentEvents(session_agent, attachment_index, pollfd.revents),
+            .attached_client => |attached_client_index| handleAttachedClientEvents(session_agent, attached_client_index, pollfd.revents),
         }
     }
 }
@@ -1375,20 +1375,20 @@ fn sessionAgentMonotonicMs(session_agent: *SessionAgent) i64 {
         std.time.milliTimestamp();
 }
 
-fn clearExpiredDebugUnresponsiveAttachments(session_agent: *SessionAgent, now_ms: i64) void {
-    for (&session_agent.attachments) |*attachment| {
-        if (!attachment.active) continue;
-        if (attachment.debug_unresponsive_until_ms != 0 and attachment.debug_unresponsive_until_ms <= now_ms) {
-            attachment.debug_unresponsive_until_ms = 0;
+fn clearExpiredDebugUnresponsiveAttachedClients(session_agent: *SessionAgent, now_ms: i64) void {
+    for (&session_agent.attached_clients) |*attached_client| {
+        if (!attached_client.active) continue;
+        if (attached_client.debug_unresponsive_until_ms != 0 and attached_client.debug_unresponsive_until_ms <= now_ms) {
+            attached_client.debug_unresponsive_until_ms = 0;
         }
     }
 }
 
 fn sessionAgentPollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64, now_unix_ms: u64) i32 {
     var timeout_ms: ?i64 = null;
-    for (&session_agent.attachments) |*attachment| {
-        if (!attachment.active or attachment.debug_unresponsive_until_ms <= now_ms) continue;
-        const remaining_ms = attachment.debug_unresponsive_until_ms - now_ms;
+    for (&session_agent.attached_clients) |*attached_client| {
+        if (!attached_client.active or attached_client.debug_unresponsive_until_ms <= now_ms) continue;
+        const remaining_ms = attached_client.debug_unresponsive_until_ms - now_ms;
         if (timeout_ms == null or remaining_ms < timeout_ms.?) timeout_ms = remaining_ms;
     }
     for (&session_agent.sessions) |*session| {
@@ -1510,18 +1510,18 @@ fn handleShutdownSignalEvent(session_agent: *SessionAgent, shutdown_signal_fd: c
     requestGracefulShutdown(session_agent);
 }
 
-fn handleAttachmentEvents(session_agent: *SessionAgent, attachment_index: usize, revents: i16) void {
+fn handleAttachedClientEvents(session_agent: *SessionAgent, attached_client_index: usize, revents: i16) void {
     if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-        detachAttachment(session_agent, attachment_index);
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     }
     if ((revents & posix.POLL.OUT) != 0) {
-        flushAttachmentOutput(session_agent, attachment_index);
+        flushAttachedClientOutput(session_agent, attached_client_index);
     }
-    if (attachment_index >= session_agent.attachments.len or !session_agent.attachments[attachment_index].active) return;
-    if (session_agent.attachments[attachment_index].close_after_flush) return;
+    if (attached_client_index >= session_agent.attached_clients.len or !session_agent.attached_clients[attached_client_index].active) return;
+    if (session_agent.attached_clients[attached_client_index].close_after_flush) return;
     if ((revents & posix.POLL.IN) != 0) {
-        drainAttachmentInput(session_agent, attachment_index);
+        drainAttachedClientInput(session_agent, attached_client_index);
     }
 }
 
@@ -1769,7 +1769,7 @@ fn sendErrorFrame(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
     try protocol.sendFrame(fd, .error_message, payload);
 }
 
-fn queueAttachmentError(session_agent: *SessionAgent, attachment: *Attachment, code: []const u8, message: []const u8, hint: []const u8) !void {
+fn queueAttachedClientError(session_agent: *SessionAgent, attached_client: *AttachedClient, code: []const u8, message: []const u8, hint: []const u8) !void {
     logSessionAgent(session_agent, "event=error code={s} message={s}", .{ code, message });
     const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
         .code = code,
@@ -1777,88 +1777,88 @@ fn queueAttachmentError(session_agent: *SessionAgent, attachment: *Attachment, c
         .hint = hint,
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .error_message, payload);
+    try queueAttachedClientFrame(attached_client, .error_message, payload);
 }
 
-fn queueAttachmentFrame(attachment: *Attachment, message_type: protocol.MessageType, payload: []const u8) !void {
+fn queueAttachedClientFrame(attached_client: *AttachedClient, message_type: protocol.MessageType, payload: []const u8) !void {
     const frame = try protocol.encodeFrame(app_allocator.allocator(), message_type, payload);
     defer app_allocator.allocator().free(frame);
     const frame_len = frame.len;
-    if (frame_len > max_attachment_output_queue_bytes or
-        attachment.queuedBytes() > max_attachment_output_queue_bytes - frame_len)
+    if (frame_len > max_attached_client_output_queue_bytes or
+        attached_client.queuedBytes() > max_attached_client_output_queue_bytes - frame_len)
     {
-        return error.AttachmentOutputQueueFull;
+        return error.AttachedClientOutputQueueFull;
     }
 
-    compactAttachmentOutput(attachment);
-    try attachment.output.appendSlice(app_allocator.allocator(), frame);
+    compactAttachedClientOutput(attached_client);
+    try attached_client.output.appendSlice(app_allocator.allocator(), frame);
 }
 
-fn compactAttachmentOutput(attachment: *Attachment) void {
-    if (attachment.output_offset == 0) return;
-    if (attachment.output_offset >= attachment.output.items.len) {
-        attachment.output.clearRetainingCapacity();
-        attachment.output_offset = 0;
+fn compactAttachedClientOutput(attached_client: *AttachedClient) void {
+    if (attached_client.output_offset == 0) return;
+    if (attached_client.output_offset >= attached_client.output.items.len) {
+        attached_client.output.clearRetainingCapacity();
+        attached_client.output_offset = 0;
         return;
     }
 
-    const remaining = attachment.output.items.len - attachment.output_offset;
+    const remaining = attached_client.output.items.len - attached_client.output_offset;
     std.mem.copyForwards(
         u8,
-        attachment.output.items[0..remaining],
-        attachment.output.items[attachment.output_offset..],
+        attached_client.output.items[0..remaining],
+        attached_client.output.items[attached_client.output_offset..],
     );
-    attachment.output.shrinkRetainingCapacity(remaining);
-    attachment.output_offset = 0;
+    attached_client.output.shrinkRetainingCapacity(remaining);
+    attached_client.output_offset = 0;
 }
 
-fn flushAttachmentOutput(session_agent: *SessionAgent, attachment_index: usize) void {
-    const attachment = &session_agent.attachments[attachment_index];
-    if (!attachment.active) return;
-    if (attachment.debug_unresponsive_until_ms != 0) {
+fn flushAttachedClientOutput(session_agent: *SessionAgent, attached_client_index: usize) void {
+    const attached_client = &session_agent.attached_clients[attached_client_index];
+    if (!attached_client.active) return;
+    if (attached_client.debug_unresponsive_until_ms != 0) {
         const now_ms = sessionAgentMonotonicMs(session_agent);
-        if (attachment.debug_unresponsive_until_ms > now_ms) return;
-        attachment.debug_unresponsive_until_ms = 0;
+        if (attached_client.debug_unresponsive_until_ms > now_ms) return;
+        attached_client.debug_unresponsive_until_ms = 0;
     }
 
-    while (attachment.output_offset < attachment.output.items.len) {
-        const result = io.writeSomeNonBlocking(attachment.fd, attachment.output.items[attachment.output_offset..]) catch {
-            detachAttachment(session_agent, attachment_index);
+    while (attached_client.output_offset < attached_client.output.items.len) {
+        const result = io.writeSomeNonBlocking(attached_client.fd, attached_client.output.items[attached_client.output_offset..]) catch {
+            detachAttachedClient(session_agent, attached_client_index);
             return;
         };
         switch (result) {
             .wrote => |n| {
                 if (n == 0) break;
-                attachment.output_offset += n;
+                attached_client.output_offset += n;
             },
             .would_block => return,
         }
     }
 
-    if (attachment.output_offset >= attachment.output.items.len) {
-        attachment.output.clearRetainingCapacity();
-        attachment.output_offset = 0;
-        if (attachment.close_after_flush) {
-            detachAttachment(session_agent, attachment_index);
+    if (attached_client.output_offset >= attached_client.output.items.len) {
+        attached_client.output.clearRetainingCapacity();
+        attached_client.output_offset = 0;
+        if (attached_client.close_after_flush) {
+            detachAttachedClient(session_agent, attached_client_index);
         }
     }
 }
 
 fn attachedCount(session_agent: *SessionAgent, session_index: usize) u32 {
     var count: u32 = 0;
-    for (&session_agent.attachments) |*attachment| {
-        if (attachment.active and attachment.session_index == session_index and !attachment.close_after_flush) count += 1;
+    for (&session_agent.attached_clients) |*attached_client| {
+        if (attached_client.active and attached_client.session_index == session_index and !attached_client.close_after_flush) count += 1;
     }
     return count;
 }
 
-fn sendSessionAttachedForSession(session_agent: *const SessionAgent, attachment: *Attachment, session: *const Session) !void {
+fn sendSessionAttachedForSession(session_agent: *const SessionAgent, attached_client: *AttachedClient, session: *const Session) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionAttached{
         .session_guid = session.idSlice(),
         .session_dir = sessionDirSlice(session_agent),
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .te_session_attached, payload);
+    try queueAttachedClientFrame(attached_client, .te_session_attached, payload);
 }
 
 fn sendSessionCreatedForSession(session_agent: *const SessionAgent, fd: c.fd_t, session: *const Session) !void {
@@ -1881,16 +1881,16 @@ fn sendSessionLiveState(session_agent: *SessionAgent, fd: c.fd_t) !void {
 
     if (session.detached_at_unix_ms != 0) response.detached_at_unix_ms = session.detached_at_unix_ms;
     if (session.last_input_at_unix_ms != 0) response.last_input_at_unix_ms = session.last_input_at_unix_ms;
-    for (&session_agent.attachments) |*attachment| {
-        if (!attachment.active or attachment.close_after_flush or attachment.session_index != session_index) continue;
+    for (&session_agent.attached_clients) |*attached_client| {
+        if (!attached_client.active or attached_client.close_after_flush or attached_client.session_index != session_index) continue;
         try response.attached_clients.append(app_allocator.allocator(), .{
-            .client_guid = attachment.clientGuidSlice(),
+            .client_guid = attached_client.clientGuidSlice(),
             .terminal_size = .{
-                .terminal_rows = attachment.rows,
-                .terminal_cols = attachment.cols,
+                .terminal_rows = attached_client.rows,
+                .terminal_cols = attached_client.cols,
             },
-            .attached_at_unix_ms = attachment.attached_at_unix_ms,
-            .last_input_at_unix_ms = if (attachment.last_input_at_unix_ms == 0) null else attachment.last_input_at_unix_ms,
+            .attached_at_unix_ms = attached_client.attached_at_unix_ms,
+            .last_input_at_unix_ms = if (attached_client.last_input_at_unix_ms == 0) null else attached_client.last_input_at_unix_ms,
         });
     }
 
@@ -1900,20 +1900,20 @@ fn sendSessionLiveState(session_agent: *SessionAgent, fd: c.fd_t) !void {
 }
 
 const CapturedClientControlGuids = struct {
-    bufs: [max_attachments][session_registry.client_guid_len]u8 = undefined,
-    lens: [max_attachments]usize = undefined,
+    bufs: [max_attached_clients][session_registry.client_guid_len]u8 = undefined,
+    lens: [max_attached_clients]usize = undefined,
     count: usize = 0,
 };
 
 fn handleSessionClientDetachRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
     var request = try protocol.decodePayload(pb.TeSessionClientDetachRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
-    var selected: [max_attachments]usize = undefined;
+    var selected: [max_attached_clients]usize = undefined;
     const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
     const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
 
-    for (selected[0..selected_count]) |attachment_index| {
-        requestClientDetachFromControl(session_agent, attachment_index);
+    for (selected[0..selected_count]) |attached_client_index| {
+        requestClientDetachFromControl(session_agent, attached_client_index);
     }
     try sendClientControlResponse(fd, captured);
 }
@@ -1921,12 +1921,12 @@ fn handleSessionClientDetachRequest(session_agent: *SessionAgent, fd: c.fd_t, pa
 fn handleSessionClientRepaintRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
     var request = try protocol.decodePayload(pb.TeSessionClientRepaintRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
-    var selected: [max_attachments]usize = undefined;
+    var selected: [max_attached_clients]usize = undefined;
     const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
     const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
 
-    for (selected[0..selected_count]) |attachment_index| {
-        requestClientRepaintFromControl(session_agent, attachment_index, request.include_scrollback);
+    for (selected[0..selected_count]) |attached_client_index| {
+        requestClientRepaintFromControl(session_agent, attached_client_index, request.include_scrollback);
     }
     try sendClientControlResponse(fd, captured);
 }
@@ -1934,12 +1934,12 @@ fn handleSessionClientRepaintRequest(session_agent: *SessionAgent, fd: c.fd_t, p
 fn handleSessionClientDebugSeverConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
     var request = try protocol.decodePayload(pb.TeSessionClientDebugSeverConnectionRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
-    var selected: [max_attachments]usize = undefined;
+    var selected: [max_attached_clients]usize = undefined;
     const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
     const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
 
-    for (selected[0..selected_count]) |attachment_index| {
-        detachAttachment(session_agent, attachment_index);
+    for (selected[0..selected_count]) |attached_client_index| {
+        detachAttachedClient(session_agent, attached_client_index);
     }
     try sendClientControlResponse(fd, captured);
 }
@@ -1947,7 +1947,7 @@ fn handleSessionClientDebugSeverConnectionRequest(session_agent: *SessionAgent, 
 fn handleSessionClientDebugUnresponsiveConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
     var request = try protocol.decodePayload(pb.TeSessionClientDebugUnresponsiveConnectionRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
-    var selected: [max_attachments]usize = undefined;
+    var selected: [max_attached_clients]usize = undefined;
     const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
     const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
 
@@ -1956,9 +1956,9 @@ fn handleSessionClientDebugUnresponsiveConnectionRequest(session_agent: *Session
     else
         request.seconds;
     const until_ms = sessionAgentMonotonicMs(session_agent) + @as(i64, seconds) * std.time.ms_per_s;
-    for (selected[0..selected_count]) |attachment_index| {
-        if (attachment_index < session_agent.attachments.len and session_agent.attachments[attachment_index].active) {
-            session_agent.attachments[attachment_index].debug_unresponsive_until_ms = until_ms;
+    for (selected[0..selected_count]) |attached_client_index| {
+        if (attached_client_index < session_agent.attached_clients.len and session_agent.attached_clients[attached_client_index].active) {
+            session_agent.attached_clients[attached_client_index].debug_unresponsive_until_ms = until_ms;
         }
     }
     try sendClientControlResponse(fd, captured);
@@ -1968,7 +1968,7 @@ fn resolveClientControlTargetsOrSend(
     session_agent: *SessionAgent,
     fd: c.fd_t,
     maybe_target: ?pb.TeClientControlTarget,
-    selected: *[max_attachments]usize,
+    selected: *[max_attached_clients]usize,
 ) !?usize {
     const session_index = findMostRecentSessionIndex(session_agent) orelse {
         try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
@@ -1994,8 +1994,8 @@ fn resolveClientControlTargetsOrSend(
 
 fn captureSelectedClientControlGuids(session_agent: *const SessionAgent, selected: []const usize) CapturedClientControlGuids {
     var captured = CapturedClientControlGuids{ .count = selected.len };
-    for (selected, 0..) |attachment_index, i| {
-        const client_guid = session_agent.attachments[attachment_index].clientGuidSlice();
+    for (selected, 0..) |attached_client_index, i| {
+        const client_guid = session_agent.attached_clients[attached_client_index].clientGuidSlice();
         @memcpy(captured.bufs[i][0..client_guid.len], client_guid);
         captured.lens[i] = client_guid.len;
     }
@@ -2017,7 +2017,7 @@ fn resolveClientControlTargets(
     session_agent: *const SessionAgent,
     session_index: usize,
     target: pb.TeClientControlTarget,
-    selected: *[max_attachments]usize,
+    selected: *[max_attached_clients]usize,
 ) !usize {
     return switch (target.target_kind) {
         .TE_CLIENT_CONTROL_TARGET_KIND_DEFAULT => resolveDefaultClientTarget(session_agent, session_index, selected),
@@ -2028,18 +2028,18 @@ fn resolveClientControlTargets(
     };
 }
 
-fn controlTargetActive(attachment: *const Attachment, session_index: usize) bool {
-    return attachment.active and attachment.session_index == session_index and !attachment.close_after_flush;
+fn controlTargetActive(attached_client: *const AttachedClient, session_index: usize) bool {
+    return attached_client.active and attached_client.session_index == session_index and !attached_client.close_after_flush;
 }
 
 fn resolveDefaultClientTarget(
     session_agent: *const SessionAgent,
     session_index: usize,
-    selected: *[max_attachments]usize,
+    selected: *[max_attached_clients]usize,
 ) !usize {
     var found: ?usize = null;
-    for (&session_agent.attachments, 0..) |*attachment, i| {
-        if (!controlTargetActive(attachment, session_index)) continue;
+    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
+        if (!controlTargetActive(attached_client, session_index)) continue;
         if (found != null) return error.MultipleAttachedClients;
         found = i;
     }
@@ -2050,11 +2050,11 @@ fn resolveDefaultClientTarget(
 fn resolveAllClientTargets(
     session_agent: *const SessionAgent,
     session_index: usize,
-    selected: *[max_attachments]usize,
+    selected: *[max_attached_clients]usize,
 ) !usize {
     var count: usize = 0;
-    for (&session_agent.attachments, 0..) |*attachment, i| {
-        if (!controlTargetActive(attachment, session_index)) continue;
+    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
+        if (!controlTargetActive(attached_client, session_index)) continue;
         selected[count] = i;
         count += 1;
     }
@@ -2065,16 +2065,16 @@ fn resolveAllClientTargets(
 fn resolveLastInputClientTarget(
     session_agent: *const SessionAgent,
     session_index: usize,
-    selected: *[max_attachments]usize,
+    selected: *[max_attached_clients]usize,
 ) !usize {
     var found: ?usize = null;
     var found_ts: u64 = 0;
-    for (&session_agent.attachments, 0..) |*attachment, i| {
-        if (!controlTargetActive(attachment, session_index)) continue;
-        if (attachment.last_input_at_unix_ms == 0) continue;
-        if (found == null or attachment.last_input_at_unix_ms >= found_ts) {
+    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
+        if (!controlTargetActive(attached_client, session_index)) continue;
+        if (attached_client.last_input_at_unix_ms == 0) continue;
+        if (found == null or attached_client.last_input_at_unix_ms >= found_ts) {
             found = i;
-            found_ts = attachment.last_input_at_unix_ms;
+            found_ts = attached_client.last_input_at_unix_ms;
         }
     }
     selected[0] = found orelse return error.NoLastInputClient;
@@ -2085,7 +2085,7 @@ fn resolveClientGuidTarget(
     session_agent: *const SessionAgent,
     session_index: usize,
     client_guid: []const u8,
-    selected: *[max_attachments]usize,
+    selected: *[max_attached_clients]usize,
 ) !usize {
     if (!session_registry.isValidClientGuid(client_guid) and
         !session_registry.isValidClientGuidPrefix(client_guid)) return error.InvalidClientControlTarget;
@@ -2094,12 +2094,12 @@ fn resolveClientGuidTarget(
     else
         null;
     var found: ?usize = null;
-    for (&session_agent.attachments, 0..) |*attachment, i| {
-        if (!controlTargetActive(attachment, session_index)) continue;
+    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
+        if (!controlTargetActive(attached_client, session_index)) continue;
         const matches = if (prefix) |value|
-            clientGuidMatchesPrefix(attachment.clientGuidSlice(), value)
+            clientGuidMatchesPrefix(attached_client.clientGuidSlice(), value)
         else
-            std.mem.eql(u8, attachment.clientGuidSlice(), client_guid);
+            std.mem.eql(u8, attached_client.clientGuidSlice(), client_guid);
         if (!matches) continue;
         if (found != null) return error.AmbiguousClientControlTarget;
         found = i;
@@ -2156,45 +2156,45 @@ fn compactClientGuidPrefix(prefix: []const u8, out: *[session_registry.compact_g
     return len;
 }
 
-fn requestClientDetachFromControl(session_agent: *SessionAgent, attachment_index: usize) void {
-    if (attachment_index >= session_agent.attachments.len) return;
-    const attachment = &session_agent.attachments[attachment_index];
-    if (!attachment.active or attachment.close_after_flush) return;
+fn requestClientDetachFromControl(session_agent: *SessionAgent, attached_client_index: usize) void {
+    if (attached_client_index >= session_agent.attached_clients.len) return;
+    const attached_client = &session_agent.attached_clients[attached_client_index];
+    if (!attached_client.active or attached_client.close_after_flush) return;
     const payload = protocol.encodePayload(app_allocator.allocator(), pb.TeClientDetachRequest{}) catch {
-        detachAttachment(session_agent, attachment_index);
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
     defer app_allocator.allocator().free(payload);
-    queueAttachmentFrame(attachment, .te_client_detach_request, payload) catch {
-        detachAttachment(session_agent, attachment_index);
+    queueAttachedClientFrame(attached_client, .te_client_detach_request, payload) catch {
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
-    flushAttachmentOutput(session_agent, attachment_index);
+    flushAttachedClientOutput(session_agent, attached_client_index);
 }
 
-fn requestClientRepaintFromControl(session_agent: *SessionAgent, attachment_index: usize, include_scrollback: bool) void {
-    if (attachment_index >= session_agent.attachments.len) return;
-    const attachment = &session_agent.attachments[attachment_index];
-    if (!attachment.active or attachment.close_after_flush) return;
+fn requestClientRepaintFromControl(session_agent: *SessionAgent, attached_client_index: usize, include_scrollback: bool) void {
+    if (attached_client_index >= session_agent.attached_clients.len) return;
+    const attached_client = &session_agent.attached_clients[attached_client_index];
+    if (!attached_client.active or attached_client.close_after_flush) return;
     const payload = protocol.encodePayload(app_allocator.allocator(), pb.TeClientRepaintRequest{
         .include_scrollback = include_scrollback,
     }) catch {
-        detachAttachment(session_agent, attachment_index);
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
     defer app_allocator.allocator().free(payload);
-    queueAttachmentFrame(attachment, .te_client_repaint_request, payload) catch {
-        detachAttachment(session_agent, attachment_index);
+    queueAttachedClientFrame(attached_client, .te_client_repaint_request, payload) catch {
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
-    flushAttachmentOutput(session_agent, attachment_index);
+    flushAttachedClientOutput(session_agent, attached_client_index);
 }
 
 fn sessionDirSlice(session_agent: *const SessionAgent) []const u8 {
     return if (session_agent.session_paths) |paths| paths.dir else "";
 }
 
-fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !void {
+fn sendSessionEnded(attached_client: *AttachedClient, reason: u8, exit_info: ExitInfo) !void {
     const exit_status: ?pb.ExitStatus = switch (exit_info.kind) {
         1 => .{ .kind = .EXIT_STATUS_KIND_EXITED, .status = exit_info.status },
         2 => .{ .kind = .EXIT_STATUS_KIND_SIGNALLED, .status = exit_info.status },
@@ -2211,21 +2211,21 @@ fn sendSessionEnded(attachment: *Attachment, reason: u8, exit_info: ExitInfo) !v
         .ended_at_unix_ms = if (exit_info.ended_at_unix_ms == 0) null else exit_info.ended_at_unix_ms,
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .te_session_ended, payload);
+    try queueAttachedClientFrame(attached_client, .te_session_ended, payload);
 }
 
 fn queueTtyTranscriptChunk(
-    attachment: *Attachment,
+    attached_client: *AttachedClient,
     stream: pb.TeTtyTranscriptStream,
     bytes: []const u8,
 ) !void {
-    if (!attachment.capture_tty_transcript or bytes.len == 0) return;
+    if (!attached_client.capture_tty_transcript or bytes.len == 0) return;
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeTtyTranscriptChunk{
         .stream = stream,
         .data = bytes,
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .te_tty_transcript_chunk, payload);
+    try queueAttachedClientFrame(attached_client, .te_tty_transcript_chunk, payload);
 }
 
 fn queueTtyTranscriptChunkForSession(
@@ -2235,11 +2235,11 @@ fn queueTtyTranscriptChunkForSession(
     bytes: []const u8,
 ) void {
     if (bytes.len == 0) return;
-    for (&session_agent.attachments, 0..) |*attachment, i| {
-        if (!attachment.active or attachment.session_index != session_index) continue;
-        if (attachment.close_after_flush or !attachment.capture_tty_transcript) continue;
-        queueTtyTranscriptChunk(attachment, stream, bytes) catch {
-            detachAttachment(session_agent, i);
+    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
+        if (!attached_client.active or attached_client.session_index != session_index) continue;
+        if (attached_client.close_after_flush or !attached_client.capture_tty_transcript) continue;
+        queueTtyTranscriptChunk(attached_client, stream, bytes) catch {
+            detachAttachedClient(session_agent, i);
         };
     }
 }
@@ -2287,24 +2287,24 @@ fn readU64BigEndian(bytes: []const u8) u64 {
 }
 
 fn queueDrawFrame(
-    attachment: *Attachment,
+    attached_client: *AttachedClient,
     session: *const Session,
     scrollback_cursor: u64,
     draw_bytes: []const u8,
     app_title_present: ?bool,
-    relay_end_restore_bytes: ?[]const u8,
+    attached_client_end_restore_bytes: ?[]const u8,
 ) !void {
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
     encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeDraw{
         .scrollback_cursor = encoded_cursor[0..],
-        .viewport_offset = attachment.presentation.protocolViewportOffset(),
+        .viewport_offset = attached_client.presentation.protocolViewportOffset(),
         .draw_bytes = draw_bytes,
         .app_title_present = app_title_present,
-        .relay_end_restore_bytes = relay_end_restore_bytes,
+        .attached_client_end_restore_bytes = attached_client_end_restore_bytes,
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .te_draw, payload);
+    try queueAttachedClientFrame(attached_client, .te_draw, payload);
 }
 
 fn appendDrawCleanup(draw_bytes: *std.ArrayList(u8)) !void {
@@ -2318,17 +2318,17 @@ fn wrapDrawInSynchronizedUpdate(draw_bytes: *std.ArrayList(u8)) !void {
     try draw_bytes.appendSlice(app_allocator.allocator(), "\x1b[?2026l");
 }
 
-fn appendRelayEndRestoreBytes(
-    attachment: *const Attachment,
+fn appendAttachedClientEndRestoreBytes(
+    attached_client: *const AttachedClient,
     session: *const Session,
     screen: *const vt.RenderedScreen,
     restore_screen: ?*const vt.RenderedScreen,
     restore_bytes: *std.ArrayList(u8),
 ) !?[]const u8 {
     if (restore_screen) |primary| {
-        var restore_presentation = attachment.presentation;
+        var restore_presentation = attached_client.presentation;
         const restore_renderer = client_renderer.Renderer.buffered(restore_bytes, .{ .kind = .xterm_compatible });
-        try restore_presentation.applyRelayEndRestoreScreen(restore_renderer, session.rows, primary);
+        try restore_presentation.applyAttachedClientEndRestoreScreen(restore_renderer, session.rows, primary);
         return restore_bytes.items;
     }
     if (screen.active_screen == 0) return "";
@@ -2342,10 +2342,10 @@ fn renderBarrierTargetActiveScreen(barrier: vt.RenderBarrier) u8 {
     };
 }
 
-fn renderBarrierRelayEndRestoreBytes(barrier: vt.RenderBarrier) []const u8 {
+fn renderBarrierAttachedClientEndRestoreBytes(barrier: vt.RenderBarrier) []const u8 {
     return switch (barrier) {
         // The primary screen was flushed immediately before this barrier, so
-        // leaving the outer alternate screen is enough to get relay cleanup
+        // leaving the outer alternate screen is enough to get attached-client cleanup
         // back to the user's normal terminal buffer.
         .enter_alternate_screen => "\x1b[?1049l",
         .leave_alternate_screen => "",
@@ -2353,7 +2353,7 @@ fn renderBarrierRelayEndRestoreBytes(barrier: vt.RenderBarrier) []const u8 {
 }
 
 fn queueRenderBarrierDraw(
-    attachment: *Attachment,
+    attached_client: *AttachedClient,
     session: *const Session,
     barrier: vt.RenderBarrier,
     scrollback_cursor: u64,
@@ -2361,22 +2361,22 @@ fn queueRenderBarrierDraw(
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try attachment.presentation.switchActiveScreen(renderer, renderBarrierTargetActiveScreen(barrier));
+    try attached_client.presentation.switchActiveScreen(renderer, renderBarrierTargetActiveScreen(barrier));
     if (bytes.items.len == 0) return;
     try appendDrawCleanup(&bytes);
     try wrapDrawInSynchronizedUpdate(&bytes);
     try queueDrawFrame(
-        attachment,
+        attached_client,
         session,
         scrollback_cursor,
         bytes.items,
         null,
-        renderBarrierRelayEndRestoreBytes(barrier),
+        renderBarrierAttachedClientEndRestoreBytes(barrier),
     );
 }
 
 fn queueScrollbackRowsDraw(
-    attachment: *Attachment,
+    attached_client: *AttachedClient,
     session: *const Session,
     rows: []const vt.RenderedRow,
     scrollback_cursor: u64,
@@ -2386,14 +2386,14 @@ fn queueScrollbackRowsDraw(
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try attachment.presentation.preparePrimaryForScrollback(renderer);
-    try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
+    try attached_client.presentation.preparePrimaryForScrollback(renderer);
+    try attached_client.presentation.appendScrollbackRows(renderer, session.rows, rows);
     try wrapDrawInSynchronizedUpdate(&bytes);
-    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null, null);
+    try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, null, null);
 }
 
 fn queueScrollbackRowsAndScreenDraw(
-    attachment: *Attachment,
+    attached_client: *AttachedClient,
     session: *const Session,
     rows: []const vt.RenderedRow,
     screen: *const vt.RenderedScreen,
@@ -2405,14 +2405,14 @@ fn queueScrollbackRowsAndScreenDraw(
     if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
 
     const plain_replay = session.pending_plain_output.items;
-    if (try attachment.presentation.canApplyPlainReplay(
+    if (try attached_client.presentation.canApplyPlainReplay(
         screen,
         align_viewport,
         plain_replay,
         session.pendingPlainOutputCanReplay(),
     )) {
-        try attachment.presentation.assumePlainReplayScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, scrollback_cursor, plain_replay, screen.title_present, null);
+        try attached_client.presentation.assumePlainReplayScreen(session.rows, screen);
+        try queueDrawFrame(attached_client, session, scrollback_cursor, plain_replay, screen.title_present, null);
         return;
     }
 
@@ -2423,30 +2423,30 @@ fn queueScrollbackRowsAndScreenDraw(
     // the cleared screen. After that copy, another alignment pass would only
     // add blank rows to scrollback.
     const align_after_scrollback = align_viewport and screen.display_clear == null;
-    var effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, align_after_scrollback);
+    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, screen, align_after_scrollback);
     if (shouldClearOuterVisibleForDisplayClear(screen)) {
         effective_align_viewport = false;
     }
-    try attachment.presentation.preparePrimaryForScrollback(renderer);
-    try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
+    try attached_client.presentation.preparePrimaryForScrollback(renderer);
+    try attached_client.presentation.appendScrollbackRows(renderer, session.rows, rows);
     if (shouldClearOuterVisibleForDisplayClear(screen)) {
         // Full-screen clears must happen after copying the old rows. Clearing
         // first would leave those rows nowhere to go except back on screen.
-        try attachment.presentation.clearOuterVisibleForScreen(renderer, screen);
+        try attached_client.presentation.clearOuterVisibleForScreen(renderer, screen);
     }
-    try attachment.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
-    if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
-    updateMouseOriginAfterDraw(attachment, screen);
+    try attached_client.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
+    if (effective_align_viewport) attached_client.origin = .{ .row = 0, .col = 0 };
+    updateMouseOriginAfterDraw(attached_client, screen);
     try appendDrawCleanup(&bytes);
     try wrapDrawInSynchronizedUpdate(&bytes);
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
-    const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, screen.title_present, restore);
+    const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, screen, restore_screen, &restore_bytes);
+    try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, screen.title_present, restore);
 }
 
 fn queueScrollbackTruncatedDraw(
-    attachment: *Attachment,
+    attached_client: *AttachedClient,
     session: *const Session,
     truncated_rows: u64,
     scrollback_cursor: u64,
@@ -2455,10 +2455,10 @@ fn queueScrollbackTruncatedDraw(
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try attachment.presentation.preparePrimaryForScrollback(renderer);
+    try attached_client.presentation.preparePrimaryForScrollback(renderer);
     try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
     try wrapDrawInSynchronizedUpdate(&bytes);
-    try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, null, null);
+    try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, null, null);
 }
 
 fn appendScrollbackTruncatedMarker(bytes: *std.ArrayList(u8), renderer: client_renderer.Renderer, truncated_rows: u64) !void {
@@ -2472,14 +2472,14 @@ fn appendScrollbackTruncatedMarker(bytes: *std.ArrayList(u8), renderer: client_r
     try renderer.newline();
 }
 
-fn updateMouseOriginAfterDraw(attachment: *Attachment, screen: *const vt.RenderedScreen) void {
+fn updateMouseOriginAfterDraw(attached_client: *AttachedClient, screen: *const vt.RenderedScreen) void {
     if (!screenWantsMouseReporting(screen)) {
-        attachment.origin = null;
+        attached_client.origin = null;
         return;
     }
 
-    if (attachment.presentation.full_height_rendering) {
-        attachment.origin = .{ .row = 0, .col = 0 };
+    if (attached_client.presentation.full_height_rendering) {
+        attached_client.origin = .{ .row = 0, .col = 0 };
     }
 }
 
@@ -2487,11 +2487,11 @@ fn screenWantsMouseReporting(screen: *const vt.RenderedScreen) bool {
     return screen.modes.mouse_tracking != 0;
 }
 
-fn shouldAlignViewportForDraw(attachment: *const Attachment, screen: *const vt.RenderedScreen, requested: bool) bool {
+fn shouldAlignViewportForDraw(attached_client: *const AttachedClient, screen: *const vt.RenderedScreen, requested: bool) bool {
     if (screen.active_screen == 1) return false;
     return requested or
-        attachment.presentation.viewportOffsetUnknown() or
-        (screenWantsMouseReporting(screen) and !attachment.presentation.full_height_rendering);
+        attached_client.presentation.viewportOffsetUnknown() or
+        (screenWantsMouseReporting(screen) and !attached_client.presentation.full_height_rendering);
 }
 
 fn shouldClearOuterVisibleForDisplayClear(screen: *const vt.RenderedScreen) bool {
@@ -2500,7 +2500,7 @@ fn shouldClearOuterVisibleForDisplayClear(screen: *const vt.RenderedScreen) bool
 }
 
 fn queueScreenDraw(
-    attachment: *Attachment,
+    attached_client: *AttachedClient,
     session: *const Session,
     screen: *const vt.RenderedScreen,
     restore_screen: ?*const vt.RenderedScreen,
@@ -2509,35 +2509,35 @@ fn queueScreenDraw(
     scrollback_cursor: u64,
 ) !bool {
     const plain_replay = session.pending_plain_output.items;
-    if (try attachment.presentation.canApplyPlainReplay(
+    if (try attached_client.presentation.canApplyPlainReplay(
         screen,
         align_viewport,
         plain_replay,
         session.pendingPlainOutputCanReplay(),
     )) {
-        try attachment.presentation.assumePlainReplayScreen(session.rows, screen);
-        try queueDrawFrame(attachment, session, scrollback_cursor, plain_replay, screen.title_present, null);
+        try attached_client.presentation.assumePlainReplayScreen(session.rows, screen);
+        try queueDrawFrame(attached_client, session, scrollback_cursor, plain_replay, screen.title_present, null);
         return true;
     }
 
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    var effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, align_viewport);
+    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, screen, align_viewport);
     if (shouldClearOuterVisibleForDisplayClear(screen)) {
-        try attachment.presentation.clearOuterVisibleForScreen(renderer, screen);
+        try attached_client.presentation.clearOuterVisibleForScreen(renderer, screen);
         effective_align_viewport = false;
     }
-    try attachment.presentation.applyScreen(renderer, session.rows, screen, force_redraw, effective_align_viewport);
-    if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
-    updateMouseOriginAfterDraw(attachment, screen);
+    try attached_client.presentation.applyScreen(renderer, session.rows, screen, force_redraw, effective_align_viewport);
+    if (effective_align_viewport) attached_client.origin = .{ .row = 0, .col = 0 };
+    updateMouseOriginAfterDraw(attached_client, screen);
     if (bytes.items.len > 0) {
         try appendDrawCleanup(&bytes);
         try wrapDrawInSynchronizedUpdate(&bytes);
         var restore_bytes = std.ArrayList(u8).empty;
         defer restore_bytes.deinit(app_allocator.allocator());
-        const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-        try queueDrawFrame(attachment, session, scrollback_cursor, bytes.items, screen.title_present, restore);
+        const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, screen, restore_screen, &restore_bytes);
+        try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, screen.title_present, restore);
         return true;
     }
     return false;
@@ -2553,23 +2553,23 @@ fn advanceScrollbackEpochForClear(session: *Session) void {
     session.last_scrollback_clear_epoch = session.scrollback_epoch;
 }
 
-fn queueRetainedScrollbackClearDraw(attachment: *Attachment, session: *Session) !void {
+fn queueRetainedScrollbackClearDraw(attached_client: *AttachedClient, session: *Session) !void {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try attachment.presentation.preparePrimaryForScrollback(renderer);
+    try attached_client.presentation.preparePrimaryForScrollback(renderer);
     try renderer.clearScrollback();
-    try queueDrawFrame(attachment, session, 0, bytes.items, null, null);
+    try queueDrawFrame(attached_client, session, 0, bytes.items, null, null);
 }
 
 fn queueRepaintResponseFrame(
-    attachment: *Attachment,
+    attached_client: *AttachedClient,
     session: *const Session,
     repaint_request_seq: u64,
     scrollback_cursor: u64,
     draw_bytes: []const u8,
     app_title_present: ?bool,
-    relay_end_restore_bytes: ?[]const u8,
+    attached_client_end_restore_bytes: ?[]const u8,
 ) !void {
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
     encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
@@ -2577,18 +2577,18 @@ fn queueRepaintResponseFrame(
         .repaint_request_seq = repaint_request_seq,
         .draw = .{
             .scrollback_cursor = encoded_cursor[0..],
-            .viewport_offset = attachment.presentation.protocolViewportOffset(),
+            .viewport_offset = attached_client.presentation.protocolViewportOffset(),
             .draw_bytes = draw_bytes,
             .app_title_present = app_title_present,
-            .relay_end_restore_bytes = relay_end_restore_bytes,
+            .attached_client_end_restore_bytes = attached_client_end_restore_bytes,
         },
     });
     defer app_allocator.allocator().free(payload);
-    try queueAttachmentFrame(attachment, .te_repaint_response, payload);
+    try queueAttachedClientFrame(attached_client, .te_repaint_response, payload);
 }
 
 fn queueRepaintResponseDraw(
-    attachment: *Attachment,
+    attached_client: *AttachedClient,
     session: *Session,
     repaint_request_seq: u64,
     clear_for_replace: bool,
@@ -2605,39 +2605,39 @@ fn queueRepaintResponseDraw(
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     if (clear_for_replace) {
-        try attachment.presentation.preparePrimaryForScrollback(renderer);
+        try attached_client.presentation.preparePrimaryForScrollback(renderer);
         try renderer.clearForReplace();
-        attachment.presentation.reset();
+        attached_client.presentation.reset();
     } else if (clear_visible_for_replace) {
         // initial-scrollback=N replaces the visible screen, not scrollback.
         // Clear stale viewport cells without sending 3J.
-        try attachment.presentation.preparePrimaryForScrollback(renderer);
+        try attached_client.presentation.preparePrimaryForScrollback(renderer);
         try renderer.clearVisible();
-        attachment.presentation.reset();
+        attached_client.presentation.reset();
     }
-    var effective_align_viewport = shouldAlignViewportForDraw(attachment, screen, false);
+    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, screen, false);
     if (!clear_for_replace and shouldClearOuterVisibleForDisplayClear(screen)) {
-        try attachment.presentation.clearOuterVisibleForScreen(renderer, screen);
+        try attached_client.presentation.clearOuterVisibleForScreen(renderer, screen);
         effective_align_viewport = false;
     }
     if (truncated_rows > 0 or rows.len > 0) {
-        try attachment.presentation.preparePrimaryForScrollback(renderer);
+        try attached_client.presentation.preparePrimaryForScrollback(renderer);
     }
     if (truncated_rows > 0) try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
-    try attachment.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    try attachment.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
-    if (effective_align_viewport) attachment.origin = .{ .row = 0, .col = 0 };
-    updateMouseOriginAfterDraw(attachment, screen);
+    try attached_client.presentation.appendScrollbackRows(renderer, session.rows, rows);
+    try attached_client.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
+    if (effective_align_viewport) attached_client.origin = .{ .row = 0, .col = 0 };
+    updateMouseOriginAfterDraw(attached_client, screen);
     try appendDrawCleanup(&bytes);
     try wrapDrawInSynchronizedUpdate(&bytes);
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
-    const restore = try appendRelayEndRestoreBytes(attachment, session, screen, restore_screen, &restore_bytes);
-    try queueRepaintResponseFrame(attachment, session, repaint_request_seq, scrollback_cursor, bytes.items, screen.title_present, restore);
+    const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, screen, restore_screen, &restore_bytes);
+    try queueRepaintResponseFrame(attached_client, session, repaint_request_seq, scrollback_cursor, bytes.items, screen.title_present, restore);
 }
 
 fn queueRepaintSnapshot(
-    attachment: *Attachment,
+    attached_client: *AttachedClient,
     session: *Session,
     request: RepaintRequest,
     clear_for_replace: bool,
@@ -2683,7 +2683,7 @@ fn queueRepaintSnapshot(
         const clear_scrollback_for_stale_clear =
             requested_cursor.epoch != 0 and requested_cursor.epoch < session.last_scrollback_clear_epoch;
         try queueRepaintResponseDraw(
-            attachment,
+            attached_client,
             session,
             request.repaint_request_seq,
             clear_for_replace or clear_scrollback_for_stale_clear,
@@ -2697,7 +2697,7 @@ fn queueRepaintSnapshot(
     } else {
         const scrollback_cursor = try model.scrollbackCursor();
         try queueRepaintResponseDraw(
-            attachment,
+            attached_client,
             session,
             request.repaint_request_seq,
             clear_for_replace,
@@ -2713,7 +2713,7 @@ fn queueRepaintSnapshot(
     return screen.rows.len;
 }
 
-fn sendSessionSnapshot(attachment: *Attachment, session: *Session) !void {
+fn sendSessionSnapshot(attached_client: *AttachedClient, session: *Session) !void {
     if (session.terminal_model) |model| {
         var scrollback = try model.scrollbackSnapshot(app_allocator.allocator());
         defer scrollback.deinit(app_allocator.allocator());
@@ -2724,16 +2724,16 @@ fn sendSessionSnapshot(attachment: *Attachment, session: *Session) !void {
         const truncated_rows_to_report = scrollback.truncated_rows;
 
         if (truncated_rows_to_report > 0) {
-            try queueScrollbackTruncatedDraw(attachment, session, truncated_rows_to_report, truncated_rows_to_report);
+            try queueScrollbackTruncatedDraw(attached_client, session, truncated_rows_to_report, truncated_rows_to_report);
         }
-        if (rows_to_draw.len > 0) try queueScrollbackRowsDraw(attachment, session, rows_to_draw, scrollback.absolute_count);
+        if (rows_to_draw.len > 0) try queueScrollbackRowsDraw(attached_client, session, rows_to_draw, scrollback.absolute_count);
         var primary_screen: ?vt.RenderedScreen = null;
         defer if (primary_screen) |*primary| primary.deinit(app_allocator.allocator());
         if (screen.active_screen == 1) {
             primary_screen = try model.renderedPrimaryScreen(app_allocator.allocator());
         }
         _ = try queueScreenDraw(
-            attachment,
+            attached_client,
             session,
             &screen,
             if (primary_screen) |*primary| primary else null,
@@ -2747,9 +2747,9 @@ fn sendSessionSnapshot(attachment: *Attachment, session: *Session) !void {
     }
 }
 
-fn sendSessionRepaintSnapshot(attachment: *Attachment, session: *Session, request: RepaintRequest) !void {
+fn sendSessionRepaintSnapshot(attached_client: *AttachedClient, session: *Session, request: RepaintRequest) !void {
     const model = session.terminal_model orelse return;
-    const screen_rows = try queueRepaintSnapshot(attachment, session, request, false);
+    const screen_rows = try queueRepaintSnapshot(attached_client, session, request, false);
     model.markScrollbackReported();
     model.markRendered(screen_rows);
 }
@@ -2941,7 +2941,7 @@ fn createSession(
     if (session_agent.fixed_session_id != null and session_agent.started_session) return error.TooManySessions;
 
     for (&session_agent.sessions, 0..) |*session, session_index| {
-        if (session.alive or hasAttachmentForSession(session_agent, session_index)) continue;
+        if (session.alive or hasAttachedClientForSession(session_agent, session_index)) continue;
 
         const terminal_model = try vt.SessionTerminal.createWithDefaultColors(
             app_allocator.allocator(),
@@ -3118,11 +3118,11 @@ fn attachSession(
     capture_tty_transcript: bool,
 ) !void {
     const session = &session_agent.sessions[session_index];
-    detachExistingAttachmentWithClientGuid(session_agent, session_index, client_guid);
+    detachExistingAttachedClientWithClientGuid(session_agent, session_index, client_guid);
 
-    for (&session_agent.attachments, 0..) |*attachment, attachment_index| {
-        if (attachment.active) continue;
-        attachment.* = .{
+    for (&session_agent.attached_clients, 0..) |*attached_client, attached_client_index| {
+        if (attached_client.active) continue;
+        attached_client.* = .{
             .fd = client_fd,
             .session_index = session_index,
             .client_guid_len = client_guid.len,
@@ -3132,59 +3132,59 @@ fn attachSession(
             .active = true,
             .capture_tty_transcript = capture_tty_transcript,
         };
-        @memcpy(attachment.client_guid[0..client_guid.len], client_guid);
-        attachment.presentation.setViewportOffset(resize.viewport_offset);
+        @memcpy(attached_client.client_guid[0..client_guid.len], client_guid);
+        attached_client.presentation.setViewportOffset(resize.viewport_offset);
         errdefer {
-            attachment.output.deinit(app_allocator.allocator());
-            attachment.* = Attachment{};
+            attached_client.output.deinit(app_allocator.allocator());
+            attached_client.* = AttachedClient{};
         }
-        try sendSessionAttachedForSession(session_agent, attachment, session);
+        try sendSessionAttachedForSession(session_agent, attached_client, session);
         if (resize.repaint_request) |request| {
-            try sendSessionRepaintSnapshot(attachment, session, request);
+            try sendSessionRepaintSnapshot(attached_client, session, request);
         } else {
-            try sendSessionSnapshot(attachment, session);
+            try sendSessionSnapshot(attached_client, session);
         }
-        writeClientAgentSocketHintForAttachment(session_agent, session, attachment);
+        writeClientAgentSocketHintForAttachedClient(session_agent, session, attached_client);
         refreshAttachedFlag(session_agent, session_index);
-        logSessionAgent(session_agent, "event=attach id={s} client={s} rows={} cols={} attachments={}", .{
+        logSessionAgent(session_agent, "event=attach id={s} client={s} rows={} cols={} attached_clients={}", .{
             session.idSlice(),
             client_guid,
             resize.rows,
             resize.cols,
             attachedCount(session_agent, session_index),
         });
-        flushAttachmentOutput(session_agent, attachment_index);
+        flushAttachedClientOutput(session_agent, attached_client_index);
         return;
     }
 
-    return error.TooManyAttachments;
+    return error.TooManyAttachedClients;
 }
 
-fn writeClientAgentSocketHintForAttachment(session_agent: *SessionAgent, session: *const Session, attachment: *const Attachment) void {
-    session_registry.writeClientAgentSocketHint(app_allocator.allocator(), attachment.clientGuidSlice(), session.idSlice()) catch |err| {
+fn writeClientAgentSocketHintForAttachedClient(session_agent: *SessionAgent, session: *const Session, attached_client: *const AttachedClient) void {
+    session_registry.writeClientAgentSocketHint(app_allocator.allocator(), attached_client.clientGuidSlice(), session.idSlice()) catch |err| {
         logSessionAgent(session_agent, "event=client_agent_socket_hint_write_failed id={s} client={s} error={t}", .{
             session.idSlice(),
-            attachment.clientGuidSlice(),
+            attached_client.clientGuidSlice(),
             err,
         });
     };
 }
 
-fn removeClientAgentSocketHintForAttachment(session_agent: *SessionAgent, session: *const Session, attachment: *const Attachment) void {
-    session_registry.removeClientAgentSocketHint(app_allocator.allocator(), attachment.clientGuidSlice()) catch |err| {
+fn removeClientAgentSocketHintForAttachedClient(session_agent: *SessionAgent, session: *const Session, attached_client: *const AttachedClient) void {
+    session_registry.removeClientAgentSocketHint(app_allocator.allocator(), attached_client.clientGuidSlice()) catch |err| {
         logSessionAgent(session_agent, "event=client_agent_socket_hint_remove_failed id={s} client={s} error={t}", .{
             session.idSlice(),
-            attachment.clientGuidSlice(),
+            attached_client.clientGuidSlice(),
             err,
         });
     };
 }
 
-fn detachExistingAttachmentWithClientGuid(session_agent: *SessionAgent, session_index: usize, client_guid: []const u8) void {
-    for (&session_agent.attachments, 0..) |*attachment, attachment_index| {
-        if (!attachment.active or attachment.session_index != session_index) continue;
-        if (!std.mem.eql(u8, attachment.clientGuidSlice(), client_guid)) continue;
-        detachAttachment(session_agent, attachment_index);
+fn detachExistingAttachedClientWithClientGuid(session_agent: *SessionAgent, session_index: usize, client_guid: []const u8) void {
+    for (&session_agent.attached_clients, 0..) |*attached_client, attached_client_index| {
+        if (!attached_client.active or attached_client.session_index != session_index) continue;
+        if (!std.mem.eql(u8, attached_client.clientGuidSlice(), client_guid)) continue;
+        detachAttachedClient(session_agent, attached_client_index);
     }
 }
 
@@ -3294,14 +3294,14 @@ fn flushSessionRenderBarrier(session_agent: *SessionAgent, session_index: usize,
 
     if (!session.alive) return;
     const scrollback_cursor = try model.scrollbackCursor();
-    for (&session_agent.attachments, 0..) |*attachment, i| {
-        if (!attachment.active or attachment.session_index != session_index) continue;
-        if (attachment.close_after_flush) continue;
-        queueRenderBarrierDraw(attachment, session, barrier, scrollback_cursor) catch {
-            detachAttachment(session_agent, i);
+    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
+        if (!attached_client.active or attached_client.session_index != session_index) continue;
+        if (attached_client.close_after_flush) continue;
+        queueRenderBarrierDraw(attached_client, session, barrier, scrollback_cursor) catch {
+            detachAttachedClient(session_agent, i);
             continue;
         };
-        flushAttachmentOutput(session_agent, i);
+        flushAttachedClientOutput(session_agent, i);
     }
 }
 
@@ -3319,52 +3319,52 @@ fn feedSessionOutputBytes(session_agent: *SessionAgent, session_index: usize, by
             &barrier_context,
             handleSessionRenderBarrier,
         );
-        if (!saw_render_barrier and hasActiveAttachment(session_agent, session_index)) {
+        if (!saw_render_barrier and hasActiveAttachedClient(session_agent, session_index)) {
             try session.appendPendingPlainOutput(bytes, starts_at_boundary);
         }
     }
 }
 
-fn drainAttachmentInput(session_agent: *SessionAgent, attachment_index: usize) void {
-    const attachment = &session_agent.attachments[attachment_index];
-    if (!attachment.active) return;
-    const session = &session_agent.sessions[attachment.session_index];
+fn drainAttachedClientInput(session_agent: *SessionAgent, attached_client_index: usize) void {
+    const attached_client = &session_agent.attached_clients[attached_client_index];
+    if (!attached_client.active) return;
+    const session = &session_agent.sessions[attached_client.session_index];
     if (!session.alive) {
-        detachAttachment(session_agent, attachment_index);
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     }
 
-    var frame = protocol.readFrameAlloc(app_allocator.allocator(), attachment.fd) catch {
-        detachAttachment(session_agent, attachment_index);
+    var frame = protocol.readFrameAlloc(app_allocator.allocator(), attached_client.fd) catch {
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
     defer frame.deinit(app_allocator.allocator());
 
     switch (frame.message_type) {
-        .te_input => handleInputFrame(session_agent, attachment_index, frame.payload),
-        .te_resize => handleResizeFrame(session_agent, attachment_index, frame.payload),
-        .te_repaint_request => handleRepaintFrame(session_agent, attachment_index, frame.payload),
+        .te_input => handleInputFrame(session_agent, attached_client_index, frame.payload),
+        .te_resize => handleResizeFrame(session_agent, attached_client_index, frame.payload),
+        .te_repaint_request => handleRepaintFrame(session_agent, attached_client_index, frame.payload),
         .ping, .pong => {
-            _ = protocol.handleTransportControlFrame(frame.message_type, frame.payload, attachment.fd) catch {
-                detachAttachment(session_agent, attachment_index);
+            _ = protocol.handleTransportControlFrame(frame.message_type, frame.payload, attached_client.fd) catch {
+                detachAttachedClient(session_agent, attached_client_index);
                 return;
             };
         },
         else => {
-            queueAttachmentError(session_agent, attachment, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
-                detachAttachment(session_agent, attachment_index);
+            queueAttachedClientError(session_agent, attached_client, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
+                detachAttachedClient(session_agent, attached_client_index);
                 return;
             };
-            closeAttachmentAfterFlush(session_agent, attachment_index);
+            closeAttachedClientAfterFlush(session_agent, attached_client_index);
         },
     }
 }
 
-fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
-    const attachment = &session_agent.attachments[attachment_index];
-    const session = &session_agent.sessions[attachment.session_index];
+fn handleInputFrame(session_agent: *SessionAgent, attached_client_index: usize, payload: []const u8) void {
+    const attached_client = &session_agent.attached_clients[attached_client_index];
+    const session = &session_agent.sessions[attached_client.session_index];
     var input = protocol.decodePayload(pb.TeInput, app_allocator.allocator(), payload) catch {
-        detachAttachment(session_agent, attachment_index);
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
     defer input.deinit(app_allocator.allocator());
@@ -3374,42 +3374,42 @@ fn handleInputFrame(session_agent: *SessionAgent, attachment_index: usize, paylo
         const ack_payload = protocol.encodePayload(app_allocator.allocator(), pb.TeInputAck{
             .input_seq = input.input_seq,
         }) catch {
-            detachAttachment(session_agent, attachment_index);
+            detachAttachedClient(session_agent, attached_client_index);
             return;
         };
         defer app_allocator.allocator().free(ack_payload);
-        queueAttachmentFrame(attachment, .te_input_ack, ack_payload) catch {
-            detachAttachment(session_agent, attachment_index);
+        queueAttachedClientFrame(attached_client, .te_input_ack, ack_payload) catch {
+            detachAttachedClient(session_agent, attached_client_index);
             return;
         };
-        flushAttachmentOutput(session_agent, attachment_index);
+        flushAttachedClientOutput(session_agent, attached_client_index);
     }
 
-    if (session.rows != attachment.rows or session.cols != attachment.cols) {
-        updateSessionSize(session, attachment.rows, attachment.cols);
+    if (session.rows != attached_client.rows or session.cols != attached_client.cols) {
+        updateSessionSize(session, attached_client.rows, attached_client.cols);
     }
 
     var translated = std.ArrayList(u8).empty;
     defer translated.deinit(app_allocator.allocator());
-    translateAttachmentInput(attachment, session, input.data, &translated) catch {
-        detachAttachment(session_agent, attachment_index);
+    translateAttachedClientInput(attached_client, session, input.data, &translated) catch {
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
-    if (inputBytesContainUserInput(attachment, input.data)) {
+    if (inputBytesContainUserInput(attached_client, input.data)) {
         const now_ms = nowUnixMs();
-        attachment.last_input_at_unix_ms = now_ms;
+        attached_client.last_input_at_unix_ms = now_ms;
         session.last_input_at_unix_ms = now_ms;
     }
     if (translated.items.len == 0) return;
 
-    queueTtyTranscriptChunk(attachment, .TE_TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {
-        detachAttachment(session_agent, attachment_index);
+    queueTtyTranscriptChunk(attached_client, .TE_TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
-    flushAttachmentOutput(session_agent, attachment_index);
+    flushAttachedClientOutput(session_agent, attached_client_index);
 
     io.writeAll(session.pty_fd, translated.items) catch {
-        detachAttachment(session_agent, attachment_index);
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
 }
@@ -3440,16 +3440,16 @@ const XtermModifiedKeyParse = union(enum) {
     complete: XtermModifiedKey,
 };
 
-fn translateAttachmentInput(
-    attachment: *Attachment,
+fn translateAttachedClientInput(
+    attached_client: *AttachedClient,
     session: *const Session,
     bytes: []const u8,
     out: *std.ArrayList(u8),
 ) !void {
-    if (!attachmentLocalInputParserActive(attachment)) {
-        if (attachment.input_pending_len > 0) {
-            try out.appendSlice(app_allocator.allocator(), attachment.input_pending[0..attachment.input_pending_len]);
-            attachment.input_pending_len = 0;
+    if (!attachedClientLocalInputParserActive(attached_client)) {
+        if (attached_client.input_pending_len > 0) {
+            try out.appendSlice(app_allocator.allocator(), attached_client.input_pending[0..attached_client.input_pending_len]);
+            attached_client.input_pending_len = 0;
         }
         try out.appendSlice(app_allocator.allocator(), bytes);
         return;
@@ -3457,9 +3457,9 @@ fn translateAttachmentInput(
 
     var input = std.ArrayList(u8).empty;
     defer input.deinit(app_allocator.allocator());
-    if (attachment.input_pending_len > 0) {
-        try input.appendSlice(app_allocator.allocator(), attachment.input_pending[0..attachment.input_pending_len]);
-        attachment.input_pending_len = 0;
+    if (attached_client.input_pending_len > 0) {
+        try input.appendSlice(app_allocator.allocator(), attached_client.input_pending[0..attached_client.input_pending_len]);
+        attached_client.input_pending_len = 0;
     }
     try input.appendSlice(app_allocator.allocator(), bytes);
 
@@ -3471,18 +3471,18 @@ fn translateAttachmentInput(
             continue;
         }
 
-        if (attachment.presentation.terminal_modes_initialized) {
+        if (attached_client.presentation.terminal_modes_initialized) {
             switch (parseSgrMouseReport(input.items, index)) {
                 .complete => |report| {
-                    if (attachmentSgrMouseActive(attachment)) {
-                        try appendTranslatedSgrMouseReport(attachment, session, report, out);
+                    if (attachedClientSgrMouseActive(attached_client)) {
+                        try appendTranslatedSgrMouseReport(attached_client, session, report, out);
                     }
                     index = report.end;
                     continue;
                 },
                 .incomplete => {
-                    if (attachmentSgrMouseActive(attachment)) {
-                        try savePendingAttachmentInput(attachment, input.items[index..], out);
+                    if (attachedClientSgrMouseActive(attached_client)) {
+                        try savePendingAttachedClientInput(attached_client, input.items[index..], out);
                         return;
                     }
                 },
@@ -3492,22 +3492,22 @@ fn translateAttachmentInput(
 
         switch (parseFocusReport(input.items, index)) {
             .complete => |report| {
-                if (attachmentFocusReportingActive(attachment)) {
+                if (attachedClientFocusReportingActive(attached_client)) {
                     try out.appendSlice(app_allocator.allocator(), input.items[index..report.end]);
                 }
                 index = report.end;
                 continue;
             },
             .incomplete => {
-                if (attachmentFocusReportingActive(attachment)) {
-                    try savePendingAttachmentInput(attachment, input.items[index..], out);
+                if (attachedClientFocusReportingActive(attached_client)) {
+                    try savePendingAttachedClientInput(attached_client, input.items[index..], out);
                     return;
                 }
             },
             .not_focus => {},
         }
 
-        if (attachmentKittyKeyboardActive(attachment)) {
+        if (attachedClientKittyKeyboardActive(attached_client)) {
             switch (parseXtermModifiedKey(input.items, index)) {
                 .complete => |key| {
                     try appendKittyKeyboardKey(key, out);
@@ -3515,7 +3515,7 @@ fn translateAttachmentInput(
                     continue;
                 },
                 .incomplete => {
-                    try savePendingAttachmentInput(attachment, input.items[index..], out);
+                    try savePendingAttachedClientInput(attached_client, input.items[index..], out);
                     return;
                 },
                 .not_modified => {},
@@ -3527,33 +3527,33 @@ fn translateAttachmentInput(
     }
 }
 
-fn savePendingAttachmentInput(attachment: *Attachment, pending: []const u8, out: *std.ArrayList(u8)) !void {
-    if (pending.len <= attachment.input_pending.len) {
-        @memcpy(attachment.input_pending[0..pending.len], pending);
-        attachment.input_pending_len = pending.len;
+fn savePendingAttachedClientInput(attached_client: *AttachedClient, pending: []const u8, out: *std.ArrayList(u8)) !void {
+    if (pending.len <= attached_client.input_pending.len) {
+        @memcpy(attached_client.input_pending[0..pending.len], pending);
+        attached_client.input_pending_len = pending.len;
     } else {
         try out.appendSlice(app_allocator.allocator(), pending);
     }
 }
 
-fn attachmentLocalInputParserActive(attachment: *const Attachment) bool {
-    return attachment.presentation.terminal_modes_initialized;
+fn attachedClientLocalInputParserActive(attached_client: *const AttachedClient) bool {
+    return attached_client.presentation.terminal_modes_initialized;
 }
 
-fn attachmentSgrMouseActive(attachment: *const Attachment) bool {
-    return attachment.presentation.terminal_modes_initialized and
-        attachment.presentation.terminal_modes.mouse_tracking != .disabled and
-        attachment.presentation.terminal_modes.mouse_sgr;
+fn attachedClientSgrMouseActive(attached_client: *const AttachedClient) bool {
+    return attached_client.presentation.terminal_modes_initialized and
+        attached_client.presentation.terminal_modes.mouse_tracking != .disabled and
+        attached_client.presentation.terminal_modes.mouse_sgr;
 }
 
-fn attachmentKittyKeyboardActive(attachment: *const Attachment) bool {
-    return attachment.presentation.terminal_modes_initialized and
-        attachment.presentation.terminal_modes.kitty_keyboard_flags != 0;
+fn attachedClientKittyKeyboardActive(attached_client: *const AttachedClient) bool {
+    return attached_client.presentation.terminal_modes_initialized and
+        attached_client.presentation.terminal_modes.kitty_keyboard_flags != 0;
 }
 
-fn attachmentFocusReportingActive(attachment: *const Attachment) bool {
-    return attachment.presentation.terminal_modes_initialized and
-        (attachment.presentation.terminal_modes.mode_flags & client_renderer.TerminalModes.focus_reporting) != 0;
+fn attachedClientFocusReportingActive(attached_client: *const AttachedClient) bool {
+    return attached_client.presentation.terminal_modes_initialized and
+        (attached_client.presentation.terminal_modes.mode_flags & client_renderer.TerminalModes.focus_reporting) != 0;
 }
 
 const FocusReport = struct {
@@ -3676,7 +3676,7 @@ const EscapeSequenceClassification = union(enum) {
     user_input: usize,
 };
 
-fn inputBytesContainUserInput(attachment: *const Attachment, bytes: []const u8) bool {
+fn inputBytesContainUserInput(attached_client: *const AttachedClient, bytes: []const u8) bool {
     var index: usize = 0;
     while (index < bytes.len) {
         const byte = bytes[index];
@@ -3686,7 +3686,7 @@ fn inputBytesContainUserInput(attachment: *const Attachment, bytes: []const u8) 
                     index = report.end;
                     continue;
                 },
-                .incomplete => if (attachmentSgrMouseActive(attachment)) return false,
+                .incomplete => if (attachedClientSgrMouseActive(attached_client)) return false,
                 .not_mouse => {},
             }
             switch (classifyEscapeSequence(bytes, index)) {
@@ -3747,12 +3747,12 @@ fn isTerminalGeneratedCsiResponse(params_and_intermediates: []const u8, final: u
 }
 
 fn appendTranslatedSgrMouseReport(
-    attachment: *const Attachment,
+    attached_client: *const AttachedClient,
     session: *const Session,
     report: SgrMouseReport,
     out: *std.ArrayList(u8),
 ) !void {
-    const origin = attachment.origin orelse return;
+    const origin = attached_client.origin orelse return;
     if (report.row <= origin.row or report.col <= origin.col) return;
 
     const inner_row = report.row - origin.row;
@@ -3770,7 +3770,7 @@ fn appendTranslatedSgrMouseReport(
 }
 
 test "SGR mouse input is translated from outer to inner coordinates" {
-    var attachment = Attachment{
+    var attached_client = AttachedClient{
         .origin = .{ .row = 4, .col = 0 },
         .presentation = .{
             .terminal_modes = .{ .mouse_tracking = .normal, .mouse_sgr = true },
@@ -3781,16 +3781,16 @@ test "SGR mouse input is translated from outer to inner coordinates" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(app_allocator.allocator());
 
-    try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;5M", &out);
+    try translateAttachedClientInput(&attached_client, &session, "\x1b[<0;12;5M", &out);
     try std.testing.expectEqualStrings("\x1b[<0;12;1M", out.items);
 
     out.clearRetainingCapacity();
-    try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;3M", &out);
+    try translateAttachedClientInput(&attached_client, &session, "\x1b[<0;12;3M", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "SGR mouse input is dropped when mouse reporting is inactive" {
-    var attachment = Attachment{
+    var attached_client = AttachedClient{
         .origin = .{ .row = 4, .col = 0 },
         .presentation = .{
             .terminal_modes = .{},
@@ -3801,12 +3801,12 @@ test "SGR mouse input is dropped when mouse reporting is inactive" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(app_allocator.allocator());
 
-    try translateAttachmentInput(&attachment, &session, "\x1b[<0;12;5M", &out);
+    try translateAttachedClientInput(&attached_client, &session, "\x1b[<0;12;5M", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "focus reports are forwarded only while focus reporting is active" {
-    var attachment = Attachment{
+    var attached_client = AttachedClient{
         .presentation = .{
             .terminal_modes = .{},
             .terminal_modes_initialized = true,
@@ -3816,16 +3816,16 @@ test "focus reports are forwarded only while focus reporting is active" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(app_allocator.allocator());
 
-    try translateAttachmentInput(&attachment, &session, "\x1b[I", &out);
+    try translateAttachedClientInput(&attached_client, &session, "\x1b[I", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 
-    attachment.presentation.terminal_modes.mode_flags = client_renderer.TerminalModes.focus_reporting;
-    try translateAttachmentInput(&attachment, &session, "\x1b[O", &out);
+    attached_client.presentation.terminal_modes.mode_flags = client_renderer.TerminalModes.focus_reporting;
+    try translateAttachedClientInput(&attached_client, &session, "\x1b[O", &out);
     try std.testing.expectEqualStrings("\x1b[O", out.items);
 }
 
 test "xterm modified key input is translated to kitty when kitty keyboard is active" {
-    var attachment = Attachment{
+    var attached_client = AttachedClient{
         .presentation = .{
             .terminal_modes = .{ .kitty_keyboard_flags = 7 },
             .terminal_modes_initialized = true,
@@ -3835,12 +3835,12 @@ test "xterm modified key input is translated to kitty when kitty keyboard is act
     var out = std.ArrayList(u8).empty;
     defer out.deinit(app_allocator.allocator());
 
-    try translateAttachmentInput(&attachment, &session, "\x1b[27;2;13~", &out);
+    try translateAttachedClientInput(&attached_client, &session, "\x1b[27;2;13~", &out);
     try std.testing.expectEqualStrings("\x1b[13;2u", out.items);
 }
 
 test "split xterm modified key input is held and translated after completion" {
-    var attachment = Attachment{
+    var attached_client = AttachedClient{
         .presentation = .{
             .terminal_modes = .{ .kitty_keyboard_flags = 7 },
             .terminal_modes_initialized = true,
@@ -3850,26 +3850,26 @@ test "split xterm modified key input is held and translated after completion" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(app_allocator.allocator());
 
-    try translateAttachmentInput(&attachment, &session, "\x1b[27;2;", &out);
+    try translateAttachedClientInput(&attached_client, &session, "\x1b[27;2;", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
-    try std.testing.expect(attachment.input_pending_len > 0);
+    try std.testing.expect(attached_client.input_pending_len > 0);
 
-    try translateAttachmentInput(&attachment, &session, "13~", &out);
+    try translateAttachedClientInput(&attached_client, &session, "13~", &out);
     try std.testing.expectEqualStrings("\x1b[13;2u", out.items);
 }
 
 test "xterm modified key input passes through when kitty keyboard is inactive" {
-    var attachment = Attachment{};
+    var attached_client = AttachedClient{};
     const session = Session{ .rows = 24, .cols = 80 };
     var out = std.ArrayList(u8).empty;
     defer out.deinit(app_allocator.allocator());
 
-    try translateAttachmentInput(&attachment, &session, "\x1b[27;2;13~", &out);
+    try translateAttachedClientInput(&attached_client, &session, "\x1b[27;2;13~", &out);
     try std.testing.expectEqualStrings("\x1b[27;2;13~", out.items);
 }
 
 test "non-xterm CSI input passes through when kitty keyboard is active" {
-    var attachment = Attachment{
+    var attached_client = AttachedClient{
         .presentation = .{
             .terminal_modes = .{ .kitty_keyboard_flags = 7 },
             .terminal_modes_initialized = true,
@@ -3879,12 +3879,12 @@ test "non-xterm CSI input passes through when kitty keyboard is active" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(app_allocator.allocator());
 
-    try translateAttachmentInput(&attachment, &session, "\x1b[A", &out);
+    try translateAttachedClientInput(&attached_client, &session, "\x1b[A", &out);
     try std.testing.expectEqualStrings("\x1b[A", out.items);
 }
 
 test "plain enter input is not synthesized as kitty when kitty keyboard is active" {
-    var attachment = Attachment{
+    var attached_client = AttachedClient{
         .presentation = .{
             .terminal_modes = .{ .kitty_keyboard_flags = 7 },
             .terminal_modes_initialized = true,
@@ -3894,12 +3894,12 @@ test "plain enter input is not synthesized as kitty when kitty keyboard is activ
     var out = std.ArrayList(u8).empty;
     defer out.deinit(app_allocator.allocator());
 
-    try translateAttachmentInput(&attachment, &session, "\r", &out);
+    try translateAttachedClientInput(&attached_client, &session, "\r", &out);
     try std.testing.expectEqualStrings("\r", out.items);
 }
 
 test "bare escape is not held by kitty keyboard translation" {
-    var attachment = Attachment{
+    var attached_client = AttachedClient{
         .presentation = .{
             .terminal_modes = .{ .kitty_keyboard_flags = 7 },
             .terminal_modes_initialized = true,
@@ -3909,13 +3909,13 @@ test "bare escape is not held by kitty keyboard translation" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(app_allocator.allocator());
 
-    try translateAttachmentInput(&attachment, &session, "\x1b", &out);
+    try translateAttachedClientInput(&attached_client, &session, "\x1b", &out);
     try std.testing.expectEqualStrings("\x1b", out.items);
-    try std.testing.expectEqual(@as(usize, 0), attachment.input_pending_len);
+    try std.testing.expectEqual(@as(usize, 0), attached_client.input_pending_len);
 }
 
 test "last input classifier ignores terminal generated responses" {
-    var attachment = Attachment{
+    var attached_client = AttachedClient{
         .origin = .{ .row = 0, .col = 0 },
         .presentation = .{
             .terminal_modes = .{ .mouse_tracking = .normal, .mouse_sgr = true },
@@ -3923,61 +3923,61 @@ test "last input classifier ignores terminal generated responses" {
         },
     };
 
-    try std.testing.expect(!inputBytesContainUserInput(&attachment, "\x1b[<0;12;5M"));
-    try std.testing.expect(!inputBytesContainUserInput(&attachment, "\x1b]10;rgb:ffff/ffff/ffff\x07"));
-    try std.testing.expect(!inputBytesContainUserInput(&attachment, "\x1b[?1;2c"));
-    try std.testing.expect(!inputBytesContainUserInput(&attachment, "\x1b[24;80R"));
-    try std.testing.expect(!inputBytesContainUserInput(&attachment, "\x1b[0n"));
-    try std.testing.expect(inputBytesContainUserInput(&attachment, "\x1b[A"));
-    try std.testing.expect(inputBytesContainUserInput(&attachment, "\x01"));
-    try std.testing.expect(inputBytesContainUserInput(&attachment, "\x1b]10;rgb:ffff/ffff/ffff\x07x"));
+    try std.testing.expect(!inputBytesContainUserInput(&attached_client, "\x1b[<0;12;5M"));
+    try std.testing.expect(!inputBytesContainUserInput(&attached_client, "\x1b]10;rgb:ffff/ffff/ffff\x07"));
+    try std.testing.expect(!inputBytesContainUserInput(&attached_client, "\x1b[?1;2c"));
+    try std.testing.expect(!inputBytesContainUserInput(&attached_client, "\x1b[24;80R"));
+    try std.testing.expect(!inputBytesContainUserInput(&attached_client, "\x1b[0n"));
+    try std.testing.expect(inputBytesContainUserInput(&attached_client, "\x1b[A"));
+    try std.testing.expect(inputBytesContainUserInput(&attached_client, "\x01"));
+    try std.testing.expect(inputBytesContainUserInput(&attached_client, "\x1b]10;rgb:ffff/ffff/ffff\x07x"));
 }
 
-fn handleResizeFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
-    const attachment = &session_agent.attachments[attachment_index];
-    const session = &session_agent.sessions[attachment.session_index];
+fn handleResizeFrame(session_agent: *SessionAgent, attached_client_index: usize, payload: []const u8) void {
+    const attached_client = &session_agent.attached_clients[attached_client_index];
+    const session = &session_agent.sessions[attached_client.session_index];
     const resize = readResizePayload(payload) catch {
-        detachAttachment(session_agent, attachment_index);
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
     const reset_for_screen_repaint = resize.repaint_request != null and
         resize.repaint_request.?.scrollback_cursor == null;
-    attachment.rows = resize.rows;
-    attachment.cols = resize.cols;
-    if (reset_for_screen_repaint) attachment.presentation.resetForScreenRepaint();
-    attachment.presentation.setViewportOffset(resize.viewport_offset);
+    attached_client.rows = resize.rows;
+    attached_client.cols = resize.cols;
+    if (reset_for_screen_repaint) attached_client.presentation.resetForScreenRepaint();
+    attached_client.presentation.setViewportOffset(resize.viewport_offset);
     updateSessionSize(session, resize.rows, resize.cols);
     if (resize.repaint_request) |request| {
-        handleRepaintRequest(session_agent, attachment_index, request);
+        handleRepaintRequest(session_agent, attached_client_index, request);
     }
 }
 
-fn handleRepaintFrame(session_agent: *SessionAgent, attachment_index: usize, payload: []const u8) void {
+fn handleRepaintFrame(session_agent: *SessionAgent, attached_client_index: usize, payload: []const u8) void {
     const request = readRepaintRequest(payload) catch {
-        detachAttachment(session_agent, attachment_index);
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
-    handleRepaintRequest(session_agent, attachment_index, request);
+    handleRepaintRequest(session_agent, attached_client_index, request);
 }
 
-fn handleRepaintRequest(session_agent: *SessionAgent, attachment_index: usize, request: RepaintRequest) void {
-    const attachment = &session_agent.attachments[attachment_index];
-    const session = &session_agent.sessions[attachment.session_index];
+fn handleRepaintRequest(session_agent: *SessionAgent, attached_client_index: usize, request: RepaintRequest) void {
+    const attached_client = &session_agent.attached_clients[attached_client_index];
+    const session = &session_agent.sessions[attached_client.session_index];
 
     const model = session.terminal_model orelse return;
     const clear_for_replace = request.scrollback_cursor != null and
         request.scrollback_cursor.?.per_epoch_cursor == 0 and
         request.initial_scrollback_rows == null;
-    const screen_rows = queueRepaintSnapshot(attachment, session, request, clear_for_replace) catch {
-        detachAttachment(session_agent, attachment_index);
+    const screen_rows = queueRepaintSnapshot(attached_client, session, request, clear_for_replace) catch {
+        detachAttachedClient(session_agent, attached_client_index);
         return;
     };
     model.markRendered(screen_rows);
-    flushAttachmentOutput(session_agent, attachment_index);
+    flushAttachedClientOutput(session_agent, attached_client_index);
 }
 
 fn broadcastSessionPatch(session_agent: *SessionAgent, session_index: usize) void {
-    if (!hasActiveAttachment(session_agent, session_index)) return;
+    if (!hasActiveAttachedClient(session_agent, session_index)) return;
 
     const session = &session_agent.sessions[session_index];
     const model = session.terminal_model orelse return;
@@ -4022,18 +4022,18 @@ fn broadcastSessionPatch(session_agent: *SessionAgent, session_index: usize) voi
     }
     if (screen.retained_scrollback_clear_dirty) advanceScrollbackEpochForClear(session);
     var delivered = false;
-    for (&session_agent.attachments, 0..) |*attachment, i| {
-        if (!attachment.active or attachment.session_index != session_index) continue;
-        if (attachment.close_after_flush) continue;
+    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
+        if (!attached_client.active or attached_client.session_index != session_index) continue;
+        if (attached_client.close_after_flush) continue;
         if (screen.retained_scrollback_clear_dirty) {
-            queueRetainedScrollbackClearDraw(attachment, session) catch {
-                detachAttachment(session_agent, i);
+            queueRetainedScrollbackClearDraw(attached_client, session) catch {
+                detachAttachedClient(session_agent, i);
                 continue;
             };
         }
         if (scrollback.rows.len > 0) {
             queueScrollbackRowsAndScreenDraw(
-                attachment,
+                attached_client,
                 session,
                 scrollback.rows,
                 &screen,
@@ -4041,12 +4041,12 @@ fn broadcastSessionPatch(session_agent: *SessionAgent, session_index: usize) voi
                 materialize_screen_after_scrollback,
                 scrollback.absolute_count,
             ) catch {
-                detachAttachment(session_agent, i);
+                detachAttachedClient(session_agent, i);
                 continue;
             };
         } else if (should_send_screen_draw) {
             _ = queueScreenDraw(
-                attachment,
+                attached_client,
                 session,
                 &screen,
                 if (primary_screen) |*primary| primary else null,
@@ -4054,12 +4054,12 @@ fn broadcastSessionPatch(session_agent: *SessionAgent, session_index: usize) voi
                 materialize_screen_after_scrollback,
                 scrollback.absolute_count,
             ) catch {
-                detachAttachment(session_agent, i);
+                detachAttachedClient(session_agent, i);
                 continue;
             };
         }
-        flushAttachmentOutput(session_agent, i);
-        if (attachment.active) delivered = true;
+        flushAttachedClientOutput(session_agent, i);
+        if (attached_client.active) delivered = true;
     }
     if (delivered) {
         if (scrollback.rows.len > 0) model.markScrollbackReported();
@@ -4076,54 +4076,54 @@ fn broadcastSessionPatch(session_agent: *SessionAgent, session_index: usize) voi
     }
 }
 
-fn hasActiveAttachment(session_agent: *const SessionAgent, session_index: usize) bool {
-    for (&session_agent.attachments) |*attachment| {
-        if (attachment.active and
-            attachment.session_index == session_index and
-            !attachment.close_after_flush) return true;
+fn hasActiveAttachedClient(session_agent: *const SessionAgent, session_index: usize) bool {
+    for (&session_agent.attached_clients) |*attached_client| {
+        if (attached_client.active and
+            attached_client.session_index == session_index and
+            !attached_client.close_after_flush) return true;
     }
     return false;
 }
 
-fn hasAttachmentForSession(session_agent: *const SessionAgent, session_index: usize) bool {
-    for (&session_agent.attachments) |*attachment| {
-        if (attachment.active and attachment.session_index == session_index) return true;
+fn hasAttachedClientForSession(session_agent: *const SessionAgent, session_index: usize) bool {
+    for (&session_agent.attached_clients) |*attached_client| {
+        if (attached_client.active and attached_client.session_index == session_index) return true;
     }
     return false;
 }
 
-fn sendSessionEndedToAttachments(session_agent: *SessionAgent, session_index: usize, reason: u8, exit_info: ExitInfo) void {
-    for (&session_agent.attachments, 0..) |*attachment, i| {
-        if (!attachment.active or attachment.session_index != session_index) continue;
-        sendSessionEnded(attachment, reason, exit_info) catch {
-            detachAttachment(session_agent, i);
+fn sendSessionEndedToAttachedClients(session_agent: *SessionAgent, session_index: usize, reason: u8, exit_info: ExitInfo) void {
+    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
+        if (!attached_client.active or attached_client.session_index != session_index) continue;
+        sendSessionEnded(attached_client, reason, exit_info) catch {
+            detachAttachedClient(session_agent, i);
             continue;
         };
-        closeAttachmentAfterFlush(session_agent, i);
+        closeAttachedClientAfterFlush(session_agent, i);
     }
 }
 
-fn detachAttachment(session_agent: *SessionAgent, attachment_index: usize) void {
-    const attachment = &session_agent.attachments[attachment_index];
-    if (!attachment.active) return;
+fn detachAttachedClient(session_agent: *SessionAgent, attached_client_index: usize) void {
+    const attached_client = &session_agent.attached_clients[attached_client_index];
+    if (!attached_client.active) return;
 
-    const session_index = attachment.session_index;
+    const session_index = attached_client.session_index;
     if (session_index < session_agent.sessions.len) {
         const session = &session_agent.sessions[session_index];
-        logSessionAgent(session_agent, "event=detach id={s} rows={} cols={}", .{ session.idSlice(), attachment.rows, attachment.cols });
-        removeClientAgentSocketHintForAttachment(session_agent, session, attachment);
+        logSessionAgent(session_agent, "event=detach id={s} rows={} cols={}", .{ session.idSlice(), attached_client.rows, attached_client.cols });
+        removeClientAgentSocketHintForAttachedClient(session_agent, session, attached_client);
     }
-    _ = c.close(attachment.fd);
-    attachment.output.deinit(app_allocator.allocator());
-    attachment.* = Attachment{};
+    _ = c.close(attached_client.fd);
+    attached_client.output.deinit(app_allocator.allocator());
+    attached_client.* = AttachedClient{};
     refreshAttachedFlag(session_agent, session_index);
 }
 
-fn closeAttachmentAfterFlush(session_agent: *SessionAgent, attachment_index: usize) void {
-    const attachment = &session_agent.attachments[attachment_index];
-    if (!attachment.active) return;
-    attachment.close_after_flush = true;
-    flushAttachmentOutput(session_agent, attachment_index);
+fn closeAttachedClientAfterFlush(session_agent: *SessionAgent, attached_client_index: usize) void {
+    const attached_client = &session_agent.attached_clients[attached_client_index];
+    if (!attached_client.active) return;
+    attached_client.close_after_flush = true;
+    flushAttachedClientOutput(session_agent, attached_client_index);
 }
 
 fn refreshAttachedFlag(session_agent: *SessionAgent, session_index: usize) void {
@@ -4141,10 +4141,10 @@ fn refreshAttachedFlag(session_agent: *SessionAgent, session_index: usize) void 
     } else if (was_attached or session_agent.sessions[session_index].detached_at_unix_ms == 0) {
         session_agent.sessions[session_index].detached_at_unix_ms = nowUnixMs();
     }
-    if (now_attached != was_attached) updateRouteAttachmentState(session_agent, session_index, count);
+    if (now_attached != was_attached) updateRouteAttachedClientState(session_agent, session_index, count);
 }
 
-fn updateRouteAttachmentState(session_agent: *SessionAgent, session_index: usize, attached_count_value: u32) void {
+fn updateRouteAttachedClientState(session_agent: *SessionAgent, session_index: usize, attached_count_value: u32) void {
     const session = &session_agent.sessions[session_index];
     session_registry.updateRouteStatus(
         app_allocator.allocator(),
@@ -4157,7 +4157,7 @@ fn updateRouteAttachmentState(session_agent: *SessionAgent, session_index: usize
             .detached_at_unix_ms = if (session.detached_at_unix_ms == 0) null else session.detached_at_unix_ms,
         },
     ) catch |err| {
-        logSessionAgent(session_agent, "event=route_attachment_state_update_failed id={s} error={t}", .{ session.idSlice(), err });
+        logSessionAgent(session_agent, "event=route_attached_client_state_update_failed id={s} error={t}", .{ session.idSlice(), err });
     };
 }
 
@@ -4186,7 +4186,7 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
             nowUnixMs(),
         });
     }
-    sendSessionEndedToAttachments(session_agent, session_index, reason, exit_info);
+    sendSessionEndedToAttachedClients(session_agent, session_index, reason, exit_info);
     removeClientAgentSocketHintsForSession(session_agent, session_index);
     writeEndedSessionTombstone(session_agent, session, reason, exit_info);
     if (session.pty_fd >= 0) _ = c.close(session.pty_fd);
@@ -4194,7 +4194,7 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
         model.destroy();
         session.terminal_model = null;
     }
-    clearAttachmentHints(session_agent);
+    clearAttachedClientHints(session_agent);
     session.deinit();
     session.alive = false;
     session.attached = false;
@@ -4227,23 +4227,23 @@ fn writeEndedSessionTombstone(session_agent: *SessionAgent, session: *const Sess
     };
 }
 
-fn clearAttachmentHints(session_agent: *SessionAgent) void {
+fn clearAttachedClientHints(session_agent: *SessionAgent) void {
     if (session_agent.session_paths) |paths| session_registry.removeEndedHints(paths) catch {};
 }
 
 fn removeClientAgentSocketHintsForSession(session_agent: *SessionAgent, session_index: usize) void {
     if (session_index >= session_agent.sessions.len) return;
     const session = &session_agent.sessions[session_index];
-    for (&session_agent.attachments) |*attachment| {
-        if (!attachment.active or attachment.session_index != session_index) continue;
-        removeClientAgentSocketHintForAttachment(session_agent, session, attachment);
+    for (&session_agent.attached_clients) |*attached_client| {
+        if (!attached_client.active or attached_client.session_index != session_index) continue;
+        removeClientAgentSocketHintForAttachedClient(session_agent, session, attached_client);
     }
 }
 
 fn stopSessionAgentIfComplete(session_agent: *SessionAgent) void {
     if (session_agent.shutting_down) {
-        for (&session_agent.attachments) |*attachment| {
-            if (attachment.active) return;
+        for (&session_agent.attached_clients) |*attached_client| {
+            if (attached_client.active) return;
         }
         session_agent.running = false;
         return;
@@ -4252,14 +4252,14 @@ fn stopSessionAgentIfComplete(session_agent: *SessionAgent) void {
     for (&session_agent.sessions) |*session| {
         if (session.alive) return;
     }
-    for (&session_agent.attachments) |*attachment| {
-        if (attachment.active) return;
+    for (&session_agent.attached_clients) |*attached_client| {
+        if (attached_client.active) return;
     }
     session_agent.running = false;
 }
 
 fn closeSessionAgent(session_agent: *SessionAgent) void {
-    for (0..session_agent.attachments.len) |i| detachAttachment(session_agent, i);
+    for (0..session_agent.attached_clients.len) |i| detachAttachedClient(session_agent, i);
     for (0..session_agent.sessions.len) |i| endSession(session_agent, i, 2, .{});
 }
 

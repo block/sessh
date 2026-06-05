@@ -1951,7 +1951,7 @@ pub const TeInputAck = struct {
 
 /// Framed payload, client -> session agent.
 ///
-/// Current terminal size for this attachment.
+/// Current terminal size for this attached client.
 pub const TeResize = struct {
     terminal_rows: u32 = 0,
     terminal_cols: u32 = 0,
@@ -2026,7 +2026,7 @@ pub const TeResize = struct {
 
 /// Framed payload, client -> session agent.
 ///
-/// Requests that the session agent redraw terminal state for this attachment.
+/// Requests that the session agent redraw terminal state for this attached client.
 pub const TeRepaintRequest = struct {
     repaint_request_seq: u64 = 0,
     scrollback_cursor: ?[]const u8 = null,
@@ -3152,14 +3152,14 @@ pub const TeDraw = struct {
     scrollback_cursor: []const u8 = &.{},
     viewport_offset: ?i32 = null,
     draw_bytes: []const u8 = &.{},
-    relay_end_restore_bytes: ?[]const u8 = null,
+    attached_client_end_restore_bytes: ?[]const u8 = null,
     app_title_present: ?bool = null,
 
     pub const _desc_table = .{
         .scrollback_cursor = fd(1, .{ .scalar = .bytes }),
         .viewport_offset = fd(2, .{ .scalar = .sint32 }),
         .draw_bytes = fd(3, .{ .scalar = .bytes }),
-        .relay_end_restore_bytes = fd(4, .{ .scalar = .bytes }),
+        .attached_client_end_restore_bytes = fd(4, .{ .scalar = .bytes }),
         .app_title_present = fd(5, .{ .scalar = .bool }),
     };
 

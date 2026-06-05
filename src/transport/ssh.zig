@@ -935,13 +935,13 @@ pub fn runInvocation(
     }
 
     while (true) {
-        const end = client.relayRuntimeSession(
+        const end = client.runAttachedClient(
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
             &session,
             .{ .monitor_connection = true },
         ) catch |err| {
-            waitAfterRuntimeAttachFailure(&child, "relay");
+            waitAfterRuntimeAttachFailure(&child, "attached client");
             if (process_exit.is(err)) return err;
             try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
             return process_exit.request(1);
@@ -1326,7 +1326,7 @@ fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) v
 }
 
 fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation, session: *client.RuntimeSession) !void {
-    session.restoreRelayEndPresentationForExit();
+    session.restoreAttachedClientEndPresentationForExit();
     client.markRouteDetachedForSession(allocator, session);
     client.removeClientRouteHintForRemoteSession(allocator, session);
     client_log.flush(2);
@@ -1341,7 +1341,7 @@ fn finishEndedRemoteSession(
     session: *client.RuntimeSession,
 ) !u8 {
     const exit_status = session.endedProcessExitCode();
-    session.restoreRelayEndPresentationForExit();
+    session.restoreAttachedClientEndPresentationForExit();
     client.removeClientRouteHintForRemoteSession(allocator, session);
     client.tombstoneLocalRouteForRemoteSession(allocator, session) catch |err| {
         client_log.debug("event=local_tombstone_failed session={s} error={t}", .{ session.idSlice(), err });
@@ -2526,7 +2526,7 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
     };
 
     // Stop after Hello while racing an unresponsive transport. SessionAttach
-    // would replace the still-visible old attachment before the user presses
+    // would replace the still-visible old attached client before the user presses
     // Ctrl-R to switch.
     client.prepareReconnectRuntimeCancellable(
         connection.child.stdout.?.handle,

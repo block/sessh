@@ -8,7 +8,7 @@ const io = @import("../core/io.zig");
 const list_format = @import("../runtime/list_format.zig");
 const process_exit = @import("../core/process_exit.zig");
 const protocol = @import("../protocol/mod.zig");
-const relay = @import("../transport/relay.zig");
+const frame_forwarder = @import("../transport/frame_forwarder.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 const socket_transport = @import("../transport/socket.zig");
 
@@ -56,7 +56,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                     else => return err,
                 };
                 defer _ = c.close(agent_fd);
-                try attachAgentAndRelay(allocator, agent_fd, frame.payload);
+                try attachAgentAndForwardFrames(allocator, agent_fd, frame.payload);
                 return;
             },
             .te_session_create => {
@@ -64,7 +64,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                     else => return err,
                 };
                 defer _ = c.close(agent_fd);
-                try createSessionAndRelay(allocator, agent_fd, frame.payload);
+                try createSessionAndForwardFrames(allocator, agent_fd, frame.payload);
                 return;
             },
             else => {
@@ -2102,7 +2102,7 @@ fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, se
     return error.SessionAgentDidNotStart;
 }
 
-fn createSessionAndRelay(
+fn createSessionAndForwardFrames(
     allocator: std.mem.Allocator,
     agent_fd: c.fd_t,
     session_create_payload: []const u8,
@@ -2115,10 +2115,10 @@ fn createSessionAndRelay(
         else => return err,
     };
     try protocol.sendFrame(agent_fd, .te_session_create, session_create_payload);
-    try relay.relayFrames(0, 1, agent_fd);
+    try frame_forwarder.forwardFrames(0, 1, agent_fd);
 }
 
-fn attachAgentAndRelay(
+fn attachAgentAndForwardFrames(
     allocator: std.mem.Allocator,
     agent_fd: c.fd_t,
     session_attach_payload: []const u8,
@@ -2131,7 +2131,7 @@ fn attachAgentAndRelay(
         else => return err,
     };
     try protocol.sendFrame(agent_fd, .te_session_attach, session_attach_payload);
-    try relay.relayFrames(0, 1, agent_fd);
+    try frame_forwarder.forwardFrames(0, 1, agent_fd);
 }
 
 fn errorIsVersionMismatch(allocator: std.mem.Allocator, payload: []const u8) !bool {

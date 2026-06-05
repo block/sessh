@@ -311,7 +311,7 @@ fn localStreamSinks(stdout_fd: c.fd_t) [channel_count]ChannelSink {
     return sinks;
 }
 
-const StreamAttachmentOptions = struct {
+const StreamAttachedClientOptions = struct {
     source_count: usize = 0,
     sources: [max_stream_sources]StreamSource = .{ .{}, .{} },
     sinks: [channel_count]ChannelSink = .{ .{}, .{}, .{} },
@@ -321,7 +321,7 @@ const StreamAttachmentOptions = struct {
     replacement_listen_fd: ?c.fd_t = null,
     close_outbound_on_inbound_eof: bool = false,
 
-    fn sink(self: *const StreamAttachmentOptions, channel: StreamChannel) ChannelSink {
+    fn sink(self: *const StreamAttachedClientOptions, channel: StreamChannel) ChannelSink {
         return self.sinks[channelIndex(channel)];
     }
 };
@@ -455,14 +455,14 @@ const StreamLiveness = struct {
 // Owns one currently attached transport. The byte-offset state is outside this
 // type so a caller can drop this transport and resume the same stream over a
 // replacement without duplicating or losing bytes.
-const StreamAttachment = struct {
+const StreamAttachedClient = struct {
     state: *StreamState,
     transport_read_fd: c.fd_t,
     transport_write_fd: c.fd_t,
-    options: StreamAttachmentOptions,
+    options: StreamAttachedClientOptions,
     liveness: StreamLiveness,
     // Optional fd used only by the local stream loop. It lets that loop wake an
-    // otherwise blocking attachment when an async replacement transport is
+    // otherwise blocking attached client when an async replacement transport is
     // ready, without shortening the main poll timeout.
     external_wakeup_fd: c.fd_t = -1,
     interrupt_fd: c.fd_t = -1,
@@ -471,8 +471,8 @@ const StreamAttachment = struct {
         state: *StreamState,
         transport_read_fd: c.fd_t,
         transport_write_fd: c.fd_t,
-        options: StreamAttachmentOptions,
-    ) !StreamAttachment {
+        options: StreamAttachedClientOptions,
+    ) !StreamAttachedClient {
         state.peer_ready = false;
         for (stream_channels) |channel| {
             if (state.active_outbound.contains(channel)) {
@@ -491,7 +491,7 @@ const StreamAttachment = struct {
         };
     }
 
-    fn step(self: *StreamAttachment, requested_timeout_ms: i32) !StreamStepOutcome {
+    fn step(self: *StreamAttachedClient, requested_timeout_ms: i32) !StreamStepOutcome {
         const state = self.state;
         if (state.complete()) return .complete;
 
@@ -655,7 +655,7 @@ fn appendStreamSourceBytes(state: *StreamState, source: StreamSource, bytes: []c
 
 fn drainStreamSourcesNonBlocking(
     state: *StreamState,
-    options: *const StreamAttachmentOptions,
+    options: *const StreamAttachedClientOptions,
 ) !void {
     for (options.sources[0..options.source_count]) |source| {
         if (source.fd < 0) continue;
@@ -945,7 +945,7 @@ const ProxyEndpoint = struct {
         };
     }
 
-    fn attachmentOptions(self: *ProxyEndpoint, listen_fd: c.fd_t) StreamAttachmentOptions {
+    fn attachedClientOptions(self: *ProxyEndpoint, listen_fd: c.fd_t) StreamAttachedClientOptions {
         return .{
             .source_count = 1,
             .sources = .{
@@ -975,7 +975,7 @@ const ProxyEndpoint = struct {
 
 /// The stream broker is bound to one ssh transport. It connects that transport
 /// to the durable stream agent socket for the stream GUID, starting the agent
-/// when needed, then relays bytes between ssh stdio and the agent socket.
+/// when needed, then forwards bytes between ssh stdio and the agent socket.
 /// Stream brokers use `p-` GUIDs, but their durable sockets are still agent
 /// sockets under `a/`; the GUID directory carries proxy-specific metadata.
 pub fn runBroker(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
@@ -987,7 +987,7 @@ pub fn runBroker(allocator: std.mem.Allocator, exe: []const u8, args: []const []
 
     const fd = try connectOrStartAgent(allocator, exe, args, socket_paths.socket);
     defer _ = c.close(fd);
-    try relayRawDuplex(0, 1, fd);
+    try forwardRawDuplex(0, 1, fd);
 }
 
 pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
@@ -1025,7 +1025,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
     }
     while (true) {
         if (attach_fd < 0) {
-            var detached_options = endpoint.attachmentOptions(listen_fd);
+            var detached_options = endpoint.attachedClientOptions(listen_fd);
             attach_fd = try waitForReplacementWhileDetached(&state, listen_fd, &detached_options);
         }
 
@@ -1033,7 +1033,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
             &state,
             attach_fd,
             attach_fd,
-            endpoint.attachmentOptions(listen_fd),
+            endpoint.attachedClientOptions(listen_fd),
         );
         switch (outcome) {
             .complete => return,
@@ -1052,7 +1052,7 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
 fn waitForReplacementWhileDetached(
     state: *StreamState,
     listen_fd: c.fd_t,
-    options: *const StreamAttachmentOptions,
+    options: *const StreamAttachedClientOptions,
 ) !c.fd_t {
     while (true) {
         // The stream agent is durable even when no ssh transport is currently
@@ -1176,7 +1176,7 @@ pub fn runLocalStream(
         input_control.status_visible = false;
 
         transport_loop: while (true) {
-            var attachment = StreamAttachment.init(
+            var attached_client = StreamAttachedClient.init(
                 &state,
                 transport.readFd(),
                 transport.writeFd(),
@@ -1206,9 +1206,9 @@ pub fn runLocalStream(
             };
             var old_unresponsive = false;
             while (true) {
-                attachment.external_wakeup_fd = if (pending) |*replacement| replacement.notifyFd() else -1;
-                attachment.interrupt_fd = local_interrupt.read_fd;
-                const outcome = attachment.step(-1) catch .transport_closed;
+                attached_client.external_wakeup_fd = if (pending) |*replacement| replacement.notifyFd() else -1;
+                attached_client.interrupt_fd = local_interrupt.read_fd;
+                const outcome = attached_client.step(-1) catch .transport_closed;
                 switch (outcome) {
                     .complete => {
                         transport.close();
@@ -1406,9 +1406,9 @@ fn runAttachedStream(
     state: *StreamState,
     transport_read_fd: c.fd_t,
     transport_write_fd: c.fd_t,
-    options: StreamAttachmentOptions,
+    options: StreamAttachedClientOptions,
 ) !StreamOutcome {
-    var attachment = StreamAttachment.init(
+    var attached_client = StreamAttachedClient.init(
         state,
         transport_read_fd,
         transport_write_fd,
@@ -1416,7 +1416,7 @@ fn runAttachedStream(
     ) catch return .transport_closed;
 
     while (true) {
-        switch (try attachment.step(-1)) {
+        switch (try attached_client.step(-1)) {
             .complete => return .complete,
             .transport_closed => return .transport_closed,
             .unresponsive => return .unresponsive,
@@ -1430,7 +1430,7 @@ fn runAttachedStream(
 fn handleFrame(
     state: *StreamState,
     transport_write_fd: c.fd_t,
-    options: *const StreamAttachmentOptions,
+    options: *const StreamAttachedClientOptions,
     frame: protocol.OwnedFrame,
 ) !void {
     var mutable = frame;
@@ -1520,7 +1520,7 @@ fn handleEofAck(state: *StreamState, channel: StreamChannel, offset: u64) !void 
 fn handleInboundData(
     state: *StreamState,
     transport_write_fd: c.fd_t,
-    options: *const StreamAttachmentOptions,
+    options: *const StreamAttachedClientOptions,
     channel: StreamChannel,
     offset: u64,
     data: []const u8,
@@ -1557,7 +1557,7 @@ fn handleInboundData(
 fn handleInboundEof(
     state: *StreamState,
     transport_write_fd: c.fd_t,
-    options: *const StreamAttachmentOptions,
+    options: *const StreamAttachedClientOptions,
     channel: StreamChannel,
     offset: u64,
 ) !void {
@@ -1586,7 +1586,7 @@ fn handleInboundEof(
     };
 }
 
-fn deliverInboundData(options: *const StreamAttachmentOptions, channel: StreamChannel, sink_fd: c.fd_t, bytes: []const u8) !void {
+fn deliverInboundData(options: *const StreamAttachedClientOptions, channel: StreamChannel, sink_fd: c.fd_t, bytes: []const u8) !void {
     if (options.reconnect_status) |status| status.observeInbound(channel, bytes);
     try io.writeAll(sink_fd, bytes);
 }
@@ -1697,7 +1697,7 @@ fn abortTransport(transport: anytype) void {
     }
 }
 
-fn relayRawDuplex(left_read_fd: c.fd_t, left_write_fd: c.fd_t, right_fd: c.fd_t) !void {
+fn forwardRawDuplex(left_read_fd: c.fd_t, left_write_fd: c.fd_t, right_fd: c.fd_t) !void {
     var left_open = true;
     var right_open = true;
     while (left_open or right_open) {
@@ -2509,7 +2509,7 @@ test "stream ping receives pong without changing offsets" {
     var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{ .stdout = true });
     defer state.deinit();
     const payload = try protocol.encodePayload(std.testing.allocator, pb.Ping{});
-    const options = StreamAttachmentOptions{};
+    const options = StreamAttachedClientOptions{};
     try handleFrame(&state, fds[1], &options, .{
         .message_type = .ping,
         .payload = payload,
@@ -2568,7 +2568,7 @@ test "stream receiver keeps suffix from overlapping data frame" {
         .offset = 0,
         .data = "firstsecond",
     });
-    var options = StreamAttachmentOptions{};
+    var options = StreamAttachedClientOptions{};
     options.sinks[channelIndex(stream_channel_stdout)] = .{ .fd = sink[1] };
     try handleFrame(&state, ack[1], &options, .{
         .message_type = .proxy_stream_data,
@@ -2605,7 +2605,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
     defer std.testing.allocator.free(payload);
     try protocol.sendFrame(transport_in[1], .proxy_stream_eof, payload);
 
-    var attachment = StreamAttachment{
+    var attached_client = StreamAttachedClient{
         .state = &state,
         .transport_read_fd = transport_in[0],
         .transport_write_fd = transport_out[1],
@@ -2615,7 +2615,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
         .liveness = StreamLiveness.init(1_000),
     };
 
-    try std.testing.expectEqual(StreamStepOutcome.progress, try attachment.step(1_000));
+    try std.testing.expectEqual(StreamStepOutcome.progress, try attached_client.step(1_000));
 
     var ack_frame = try protocol.readFrameAlloc(std.testing.allocator, transport_out[0]);
     defer ack_frame.deinit(std.testing.allocator);
@@ -2775,7 +2775,7 @@ test "stream completion waits for eof acknowledgement" {
     const payload = try protocol.encodePayload(std.testing.allocator, pb.ProxyStreamEofAck{
         .offset = 0,
     });
-    const options = StreamAttachmentOptions{};
+    const options = StreamAttachedClientOptions{};
     try handleFrame(&state, -1, &options, .{
         .message_type = .proxy_stream_eof_ack,
         .payload = payload,
