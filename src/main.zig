@@ -2,14 +2,17 @@ const std = @import("std");
 const posix = std.posix;
 
 const app_allocator = @import("app_allocator.zig");
-const broker = @import("broker.zig");
-const client = @import("client.zig");
 const config = @import("config.zig");
 const io = @import("io.zig");
+const mux = @import("mux.zig");
+const mux_broker = @import("mux_broker.zig");
+const mux_force_compat = @import("mux_force_compat.zig");
+const mux_proxy_stream = @import("mux_proxy_stream.zig");
+const mux_sessh = @import("mux_sessh.zig");
+const mux_session_agent = @import("mux_session_agent.zig");
+const mux_stream_agent = @import("mux_stream_agent.zig");
+const mux_stream_broker = @import("mux_stream_broker.zig");
 const process_exit = @import("process_exit.zig");
-const session_agent = @import("session_agent.zig");
-const ssh_client = @import("ssh_client.zig");
-const stream_agent = @import("stream_agent.zig");
 const terminal = @import("terminal.zig");
 
 pub fn main() !void {
@@ -50,44 +53,38 @@ fn runMain() !void {
     }
 
     if (entrypoint == .sessh) {
-        const sessh_args = try sesshArgsFromInternal(allocator, args);
-        defer allocator.free(sessh_args);
-        return ssh_client.run(allocator, sessh_args);
+        return mux_sessh.run(allocator, args);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-session-agent:")) {
-        if (args.len != 4 or !std.mem.eql(u8, args[2], "--session-dir")) {
-            try io.writeAll(2, "sessh: :internal-session-agent: requires --session-dir DIR\n");
-            return process_exit.request(64);
-        }
-        return session_agent.runSessionAgent(args[3]);
+        return mux_session_agent.run(args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-session-broker:")) {
-        return broker.run(allocator, args[0], args[2..]);
+        return mux_broker.runSessionBroker(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-control:")) {
-        if (args.len != 2) {
-            try io.writeAll(2, "sessh: :internal-control: does not accept arguments\n");
-            return process_exit.request(64);
-        }
-        return broker.runControl(allocator);
+        return mux_broker.runControl(allocator, args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-stream-broker:")) {
-        return stream_agent.runBroker(allocator, args[0], args[2..]);
+        return mux_stream_broker.run(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-stream-agent:")) {
-        return stream_agent.runAgent(allocator, args[0], args[2..]);
+        return mux_stream_agent.run(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-proxy-stream:")) {
-        return ssh_client.runProxyStream(allocator, args[0], args[2..]);
+        return mux_proxy_stream.run(allocator, args[0], args[2..]);
     }
 
-    return ssh_client.runMux(allocator, args, true);
+    if (std.mem.eql(u8, args[1], "force-compat")) {
+        return mux_force_compat.run(allocator, args[2..]);
+    }
+
+    return mux.run(allocator, args);
 }
 
 const EntryPoint = enum {
@@ -102,34 +99,9 @@ fn entrypointName(entrypoint: EntryPoint) []const u8 {
     };
 }
 
-fn sesshArgsFromInternal(allocator: std.mem.Allocator, args: []const []const u8) ![][]const u8 {
-    std.debug.assert(args.len >= 2);
-    std.debug.assert(std.mem.eql(u8, args[1], ":internal-sessh:"));
-
-    const sessh_args = try allocator.alloc([]const u8, args.len - 1);
-    sessh_args[0] = args[0];
-    @memcpy(sessh_args[1..], args[2..]);
-    return sessh_args;
-}
-
 test "version label follows entrypoint" {
     try std.testing.expectEqualStrings("sessh", entrypointName(.sessh));
     try std.testing.expectEqualStrings("sesshmux", entrypointName(.sesshmux));
-}
-
-test "internal sessh modality removes sentinel" {
-    const rewritten = try sesshArgsFromInternal(std.testing.allocator, &.{
-        "sesshmux-macos-aarch64",
-        ":internal-sessh:",
-        "-v",
-        "example.com",
-    });
-    defer std.testing.allocator.free(rewritten);
-
-    try std.testing.expectEqual(@as(usize, 3), rewritten.len);
-    try std.testing.expectEqualStrings("sesshmux-macos-aarch64", rewritten[0]);
-    try std.testing.expectEqualStrings("-v", rewritten[1]);
-    try std.testing.expectEqualStrings("example.com", rewritten[2]);
 }
 
 test "sessh top-level options do not match remote command arguments" {
@@ -260,7 +232,25 @@ test {
     _ = @import("broker.zig");
     _ = @import("proxy_control.zig");
     _ = @import("client_renderer.zig");
+    _ = @import("mux.zig");
+    _ = @import("mux_attach.zig");
+    _ = @import("mux_broker.zig");
+    _ = @import("mux_client_control.zig");
+    _ = @import("mux_common.zig");
+    _ = @import("mux_debug.zig");
+    _ = @import("mux_detach.zig");
     _ = @import("mux_cli.zig");
+    _ = @import("mux_force_compat.zig");
+    _ = @import("mux_kill.zig");
+    _ = @import("mux_list.zig");
+    _ = @import("mux_new.zig");
+    _ = @import("mux_parser.zig");
+    _ = @import("mux_proxy_stream.zig");
+    _ = @import("mux_repaint.zig");
+    _ = @import("mux_sessh.zig");
+    _ = @import("mux_session_agent.zig");
+    _ = @import("mux_stream_agent.zig");
+    _ = @import("mux_stream_broker.zig");
     _ = @import("pty_process.zig");
     _ = @import("process_exit.zig");
     _ = @import("runtime_refresher.zig");

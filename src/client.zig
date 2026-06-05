@@ -90,6 +90,7 @@ const LocalOptions = struct {
     attach_id: ?[]const u8 = null,
     kill_id: ?[]const u8 = null,
     kill_ids: []const []const u8 = &.{},
+    owned_kill_ids: ?[][]const u8 = null,
     kill_current: bool = false,
     kill_request_args: []const []const u8 = &.{},
     kill_jsonl: bool = false,
@@ -117,6 +118,12 @@ const LocalOptions = struct {
     client_log_level_set: bool = false,
     compat_mode: bool = false,
     capture_tty_transcript: ?[]const u8 = null,
+
+    fn deinit(self: *LocalOptions, allocator: std.mem.Allocator) void {
+        if (self.owned_kill_ids) |ids| allocator.free(ids);
+        self.owned_kill_ids = null;
+        self.kill_ids = &.{};
+    }
 };
 
 pub const LocalNewSessionRequest = struct {
@@ -2666,10 +2673,11 @@ test "client detach request uses normal detach relay end" {
 /// Implements sesshmux-local commands after the public mux parser has selected
 /// the local endpoint.
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    var options = parseLocalOptions(args) catch |err| {
+    var options = parseLocalOptions(allocator, args) catch |err| {
         try writeLocalArgError(err);
         return process_exit.request(64);
     };
+    defer options.deinit(allocator);
     applyFileConfigToLocal(allocator, &options) catch |err| {
         try io_helpers.stderrPrint("sessh: invalid config: {t}\n", .{err});
         return process_exit.request(64);
@@ -2685,6 +2693,7 @@ fn writeLocalArgError(err: anyerror) !void {
         error.MissingKillTarget => try io_helpers.writeAll(2, "sesshmux: kill requires --all, a guid, or --current\n"),
         error.MissingCurrentSession => try io_helpers.writeAll(2, "sesshmux: --current requires $SESSH_GUID\n"),
         error.MissingHost => try io_helpers.writeAll(2, "sesshmux: --host requires a value\n"),
+        error.MissingId => try io_helpers.writeAll(2, "sesshmux: --id requires a value\n"),
         error.InvalidLocalHost => try io_helpers.writeAll(2, "sesshmux: local commands only accept --host .\n"),
         error.DetachedCaptureUnsupported => try io_helpers.writeAll(2, "sesshmux: new --detached does not support --capture-tty-transcript\n"),
         else => try io_helpers.stderrPrint("sessh: invalid . arguments: {t}\n", .{err}),
@@ -3350,20 +3359,28 @@ fn runRemoteClientControlCommand(
     defer argv.deinit(allocator);
     try argv.append(allocator, exe);
     switch (options.action) {
-        .detach_client => try argv.append(allocator, "detach"),
-        .repaint_client => try argv.append(allocator, "repaint"),
+        .detach_client => {
+            try argv.append(allocator, "detach");
+        },
+        .repaint_client => {
+            try argv.append(allocator, "repaint");
+        },
         .debug_client => {
             try argv.append(allocator, "debug");
-            try argv.append(allocator, switch (options.debug_client_action.?) {
-                .sever_connection => "sever-connection",
-                .unresponsive_connection => "unresponsive-connection",
-            });
         },
         else => unreachable,
     }
     try argv.appendSlice(allocator, route.ssh_options);
     try argv.append(allocator, "--host");
     try argv.append(allocator, route.host);
+    try argv.append(allocator, "--id");
+    try argv.append(allocator, route.guid);
+    if (options.action == .debug_client) {
+        try argv.append(allocator, switch (options.debug_client_action.?) {
+            .sever_connection => "sever-connection",
+            .unresponsive_connection => "unresponsive-connection",
+        });
+    }
     switch (options.client_target) {
         .default => {},
         .all => try argv.append(allocator, "--all"),
@@ -3379,7 +3396,6 @@ fn runRemoteClientControlCommand(
         try argv.append(allocator, "--seconds");
         try argv.append(allocator, seconds_arg);
     }
-    try argv.append(allocator, route.guid);
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
@@ -4311,8 +4327,8 @@ fn terminateChild(child: *std.process.Child) void {
     _ = child.wait() catch {};
 }
 
-fn parseLocalOptions(args: []const []const u8) !LocalOptions {
-    return parseLocalOptionsWithCompatMode(args, compatModeFromEnv());
+fn parseLocalOptions(allocator: std.mem.Allocator, args: []const []const u8) !LocalOptions {
+    return parseLocalOptionsWithCompatMode(allocator, args, compatModeFromEnv());
 }
 
 fn compatModeFromEnv() bool {
@@ -4320,8 +4336,9 @@ fn compatModeFromEnv() bool {
     return std.mem.eql(u8, std.mem.span(value_z), "1");
 }
 
-fn parseLocalOptionsWithCompatMode(args: []const []const u8, compat_mode: bool) !LocalOptions {
+fn parseLocalOptionsWithCompatMode(allocator: std.mem.Allocator, args: []const []const u8, compat_mode: bool) !LocalOptions {
     var options = LocalOptions{};
+    errdefer options.deinit(allocator);
     options.compat_mode = compat_mode;
     var i: usize = 1;
 
@@ -4364,7 +4381,7 @@ fn parseLocalOptionsWithCompatMode(args: []const []const u8, compat_mode: bool) 
         try parseLocalAttachOptions(args, &i, &options);
     } else if (std.mem.eql(u8, command, "kill")) {
         i += 1;
-        try parseLocalKillOptions(args, &i, &options);
+        try parseLocalKillOptions(allocator, args, &i, &options);
     } else {
         try parseLocalNewOptions(args, &i, &options);
     }
@@ -4402,13 +4419,19 @@ fn parseLocalNewOptions(args: []const []const u8, index: *usize, options: *Local
 }
 
 fn parseLocalAttachOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
-    while (index.* < args.len and try parseLocalHostTargetOption(args, index)) {}
+    while (index.* < args.len) {
+        if (try parseLocalHostTargetOption(args, index)) continue;
+        if (try parseLocalIdOption(args, index, &options.attach_id)) continue;
+        break;
+    }
     if (index.* < args.len and !std.mem.startsWith(u8, args[index.*], "--")) {
+        if (options.attach_id != null) return error.MultipleTargets;
         options.attach_id = args[index.*];
         index.* += 1;
     }
     while (index.* < args.len) {
         if (try parseLocalHostTargetOption(args, index)) continue;
+        if (try parseLocalIdOption(args, index, &options.attach_id)) continue;
         if (try parseLocalCommonSessionOption(args, index, options)) continue;
         return error.UnknownArgument;
     }
@@ -4456,7 +4479,7 @@ fn parseLocalListOptions(args: []const []const u8, index: *usize, options: *Loca
     }
 }
 
-fn parseLocalKillOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
+fn parseLocalKillOptions(allocator: std.mem.Allocator, args: []const []const u8, index: *usize, options: *LocalOptions) !void {
     try setAction(options, .kill);
     while (index.* < args.len) {
         const arg = args[index.*];
@@ -4470,6 +4493,12 @@ fn parseLocalKillOptions(args: []const []const u8, index: *usize, options: *Loca
         } else if (std.mem.eql(u8, arg, "--current")) {
             if (options.action == .kill_all or options.kill_ids.len > 0 or options.kill_request_args.len > 0) return error.MultipleTargets;
             options.kill_current = true;
+            index.* += 1;
+        } else if (std.mem.eql(u8, arg, "--id")) {
+            if (options.action == .kill_all or options.kill_current or options.kill_request_args.len > 0) return error.MultipleTargets;
+            index.* += 1;
+            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingId;
+            try appendLocalKillId(allocator, options, args[index.*]);
             index.* += 1;
         } else if (std.mem.startsWith(u8, arg, "--request=") or std.mem.eql(u8, arg, "--request")) {
             if (options.action == .kill_all or options.kill_current or options.kill_ids.len > 0) return error.MultipleTargets;
@@ -4510,6 +4539,13 @@ fn parseLocalKillOptions(args: []const []const u8, index: *usize, options: *Loca
 }
 
 fn parseLocalDebugOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
+    while (index.* < args.len) {
+        if (try parseLocalHostTargetOption(args, index)) continue;
+        if (try parseLocalIdOption(args, index, &options.client_session_ref)) continue;
+        if (try parseLocalCommonSessionOption(args, index, options)) continue;
+        if (std.mem.startsWith(u8, args[index.*], "--")) return error.UnknownArgument;
+        break;
+    }
     if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingDebugAction;
     if (std.mem.eql(u8, args[index.*], "sever-connection")) {
         options.debug_client_action = .sever_connection;
@@ -4520,6 +4556,18 @@ fn parseLocalDebugOptions(args: []const []const u8, index: *usize, options: *Loc
     }
     index.* += 1;
     try parseLocalClientControlOptions(args, index, options);
+}
+
+fn appendLocalKillId(allocator: std.mem.Allocator, options: *LocalOptions, id: []const u8) !void {
+    const old = options.kill_ids;
+    const owned = try allocator.alloc([]const u8, old.len + 1);
+    errdefer allocator.free(owned);
+    @memcpy(owned[0..old.len], old);
+    owned[old.len] = id;
+    if (options.owned_kill_ids) |previous| allocator.free(previous);
+    options.owned_kill_ids = owned;
+    options.kill_ids = owned;
+    options.kill_id = options.kill_ids[0];
 }
 
 fn parseLocalClientControlOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
@@ -4543,6 +4591,8 @@ fn parseLocalClientControlOptions(args: []const []const u8, index: *usize, optio
             index.* += 1;
         } else if (try parseLocalHostTargetOption(args, index)) {
             continue;
+        } else if (try parseLocalIdOption(args, index, &options.client_session_ref)) {
+            continue;
         } else if (std.mem.eql(u8, arg, ".")) {
             index.* += 1;
         } else if (try parseLocalCommonSessionOption(args, index, options)) {
@@ -4557,6 +4607,16 @@ fn parseLocalClientControlOptions(args: []const []const u8, index: *usize, optio
             return error.UnknownArgument;
         }
     }
+}
+
+fn parseLocalIdOption(args: []const []const u8, index: *usize, target: *?[]const u8) !bool {
+    if (!std.mem.eql(u8, args[index.*], "--id")) return false;
+    index.* += 1;
+    if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingId;
+    if (target.* != null) return error.MultipleTargets;
+    target.* = args[index.*];
+    index.* += 1;
+    return true;
 }
 
 fn parseLocalHostTargetOption(args: []const []const u8, index: *usize) !bool {
@@ -4693,36 +4753,36 @@ fn setAction(options: *LocalOptions, action: LocalAction) !void {
 }
 
 test "parseLocalOptions keeps command flags command-specific" {
-    const list_all = try parseLocalOptions(&.{
+    const list_all = try parseLocalOptions(std.testing.allocator, &.{
         "sesshmux",
         "list",
         "--all",
     });
     try std.testing.expect(list_all.list_all);
-    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
+    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(std.testing.allocator, &.{
         "sesshmux",
         "list",
         "--current",
     }));
-    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
+    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(std.testing.allocator, &.{
         "sesshmux",
         "kill",
         "--refresh",
     }));
-    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(&.{
+    try std.testing.expectError(error.UnknownArgument, parseLocalOptions(std.testing.allocator, &.{
         "sesshmux",
         "attach",
         "s1",
         "--exited",
     }));
-    const detached_new = try parseLocalOptions(&.{
+    const detached_new = try parseLocalOptions(std.testing.allocator, &.{
         "sesshmux",
         "new",
         "--detached",
     });
     try std.testing.expect(detached_new.new_detached);
     try std.testing.expectEqual(LocalAction.new, detached_new.action);
-    try std.testing.expectError(error.UnsupportedClientTarget, parseLocalOptions(&.{
+    try std.testing.expectError(error.UnsupportedClientTarget, parseLocalOptions(std.testing.allocator, &.{
         "sesshmux",
         "detach",
         "--scrollback",
@@ -4730,7 +4790,7 @@ test "parseLocalOptions keeps command flags command-specific" {
 }
 
 test "parseLocalOptions supports compatibility options before local commands" {
-    const attach = try parseLocalOptionsWithCompatMode(&.{
+    const attach = try parseLocalOptionsWithCompatMode(std.testing.allocator, &.{
         "sesshmux",
         "attach",
         "--host",
@@ -4745,7 +4805,7 @@ test "parseLocalOptions supports compatibility options before local commands" {
     try std.testing.expectEqualStrings("s1", attach.attach_id.?);
     try std.testing.expectEqual(@as(u32, 42), attach.scrollback_row_count);
 
-    const list = try parseLocalOptionsWithCompatMode(&.{
+    const list = try parseLocalOptionsWithCompatMode(std.testing.allocator, &.{
         "sesshmux",
         "list",
         "--initial-scrollback",
@@ -4757,12 +4817,12 @@ test "parseLocalOptions supports compatibility options before local commands" {
 }
 
 test "parseLocalOptions uses current session only when explicit" {
-    try std.testing.expectError(error.MissingKillTarget, parseLocalOptionsWithCompatMode(&.{
+    try std.testing.expectError(error.MissingKillTarget, parseLocalOptionsWithCompatMode(std.testing.allocator, &.{
         "sesshmux",
         "kill",
     }, false));
 
-    const current = try parseLocalOptionsWithCompatMode(&.{
+    const current = try parseLocalOptionsWithCompatMode(std.testing.allocator, &.{
         "sesshmux",
         "kill",
         "--current",
@@ -4770,22 +4830,53 @@ test "parseLocalOptions uses current session only when explicit" {
     try std.testing.expectEqual(LocalAction.kill, current.action);
     try std.testing.expect(current.kill_current);
 
-    const all = try parseLocalOptionsWithCompatMode(&.{
+    const all = try parseLocalOptionsWithCompatMode(std.testing.allocator, &.{
         "sesshmux",
         "kill",
         "--all",
     }, false);
     try std.testing.expectEqual(LocalAction.kill_all, all.action);
 
-    try std.testing.expectError(error.MissingKillTarget, parseLocalOptionsWithCompatMode(&.{
+    try std.testing.expectError(error.MissingKillTarget, parseLocalOptionsWithCompatMode(std.testing.allocator, &.{
         "sesshmux",
         "kill",
     }, true));
 }
 
+test "parseLocalOptions accepts id option for local route commands" {
+    const debug = try parseLocalOptions(std.testing.allocator, &.{
+        "sesshmux",
+        "debug",
+        "--host",
+        ".",
+        "--id",
+        "s1",
+        "sever-connection",
+        "--all",
+    });
+    try std.testing.expectEqual(LocalAction.debug_client, debug.action);
+    try std.testing.expectEqual(DebugClientAction.sever_connection, debug.debug_client_action.?);
+    try std.testing.expectEqual(ClientTarget.all, debug.client_target);
+    try std.testing.expectEqualStrings("s1", debug.client_session_ref.?);
+
+    var kill = try parseLocalOptions(std.testing.allocator, &.{
+        "sesshmux",
+        "kill",
+        "--id",
+        "s1",
+        "--id",
+        "p1",
+    });
+    defer kill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(LocalAction.kill, kill.action);
+    try std.testing.expectEqual(@as(usize, 2), kill.kill_ids.len);
+    try std.testing.expectEqualStrings("s1", kill.kill_ids[0]);
+    try std.testing.expectEqualStrings("p1", kill.kill_ids[1]);
+}
+
 test "parseLocalOptions supports kill request mode" {
     const request_json = "{\"guid\":\"s-00000000-0000-4000-8000-000000000001\",\"requested_age_ms\":123}";
-    const request = try parseLocalOptions(&.{
+    const request = try parseLocalOptions(std.testing.allocator, &.{
         "sesshmux",
         "kill",
         "--jsonl",
@@ -4798,7 +4889,7 @@ test "parseLocalOptions supports kill request mode" {
     try std.testing.expectEqualStrings("--request", request.kill_request_args[0]);
     try std.testing.expectEqualStrings(request_json, request.kill_request_args[1]);
 
-    try std.testing.expectError(error.MultipleTargets, parseLocalOptions(&.{
+    try std.testing.expectError(error.MultipleTargets, parseLocalOptions(std.testing.allocator, &.{
         "sesshmux",
         "kill",
         "--request",
