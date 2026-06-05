@@ -218,10 +218,7 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
             }
             return finishCommand(64, "", "ERROR usage: list [--host-display HOST] [--jsonl] [--all] [--exited] [--local-only] [--client incoming|outgoing|session|ID]\n");
         };
-        const exit_status = if (options.client_selector == .none)
-            try listAgents(allocator, options)
-        else
-            try listClients(allocator, options);
+        const exit_status = try runListCommand(allocator, options);
         return process_exit.request(exit_status);
     }
     if (std.mem.eql(u8, command, "kill")) {
@@ -229,7 +226,7 @@ fn runCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) !void 
             return finishCommand(64, "", "ERROR usage: kill [--jsonl] (--all | --current | ID... | --request JSON...)\n");
         };
         defer options.deinit(allocator);
-        return killAgents(allocator, options);
+        return runKillCommand(allocator, options);
     }
     if (isClientControlCommandName(command)) {
         const client_command = parseClientControlCommand(args) catch return finishCommand(64, "", "ERROR usage: detach|repaint|debug [options] ID\n");
@@ -250,17 +247,25 @@ fn finishCommand(exit_status: u8, stdout: []const u8, stderr: []const u8) !void 
     return process_exit.request(exit_status);
 }
 
-const ListFormat = enum {
+pub fn runListCommand(allocator: std.mem.Allocator, options: ListOptions) !u8 {
+    socket_transport.publishRuntimeRootSymlinkOnce(allocator);
+    return if (options.client_selector == .none)
+        try listAgents(allocator, options)
+    else
+        try listClients(allocator, options);
+}
+
+pub const ListFormat = enum {
     table,
     jsonl,
 };
 
-const ListMode = enum {
+pub const ListMode = enum {
     live,
     exited,
 };
 
-const ClientListSelector = union(enum) {
+pub const ClientListSelector = union(enum) {
     none,
     incoming,
     outgoing,
@@ -269,7 +274,7 @@ const ClientListSelector = union(enum) {
     client_ref: []const u8,
 };
 
-const ListOptions = struct {
+pub const ListOptions = struct {
     host_display: []const u8 = ".",
     format: ListFormat = .table,
     mode: ListMode = .live,
@@ -278,12 +283,12 @@ const ListOptions = struct {
     client_selector: ClientListSelector = .none,
 };
 
-const KillFormat = enum {
+pub const KillFormat = enum {
     text,
     jsonl,
 };
 
-const KillOptions = struct {
+pub const KillOptions = struct {
     format: KillFormat = .text,
     all: bool = false,
     current: bool = false,
@@ -297,11 +302,11 @@ const KillOptions = struct {
     }
 };
 
-const KillRequest = struct {
+pub const KillRequest = struct {
     guid: []u8,
     requested_age_ms: u64,
 
-    fn deinit(self: *KillRequest, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *KillRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.guid);
         self.* = undefined;
     }
@@ -321,7 +326,7 @@ const KillResult = struct {
     reason: []const u8 = "",
 };
 
-const ClientControlTarget = struct {
+pub const ClientControlTarget = struct {
     kind: pb.TeClientControlTargetKind,
     client_guid: []const u8 = "",
 
@@ -333,29 +338,29 @@ const ClientControlTarget = struct {
     }
 };
 
-const ClientDetachCommand = struct {
+pub const ClientDetachCommand = struct {
     session_ref: ?[]const u8,
     target: ClientControlTarget,
 };
 
-const ClientRepaintCommand = struct {
+pub const ClientRepaintCommand = struct {
     session_ref: ?[]const u8,
     target: ClientControlTarget,
     include_scrollback: bool = false,
 };
 
-const ClientDebugSeverConnectionCommand = struct {
+pub const ClientDebugSeverConnectionCommand = struct {
     session_ref: ?[]const u8,
     target: ClientControlTarget,
 };
 
-const ClientDebugUnresponsiveConnectionCommand = struct {
+pub const ClientDebugUnresponsiveConnectionCommand = struct {
     session_ref: ?[]const u8,
     target: ClientControlTarget,
     seconds: u32 = config.default_debug_unresponsive_seconds,
 };
 
-const ClientControlCommand = union(enum) {
+pub const ClientControlCommand = union(enum) {
     detach: ClientDetachCommand,
     repaint: ClientRepaintCommand,
     debug_sever_connection: ClientDebugSeverConnectionCommand,
@@ -476,7 +481,7 @@ fn parseKillOptions(allocator: std.mem.Allocator, args: []const []const u8) !Kil
     return options;
 }
 
-fn parseKillRequestJson(allocator: std.mem.Allocator, bytes: []const u8) !KillRequest {
+pub fn parseKillRequestJson(allocator: std.mem.Allocator, bytes: []const u8) !KillRequest {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
     const object = try jsonObject(parsed.value);
@@ -1262,7 +1267,7 @@ fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8, max_len: usize)
     return allocator.dupe(u8, buf[0..@intCast(n)]);
 }
 
-fn runClientControlCommand(allocator: std.mem.Allocator, command: ClientControlCommand) !void {
+pub fn runClientControlCommand(allocator: std.mem.Allocator, command: ClientControlCommand) !void {
     var response = if (command.sessionRef()) |session_ref|
         try runClientControlCommandForSessionRef(allocator, session_ref, command)
     else
@@ -1481,7 +1486,7 @@ fn writeCommandErrorForAgentFailure(err: anyerror) !void {
     try io.writeAll(2, message);
 }
 
-fn killAgents(allocator: std.mem.Allocator, options: KillOptions) !void {
+pub fn runKillCommand(allocator: std.mem.Allocator, options: KillOptions) !void {
     if (options.all) return killAllAgents(allocator, options.format);
     if (options.current) {
         const session_id = currentSessionId(allocator) catch |err| switch (err) {

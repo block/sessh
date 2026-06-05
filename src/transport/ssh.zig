@@ -4,10 +4,10 @@ const c = std.c;
 const posix = std.posix;
 
 const attached_client = @import("../session/attached_client.zig");
-const client = @import("../session/client.zig");
 const client_config = @import("../session/client_config.zig");
 const client_log = @import("../core/client_log.zig");
 const client_ui = @import("../session/client_ui.zig");
+const mux_routed = @import("../mux/routed.zig");
 const proxy_control = @import("../stream/proxy_control.zig");
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
@@ -18,6 +18,8 @@ const reconnect = @import("../reconnect/mod.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect_title = @import("../reconnect/title.zig");
 const route_commands = @import("../runtime/route_commands.zig");
+const session_attach = @import("../session/attach.zig");
+const session_new = @import("../session/new.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 const socket_transport = @import("socket.zig");
 const stream_agent = @import("../stream/agent.zig");
@@ -641,7 +643,7 @@ pub fn runInvocation(
         parsed_ssh_args.action == .new and
         std.mem.eql(u8, parsed_ssh_args.host, "."))
     {
-        applyFileConfigToLocalNew(allocator, parsed_ssh_args) catch |err| {
+        applyFileConfigToLocalMux(allocator, parsed_ssh_args) catch |err| {
             try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
             return process_exit.request(64);
         };
@@ -656,7 +658,7 @@ pub fn runInvocation(
         }
         const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
         defer if (shell_command) |command| allocator.free(command);
-        return client.runLocalNewSession(allocator, .{
+        return session_new.runLocal(allocator, .{
             .exe = args[0],
             .new_detached = parsed_ssh_args.new_detached,
             .scrollback_row_count = parsed_ssh_args.scrollback_row_count,
@@ -671,9 +673,20 @@ pub fn runInvocation(
     if ((parsed_ssh_args.action == .attach or isOneShotBrokerCommandAction(parsed_ssh_args.action)) and
         (parsed_ssh_args.host.len == 0 or std.mem.eql(u8, parsed_ssh_args.host, ".")))
     {
-        if (parsed_ssh_args.action == .attach and parsed_ssh_args.attach_id_from_latest_route) {
-            return runLocalAttachRouteCommand(allocator, args, parsed_ssh_args.attach_id.?);
-        }
+        applyFileConfigToLocalMux(allocator, parsed_ssh_args) catch |err| {
+            try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
+            return process_exit.request(64);
+        };
+        client_log.setLevel(parsed_ssh_args.client_log_level);
+        if (parsed_ssh_args.action == .attach) return session_attach.runLocal(allocator, .{
+            .exe = args[0],
+            .session_ref = parsed_ssh_args.attach_id,
+            .session_dir = parsed_ssh_args.attach_session_dir,
+            .initial_scrollback_row_count = parsed_ssh_args.initial_scrollback_row_count,
+            .overlay_args = parsed_ssh_args.overlay_args.slice(),
+            .capture_tty_transcript = parsed_ssh_args.capture_tty_transcript,
+            .compat_mode = compatModeFromEnv(),
+        });
         if (parsed_ssh_args.action == .list and parsed_ssh_args.list_client_target == null) {
             var remote_control_runner: ?RemoteControlRunner = if (parsed_ssh_args.list_refresh and parsed_ssh_args.list_include_cached_routes)
                 try RemoteControlRunner.init(allocator)
@@ -698,7 +711,7 @@ pub fn runInvocation(
             if (exit_status != 0) return process_exit.request(exit_status);
             return;
         }
-        return runLocalRouteCommand(allocator, args);
+        return mux_routed.runInvocation(allocator, args[0], parsed_ssh_args.*);
     }
     applyFileConfigToSsh(allocator, parsed_ssh_args) catch |err| {
         try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
@@ -1908,13 +1921,16 @@ fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *SessionInvocation
     }
 }
 
-// Local `sesshmux new .` has no ssh transport, so ssh-only config such as
-// `terminal-emulator` and `filter-level` must not change its execution
-// path. Apply only the fields that already make sense for local mux sessions.
-fn applyFileConfigToLocalNew(allocator: std.mem.Allocator, parsed: *SessionInvocation) !void {
+// Local mux commands have no ssh transport, so ssh-only config such as
+// `terminal-emulator` and `filter-level` must not change their execution path.
+// Apply only the fields that already make sense for local mux sessions.
+fn applyFileConfigToLocalMux(allocator: std.mem.Allocator, parsed: *SessionInvocation) !void {
     const file_config = try client_config.loadFileConfig(allocator);
     if (!parsed.scrollback_row_count_set) {
         if (file_config.scrollback_row_count) |count| parsed.scrollback_row_count = count;
+    }
+    if (!parsed.initial_scrollback_row_count_set and file_config.initial_scrollback_row_count_set) {
+        parsed.initial_scrollback_row_count = file_config.initial_scrollback_row_count;
     }
     if (file_config.reap_ms) |ms| parsed.reap_ms = ms;
     if (file_config.tombstone_retention_ms) |ms| parsed.tombstone_retention_ms = ms;
@@ -4067,20 +4083,9 @@ fn shellQuote(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn runLocalRouteCommand(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    return client.run(allocator, args);
-}
-
-fn runLocalAttachRouteCommand(allocator: std.mem.Allocator, args: []const []const u8, session_ref: []const u8) !void {
-    const local_args = try allocator.alloc([]const u8, args.len + 3);
-    defer allocator.free(local_args);
-    local_args[0] = args[0];
-    local_args[1] = "attach";
-    local_args[2] = "--host";
-    local_args[3] = ".";
-    local_args[4] = session_ref;
-    @memcpy(local_args[5..], args[2..]);
-    return client.run(allocator, local_args);
+fn compatModeFromEnv() bool {
+    const value_z = c.getenv(config.compat_env) orelse return false;
+    return std.mem.eql(u8, std.mem.span(value_z), "1");
 }
 
 fn resolveLocalRefs(allocator: std.mem.Allocator, parsed: *SessionInvocation) !?[]u8 {

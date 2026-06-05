@@ -3,6 +3,7 @@ const std = @import("std");
 const client_log = @import("../core/client_log.zig");
 const io_helpers = @import("../core/io.zig");
 const list_format = @import("list_format.zig");
+const session_broker = @import("../session/broker.zig");
 const session_registry = @import("session_registry.zig");
 const shell = @import("../core/shell.zig");
 
@@ -39,21 +40,6 @@ pub const RemoteCommandRunner = struct {
     }
 };
 
-fn appendBrokerCommand(
-    runtime_args: []const []const u8,
-    command: []const u8,
-    value: ?[]const u8,
-    buf: [][]const u8,
-) []const []const u8 {
-    @memcpy(buf[0..runtime_args.len], runtime_args);
-    buf[runtime_args.len] = command;
-    if (value) |arg| {
-        buf[runtime_args.len + 1] = arg;
-        return buf[0 .. runtime_args.len + 2];
-    }
-    return buf[0 .. runtime_args.len + 1];
-}
-
 pub fn runLocalListCommand(
     allocator: std.mem.Allocator,
     exe: []const u8,
@@ -67,48 +53,13 @@ pub fn runLocalListCommand(
 ) !u8 {
     if (include_cached_routes and refresh) try refreshCachedRemoteRoutes(allocator, exe, remote_runner);
 
-    var command_args_buf: [8][]const u8 = undefined;
-    const command_args = appendBrokerCommand(runtime_broker_args, "list", null, &command_args_buf);
-    const extra_args: usize = (if (jsonl) @as(usize, 1) else 0) +
-        (if (all) @as(usize, 1) else 0) +
-        (if (exited) @as(usize, 1) else 0) +
-        (if ((all or exited) and !include_cached_routes) @as(usize, 1) else 0);
-    const argv = try allocator.alloc([]const u8, 2 + command_args.len + extra_args);
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = ":internal-session-broker:";
-    @memcpy(argv[2 .. 2 + command_args.len], command_args);
-    var arg_index = 2 + command_args.len;
-    if (jsonl) {
-        argv[arg_index] = "--jsonl";
-        arg_index += 1;
-    }
-    if (all) {
-        argv[arg_index] = "--all";
-        arg_index += 1;
-    }
-    if (exited) {
-        argv[arg_index] = "--exited";
-        arg_index += 1;
-    }
-    if ((all or exited) and !include_cached_routes) {
-        argv[arg_index] = "--local-only";
-        arg_index += 1;
-    }
-
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 1024 * 1024,
+    _ = runtime_broker_args;
+    const exit_status = try session_broker.runListCommand(allocator, .{
+        .format = if (jsonl) .jsonl else .table,
+        .mode = if (exited) .exited else .live,
+        .all = all,
+        .local_only = (all or exited) and !include_cached_routes,
     });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.stdout.len > 0) try io_helpers.writeAll(1, result.stdout);
-    if (result.stderr.len > 0) try io_helpers.writeAll(2, result.stderr);
-    const exit_status: u8 = switch (result.term) {
-        .Exited => |code| @intCast(@min(code, std.math.maxInt(u8))),
-        else => 1,
-    };
     if (exit_status != 0) return exit_status;
     if (include_cached_routes and !exited and !all) {
         const appended_cached_routes = try appendCachedRemoteRouteRows(allocator, jsonl);

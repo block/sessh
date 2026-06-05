@@ -268,6 +268,7 @@ test {
     _ = @import("core/shell.zig");
     _ = @import("mux/attach.zig");
     _ = @import("mux/cli.zig");
+    _ = @import("mux/client_control_args.zig");
     _ = @import("mux/client_control.zig");
     _ = @import("mux/common.zig");
     _ = @import("mux/debug.zig");
@@ -275,10 +276,12 @@ test {
     _ = @import("mux/force_compat.zig");
     _ = @import("mux/kill.zig");
     _ = @import("mux/list.zig");
+    _ = @import("mux/local.zig");
     _ = @import("mux/mod.zig");
     _ = @import("mux/new.zig");
     _ = @import("mux/parser.zig");
     _ = @import("mux/repaint.zig");
+    _ = @import("mux/routed.zig");
     _ = @import("protocol/mod.zig");
     _ = @import("reconnect/control.zig");
     _ = @import("reconnect/mod.zig");
@@ -288,11 +291,13 @@ test {
     _ = @import("runtime/refresher.zig");
     _ = @import("runtime/session_registry.zig");
     _ = @import("session/attached_client.zig");
+    _ = @import("session/attach.zig");
     _ = @import("session/agent.zig");
     _ = @import("session/broker.zig");
-    _ = @import("session/client.zig");
     _ = @import("session/client_config.zig");
     _ = @import("session/client_ui.zig");
+    _ = @import("session/local_broker.zig");
+    _ = @import("session/new.zig");
     _ = @import("session/renderer.zig");
     _ = @import("session/vt.zig");
     _ = @import("stream/agent.zig");
