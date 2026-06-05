@@ -604,6 +604,11 @@ pub const RuntimeSession = struct {
         restoreRelayEndPresentationBytes(&self.relay_end_restore);
     }
 
+    pub fn restoreRelayEndPresentationForExit(self: *RuntimeSession) void {
+        self.restoreRelayEndPresentation();
+        restoreLocalTerminalPresentation();
+    }
+
     pub fn deinit(self: *RuntimeSession) void {
         self.relay_end_restore.deinit(app_allocator.allocator());
         self.relay_end_restore = .empty;
@@ -2766,7 +2771,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
 
         switch (end) {
             .detach => {
-                session.restoreRelayEndPresentation();
+                session.restoreRelayEndPresentationForExit();
                 terminateChild(&child);
                 markRouteDetachedForSession(allocator, &session);
                 try tty_transcript.finishActiveOrReport();
@@ -2777,7 +2782,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
             .kill_detach => {
                 recordRuntimeSessionKillRequested(allocator, ".", &session);
                 spawnLocalKillJsonl(allocator, request.exe, &.{session.guidSlice()});
-                session.restoreRelayEndPresentation();
+                session.restoreRelayEndPresentationForExit();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 return;
@@ -2789,13 +2794,13 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
                     .ended_at_unix_ms = nowUnixMs(),
                     .end_reason = .killed_by_request,
                 };
-                session.restoreRelayEndPresentation();
+                session.restoreRelayEndPresentationForExit();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 return;
             },
             .session_ended => {
-                session.restoreRelayEndPresentation();
+                session.restoreRelayEndPresentationForExit();
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
                 try tty_transcript.finishActiveOrReport();
@@ -2808,7 +2813,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
                 if (!anySessionExistsViaBroker(allocator, request.exe, runtime_broker_args)) {
-                    session.restoreRelayEndPresentation();
+                    session.restoreRelayEndPresentationForExit();
                     try io_helpers.writeAll(2, "\r\nsessh: session agent crashed\r\n");
                     return process_exit.request(1);
                 }
@@ -2819,14 +2824,14 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
         try io_helpers.writeAll(2, reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
         try io_helpers.writeAll(2, "\r\n");
         child = startLocalBroker(allocator, request.exe, runtime_broker_args) catch |err| {
-            session.restoreRelayEndPresentation();
+            session.restoreRelayEndPresentationForExit();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
         reconnectSessionOnRuntime(child.stdout.?.handle, child.stdin.?.handle, &session) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
-            session.restoreRelayEndPresentation();
+            session.restoreRelayEndPresentationForExit();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -2997,7 +3002,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
 
         switch (end) {
             .detach => {
-                session.restoreRelayEndPresentation();
+                session.restoreRelayEndPresentationForExit();
                 terminateChild(&child);
                 markRouteDetachedForSession(allocator, &session);
                 try tty_transcript.finishActiveOrReport();
@@ -3008,7 +3013,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
             .kill_detach => {
                 recordRuntimeSessionKillRequested(allocator, ".", &session);
                 spawnLocalKillJsonl(allocator, args[0], &.{session.guidSlice()});
-                session.restoreRelayEndPresentation();
+                session.restoreRelayEndPresentationForExit();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 return;
@@ -3020,13 +3025,13 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                     .ended_at_unix_ms = nowUnixMs(),
                     .end_reason = .killed_by_request,
                 };
-                session.restoreRelayEndPresentation();
+                session.restoreRelayEndPresentationForExit();
                 terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 return;
             },
             .session_ended => {
-                session.restoreRelayEndPresentation();
+                session.restoreRelayEndPresentationForExit();
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
                 try tty_transcript.finishActiveOrReport();
@@ -3039,7 +3044,7 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
                 closeChildStdin(&child);
                 _ = child.wait() catch {};
                 if (!anySessionExistsViaBroker(allocator, args[0], runtime_broker_args)) {
-                    session.restoreRelayEndPresentation();
+                    session.restoreRelayEndPresentationForExit();
                     try io_helpers.writeAll(2, "\r\nsessh: session agent crashed\r\n");
                     return process_exit.request(1);
                 }
@@ -3050,14 +3055,14 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         try io_helpers.writeAll(2, reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
         try io_helpers.writeAll(2, "\r\n");
         child = startLocalBroker(allocator, args[0], runtime_broker_args) catch |err| {
-            session.restoreRelayEndPresentation();
+            session.restoreRelayEndPresentationForExit();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
         reconnectSessionOnRuntime(child.stdout.?.handle, child.stdin.?.handle, &session) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
-            session.restoreRelayEndPresentation();
+            session.restoreRelayEndPresentationForExit();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -6544,6 +6549,16 @@ fn restoreRelayEndPresentationBytesToFd(fd: c.fd_t, relay_end_restore: ?*std.Arr
     if (restore.items.len == 0) return;
     io_helpers.writeAll(fd, restore.items) catch {};
     restore.clearRetainingCapacity();
+}
+
+fn restoreLocalTerminalPresentation() void {
+    const renderer = client_renderer.Renderer.init(1);
+    renderer.restorePresentation(queryInitialKittyKeyboardFlags()) catch {};
+    const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
+    if (cleanup_title) |title| {
+        defer app_allocator.allocator().free(title);
+        renderer.setTitle(title) catch {};
+    }
 }
 
 fn requestSessionDetach(read_fd: c.fd_t, write_fd: c.fd_t) RelayEnd {

@@ -2753,20 +2753,39 @@ def run_slow_attachment_does_not_block_commands_test(base_env):
 def run_session_agent_crash_client_error_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-agent-crash-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
-        env["SHELL"] = "/bin/sh"
+        shell = Path(tmp) / "crash-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            "printf '\\033[6 qREADY$ '\n"
+            "while IFS= read -r line; do\n"
+            "  printf '\\033[?1049h\\033[?1000;1004;1006;2004hCRASH_UI_READY'\n"
+            "  sleep 60\n"
+            "done\n"
+        )
+        shell.chmod(0o700)
+        env["SHELL"] = str(shell)
         cleanup_runtime(env)
         pid, fd = spawn_client(env, [])
         child_closed = False
         try:
-            read_until(fd, b"$ ")
+            output = read_until(fd, b"READY$ ")
+            os.write(fd, b"go\n")
+            output += read_until(fd, b"CRASH_UI_READY")
             pids = session_agent_pids(env)
             if len(pids) != 1:
                 raise AssertionError(f"expected one session agent, found {pids}")
 
             os.kill(pids[0], signal.SIGKILL)
-            output = read_until(fd, b"sessh: session agent crashed", timeout=5.0)
+            output += read_until(fd, b"sessh: session agent crashed", timeout=5.0)
             if b"session agent crashed" not in output:
                 raise AssertionError(output)
+            alt_leave = output.rfind(b"\x1b[?1049l")
+            if alt_leave < 0:
+                raise AssertionError(f"agent crash did not leave alternate screen: {output!r}")
+            final_cleanup = output[alt_leave:]
+            for seq in (b"\x1b[?1000l", b"\x1b[?1006l", b"\x1b[?1004l", b"\x1b[?2004l", b"\x1b[0 q"):
+                if seq not in final_cleanup:
+                    raise AssertionError(f"missing final cleanup sequence {seq!r} after alternate-screen leave: {final_cleanup!r}")
 
             status = wait_child_draining_fd(pid, fd)
             if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 1:

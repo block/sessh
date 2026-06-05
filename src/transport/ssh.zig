@@ -1323,7 +1323,7 @@ fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) v
 }
 
 fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation, session: *client.RuntimeSession) !void {
-    session.restoreRelayEndPresentation();
+    session.restoreRelayEndPresentationForExit();
     client.markRouteDetachedForSession(allocator, session);
     client.removeClientRouteHintForRemoteSession(allocator, session);
     client_log.flush(2);
@@ -1338,7 +1338,7 @@ fn finishEndedRemoteSession(
     session: *client.RuntimeSession,
 ) !u8 {
     const exit_status = session.endedProcessExitCode();
-    session.restoreRelayEndPresentation();
+    session.restoreRelayEndPresentationForExit();
     client.removeClientRouteHintForRemoteSession(allocator, session);
     client.tombstoneLocalRouteForRemoteSession(allocator, session) catch |err| {
         client_log.debug("event=local_tombstone_failed session={s} error={t}", .{ session.idSlice(), err });
