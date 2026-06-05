@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
+const attached_client = @import("../session/attached_client.zig");
 const client = @import("../session/client.zig");
 const client_config = @import("../session/client_config.zig");
 const client_log = @import("../core/client_log.zig");
@@ -412,7 +413,7 @@ const RemoteControlRunner = struct {
             null,
         );
         errdefer connection.terminate();
-        try client.runtimeHandshake(connection.child.stdout.?.handle, connection.child.stdin.?.handle);
+        try attached_client.runtimeHandshake(connection.child.stdout.?.handle, connection.child.stdin.?.handle);
 
         self.active = .{
             .key = key,
@@ -498,7 +499,7 @@ const ParallelReconnectState = struct {
     bootstrap_entrypoint: BootstrapEntrypoint,
     broker_args: []const []const u8,
     reconnect_ui: *client_ui.ReconnectUi,
-    session: client.RuntimeSession,
+    session: attached_client.RuntimeSession,
 
     fn store(self: *ParallelReconnectState, result: ParallelReconnectResult) void {
         self.task.store(result);
@@ -834,7 +835,7 @@ pub fn runInvocation(
     );
 
     if (parsed_ssh_args.action == .new and parsed_ssh_args.new_detached) {
-        var created = client.createSessionOnRuntime(
+        var created = attached_client.createSessionOnRuntime(
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
             parsed_ssh_args.scrollback_row_count,
@@ -858,7 +859,7 @@ pub fn runInvocation(
         };
         defer created.deinit();
         child.suppressSshStderr();
-        try client.ensureLocalRouteForCreatedRemoteSession(
+        try attached_client.ensureLocalRouteForCreatedRemoteSession(
             allocator,
             &created,
             parsed_ssh_args.host,
@@ -879,7 +880,7 @@ pub fn runInvocation(
     }
 
     var session = (switch (parsed_ssh_args.action) {
-        .new => client.startNewSessionOnRuntime(
+        .new => attached_client.startNewSessionOnRuntime(
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
             parsed_ssh_args.scrollback_row_count,
@@ -890,7 +891,7 @@ pub fn runInvocation(
             parsed_ssh_args.reap_ms,
             parsed_ssh_args.tombstone_retention_ms,
         ),
-        .attach => client.startAttachSessionOnRuntime(
+        .attach => attached_client.startAttachSessionOnRuntime(
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
             parsed_ssh_args.attach_id orelse "",
@@ -922,7 +923,7 @@ pub fn runInvocation(
     session.setTitleFallback(parsed_ssh_args.host);
     child.suppressSshStderr();
     if (parsed_ssh_args.action == .new or parsed_ssh_args.action == .attach) {
-        try client.ensureLocalRouteForRemoteSession(
+        try attached_client.ensureLocalRouteForRemoteSession(
             allocator,
             &session,
             parsed_ssh_args.attach_id orelse "",
@@ -935,7 +936,7 @@ pub fn runInvocation(
     }
 
     while (true) {
-        const end = client.runAttachedClient(
+        const end = attached_client.runAttachedClient(
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
             &session,
@@ -957,7 +958,7 @@ pub fn runInvocation(
             },
             .kill_detach => {
                 client_log.debug("event=kill_detach host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
-                client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
                 route_commands.spawnRemoteKillJsonl(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()});
                 child.terminate();
                 try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
@@ -965,7 +966,7 @@ pub fn runInvocation(
             },
             .kill_wait => {
                 client_log.debug("event=kill_wait host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
-                client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
                 const killed = try route_commands.runRemoteKillJsonlAndProcess(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()}, session.guidSlice());
                 child.terminate();
                 if (!killed) return process_exit.request(1);
@@ -1024,7 +1025,7 @@ pub fn runInvocation(
                     session.noteUnresponsiveRecovery();
                     session.discardPendingInputAcks();
                     session.viewport_offset = try reconnect_ui.clearOverlay();
-                    client.repaintRuntimeSession(
+                    attached_client.repaintRuntimeSession(
                         child.child.stdout.?.handle,
                         child.child.stdin.?.handle,
                         &session,
@@ -1045,7 +1046,7 @@ pub fn runInvocation(
                     child = new_child;
                     session.discardPendingInputAcks();
                     session.viewport_offset = try reconnect_ui.clearOverlay();
-                    client.finishReconnectRepaint(child.child.stdout.?.handle, child.child.stdin.?.handle, &session) catch |err| switch (err) {
+                    attached_client.finishReconnectRepaint(child.child.stdout.?.handle, child.child.stdin.?.handle, &session) catch |err| switch (err) {
                         error.SessionEnded => {
                             const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
                             return process_exit.request(exit_status);
@@ -1116,7 +1117,7 @@ pub fn runInvocation(
                     return;
                 },
                 .kill_detach => {
-                    client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                    attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
                     client_log.debug("event=reconnect_kill_detach host={s} session={s} attempt={}", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
@@ -1127,7 +1128,7 @@ pub fn runInvocation(
                     return;
                 },
                 .kill_wait => {
-                    client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                    attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
                     client_log.debug("event=reconnect_kill_wait host={s} session={s} attempt={}", .{
                         parsed_ssh_args.host,
                         session.idSlice(),
@@ -1219,7 +1220,7 @@ pub fn runInvocation(
             };
 
             session.viewport_offset = reconnect_ui.currentViewportOffset();
-            client.reconnectSessionOnRuntimeCancellable(
+            attached_client.reconnectSessionOnRuntimeCancellable(
                 child.child.stdout.?.handle,
                 child.child.stdin.?.handle,
                 &session,
@@ -1256,7 +1257,7 @@ pub fn runInvocation(
                     return;
                 },
                 .kill_detach => {
-                    client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                    attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
                     route_commands.spawnRemoteKillJsonl(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()});
                     child.terminate();
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
@@ -1264,7 +1265,7 @@ pub fn runInvocation(
                     return;
                 },
                 .kill_wait => {
-                    client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                    attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
                     const killed = try route_commands.runRemoteKillJsonlAndProcess(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()}, session.guidSlice());
                     child.terminate();
                     if (!killed) return process_exit.request(1);
@@ -1278,7 +1279,7 @@ pub fn runInvocation(
 
             session.discardPendingInputAcks();
             session.viewport_offset = try reconnect_ui.clearOverlay();
-            client.finishReconnectRepaint(
+            attached_client.finishReconnectRepaint(
                 child.child.stdout.?.handle,
                 child.child.stdin.?.handle,
                 &session,
@@ -1325,25 +1326,25 @@ fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) v
     io.stderrPrint("sessh: ssh runtime ended after attach {s} failure: {t}\n", .{ stage, term }) catch {};
 }
 
-fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation, session: *client.RuntimeSession) !void {
+fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation, session: *attached_client.RuntimeSession) !void {
     session.restoreAttachedClientEndPresentationForExit();
-    client.markRouteDetachedForSession(allocator, session);
-    client.removeClientRouteHintForRemoteSession(allocator, session);
+    attached_client.markRouteDetachedForSession(allocator, session);
+    attached_client.removeClientRouteHintForRemoteSession(allocator, session);
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
-    client.writeDetachOverlayForSessionRef(parsed_ssh_args.overlay_args.slice(), session.idSlice());
-    if (session.kill_requested) client.writeUnconfirmedKillDetachWarningForSessionRef(session.guidSlice());
+    attached_client.writeDetachOverlayForSessionRef(parsed_ssh_args.overlay_args.slice(), session.idSlice());
+    if (session.kill_requested) attached_client.writeUnconfirmedKillDetachWarningForSessionRef(session.guidSlice());
 }
 
 fn finishEndedRemoteSession(
     allocator: std.mem.Allocator,
     child: *RuntimeConnection,
-    session: *client.RuntimeSession,
+    session: *attached_client.RuntimeSession,
 ) !u8 {
     const exit_status = session.endedProcessExitCode();
     session.restoreAttachedClientEndPresentationForExit();
-    client.removeClientRouteHintForRemoteSession(allocator, session);
-    client.tombstoneLocalRouteForRemoteSession(allocator, session) catch |err| {
+    attached_client.removeClientRouteHintForRemoteSession(allocator, session);
+    attached_client.tombstoneLocalRouteForRemoteSession(allocator, session) catch |err| {
         client_log.debug("event=local_tombstone_failed session={s} error={t}", .{ session.idSlice(), err });
     };
     child.closeStdin();
@@ -2130,7 +2131,7 @@ fn raceExistingConnectionWithReconnect(
     remote_command: []const u8,
     broker_args: []const []const u8,
     old_child: *RuntimeConnection,
-    session: *client.RuntimeSession,
+    session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
     pending_input_at_disconnect: bool,
     pending_paste_like_input_at_disconnect: bool,
@@ -2181,7 +2182,7 @@ fn raceExistingConnectionWithReconnect(
 
 fn waitForUnresponsiveReconnectRetry(
     old_child: *RuntimeConnection,
-    session: *client.RuntimeSession,
+    session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
     delay_ms: u64,
 ) !?ReconnectRaceOutcome {
@@ -2190,7 +2191,7 @@ fn waitForUnresponsiveReconnectRetry(
         const elapsed_ms = @divTrunc(timer.read(), std.time.ns_per_ms);
         if (elapsed_ms >= delay_ms) return null;
 
-        if (try client.pollRuntimeRecovery(old_child.child.stdout.?.handle, session, 0)) |recovery| {
+        if (try attached_client.pollRuntimeRecovery(old_child.child.stdout.?.handle, session, 0)) |recovery| {
             switch (recovery) {
                 .recovered => return .recovered,
                 .session_ended => return .session_ended,
@@ -2205,7 +2206,7 @@ fn waitForUnresponsiveReconnectRetry(
 
         const remaining_ms = delay_ms - elapsed_ms;
         const poll_ms: i32 = @intCast(@min(remaining_ms, @as(u64, 50)));
-        switch (try client.pollAndForwardReconnectInput(
+        switch (try attached_client.pollAndForwardReconnectInput(
             old_child.child.stdout.?.handle,
             old_child.child.stdin.?.handle,
             session,
@@ -2232,7 +2233,7 @@ fn raceExistingConnectionWithReconnectAttempt(
     remote_command: []const u8,
     broker_args: []const []const u8,
     old_child: *RuntimeConnection,
-    session: *client.RuntimeSession,
+    session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
     pending_input_at_disconnect: bool,
     pending_paste_like_input_at_disconnect: bool,
@@ -2257,7 +2258,7 @@ fn raceExistingConnectionWithReconnectAttempt(
     };
     var ready_connection: ?RuntimeConnection = null;
     defer if (ready_connection) |*connection| connection.terminate();
-    var ready_session = client.RuntimeSession{};
+    var ready_session = attached_client.RuntimeSession{};
 
     var old_available = true;
     while (true) {
@@ -2302,7 +2303,7 @@ fn raceExistingConnectionWithReconnectAttempt(
         }
 
         if (old_available) {
-            if (try client.pollRuntimeRecovery(old_child.child.stdout.?.handle, session, 0)) |recovery| {
+            if (try attached_client.pollRuntimeRecovery(old_child.child.stdout.?.handle, session, 0)) |recovery| {
                 switch (recovery) {
                     .recovered => {
                         reconnect_ui.cancel();
@@ -2351,7 +2352,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                 }
             }
             if (old_available) {
-                switch (try client.pollAndForwardReconnectInput(
+                switch (try attached_client.pollAndForwardReconnectInput(
                     old_child.child.stdout.?.handle,
                     old_child.child.stdin.?.handle,
                     session,
@@ -2379,7 +2380,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                         }
                     },
                     .kill_detach => {
-                        client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                        attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
                         reconnect_ui.cancel();
                         if (!joined) {
                             joined = true;
@@ -2389,7 +2390,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                         return .detach;
                     },
                     .kill_wait => {
-                        client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                        attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
                         if (ready_connection != null) {
                             return try attachReadyReconnectConnection(
                                 &ready_connection,
@@ -2430,7 +2431,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                     return .detach;
                 },
                 .kill_detach => {
-                    client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                    attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
                     reconnect_ui.cancel();
                     if (!joined) {
                         joined = true;
@@ -2440,7 +2441,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                     return .detach;
                 },
                 .kill_wait => {
-                    client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                    attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
                     if (ready_connection) |connection| {
                         ready_connection = null;
                         return .{ .reconnected = connection };
@@ -2461,8 +2462,8 @@ fn raceExistingConnectionWithReconnectAttempt(
 
 fn attachReadyReconnectConnectionAfterTransportClosed(
     ready_connection: *?RuntimeConnection,
-    ready_session: *client.RuntimeSession,
-    session: *client.RuntimeSession,
+    ready_session: *attached_client.RuntimeSession,
+    session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
     pending_input_at_disconnect: bool,
     pending_paste_like_input_at_disconnect: bool,
@@ -2476,10 +2477,10 @@ fn attachReadyReconnectConnectionAfterTransportClosed(
     )) {
         .detach => return .detach,
         .kill_detach => {
-            client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, host, session);
+            attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, host, session);
             return .detach;
         },
-        .kill_wait => client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, host, session),
+        .kill_wait => attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, host, session),
         .reconnect_now, .wait_elapsed => {},
     }
     return attachReadyReconnectConnection(ready_connection, ready_session, session, reconnect_ui);
@@ -2487,14 +2488,14 @@ fn attachReadyReconnectConnectionAfterTransportClosed(
 
 fn attachReadyReconnectConnection(
     ready_connection: *?RuntimeConnection,
-    ready_session: *client.RuntimeSession,
-    session: *client.RuntimeSession,
+    ready_session: *attached_client.RuntimeSession,
+    session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
 ) !ReconnectRaceOutcome {
     var connection = ready_connection.* orelse return .{ .failed = error.ReconnectNotReady };
     ready_connection.* = null;
 
-    client.attachPreparedReconnectRuntimeCancellable(
+    attached_client.attachPreparedReconnectRuntimeCancellable(
         connection.child.stdout.?.handle,
         connection.child.stdin.?.handle,
         ready_session,
@@ -2528,7 +2529,7 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
     // Stop after Hello while racing an unresponsive transport. SessionAttach
     // would replace the still-visible old attached client before the user presses
     // Ctrl-R to switch.
-    client.prepareReconnectRuntimeCancellable(
+    attached_client.prepareReconnectRuntimeCancellable(
         connection.child.stdout.?.handle,
         connection.child.stdin.?.handle,
         state.reconnect_ui.cancellationFlag(),

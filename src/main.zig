@@ -287,6 +287,7 @@ test {
     _ = @import("runtime/route_commands.zig");
     _ = @import("runtime/refresher.zig");
     _ = @import("runtime/session_registry.zig");
+    _ = @import("session/attached_client.zig");
     _ = @import("session/agent.zig");
     _ = @import("session/broker.zig");
     _ = @import("session/client.zig");
