@@ -78,8 +78,8 @@ Client routes and session-agent logs live under `guid/<session-guid>/`.
 diagnostics.
 
 Exited sessions move out of `guid/` into `tombstone/<session-guid>.json`.
-Tombstones keep the display route, aliases that pointed at the session, end
-time, end reason, expiration time, and exit or signal status when available.
+Tombstones keep the display route, end time, end reason, expiration time, and
+exit or signal status when available.
 The expiration time is derived from the `tombstone-hours` value recorded in the
 route when the agent was created.
 

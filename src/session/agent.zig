@@ -699,7 +699,6 @@ const SessionCreateRequest = struct {
     environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
     session_guid: []u8,
-    session_alias: []u8,
     command_argv: [][]u8,
     shell_command: ?[]u8,
     tty_settings: ?tty_settings.Settings,
@@ -707,7 +706,6 @@ const SessionCreateRequest = struct {
     tombstone_retention_ms: u64,
 
     fn deinit(self: *SessionCreateRequest) void {
-        app_allocator.allocator().free(self.session_alias);
         app_allocator.allocator().free(self.session_guid);
         for (self.command_argv) |arg| app_allocator.allocator().free(arg);
         app_allocator.allocator().free(self.command_argv);
@@ -1565,18 +1563,6 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     return false;
                 };
                 defer request.deinit();
-                const alias = registerSessionAlias(request.session_guid, request.session_alias) catch |err| switch (err) {
-                    error.AliasExists => {
-                        try sendError(session_agent, fd, "ALIAS_EXISTS", "session alias already exists", "");
-                        return false;
-                    },
-                    error.InvalidAlias => {
-                        try sendError(session_agent, fd, "INVALID_ALIAS", "invalid session alias", "");
-                        return false;
-                    },
-                    else => return err,
-                };
-                defer app_allocator.allocator().free(alias);
                 const session_index = createSession(
                     session_agent,
                     request.terminal_size.rows,
@@ -1590,16 +1576,13 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.tty_settings,
                     request.reap_ms,
                     request.tombstone_retention_ms,
-                ) catch |err| {
-                    session_registry.removeAlias(app_allocator.allocator(), alias) catch {};
-                    return err;
-                };
+                ) catch |err| return err;
                 const session = &session_agent.sessions[session_index];
                 if (session_agent.session_paths) |paths| {
-                    try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), alias, paths.dir, config.version, session.tombstone_retention_ms);
+                    try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), paths.dir, config.version, session.tombstone_retention_ms);
                     session.detached_at_unix_ms = nowUnixMs();
                 }
-                try sendSessionCreatedForSession(session_agent, fd, session, alias);
+                try sendSessionCreatedForSession(session_agent, fd, session);
                 continue;
             },
             .te_session_live_state_query => {
@@ -1870,21 +1853,17 @@ fn attachedCount(session_agent: *SessionAgent, session_index: usize) u32 {
 }
 
 fn sendSessionAttachedForSession(session_agent: *const SessionAgent, attachment: *Attachment, session: *const Session) !void {
-    const maybe_alias = try session_registry.primaryAliasForGuid(app_allocator.allocator(), session.idSlice());
-    defer if (maybe_alias) |alias| app_allocator.allocator().free(alias);
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionAttached{
         .session_guid = session.idSlice(),
-        .session_alias = maybe_alias orelse "",
         .session_dir = sessionDirSlice(session_agent),
     });
     defer app_allocator.allocator().free(payload);
     try queueAttachmentFrame(attachment, .te_session_attached, payload);
 }
 
-fn sendSessionCreatedForSession(session_agent: *const SessionAgent, fd: c.fd_t, session: *const Session, alias: []const u8) !void {
+fn sendSessionCreatedForSession(session_agent: *const SessionAgent, fd: c.fd_t, session: *const Session) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionCreated{
         .session_guid = session.idSlice(),
-        .session_alias = alias,
         .session_dir = sessionDirSlice(session_agent),
     });
     defer app_allocator.allocator().free(payload);
@@ -2833,7 +2812,6 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
         .environment = environment,
         .query_default_colors = query_default_colors,
         .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
-        .session_alias = try app_allocator.allocator().dupe(u8, message.session_alias),
         .command_argv = command_argv,
         .shell_command = if (shell_command) |command|
             try app_allocator.allocator().dupe(u8, command)
@@ -2863,14 +2841,6 @@ fn readTtySettings(message: pb.TeTtySettings) !tty_settings.Settings {
             null,
         .modes = modes,
     };
-}
-
-fn registerSessionAlias(session_guid: []const u8, requested_alias: []const u8) ![]u8 {
-    if (requested_alias.len > 0) {
-        try session_registry.ensureAliasForGuid(app_allocator.allocator(), requested_alias, session_guid);
-        return try app_allocator.allocator().dupe(u8, requested_alias);
-    }
-    return session_registry.createDefaultAliasForGuid(app_allocator.allocator(), session_guid);
 }
 
 fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.TeEnvironmentEntry) !void {

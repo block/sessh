@@ -74,7 +74,7 @@ do not all attempt the same kill work.
 
 The pending directory for a host is keyed by an `h-` GUID reported by the
 remote agent. The remote stores that GUID in its state directory, so different
-local aliases, config files, or client machines can still agree that they are
+local SSH aliases, config files, or client machines can still agree that they are
 talking to the same sessh host. A `meta.json` records the best-known connection
 `name` and `port`; action files ignore it except as a fallback when there is no
 cached route. Request files are currently named `kill-s-<guid>.json` or

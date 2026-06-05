@@ -1640,7 +1640,6 @@ pub const TeSessionCreate = struct {
     environment: std.ArrayListUnmanaged(TeEnvironmentEntry) = .empty,
     query_default_colors: ?TeDefaultColors = null,
     session_guid: []const u8 = &.{},
-    session_alias: []const u8 = &.{},
     legacy_command_argv: std.ArrayListUnmanaged([]const u8) = .empty,
     tty_settings: ?TeTtySettings = null,
     reap_ms: u64 = 0,
@@ -1666,7 +1665,6 @@ pub const TeSessionCreate = struct {
         .environment = fd(3, .{ .repeated = .submessage }),
         .query_default_colors = fd(4, .submessage),
         .session_guid = fd(5, .{ .scalar = .string }),
-        .session_alias = fd(6, .{ .scalar = .string }),
         .legacy_command_argv = fd(7, .{ .repeated = .{ .scalar = .string } }),
         .tty_settings = fd(10, .submessage),
         .reap_ms = fd(11, .{ .scalar = .uint64 }),
@@ -2239,12 +2237,10 @@ pub const TeClientDetachRequest = struct {
 /// Confirms that a TeSessionCreate created the requested session.
 pub const TeSessionCreated = struct {
     session_guid: []const u8 = &.{},
-    session_alias: []const u8 = &.{},
     session_dir: []const u8 = &.{},
 
     pub const _desc_table = .{
         .session_guid = fd(1, .{ .scalar = .string }),
-        .session_alias = fd(2, .{ .scalar = .string }),
         .session_dir = fd(3, .{ .scalar = .string }),
     };
 
@@ -2312,12 +2308,10 @@ pub const TeSessionCreated = struct {
 /// Confirms the session selected for this connection.
 pub const TeSessionAttached = struct {
     session_guid: []const u8 = &.{},
-    session_alias: []const u8 = &.{},
     session_dir: []const u8 = &.{},
 
     pub const _desc_table = .{
         .session_guid = fd(1, .{ .scalar = .string }),
-        .session_alias = fd(2, .{ .scalar = .string }),
         .session_dir = fd(3, .{ .scalar = .string }),
     };
 

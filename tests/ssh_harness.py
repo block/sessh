@@ -557,7 +557,9 @@ def env_with_session_guid(env, session_ref):
     return scoped
 
 
-def sever_session_clients(env, timeout=30.0, session_ref="s1"):
+def sever_session_clients(env, timeout=30.0, session_ref=None):
+    if session_ref is None:
+        session_ref = test_session_guid(1)
     result = run_sesshmux(
         ["debug", "sever-connection", "--host", "test-host", "--all"],
         env_with_session_guid(env, session_ref),
@@ -899,7 +901,7 @@ def run_sessh_reconnect_probe(
         stderr=subprocess.PIPE,
     )
     stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
-    sever_session_clients(env, timeout)
+    sever_session_clients(env, timeout, single_live_session_guid(env))
     stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
     if expect_countdown:
         stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 9sec", timeout)
@@ -968,7 +970,7 @@ def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, tim
         proc.stdin.write(b"enter-alt\n")
         proc.stdin.flush()
         read_until_pipe(proc.stdout, alt_ready.encode("utf-8"), timeout)
-        sever_session_clients(env, timeout)
+        sever_session_clients(env, timeout, single_live_session_guid(env))
         stdout = read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
         proc.stdin.write(b"\x03")
         proc.stdin.flush()
@@ -998,7 +1000,7 @@ def run_sessh_detach_reconnect_probe(args, env, ready, detach_bytes=b"\x03", tim
         stderr=subprocess.PIPE,
     )
     stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
-    sever_session_clients(env, timeout)
+    sever_session_clients(env, timeout, single_live_session_guid(env))
     stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
     proc.stdin.write(detach_bytes)
     proc.stdin.flush()
@@ -1100,10 +1102,6 @@ def sessh_version():
     raise AssertionError("could not find sessh version")
 
 
-def aliases_dir(env):
-    return state_root(env) / "alias"
-
-
 def state_root(env):
     return Path(env["XDG_STATE_HOME"]) / "sessh"
 
@@ -1202,12 +1200,16 @@ def canonical_guid(guid):
     raise AssertionError(f"invalid guid: {guid}")
 
 
-def guid_for_alias(alias):
-    match = re.fullmatch(r"s([0-9]+)", alias)
-    if match:
-        return f"s-00000000-0000-4000-8000-{int(match.group(1)):012x}"
-    digest = hashlib.sha256(alias.encode("utf-8")).hexdigest()
-    return f"s-{digest[0:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+def test_session_guid(index):
+    return f"s-{index:08x}-0000-4000-8000-{index:012x}"
+
+
+def test_session_id(index):
+    return f"s-{index:08x}"
+
+
+def short_session_id(guid):
+    return "s-" + compact_guid(guid)[:8]
 
 
 def list_rows(list_stdout):
@@ -1241,18 +1243,43 @@ def list_has_session(list_stdout, session_id):
     return False
 
 
-def ensure_alias(env, alias, guid=None):
-    guid = canonical_guid(guid or guid_for_alias(alias))
-    alias_path = aliases_dir(env) / alias
-    alias_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if alias_path.exists() or alias_path.is_symlink():
-        return
-    alias_path.symlink_to(Path("../guid") / guid)
+def jsonl_rows(stdout):
+    return [json.loads(line) for line in stdout.splitlines() if line.strip()]
 
 
-def write_ssh_route(env, alias, guid, host, ssh_options=(), detached_at_unix_ms=None, resolved_host=None, port="22", host_guid=DEFAULT_HOST_GUID):
+def only_jsonl_row(stdout):
+    rows = jsonl_rows(stdout)
+    if len(rows) != 1:
+        raise AssertionError(stdout)
+    return rows[0]
+
+
+def single_live_session_row(env):
+    listed = run_sesshmux(["list", "--jsonl"], env, timeout=30.0)
+    if listed.returncode != 0:
+        raise AssertionError(listed)
+    rows = jsonl_rows(listed.stdout)
+    if not rows:
+        raise AssertionError(listed.stdout)
+    guids = {row.get("guid") for row in rows}
+    if len(guids) != 1:
+        raise AssertionError(listed.stdout)
+    for row in rows:
+        if row.get("host") != ".":
+            return row
+    return rows[0]
+
+
+def single_live_session_guid(env):
+    row = single_live_session_row(env)
+    guid = row.get("guid")
+    if not guid:
+        raise AssertionError(row)
+    return guid
+
+
+def write_ssh_route(env, guid, host, ssh_options=(), detached_at_unix_ms=None, resolved_host=None, port="22", host_guid=DEFAULT_HOST_GUID):
     guid = canonical_guid(guid)
-    ensure_alias(env, alias, guid)
     session = state_sessions_dir(env) / guid
     session.mkdir(mode=0o700, parents=True, exist_ok=True)
     remote_session_dir = runtime_root(env) / "guid" / guid
@@ -1260,7 +1287,6 @@ def write_ssh_route(env, alias, guid, host, ssh_options=(), detached_at_unix_ms=
         json.dumps(
             {
                 "guid": guid,
-                "primary_alias": alias,
                 "session_dir": str(remote_session_dir),
                 "host_guid": host_guid,
                 "host": host,
@@ -1300,37 +1326,28 @@ def write_client_route_hint(env, client_guid, session_id):
     return hint
 
 
-def session_path(env, session_id="s1"):
-    if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
-        return sessions_dir(env) / canonical_guid(session_id)
-    alias_path = aliases_dir(env) / session_id
-    if alias_path.is_symlink():
-        return sessions_dir(env) / canonical_guid(Path(os.readlink(alias_path)).name)
-    ensure_alias(env, session_id)
-    return sessions_dir(env) / canonical_guid(Path(os.readlink(alias_path)).name)
+def session_path(env, session_id=None):
+    if session_id is None:
+        session_id = test_session_guid(1)
+    return sessions_dir(env) / canonical_guid(session_id)
 
 
-def route_file(env, session_id="s1"):
-    if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
-        return state_sessions_dir(env) / canonical_guid(session_id) / "route.json"
-    alias_path = aliases_dir(env) / session_id
-    if not alias_path.is_symlink():
-        ensure_alias(env, session_id)
-    return state_sessions_dir(env) / canonical_guid(Path(os.readlink(alias_path)).name) / "route.json"
+def route_file(env, session_id=None):
+    if session_id is None:
+        session_id = test_session_guid(1)
+    return state_sessions_dir(env) / canonical_guid(session_id) / "route.json"
 
 
-def actual_socket_path(env, session_id="s1"):
-    if GUID_RE.match(session_id) or COMPACT_GUID_RE.match(session_id):
-        guid = canonical_guid(session_id)
-    else:
-        alias_path = aliases_dir(env) / session_id
-        if not alias_path.is_symlink():
-            ensure_alias(env, session_id)
-        guid = canonical_guid(Path(os.readlink(alias_path)).name)
+def actual_socket_path(env, session_id=None):
+    if session_id is None:
+        session_id = test_session_guid(1)
+    guid = canonical_guid(session_id)
     return runtime_root(env) / "a" / compact_guid(guid)
 
 
-def ensure_agent_socket_link(env, session_id="s1"):
+def ensure_agent_socket_link(env, session_id=None):
+    if session_id is None:
+        session_id = test_session_guid(1)
     session = session_path(env, session_id)
     session.mkdir(mode=0o700, parents=True, exist_ok=True)
     (runtime_root(env) / "a").mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1339,7 +1356,7 @@ def ensure_agent_socket_link(env, session_id="s1"):
         link.symlink_to(Path("../../a") / actual_socket_path(env, session_id).name)
 
 
-def session_compat_path(env, session_id="s1"):
+def session_compat_path(env, session_id=None):
     return session_path(env, session_id) / "compat"
 
 
@@ -1385,7 +1402,9 @@ def version_mismatch_frame():
     return struct.pack(">I", len(hello_frame)) + hello_frame
 
 
-def start_version_mismatch_agent(env, session_id="s1"):
+def start_version_mismatch_agent(env, session_id=None):
+    if session_id is None:
+        session_id = test_session_guid(1)
     ensure_agent_socket_link(env, session_id)
     session = session_path(env, session_id)
     (session / "meta.json").write_text(
@@ -1491,7 +1510,7 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["--alias", "s1", "-F", str(fake_config), "test-host"], env, timeout=30.0)
+    result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
 
     if not fake_log.exists():
         raise AssertionError(ssh_failure_diagnostics("fake ssh was not invoked", result, fake_log, fake_trace))
@@ -1543,14 +1562,14 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError("uploaded broker did not create a session tombstone")
     tombstone = tombstones[0]
     tombstone_json = json.loads(tombstone.read_text())
-    if tombstone_json.get("primary_alias") != "s1" or "s1" not in tombstone_json.get("aliases", []):
+    if tombstone_json.get("guid") != tombstone.stem:
+        raise AssertionError(tombstone_json)
+    if "primary_alias" in tombstone_json or "aliases" in tombstone_json:
         raise AssertionError(tombstone_json)
     if tombstone_json.get("end_reason") != "process_exited":
         raise AssertionError(tombstone_json)
     if tombstone_json.get("exit_status") != {"kind": "exited", "status": 0}:
         raise AssertionError(tombstone_json)
-    if (aliases_dir(env) / "s1").exists() or (aliases_dir(env) / "s1").is_symlink():
-        raise AssertionError("ended session alias was not released")
 
 
 def test_ssh_clean_remote_exit_tombstones_local_route(tmp):
@@ -1561,7 +1580,6 @@ def test_ssh_clean_remote_exit_tombstones_local_route(tmp):
     remote_state = tmp / "remote-state"
     remote_shell = tmp / "remote-shell"
     marker = "SSH_REMOTE_EXIT_READY"
-    alias = "remote-exit"
     remote_runtime.mkdir(mode=0o700)
     remote_state.mkdir(mode=0o700)
     remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\nexit 7\n")
@@ -1573,7 +1591,7 @@ def test_ssh_clean_remote_exit_tombstones_local_route(tmp):
     env["SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"] = str(remote_state)
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["--alias", alias, "test-host"], env, timeout=30.0)
+    result = run_sessh(["test-host"], env, timeout=30.0)
 
     if result.returncode != 7:
         raise AssertionError(result)
@@ -1583,12 +1601,8 @@ def test_ssh_clean_remote_exit_tombstones_local_route(tmp):
     listed = run_sesshmux(["list", "--exited", "--jsonl"], env, timeout=30.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
-    rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
-    matches = [row for row in rows if row.get("id") == alias]
-    if len(matches) != 1:
-        raise AssertionError(process_diagnostics(listed))
-    row = matches[0]
-    if row.get("host") != "test-host" or alias not in row.get("aliases", []):
+    row = only_jsonl_row(listed.stdout)
+    if row.get("host") != "test-host" or not str(row.get("id", "")).startswith("s-"):
         raise AssertionError(row)
     if row.get("end_reason") != "process_exited":
         raise AssertionError(row)
@@ -1600,8 +1614,6 @@ def test_ssh_clean_remote_exit_tombstones_local_route(tmp):
         raise AssertionError(row)
     if (state_sessions_dir(env) / guid / "route.json").exists():
         raise AssertionError("local cached route was not tombstoned")
-    if (aliases_dir(env) / alias).exists() or (aliases_dir(env) / alias).is_symlink():
-        raise AssertionError("local cached route alias was not released")
     if not (remote_state / "sessh" / "tombstone" / f"{guid}.json").exists():
         raise AssertionError("remote session did not write its own tombstone")
 
@@ -2901,14 +2913,15 @@ def test_sesshmux_subcommands_reject_raw_ssh_options(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
 
+    session_id = test_session_id(1)
     cases = [
         ("new", ["new", "-n", "test-host"]),
-        ("attach", ["attach", "-n", "--host", "test-host", "s1"]),
+        ("attach", ["attach", "-n", "--host", "test-host", session_id]),
         ("list", ["list", "-n"]),
-        ("kill", ["kill", "-n", "s1"]),
-        ("detach", ["detach", "-n", "s1"]),
-        ("repaint", ["repaint", "-n", "s1"]),
-        ("debug", ["debug", "sever-connection", "-n", "s1"]),
+        ("kill", ["kill", "-n", session_id]),
+        ("detach", ["detach", "-n", session_id]),
+        ("repaint", ["repaint", "-n", session_id]),
+        ("debug", ["debug", "sever-connection", "-n", session_id]),
     ]
     for name, args in cases:
         result = run_sesshmux(args, env, timeout=5.0)
@@ -2965,7 +2978,7 @@ def test_ssh_unsupported_option_does_not_fallback_for_sessh_action(tmp):
     # `-n` requires proxy stream mode, and proxy streams are only used for new
     # sessions. Management actions must reject it instead of falling back to
     # plain ssh.
-    result = run_sesshmux(["attach", "--ssh-options", "-n", "--host", "test-host", "s1"], env, timeout=5.0)
+    result = run_sesshmux(["attach", "--ssh-options", "-n", "--host", "test-host", test_session_id(1)], env, timeout=5.0)
 
     if result.returncode != 64:
         raise AssertionError(result)
@@ -3095,26 +3108,28 @@ def test_mux_new_detached_creates_local_session_without_attach(tmp):
     shell.chmod(0o700)
     env["SHELL"] = str(shell)
 
-    created = run_sesshmux(["new", "--detached", "--alias", "detached-local", "."], env, timeout=10.0)
+    created = run_sesshmux(["new", "--detached", "."], env, timeout=10.0)
 
     if created.returncode != 0:
         raise AssertionError(created)
     if not created.stdout.startswith("CREATED s-"):
         raise AssertionError(created)
+    guid = created.stdout.strip().split()[-1]
+    session_id = short_session_id(guid)
     if marker in created.stdout:
         raise AssertionError(f"detached create leaked session output:\n{created.stdout}")
 
     listed = run_sesshmux(["list", "--jsonl"], env, timeout=10.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
-    rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
-    matches = [row for row in rows if row.get("id") == "detached-local"]
+    rows = jsonl_rows(listed.stdout)
+    matches = [row for row in rows if row.get("id") == session_id]
     if len(matches) != 1:
         raise AssertionError(process_diagnostics(listed))
     if matches[0].get("attached_count") != 0:
         raise AssertionError(matches[0])
 
-    attached = run_sesshmux_until_stdout(["attach", "detached-local"], env, marker, timeout=10.0)
+    attached = run_sesshmux_until_stdout(["attach", session_id], env, marker, timeout=10.0)
     if attached.returncode != 0:
         raise AssertionError(attached)
     if marker not in attached.stdout:
@@ -3131,23 +3146,24 @@ def test_mux_new_detached_times_out_after_reap_hours(tmp):
     shell.chmod(0o700)
     env["SHELL"] = str(shell)
 
-    created = run_sesshmux(["new", "--detached", "--alias", "timeout-local", "."], env, timeout=10.0)
+    created = run_sesshmux(["new", "--detached", "."], env, timeout=10.0)
 
     if created.returncode != 0 or not created.stdout.startswith("CREATED s-"):
         raise AssertionError(created)
     guid = created.stdout.strip().split()[-1]
+    session_id = short_session_id(guid)
     tombstone_path = tombstones_dir(env) / f"{guid}.json"
     wait_for_path(tombstone_path, timeout=8.0)
 
     listed_jsonl = run_sesshmux(["list", "--exited", "--jsonl"], env, timeout=10.0)
     if listed_jsonl.returncode != 0:
         raise AssertionError(listed_jsonl)
-    rows = [json.loads(line) for line in listed_jsonl.stdout.splitlines() if line.strip()]
+    rows = jsonl_rows(listed_jsonl.stdout)
     matches = [row for row in rows if row.get("guid") == guid]
     if len(matches) != 1:
         raise AssertionError(process_diagnostics(listed_jsonl))
     row = matches[0]
-    if row.get("id") != "timeout-local" or row.get("end_reason") != "reaped":
+    if row.get("id") != session_id or row.get("end_reason") != "reaped":
         raise AssertionError(row)
     if row.get("exit_status") is not None:
         raise AssertionError(row)
@@ -3186,26 +3202,28 @@ def test_mux_new_detached_creates_remote_route_without_attach(tmp):
     env["SHELL"] = str(remote_shell)
     seed_remote_artifact_cache(env)
 
-    created = run_sesshmux(["new", "--detached", "--alias", "remote-detached", "test-host"], env, timeout=30.0)
+    created = run_sesshmux(["new", "--detached", "test-host"], env, timeout=30.0)
 
     if created.returncode != 0:
         raise AssertionError(created)
     if not created.stdout.startswith("CREATED s-"):
         raise AssertionError(created)
+    guid = created.stdout.strip().split()[-1]
+    session_id = short_session_id(guid)
     if marker in created.stdout:
         raise AssertionError(f"detached create leaked session output:\n{created.stdout}")
 
     listed = run_sesshmux(["list", "--jsonl"], env, timeout=30.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
-    rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
-    matches = [row for row in rows if row.get("id") == "remote-detached"]
+    rows = jsonl_rows(listed.stdout)
+    matches = [row for row in rows if row.get("id") == session_id]
     if len(matches) != 1:
         raise AssertionError(process_diagnostics(listed))
     if matches[0].get("host") != "test-host":
         raise AssertionError(matches[0])
 
-    attached = run_sesshmux_until_stdout(["attach", "--host", "test-host", "remote-detached"], env, marker, timeout=30.0)
+    attached = run_sesshmux_until_stdout(["attach", "--host", "test-host", session_id], env, marker, timeout=30.0)
     if attached.returncode != 0:
         raise AssertionError(attached)
     if marker not in attached.stdout:
@@ -3233,7 +3251,7 @@ def test_mux_new_detached_records_remote_host_identity(tmp):
     env["SHELL"] = str(remote_shell)
     seed_remote_artifact_cache(env)
 
-    created = run_sesshmux(["new", "--detached", "--alias", "resolved-route", "alias-host"], env, timeout=30.0)
+    created = run_sesshmux(["new", "--detached", "alias-host"], env, timeout=30.0)
 
     if created.returncode != 0 or not created.stdout.startswith("CREATED s-"):
         raise AssertionError(created)
@@ -3261,20 +3279,25 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    first = run_sessh_until_stdout(["--alias", "route-alias", "test-host"], env, marker)
+    first = run_sessh_until_stdout(["test-host"], env, marker)
     if first.returncode != 0:
         raise AssertionError(first)
     if "ID=unset GUID=" not in first.stdout:
         raise AssertionError(first)
+    match = re.search(r"GUID=(s-[0-9a-fA-F-]+)", first.stdout)
+    if not match:
+        raise AssertionError(first)
+    guid = canonical_guid(match.group(1))
+    session_id = short_session_id(guid)
 
     changed_runtime_env = dict(env)
     changed_runtime_env["XDG_RUNTIME_DIR"] = str(tmp / "changed-runtime")
-    attached = run_sesshmux_until_stdout(["attach", "route-alias"], changed_runtime_env, marker)
+    attached = run_sesshmux_until_stdout(["attach", session_id], changed_runtime_env, marker)
     if attached.returncode != 0:
         raise AssertionError(attached)
     if marker not in attached.stdout:
         raise AssertionError(attached)
-    killed = run_sesshmux(["kill", "route-alias"], changed_runtime_env, timeout=30.0)
+    killed = run_sesshmux(["kill", session_id], changed_runtime_env, timeout=30.0)
     if killed.returncode != 0:
         raise AssertionError(killed)
     if not killed.stdout.startswith("ENDED "):
@@ -3282,20 +3305,17 @@ def test_ssh_no_host_attach_uses_local_route(tmp):
     listed_exited = run_sesshmux(["list", "--exited", "--jsonl"], changed_runtime_env, timeout=30.0)
     if listed_exited.returncode != 0:
         raise AssertionError(listed_exited)
-    rows = [json.loads(line) for line in listed_exited.stdout.splitlines() if line.strip()]
-    matches = [row for row in rows if row.get("id") == "route-alias"]
+    rows = jsonl_rows(listed_exited.stdout)
+    matches = [row for row in rows if row.get("guid") == guid]
     if len(matches) != 1:
         raise AssertionError(process_diagnostics(listed_exited))
     row = matches[0]
     if row.get("host") != "test-host" or row.get("end_reason") != "killed_by_request" or row.get("exit_status") is not None:
         raise AssertionError(row)
-    guid = row.get("guid")
-    if not guid:
+    if not row.get("guid"):
         raise AssertionError(row)
     if (state_sessions_dir(changed_runtime_env) / guid / "route.json").exists():
         raise AssertionError("local cached route was not tombstoned after remote kill")
-    if (aliases_dir(changed_runtime_env) / "route-alias").exists() or (aliases_dir(changed_runtime_env) / "route-alias").is_symlink():
-        raise AssertionError("local cached route alias was not released after remote kill")
     log_text = fake_log.read_text()
     if log_text.splitlines().count("invoked=1") < 2:
         raise AssertionError(log_text)
@@ -3311,8 +3331,8 @@ def test_ssh_no_host_attach_uses_latest_detached_route(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
     env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "42"
-    write_ssh_route(env, "older-detached", guid_for_alias("older-detached"), "older-host", detached_at_unix_ms=1000)
-    write_ssh_route(env, "newer-detached", guid_for_alias("newer-detached"), "newer-host", detached_at_unix_ms=2000)
+    write_ssh_route(env, test_session_guid(21), "older-host", detached_at_unix_ms=1000)
+    write_ssh_route(env, test_session_guid(22), "newer-host", detached_at_unix_ms=2000)
 
     result = run_sesshmux(["attach"], env, timeout=30.0)
 
@@ -3346,10 +3366,10 @@ def test_ssh_no_host_attach_skips_route_attached_by_this_machine(tmp):
     env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
     env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "42"
 
-    older_guid = guid_for_alias("older-detached")
-    busy_guid = guid_for_alias("busy-detached")
-    write_ssh_route(env, "older-detached", older_guid, "older-host", detached_at_unix_ms=2000)
-    write_ssh_route(env, "busy-detached", busy_guid, "busy-host", detached_at_unix_ms=3000)
+    older_guid = test_session_guid(23)
+    busy_guid = test_session_guid(24)
+    write_ssh_route(env, older_guid, "older-host", detached_at_unix_ms=2000)
+    write_ssh_route(env, busy_guid, "busy-host", detached_at_unix_ms=3000)
     write_client_route_hint(env, "c-33333333-3333-4333-8333-333333333333", busy_guid)
 
     result = run_sesshmux(["attach"], env, timeout=30.0)
@@ -3375,13 +3395,15 @@ def test_ssh_no_host_list_client_uses_remote_route(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "42"
-    write_ssh_route(env, "remote-clients", guid_for_alias("remote-clients"), "test-host")
+    remote_guid = test_session_guid(25)
+    remote_id = short_session_id(remote_guid)
+    write_ssh_route(env, remote_guid, "test-host")
 
     missing_target = run_sesshmux(["list", "--client"], env, timeout=30.0)
     if missing_target.returncode != 64 or "incoming, outgoing, session" not in missing_target.stderr:
         raise AssertionError(missing_target)
 
-    result = run_sesshmux(["list", "--client", "remote-clients"], env, timeout=30.0)
+    result = run_sesshmux(["list", "--client", remote_id], env, timeout=30.0)
 
     if result.returncode == 0:
         raise AssertionError(result)
@@ -3402,10 +3424,9 @@ def test_ssh_no_host_detach_client_uses_client_route_hint(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "42"
-    alias = "remote-client-detach"
-    guid = guid_for_alias(alias)
+    guid = test_session_guid(26)
     client_guid = "c-33333333-3333-4333-8333-333333333333"
-    write_ssh_route(env, alias, guid, "test-host")
+    write_ssh_route(env, guid, "test-host")
     write_client_route_hint(env, client_guid, guid)
 
     result = run_sesshmux(["detach", client_guid], env, timeout=30.0)
@@ -3429,20 +3450,20 @@ def test_ssh_list_refresh_tombstones_missing_remote_route(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    alias = "remote-dead"
-    guid = guid_for_alias(alias)
-    write_ssh_route(env, alias, guid, "test-host")
+    guid = test_session_guid(27)
+    session_id = short_session_id(guid)
+    write_ssh_route(env, guid, "test-host")
 
     result = run_sesshmux(["list", "--refresh", "--exited", "--jsonl"], env, timeout=30.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
-    rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    rows = jsonl_rows(result.stdout)
     matches = [row for row in rows if row.get("guid") == guid]
     if len(matches) != 1:
         raise AssertionError(process_diagnostics(result))
     row = matches[0]
-    if row.get("id") != alias or alias not in row.get("aliases", []):
+    if row.get("id") != session_id:
         raise AssertionError(row)
     if row.get("host") != "test-host" or row.get("end_reason") != "unknown":
         raise AssertionError(row)
@@ -3450,13 +3471,11 @@ def test_ssh_list_refresh_tombstones_missing_remote_route(tmp):
         raise AssertionError(row)
     if (state_sessions_dir(env) / guid / "route.json").exists():
         raise AssertionError("remote route was not moved to a tombstone")
-    if (aliases_dir(env) / alias).exists() or (aliases_dir(env) / alias).is_symlink():
-        raise AssertionError("remote route alias was not released")
     tombstone = tombstones_dir(env) / f"{guid}.json"
     if not tombstone.exists():
         raise AssertionError("tombstone file was not written")
 
-    attached = run_sesshmux(["attach", alias], env, timeout=5.0)
+    attached = run_sesshmux(["attach", session_id], env, timeout=5.0)
     if attached.returncode == 0 or "session already exited" not in attached.stderr:
         raise AssertionError(attached)
 
@@ -3481,10 +3500,11 @@ def test_ssh_list_refresh_drains_pending_session_kill(tmp):
     env["SHELL"] = str(remote_shell)
     seed_remote_artifact_cache(env)
 
-    created = run_sesshmux(["new", "--detached", "--alias", "pending-session", "test-host"], env, timeout=30.0)
+    created = run_sesshmux(["new", "--detached", "test-host"], env, timeout=30.0)
     if created.returncode != 0 or not created.stdout.startswith("CREATED s-"):
         raise AssertionError(created)
     guid = created.stdout.strip().split()[-1]
+    session_id = short_session_id(guid)
     route = json.loads((state_sessions_dir(env) / guid / "route.json").read_text())
     host_guid = route.get("host_guid")
     if not host_guid:
@@ -3500,12 +3520,12 @@ def test_ssh_list_refresh_drains_pending_session_kill(tmp):
         raise AssertionError(f"list --refresh did not piggy-back list and kill on one ssh connection:\n{optional_text(fake_log)}")
     if pending.exists():
         raise AssertionError("pending session kill was not removed")
-    rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
+    rows = jsonl_rows(listed.stdout)
     matches = [row for row in rows if row.get("guid") == guid]
     if len(matches) != 1:
         raise AssertionError(process_diagnostics(listed))
     row = matches[0]
-    if row.get("id") != "pending-session" or row.get("end_reason") != "killed_by_request":
+    if row.get("id") != session_id or row.get("end_reason") != "killed_by_request":
         raise AssertionError(row)
     if (state_sessions_dir(env) / guid / "route.json").exists():
         raise AssertionError("pending-killed remote route was not tombstoned")
@@ -3531,10 +3551,11 @@ def test_ssh_list_refresh_skips_pending_session_kill_after_attach(tmp):
     env["SHELL"] = str(remote_shell)
     seed_remote_artifact_cache(env)
 
-    created = run_sesshmux(["new", "--detached", "--alias", "pending-stale", "test-host"], env, timeout=30.0)
+    created = run_sesshmux(["new", "--detached", "test-host"], env, timeout=30.0)
     if created.returncode != 0 or not created.stdout.startswith("CREATED s-"):
         raise AssertionError(created)
     guid = created.stdout.strip().split()[-1]
+    session_id = short_session_id(guid)
     route = json.loads((state_sessions_dir(env) / guid / "route.json").read_text())
     host_guid = route.get("host_guid")
     if not host_guid:
@@ -3544,7 +3565,7 @@ def test_ssh_list_refresh_skips_pending_session_kill_after_attach(tmp):
     time.sleep(0.05)
 
     try:
-        attached = run_sesshmux_until_stdout(["attach", "--host", "test-host", "pending-stale"], env, marker, timeout=30.0)
+        attached = run_sesshmux_until_stdout(["attach", "--host", "test-host", session_id], env, marker, timeout=30.0)
         if attached.returncode != 0:
             raise AssertionError(attached)
         time.sleep(0.05)
@@ -3558,11 +3579,11 @@ def test_ssh_list_refresh_skips_pending_session_kill_after_attach(tmp):
             raise AssertionError(f"list --refresh did not piggy-back list and stale kill on one ssh connection:\n{optional_text(fake_log)}")
         if pending.exists():
             raise AssertionError("stale pending session kill was not removed")
-        rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
+        rows = jsonl_rows(listed.stdout)
         matches = [row for row in rows if row.get("guid") == guid]
         if len(matches) != 1:
             raise AssertionError(process_diagnostics(listed))
-        if matches[0].get("id") != "pending-stale":
+        if matches[0].get("id") != session_id:
             raise AssertionError(matches[0])
         if not (state_sessions_dir(env) / guid / "route.json").exists():
             raise AssertionError("stale pending kill tombstoned a live remote route")
@@ -3610,12 +3631,12 @@ def test_ssh_list_refresh_drains_pending_proxy_kill_without_route(tmp):
         raise AssertionError(f"pending-only refresh should use one ssh connection:\n{log_text}")
 
 
-def test_ssh_remote_default_alias_is_remote_generated(tmp):
+def test_ssh_remote_default_id_is_remote_generated(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     remote_shell = tmp / "remote-shell"
-    marker = "SSH_REMOTE_ALIAS_READY"
+    marker = "SSH_REMOTE_ID_READY"
     remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\nwhile :; do sleep 1; done\n")
     remote_shell.chmod(0o700)
     write_fake_ssh(fake_bin / "ssh")
@@ -3631,12 +3652,12 @@ def test_ssh_remote_default_alias_is_remote_generated(tmp):
     if listed.returncode != 0:
         raise AssertionError(listed)
     rows = list_rows(listed.stdout)
-    aliases = [row[0] for row in rows if len(row) >= 1]
-    remote_aliases = [alias for alias in aliases if re.fullmatch(r"s-[0-9a-f]{8}", alias)]
-    if len(remote_aliases) != 1:
+    ids = [row[0] for row in rows if len(row) >= 1]
+    remote_ids = [session_id for session_id in ids if re.fullmatch(r"s-[0-9a-f]{8}", session_id)]
+    if len(remote_ids) != 1:
         raise AssertionError(listed.stdout)
 
-    attached = run_sesshmux_until_stdout(["attach", "--host", "test-host", remote_aliases[0]], env, marker)
+    attached = run_sesshmux_until_stdout(["attach", "--host", "test-host", remote_ids[0]], env, marker)
     if attached.returncode != 0:
         raise AssertionError(attached)
 
@@ -3648,9 +3669,11 @@ def test_ssh_host_attach_does_not_follow_remote_route(tmp):
     write_fake_ssh(fake_bin / "ssh")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    write_ssh_route(env, "remote-hop", guid_for_alias("remote-hop"), "other-host")
+    remote_guid = test_session_guid(28)
+    remote_id = short_session_id(remote_guid)
+    write_ssh_route(env, remote_guid, "other-host")
 
-    result = run_sesshmux(["attach", "--host", "test-host", "remote-hop"], env, timeout=30.0)
+    result = run_sesshmux(["attach", "--host", "test-host", remote_id], env, timeout=30.0)
 
     if result.returncode == 0:
         raise AssertionError(result)
@@ -3677,7 +3700,7 @@ def test_ssh_debug_sever_reconnects_with_countdown(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_reconnect_probe(
-        ["--alias", "s1", "test-host"],
+        ["test-host"],
         env,
         marker,
         "after-reconnect",
@@ -3720,7 +3743,7 @@ def test_ssh_debug_sever_reconnects_twice(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["--alias", "s1", "test-host"])
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -3733,8 +3756,9 @@ def test_ssh_debug_sever_reconnects_twice(tmp):
     stderr = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+        session_id = short_session_id(single_live_session_guid(env))
         for after in ("after-debug-sever-1", "after-debug-sever-2"):
-            severed = run_sesshmux(["debug", "sever-connection", "--host", "test-host", "s1"], env, timeout=30.0)
+            severed = run_sesshmux(["debug", "sever-connection", "--host", "test-host", session_id], env, timeout=30.0)
             if severed.returncode != 0:
                 raise AssertionError(severed)
             if not severed.stdout.startswith("SEVERED "):
@@ -3789,7 +3813,7 @@ def test_ssh_unresponsive_reconnect_failure_keeps_input_on_old_connection_withou
     env["SESSH_FAKE_SSH_EXIT_ON_BATCH_FILE"] = str(batch_fail_file)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["--alias", "s1", "test-host"])
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -3801,9 +3825,10 @@ def test_ssh_unresponsive_reconnect_failure_keeps_input_on_old_connection_withou
     stdout = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+        session_id = short_session_id(single_live_session_guid(env))
         before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
 
-        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "30", "--host", "test-host", "s1"], env, timeout=30.0)
+        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "30", "--host", "test-host", session_id], env, timeout=30.0)
         if unresponsive.returncode != 0:
             raise AssertionError(unresponsive)
         if not unresponsive.stdout.startswith("UNRESPONSIVE "):
@@ -3871,7 +3896,7 @@ def test_ssh_unresponsive_tty_sets_title_without_banner(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["--alias", "s1", "test-host"])
+    argv = sessh_argv(["test-host"])
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(ROOT)
@@ -3882,9 +3907,10 @@ def test_ssh_unresponsive_tty_sets_title_without_banner(tmp):
     try:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         output = read_pty_until(fd, output, marker.encode("utf-8"), timeout=30.0)
+        session_id = short_session_id(single_live_session_guid(env))
         before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
 
-        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "30", "--host", "test-host", "s1"], env, timeout=30.0)
+        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "30", "--host", "test-host", session_id], env, timeout=30.0)
         if unresponsive.returncode != 0:
             raise AssertionError(unresponsive)
         if not unresponsive.stdout.startswith("UNRESPONSIVE "):
@@ -3945,7 +3971,7 @@ def test_ssh_unresponsive_reconnect_retries_after_prepare_failure(tmp):
     env["SESSH_FAKE_SSH_EXIT_ON_BATCH_FILE"] = str(batch_fail_file)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["--alias", "s1", "test-host"])
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -3958,9 +3984,10 @@ def test_ssh_unresponsive_reconnect_retries_after_prepare_failure(tmp):
     stderr = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+        session_id = short_session_id(single_live_session_guid(env))
         before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
 
-        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "30", "--host", "test-host", "s1"], env, timeout=30.0)
+        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "30", "--host", "test-host", session_id], env, timeout=30.0)
         if unresponsive.returncode != 0:
             raise AssertionError(unresponsive)
         if not unresponsive.stdout.startswith("UNRESPONSIVE "):
@@ -4026,7 +4053,7 @@ def test_ssh_unresponsive_old_connection_recovers_without_switch_or_bell(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["--alias", "s1", "test-host"])
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -4039,9 +4066,10 @@ def test_ssh_unresponsive_old_connection_recovers_without_switch_or_bell(tmp):
     stderr = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+        session_id = short_session_id(single_live_session_guid(env))
         before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
 
-        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "6", "--host", "test-host", "s1"], env, timeout=30.0)
+        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "6", "--host", "test-host", session_id], env, timeout=30.0)
         if unresponsive.returncode != 0:
             raise AssertionError(unresponsive)
         if not unresponsive.stdout.startswith("UNRESPONSIVE "):
@@ -4107,7 +4135,7 @@ def test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["--alias", "s1", "test-host"])
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -4120,9 +4148,10 @@ def test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner(tmp):
     stderr = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+        session_id = short_session_id(single_live_session_guid(env))
         before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
 
-        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "30", "--host", "test-host", "s1"], env, timeout=30.0)
+        unresponsive = run_sesshmux(["debug", "unresponsive-connection", "--seconds", "30", "--host", "test-host", session_id], env, timeout=30.0)
         if unresponsive.returncode != 0:
             raise AssertionError(unresponsive)
         if not unresponsive.stdout.startswith("UNRESPONSIVE "):
@@ -4135,7 +4164,7 @@ def test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner(tmp):
         if b"sessh: disconnected: Reconnecting" in stdout:
             raise AssertionError(f"unresponsive connection showed disconnected before transport close:\n{stdout!r}")
 
-        severed = run_sesshmux(["debug", "sever-connection", "--host", "test-host", "s1"], env, timeout=30.0)
+        severed = run_sesshmux(["debug", "sever-connection", "--host", "test-host", session_id], env, timeout=30.0)
         if severed.returncode != 0:
             raise AssertionError(severed)
         if not severed.stdout.startswith("SEVERED "):
@@ -4191,7 +4220,7 @@ def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["--alias", "s1", "test-host"])
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -4203,7 +4232,7 @@ def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
     stdout = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
-        sever_session_clients(env, 30.0)
+        sever_session_clients(env, 30.0, single_live_session_guid(env))
         reconnect_output = read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", 10.0)
         proc.stdin.write(b"during-timer\n")
         proc.stdin.flush()
@@ -4270,7 +4299,7 @@ def test_ssh_retry_elapsed_without_input_switches_automatically(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["--alias", "s1", "test-host"])
+    argv = sessh_argv(["test-host"])
     proc = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -4282,7 +4311,7 @@ def test_ssh_retry_elapsed_without_input_switches_automatically(tmp):
     stdout = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
-        sever_session_clients(env, 30.0)
+        sever_session_clients(env, 30.0, single_live_session_guid(env))
         stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", 10.0)
         stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Reconnecting... CTRL-C detach", 12.0)
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
@@ -4411,7 +4440,7 @@ def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_reconnect_probe(
-        ["--alias", "s1", "test-host"],
+        ["test-host"],
         env,
         marker,
         "after-reconnect",
@@ -4462,7 +4491,7 @@ def test_ssh_log_level_quiet_suppresses_buffered_stderr_display(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_reconnect_probe(
-        ["--log-level", "quiet", "--alias", "s1", "test-host"],
+        ["--log-level", "quiet", "test-host"],
         env,
         marker,
         "after-reconnect",
@@ -4563,7 +4592,7 @@ def test_ssh_reconnect_does_not_apply_active_screen_cleanup(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_enter_alt_then_reconnect_banner(
-        ["--alias", "s1", "test-host"],
+        ["test-host"],
         env,
         primary_marker,
         alt_marker,
@@ -4593,7 +4622,7 @@ def test_ssh_reconnect_can_detach_while_bootstrapping(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_detach_reconnect_probe(
-        ["--alias", "s1", "test-host"],
+        ["test-host"],
         env,
         marker,
         timeout=10.0,
@@ -4624,7 +4653,7 @@ def test_ssh_reconnect_can_detach_with_ctrl_c(tmp):
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_detach_reconnect_probe(
-        ["--alias", "s1", "test-host"],
+        ["test-host"],
         env,
         marker,
         detach_bytes=b"\x03",
@@ -4718,7 +4747,7 @@ def test_ssh_unsupported_remote_platform_does_not_plain_ssh_fallback_for_attach(
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
     env["SESSH_FAKE_SSH_REMOTE_PATH"] = str(remote_bin)
 
-    result = run_sesshmux(["attach", "--host", "test-host", guid_for_alias("s1")], env, timeout=30.0)
+    result = run_sesshmux(["attach", "--host", "test-host", test_session_id(1)], env, timeout=30.0)
 
     if result.returncode == 0:
         raise AssertionError(result)
@@ -4743,19 +4772,25 @@ def test_ssh_remote_session_commands_use_broker(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    first = run_sessh_until_stdout(["--alias", "s1", "test-host"], env, marker)
+    first = run_sessh_until_stdout(["test-host"], env, marker)
     if first.returncode != 0:
         raise AssertionError(first)
 
-    assert_session_compat_points_to_cached_artifact(env, remote_path_artifact(), "s1", "remote session command")
+    listed_jsonl = run_sesshmux(["list", "test-host", "--jsonl"], env, timeout=30.0)
+    if listed_jsonl.returncode != 0:
+        raise AssertionError(listed_jsonl)
+    row = only_jsonl_row(listed_jsonl.stdout)
+    session_id = row["id"]
+    session_guid = row["guid"]
+    assert_session_compat_points_to_cached_artifact(env, remote_path_artifact(), session_guid, "remote session command")
 
     listed = run_sesshmux(["list", "test-host"], env, timeout=30.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
-    if not has_list_header(listed.stdout) or not list_has_session(listed.stdout, "s1"):
+    if not has_list_header(listed.stdout) or not list_has_session(listed.stdout, session_id):
         raise AssertionError(listed)
 
-    killed = run_sesshmux(["kill", "test-host", "s1"], env, timeout=30.0)
+    killed = run_sesshmux(["kill", "test-host", session_id], env, timeout=30.0)
     if killed.returncode != 0:
         raise AssertionError(killed)
     if not killed.stdout.startswith("ENDED "):
@@ -4764,7 +4799,7 @@ def test_ssh_remote_session_commands_use_broker(tmp):
     listed = run_sesshmux(["list", "test-host"], env, timeout=30.0)
     if listed.returncode != 0:
         raise AssertionError(listed)
-    if "s1" in listed.stdout:
+    if session_id in listed.stdout:
         raise AssertionError(listed)
 
     stopped = run_sesshmux(["kill", "--all", "test-host"], env, timeout=30.0)
@@ -4798,14 +4833,17 @@ def test_ssh_version_mismatch_uses_compat_path(tmp):
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     marker = "SSH_VERSION_FALLBACK_READY"
+    session_guid = test_session_guid(1)
+    session_id = short_session_id(session_guid)
     write_fake_ssh(fake_bin / "ssh")
-    write_compat_marker(session_compat_path(env, "s1"), marker)
-    server, thread, observed = start_version_mismatch_agent(env, "s1")
+    write_ssh_route(env, session_guid, "test-host")
+    write_compat_marker(session_compat_path(env, session_guid), marker)
+    server, thread, observed = start_version_mismatch_agent(env, session_guid)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
     try:
-        result = run_sesshmux(["attach", "--host", "test-host", "s1"], env, timeout=30.0)
+        result = run_sesshmux(["attach", "--host", "test-host", session_id], env, timeout=30.0)
     finally:
         server.close()
         thread.join(timeout=5.0)
@@ -4827,10 +4865,10 @@ def test_ssh_version_mismatch_uses_compat_path(tmp):
         raise AssertionError(log_text)
     if "compat_invoked=1" not in log_text:
         raise AssertionError(log_text)
-    expected_args = "compat_args=. attach s1 --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
+    expected_args = f"compat_args=. attach {session_id} --scrollback-limit 2000 --initial-scrollback -1 --log-level warn"
     if expected_args not in log_text:
         raise AssertionError(log_text)
-    if f"compat_env_guid={guid_for_alias('s1')}" not in log_text:
+    if f"compat_env_guid={session_guid}" not in log_text:
         raise AssertionError(log_text)
     if f"compat_env_client_version={sessh_version()}" not in log_text:
         raise AssertionError(log_text)
@@ -4843,13 +4881,15 @@ def test_sesshmux_force_compat_invokes_session_compat_path(tmp):
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     marker = "SESSHMUX_FORCE_COMPAT_READY"
+    session_guid = test_session_guid(1)
+    session_id = short_session_id(session_guid)
     write_fake_ssh(fake_bin / "ssh")
-    write_compat_marker(session_compat_path(env, "s1"), marker)
+    write_compat_marker(session_compat_path(env, session_guid), marker)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
     result = run_sesshmux(
-        ["force-compat", "--ssh-options", "-F cfg", "--host", "test-host", "s1", "attach"],
+        ["force-compat", "--ssh-options", "-F cfg", "--host", "test-host", session_id, "attach"],
         env,
         timeout=30.0,
     )
@@ -4865,9 +4905,9 @@ def test_sesshmux_force_compat_invokes_session_compat_path(tmp):
         raise AssertionError(log_text)
     if "batch_mode=1" in log_text:
         raise AssertionError(log_text)
-    if "compat_args=. attach s1" not in log_text:
+    if f"compat_args=. attach {session_id}" not in log_text:
         raise AssertionError(log_text)
-    if f"compat_env_guid={guid_for_alias('s1')}" not in log_text:
+    if f"compat_env_guid={session_guid}" not in log_text:
         raise AssertionError(log_text)
     if f"compat_env_client_version={sessh_version()}" not in log_text:
         raise AssertionError(log_text)
@@ -4880,15 +4920,15 @@ def test_sesshmux_force_compat_uses_cached_route(tmp):
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     marker = "SESSHMUX_FORCE_COMPAT_ROUTE_READY"
-    route_alias = "route-force-compat"
-    route_guid = guid_for_alias(route_alias)
+    route_guid = test_session_guid(29)
+    route_id = short_session_id(route_guid)
     write_fake_ssh(fake_bin / "ssh")
-    write_ssh_route(env, route_alias, route_guid, "test-host", ssh_options=("-F", "cached-cfg"))
-    write_compat_marker(session_compat_path(env, route_alias), marker)
+    write_ssh_route(env, route_guid, "test-host", ssh_options=("-F", "cached-cfg"))
+    write_compat_marker(session_compat_path(env, route_guid), marker)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    result = run_sesshmux(["force-compat", route_alias, "attach"], env, timeout=30.0)
+    result = run_sesshmux(["force-compat", route_id, "attach"], env, timeout=30.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -4932,13 +4972,16 @@ def test_sesshmux_force_compat_ctrl_c_reaches_remote_pty(tmp):
     env["SESSH_FAKE_SSH_SIMULATE_NO_PTY"] = "1"
     env["SHELL"] = str(remote_shell)
 
-    first = run_sessh_until_stdout(["--alias", "s1", "test-host"], env, marker, timeout=30.0)
+    first = run_sessh_until_stdout(["test-host"], env, marker, timeout=30.0)
     if first.returncode != 0:
         raise AssertionError(first)
-    assert_session_compat_points_to_cached_artifact(env, remote_path_artifact(), "s1", "force compat signal")
+    row = single_live_session_row(env)
+    session_id = row["id"]
+    session_guid = row["guid"]
+    assert_session_compat_points_to_cached_artifact(env, remote_path_artifact(), session_guid, "force compat signal")
 
     result = run_sesshmux_in_pty(
-        ["force-compat", "--host", "test-host", "s1", "attach"],
+        ["force-compat", "--host", "test-host", session_id, "attach"],
         env,
         (
             (b"REMOTE_PROMPT$", b"\x03"),
@@ -5261,8 +5304,8 @@ def main(argv=None):
             test_ssh_list_refresh_drains_pending_proxy_kill_without_route,
         ),
         (
-            "ssh remote default alias is remote generated",
-            test_ssh_remote_default_alias_is_remote_generated,
+            "ssh remote default id is remote generated",
+            test_ssh_remote_default_id_is_remote_generated,
         ),
         (
             "ssh host attach does not follow remote route",

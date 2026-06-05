@@ -95,6 +95,14 @@ _FRAME_FIELDS = {
 }
 
 
+def test_session_guid(index):
+    return f"s-{index:08x}-0000-4000-8000-{index:012x}"
+
+
+def test_session_id(index):
+    return f"s-{index:08x}"
+
+
 def encode_scrollback_cursor(epoch, cursor):
     return struct.pack(">QQ", epoch, cursor)
 
@@ -394,7 +402,7 @@ def pack_session_create(
     scrollback=2000,
     fg=0xFFFFFFFF,
     bg=0xFFFFFFFF,
-    session_id="s1",
+    session_id=None,
     command_argv=None,
     legacy_command_argv=None,
     shell_command=None,
@@ -402,9 +410,9 @@ def pack_session_create(
 ):
     pb = sessh_pb()
     message = pb.TeSessionCreate(scrollback_row_limit=scrollback)
+    if session_id is None:
+        session_id = test_session_guid(1)
     message.session_guid = guid_for_ref(session_id)
-    if not is_guid_ref(session_id):
-        message.session_alias = session_id
     rows, cols = _LAST_RESIZE
     message.terminal_size.terminal_rows = rows
     message.terminal_size.terminal_cols = cols
@@ -533,7 +541,7 @@ def create_and_attach_session(
     scrollback=2000,
     fg=0xFFFFFFFF,
     bg=0xFFFFFFFF,
-    session_id="s1",
+    session_id=None,
     initial_scrollback=None,
     command_argv=None,
     legacy_command_argv=None,
@@ -714,10 +722,6 @@ def client_agent_socket_hint_file(env, client_guid):
     return runtime_root(env) / "guid" / client_guid / "agent.sock"
 
 
-def aliases_dir(env):
-    return state_root(env) / "alias"
-
-
 def state_root(env):
     return Path(env["XDG_STATE_HOME"]) / "sessh"
 
@@ -744,28 +748,15 @@ def guid_for_ref(ref):
     if _COMPACT_GUID_RE.match(ref):
         compact = ref.lower()
         return f"s-{compact[0:8]}-{compact[8:12]}-{compact[12:16]}-{compact[16:20]}-{compact[20:32]}"
-    match = re.fullmatch(r"s([0-9]+)", ref)
-    if not match:
-        raise AssertionError(f"test alias cannot be mapped to a deterministic guid: {ref}")
-    return f"s-00000000-0000-4000-8000-{int(match.group(1)):012x}"
+    raise AssertionError(f"invalid guid ref: {ref}")
 
 
 def client_guid_for_index(index):
     return f"c-00000000-0000-4000-8000-{index:012x}"
 
 
-def ensure_alias(env, alias, guid=None):
-    guid = guid_for_ref(guid) if guid is not None else guid_for_ref(alias)
-    alias_path = aliases_dir(env) / alias
-    alias_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if alias_path.exists() or alias_path.is_symlink():
-        return
-    alias_path.symlink_to(Path("../guid") / guid)
-
-
-def write_cached_remote_route(env, alias, host, guid=None, alive=True, agent_version="cached-test"):
-    guid = guid_for_ref(guid) if guid is not None else guid_for_ref(alias)
-    ensure_alias(env, alias, guid)
+def write_cached_remote_route(env, session_id, host, guid=None, alive=True, agent_version="cached-test"):
+    guid = guid_for_ref(guid) if guid is not None else guid_for_ref(session_id)
     route_dir = state_sessions_dir(env) / guid
     route_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     remote_session_dir = f"/tmp/sessh-remote/guid/{guid}"
@@ -773,7 +764,6 @@ def write_cached_remote_route(env, alias, host, guid=None, alive=True, agent_ver
         json.dumps(
             {
                 "guid": guid,
-                "primary_alias": alias,
                 "session_dir": remote_session_dir,
                 "host": host,
                 "agent_version": agent_version,
@@ -795,27 +785,19 @@ def assert_runtime_dir_symlink(env, expected_runtime_root):
         raise AssertionError(f"runtime dir pointer target mismatch: expected {expected_runtime_root}, got {actual}")
 
 
-def session_dir(env, session_id="s1"):
-    if is_guid_ref(session_id):
-        return sessions_dir(env) / guid_for_ref(session_id)
-    ensure_alias(env, session_id)
-    alias_path = aliases_dir(env) / session_id
-    if alias_path.is_symlink():
-        return sessions_dir(env) / guid_for_ref(Path(os.readlink(alias_path)).name)
+def session_dir(env, session_id=None):
+    if session_id is None:
+        session_id = test_session_guid(1)
     return sessions_dir(env) / guid_for_ref(session_id)
 
 
-def route_file(env, session_id="s1"):
-    if is_guid_ref(session_id):
-        return state_sessions_dir(env) / guid_for_ref(session_id) / "route.json"
-    ensure_alias(env, session_id)
-    alias_path = aliases_dir(env) / session_id
-    if alias_path.is_symlink():
-        return state_sessions_dir(env) / guid_for_ref(Path(os.readlink(alias_path)).name) / "route.json"
+def route_file(env, session_id=None):
+    if session_id is None:
+        session_id = test_session_guid(1)
     return state_sessions_dir(env) / guid_for_ref(session_id) / "route.json"
 
 
-def query_session_live_state(env, session_id="s1"):
+def query_session_live_state(env, session_id=None):
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     conn.settimeout(5.0)
     try:
@@ -830,7 +812,7 @@ def query_session_live_state(env, session_id="s1"):
         conn.close()
 
 
-def wait_session_detached(env, session_id="s1", timeout=5.0):
+def wait_session_detached(env, session_id=None, timeout=5.0):
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
@@ -845,7 +827,7 @@ def wait_session_detached(env, session_id="s1", timeout=5.0):
     raise AssertionError(f"session did not become detached: {session_id}: {last!r}")
 
 
-def wait_session_attached(env, session_id="s1", timeout=5.0):
+def wait_session_attached(env, session_id=None, timeout=5.0):
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
@@ -860,26 +842,30 @@ def wait_session_attached(env, session_id="s1", timeout=5.0):
     raise AssertionError(f"session did not become attached: {session_id}: {last!r}")
 
 
-def agent_log_file(env, session_id="s1"):
+def agent_log_file(env, session_id=None):
     return route_file(env, session_id).parent / "agent.log"
 
 
-def socket_path(env, session_id="s1"):
+def socket_path(env, session_id=None):
     link = agent_sock_link_path(env, session_id)
     if link.is_symlink():
         return (link.parent / os.readlink(link)).resolve()
     return actual_socket_path(env, session_id)
 
 
-def actual_socket_path(env, session_id="s1"):
+def actual_socket_path(env, session_id=None):
+    if session_id is None:
+        session_id = test_session_guid(1)
     return runtime_root(env) / "a" / compact_guid(guid_for_ref(session_id))
 
 
-def agent_sock_link_path(env, session_id="s1"):
+def agent_sock_link_path(env, session_id=None):
     return session_dir(env, session_id) / "agent.sock"
 
 
-def ensure_agent_socket_link(env, session_id="s1"):
+def ensure_agent_socket_link(env, session_id=None):
+    if session_id is None:
+        session_id = test_session_guid(1)
     path = session_dir(env, session_id)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     (runtime_root(env) / "a").mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -888,7 +874,9 @@ def ensure_agent_socket_link(env, session_id="s1"):
         link.symlink_to(Path("../../a") / compact_guid(guid_for_ref(session_id)))
 
 
-def start_session_agent(env, session_id="s1"):
+def start_session_agent(env, session_id=None):
+    if session_id is None:
+        session_id = test_session_guid(1)
     ensure_agent_socket_link(env, session_id)
     path = socket_path(env, session_id)
     session_path = session_dir(env, session_id)
@@ -1975,7 +1963,7 @@ def run_state_only_client_render_test(base_env):
         shell.chmod(0o700)
         env["SHELL"] = str(shell)
         cleanup_runtime(env)
-        pid, fd = spawn_client(env, ["--alias", "s1"])
+        pid, fd = spawn_client(env, [])
         try:
             read_until(fd, b"\x1b]2;state-only-client-ready\x1b\\", timeout=5.0)
             os.write(fd, b"insert\n")
@@ -2018,7 +2006,7 @@ def run_display_clear_not_forwarded_test(base_env):
         shell.chmod(0o700)
         env["SHELL"] = str(shell)
         cleanup_runtime(env)
-        pid, fd = spawn_client(env, ["--alias", "s1"])
+        pid, fd = spawn_client(env, [])
         try:
             read_until(fd, b"CLEAR$ ", timeout=5.0)
             read_available(fd)
@@ -2767,7 +2755,7 @@ def run_session_agent_crash_client_error_test(base_env):
         env = isolated_env(tmp)
         env["SHELL"] = "/bin/sh"
         cleanup_runtime(env)
-        pid, fd = spawn_client(env, ["--alias", "s1"])
+        pid, fd = spawn_client(env, [])
         child_closed = False
         try:
             read_until(fd, b"$ ")
@@ -2806,10 +2794,11 @@ def run_session_agent_registry_test(base_env):
         )
         shell.chmod(0o700)
 
-        session_path = session_dir(env, "s42")
-        ensure_agent_socket_link(env, "s42")
-        socket_file = socket_path(env, "s42")
-        socket_link = agent_sock_link_path(env, "s42")
+        session_42_guid = test_session_guid(42)
+        session_path = session_dir(env, session_42_guid)
+        ensure_agent_socket_link(env, session_42_guid)
+        socket_file = socket_path(env, session_42_guid)
+        socket_link = agent_sock_link_path(env, session_42_guid)
         meta_file = session_path / "meta.json"
         compat_file = session_path / "compat"
 
@@ -2844,12 +2833,12 @@ def run_session_agent_registry_test(base_env):
             conn.connect(str(socket_file))
             send_hello(conn)
             send_resize(conn, rows=4, cols=40)
-            create_and_attach_session(conn, shell, session_id="s42")
+            create_and_attach_session(conn, shell, session_id=session_42_guid)
             message_type, payload = recv_frame(conn)
             if message_type != SESSION_ATTACHED:
                 raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
             assert_session_attached(payload)
-            live_state = wait_session_attached(env, "s42")
+            live_state = wait_session_attached(env, session_42_guid)
             client = live_state.attached_clients[0]
             if not client.client_guid:
                 raise AssertionError(live_state)
@@ -2877,7 +2866,7 @@ def run_session_agent_registry_test(base_env):
             wait_sticky(meta_file, timeout=10.0)
             if not socket_link.is_symlink():
                 raise AssertionError("session agent did not recreate socket link")
-            live_state = wait_session_attached(env, "s42", timeout=10.0)
+            live_state = wait_session_attached(env, session_42_guid, timeout=10.0)
             if live_state.HasField("detached_at_unix_ms"):
                 raise AssertionError(f"live state became detached while an attachment was active: {live_state}")
 
@@ -2898,7 +2887,7 @@ def run_session_agent_registry_test(base_env):
 
             conn.close()
             conn = None
-            wait_session_detached(env, "s42")
+            wait_session_detached(env, session_42_guid)
 
             attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             attach.settimeout(5.0)
@@ -2910,7 +2899,7 @@ def run_session_agent_registry_test(base_env):
             if message_type != SESSION_ATTACHED:
                 raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
             assert_session_attached(payload)
-            live_state = wait_session_attached(env, "s42")
+            live_state = wait_session_attached(env, session_42_guid)
             if live_state.HasField("detached_at_unix_ms"):
                 raise AssertionError("live detached state survived reattach")
 
@@ -2970,10 +2959,12 @@ def run_broker_starts_session_agent_test(base_env):
             assert_session_attached(payload)
             recv_draw_until(conn, b"BROKER_READY")
 
-            session_path = session_dir(env, "s1")
-            if not agent_sock_link_path(env, "s1").is_symlink():
+            session_1_guid = test_session_guid(1)
+            session_1_id = test_session_id(1)
+            session_path = session_dir(env, session_1_guid)
+            if not agent_sock_link_path(env, session_1_guid).is_symlink():
                 raise AssertionError("broker did not create a session-agent socket link")
-            if not socket_path(env, "s1").exists():
+            if not socket_path(env, session_1_guid).exists():
                 raise AssertionError("broker did not create a session-agent socket")
             if not os.path.islink(session_path / "compat"):
                 raise AssertionError("broker session agent did not write compat symlink")
@@ -2985,8 +2976,8 @@ def run_broker_starts_session_agent_test(base_env):
             proc.wait(timeout=5.0)
             if proc.returncode != 0:
                 raise AssertionError(proc.stderr.read().decode("utf-8", "replace"))
-            wait_missing(socket_path(env, "s1"))
-            wait_missing(agent_sock_link_path(env, "s1"))
+            wait_missing(socket_path(env, session_1_guid))
+            wait_missing(agent_sock_link_path(env, session_1_guid))
             wait_missing(session_path / "compat")
             wait_missing(session_path)
         finally:
@@ -3012,7 +3003,11 @@ def run_broker_registry_commands_test(base_env):
             "done\n"
         )
         shell.chmod(0o700)
-        session_path = session_dir(env, "s1")
+        session_1_guid = test_session_guid(1)
+        session_1_id = test_session_id(1)
+        session_2_guid = test_session_guid(2)
+        session_2_id = test_session_id(2)
+        session_path = session_dir(env, session_1_guid)
 
         proc = subprocess.Popen(
             [str(BIN), ":internal-session-broker:"],
@@ -3034,14 +3029,14 @@ def run_broker_registry_commands_test(base_env):
             recv_draw_until(conn, b"BROKER_COMMAND_READY")
             proc.stdin.close()
             proc.wait(timeout=5.0)
-            wait_session_detached(env, "s1")
+            wait_session_detached(env, session_1_guid)
         finally:
             if proc.poll() is None:
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
         listed = run([":internal-session-broker:", "list"], env, check=True, timeout=5.0)
-        if "s1" not in sessions(listed.stdout):
+        if session_1_id not in sessions(listed.stdout):
             raise AssertionError(listed.stdout)
 
         proc = subprocess.Popen(
@@ -3061,23 +3056,23 @@ def run_broker_registry_commands_test(base_env):
             if message_type != SESSION_ATTACHED:
                 raise AssertionError((message_type, payload))
             assert_session_attached(payload)
-            live_state = wait_session_attached(env, "s1")
+            live_state = wait_session_attached(env, session_1_guid)
             if live_state.HasField("detached_at_unix_ms"):
                 raise AssertionError("broker attach did not clear detached live state")
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
             recv_until_message(conn, SESSION_ENDED)
             proc.stdin.close()
             proc.wait(timeout=5.0)
-            wait_missing(socket_path(env, "s1"))
-            wait_missing(agent_sock_link_path(env, "s1"))
+            wait_missing(socket_path(env, session_1_guid))
+            wait_missing(agent_sock_link_path(env, session_1_guid))
             wait_missing(session_path / "compat")
         finally:
             if proc.poll() is None:
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        missing = run([":internal-session-broker:", "kill", "s1"], env, timeout=5.0)
-        if missing.returncode != 1 or "ERROR s1 not found" not in missing.stderr:
+        missing = run([":internal-session-broker:", "kill", session_1_guid], env, timeout=5.0)
+        if missing.returncode != 1 or f"ERROR {session_1_guid} not found" not in missing.stderr:
             raise AssertionError(missing)
 
         proc = subprocess.Popen(
@@ -3092,7 +3087,7 @@ def run_broker_registry_commands_test(base_env):
         try:
             send_hello(conn)
             send_resize(conn, rows=4, cols=40)
-            create_and_attach_session(conn, shell, session_id="s2")
+            create_and_attach_session(conn, shell, session_id=session_2_guid)
             message_type, payload = recv_frame(conn)
             if message_type != SESSION_ATTACHED:
                 raise AssertionError((message_type, payload))
@@ -3100,21 +3095,21 @@ def run_broker_registry_commands_test(base_env):
             recv_draw_until(conn, b"BROKER_COMMAND_READY")
             proc.stdin.close()
             proc.wait(timeout=5.0)
-            wait_session_detached(env, "s2")
+            wait_session_detached(env, session_2_guid)
         finally:
             if proc.poll() is None:
                 proc.terminate()
                 proc.wait(timeout=2.0)
 
-        killed = run([":internal-session-broker:", "kill", "s2"], env, check=True, timeout=5.0)
-        if "ENDED s2" not in killed.stdout or killed.stderr:
+        killed = run([":internal-session-broker:", "kill", session_2_guid], env, check=True, timeout=5.0)
+        if f"ENDED {session_2_guid}" not in killed.stdout or killed.stderr:
             raise AssertionError(killed)
-        s2_dir = session_dir(env, "s2")
-        wait_missing(socket_path(env, "s2"))
-        wait_missing(agent_sock_link_path(env, "s2"))
+        s2_dir = session_dir(env, session_2_guid)
+        wait_missing(socket_path(env, session_2_guid))
+        wait_missing(agent_sock_link_path(env, session_2_guid))
         wait_missing(s2_dir / "compat")
 
-        for expected_id in ("s3", "s4"):
+        for expected_guid in (test_session_guid(3), test_session_guid(4)):
             proc = subprocess.Popen(
                 [str(BIN), ":internal-session-broker:"],
                 cwd=ROOT,
@@ -3127,15 +3122,15 @@ def run_broker_registry_commands_test(base_env):
             try:
                 send_hello(conn)
                 send_resize(conn, rows=4, cols=40)
-                create_and_attach_session(conn, shell, session_id=expected_id)
+                create_and_attach_session(conn, shell, session_id=expected_guid)
                 message_type, payload = recv_frame(conn)
                 if message_type != SESSION_ATTACHED:
-                    raise AssertionError((expected_id, message_type, payload))
+                    raise AssertionError((expected_guid, message_type, payload))
                 assert_session_attached(payload)
                 recv_draw_until(conn, b"BROKER_COMMAND_READY")
                 proc.stdin.close()
                 proc.wait(timeout=5.0)
-                wait_session_detached(env, expected_id)
+                wait_session_detached(env, expected_guid)
             finally:
                 if proc.poll() is None:
                     proc.terminate()
@@ -3144,10 +3139,10 @@ def run_broker_registry_commands_test(base_env):
         stopped = run([":internal-session-broker:", "kill", "--all"], env, check=True, timeout=5.0)
         if "KILLING_ALL" not in stopped.stdout or stopped.stderr:
             raise AssertionError(stopped)
-        for expected_id in ("s3", "s4"):
-            path = session_dir(env, expected_id)
-            wait_missing(socket_path(env, expected_id))
-            wait_missing(agent_sock_link_path(env, expected_id))
+        for expected_guid in (test_session_guid(3), test_session_guid(4)):
+            path = session_dir(env, expected_guid)
+            wait_missing(socket_path(env, expected_guid))
+            wait_missing(agent_sock_link_path(env, expected_guid))
             wait_missing(path / "compat")
 
 
@@ -3163,6 +3158,8 @@ def run_client_control_commands_test(base_env):
             "done\n"
         )
         shell.chmod(0o700)
+        session_1_guid = test_session_guid(1)
+        session_1_id = test_session_id(1)
         client_one = "c-11111111-1111-1111-1111-111111111111"
         client_two = "c-22222222-2222-2222-2222-222222222222"
         client_three = "c-33333333-3333-4333-8333-333333333333"
@@ -3180,7 +3177,7 @@ def run_client_control_commands_test(base_env):
         def attach_existing(client_guid):
             conn = connect_socket()
             send_resize(conn, rows=8, cols=60)
-            send_frame(conn, SESSION_ATTACH, pack_session_attach(session_ref="s1", client_guid=client_guid))
+            send_frame(conn, SESSION_ATTACH, pack_session_attach(session_ref=session_1_guid, client_guid=client_guid))
             message_type, payload = recv_frame(conn)
             if message_type != SESSION_ATTACHED:
                 raise AssertionError((message_type, payload))
@@ -3208,7 +3205,7 @@ def run_client_control_commands_test(base_env):
             proc = start_session_agent(env)
             conn1 = connect_socket()
             send_resize(conn1, rows=8, cols=60)
-            create_and_attach_session(conn1, shell, session_id="s1", client_guid=client_one)
+            create_and_attach_session(conn1, shell, session_id=session_1_guid, client_guid=client_one)
             message_type, payload = recv_frame(conn1)
             if message_type != SESSION_ATTACHED:
                 raise AssertionError((message_type, payload))
@@ -3242,12 +3239,12 @@ def run_client_control_commands_test(base_env):
 
             listed_sessions = run([".", "list"], env, check=True, timeout=5.0)
             session_rows = sessions(listed_sessions.stdout)
-            if session_rows.get("s1", {}).get("attached") != "2":
+            if session_rows.get(session_1_id, {}).get("attached") != "2":
                 raise AssertionError(listed_sessions.stdout)
-            if session_rows["s1"].get("input") == "never":
+            if session_rows[session_1_id].get("input") == "never":
                 raise AssertionError(listed_sessions.stdout)
 
-            listed = run([".", "list", "--client=s1", "--jsonl"], env, check=True, timeout=5.0)
+            listed = run([".", "list", f"--client={session_1_id}", "--jsonl"], env, check=True, timeout=5.0)
             rows = [json.loads(line) for line in listed.stdout.splitlines()]
             if [row["client_guid"] for row in rows] != [client_one, client_two]:
                 raise AssertionError(listed.stdout)
@@ -3262,7 +3259,7 @@ def run_client_control_commands_test(base_env):
                 raise AssertionError(listed_one.stdout)
 
             session_env = dict(env)
-            session_env["SESSH_GUID"] = guid_for_ref("s1")
+            session_env["SESSH_GUID"] = session_1_guid
             listed_current = run([".", "list", "--client", "session", "--jsonl"], session_env, check=True, timeout=5.0)
             current_rows = [json.loads(line) for line in listed_current.stdout.splitlines()]
             if [row["client_guid"] for row in current_rows] != [client_one, client_two]:
@@ -3272,8 +3269,9 @@ def run_client_control_commands_test(base_env):
             if missing_target.returncode != 64 or "incoming, outgoing, session" not in missing_target.stderr:
                 raise AssertionError(missing_target)
 
-            missing_session_ref = run([".", "list", "--client", "does-not-exist"], env, timeout=5.0)
-            if missing_session_ref.returncode != 1 or "expected: incoming, outgoing, session, or a guid/alias" not in missing_session_ref.stderr:
+            missing_id = test_session_id(99)
+            missing_session_ref = run([".", "list", "--client", missing_id], env, timeout=5.0)
+            if missing_session_ref.returncode != 1 or f"session not found for --client {missing_id}" not in missing_session_ref.stderr:
                 raise AssertionError(missing_session_ref)
 
             listed_incoming = run([".", "list", "--client=incoming", "--jsonl"], env, check=True, timeout=5.0)
@@ -3281,15 +3279,15 @@ def run_client_control_commands_test(base_env):
             if [row["client_guid"] for row in incoming_rows] != [client_one, client_two]:
                 raise AssertionError(listed_incoming.stdout)
 
-            listed_clients = run([".", "list", "--client=s1"], env, check=True, timeout=5.0)
+            listed_clients = run([".", "list", f"--client={session_1_id}"], env, check=True, timeout=5.0)
             if client_one in listed_clients.stdout or "c-11111111" not in listed_clients.stdout:
                 raise AssertionError(listed_clients.stdout)
 
-            ambiguous = run(["detach", "s1"], env, timeout=5.0)
+            ambiguous = run(["detach", session_1_id], env, timeout=5.0)
             if ambiguous.returncode == 0 or "multiple clients are attached" not in ambiguous.stderr:
                 raise AssertionError(ambiguous)
 
-            repainted = run(["repaint", "--last-input", "s1"], env, check=True, timeout=5.0)
+            repainted = run(["repaint", "--last-input", session_1_id], env, check=True, timeout=5.0)
             if f"REPAINTED {client_one}" not in repainted.stdout:
                 raise AssertionError(repainted)
             repaint_request = parse_client_repaint_request(recv_until_message(conn1, CLIENT_REPAINT_REQUEST))
@@ -3297,7 +3295,7 @@ def run_client_control_commands_test(base_env):
                 raise AssertionError(repaint_request)
             assert_no_frame(conn2)
 
-            repainted = run(["repaint", "--scrollback", "--last-input", "s1"], env, check=True, timeout=5.0)
+            repainted = run(["repaint", "--scrollback", "--last-input", session_1_id], env, check=True, timeout=5.0)
             if f"REPAINTED {client_one}" not in repainted.stdout:
                 raise AssertionError(repainted)
             repaint_request = parse_client_repaint_request(recv_until_message(conn1, CLIENT_REPAINT_REQUEST))
@@ -3305,13 +3303,13 @@ def run_client_control_commands_test(base_env):
                 raise AssertionError(repaint_request)
             assert_no_frame(conn2)
 
-            repainted = run(["repaint", "c-11111111", "s1"], env, check=True, timeout=5.0)
+            repainted = run(["repaint", "c-11111111", session_1_id], env, check=True, timeout=5.0)
             if f"REPAINTED {client_one}" not in repainted.stdout:
                 raise AssertionError(repainted)
             recv_until_message(conn1, CLIENT_REPAINT_REQUEST)
             assert_no_frame(conn2)
 
-            detached = run(["detach", "--last-input", "s1"], env, check=True, timeout=5.0)
+            detached = run(["detach", "--last-input", session_1_id], env, check=True, timeout=5.0)
             if f"DETACHED {client_one}" not in detached.stdout:
                 raise AssertionError(detached)
             recv_until_message(conn1, CLIENT_DETACH_REQUEST)
@@ -3327,12 +3325,12 @@ def run_client_control_commands_test(base_env):
                 time.sleep(0.02)
             listed_sessions = run([".", "list"], env, check=True, timeout=5.0)
             session_rows = sessions(listed_sessions.stdout)
-            if session_rows.get("s1", {}).get("attached") != "1":
+            if session_rows.get(session_1_id, {}).get("attached") != "1":
                 raise AssertionError(listed_sessions.stdout)
-            if session_rows["s1"].get("input") == "never":
+            if session_rows[session_1_id].get("input") == "never":
                 raise AssertionError(listed_sessions.stdout)
 
-            missing_last_input = run(["detach", "--last-input", "s1"], env, timeout=5.0)
+            missing_last_input = run(["detach", "--last-input", session_1_id], env, timeout=5.0)
             if missing_last_input.returncode == 0 or "no attached client has sent user input" not in missing_last_input.stderr:
                 raise AssertionError(missing_last_input)
 
@@ -3340,7 +3338,7 @@ def run_client_control_commands_test(base_env):
             socket_hint = client_agent_socket_hint_file(env, client_three)
             if not socket_hint.is_symlink():
                 raise AssertionError(f"client agent socket hint is missing: {socket_hint}")
-            expected_target = Path("..") / guid_for_ref("s1") / "agent.sock"
+            expected_target = Path("..") / session_1_guid / "agent.sock"
             if Path(os.readlink(socket_hint)) != expected_target:
                 raise AssertionError(f"client agent socket hint target mismatch: {os.readlink(socket_hint)}")
             route_hint = client_route_hint_file(env, client_three)
@@ -3362,7 +3360,7 @@ def run_client_control_commands_test(base_env):
             if socket_hint.exists() or socket_hint.is_symlink():
                 raise AssertionError(f"client agent socket hint was not removed: {socket_hint}")
 
-            unresponsive = run(["debug", "unresponsive-connection", "--seconds", "1", client_two, "s1"], env, check=True, timeout=5.0)
+            unresponsive = run(["debug", "unresponsive-connection", "--seconds", "1", client_two, session_1_id], env, check=True, timeout=5.0)
             if f"UNRESPONSIVE {client_two}" not in unresponsive.stdout:
                 raise AssertionError(unresponsive)
             send_frame(conn2, INPUT, pack_input(b"ignored\n", input_seq=23))
@@ -3406,6 +3404,8 @@ def run_broker_attach_without_id_uses_latest_detached_test(base_env):
             "done\n"
         )
         shell.chmod(0o700)
+        session_1_guid = test_session_guid(1)
+        session_2_guid = test_session_guid(2)
         attached = []
 
         def start_attached_session(session_id):
@@ -3432,15 +3432,15 @@ def run_broker_attach_without_id_uses_latest_detached_test(base_env):
             return proc, conn
 
         try:
-            s1_proc, _ = start_attached_session("s1")
+            s1_proc, _ = start_attached_session(session_1_guid)
             s1_proc.stdin.close()
             s1_proc.wait(timeout=5.0)
             attached = [(proc, conn) for proc, conn in attached if proc is not s1_proc]
-            wait_session_detached(env, "s1")
+            wait_session_detached(env, session_1_guid)
 
             time.sleep(0.02)
-            s2_proc, s2_conn = start_attached_session("s2")
-            live_state = wait_session_attached(env, "s2")
+            s2_proc, s2_conn = start_attached_session(session_2_guid)
+            live_state = wait_session_attached(env, session_2_guid)
             if live_state.HasField("detached_at_unix_ms"):
                 raise AssertionError("newer attached session has detached live state")
 
@@ -3461,8 +3461,8 @@ def run_broker_attach_without_id_uses_latest_detached_test(base_env):
             if message_type != SESSION_ATTACHED:
                 raise AssertionError((message_type, payload))
             message = assert_session_attached(payload)
-            if message.session_guid != guid_for_ref("s1"):
-                raise AssertionError(f"expected no-id attach to select detached s1, got {message.session_guid}")
+            if message.session_guid != session_1_guid:
+                raise AssertionError(f"expected no-id attach to select detached fixture session, got {message.session_guid}")
 
             send_frame(attach_conn, INPUT, pack_bytes(b"exit\n"))
             recv_until_message(attach_conn, SESSION_ENDED)
@@ -3487,11 +3487,12 @@ def run_broker_kill_edge_cases_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-broker-sigkill-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         cleanup_runtime(env)
+        session_1_guid = test_session_guid(1)
         agent_pid, term_marker = start_sigterm_ignoring_process(tmp, "ignore-term-agent")
         try:
-            write_session_meta(env, "s1", agent_pid)
-            killed = run([":internal-session-broker:", "kill", "s1"], env, timeout=6.0)
-            if killed.returncode != 0 or "ENDED s1" not in killed.stdout:
+            write_session_meta(env, session_1_guid, agent_pid)
+            killed = run([":internal-session-broker:", "kill", session_1_guid], env, timeout=6.0)
+            if killed.returncode != 0 or f"ENDED {session_1_guid}" not in killed.stdout:
                 raise AssertionError(killed)
             wait_file(term_marker)
             wait_process_missing(agent_pid)
@@ -3504,19 +3505,20 @@ def run_broker_kill_edge_cases_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-broker-compat-kill-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         cleanup_runtime(env)
+        session_1_guid = test_session_guid(1)
         sleeper = subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            session_path = write_session_meta(env, "s1", sleeper.pid, version="0.0.0-compat-test")
+            session_path = write_session_meta(env, session_1_guid, sleeper.pid, version="0.0.0-compat-test")
             compat_log = Path(tmp) / "compat.log"
             write_compat_script(session_path / "compat", compat_log)
 
-            killed = run([":internal-session-broker:", "kill", "s1"], env, check=True, timeout=5.0)
+            killed = run([":internal-session-broker:", "kill", session_1_guid], env, check=True, timeout=5.0)
             if killed.stdout or killed.stderr:
                 raise AssertionError(killed)
             lines = compat_log.read_text().splitlines()
-            if f"kill {guid_for_ref('s1')}" not in lines:
+            if f"kill {session_1_guid}" not in lines:
                 raise AssertionError(lines)
-            if f"env_guid={guid_for_ref('s1')}" not in lines:
+            if f"env_guid={session_1_guid}" not in lines:
                 raise AssertionError(lines)
             if f"env_client_version={sessh_version()}" not in lines:
                 raise AssertionError(lines)
@@ -3539,18 +3541,19 @@ def run_broker_kill_edge_cases_test(base_env):
         ]
         try:
             compat_log = Path(tmp) / "compat-all.log"
-            for session_id, proc in zip(("s1", "s2"), sleepers):
-                session_path = write_session_meta(env, session_id, proc.pid, version="0.0.0-compat-test")
+            session_guids = (test_session_guid(1), test_session_guid(2))
+            for session_guid, proc in zip(session_guids, sleepers):
+                session_path = write_session_meta(env, session_guid, proc.pid, version="0.0.0-compat-test")
                 write_compat_script(session_path / "compat", compat_log)
 
             stopped = run([":internal-session-broker:", "kill", "--all"], env, check=True, timeout=5.0)
             if stopped.stdout != "KILLING_ALL\n" or stopped.stderr:
                 raise AssertionError(stopped)
             lines = compat_log.read_text().splitlines()
-            for session_id in ("s1", "s2"):
-                if f"kill {guid_for_ref(session_id)}" not in lines:
+            for session_guid in session_guids:
+                if f"kill {session_guid}" not in lines:
                     raise AssertionError(lines)
-                if f"env_guid={guid_for_ref(session_id)}" not in lines:
+                if f"env_guid={session_guid}" not in lines:
                     raise AssertionError(lines)
             if lines.count(f"env_client_version={sessh_version()}") != 2:
                 raise AssertionError(lines)
@@ -3628,6 +3631,14 @@ def jsonl_sessions(stdout):
     return result
 
 
+def single_jsonl_session(env):
+    listed = run(["list", ".", "--jsonl"], env, check=True, timeout=5.0)
+    rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
+    if len(rows) != 1:
+        raise AssertionError(listed.stdout)
+    return rows[0]
+
+
 def assert_list_header(stdout):
     header = stdout.splitlines()[0] if stdout.splitlines() else ""
     for column in ("ID", "ATTACHED", "INPUT", "HOST", "VERSION"):
@@ -3645,7 +3656,7 @@ def run_env_config_client_test(tmp_root):
     (config_dir / "sessh.env").write_text("scrollback-limit=80\ninitial-scrollback=0\n")
 
     try:
-        pid, fd = spawn_client(env, ["--alias", "s1"])
+        pid, fd = spawn_client(env, [])
         try:
             read_until(fd, b"$ ")
             os.write(
@@ -3658,7 +3669,10 @@ def run_env_config_client_test(tmp_root):
         finally:
             close_client(pid, fd)
 
-        wait_log_contains(agent_log_file(env, "s1"), "scrollback_rows=80")
+        first_session = single_jsonl_session(env)
+        first_id = first_session["id"]
+        first_guid = first_session["guid"]
+        wait_log_contains(agent_log_file(env, first_guid), "scrollback_rows=80")
 
         pid, fd = spawn_client(env, ["attach"])
         try:
@@ -3671,12 +3685,12 @@ def run_env_config_client_test(tmp_root):
         finally:
             close_client(pid, fd)
 
-        killed = run([".", "kill", "s1"], env, check=True, timeout=5.0)
-        if "ENDED s1" not in killed.stdout:
+        killed = run([".", "kill", first_id], env, check=True, timeout=5.0)
+        if f"ENDED {first_id}" not in killed.stdout:
             raise AssertionError(killed.stdout)
 
         (config_dir / "sessh.env").write_text("")
-        pid, fd = spawn_client(env, ["--alias", "s2"])
+        pid, fd = spawn_client(env, [])
         try:
             read_until(fd, b"$ ")
             send_escape_detach(fd)
@@ -3684,8 +3698,10 @@ def run_env_config_client_test(tmp_root):
         finally:
             close_client(pid, fd)
 
-        killed = run([".", "kill", "s2"], env, check=True, timeout=5.0)
-        if "ENDED s2" not in killed.stdout:
+        second_session = single_jsonl_session(env)
+        second_id = second_session["id"]
+        killed = run([".", "kill", second_id], env, check=True, timeout=5.0)
+        if f"ENDED {second_id}" not in killed.stdout:
             raise AssertionError(killed.stdout)
     finally:
         cleanup_runtime(env)
@@ -3698,7 +3714,7 @@ def run_tty_transcript_capture_test(tmp_root):
 
     archive = Path(tmp_root) / "tty-transcript.tar.gz"
     try:
-        pid, fd = spawn_client(env, ["--alias", "s1", "--capture-tty-transcript", str(archive)])
+        pid, fd = spawn_client(env, ["--capture-tty-transcript", str(archive)])
         try:
             startup = read_until(fd, b"$ ")
             if b"WARNING: tty transcript capture is enabled" not in startup:
@@ -3743,8 +3759,9 @@ def run_tty_transcript_capture_test(tmp_root):
         if b"transcript_inner_marker" not in inner_out:
             raise AssertionError(inner_out)
 
-        killed = run([".", "kill", "s1"], env, check=True, timeout=5.0)
-        if "ENDED s1" not in killed.stdout:
+        session = single_jsonl_session(env)
+        killed = run([".", "kill", session["id"]], env, check=True, timeout=5.0)
+        if f"ENDED {session['id']}" not in killed.stdout:
             raise AssertionError(killed.stdout)
     finally:
         cleanup_runtime(env)
@@ -3760,7 +3777,7 @@ def run_initial_kitty_keyboard_restore_test(tmp_root):
     previous_response = kitty_keyboard_status_response
     kitty_keyboard_status_response = b"\x1b[?7u"
     try:
-        pid, fd = spawn_client(env, ["--alias", "s1"])
+        pid, fd = spawn_client(env, [])
         try:
             read_until(fd, b"$ ")
             send_escape_detach(fd)
@@ -3915,8 +3932,9 @@ def main():
             listed = run([".", "list"], env, check=True, timeout=5.0)
             assert_list_header(listed.stdout)
 
-            missing = run([".", "kill", "s1"], env, timeout=5.0)
-            if missing.returncode != 1 or "ERROR s1 not found" not in missing.stderr:
+            missing_id = test_session_id(1)
+            missing = run([".", "kill", missing_id], env, timeout=5.0)
+            if missing.returncode != 1 or f"ERROR {missing_id} not found" not in missing.stderr:
                 raise AssertionError(missing)
 
             bad = run([".", "--scrollback-limit", "0"], env, timeout=5.0)
@@ -3974,13 +3992,14 @@ def main():
             listed = run([".", "list"], env, check=True, timeout=5.0)
             assert_list_header(listed.stdout)
 
-            remote_guid = guid_for_ref("s7")
-            write_cached_remote_route(env, "remote8", "example.com", remote_guid)
+            remote_guid = test_session_guid(7)
+            remote_id = test_session_id(7)
+            write_cached_remote_route(env, remote_guid, "example.com")
             listed = run(["list"], env, check=True, timeout=5.0)
             if "cached remote session status may be out of date" not in listed.stderr:
                 raise AssertionError(listed)
             current_sessions = sessions(listed.stdout)
-            remote_route = current_sessions.get("remote8")
+            remote_route = current_sessions.get(remote_id)
             if remote_route is None:
                 raise AssertionError(listed.stdout)
             if (
@@ -3993,7 +4012,7 @@ def main():
             listed_jsonl = run(["list", "--jsonl"], env, check=True, timeout=5.0)
             if "cached remote session status may be out of date" not in listed_jsonl.stderr:
                 raise AssertionError(listed_jsonl)
-            jsonl_route = jsonl_sessions(listed_jsonl.stdout).get("remote8")
+            jsonl_route = jsonl_sessions(listed_jsonl.stdout).get(remote_id)
             if jsonl_route != {
                 "host": "example.com",
                 "version": "cached-test",
@@ -4005,10 +4024,10 @@ def main():
             listed = run(["list", "."], env, check=True, timeout=5.0)
             if listed.stderr:
                 raise AssertionError(listed)
-            if "remote8" in sessions(listed.stdout):
+            if remote_id in sessions(listed.stdout):
                 raise AssertionError(listed.stdout)
 
-            pid, fd = spawn_client(env, ["--alias", "s1"])
+            pid, fd = spawn_client(env, [])
             try:
                 read_until(fd, b"$ ")
                 os.write(fd, b"echo TERM=$TERM\n")
@@ -4027,14 +4046,17 @@ def main():
             listed = run([".", "list"], env, check=True, timeout=5.0)
             assert_list_header(listed.stdout)
             current_sessions = sessions(listed.stdout)
-            if "s1" not in current_sessions:
+            first_session = single_jsonl_session(env)
+            first_id = first_session["id"]
+            first_guid = first_session["guid"]
+            if first_id not in current_sessions:
                 raise AssertionError(listed.stdout)
-            if current_sessions["s1"].get("version") != sessh_version():
+            if current_sessions[first_id].get("version") != sessh_version():
                 raise AssertionError(listed.stdout)
-            route_text = route_file(env, "s1").read_text()
+            route_text = route_file(env, first_guid).read_text()
             route = json.loads(route_text)
             if (
-                route.get("session_dir") != str(session_dir(env, "s1"))
+                route.get("session_dir") != str(session_dir(env, first_guid))
                 or route.get("host") != "."
                 or route.get("agent_version") != sessh_version()
             ):
@@ -4059,7 +4081,7 @@ def main():
             config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
             config_dir.mkdir(parents=True, exist_ok=True)
             (config_dir / "sessh.env").write_text("scrollback-limit=7\n")
-            pid, fd = spawn_client(env, ["--alias", "s2"])
+            pid, fd = spawn_client(env, [])
             try:
                 read_until(fd, b"$ ")
                 send_escape_detach(fd)
@@ -4068,22 +4090,24 @@ def main():
 
             listed = run([".", "list"], env, check=True, timeout=5.0)
             current_sessions = sessions(listed.stdout)
-            if "s2" not in current_sessions:
+            second_session = single_jsonl_session(env)
+            second_id = second_session["id"]
+            if second_id not in current_sessions:
                 raise AssertionError(listed.stdout)
 
-            killed = run([".", "kill", "s2"], env, check=True, timeout=5.0)
-            if "ENDED s2" not in killed.stdout:
+            killed = run([".", "kill", second_id], env, check=True, timeout=5.0)
+            if f"ENDED {second_id}" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
             listed = run([".", "list"], env, check=True, timeout=5.0)
-            if "s2" in sessions(listed.stdout):
+            if second_id in sessions(listed.stdout):
                 raise AssertionError(listed.stdout)
 
             missing = run([".", "kill", "missing"], env, timeout=5.0)
             if missing.returncode != 1 or "ERROR missing not found" not in missing.stderr:
                 raise AssertionError(missing)
 
-            pid, fd = spawn_client(env, ["--alias", "s3"])
+            pid, fd = spawn_client(env, [])
             try:
                 read_until(fd, b"$ ")
                 send_escape_detach(fd)
@@ -4092,12 +4116,14 @@ def main():
 
             listed = run([".", "list"], env, check=True, timeout=5.0)
             current_sessions = sessions(listed.stdout)
-            if "s3" not in current_sessions:
+            third_session = single_jsonl_session(env)
+            third_id = third_session["id"]
+            if third_id not in current_sessions:
                 raise AssertionError(listed.stdout)
 
             changed_runtime_env = dict(env)
             changed_runtime_env["XDG_RUNTIME_DIR"] = str(Path(tmp) / "changed-runtime")
-            pid, fd = spawn_bin(changed_runtime_env, ["attach", "s3"])
+            pid, fd = spawn_bin(changed_runtime_env, ["attach", third_id])
             try:
                 read_until(fd, b"$ ")
                 os.write(fd, b"echo sessh_runtime_route_attach\n")
@@ -4106,16 +4132,18 @@ def main():
             finally:
                 close_client(pid, fd)
 
-            killed = run(["kill", "s3"], changed_runtime_env, check=True, timeout=5.0)
-            if "ENDED s3" not in killed.stdout:
+            killed = run(["kill", third_id], changed_runtime_env, check=True, timeout=5.0)
+            if f"ENDED {third_id}" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
-            pid, fd = spawn_client(env, ["--alias", "s4"])
+            pid, fd = spawn_client(env, [])
             try:
                 read_until(fd, b"$ ")
+                fourth_session = single_jsonl_session(env)
+                fourth_id = fourth_session["id"]
                 os.write(fd, b"echo sessh_before_sever\n")
                 read_until_count(fd, b"sessh_before_sever", 2)
-                severed = run([".", "debug", "sever-connection", "--last-input", "s4"], env, check=True, timeout=5.0)
+                severed = run([".", "debug", "sever-connection", "--last-input", fourth_id], env, check=True, timeout=5.0)
                 if "SEVERED" not in severed.stdout:
                     raise AssertionError(severed.stdout)
                 read_until(fd, b"sessh: disconnected: Reconnecting")
@@ -4127,19 +4155,21 @@ def main():
             finally:
                 close_client(pid, fd)
 
-            killed = run([".", "kill", "s4"], env, check=True, timeout=5.0)
-            if "ENDED s4" not in killed.stdout:
+            killed = run([".", "kill", fourth_id], env, check=True, timeout=5.0)
+            if f"ENDED {fourth_id}" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
-            pid1, fd1 = spawn_client(env, ["--alias", "s5"])
+            pid1, fd1 = spawn_client(env, [])
             try:
                 read_until(fd1, b"$ ")
                 listed = run([".", "list"], env, check=True, timeout=5.0)
                 current_sessions = sessions(listed.stdout)
-                if "s5" not in current_sessions:
+                fifth_session = single_jsonl_session(env)
+                fifth_id = fifth_session["id"]
+                if fifth_id not in current_sessions:
                     raise AssertionError(listed.stdout)
 
-                pid2, fd2 = spawn_client(env, ["attach", "s5"])
+                pid2, fd2 = spawn_client(env, ["attach", fifth_id])
                 try:
                     read_until(fd2, b"$ ")
                     os.write(fd2, b"echo sessh_multi_from_second\n")
@@ -4153,14 +4183,17 @@ def main():
             finally:
                 close_client(pid1, fd1)
 
-            killed = run([".", "kill", "s5"], env, check=True, timeout=5.0)
-            if "ENDED s5" not in killed.stdout:
+            killed = run([".", "kill", fifth_id], env, check=True, timeout=5.0)
+            if f"ENDED {fifth_id}" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
             drain_done = Path(env["XDG_RUNTIME_DIR"]) / "detached_drain_done"
-            pid, fd = spawn_client(env, ["--alias", "s6"])
+            pid, fd = spawn_client(env, [])
             try:
                 read_until(fd, b"$ ")
+                sixth_session = single_jsonl_session(env)
+                sixth_id = sixth_session["id"]
+                sixth_guid = sixth_session["guid"]
                 os.write(
                     fd,
                     b"python3 -c 'import os,sys; sys.stdout.write(\"x\"*200000); sys.stdout.flush(); open(os.environ[\"XDG_RUNTIME_DIR\"]+\"/detached_drain_done\",\"w\").write(\"done\")'\n",
@@ -4173,9 +4206,9 @@ def main():
                 close_client(pid, fd)
             wait_file(drain_done)
 
-            log_path = agent_log_file(env, "s6")
-            killed = run([".", "kill", "s6"], env, check=True, timeout=5.0)
-            if "ENDED s6" not in killed.stdout:
+            log_path = agent_log_file(env, sixth_guid)
+            killed = run([".", "kill", sixth_id], env, check=True, timeout=5.0)
+            if f"ENDED {sixth_id}" not in killed.stdout:
                 raise AssertionError(killed.stdout)
 
             log_text = wait_log_contains(log_path, "event=session_agent_stop")

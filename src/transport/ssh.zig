@@ -28,7 +28,7 @@ const max_artifact_manifest_bytes = 16 * 1024;
 const artifact_manifest_filename = "artifacts.manifest";
 const default_ipqos_option_prefix = "-oIPQoS=";
 const ssh_config_query_max_output_bytes = 256 * 1024;
-const client_list_target_help = "incoming, outgoing, session, or a guid/alias";
+const client_list_target_help = "incoming, outgoing, session, or a guid";
 const bootstrap_exec_encoded_arg_prefix = "b64:";
 
 const BootstrapEntrypoint = enum {
@@ -197,7 +197,6 @@ pub const SessionInvocation = struct {
     command_argv: []const []const u8 = &.{},
     shell_command_args: []const []const u8 = &.{},
     tty_request: SshTtyRequest = .none,
-    alias: ?[]const u8 = null,
     banner_args: client.DetachBannerArgs = .{},
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     scrollback_row_count_set: bool = false,
@@ -656,7 +655,6 @@ pub fn runInvocation(
         return client.runLocalNewSession(allocator, .{
             .exe = args[0],
             .new_detached = parsed_ssh_args.new_detached,
-            .alias = parsed_ssh_args.alias,
             .scrollback_row_count = parsed_ssh_args.scrollback_row_count,
             .banner_args = parsed_ssh_args.banner_args.slice(),
             .capture_tty_transcript = parsed_ssh_args.capture_tty_transcript,
@@ -814,15 +812,8 @@ pub fn runInvocation(
 
     var new_guid: ?[]u8 = null;
     defer if (new_guid) |guid| allocator.free(guid);
-    var new_alias: ?[]u8 = null;
-    defer if (new_alias) |alias| allocator.free(alias);
     if (parsed_ssh_args.action == .new) {
         new_guid = try session_registry.generateGuid(allocator);
-        if (parsed_ssh_args.alias) |alias| {
-            new_alias = try allocator.dupe(u8, alias);
-        } else {
-            new_alias = try allocator.dupe(u8, "");
-        }
     }
 
     var child = try startRuntimeConnection(
@@ -845,7 +836,6 @@ pub fn runInvocation(
             child.child.stdin.?.handle,
             parsed_ssh_args.scrollback_row_count,
             new_guid.?,
-            new_alias.?,
             parsed_ssh_args.command_argv,
             shell_command,
             parsed_ssh_args.host,
@@ -891,7 +881,6 @@ pub fn runInvocation(
             child.child.stdin.?.handle,
             parsed_ssh_args.scrollback_row_count,
             new_guid.?,
-            new_alias.?,
             parsed_ssh_args.command_argv,
             shell_command,
             parsed_ssh_args.host,
@@ -1653,6 +1642,32 @@ pub fn remoteCompatCommandScriptFor(
         \\  fi
         \\  printf '%s\n' "$1"
         \\}}
+        \\resolve_session_prefix() {{
+        \\  prefix=$(printf '%s' "$1" | tr 'ABCDEF' 'abcdef')
+        \\  match=
+        \\  for base in "$runtime_root" "$state_root"; do
+        \\    [ -n "$base" ] || continue
+        \\    for dir in "$base"/guid/s-*; do
+        \\      [ -d "$dir" ] || continue
+        \\      name=$(basename "$dir")
+        \\      compact=$(compact_session_id "$name" | tr 'ABCDEF' 'abcdef')
+        \\      case "$compact" in
+        \\        "$prefix"*) ;;
+        \\        *) continue ;;
+        \\      esac
+        \\      if [ -n "$match" ] && [ "$match" != "$name" ]; then
+        \\        printf 'sesshmux: session id is ambiguous\n' >&2
+        \\        exit 1
+        \\      fi
+        \\      match=$name
+        \\    done
+        \\  done
+        \\  if [ -n "$match" ]; then
+        \\    printf '%s\n' "$match"
+        \\    return
+        \\  fi
+        \\  canonical_session_id "$1"
+        \\}}
         \\resolve_session_ref() {{
         \\  ref=$1
         \\  compact=$(compact_session_id "$ref")
@@ -1662,23 +1677,15 @@ pub fn remoteCompatCommandScriptFor(
         \\      *) canonical_session_id "$compact"; return ;;
         \\    esac
         \\  fi
+        \\  if [ ${{#compact}} -gt 0 ] && [ ${{#compact}} -lt 32 ]; then
+        \\    case "$compact" in
+        \\      *[!0123456789abcdefABCDEF]*) ;;
+        \\      *) resolve_session_prefix "$compact"; return ;;
+        \\    esac
+        \\  fi
         \\  case "$ref" in
         \\    ""|/*|*/*|.|..) canonical_session_id "$compact"; return ;;
         \\  esac
-        \\  if [ -n "$state_root" ]; then
-        \\    alias_path=$state_root/alias/$ref
-        \\    if [ -L "$alias_path" ]; then
-        \\      target=$(readlink "$alias_path") || exit 1
-        \\      canonical_session_id "$(basename "$target")"
-        \\      return
-        \\    fi
-        \\  fi
-        \\  alias_path=$runtime_root/alias/$ref
-        \\  if [ -L "$alias_path" ]; then
-        \\    target=$(readlink "$alias_path") || exit 1
-        \\    canonical_session_id "$(basename "$target")"
-        \\    return
-        \\  fi
         \\  canonical_session_id "$compact"
         \\}}
         \\find_latest_session_id() {{
@@ -1748,7 +1755,7 @@ pub fn remoteCompatCommandScriptFor(
         \\case "$compat_action" in
         \\  force-compat)
         \\    if [ -z "$compat_session_id" ]; then
-        \\      printf 'sesshmux: force-compat requires a session id or alias\n' >&2
+        \\      printf 'sesshmux: force-compat requires a session id\n' >&2
         \\      exit 64
         \\    fi
         \\    compat_session_id=$(resolve_session_ref "$compat_session_id")
@@ -4217,12 +4224,6 @@ fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: 
             try parsed.banner_args.append(arg);
             try parsed.banner_args.append(args[index.*]);
             index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--alias")) {
-            index.* += 1;
-            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingAlias;
-            if (!session_registry.isValidCustomAlias(args[index.*])) return error.InvalidAlias;
-            parsed.alias = args[index.*];
-            index.* += 1;
         } else if (std.mem.eql(u8, arg, "--terminal-emulator")) {
             parsed.terminal_emulator = true;
             parsed.terminal_emulator_set = true;
@@ -4261,7 +4262,6 @@ fn isSesshLongOption(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
-        std.mem.eql(u8, arg, "--alias") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
         std.mem.eql(u8, arg, "--terminal-emulator") or
@@ -4514,7 +4514,6 @@ pub fn printSshArgError(err: anyerror) !void {
         error.MissingAttachId => try io.writeAll(2, "sesshmux: attach requires an id in this form\n"),
         error.MissingKillTarget => try io.writeAll(2, "sesshmux: kill requires --all, a guid, or --current\n"),
         error.MissingKillId => try io.writeAll(2, "sesshmux: kill requires an id\n"),
-        error.MissingAlias => try io.writeAll(2, "sessh: --alias requires a value\n"),
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),
         error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
@@ -4535,7 +4534,6 @@ pub fn printSshArgError(err: anyerror) !void {
         error.InvalidInitialScrollback => try io.writeAll(2, "sessh: invalid initial scrollback\n"),
         error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
         error.InvalidFilterLevel => try io.writeAll(2, "sessh: invalid filter level; expected one of: raw, unhygienic, hygienic, emulated\n"),
-        error.InvalidAlias => try io.writeAll(2, "sessh: invalid alias\n"),
         error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
         error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands require -t or -tt for persistent sessions\n"),
         error.UnsafeSshOption => try io.writeAll(2, "sessh: ssh option is not safe for sessh transport\n"),
@@ -5079,8 +5077,6 @@ test "parseSshArgs passes through ssh options before host" {
 test "parseSshArgs accepts public sessh options before ssh options and host" {
     const parsed = try parseSshArgs(std.testing.allocator, &.{
         "sessh",
-        "--alias",
-        "work",
         "--log-level",
         "debug",
         "-F",
@@ -5089,7 +5085,6 @@ test "parseSshArgs accepts public sessh options before ssh options and host" {
     }, .{});
 
     try std.testing.expectEqualStrings("example.com", parsed.host);
-    try std.testing.expectEqualStrings("work", parsed.alias.?);
     try std.testing.expectEqual(client_log.Level.debug, parsed.client_log_level);
     try std.testing.expectEqual(@as(usize, 2), parsed.options.len);
     try std.testing.expectEqualStrings("-F", parsed.options[0]);
@@ -5127,7 +5122,7 @@ test "parseSshArgs treats every direct post-host token as remote command" {
         "rsync",
         "--version",
         "--no-terminal-emulator",
-        "--alias",
+        "--remote-name",
         "work",
         "-t",
     }, .{});
@@ -5135,8 +5130,7 @@ test "parseSshArgs treats every direct post-host token as remote command" {
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqual(SessionAction.new, parsed.action);
     try std.testing.expect(!parsed.terminal_emulator_set);
-    try std.testing.expectEqual(@as(?[]const u8, null), parsed.alias);
-    try expectArgvEqual(&.{ "rsync", "--version", "--no-terminal-emulator", "--alias", "work", "-t" }, parsed.shell_command_args);
+    try expectArgvEqual(&.{ "rsync", "--version", "--no-terminal-emulator", "--remote-name", "work", "-t" }, parsed.shell_command_args);
 }
 
 test "parseSshArgs rejects config-only sessh options on direct ssh transport" {
@@ -5743,21 +5737,6 @@ test "proxy diagnostics plan disables ctrl-r when visible ssh is not wrapped" {
     try std.testing.expect(plan.use_client_socket);
     try std.testing.expect(!plan.wrap_visible_ssh);
     try std.testing.expect(!plan.client_ctrl_r);
-}
-
-test "parseSshArgs rejects custom aliases with reserved typed prefix shape" {
-    try std.testing.expectError(error.InvalidAlias, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "--alias",
-        "s-deadbeef",
-        "example.com",
-    }, .{}));
-    try std.testing.expectError(error.InvalidAlias, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "--alias",
-        "x-anything",
-        "example.com",
-    }, .{}));
 }
 
 fn expectArgvEqual(expected: []const []const u8, actual: []const []const u8) !void {

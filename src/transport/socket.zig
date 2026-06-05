@@ -23,7 +23,7 @@ fn runtimeRootForXdg(allocator: std.mem.Allocator, xdg_runtime_dir: []const u8) 
     return allocator.dupe(u8, xdg_runtime_dir);
 }
 
-/// Persistent client-side registry for aliases and remote routes.
+/// Persistent client-side registry for remote routes.
 pub fn stateRoot(allocator: std.mem.Allocator) ![]u8 {
     if (c.getenv("XDG_STATE_HOME")) |state_z| {
         const state = std.mem.span(state_z);

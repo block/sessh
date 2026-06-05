@@ -131,7 +131,6 @@ pub const JsonExitStatus = struct {
 pub fn writeExitedJsonlRow(
     writer: anytype,
     id: []const u8,
-    aliases: []const []const u8,
     host: []const u8,
     version: []const u8,
     guid: []const u8,
@@ -141,12 +140,7 @@ pub fn writeExitedJsonlRow(
 ) !void {
     try writer.writeAll("{\"id\":");
     try writeJsonString(writer, id);
-    try writer.writeAll(",\"aliases\":[");
-    for (aliases, 0..) |alias, i| {
-        if (i > 0) try writer.writeAll(",");
-        try writeJsonString(writer, alias);
-    }
-    try writer.writeAll("],\"host\":");
+    try writer.writeAll(",\"host\":");
     try writeJsonString(writer, host);
     try writer.writeAll(",\"version\":");
     try writeJsonString(writer, version);
@@ -259,7 +253,6 @@ test "writeExitedJsonlRow writes tombstone fields" {
     try writeExitedJsonlRow(
         out.writer(std.testing.allocator),
         "s1",
-        &.{ "s1", "old" },
         "work\\host",
         "0.5\nx",
         "s-guid",
@@ -268,7 +261,7 @@ test "writeExitedJsonlRow writes tombstone fields" {
         .{ .kind = "exited", .status = 7 },
     );
     try std.testing.expectEqualStrings(
-        "{\"id\":\"s1\",\"aliases\":[\"s1\",\"old\"],\"host\":\"work\\\\host\",\"version\":\"0.5\\nx\",\"guid\":\"s-guid\",\"ended_at_unix_ms\":1234,\"end_reason\":\"process_exited\",\"exit_status\":{\"kind\":\"exited\",\"status\":7}}\n",
+        "{\"id\":\"s1\",\"host\":\"work\\\\host\",\"version\":\"0.5\\nx\",\"guid\":\"s-guid\",\"ended_at_unix_ms\":1234,\"end_reason\":\"process_exited\",\"exit_status\":{\"kind\":\"exited\",\"status\":7}}\n",
         out.items,
     );
 }

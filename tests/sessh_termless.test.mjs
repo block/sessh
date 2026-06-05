@@ -105,7 +105,7 @@ test("sessh initial-scrollback=0 attach clears stale outer row tails", async () 
 
   try {
     starter = createTestTerminal({ cols: 40, rows: 8 });
-    await starter.spawn(sesshmuxArgs("new", "--alias", "stale-tail", "."), {
+    await starter.spawn(sesshmuxArgs("new", "."), {
       cwd: REPO_ROOT,
       env,
     });
@@ -117,7 +117,7 @@ test("sessh initial-scrollback=0 attach clears stale outer row tails", async () 
 
     attach = createTestTerminal({ cols: 40, rows: 8 });
     attach.feed(staleVisibleRows(8));
-    await attach.spawn(sesshmuxArgs("attach", "--host", ".", "stale-tail"), {
+    await attach.spawn(sesshmuxArgs("attach", "--host", "."), {
       cwd: REPO_ROOT,
       env,
     });

@@ -255,9 +255,6 @@ message TeSessionCreate {
   // Canonical session GUID in s-prefixed hyphenated UUID form, e.g.
   // s-550e8400-e29b-41d4-a716-446655440000.
   string session_guid = 5;
-  // Alias to register for this session in the session agent's namespace. Empty
-  // asks the receiver to generate an alias.
-  string session_alias = 6;
   // Deprecated wire-compatible field for older clients. It is illegal to set
   // both legacy_command_argv and command. New clients must use command instead.
   repeated string legacy_command_argv = 7;
@@ -285,8 +282,8 @@ message TeSessionCreate {
 // TeSessionAttached for the selected session, then TeDraw/TeRepaintResponse messages.
 message TeSessionAttach {
   TeResize resize = 1;
-  // Session GUID, compact session GUID, or alias. Empty means attach the most
-  // recent session known to the selected broker.
+  // Session GUID or compact session GUID. Empty means attach the most recent
+  // session known to the selected broker.
   string session_ref = 2;
   // When true, the session agent sends raw inner PTY transcript chunks for
   // this attachment. The client still owns archive creation and storage.
@@ -381,8 +378,6 @@ message TeClientDetachRequest {}
 message TeSessionCreated {
   // Canonical session GUID in s-prefixed hyphenated UUID form.
   string session_guid = 1;
-  // Alias registered for this session in the creating namespace.
-  string session_alias = 2;
   // Absolute path to this session's GUID directory
   string session_dir = 3;
 }
@@ -393,8 +388,6 @@ message TeSessionCreated {
 message TeSessionAttached {
   // Canonical session GUID in s-prefixed hyphenated UUID form.
   string session_guid = 1;
-  // Primary alias for this session in the attaching namespace, if known.
-  string session_alias = 2;
   // Absolute path to this session's GUID directory
   string session_dir = 3;
 }

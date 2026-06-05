@@ -370,6 +370,8 @@ def run_reconnect_probe(cmd, env, ready, after, sever_cmd, timeout=60.0):
         stderr=subprocess.PIPE,
     )
     stdout = read_until_pipe(proc, proc.stdout, ready.encode("utf-8"), timeout)
+    if callable(sever_cmd):
+        sever_cmd = sever_cmd()
     severed = run(sever_cmd, env=env, timeout=30.0, check=False)
     if severed.returncode != 0:
         proc.kill()
@@ -730,12 +732,16 @@ def first_session_id(list_stdout):
     raise AssertionError(f"no sessions in list output: {list_stdout!r}")
 
 
-def first_session_guid(jsonl_stdout):
+def first_session_row(jsonl_stdout):
     for line in jsonl_stdout.splitlines():
         if not line.strip():
             continue
-        return json.loads(line)["guid"]
+        return json.loads(line)
     raise AssertionError(f"no sessions in jsonl list output: {jsonl_stdout!r}")
+
+
+def first_session_guid(jsonl_stdout):
+    return first_session_row(jsonl_stdout)["guid"]
 
 
 def has_list_header(list_stdout):
@@ -1123,14 +1129,19 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         set_remote_login_shell(container, remote_shell)
         config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
         config_dir.mkdir(parents=True, exist_ok=True)
-        reconnect_alias = f"podman-reconnect-{arch}"
         ssh_options = f"-F {config}"
-        reconnected = run_reconnect_probe(
-            [str(prefix / "bin" / "sessh"), "--alias", reconnect_alias, "-F", str(config), host_alias],
-            env,
-            reconnect_marker,
-            f"after-reconnect-{arch}",
-            [
+
+        def reconnect_sever_cmd():
+            listed_jsonl = run(
+                [str(prefix / "bin" / "sesshmux"), "list", "--jsonl", "--ssh-options", ssh_options, host_alias],
+                env=env,
+                timeout=60.0,
+                check=False,
+            )
+            if listed_jsonl.returncode != 0:
+                raise AssertionError(listed_jsonl)
+            session_id = first_session_row(listed_jsonl.stdout)["id"]
+            return [
                 str(prefix / "bin" / "sesshmux"),
                 "debug",
                 "--ssh-options",
@@ -1138,10 +1149,17 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
                 "--host",
                 host_alias,
                 "--id",
-                reconnect_alias,
+                session_id,
                 "sever-connection",
                 "--all",
-            ],
+            ]
+
+        reconnected = run_reconnect_probe(
+            [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias],
+            env,
+            reconnect_marker,
+            f"after-reconnect-{arch}",
+            reconnect_sever_cmd,
             timeout=90.0,
         )
         if reconnected.returncode != 0:

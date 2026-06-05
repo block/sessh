@@ -13,7 +13,6 @@ pub fn baseInvocation(
         .options = options,
         .host = "",
         .action = action,
-        .alias = common.alias,
         .banner_args = common.banner_args,
         .scrollback_row_count = common.scrollback_row_count,
         .scrollback_row_count_set = common.scrollback_row_count_set,

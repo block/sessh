@@ -16,8 +16,7 @@ pub const session_guid_len = session_guid_prefix.len + guid_body_len;
 pub const client_guid_len = client_guid_prefix.len + guid_body_len;
 pub const proxy_guid_len = proxy_guid_prefix.len + guid_body_len;
 pub const host_guid_len = host_guid_prefix.len + guid_body_len;
-pub const generated_alias_hex_len = 8;
-pub const generated_alias_len = session_guid_prefix.len + generated_alias_hex_len;
+pub const short_guid_hex_len = 8;
 pub const default_pending_port = "22";
 
 pub const SessionPaths = struct {
@@ -72,17 +71,6 @@ pub const RuntimeAgentSocketPaths = struct {
         unlinkIfExists(self.agent_sock_link) catch {};
         unlinkIfExists(self.meta) catch {};
         removeDirIfEmpty(self.dir) catch {};
-    }
-};
-
-pub const GeneratedIdentity = struct {
-    guid: []u8,
-    alias: []u8,
-
-    pub fn deinit(self: *GeneratedIdentity, allocator: std.mem.Allocator) void {
-        allocator.free(self.alias);
-        allocator.free(self.guid);
-        self.* = undefined;
     }
 };
 
@@ -318,7 +306,7 @@ pub fn isValidCompactGuid(guid: []const u8) bool {
 }
 
 pub fn isValidSessionRef(ref: []const u8) bool {
-    return isValidSessionId(ref) or isValidSessionGuidPrefix(ref) or isValidAlias(ref);
+    return isValidSessionId(ref) or isValidSessionGuidPrefix(ref);
 }
 
 pub fn isValidSessionGuidPrefix(ref: []const u8) bool {
@@ -547,65 +535,6 @@ pub fn generateHostGuid(allocator: std.mem.Allocator) ![]u8 {
     return out;
 }
 
-pub fn generateGuidWithDefaultAlias(allocator: std.mem.Allocator) !GeneratedIdentity {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return generateGuidWithDefaultAliasInRoot(allocator, root);
-}
-
-pub fn generateGuidWithDefaultAliasInRoot(allocator: std.mem.Allocator, root: []const u8) !GeneratedIdentity {
-    var attempts: usize = 0;
-    while (attempts < 4096) : (attempts += 1) {
-        const guid = try generateGuid(allocator);
-        errdefer allocator.free(guid);
-        const alias = availableDefaultAliasForGuidInRoot(allocator, root, guid) catch |err| switch (err) {
-            error.AliasExists => {
-                allocator.free(guid);
-                continue;
-            },
-            else => return err,
-        };
-        return .{ .guid = guid, .alias = alias };
-    }
-    return error.DefaultAliasExhausted;
-}
-
-pub fn createDefaultAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return createDefaultAliasForGuidInRoot(allocator, root, guid);
-}
-
-pub fn createDefaultAliasForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
-    const alias = try defaultAliasForGuid(allocator, guid);
-    errdefer allocator.free(alias);
-    try ensureAliasForGuidInRoot(allocator, root, alias, guid);
-    return alias;
-}
-
-fn availableDefaultAliasForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
-    const alias = try defaultAliasForGuid(allocator, guid);
-    errdefer allocator.free(alias);
-    if (try aliasAvailableForGuidInRoot(allocator, root, alias, guid)) return alias;
-    return error.AliasExists;
-}
-
-fn generateGuidWithDefaultAliasFromCandidatesInRoot(allocator: std.mem.Allocator, root: []const u8, candidates: []const []const u8) !GeneratedIdentity {
-    for (candidates) |candidate| {
-        const guid = try canonicalGuid(allocator, candidate);
-        errdefer allocator.free(guid);
-        const alias = availableDefaultAliasForGuidInRoot(allocator, root, guid) catch |err| switch (err) {
-            error.AliasExists => {
-                allocator.free(guid);
-                continue;
-            },
-            else => return err,
-        };
-        return .{ .guid = guid, .alias = alias };
-    }
-    return error.DefaultAliasExhausted;
-}
-
 pub const Meta = struct {
     agent_pid: c.pid_t,
     version: []u8,
@@ -822,7 +751,6 @@ pub fn readMeta(allocator: std.mem.Allocator, paths: SessionPaths) !Meta {
 
 pub const Route = struct {
     guid: []u8,
-    primary_alias: []u8,
     session_dir: []u8,
     host_guid: []u8,
     host: []u8,
@@ -846,7 +774,6 @@ pub const Route = struct {
         allocator.free(self.host);
         allocator.free(self.host_guid);
         allocator.free(self.session_dir);
-        allocator.free(self.primary_alias);
         allocator.free(self.guid);
         self.* = undefined;
     }
@@ -878,8 +805,6 @@ pub const TombstoneDetails = struct {
 
 pub const Tombstone = struct {
     guid: []u8,
-    primary_alias: []u8,
-    aliases: []const []const u8,
     session_dir: []u8,
     host: []u8,
     agent_version: []u8,
@@ -889,11 +814,9 @@ pub const Tombstone = struct {
     exit_status: ?TombstoneExitStatus,
 
     pub fn deinit(self: *Tombstone, allocator: std.mem.Allocator) void {
-        freeStringArray(allocator, self.aliases);
         allocator.free(self.agent_version);
         allocator.free(self.host);
         allocator.free(self.session_dir);
-        allocator.free(self.primary_alias);
         allocator.free(self.guid);
         self.* = undefined;
     }
@@ -1030,7 +953,6 @@ pub fn tombstoneExitStatusKindFromName(value: []const u8) !TombstoneExitStatusKi
 pub fn writeSshRoute(
     allocator: std.mem.Allocator,
     guid: []const u8,
-    primary_alias: []const u8,
     session_dir: []const u8,
     host_guid: []const u8,
     host: []const u8,
@@ -1040,7 +962,7 @@ pub fn writeSshRoute(
     agent_version: []const u8,
     tombstone_retention_ms: u64,
 ) !void {
-    return writeRoute(allocator, guid, primary_alias, session_dir, host, ssh_options, .{
+    return writeRoute(allocator, guid, session_dir, host, ssh_options, .{
         .host_guid = host_guid,
         .port = port,
         .resolved_host = resolved_host,
@@ -1052,12 +974,11 @@ pub fn writeSshRoute(
 pub fn writeLocalRoute(
     allocator: std.mem.Allocator,
     guid: []const u8,
-    primary_alias: []const u8,
     session_dir: []const u8,
     agent_version: []const u8,
     tombstone_retention_ms: u64,
 ) !void {
-    return writeRoute(allocator, guid, primary_alias, session_dir, ".", &.{}, .{
+    return writeRoute(allocator, guid, session_dir, ".", &.{}, .{
         .agent_version = agent_version,
         .tombstone_retention_ms = tombstone_retention_ms,
     });
@@ -1079,7 +1000,6 @@ const RouteStatus = struct {
 fn writeRoute(
     allocator: std.mem.Allocator,
     guid: []const u8,
-    primary_alias: []const u8,
     session_dir: []const u8,
     host: []const u8,
     ssh_options: []const []const u8,
@@ -1100,10 +1020,9 @@ fn writeRoute(
     const resolved_host = if (status.resolved_host.len == 0) host else status.resolved_host;
     if (status.host_guid.len != 0 and !isValidHostGuid(status.host_guid)) return error.InvalidHostId;
     try writer.print(
-        "{{\"guid\":{f},\"primary_alias\":{f},\"session_dir\":{f},\"host_guid\":{f},\"host\":{f},\"resolved_host\":{f},\"port\":{f},\"agent_version\":{f},\"alive\":{},\"kill_requested\":{},\"tombstone_retention_ms\":{},\"attached_count\":",
+        "{{\"guid\":{f},\"session_dir\":{f},\"host_guid\":{f},\"host\":{f},\"resolved_host\":{f},\"port\":{f},\"agent_version\":{f},\"alive\":{},\"kill_requested\":{},\"tombstone_retention_ms\":{},\"attached_count\":",
         .{
             std.json.fmt(canonical, .{}),
-            std.json.fmt(primary_alias, .{}),
             std.json.fmt(session_dir, .{}),
             std.json.fmt(status.host_guid, .{}),
             std.json.fmt(host, .{}),
@@ -1163,7 +1082,6 @@ pub fn updateRouteStatus(allocator: std.mem.Allocator, guid: []const u8, last_kn
     try writeRoute(
         allocator,
         route.guid,
-        route.primary_alias,
         route.session_dir,
         route.host,
         route.ssh_options,
@@ -1188,7 +1106,6 @@ pub fn markRouteKillRequested(allocator: std.mem.Allocator, guid: []const u8) !v
     try writeRoute(
         allocator,
         route.guid,
-        route.primary_alias,
         route.session_dir,
         route.host,
         route.ssh_options,
@@ -1367,10 +1284,6 @@ fn writeTombstoneForRouteInRoot(allocator: std.mem.Allocator, root: []const u8, 
     const canonical = try canonicalGuid(allocator, route.guid);
     defer allocator.free(canonical);
 
-    const aliases = try aliasesForGuidInRoot(allocator, root, canonical);
-    defer freeStringArray(allocator, aliases);
-    const include_primary_alias = isValidAlias(route.primary_alias) and !aliasListContains(aliases, route.primary_alias);
-
     try ensureTombstoneDir(allocator, root);
     const path = try tombstonePathForGuidInRoot(allocator, root, canonical);
     defer allocator.free(path);
@@ -1383,23 +1296,9 @@ fn writeTombstoneForRouteInRoot(allocator: std.mem.Allocator, root: []const u8, 
     defer text.deinit(allocator);
     const writer = text.writer(allocator);
     try writer.print(
-        "{{\"guid\":{f},\"primary_alias\":{f},\"aliases\":[",
+        "{{\"guid\":{f},\"session_dir\":{f},\"host\":{f},\"agent_version\":{f},\"ended_at_unix_ms\":{},\"expires_at_unix_ms\":",
         .{
             std.json.fmt(canonical, .{}),
-            std.json.fmt(route.primary_alias, .{}),
-        },
-    );
-    for (aliases, 0..) |alias, i| {
-        if (i > 0) try writer.writeAll(",");
-        try writer.print("{f}", .{std.json.fmt(alias, .{})});
-    }
-    if (include_primary_alias) {
-        if (aliases.len > 0) try writer.writeAll(",");
-        try writer.print("{f}", .{std.json.fmt(route.primary_alias, .{})});
-    }
-    try writer.print(
-        "],\"session_dir\":{f},\"host\":{f},\"agent_version\":{f},\"ended_at_unix_ms\":{},\"expires_at_unix_ms\":",
-        .{
             std.json.fmt(route.session_dir, .{}),
             std.json.fmt(route.host, .{}),
             std.json.fmt(route.agent_version, .{}),
@@ -1427,14 +1326,6 @@ fn writeTombstoneForRouteInRoot(allocator: std.mem.Allocator, root: []const u8, 
     const route_path = try routePathForGuidInStateRoot(allocator, root, canonical);
     defer allocator.free(route_path);
     try unlinkIfExists(route_path);
-    try removeAliasesForGuidInRoot(allocator, root, canonical, aliases);
-}
-
-fn aliasListContains(aliases: []const []const u8, needle: []const u8) bool {
-    for (aliases) |alias| {
-        if (std.mem.eql(u8, alias, needle)) return true;
-    }
-    return false;
 }
 
 pub fn readTombstoneForRef(allocator: std.mem.Allocator, ref: []const u8) !Tombstone {
@@ -1466,17 +1357,6 @@ pub fn readTombstone(allocator: std.mem.Allocator, path: []const u8) !Tombstone 
     const guid = try allocator.dupe(u8, guid_value);
     errdefer allocator.free(guid);
 
-    const primary_alias_value = jsonOptionalString(object, "primary_alias") orelse "";
-    if (primary_alias_value.len > 0 and !isValidAlias(primary_alias_value)) return error.InvalidTombstone;
-    const primary_alias = try allocator.dupe(u8, primary_alias_value);
-    errdefer allocator.free(primary_alias);
-
-    const aliases = try jsonStringArrayField(allocator, object, "aliases");
-    errdefer freeStringArray(allocator, aliases);
-    for (aliases) |alias| {
-        if (!isValidAlias(alias)) return error.InvalidTombstone;
-    }
-
     const session_dir_value = jsonOptionalString(object, "session_dir") orelse "";
     if (session_dir_value.len > 0 and !isAbsolutePath(session_dir_value)) return error.InvalidTombstone;
     const session_dir = try allocator.dupe(u8, session_dir_value);
@@ -1495,8 +1375,6 @@ pub fn readTombstone(allocator: std.mem.Allocator, path: []const u8) !Tombstone 
 
     return .{
         .guid = guid,
-        .primary_alias = primary_alias,
-        .aliases = aliases,
         .session_dir = session_dir,
         .host = host,
         .agent_version = agent_version,
@@ -1545,7 +1423,6 @@ fn cleanupExpiredTombstonesInRoot(allocator: std.mem.Allocator, root: []const u8
         defer tombstone.deinit(allocator);
         const expires_at = tombstone.expires_at_unix_ms orelse continue;
         if (now_ms < expires_at) continue;
-        try removeRecordedAliasesForTombstoneInRoot(allocator, root, &tombstone);
         try unlinkIfExists(path);
     }
 }
@@ -2109,54 +1986,10 @@ fn ensureRouteDirForGuid(allocator: std.mem.Allocator, guid: []const u8) !void {
 
 fn resolveTombstoneRefToGuidInRoot(allocator: std.mem.Allocator, root: []const u8, ref: []const u8) ![]u8 {
     if (isValidSessionId(ref)) return canonicalGuid(allocator, ref);
-    if (isValidAlias(ref)) {
-        return resolveAliasToGuidInRoot(allocator, root, ref) catch |err| switch (err) {
-            error.FileNotFound => {
-                return findTombstoneGuidForAliasInRoot(allocator, root, ref) catch |alias_err| switch (alias_err) {
-                    error.FileNotFound => {
-                        if (compactGuidPrefix(ref, session_guid_prefix)) |prefix| {
-                            return resolveTombstoneGuidPrefixInRoot(allocator, root, prefix.slice());
-                        }
-                        return err;
-                    },
-                    else => return alias_err,
-                };
-            },
-            else => return err,
-        };
-    }
     if (compactGuidPrefix(ref, session_guid_prefix)) |prefix| {
         return resolveTombstoneGuidPrefixInRoot(allocator, root, prefix.slice());
     }
     return error.InvalidSessionId;
-}
-
-fn findTombstoneGuidForAliasInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8) ![]u8 {
-    const dir_path = try tombstonesDirInRoot(allocator, root);
-    defer allocator.free(dir_path);
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return error.FileNotFound,
-        else => return err,
-    };
-    defer dir.close();
-
-    var match: ?[]u8 = null;
-    errdefer if (match) |guid| allocator.free(guid);
-    var iterator = dir.iterate();
-    while (try iterator.next()) |entry| {
-        if (entry.kind != .file) continue;
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-        defer allocator.free(path);
-        var tombstone = readTombstone(allocator, path) catch continue;
-        defer tombstone.deinit(allocator);
-        for (tombstone.aliases) |candidate| {
-            if (!std.mem.eql(u8, candidate, alias)) continue;
-            if (match != null) return error.AmbiguousSessionId;
-            match = try allocator.dupe(u8, tombstone.guid);
-            break;
-        }
-    }
-    return match orelse error.FileNotFound;
 }
 
 fn resolveTombstoneGuidPrefixInRoot(allocator: std.mem.Allocator, root: []const u8, prefix: []const u8) ![]u8 {
@@ -2197,11 +2030,6 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
     const guid = try allocator.dupe(u8, guid_value);
     errdefer allocator.free(guid);
 
-    const primary_alias_value = try jsonRequiredString(object, "primary_alias");
-    if (!isValidAlias(primary_alias_value)) return error.InvalidRoute;
-    const primary_alias = try allocator.dupe(u8, primary_alias_value);
-    errdefer allocator.free(primary_alias);
-
     const session_dir_value = jsonOptionalString(object, "session_dir") orelse "";
     if (session_dir_value.len > 0 and !isAbsolutePath(session_dir_value)) return error.InvalidRoute;
     const session_dir = try allocator.dupe(u8, session_dir_value);
@@ -2236,7 +2064,6 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
 
     return .{
         .guid = guid,
-        .primary_alias = primary_alias,
         .session_dir = session_dir,
         .host_guid = host_guid,
         .host = host,
@@ -2618,116 +2445,6 @@ fn writeAtomicFile(path: []const u8, contents: []const u8) !void {
     }
 }
 
-pub fn createAlias(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !void {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return createAliasInRoot(allocator, root, alias, guid);
-}
-
-pub fn createAliasInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8, guid: []const u8) !void {
-    if (!isValidAlias(alias)) return error.InvalidAlias;
-    const aliases_dir = try aliasesDirInRoot(allocator, root);
-    defer allocator.free(aliases_dir);
-    try ensureRegistryRoot(allocator, root);
-    try mkdirIgnoreExists(allocator, aliases_dir);
-
-    const canonical = try canonicalGuid(allocator, guid);
-    defer allocator.free(canonical);
-    const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, alias });
-    defer allocator.free(link_path);
-    const target = try std.fmt.allocPrint(allocator, "../guid/{s}", .{canonical});
-    defer allocator.free(target);
-    const link_path_z = try allocator.dupeZ(u8, link_path);
-    defer allocator.free(link_path_z);
-    const target_z = try allocator.dupeZ(u8, target);
-    defer allocator.free(target_z);
-    switch (posix.errno(c.symlink(target_z.ptr, link_path_z.ptr))) {
-        .SUCCESS => return,
-        .EXIST => return error.AliasExists,
-        else => return error.SymlinkFailed,
-    }
-}
-
-pub fn ensureAliasForGuid(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !void {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return ensureAliasForGuidInRoot(allocator, root, alias, guid);
-}
-
-pub fn ensureAliasForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8, guid: []const u8) !void {
-    createAliasInRoot(allocator, root, alias, guid) catch |err| switch (err) {
-        error.AliasExists => {
-            const existing = try resolveRefToGuidInRoot(allocator, root, alias);
-            defer allocator.free(existing);
-            const canonical = try canonicalGuid(allocator, guid);
-            defer allocator.free(canonical);
-            if (!std.mem.eql(u8, existing, canonical)) return error.AliasExists;
-        },
-        else => return err,
-    };
-}
-
-pub fn aliasAvailableForGuid(allocator: std.mem.Allocator, alias: []const u8, guid: []const u8) !bool {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return aliasAvailableForGuidInRoot(allocator, root, alias, guid);
-}
-
-pub fn aliasAvailableForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8, guid: []const u8) !bool {
-    const existing = resolveRefToGuidInRoot(allocator, root, alias) catch |err| switch (err) {
-        error.FileNotFound => return true,
-        else => return err,
-    };
-    defer allocator.free(existing);
-    const canonical = try canonicalGuid(allocator, guid);
-    defer allocator.free(canonical);
-    return std.mem.eql(u8, existing, canonical);
-}
-
-pub fn removeAlias(allocator: std.mem.Allocator, alias: []const u8) !void {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return removeAliasInRoot(allocator, root, alias);
-}
-
-pub fn removeAliasInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8) !void {
-    if (!isValidAlias(alias)) return error.InvalidAlias;
-    const aliases_dir = try aliasesDirInRoot(allocator, root);
-    defer allocator.free(aliases_dir);
-    const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, alias });
-    defer allocator.free(link_path);
-    try unlinkIfExists(link_path);
-}
-
-fn removeRecordedAliasesForTombstoneInRoot(allocator: std.mem.Allocator, root: []const u8, tombstone: *const Tombstone) !void {
-    return removeAliasesForGuidInRoot(allocator, root, tombstone.guid, tombstone.aliases);
-}
-
-fn removeAliasesForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8, aliases: []const []const u8) !void {
-    for (aliases) |alias| {
-        const resolved = resolveRefToGuidInRoot(allocator, root, alias) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
-        };
-        defer allocator.free(resolved);
-        if (!std.mem.eql(u8, resolved, guid)) continue;
-        try removeAliasInRoot(allocator, root, alias);
-    }
-}
-
-pub fn defaultAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    return shortSessionGuid(allocator, guid);
-}
-
-fn defaultAliasForGuidLen(allocator: std.mem.Allocator, guid: []const u8, hex_len: usize) ![]u8 {
-    if (hex_len != generated_alias_hex_len) return error.InvalidAliasLength;
-    const canonical = try canonicalGuid(allocator, guid);
-    defer allocator.free(canonical);
-    const compact = try compactGuid(allocator, canonical);
-    defer allocator.free(compact);
-    return std.fmt.allocPrint(allocator, "s-{s}", .{compact[0..hex_len]});
-}
-
 pub fn shortSessionGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     return shortTypedGuid(allocator, guid, session_guid_prefix);
 }
@@ -2755,51 +2472,12 @@ fn shortTypedGuid(allocator: std.mem.Allocator, guid: []const u8, prefix: []cons
     else
         try compactClientGuid(allocator, guid);
     defer allocator.free(compact);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, compact[0..generated_alias_hex_len] });
-}
-
-pub fn createGeneratedRemoteAlias(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return createGeneratedRemoteAliasInRoot(allocator, root, guid);
-}
-
-pub fn createGeneratedRemoteAliasInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]u8 {
-    var attempts: usize = 0;
-    while (attempts < 4096) : (attempts += 1) {
-        var bytes: [16]u8 = undefined;
-        std.crypto.random.bytes(&bytes);
-        const hex = std.fmt.bytesToHex(bytes, .lower);
-        const alias = try std.fmt.allocPrint(allocator, "a-{s}", .{hex[0..generated_alias_hex_len]});
-        errdefer allocator.free(alias);
-        if (try createAliasCandidateInRoot(allocator, root, alias, guid)) return alias;
-        allocator.free(alias);
-    }
-    return error.GeneratedAliasExhausted;
-}
-
-fn createGeneratedAliasFromHexCandidatesInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8, candidates: []const []const u8) ![]u8 {
-    for (candidates) |candidate| {
-        if (candidate.len < generated_alias_hex_len) return error.InvalidAliasLength;
-        const alias = try std.fmt.allocPrint(allocator, "a-{s}", .{candidate[0..generated_alias_hex_len]});
-        errdefer allocator.free(alias);
-        if (try createAliasCandidateInRoot(allocator, root, alias, guid)) return alias;
-        allocator.free(alias);
-    }
-    return error.GeneratedAliasExhausted;
-}
-
-fn createAliasCandidateInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8, guid: []const u8) !bool {
-    createAliasInRoot(allocator, root, alias, guid) catch |err| switch (err) {
-        error.AliasExists => return false,
-        else => return err,
-    };
-    return true;
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, compact[0..short_guid_hex_len] });
 }
 
 pub fn pathsForRef(allocator: std.mem.Allocator, ref: []const u8) !SessionPaths {
     if (isValidSessionId(ref)) return pathsForSessionId(allocator, ref);
-    if (!isValidSessionGuidPrefix(ref) and !isValidAlias(ref)) return error.InvalidSessionId;
+    if (!isValidSessionGuidPrefix(ref)) return error.InvalidSessionId;
     const guid = try resolveRefToGuid(allocator, ref);
     defer allocator.free(guid);
     return pathsForSessionId(allocator, guid);
@@ -2813,32 +2491,10 @@ pub fn resolveRefToGuid(allocator: std.mem.Allocator, ref: []const u8) ![]u8 {
 
 pub fn resolveRefToGuidInRoot(allocator: std.mem.Allocator, root: []const u8, ref: []const u8) ![]u8 {
     if (isValidSessionId(ref)) return canonicalGuid(allocator, ref);
-    if (isValidAlias(ref)) {
-        return resolveAliasToGuidInRoot(allocator, root, ref) catch |err| switch (err) {
-            error.FileNotFound => {
-                if (compactGuidPrefix(ref, session_guid_prefix)) |prefix| {
-                    return resolveSessionGuidPrefixInRoot(allocator, root, prefix.slice());
-                }
-                return err;
-            },
-            else => return err,
-        };
-    }
     if (compactGuidPrefix(ref, session_guid_prefix)) |prefix| {
         return resolveSessionGuidPrefixInRoot(allocator, root, prefix.slice());
     }
     return error.InvalidSessionId;
-}
-
-fn resolveAliasToGuidInRoot(allocator: std.mem.Allocator, root: []const u8, alias: []const u8) ![]u8 {
-    const aliases_dir = try aliasesDirInRoot(allocator, root);
-    defer allocator.free(aliases_dir);
-    const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, alias });
-    defer allocator.free(link_path);
-    const target = try readLinkAlloc(allocator, link_path, 4096);
-    defer allocator.free(target);
-    const compact = std.fs.path.basename(target);
-    return canonicalGuid(allocator, compact);
 }
 
 fn resolveSessionGuidPrefixInRoot(allocator: std.mem.Allocator, root: []const u8, prefix: []const u8) ![]u8 {
@@ -2868,130 +2524,6 @@ fn resolveSessionGuidPrefixInRoot(allocator: std.mem.Allocator, root: []const u8
         match = try canonicalGuid(allocator, entry.name);
     }
     return match orelse error.FileNotFound;
-}
-
-pub fn aliasesDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/alias", .{root});
-}
-
-pub fn aliasesForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]const []const u8 {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return aliasesForGuidInRoot(allocator, root, guid);
-}
-
-fn aliasesForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) ![]const []const u8 {
-    const aliases_dir = try aliasesDirInRoot(allocator, root);
-    defer allocator.free(aliases_dir);
-    var dir = std.fs.openDirAbsolute(aliases_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return try allocator.alloc([]const u8, 0),
-        else => return err,
-    };
-    defer dir.close();
-
-    const canonical = try canonicalGuid(allocator, guid);
-    defer allocator.free(canonical);
-
-    var aliases: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (aliases.items) |alias| allocator.free(alias);
-        aliases.deinit(allocator);
-    }
-
-    var iterator = dir.iterate();
-    while (try iterator.next()) |entry| {
-        if (!isValidAlias(entry.name)) continue;
-        const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, entry.name });
-        defer allocator.free(link_path);
-        const target = readLinkAlloc(allocator, link_path, 4096) catch continue;
-        defer allocator.free(target);
-        const target_guid = canonicalGuid(allocator, std.fs.path.basename(target)) catch continue;
-        defer allocator.free(target_guid);
-        if (!std.mem.eql(u8, target_guid, canonical)) continue;
-        try aliases.append(allocator, try allocator.dupe(u8, entry.name));
-    }
-    std.mem.sort([]const u8, aliases.items, {}, stringSliceLessThan);
-    return aliases.toOwnedSlice(allocator);
-}
-
-fn stringSliceLessThan(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
-}
-
-pub fn primaryAliasForGuid(allocator: std.mem.Allocator, guid: []const u8) !?[]u8 {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    const aliases_dir = try aliasesDirInRoot(allocator, root);
-    defer allocator.free(aliases_dir);
-    var dir = std.fs.openDirAbsolute(aliases_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer dir.close();
-
-    const canonical = try canonicalGuid(allocator, guid);
-    defer allocator.free(canonical);
-
-    var iterator = dir.iterate();
-    while (try iterator.next()) |entry| {
-        if (!isValidAlias(entry.name)) continue;
-        const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ aliases_dir, entry.name });
-        defer allocator.free(link_path);
-        const target = readLinkAlloc(allocator, link_path, 4096) catch continue;
-        defer allocator.free(target);
-        const target_guid = canonicalGuid(allocator, std.fs.path.basename(target)) catch continue;
-        defer allocator.free(target_guid);
-        if (std.mem.eql(u8, target_guid, canonical)) {
-            return try allocator.dupe(u8, entry.name);
-        }
-    }
-    return null;
-}
-
-pub fn isValidAlias(alias: []const u8) bool {
-    if (alias.len == 0 or alias.len > 128) return false;
-    if (std.mem.eql(u8, alias, ".") or std.mem.eql(u8, alias, "..")) return false;
-    if (alias[0] == '-') return false;
-    if (isValidGuidBody(alias) or
-        isValidGuid(alias) or
-        isValidCompactGuid(alias) or
-        isReservedGuidLikeAlias(alias)) return false;
-    if (alias.len >= 2 and alias[1] == '-' and !isValidGeneratedAlias(alias)) return false;
-    for (alias) |byte| {
-        switch (byte) {
-            'A'...'Z', 'a'...'z', '0'...'9', '_', '-', '.' => {},
-            else => return false,
-        }
-    }
-    return true;
-}
-
-pub fn isValidCustomAlias(alias: []const u8) bool {
-    if (!isValidAlias(alias)) return false;
-    if (alias[0] == '-') return false;
-    if (alias.len >= 2 and alias[1] == '-') return false;
-    return true;
-}
-
-fn isValidGeneratedAlias(alias: []const u8) bool {
-    if (std.mem.startsWith(u8, alias, "s-")) {
-        if (alias.len != generated_alias_len) return false;
-    } else if (std.mem.startsWith(u8, alias, "a-")) {
-        if (alias.len != generated_alias_len) return false;
-    } else {
-        return false;
-    }
-    for (alias[2..]) |byte| {
-        if (!std.ascii.isHex(byte)) return false;
-    }
-    return true;
-}
-
-fn isReservedGuidLikeAlias(alias: []const u8) bool {
-    if (alias.len < 3) return false;
-    if (!std.ascii.isAlphabetic(alias[0]) or alias[1] != '-') return false;
-    const body = alias[2..];
-    return isValidGuidBody(body) or isValidCompactGuid(body);
 }
 
 fn isAbsolutePath(path: []const u8) bool {
@@ -3181,7 +2713,7 @@ pub fn removeStaleHints(paths: SessionPaths) !void {
     try removeRuntimeSessionFiles(paths);
 }
 
-/// Clean shutdown removes runtime files. Durable routes/aliases live in the
+/// Clean shutdown removes runtime files. Durable routes live in the
 /// state directory, not in XDG_RUNTIME_DIR.
 pub fn removeEndedHints(paths: SessionPaths) !void {
     try removeRuntimeSessionFiles(paths);
@@ -3422,7 +2954,7 @@ test "outgoing proxy hints use proxy runtime metadata without stealing incoming 
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(dir));
 }
 
-test "validates session ids and aliases" {
+test "validates session ids and short typed prefixes" {
     try std.testing.expect(isValidSessionId("s-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(isValidSessionId("550e8400e29b41d4a716446655440000"));
     try std.testing.expect(isValidSessionGuid("s-550e8400-e29b-41d4-a716-446655440000"));
@@ -3443,94 +2975,10 @@ test "validates session ids and aliases" {
     try std.testing.expect(isValidSessionGuidPrefix("s-550e8400"));
     try std.testing.expect(isValidSessionGuidPrefix("s-550e8400-e"));
     try std.testing.expect(isValidClientGuidPrefix("c-550e8400"));
-    try std.testing.expect(isValidAlias("s1"));
-    try std.testing.expect(isValidAlias("my-awesome-session"));
-    try std.testing.expect(!isValidAlias("s-550e"));
-    try std.testing.expect(!isValidAlias("s-550e8"));
-    try std.testing.expect(isValidAlias("s-550e8400"));
-    try std.testing.expect(isValidAlias("a-550e8400"));
-    try std.testing.expect(!isValidAlias("a-550e8400a"));
-    try std.testing.expect(!isValidAlias("s-not-hex"));
-    try std.testing.expect(!isValidAlias("a-not-hex"));
-    try std.testing.expect(!isValidAlias("x-anything"));
-    try std.testing.expect(isValidCustomAlias("s1"));
-    try std.testing.expect(isValidCustomAlias("my-awesome-session"));
-    try std.testing.expect(!isValidCustomAlias("-bad"));
-    try std.testing.expect(!isValidCustomAlias("s-550e"));
-    try std.testing.expect(!isValidCustomAlias("a-550e8400"));
-    try std.testing.expect(!isValidCustomAlias("x-anything"));
-    try std.testing.expect(!isValidAlias("s-550e8400-e29b-41d4-a716-446655440000"));
-    try std.testing.expect(!isValidAlias("c-550e8400-e29b-41d4-a716-446655440000"));
-    try std.testing.expect(!isValidAlias("x-550e8400-e29b-41d4-a716-446655440000"));
-    try std.testing.expect(!isValidAlias("x-550e8400e29b41d4a716446655440000"));
-    try std.testing.expect(!isValidAlias("550e8400-e29b-41d4-a716-446655440000"));
-    try std.testing.expect(!isValidAlias("550e8400e29b41d4a716446655440000"));
-    try std.testing.expect(!isValidAlias("-bad"));
-    try std.testing.expect(!isValidAlias("bad/name"));
 
-    const default_alias = try defaultAliasForGuid(std.testing.allocator, "s-550e8400-e29b-41d4-a716-446655440000");
-    defer std.testing.allocator.free(default_alias);
-    try std.testing.expectEqualStrings("s-550e8400", default_alias);
-    try std.testing.expect(isValidAlias(default_alias));
-    try std.testing.expect(!isValidCustomAlias(default_alias));
-}
-
-test "default alias availability detects generated alias collisions" {
-    const allocator = std.testing.allocator;
-    const root = "zig-cache/session-registry-default-alias-test";
-    std.fs.cwd().deleteTree(root) catch {};
-    defer std.fs.cwd().deleteTree(root) catch {};
-
-    const first_guid = "s-550e0000-e29b-41d4-a716-446655440000";
-    const second_guid = "s-550e0000-e29b-41d4-a716-446655440001";
-    const alias = try defaultAliasForGuid(allocator, first_guid);
-    defer allocator.free(alias);
-    try std.testing.expectEqualStrings("s-550e0000", alias);
-    try createAliasInRoot(allocator, root, alias, first_guid);
-
-    try std.testing.expect(try aliasAvailableForGuidInRoot(allocator, root, alias, first_guid));
-    try std.testing.expect(!try aliasAvailableForGuidInRoot(allocator, root, alias, second_guid));
-}
-
-test "guid default alias generation retries colliding generated aliases" {
-    const allocator = std.testing.allocator;
-    const root = "zig-cache/session-registry-default-alias-retry-test";
-    std.fs.cwd().deleteTree(root) catch {};
-    defer std.fs.cwd().deleteTree(root) catch {};
-
-    const existing_guid = "s-550e1111-e29b-41d4-a716-446655440001";
-    try createAliasInRoot(allocator, root, "s-550e1111", existing_guid);
-
-    var identity = try generateGuidWithDefaultAliasFromCandidatesInRoot(allocator, root, &.{
-        "s-550e1111-e29b-41d4-a716-446655440000",
-        "s-550e2222-e29b-41d4-a716-446655440000",
-    });
-    defer identity.deinit(allocator);
-
-    try std.testing.expectEqualStrings("s-550e2222-e29b-41d4-a716-446655440000", identity.guid);
-    try std.testing.expectEqualStrings("s-550e2222", identity.alias);
-}
-
-test "random generated aliases retry collisions" {
-    const allocator = std.testing.allocator;
-    const root = "zig-cache/session-registry-generated-alias-retry-test";
-    std.fs.cwd().deleteTree(root) catch {};
-    defer std.fs.cwd().deleteTree(root) catch {};
-
-    const existing_guid = "s-11110000-e29b-41d4-a716-446655440000";
-    const new_guid = "s-22220000-e29b-41d4-a716-446655440000";
-    try createAliasInRoot(allocator, root, "a-deadbeef", existing_guid);
-
-    const alias = try createGeneratedAliasFromHexCandidatesInRoot(allocator, root, new_guid, &.{
-        "deadbeef000000000000000000000000",
-        "feed1234500000000000000000000000",
-    });
-    defer allocator.free(alias);
-
-    try std.testing.expectEqualStrings("a-feed1234", alias);
-    const resolved = try resolveRefToGuidInRoot(allocator, root, alias);
-    defer allocator.free(resolved);
-    try std.testing.expectEqualStrings(new_guid, resolved);
+    const short_session = try shortSessionGuid(std.testing.allocator, "s-550e8400-e29b-41d4-a716-446655440000");
+    defer std.testing.allocator.free(short_session);
+    try std.testing.expectEqualStrings("s-550e8400", short_session);
 }
 
 test "unique session guid prefixes resolve through state sessions" {
@@ -3588,7 +3036,7 @@ test "route json persists absolute session directories" {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     try text.writer(allocator).print(
-        "{{\"guid\":\"s-550e8400-e29b-41d4-a716-446655440000\",\"primary_alias\":\"s-550e8400\",\"session_dir\":{f},\"host\":\"work.example\",\"agent_version\":\"0.5.0-test\",\"alive\":true,\"attached_count\":2,\"last_input_at_unix_ms\":1234,\"ssh_options\":[\"-F\"]}}\n",
+        "{{\"guid\":\"s-550e8400-e29b-41d4-a716-446655440000\",\"session_dir\":{f},\"host\":\"work.example\",\"agent_version\":\"0.5.0-test\",\"alive\":true,\"attached_count\":2,\"last_input_at_unix_ms\":1234,\"ssh_options\":[\"-F\"]}}\n",
         .{std.json.fmt(session_dir, .{})},
     );
     const file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
@@ -3598,7 +3046,6 @@ test "route json persists absolute session directories" {
     var route = try readRoute(allocator, route_path);
     defer route.deinit(allocator);
     try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", route.guid);
-    try std.testing.expectEqualStrings("s-550e8400", route.primary_alias);
     try std.testing.expectEqualStrings(session_dir, route.session_dir);
     try std.testing.expectEqualStrings("work.example", route.host);
     try std.testing.expectEqualStrings("0.5.0-test", route.agent_version);
@@ -3633,7 +3080,7 @@ test "runtime client route hints point client guids at session routes" {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     try text.writer(allocator).print(
-        "{{\"guid\":\"s-550e8400-e29b-41d4-a716-446655440000\",\"primary_alias\":\"s-550e8400\",\"session_dir\":{f},\"host\":\"work.example\",\"agent_version\":\"0.5.0-test\",\"alive\":true,\"attached_count\":1,\"last_input_at_unix_ms\":null,\"ssh_options\":[]}}\n",
+        "{{\"guid\":\"s-550e8400-e29b-41d4-a716-446655440000\",\"session_dir\":{f},\"host\":\"work.example\",\"agent_version\":\"0.5.0-test\",\"alive\":true,\"attached_count\":1,\"last_input_at_unix_ms\":null,\"ssh_options\":[]}}\n",
         .{std.json.fmt(session_dir, .{})},
     );
     var route_file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
@@ -3689,7 +3136,7 @@ test "runtime client route hints point client guids at session routes" {
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(client_dir));
 }
 
-test "tombstone snapshots aliases, removes route, and releases aliases" {
+test "tombstone snapshots route details and removes route" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/sessh-tombstone-test-{}", .{c.getpid()});
     defer allocator.free(root);
@@ -3705,13 +3152,8 @@ test "tombstone snapshots aliases, removes route, and releases aliases" {
     var route_file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
     route_file.close();
 
-    try createAliasInRoot(allocator, root, "beta", guid);
-    try createAliasInRoot(allocator, root, "alpha", guid);
-    try createAliasInRoot(allocator, root, "other", "s-11111111-1111-4111-8111-111111111111");
-
     var route = Route{
         .guid = try allocator.dupe(u8, guid),
-        .primary_alias = try allocator.dupe(u8, "alpha"),
         .session_dir = try allocator.dupe(u8, "/tmp/sessh-runtime-test/guid/s-550e8400-e29b-41d4-a716-446655440000"),
         .host_guid = try allocator.dupe(u8, "h-550e8400-e29b-41d4-a716-446655440001"),
         .host = try allocator.dupe(u8, "work.example"),
@@ -3741,28 +3183,18 @@ test "tombstone snapshots aliases, removes route, and releases aliases" {
     var tombstone = try readTombstone(allocator, tombstone_path);
     defer tombstone.deinit(allocator);
     try std.testing.expectEqualStrings(guid, tombstone.guid);
-    try std.testing.expectEqualStrings("alpha", tombstone.primary_alias);
-    try std.testing.expectEqual(@as(usize, 2), tombstone.aliases.len);
-    try std.testing.expectEqualStrings("alpha", tombstone.aliases[0]);
-    try std.testing.expectEqualStrings("beta", tombstone.aliases[1]);
+    try std.testing.expectEqualStrings("work.example", tombstone.host);
     try std.testing.expectEqual(@as(u64, 1234), tombstone.ended_at_unix_ms);
     try std.testing.expectEqual(TombstoneEndReason.process_exited, tombstone.end_reason);
     try std.testing.expectEqual(TombstoneExitStatusKind.exited, tombstone.exit_status.?.kind);
     try std.testing.expectEqual(@as(i32, 7), tombstone.exit_status.?.status);
 
-    try std.testing.expectError(error.FileNotFound, resolveRefToGuidInRoot(allocator, root, "alpha"));
-    try std.testing.expectError(error.FileNotFound, resolveRefToGuidInRoot(allocator, root, "beta"));
-    const other = try resolveRefToGuidInRoot(allocator, root, "other");
-    defer allocator.free(other);
-    try std.testing.expectEqualStrings("s-11111111-1111-4111-8111-111111111111", other);
-
-    const alias_guid = try resolveTombstoneRefToGuidInRoot(allocator, root, "alpha");
-    defer allocator.free(alias_guid);
-    try std.testing.expectEqualStrings(guid, alias_guid);
-    try createAliasInRoot(allocator, root, "alpha", "s-22222222-2222-4222-8222-222222222222");
+    const short_guid = try resolveTombstoneRefToGuidInRoot(allocator, root, "s-550e8400");
+    defer allocator.free(short_guid);
+    try std.testing.expectEqualStrings(guid, short_guid);
 }
 
-test "expired tombstone cleanup removes only recorded aliases" {
+test "expired tombstone cleanup removes tombstone" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/sessh-tombstone-expiry-test-{}", .{c.getpid()});
     defer allocator.free(root);
@@ -3770,11 +3202,9 @@ test "expired tombstone cleanup removes only recorded aliases" {
     defer std.fs.cwd().deleteTree(root) catch {};
 
     const guid = "s-550e8400-e29b-41d4-a716-446655440000";
-    try createAliasInRoot(allocator, root, "recorded", guid);
 
     var route = Route{
         .guid = try allocator.dupe(u8, guid),
-        .primary_alias = try allocator.dupe(u8, "recorded"),
         .session_dir = try allocator.dupe(u8, "/tmp/sessh-runtime-test/guid/s-550e8400-e29b-41d4-a716-446655440000"),
         .host_guid = try allocator.dupe(u8, ""),
         .host = try allocator.dupe(u8, "."),
@@ -3796,7 +3226,6 @@ test "expired tombstone cleanup removes only recorded aliases" {
         .end_reason = .killed_by_request,
         .exit_status = null,
     });
-    try createAliasInRoot(allocator, root, "late", guid);
 
     try cleanupExpiredTombstonesInRoot(allocator, root, 599);
     const retained_path = try tombstonePathForGuidInRoot(allocator, root, guid);
@@ -3805,10 +3234,7 @@ test "expired tombstone cleanup removes only recorded aliases" {
 
     try cleanupExpiredTombstonesInRoot(allocator, root, 600);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(retained_path));
-    try std.testing.expectError(error.FileNotFound, resolveRefToGuidInRoot(allocator, root, "recorded"));
-    const late = try resolveRefToGuidInRoot(allocator, root, "late");
-    defer allocator.free(late);
-    try std.testing.expectEqualStrings(guid, late);
+    try std.testing.expectError(error.FileNotFound, resolveTombstoneRefToGuidInRoot(allocator, root, "s-550e8400"));
 }
 
 test "pending kills use per-host-guid entry files" {

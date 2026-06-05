@@ -17,7 +17,7 @@ const hpb = protocol.hpb;
 
 const command_timeout_ms: i64 = 2_000;
 const command_poll_ms: u64 = 20;
-const client_list_target_help = "incoming, outgoing, session, or a guid/alias";
+const client_list_target_help = "incoming, outgoing, session, or a guid";
 
 pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
@@ -61,14 +61,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
             },
             .te_session_create => {
                 const agent_fd = startSessionAgentAndConnect(allocator, exe, frame.payload) catch |err| switch (err) {
-                    error.AliasExists => {
-                        try sendError(1, "ALIAS_EXISTS", "session alias already exists", "");
-                        return;
-                    },
-                    error.InvalidAlias => {
-                        try sendError(1, "INVALID_ALIAS", "invalid session alias", "");
-                        return;
-                    },
                     else => return err,
                 };
                 defer _ = c.close(agent_fd);
@@ -676,7 +668,7 @@ fn listAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
             continue;
         };
         defer allocator.free(guid);
-        const display_id = (try session_registry.primaryAliasForGuid(allocator, guid)) orelse try session_registry.shortSessionGuid(allocator, guid);
+        const display_id = try session_registry.shortSessionGuid(allocator, guid);
         defer allocator.free(display_id);
 
         const live = querySessionListLiveStatus(allocator, paths) catch null;
@@ -878,7 +870,6 @@ fn listExitedAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
             .jsonl => try list_format.writeExitedJsonlRow(
                 writer,
                 display_id,
-                tombstone.aliases,
                 tombstone.host,
                 tombstone.agent_version,
                 tombstone.guid,
@@ -897,8 +888,6 @@ fn listExitedAgents(allocator: std.mem.Allocator, options: ListOptions) !u8 {
 }
 
 fn tombstoneDisplayId(allocator: std.mem.Allocator, tombstone: *const session_registry.Tombstone) ![]u8 {
-    if (tombstone.primary_alias.len > 0) return allocator.dupe(u8, tombstone.primary_alias);
-    if (tombstone.aliases.len > 0) return allocator.dupe(u8, tombstone.aliases[0]);
     return session_registry.shortSessionGuid(allocator, tombstone.guid);
 }
 
@@ -997,7 +986,7 @@ fn listClientsForSessionPaths(allocator: std.mem.Allocator, writer: anytype, opt
     std.mem.sort(pb.TeAttachedClient, state.attached_clients.items, {}, attachedClientSortLessThan);
 
     const session_guid = std.fs.path.basename(paths.dir);
-    const display_id = (try session_registry.primaryAliasForGuid(allocator, session_guid)) orelse try session_registry.shortSessionGuid(allocator, session_guid);
+    const display_id = try session_registry.shortSessionGuid(allocator, session_guid);
     defer allocator.free(display_id);
     try writeClientRows(writer, options.format, display_id, session_guid, options.host_display, state.attached_clients.items, null);
     return 0;
@@ -1049,7 +1038,7 @@ fn listClientByRef(allocator: std.mem.Allocator, writer: anytype, options: ListO
 
     const session_guid = try sessionGuidFromClientAgentSocketHint(allocator, socket_path);
     defer allocator.free(session_guid);
-    const display_id = (try session_registry.primaryAliasForGuid(allocator, session_guid)) orelse try session_registry.shortSessionGuid(allocator, session_guid);
+    const display_id = try session_registry.shortSessionGuid(allocator, session_guid);
     defer allocator.free(display_id);
     try writeClientRows(writer, options.format, display_id, session_guid, options.host_display, state.attached_clients.items, client_ref);
     return 0;
@@ -1073,7 +1062,9 @@ fn listOutgoingClients(allocator: std.mem.Allocator, writer: anytype, options: L
         defer allocator.free(route_path);
         var route = session_registry.readRoute(allocator, route_path) catch continue;
         defer route.deinit(allocator);
-        try writeCachedClientRow(writer, options.format, route.primary_alias, route.guid, route.host, entry.name, route.agent_version);
+        const display_id = try session_registry.shortSessionGuid(allocator, route.guid);
+        defer allocator.free(display_id);
+        try writeCachedClientRow(writer, options.format, display_id, route.guid, route.host, entry.name, route.agent_version);
     }
     return 0;
 }
@@ -2081,10 +2072,6 @@ fn statAbsolute(path: []const u8) !std.fs.File.Stat {
 fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_create_payload: []const u8) !c.fd_t {
     var request = try protocol.decodePayload(pb.TeSessionCreate, allocator, session_create_payload);
     defer request.deinit(allocator);
-    if (request.session_alias.len > 0) {
-        if (!session_registry.isValidAlias(request.session_alias)) return error.InvalidAlias;
-        if (!try session_registry.aliasAvailableForGuid(allocator, request.session_alias, request.session_guid)) return error.AliasExists;
-    }
     var allocation = if (request.session_guid.len > 0)
         try session_registry.allocateSessionDirForGuid(allocator, request.session_guid)
     else
@@ -2338,7 +2325,7 @@ test "list all rows include runtime metadata and cached remote sessions" {
     defer allocator.free(remote_route_path);
     try writeTestFile(
         remote_route_path,
-        "{\"guid\":\"s-33333333-3333-4333-8333-333333333333\",\"primary_alias\":\"s-33333333\",\"session_dir\":\"/tmp/remote/guid/s-33333333-3333-4333-8333-333333333333\",\"host\":\"work.example\",\"agent_version\":\"0.6.0-test\",\"alive\":true,\"attached_count\":null,\"last_input_at_unix_ms\":null,\"ssh_options\":[]}\n",
+        "{\"guid\":\"s-33333333-3333-4333-8333-333333333333\",\"session_dir\":\"/tmp/remote/guid/s-33333333-3333-4333-8333-333333333333\",\"host\":\"work.example\",\"agent_version\":\"0.6.0-test\",\"alive\":true,\"attached_count\":null,\"last_input_at_unix_ms\":null,\"ssh_options\":[]}\n",
     );
 
     var out: std.ArrayList(u8) = .empty;

@@ -40,8 +40,6 @@ You may provide extra parameters for advanced usage:
 ```text
 sessh [[ssh-option|sessh-option] ...] destination [command [argument ...]]
 ```
-- `--alias NAME`: choose the alias for a new session. Remote sessions register
-  the alias on the remote host and cache a local route after the first attach.
 - `--log-level quiet|error|warn|info|debug|verbose`: override
   `client-log-level` for the local client.
 - `--terminal-emulator` / `--no-terminal-emulator`: enable or disable sessh's
@@ -114,8 +112,8 @@ tombstone-hours=168
 
 Use `sesshmux` for session management:
 
-- `sesshmux attach ID`: attach using a local alias, cached remote route, session
-  GUID, or unique `s-` GUID prefix.
+- `sesshmux attach ID`: attach using a session GUID or unique `s-` GUID prefix.
+  Cached remote routes let those IDs reconnect without restating the host.
 - `sesshmux attach --host HOST [ID]`: attach by resolving `ID` on `HOST`, or
   attach to the most recent attachable session on `HOST` if `ID` is omitted.
 - `sesshmux force-compat --host HOST ID command ...`: run `command ...` through the
@@ -133,8 +131,7 @@ Use `sesshmux` for session management:
   setting and cleaned up by `list`. `--jsonl` emits one JSON object per session
   in the selected live/exited mode.
 - `sesshmux kill [--jsonl] [HOST] ID...`: terminate one or more local or remote
-  targets. `ID` may be an `s-` session GUID or a `p-` proxy-stream GUID; local
-  session aliases are also accepted.
+  targets. `ID` may be an `s-` session GUID or a `p-` proxy-stream GUID.
 - `sesshmux kill [--jsonl] --all [HOST]`: terminate all local sessions or all
   sessions on `HOST`.
 
@@ -162,20 +159,13 @@ The session also exports `$SESSH_PATH`, the directory containing the `sesshmux`
 binary used by the session agent. `sessh` appends that directory to `$PATH` so
 commands inside the session can invoke `sesshmux`.
 
-Each attached client uses a `c-`-prefixed GUID.
-
-When creating a new session, you can specify a custom alias with `--alias`. Any
-valid filename is allowed except
-
-1. Neither of the first two characters can be `-`
-2. `/` is not allowed.
-
-If you don't specify one, `sessh` generates a 10-character alias
-such as `s-550e8400`.
+Each attached client uses a `c-`-prefixed GUID. Sessions are shown in short
+form such as `s-550e8400`; any unique `s-` prefix may be used where a session
+ID is expected.
 
 After you attach to a remote session, sessh caches a local route so later
-`sesshmux attach ALIAS` can reconnect without restating the host. If
-`sesshmux attach --host HOST ALIAS` resolves to a route for another host, sessh
+`sesshmux attach s-...` can reconnect without restating the host. If
+`sesshmux attach --host HOST s-...` resolves to a route for another host, sessh
 fails instead of following that route.
 
 ## Reconnects

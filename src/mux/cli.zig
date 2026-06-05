@@ -132,7 +132,6 @@ pub const DebugAction = enum {
 };
 
 pub const CommonSessionOptions = struct {
-    alias: ?[]const u8 = null,
     banner_args: client.DetachBannerArgs = .{},
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     scrollback_row_count_set: bool = false,
@@ -317,8 +316,7 @@ pub fn parseCommonOption(args: []const []const u8, index: *usize, common: *Commo
         return true;
     }
     if (kind != .new) {
-        if (std.mem.eql(u8, arg, "--alias") or
-            std.mem.eql(u8, arg, "--scrollback-limit") or
+        if (std.mem.eql(u8, arg, "--scrollback-limit") or
             std.mem.eql(u8, arg, "--initial-scrollback") or
             std.mem.eql(u8, arg, "--bootstrap") or
             std.mem.eql(u8, arg, "--no-bootstrap") or
@@ -329,14 +327,6 @@ pub fn parseCommonOption(args: []const []const u8, index: *usize, common: *Commo
             return error.UnsupportedMuxOption;
         }
         return false;
-    }
-    if (std.mem.eql(u8, arg, "--alias")) {
-        index.* += 1;
-        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingAlias;
-        if (!session_registry.isValidCustomAlias(args[index.*])) return error.InvalidAlias;
-        common.alias = args[index.*];
-        index.* += 1;
-        return true;
     }
     if (std.mem.eql(u8, arg, "--scrollback-limit")) {
         index.* += 1;

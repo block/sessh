@@ -107,7 +107,7 @@ fn usage(err: anyerror) !void {
         error.MissingHost => try io.writeAll(2, "sesshmux: --host requires a value\n"),
         error.MissingSshOptions => try io.writeAll(2, "sesshmux: --ssh-options requires a value\n"),
         error.UnsupportedMuxOption => try io.writeAll(2, "sesshmux: unsupported option for this command\n"),
-        error.MissingCompatSession => try io.writeAll(2, "sesshmux: force-compat requires a session id or alias\n"),
+        error.MissingCompatSession => try io.writeAll(2, "sesshmux: force-compat requires a session id\n"),
         error.MissingCompatCommand => try io.writeAll(2, "sesshmux: force-compat requires a command after the session id\n"),
         error.MissingCompatHost => try io.writeAll(2, "sesshmux: force-compat requires --host HOST unless the session has a cached remote route\n"),
         else => try io.stderrPrint("sesshmux: invalid force-compat arguments: {t}\n", .{err}),

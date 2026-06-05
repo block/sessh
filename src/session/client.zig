@@ -25,7 +25,7 @@ const WindowSize = terminal.WindowSize;
 var next_repaint_request_seq: u64 = 1;
 
 const unknown_viewport_offset: i32 = -1;
-const client_list_target_help = "incoming, outgoing, session, or a guid/alias";
+const client_list_target_help = "incoming, outgoing, session, or a guid";
 
 pub const RemoteCommandResult = struct {
     stdout: []u8,
@@ -94,7 +94,6 @@ const LocalOptions = struct {
     kill_current: bool = false,
     kill_request_args: []const []const u8 = &.{},
     kill_jsonl: bool = false,
-    alias: ?[]const u8 = null,
     list_refresh: bool = false,
     list_include_cached_routes: bool = true,
     list_jsonl: bool = false,
@@ -129,7 +128,6 @@ const LocalOptions = struct {
 pub const LocalNewSessionRequest = struct {
     exe: []const u8,
     new_detached: bool = false,
-    alias: ?[]const u8 = null,
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     reap_ms: u64 = config.default_reap_ms,
     tombstone_retention_ms: u64 = config.default_tombstone_retention_ms,
@@ -355,7 +353,6 @@ pub const RuntimeRecovery = enum {
 
 pub const CreatedSession = struct {
     guid: []u8,
-    alias: []u8,
     session_dir: []u8,
     host_guid: []u8,
 
@@ -363,7 +360,6 @@ pub const CreatedSession = struct {
         const allocator = app_allocator.allocator();
         allocator.free(self.host_guid);
         allocator.free(self.session_dir);
-        allocator.free(self.alias);
         allocator.free(self.guid);
         self.* = undefined;
     }
@@ -558,8 +554,6 @@ pub const RuntimeSession = struct {
     host_guid_len: usize = 0,
     client_guid: [session_registry.client_guid_len]u8 = [_]u8{0} ** session_registry.client_guid_len,
     client_guid_len: usize = 0,
-    primary_alias: [128]u8 = [_]u8{0} ** 128,
-    primary_alias_len: usize = 0,
     session_dir: [4096]u8 = [_]u8{0} ** 4096,
     session_dir_len: usize = 0,
     scrollback_cursor: ScrollbackCursor = .{},
@@ -616,7 +610,6 @@ pub const RuntimeSession = struct {
     }
 
     pub fn idSlice(self: *const RuntimeSession) []const u8 {
-        if (self.primary_alias_len > 0) return self.primary_alias[0..self.primary_alias_len];
         return self.guidSlice();
     }
 
@@ -684,30 +677,10 @@ pub const RuntimeSession = struct {
     }
 
     pub fn setIdentity(self: *RuntimeSession, guid: []const u8) !void {
-        return self.setIdentityWithAlias(guid, "");
-    }
-
-    pub fn setIdentityWithAlias(self: *RuntimeSession, guid: []const u8, alias: []const u8) !void {
         if (guid.len > self.guid.len) return error.SessionGuidTooLarge;
         @memcpy(self.guid[0..guid.len], guid);
         self.guid_len = guid.len;
-        self.primary_alias_len = 0;
         tty_transcript.setSessionGuid(guid);
-
-        if (alias.len > 0) {
-            try self.setPrimaryAlias(alias);
-            return;
-        }
-
-        const local_alias = (try session_registry.primaryAliasForGuid(app_allocator.allocator(), guid)) orelse return;
-        defer app_allocator.allocator().free(local_alias);
-        try self.setPrimaryAlias(local_alias);
-    }
-
-    fn setPrimaryAlias(self: *RuntimeSession, alias: []const u8) !void {
-        if (alias.len > self.primary_alias.len) return error.SessionAliasTooLarge;
-        @memcpy(self.primary_alias[0..alias.len], alias);
-        self.primary_alias_len = alias.len;
     }
 
     fn recordSessionEndedPayload(self: *RuntimeSession, payload: []const u8) !void {
@@ -2719,18 +2692,8 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
         recorder.deinit();
     };
 
-    var generated_guid: ?[]u8 = null;
-    defer if (generated_guid) |guid| allocator.free(guid);
-    var generated_alias: ?[]u8 = null;
-    defer if (generated_alias) |alias| allocator.free(alias);
-    if (request.alias) |alias| {
-        generated_guid = try session_registry.generateGuid(allocator);
-        generated_alias = try allocator.dupe(u8, alias);
-    } else {
-        const identity = try session_registry.generateGuidWithDefaultAlias(allocator);
-        generated_guid = identity.guid;
-        generated_alias = identity.alias;
-    }
+    const generated_guid = try session_registry.generateGuid(allocator);
+    defer allocator.free(generated_guid);
 
     const runtime_broker_args: []const []const u8 = &.{};
     var child = try startLocalBroker(allocator, request.exe, runtime_broker_args);
@@ -2742,8 +2705,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
             child_read_fd,
             child_write_fd,
             request.scrollback_row_count,
-            generated_guid.?,
-            generated_alias.?,
+            generated_guid,
             request.command_argv,
             request.shell_command,
             null,
@@ -2756,8 +2718,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
             return process_exit.request(1);
         };
         defer created.deinit();
-        try session_registry.ensureAliasForGuid(allocator, created.alias, created.guid);
-        try session_registry.writeLocalRoute(allocator, created.guid, created.alias, created.session_dir, config.version, request.tombstone_retention_ms);
+        try session_registry.writeLocalRoute(allocator, created.guid, created.session_dir, config.version, request.tombstone_retention_ms);
         session_registry.markRouteDetachedNow(allocator, created.guid) catch |err| {
             client_log.debug("event=local_route_detached_mark_failed session={s} error={t}", .{ created.guid, err });
         };
@@ -2769,13 +2730,11 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
         return;
     }
 
-    var local_alias_created = false;
     var session = startNewSessionOnRuntime(
         child_read_fd,
         child_write_fd,
         request.scrollback_row_count,
-        generated_guid.?,
-        generated_alias.?,
+        generated_guid,
         request.command_argv,
         request.shell_command,
         null,
@@ -2788,9 +2747,7 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
         return process_exit.request(1);
     };
     defer session.deinit();
-    try session_registry.ensureAliasForGuid(allocator, session.idSlice(), session.guidSlice());
-    try session_registry.writeLocalRoute(allocator, session.guidSlice(), session.idSlice(), session.sessionDirSlice(), config.version, request.tombstone_retention_ms);
-    local_alias_created = true;
+    try session_registry.writeLocalRoute(allocator, session.guidSlice(), session.sessionDirSlice(), config.version, request.tombstone_retention_ms);
     writeClientRouteHintForSession(allocator, &session);
     defer removeClientRouteHintForSession(allocator, &session);
 
@@ -2803,7 +2760,6 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
         ) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
-            if (local_alias_created) session_registry.removeAlias(allocator, session.idSlice()) catch {};
             try io_helpers.stderrPrint("sessh: local runtime attach failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -2870,7 +2826,6 @@ pub fn runLocalNewSession(allocator: std.mem.Allocator, request: LocalNewSession
         reconnectSessionOnRuntime(child.stdout.?.handle, child.stdin.?.handle, &session) catch |err| {
             if (process_exit.is(err)) return err;
             terminateChild(&child);
-            if (local_alias_created) session_registry.removeAlias(allocator, session.idSlice()) catch {};
             session.restoreRelayEndPresentation();
             try io_helpers.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
@@ -2966,7 +2921,6 @@ fn runBrokerClient(allocator: std.mem.Allocator, args: []const []const u8, optio
         return runLocalNewSession(allocator, .{
             .exe = args[0],
             .new_detached = options.new_detached,
-            .alias = options.alias,
             .scrollback_row_count = options.scrollback_row_count,
             .reap_ms = options.reap_ms,
             .tombstone_retention_ms = options.tombstone_retention_ms,
@@ -3532,10 +3486,12 @@ fn appendCachedRemoteRouteRows(allocator: std.mem.Allocator, jsonl: bool) !bool 
         const input = try formatRouteInput(&input_buf, route.last_input_at_unix_ms);
         var attached_buf: [32]u8 = undefined;
         const attached = formatRouteAttachedCount(&attached_buf, route.attached_count);
+        const display_id = try session_registry.shortSessionGuid(allocator, route.guid);
+        defer allocator.free(display_id);
         if (jsonl) {
             try list_format.writeJsonlRow(
                 writer,
-                route.primary_alias,
+                display_id,
                 route.host,
                 route.agent_version,
                 route.guid,
@@ -3543,7 +3499,7 @@ fn appendCachedRemoteRouteRows(allocator: std.mem.Allocator, jsonl: bool) !bool 
                 route.last_input_at_unix_ms,
             );
         } else {
-            try list_format.writeRow(writer, route.primary_alias, attached, input, route.host, route.agent_version);
+            try list_format.writeRow(writer, display_id, attached, input, route.host, route.agent_version);
         }
     }
     if (out.items.len > 0) try io_helpers.writeAll(1, out.items);
@@ -4275,7 +4231,7 @@ test "remoteListVersionForGuid reads jsonl rows" {
 test "remoteTombstoneForGuid reads exited jsonl rows" {
     const guid = "s-550e8400-e29b-41d4-a716-446655440000";
     const stdout =
-        \\{"id":"s-550e8400","aliases":["s-550e8400"],"host":"example.com","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000","ended_at_unix_ms":1234,"end_reason":"process_exited","exit_status":{"kind":"exited","status":7}}
+        \\{"id":"s-550e8400","host":"example.com","version":"0.5.0-dev","guid":"s-550e8400-e29b-41d4-a716-446655440000","ended_at_unix_ms":1234,"end_reason":"process_exited","exit_status":{"kind":"exited","status":7}}
         \\
     ;
 
@@ -4401,13 +4357,7 @@ fn parseLocalPreCommandOption(args: []const []const u8, index: *usize, options: 
 fn parseLocalNewOptions(args: []const []const u8, index: *usize, options: *LocalOptions) !void {
     while (index.* < args.len) {
         const arg = args[index.*];
-        if (std.mem.eql(u8, arg, "--alias")) {
-            index.* += 1;
-            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingAlias;
-            if (!session_registry.isValidCustomAlias(args[index.*])) return error.InvalidAlias;
-            options.alias = args[index.*];
-            index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--detached")) {
+        if (std.mem.eql(u8, arg, "--detached")) {
             options.new_detached = true;
             index.* += 1;
         } else if (try parseLocalCommonSessionOption(args, index, options)) {
@@ -4903,7 +4853,6 @@ pub fn startNewSessionOnRuntime(
     write_fd: c.fd_t,
     scrollback_row_count: u32,
     session_guid: []const u8,
-    session_alias: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     pending_kill_host: ?[]const u8,
@@ -4918,7 +4867,6 @@ pub fn startNewSessionOnRuntime(
         size,
         scrollback_row_count,
         session_guid,
-        session_alias,
         command_argv,
         shell_command,
         pending_kill_host,
@@ -4942,7 +4890,6 @@ pub fn createSessionOnRuntime(
     write_fd: c.fd_t,
     scrollback_row_count: u32,
     session_guid: []const u8,
-    session_alias: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     pending_kill_host: ?[]const u8,
@@ -4955,7 +4902,6 @@ pub fn createSessionOnRuntime(
         terminal.currentWindowSize(),
         scrollback_row_count,
         session_guid,
-        session_alias,
         command_argv,
         shell_command,
         pending_kill_host,
@@ -4970,7 +4916,6 @@ fn createSessionOnRuntimeWithSize(
     size: WindowSize,
     scrollback_row_count: u32,
     session_guid: []const u8,
-    session_alias: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     pending_kill_host: ?[]const u8,
@@ -4987,7 +4932,6 @@ fn createSessionOnRuntimeWithSize(
         size,
         scrollback_row_count,
         session_guid,
-        session_alias,
         command_argv,
         shell_command,
         peer_supports_command_oneof,
@@ -5032,13 +4976,10 @@ pub fn ensureLocalRouteForRemoteSession(
     tombstone_retention_ms: u64,
 ) !void {
     if (session.guidSlice().len == 0) return;
-    const alias = try localAliasForRemoteSession(allocator, session, requested_ref);
-    defer allocator.free(alias);
-    try session_registry.ensureAliasForGuid(allocator, alias, session.guidSlice());
+    _ = requested_ref;
     try session_registry.writeSshRoute(
         allocator,
         session.guidSlice(),
-        alias,
         session.sessionDirSlice(),
         session.hostGuidSlice(),
         host,
@@ -5068,11 +5009,9 @@ pub fn ensureLocalRouteForCreatedRemoteSession(
     ssh_options: []const []const u8,
     tombstone_retention_ms: u64,
 ) !void {
-    try session_registry.ensureAliasForGuid(allocator, created.alias, created.guid);
     try session_registry.writeSshRoute(
         allocator,
         created.guid,
-        created.alias,
         created.session_dir,
         created.host_guid,
         host,
@@ -5125,22 +5064,6 @@ pub fn tombstoneLocalRouteForRemoteSession(allocator: std.mem.Allocator, session
     var route = session_registry.readRouteForRef(allocator, session.guidSlice()) catch return;
     defer route.deinit(allocator);
     try session_registry.writeTombstoneForRoute(allocator, &route, details);
-}
-
-fn localAliasForRemoteSession(allocator: std.mem.Allocator, session: *const RuntimeSession, requested_ref: []const u8) ![]u8 {
-    if (requested_ref.len > 0 and
-        !session_registry.isValidSessionId(requested_ref) and
-        session_registry.isValidAlias(requested_ref))
-    {
-        return allocator.dupe(u8, requested_ref);
-    }
-    if (session.idSlice().len > 0 and
-        !session_registry.isValidSessionId(session.idSlice()) and
-        session_registry.isValidAlias(session.idSlice()))
-    {
-        return allocator.dupe(u8, session.idSlice());
-    }
-    return session_registry.createGeneratedRemoteAlias(allocator, session.guidSlice());
 }
 
 pub fn reconnectSessionOnRuntime(
@@ -5440,35 +5363,61 @@ pub fn writeUnconfirmedKillDetachWarningForSessionRef(session_ref: []const u8) v
 }
 
 fn writeDetachBannerForSessionRefInner(session_ref: []const u8) !void {
+    var display_ref_storage: [session_registry.session_guid_prefix.len + session_registry.short_guid_hex_len]u8 = undefined;
+    const display_ref = sessionRefForBanner(session_ref, &display_ref_storage);
     try io_helpers.writeAll(1, "--- sessh: detached. Re-attach: `");
     try writeShellArg(1, "sesshmux");
     try io_helpers.writeAll(1, " ");
     try writeShellArg(1, "attach");
-    if (session_ref.len > 0) {
+    if (display_ref.len > 0) {
         try io_helpers.writeAll(1, " ");
-        try writeShellArg(1, session_ref);
+        try writeShellArg(1, display_ref);
     }
     try io_helpers.writeAll(1, "` / Kill: `");
     try writeShellArg(1, "sesshmux");
     try io_helpers.writeAll(1, " ");
     try writeShellArg(1, "kill");
-    if (session_ref.len > 0) {
+    if (display_ref.len > 0) {
         try io_helpers.writeAll(1, " ");
-        try writeShellArg(1, session_ref);
+        try writeShellArg(1, display_ref);
     }
     try io_helpers.writeAll(1, "` ---\r\n");
 }
 
 fn writeUnconfirmedKillDetachWarningForSessionRefInner(session_ref: []const u8) !void {
+    var display_ref_storage: [session_registry.session_guid_prefix.len + session_registry.short_guid_hex_len]u8 = undefined;
+    const display_ref = sessionRefForBanner(session_ref, &display_ref_storage);
     try io_helpers.writeAll(1, "--- sessh: remote session might still be alive. Kill it with `");
     try writeShellArg(1, "sesshmux");
     try io_helpers.writeAll(1, " ");
     try writeShellArg(1, "kill");
-    if (session_ref.len > 0) {
+    if (display_ref.len > 0) {
         try io_helpers.writeAll(1, " ");
-        try writeShellArg(1, session_ref);
+        try writeShellArg(1, display_ref);
     }
     try io_helpers.writeAll(1, "` ---\r\n");
+}
+
+fn sessionRefForBanner(session_ref: []const u8, storage: *[session_registry.session_guid_prefix.len + session_registry.short_guid_hex_len]u8) []const u8 {
+    if (session_registry.isValidSessionGuid(session_ref)) {
+        @memcpy(storage[0..session_registry.session_guid_prefix.len], session_registry.session_guid_prefix);
+        var out_index: usize = session_registry.session_guid_prefix.len;
+        for (session_ref[session_registry.session_guid_prefix.len..]) |byte| {
+            if (byte == '-') continue;
+            storage[out_index] = std.ascii.toLower(byte);
+            out_index += 1;
+            if (out_index == storage.len) break;
+        }
+        return storage[0..];
+    }
+    if (session_registry.isValidCompactGuid(session_ref)) {
+        @memcpy(storage[0..session_registry.session_guid_prefix.len], session_registry.session_guid_prefix);
+        for (session_ref[0..session_registry.short_guid_hex_len], 0..) |byte, i| {
+            storage[session_registry.session_guid_prefix.len + i] = std.ascii.toLower(byte);
+        }
+        return storage[0..];
+    }
+    return session_ref;
 }
 
 fn shellJoinArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
@@ -5551,7 +5500,7 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                 var attached = try protocol.decodePayload(pb.TeSessionAttached, app_allocator.allocator(), frame.payload);
                 defer attached.deinit(app_allocator.allocator());
                 var session = RuntimeSession{};
-                try session.setIdentityWithAlias(attached.session_guid, attached.session_alias);
+                try session.setIdentity(attached.session_guid);
                 try session.setSessionDir(attached.session_dir);
                 return session;
             },
@@ -5579,7 +5528,6 @@ fn readSessionCreated(read_fd: c.fd_t, write_fd: c.fd_t) !CreatedSession {
                 defer message.deinit(app_allocator.allocator());
                 return .{
                     .guid = try app_allocator.allocator().dupe(u8, message.session_guid),
-                    .alias = try app_allocator.allocator().dupe(u8, message.session_alias),
                     .session_dir = try app_allocator.allocator().dupe(u8, message.session_dir),
                     .host_guid = try app_allocator.allocator().alloc(u8, 0),
                 };
@@ -5856,14 +5804,13 @@ fn sendSessionCreateAndReadCreated(
     size: WindowSize,
     scrollback_row_count: u32,
     session_guid: []const u8,
-    session_alias: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     peer_supports_command_oneof: bool,
     reap_ms: u64,
     tombstone_retention_ms: u64,
 ) !CreatedSession {
-    try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid, session_alias, command_argv, shell_command, peer_supports_command_oneof, reap_ms, tombstone_retention_ms);
+    try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid, command_argv, shell_command, peer_supports_command_oneof, reap_ms, tombstone_retention_ms);
     return readSessionCreated(read_fd, write_fd);
 }
 
@@ -5872,7 +5819,6 @@ fn sendSessionCreate(
     size: WindowSize,
     scrollback_row_count: u32,
     session_guid: []const u8,
-    session_alias: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     peer_supports_command_oneof: bool,
@@ -5887,7 +5833,6 @@ fn sendSessionCreate(
         },
         .scrollback_row_limit = scrollback_row_count,
         .session_guid = session_guid,
-        .session_alias = session_alias,
         .reap_ms = reap_ms,
         .tombstone_retention_ms = tombstone_retention_ms,
     };
