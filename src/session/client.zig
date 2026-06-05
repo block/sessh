@@ -380,6 +380,7 @@ pub const RelayOptions = struct {
 const input_chunk_bytes = 1024;
 const default_responsiveness_timeout_ms: i64 = 5_000;
 const max_responsiveness_timeout_ms: i64 = 15_000;
+const resize_repaint_timeout_ms: i64 = 1_000;
 const paste_like_single_read_bytes = 32;
 const paste_like_window_bytes = 64;
 const paste_like_window_ms: i64 = 250;
@@ -524,14 +525,36 @@ pub const ScrollbackCursor = struct {
 };
 
 const PendingRepaint = struct {
+    const Kind = enum {
+        none,
+        generic,
+        resize,
+    };
+
     repaint_request_seq: u64 = 0,
+    kind: Kind = .none,
+    started_at_unix_ms: i64 = 0,
 
     fn active(self: PendingRepaint) bool {
         return self.repaint_request_seq != 0;
     }
 
     fn start(self: *PendingRepaint) u64 {
+        return self.startInner(.generic, std.time.milliTimestamp());
+    }
+
+    fn startResize(self: *PendingRepaint) u64 {
+        return self.startInner(.resize, std.time.milliTimestamp());
+    }
+
+    fn startResizeAt(self: *PendingRepaint, now_ms: i64) u64 {
+        return self.startInner(.resize, now_ms);
+    }
+
+    fn startInner(self: *PendingRepaint, kind: Kind, now_ms: i64) u64 {
         self.repaint_request_seq = allocateRepaintRequestSeq();
+        self.kind = kind;
+        self.started_at_unix_ms = now_ms;
         return self.repaint_request_seq;
     }
 
@@ -539,8 +562,19 @@ const PendingRepaint = struct {
         return self.repaint_request_seq == repaint_request_seq;
     }
 
+    fn resizeTimedOut(self: PendingRepaint, now_ms: i64) bool {
+        if (!self.active() or self.kind != .resize) return false;
+        return now_ms - self.started_at_unix_ms >= resize_repaint_timeout_ms;
+    }
+
+    fn requiresRepaintForRecovery(self: PendingRepaint) bool {
+        return self.active() and self.kind == .resize;
+    }
+
     fn clear(self: *PendingRepaint) void {
         self.repaint_request_seq = 0;
+        self.kind = .none;
+        self.started_at_unix_ms = 0;
     }
 };
 
@@ -796,6 +830,9 @@ pub const ReconnectUi = struct {
     presentation: ReconnectPresentation = .overlay,
     cleanup_title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
     cleanup_title_fallback_len: usize = 0,
+    last_size: WindowSize = .{},
+    resize_generation: u64 = 0,
+    forwarded_resize_generation: u64 = 0,
 
     pub fn begin(viewport_offset: i32) !ReconnectUi {
         return beginWithPresentation(viewport_offset, .overlay);
@@ -806,6 +843,7 @@ pub const ReconnectUi = struct {
             .mode_guard = try terminal.TerminalModeGuard.enable(0),
             .title_enabled = (presentation == .overlay or presentation == .title) and c.isatty(1) != 0,
             .presentation = presentation,
+            .last_size = terminal.currentWindowSize(),
         };
         errdefer ui.mode_guard.restore();
         ui.viewport_offset = if (viewport_offset > 0) @intCast(viewport_offset) else 0;
@@ -866,6 +904,7 @@ pub const ReconnectUi = struct {
             const next_wake_ms = @min(delay_ms, next_banner_update_ms);
             const wait_ms: i32 = @intCast(@min(next_wake_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
             const decision = try self.pollInput(wait_ms);
+            try self.refreshForResize();
             try self.refreshBannerIfDiagnosticsChanged();
             switch (decision) {
                 .detach, .kill_detach, .kill_wait => return decision,
@@ -991,16 +1030,20 @@ pub const ReconnectUi = struct {
 
     pub fn pollDecision(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
         if (self.isCancelled()) return .detach;
+        try self.refreshForResize();
         try self.refreshBannerIfDiagnosticsChanged();
         const decision = try self.pollInput(timeout_ms);
+        try self.refreshForResize();
         try self.refreshBannerIfDiagnosticsChanged();
         return decision;
     }
 
     pub fn pollKillingDecision(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
         if (self.isCancelled()) return .detach;
+        try self.refreshForResize();
         try self.refreshBannerIfDiagnosticsChanged();
         const decision = try self.pollKillingInput(timeout_ms);
+        try self.refreshForResize();
         try self.refreshBannerIfDiagnosticsChanged();
         return decision;
     }
@@ -1017,6 +1060,34 @@ pub const ReconnectUi = struct {
         return &self.cancelled;
     }
 
+    pub fn consumeResizeForRuntime(self: *ReconnectUi) bool {
+        if (self.forwarded_resize_generation == self.resize_generation) return false;
+        self.forwarded_resize_generation = self.resize_generation;
+        return true;
+    }
+
+    fn effectivePollTimeout(self: *const ReconnectUi, timeout_ms: i32) i32 {
+        if (timeout_ms >= 0) return timeout_ms;
+        if (self.presentation != .overlay) return timeout_ms;
+        return 250;
+    }
+
+    fn refreshForResize(self: *ReconnectUi) !void {
+        const size = terminal.currentWindowSize();
+        if (size.rows == self.last_size.rows and size.cols == self.last_size.cols) return;
+        self.last_size = size;
+        self.resize_generation +%= 1;
+        if (self.resize_generation == 0) self.resize_generation = 1;
+        if (self.presentation != .overlay or c.isatty(1) == 0) return;
+
+        const renderer = client_renderer.Renderer.init(1);
+        try renderer.restorePresentation(queryInitialKittyKeyboardFlags());
+        try renderer.clearVisible();
+        self.banner_state = null;
+        self.viewport_offset = 0;
+        if (self.banner_message_len > 0) try self.drawCurrentBanner();
+    }
+
     fn pollInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
         var pollfds = [_]posix.pollfd{
             .{
@@ -1031,7 +1102,7 @@ pub const ReconnectUi = struct {
             },
         };
         const poll_count: usize = if (self.diagnostic_notify_read_fd >= 0) 2 else 1;
-        const ready = try posix.poll(pollfds[0..poll_count], timeout_ms);
+        const ready = try posix.poll(pollfds[0..poll_count], self.effectivePollTimeout(timeout_ms));
         if (ready == 0) return .wait_elapsed;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .detach;
         if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
@@ -1083,7 +1154,7 @@ pub const ReconnectUi = struct {
             },
         };
         const poll_count: usize = if (self.diagnostic_notify_read_fd >= 0) 2 else 1;
-        const ready = try posix.poll(pollfds[0..poll_count], timeout_ms);
+        const ready = try posix.poll(pollfds[0..poll_count], self.effectivePollTimeout(timeout_ms));
         if (ready == 0) return .wait_elapsed;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .detach;
         if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
@@ -1207,6 +1278,7 @@ pub const ReconnectUi = struct {
         }
 
         const size = terminal.currentWindowSize();
+        self.last_size = size;
         const max_visible_diagnostic_lines: usize = if (size.rows > 1)
             @min(max_diagnostic_banner_lines, @as(usize, size.rows - 1))
         else
@@ -1916,6 +1988,19 @@ test "ReconnectUi restores local cleanup title on detach" {
     try std.testing.expect(!ui.title_visible);
 }
 
+test "ReconnectUi records resize event for runtime forwarding" {
+    var ui = ReconnectUi{
+        .mode_guard = undefined,
+        .presentation = .none,
+        .last_size = .{ .rows = 0, .cols = 0 },
+    };
+
+    try ui.refreshForResize();
+    try std.testing.expect(ui.resize_generation != 0);
+    try std.testing.expect(ui.consumeResizeForRuntime());
+    try std.testing.expect(!ui.consumeResizeForRuntime());
+}
+
 test "reconnect switch disposition distinguishes typing paste and unresponsive" {
     var ui = ReconnectUi{ .mode_guard = undefined };
     try std.testing.expectEqual(
@@ -2157,6 +2242,38 @@ test "paste-like input classifier uses read size and short rolling window" {
     try std.testing.expect(window.classify(24));
 }
 
+test "resize repaint timeout waits for short grace period" {
+    var pending = PendingRepaint{};
+    _ = pending.startResizeAt(1_000);
+
+    try std.testing.expect(pending.requiresRepaintForRecovery());
+    try std.testing.expect(!pending.resizeTimedOut(1_999));
+    try std.testing.expect(pending.resizeTimedOut(2_000));
+
+    pending.clear();
+    try std.testing.expect(!pending.requiresRepaintForRecovery());
+    try std.testing.expect(!pending.resizeTimedOut(3_000));
+}
+
+test "resize repaint timeout clears stale relay display and enters unresponsive state" {
+    var pending = PendingRepaint{};
+    _ = pending.startResizeAt(1_000);
+    var viewport_offset: i32 = 7;
+
+    try std.testing.expectEqual(
+        @as(?RelayEnd, null),
+        checkResizeRepaintTimeout(&pending, &viewport_offset, 1_999),
+    );
+    try std.testing.expectEqual(@as(i32, 7), viewport_offset);
+
+    try std.testing.expectEqual(
+        RelayEnd.unresponsive,
+        checkResizeRepaintTimeout(&pending, &viewport_offset, 2_000).?,
+    );
+    try std.testing.expectEqual(@as(i32, 0), viewport_offset);
+    try std.testing.expect(pending.requiresRepaintForRecovery());
+}
+
 test "relay drains pending session end before monitor timeout" {
     const input = try posix.pipe();
     defer posix.close(input[0]);
@@ -2371,6 +2488,40 @@ test "recovery polling ignores draw while repaint is outstanding" {
     try std.testing.expectEqual(@as(usize, 0), session.scrollback_cursor.len);
     try std.testing.expectEqual(@as(i32, 0), session.viewport_offset);
     try std.testing.expect(session.pending_repaint.active());
+}
+
+test "recovery polling waits for resize repaint after input ack" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var session = RuntimeSession{};
+    defer session.relay_end_restore.deinit(app_allocator.allocator());
+    const repaint_seq = session.pending_repaint.startResizeAt(1_000);
+
+    const ack_payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeInputAck{
+        .input_seq = 1,
+    });
+    defer app_allocator.allocator().free(ack_payload);
+    try protocol.sendFrame(fds[1], .te_input_ack, ack_payload);
+
+    try std.testing.expectEqual(@as(?RuntimeRecovery, null), try pollRuntimeRecovery(fds[0], &session, 0));
+    try std.testing.expect(session.pending_repaint.requiresRepaintForRecovery());
+
+    const repaint_payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeRepaintResponse{
+        .repaint_request_seq = repaint_seq,
+        .draw = .{
+            .scrollback_cursor = "fresh-cursor",
+            .viewport_offset = 0,
+            .draw_bytes = "",
+        },
+    });
+    defer app_allocator.allocator().free(repaint_payload);
+    try protocol.sendFrame(fds[1], .te_repaint_response, repaint_payload);
+
+    try std.testing.expectEqual(RuntimeRecovery.recovered, (try pollRuntimeRecovery(fds[0], &session, 0)).?);
+    try std.testing.expect(!session.pending_repaint.active());
+    try std.testing.expectEqualStrings("fresh-cursor", session.scrollback_cursor.slice());
 }
 
 test "repaint response applies only latest outstanding request" {
@@ -5255,6 +5406,7 @@ pub fn pollRuntimeRecovery(
         },
         .te_input_ack => {
             _ = try handleInputAckFrame(frame.payload, &session.input_ack_tracker);
+            if (session.pending_repaint.requiresRepaintForRecovery()) return null;
             return .recovered;
         },
         .te_client_repaint_request => return null,
@@ -5289,6 +5441,20 @@ pub fn pollAndForwardReconnectInput(
     reconnect_ui: *ReconnectUi,
     timeout_ms: i32,
 ) !ReconnectInputPumpResult {
+    try reconnect_ui.refreshForResize();
+    if (reconnect_ui.consumeResizeForRuntime()) {
+        session.viewport_offset = reconnect_ui.currentViewportOffset();
+        sendResizeWithRepaint(
+            write_fd,
+            terminal.currentWindowSize(),
+            &session.scrollback_cursor,
+            session.viewport_offset,
+            &session.pending_repaint,
+        ) catch |err| switch (err) {
+            error.WriteFailed => return .transport_closed,
+            else => return err,
+        };
+    }
     try reconnect_ui.refreshBannerIfDiagnosticsChanged();
 
     var pollfds = [_]posix.pollfd{.{
@@ -6203,6 +6369,8 @@ fn relayTerminal(
             else => return err,
         };
 
+        if (checkResizeRepaintTimeout(pending_repaint, viewport_offset, std.time.milliTimestamp())) |end| return end;
+
         if (connection_monitor.isUnresponsive()) {
             return .unresponsive;
         }
@@ -6561,6 +6729,20 @@ fn restoreLocalTerminalPresentation() void {
     }
 }
 
+fn clearVisibleAfterResizeTimeout(viewport_offset: *i32) void {
+    viewport_offset.* = 0;
+    if (c.isatty(1) == 0) return;
+    const renderer = client_renderer.Renderer.init(1);
+    renderer.restorePresentation(queryInitialKittyKeyboardFlags()) catch {};
+    renderer.clearVisible() catch {};
+}
+
+fn checkResizeRepaintTimeout(pending_repaint: *const PendingRepaint, viewport_offset: *i32, now_ms: i64) ?RelayEnd {
+    if (!pending_repaint.resizeTimedOut(now_ms)) return null;
+    clearVisibleAfterResizeTimeout(viewport_offset);
+    return .unresponsive;
+}
+
 fn requestSessionDetach(read_fd: c.fd_t, write_fd: c.fd_t) RelayEnd {
     _ = read_fd;
     _ = write_fd;
@@ -6713,7 +6895,7 @@ fn sendResizeWithRepaint(
     viewport_offset: i32,
     pending_repaint: *PendingRepaint,
 ) !void {
-    const repaint_request_seq = pending_repaint.start();
+    const repaint_request_seq = pending_repaint.startResize();
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeResize{
         .terminal_rows = size.rows,
         .terminal_cols = size.cols,
