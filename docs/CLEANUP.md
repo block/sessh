@@ -7,12 +7,11 @@ resumed later by another command.
 
 Remote session agents therefore clean themselves up with two mechanisms:
 
-- A normal session exit writes a tombstone and removes live runtime files.
+- A normal session exit removes live routing and runtime files.
 - `reap-hours` lets an agent exit after it has been disconnected for too long.
 
-`tombstone-hours` controls how long tombstones remain in state. Both values are
-recorded when the agent is created, so later config changes do not rewrite the
-meaning of an existing session.
+`reap-hours` is recorded when the agent is created, so later config changes do
+not rewrite the meaning of an existing session.
 
 Future guardian-process work may add stronger cleanup for orphaned remote
 processes. That should not reintroduce a public list/attach/kill surface.

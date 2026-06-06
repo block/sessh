@@ -52,27 +52,6 @@ pub const RuntimeRecovery = enum {
     detach,
 };
 
-pub const CreatedSession = struct {
-    guid: []u8,
-    session_dir: []u8,
-    host_guid: []u8,
-
-    pub fn deinit(self: *CreatedSession) void {
-        const allocator = app_allocator.allocator();
-        allocator.free(self.host_guid);
-        allocator.free(self.session_dir);
-        allocator.free(self.guid);
-        self.* = undefined;
-    }
-
-    fn setHostGuid(self: *CreatedSession, host_guid: []const u8) !void {
-        if (!session_registry.isValidHostGuid(host_guid)) return error.InvalidHostGuid;
-        const copy = try app_allocator.allocator().dupe(u8, host_guid);
-        app_allocator.allocator().free(self.host_guid);
-        self.host_guid = copy;
-    }
-};
-
 pub const AttachedClientOptions = struct {
     monitor_connection: bool = false,
     responsiveness_timeout_floor_ms: i64 = default_responsiveness_timeout_ms,
@@ -300,7 +279,7 @@ pub const RuntimeSession = struct {
     input_ack_tracker: InputAckTracker = .{},
     input_escape_filter: terminal.EscapeFilter = .{},
     paste_like_input_classifier: PasteLikeInputClassifier = .{},
-    ended_tombstone_details: ?session_registry.TombstoneDetails = null,
+    ended_process_exit_code: ?u8 = null,
     /// Local-only fallback for the terminal title while this session is active.
     /// For remote sessh this is the host string the user passed locally. We do
     /// not send it to the session agent because ssh aliases can reveal local
@@ -425,37 +404,20 @@ pub const RuntimeSession = struct {
     fn recordSessionEndedPayload(self: *RuntimeSession, payload: []const u8) !void {
         var ended = try protocol.decodePayload(pb.TeSessionEnded, app_allocator.allocator(), payload);
         defer ended.deinit(app_allocator.allocator());
-        self.ended_tombstone_details = tombstoneDetailsFromSessionEnded(ended);
+        self.ended_process_exit_code = processExitCodeFromSessionEnded(ended);
     }
 
     pub fn endedProcessExitCode(self: *const RuntimeSession) u8 {
-        return processExitCodeFromTombstoneDetails(self.ended_tombstone_details);
+        return self.ended_process_exit_code orelse 0;
     }
 };
 
-fn tombstoneDetailsFromSessionEnded(ended: pb.TeSessionEnded) session_registry.TombstoneDetails {
-    return .{
-        .ended_at_unix_ms = ended.ended_at_unix_ms orelse nowUnixMs(),
-        .end_reason = switch (ended.reason) {
-            .TE_SESSION_END_REASON_PROCESS_EXITED => .process_exited,
-            .TE_SESSION_END_REASON_KILLED_BY_REQUEST => .killed_by_request,
-            .TE_SESSION_END_REASON_AGENT_SHUTDOWN => .agent_shutdown,
-            .TE_SESSION_END_REASON_REAPED => .reaped,
-            else => .unknown,
-        },
-        .exit_status = if (ended.exit_status) |status| switch (status.kind) {
-            .EXIT_STATUS_KIND_EXITED => .{ .kind = .exited, .status = status.status },
-            .EXIT_STATUS_KIND_SIGNALLED => .{ .kind = .signalled, .status = status.status },
-            else => null,
-        } else null,
-    };
-}
-
-fn processExitCodeFromTombstoneDetails(details: ?session_registry.TombstoneDetails) u8 {
-    const status = if (details) |value| value.exit_status orelse return 0 else return 0;
+fn processExitCodeFromSessionEnded(ended: pb.TeSessionEnded) u8 {
+    const status = ended.exit_status orelse return 0;
     return switch (status.kind) {
-        .exited => if (status.status >= 0 and status.status <= 255) @intCast(status.status) else 255,
-        .signalled => if (status.status >= 0 and status.status <= 127) @intCast(128 + status.status) else 255,
+        .EXIT_STATUS_KIND_EXITED => if (status.status >= 0 and status.status <= 255) @intCast(status.status) else 255,
+        .EXIT_STATUS_KIND_SIGNALLED => if (status.status >= 0 and status.status <= 127) @intCast(128 + status.status) else 255,
+        else => 0,
     };
 }
 
@@ -1004,85 +966,32 @@ pub fn startNewSessionOnRuntime(
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     reap_ms: u64,
-    tombstone_retention_ms: u64,
 ) !RuntimeSession {
     const size = terminal.currentWindowSize();
     const viewport_offset = queryInitialViewportOffset();
-    var created = try createSessionOnRuntimeWithSize(
-        read_fd,
-        write_fd,
-        size,
-        scrollback_row_count,
-        session_guid,
-        command_argv,
-        shell_command,
-        reap_ms,
-        tombstone_retention_ms,
-    );
-    defer created.deinit();
-    const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
-    defer app_allocator.allocator().free(client_guid);
-    const repaint_request_seq = try sendSessionAttach(write_fd, size, viewport_offset, null, null, created.guid, client_guid, "");
-    var session = try readRuntimeSession(read_fd);
-    try session.setClientGuid(client_guid);
-    try session.setHostGuid(created.host_guid);
-    session.viewport_offset = viewport_offset orelse 0;
-    session.pending_repaint.repaint_request_seq = repaint_request_seq;
-    return session;
-}
-
-pub fn createSessionOnRuntime(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    scrollback_row_count: u32,
-    session_guid: []const u8,
-    command_argv: []const []const u8,
-    shell_command: ?[]const u8,
-    reap_ms: u64,
-    tombstone_retention_ms: u64,
-) !CreatedSession {
-    return createSessionOnRuntimeWithSize(
-        read_fd,
-        write_fd,
-        terminal.currentWindowSize(),
-        scrollback_row_count,
-        session_guid,
-        command_argv,
-        shell_command,
-        reap_ms,
-        tombstone_retention_ms,
-    );
-}
-
-fn createSessionOnRuntimeWithSize(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    size: WindowSize,
-    scrollback_row_count: u32,
-    session_guid: []const u8,
-    command_argv: []const []const u8,
-    shell_command: ?[]const u8,
-    reap_ms: u64,
-    tombstone_retention_ms: u64,
-) !CreatedSession {
     const handshake = try runtimeHandshakeWithPeerProtocol(read_fd, write_fd);
     const peer_supports_command_oneof = peerSupportsSessionCreateCommandOneof(handshake.peer_protocol);
     if (shell_command != null and !peer_supports_command_oneof) return error.VersionMismatch;
-    var created = try sendSessionCreateAndReadCreated(
-        read_fd,
+    const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
+    defer app_allocator.allocator().free(client_guid);
+    const repaint_request_seq = try sendSessionCreate(
         write_fd,
         size,
+        viewport_offset,
         scrollback_row_count,
         session_guid,
         command_argv,
         shell_command,
         peer_supports_command_oneof,
         reap_ms,
-        tombstone_retention_ms,
+        client_guid,
     );
-    errdefer created.deinit();
-    try created.setHostGuid(handshake.hostGuidSlice());
-    return created;
+    var session = try readRuntimeSession(read_fd);
+    try session.setClientGuid(client_guid);
+    try session.setHostGuid(handshake.hostGuidSlice());
+    session.viewport_offset = viewport_offset orelse 0;
+    session.pending_repaint.repaint_request_seq = repaint_request_seq;
+    return session;
 }
 
 pub fn startAttachSessionOnRuntime(
@@ -1112,7 +1021,6 @@ pub fn ensureLocalRouteForRemoteSession(
     resolved_host: []const u8,
     port: []const u8,
     ssh_options: []const []const u8,
-    tombstone_retention_ms: u64,
 ) !void {
     if (session.guidSlice().len == 0) return;
     try session_registry.writeSshRoute(
@@ -1125,38 +1033,7 @@ pub fn ensureLocalRouteForRemoteSession(
         port,
         ssh_options,
         config.version,
-        tombstone_retention_ms,
     );
-}
-
-pub fn ensureLocalRouteForCreatedRemoteSession(
-    allocator: std.mem.Allocator,
-    created: *const CreatedSession,
-    host: []const u8,
-    resolved_host: []const u8,
-    port: []const u8,
-    ssh_options: []const []const u8,
-    tombstone_retention_ms: u64,
-) !void {
-    try session_registry.writeSshRoute(
-        allocator,
-        created.guid,
-        created.session_dir,
-        created.host_guid,
-        host,
-        resolved_host,
-        port,
-        ssh_options,
-        config.version,
-        tombstone_retention_ms,
-    );
-}
-
-pub fn tombstoneLocalRouteForRemoteSession(allocator: std.mem.Allocator, session: *const RuntimeSession) !void {
-    const details = session.ended_tombstone_details orelse return;
-    var route = session_registry.readRouteForRef(allocator, session.guidSlice()) catch return;
-    defer route.deinit(allocator);
-    try session_registry.writeTombstoneForRoute(allocator, &route, details);
 }
 
 pub fn reconnectSessionOnRuntime(
@@ -1292,7 +1169,7 @@ pub fn runAttachedClient(
         &session.attached_client_end_restore,
         &session.input_ack_tracker,
         &session.paste_like_input_classifier,
-        &session.ended_tombstone_details,
+        &session.ended_process_exit_code,
         &session.app_title_present,
         .{
             .monitor_connection = options.monitor_connection,
@@ -1476,37 +1353,6 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                 try session.setIdentity(attached.session_guid);
                 try session.setSessionDir(attached.session_dir);
                 return session;
-            },
-            else => return error.UnexpectedFrame,
-        }
-    }
-}
-
-fn readSessionCreated(read_fd: c.fd_t, write_fd: c.fd_t) !CreatedSession {
-    while (true) {
-        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
-        defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .error_message => {
-                const parsed = try parseErrorPayload(frame.payload);
-                if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
-                    freeErrorPayload(parsed);
-                    return error.VersionMismatch;
-                }
-                try printParsedError(parsed);
-                return process_exit.request(1);
-            },
-            .te_session_created => {
-                var message = try protocol.decodePayload(pb.TeSessionCreated, app_allocator.allocator(), frame.payload);
-                defer message.deinit(app_allocator.allocator());
-                return .{
-                    .guid = try app_allocator.allocator().dupe(u8, message.session_guid),
-                    .session_dir = try app_allocator.allocator().dupe(u8, message.session_dir),
-                    .host_guid = try app_allocator.allocator().alloc(u8, 0),
-                };
-            },
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
             else => return error.UnexpectedFrame,
         }
@@ -1771,43 +1617,35 @@ fn errorPayloadFromHelloError(response_error: hpb.HelloError) ErrorPayload {
     };
 }
 
-fn sendSessionCreateAndReadCreated(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    size: WindowSize,
-    scrollback_row_count: u32,
-    session_guid: []const u8,
-    command_argv: []const []const u8,
-    shell_command: ?[]const u8,
-    peer_supports_command_oneof: bool,
-    reap_ms: u64,
-    tombstone_retention_ms: u64,
-) !CreatedSession {
-    try sendSessionCreate(write_fd, size, scrollback_row_count, session_guid, command_argv, shell_command, peer_supports_command_oneof, reap_ms, tombstone_retention_ms);
-    return readSessionCreated(read_fd, write_fd);
-}
-
 fn sendSessionCreate(
     conn: c.fd_t,
     size: WindowSize,
+    viewport_offset: ?i32,
     scrollback_row_count: u32,
     session_guid: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     peer_supports_command_oneof: bool,
     reap_ms: u64,
-    tombstone_retention_ms: u64,
-) !void {
+    client_guid: []const u8,
+) !u64 {
     if (command_argv.len > 0 and shell_command != null) return error.InvalidSessionCommand;
+    const repaint_request_seq = allocateRepaintRequestSeq();
     var message = pb.TeSessionCreate{
-        .terminal_size = .{
+        .resize = .{
             .terminal_rows = size.rows,
             .terminal_cols = size.cols,
+            .viewport_offset = viewport_offset,
+            .repaint_request = .{
+                .repaint_request_seq = repaint_request_seq,
+                .scrollback_cursor = "",
+            },
         },
         .scrollback_row_limit = scrollback_row_count,
         .session_guid = session_guid,
         .reap_ms = reap_ms,
-        .tombstone_retention_ms = tombstone_retention_ms,
+        .client_guid = client_guid,
+        .capture_tty_transcript = tty_transcript.enabled(),
     };
     defer message.environment.deinit(app_allocator.allocator());
     defer message.legacy_command_argv.deinit(app_allocator.allocator());
@@ -1848,6 +1686,7 @@ fn sendSessionCreate(
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(conn, .te_session_create, payload);
+    return repaint_request_seq;
 }
 
 const ProtocolDefaultColors = struct {
@@ -1973,7 +1812,7 @@ fn runAttachedClientLoop(
     attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
-    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    ended_process_exit_code: ?*?u8,
     app_title_present: *?bool,
     options: AttachedClientOptions,
 ) !AttachedClientEnd {
@@ -2004,7 +1843,7 @@ fn runAttachedClientLoop(
         attached_client_end_restore,
         input_ack_tracker,
         paste_like_input_classifier,
-        ended_tombstone_details,
+        ended_process_exit_code,
         app_title_present,
         options,
     );
@@ -2024,7 +1863,7 @@ fn runAttachedTerminal(
     attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
-    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    ended_process_exit_code: ?*?u8,
     app_title_present: *?bool,
     options: AttachedClientOptions,
 ) !AttachedClientEnd {
@@ -2054,7 +1893,7 @@ fn runAttachedTerminal(
                 pending_repaint,
                 attached_client_end_restore,
                 input_ack_tracker,
-                ended_tombstone_details,
+                ended_process_exit_code,
                 app_title_present,
             )) |end| return finishAttachedClient(end, attached_client_end_restore);
         }
@@ -2075,7 +1914,7 @@ fn runAttachedTerminal(
                         pending_repaint,
                         attached_client_end_restore,
                         input_ack_tracker,
-                        ended_tombstone_details,
+                        ended_process_exit_code,
                         app_title_present,
                     ),
                     else => return err,
@@ -2092,7 +1931,7 @@ fn runAttachedTerminal(
                         viewport_offset,
                         pending_repaint,
                         input_ack_tracker,
-                        ended_tombstone_details,
+                        ended_process_exit_code,
                     )) |modal_end| return finishAttachedClient(modal_end, attached_client_end_restore);
                 },
                 .repaint => sendRepaint(write_fd, "", pending_repaint) catch |err| switch (err) {
@@ -2104,7 +1943,7 @@ fn runAttachedTerminal(
                         pending_repaint,
                         attached_client_end_restore,
                         input_ack_tracker,
-                        ended_tombstone_details,
+                        ended_process_exit_code,
                         app_title_present,
                     ),
                     else => return err,
@@ -2121,7 +1960,7 @@ fn runAttachedTerminal(
                 pending_repaint,
                 attached_client_end_restore,
                 input_ack_tracker,
-                ended_tombstone_details,
+                ended_process_exit_code,
                 app_title_present,
             ),
             else => return err,
@@ -2142,7 +1981,7 @@ fn showEscapeHelpModal(
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
     input_ack_tracker: *InputAckTracker,
-    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    ended_process_exit_code: ?*?u8,
 ) !?AttachedClientEnd {
     // The help overlay is local UI, not part of the remote terminal model. While
     // it is visible, remote draw frames are discarded and a repaint is requested
@@ -2165,7 +2004,7 @@ fn showEscapeHelpModal(
                 read_fd,
                 write_fd,
                 input_ack_tracker,
-                ended_tombstone_details,
+                ended_process_exit_code,
             )) |end| {
                 try clearEscapeHelpOverlay(renderer, viewport_offset, &overlay_state);
                 return end;
@@ -2242,7 +2081,7 @@ fn drainEscapeHelpRuntimeFrames(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     input_ack_tracker: *InputAckTracker,
-    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    ended_process_exit_code: ?*?u8,
 ) !?AttachedClientEnd {
     while (true) {
         var runtime_poll = [_]posix.pollfd{.{
@@ -2259,7 +2098,7 @@ fn drainEscapeHelpRuntimeFrames(
         }
         if ((revents & posix.POLL.IN) == 0) return null;
 
-        if (try handleEscapeHelpRuntimeFrame(read_fd, write_fd, input_ack_tracker, ended_tombstone_details)) |end| return end;
+        if (try handleEscapeHelpRuntimeFrame(read_fd, write_fd, input_ack_tracker, ended_process_exit_code)) |end| return end;
     }
 }
 
@@ -2267,7 +2106,7 @@ fn handleEscapeHelpRuntimeFrame(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     input_ack_tracker: *InputAckTracker,
-    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    ended_process_exit_code: ?*?u8,
 ) !?AttachedClientEnd {
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
@@ -2289,10 +2128,10 @@ fn handleEscapeHelpRuntimeFrame(
             return null;
         },
         .te_session_ended => {
-            if (ended_tombstone_details) |details| {
+            if (ended_process_exit_code) |exit_code| {
                 var ended = try protocol.decodePayload(pb.TeSessionEnded, app_allocator.allocator(), frame.payload);
                 defer ended.deinit(app_allocator.allocator());
-                details.* = tombstoneDetailsFromSessionEnded(ended);
+                exit_code.* = processExitCodeFromSessionEnded(ended);
             }
             return .session_ended;
         },
@@ -2313,7 +2152,7 @@ fn drainAttachedClientRuntimeFrames(
     pending_repaint: *PendingRepaint,
     attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
-    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    ended_process_exit_code: ?*?u8,
     app_title_present: *?bool,
 ) !?AttachedClientEnd {
     while (true) {
@@ -2340,7 +2179,7 @@ fn drainAttachedClientRuntimeFrames(
             pending_repaint,
             attached_client_end_restore,
             input_ack_tracker,
-            ended_tombstone_details,
+            ended_process_exit_code,
             app_title_present,
         )) |end| return end;
     }
@@ -2354,7 +2193,7 @@ fn finishAttachedClientAfterRuntimeWriteFailed(
     pending_repaint: *PendingRepaint,
     attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
-    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    ended_process_exit_code: ?*?u8,
     app_title_present: *?bool,
 ) !AttachedClientEnd {
     if (try drainAttachedClientRuntimeFrames(
@@ -2366,7 +2205,7 @@ fn finishAttachedClientAfterRuntimeWriteFailed(
         pending_repaint,
         attached_client_end_restore,
         input_ack_tracker,
-        ended_tombstone_details,
+        ended_process_exit_code,
         app_title_present,
     )) |end| return finishAttachedClient(end, attached_client_end_restore);
     return .transport_closed;
@@ -2381,7 +2220,7 @@ fn handleAttachedClientRuntimeFrame(
     pending_repaint: *PendingRepaint,
     attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
-    ended_tombstone_details: ?*?session_registry.TombstoneDetails,
+    ended_process_exit_code: ?*?u8,
     app_title_present: *?bool,
 ) !?AttachedClientEnd {
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
@@ -2418,10 +2257,10 @@ fn handleAttachedClientRuntimeFrame(
             return null;
         },
         .te_session_ended => {
-            if (ended_tombstone_details) |details| {
+            if (ended_process_exit_code) |exit_code| {
                 var ended = try protocol.decodePayload(pb.TeSessionEnded, app_allocator.allocator(), frame.payload);
                 defer ended.deinit(app_allocator.allocator());
-                details.* = tombstoneDetailsFromSessionEnded(ended);
+                exit_code.* = processExitCodeFromSessionEnded(ended);
             }
             return .session_ended;
         },

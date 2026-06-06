@@ -49,7 +49,6 @@ const Session = struct {
     attached: bool = false,
     detached_at_unix_ms: u64 = 0,
     reap_ms: u64 = 0,
-    tombstone_retention_ms: u64 = 0,
     alive: bool = false,
     pending_plain_output: std.ArrayList(u8) = .empty,
     pending_plain_starts_at_boundary: bool = false,
@@ -91,8 +90,6 @@ const Session = struct {
 const AttachedClient = struct {
     fd: c.fd_t = -1,
     session_index: usize = 0,
-    client_guid: [session_registry.client_guid_len]u8 = [_]u8{0} ** session_registry.client_guid_len,
-    client_guid_len: usize = 0,
     rows: u16 = 24,
     cols: u16 = 80,
     attached_at_unix_ms: u64 = 0,
@@ -109,10 +106,6 @@ const AttachedClient = struct {
 
     fn queuedBytes(self: *const AttachedClient) usize {
         return self.output.items.len - self.output_offset;
-    }
-
-    fn clientGuidSlice(self: *const AttachedClient) []const u8 {
-        return self.client_guid[0..self.client_guid_len];
     }
 };
 
@@ -686,24 +679,21 @@ const AttachRequest = struct {
     }
 };
 
-const TerminalSizePayload = struct {
-    rows: u16,
-    cols: u16,
-};
-
 const SessionCreateRequest = struct {
-    terminal_size: TerminalSizePayload,
+    resize: ResizePayload,
     scrollback_row_count: u32,
     environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
     session_guid: []u8,
+    client_guid: []u8,
     command_argv: [][]u8,
     shell_command: ?[]u8,
     tty_settings: ?tty_settings.Settings,
     reap_ms: u64,
-    tombstone_retention_ms: u64,
+    capture_tty_transcript: bool,
 
     fn deinit(self: *SessionCreateRequest) void {
+        app_allocator.allocator().free(self.client_guid);
         app_allocator.allocator().free(self.session_guid);
         for (self.command_argv) |arg| app_allocator.allocator().free(arg);
         app_allocator.allocator().free(self.command_argv);
@@ -1563,8 +1553,8 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                 defer request.deinit();
                 const session_index = createSession(
                     session_agent,
-                    request.terminal_size.rows,
-                    request.terminal_size.cols,
+                    request.resize.rows,
+                    request.resize.cols,
                     request.scrollback_row_count,
                     request.environment,
                     request.query_default_colors,
@@ -1573,15 +1563,13 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.shell_command,
                     request.tty_settings,
                     request.reap_ms,
-                    request.tombstone_retention_ms,
                 ) catch |err| return err;
                 const session = &session_agent.sessions[session_index];
                 if (session_agent.session_paths) |paths| {
-                    try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), paths.dir, config.version, session.tombstone_retention_ms);
-                    session.detached_at_unix_ms = nowUnixMs();
+                    try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), paths.dir, config.version);
                 }
-                try sendSessionCreatedForSession(session_agent, fd, session);
-                continue;
+                try attachSession(session_agent, session_index, fd, request.resize, request.client_guid, request.capture_tty_transcript);
+                return true;
             },
             .te_session_client_debug_sever_connection_request => {
                 try handleSessionClientDebugSeverConnectionRequest(session_agent, fd, frame.payload);
@@ -1845,15 +1833,6 @@ fn sendSessionAttachedForSession(session_agent: *const SessionAgent, attached_cl
     });
     defer app_allocator.allocator().free(payload);
     try queueAttachedClientFrame(attached_client, .te_session_attached, payload);
-}
-
-fn sendSessionCreatedForSession(session_agent: *const SessionAgent, fd: c.fd_t, session: *const Session) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionCreated{
-        .session_guid = session.idSlice(),
-        .session_dir = sessionDirSlice(session_agent),
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .te_session_created, payload);
 }
 
 fn handleSessionClientDebugSeverConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
@@ -2478,8 +2457,9 @@ fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
 fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
     var message = try protocol.decodePayload(pb.TeSessionCreate, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
-    const terminal_size = message.terminal_size orelse return error.MissingTerminalSize;
+    const resize = message.resize orelse return error.MissingResize;
     if (!session_registry.isValidSessionGuid(message.session_guid)) return error.InvalidSessionGuid;
+    if (!session_registry.isValidClientGuid(message.client_guid)) return error.InvalidClientGuid;
     var environment = SessionEnvironment{};
     errdefer environment.deinit();
     var query_default_colors = vt.DefaultColors{};
@@ -2517,11 +2497,12 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
     }
 
     return .{
-        .terminal_size = try terminalSizePayloadFromMessage(terminal_size),
+        .resize = try resizePayloadFromMessage(resize),
         .scrollback_row_count = message.scrollback_row_limit,
         .environment = environment,
         .query_default_colors = query_default_colors,
         .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
+        .client_guid = try app_allocator.allocator().dupe(u8, message.client_guid),
         .command_argv = command_argv,
         .shell_command = if (shell_command) |command|
             try app_allocator.allocator().dupe(u8, command)
@@ -2529,7 +2510,7 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
             null,
         .tty_settings = request_tty_settings,
         .reap_ms = message.reap_ms,
-        .tombstone_retention_ms = message.tombstone_retention_ms,
+        .capture_tty_transcript = message.capture_tty_transcript,
     };
 }
 
@@ -2571,18 +2552,6 @@ fn readResizePayload(payload: []const u8) !ResizePayload {
     var message = try protocol.decodePayload(pb.TeResize, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     return try resizePayloadFromMessage(message);
-}
-
-fn terminalSizePayloadFromMessage(message: pb.TeTerminalSize) !TerminalSizePayload {
-    if (message.terminal_rows > std.math.maxInt(u16) or
-        message.terminal_cols > std.math.maxInt(u16))
-    {
-        return error.IntOutOfRange;
-    }
-    return .{
-        .rows = @intCast(message.terminal_rows),
-        .cols = @intCast(message.terminal_cols),
-    };
 }
 
 fn resizePayloadFromMessage(message: pb.TeResize) !ResizePayload {
@@ -2646,7 +2615,6 @@ fn createSession(
     shell_command: ?[]const u8,
     settings: ?tty_settings.Settings,
     reap_ms: u64,
-    tombstone_retention_ms: u64,
 ) !usize {
     if (session_agent.fixed_session_id != null and session_agent.started_session) return error.TooManySessions;
 
@@ -2686,7 +2654,6 @@ fn createSession(
             .cols = cols,
             .scrollback_row_count = scrollback_row_count,
             .reap_ms = reap_ms,
-            .tombstone_retention_ms = tombstone_retention_ms,
             .alive = true,
         };
         @memcpy(session.id[0..session_guid.len], session_guid);
@@ -2828,21 +2795,19 @@ fn attachSession(
     capture_tty_transcript: bool,
 ) !void {
     const session = &session_agent.sessions[session_index];
-    detachExistingAttachedClientWithClientGuid(session_agent, session_index, client_guid);
+    detachExistingAttachedClientsForSession(session_agent, session_index);
 
     for (&session_agent.attached_clients, 0..) |*attached_client, attached_client_index| {
         if (attached_client.active) continue;
         attached_client.* = .{
             .fd = client_fd,
             .session_index = session_index,
-            .client_guid_len = client_guid.len,
             .rows = resize.rows,
             .cols = resize.cols,
             .attached_at_unix_ms = nowUnixMs(),
             .active = true,
             .capture_tty_transcript = capture_tty_transcript,
         };
-        @memcpy(attached_client.client_guid[0..client_guid.len], client_guid);
         attached_client.presentation.setViewportOffset(resize.viewport_offset);
         errdefer {
             attached_client.output.deinit(app_allocator.allocator());
@@ -2869,10 +2834,9 @@ fn attachSession(
     return error.TooManyAttachedClients;
 }
 
-fn detachExistingAttachedClientWithClientGuid(session_agent: *SessionAgent, session_index: usize, client_guid: []const u8) void {
+fn detachExistingAttachedClientsForSession(session_agent: *SessionAgent, session_index: usize) void {
     for (&session_agent.attached_clients, 0..) |*attached_client, attached_client_index| {
         if (!attached_client.active or attached_client.session_index != session_index) continue;
-        if (!std.mem.eql(u8, attached_client.clientGuidSlice(), client_guid)) continue;
         detachAttachedClient(session_agent, attached_client_index);
     }
 }
@@ -3757,7 +3721,6 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
         });
     }
     sendSessionEndedToAttachedClients(session_agent, session_index, reason, exit_info);
-    writeEndedSessionTombstone(session_agent, session, reason, exit_info);
     if (session.pty_fd >= 0) _ = c.close(session.pty_fd);
     if (session.terminal_model) |model| {
         model.destroy();
@@ -3767,33 +3730,6 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
     session.deinit();
     session.alive = false;
     session.attached = false;
-}
-
-fn writeEndedSessionTombstone(session_agent: *SessionAgent, session: *const Session, reason: u8, exit_info: ExitInfo) void {
-    const allocator = app_allocator.allocator();
-    var route = session_registry.readRouteForRef(allocator, session.idSlice()) catch |err| {
-        logSessionAgent(session_agent, "event=tombstone_route_missing id={s} error={t}", .{ session.idSlice(), err });
-        return;
-    };
-    defer route.deinit(allocator);
-
-    const exit_status: ?session_registry.TombstoneExitStatus = switch (exit_info.kind) {
-        1 => .{ .kind = .exited, .status = exit_info.status },
-        2 => .{ .kind = .signalled, .status = exit_info.status },
-        else => null,
-    };
-    session_registry.writeTombstoneForRoute(allocator, &route, .{
-        .ended_at_unix_ms = if (exit_info.ended_at_unix_ms == 0) nowUnixMs() else exit_info.ended_at_unix_ms,
-        .end_reason = switch (reason) {
-            1 => .killed_by_request,
-            2 => .agent_shutdown,
-            3 => .reaped,
-            else => .process_exited,
-        },
-        .exit_status = exit_status,
-    }) catch |err| {
-        logSessionAgent(session_agent, "event=tombstone_write_failed id={s} error={t}", .{ session.idSlice(), err });
-    };
 }
 
 fn clearAttachedClientHints(session_agent: *SessionAgent) void {

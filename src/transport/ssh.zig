@@ -83,7 +83,6 @@ const ResolvedSshTarget = struct {
 const SessionRuntimeConfig = struct {
     common: CommonSessionOptions,
     reap_ms: u64 = config.default_reap_ms,
-    tombstone_retention_ms: u64 = config.default_tombstone_retention_ms,
 };
 
 const RemoteNewSession = struct {
@@ -325,7 +324,6 @@ fn remoteSessionConfig(
         if (file_config.filter_level) |level| result.common.filter_level = level;
     }
     if (file_config.reap_ms) |ms| result.reap_ms = ms;
-    if (file_config.tombstone_retention_ms) |ms| result.tombstone_retention_ms = ms;
     if (!result.common.client_log_level_set) {
         if (file_config.client_log_level) |level| {
             result.common.client_log_level = level;
@@ -400,7 +398,6 @@ fn runRemoteNewSession(
         new.command_argv,
         shell_command,
         runtime_config.reap_ms,
-        runtime_config.tombstone_retention_ms,
     ) catch |err| {
         if (err == error.VersionMismatch) {
             child.closeStdin();
@@ -430,7 +427,6 @@ fn runRemoteNewSession(
         target.resolved_host,
         target.resolved_port,
         target.options,
-        runtime_config.tombstone_retention_ms,
     );
     try runAttachedRemoteClient(
         allocator,
@@ -522,7 +518,7 @@ fn runAttachedRemoteClient(
             },
             .session_ended => {
                 client_log.debug("event=session_ended host={s} session={s}", .{ target.host, session.idSlice() });
-                const exit_status = try finishEndedRemoteSession(allocator, child, session);
+                const exit_status = try finishEndedRemoteSession(child, session);
                 return process_exit.request(exit_status);
             },
             .unresponsive => {
@@ -573,7 +569,7 @@ fn runAttachedRemoteClient(
                         session,
                     ) catch |err| switch (err) {
                         error.SessionEnded => {
-                            const exit_status = try finishEndedRemoteSession(allocator, child, session);
+                            const exit_status = try finishEndedRemoteSession(child, session);
                             return process_exit.request(exit_status);
                         },
                         else => return err,
@@ -590,7 +586,7 @@ fn runAttachedRemoteClient(
                     session.viewport_offset = try reconnect_ui.clearOverlay();
                     attached_client.finishReconnectRepaint(child.child.stdout.?.handle, child.child.stdin.?.handle, session) catch |err| switch (err) {
                         error.SessionEnded => {
-                            const exit_status = try finishEndedRemoteSession(allocator, child, session);
+                            const exit_status = try finishEndedRemoteSession(child, session);
                             return process_exit.request(exit_status);
                         },
                         else => return err,
@@ -605,7 +601,7 @@ fn runAttachedRemoteClient(
                     continue;
                 },
                 .session_ended => {
-                    const exit_status = try finishEndedRemoteSession(allocator, child, session);
+                    const exit_status = try finishEndedRemoteSession(child, session);
                     return process_exit.request(exit_status);
                 },
                 .detach => {
@@ -800,15 +796,23 @@ fn finishDetachedSshSession(
 }
 
 fn finishEndedRemoteSession(
-    allocator: std.mem.Allocator,
     child: *RuntimeConnection,
     session: *attached_client.RuntimeSession,
 ) !u8 {
     const exit_status = session.endedProcessExitCode();
+    if (session.guidSlice().len > 0) {
+        var maybe_paths: ?session_registry.SessionPaths = session_registry.pathsForSessionId(std.heap.page_allocator, session.guidSlice()) catch |err| blk: {
+            client_log.debug("event=remote_session_route_cleanup_resolve_failed session={s} error={t}", .{ session.idSlice(), err });
+            break :blk null;
+        };
+        if (maybe_paths) |*paths| {
+            defer paths.deinit(std.heap.page_allocator);
+            session_registry.removeEndedHints(paths.*) catch |err| {
+                client_log.debug("event=remote_session_route_cleanup_failed session={s} error={t}", .{ session.idSlice(), err });
+            };
+        }
+    }
     session.restoreAttachedClientEndPresentationForExit();
-    attached_client.tombstoneLocalRouteForRemoteSession(allocator, session) catch |err| {
-        client_log.debug("event=local_tombstone_failed session={s} error={t}", .{ session.idSlice(), err });
-    };
     child.closeStdin();
     _ = child.wait() catch {};
     client_log.flush(2);
@@ -2242,7 +2246,6 @@ pub fn printSshArgError(err: anyerror) !void {
         error.UnsupportedSesshOption => try io.writeAll(2, "sessh: unsupported sessh option for ssh transport\n"),
         error.UnsupportedSesshCliOption => try io.writeAll(2, "sessh: unsupported sessh option\n"),
         error.UnsupportedSshOption => try io.writeAll(2, "sessh: unsupported ssh option for sessh transport\n"),
-        error.SessionAlreadyExited => try io.writeAll(2, "ERROR session already exited\n"),
         else => try io.stderrPrint("sessh: invalid ssh arguments: {t}\n", .{err}),
     }
 }

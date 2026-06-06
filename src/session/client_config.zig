@@ -13,7 +13,6 @@ pub const FileConfig = struct {
     terminal_emulator: ?bool = null,
     filter_level: ?config.FilterLevel = null,
     reap_ms: ?u64 = null,
-    tombstone_retention_ms: ?u64 = null,
 };
 
 pub fn loadFileConfig(allocator: std.mem.Allocator) !FileConfig {
@@ -78,8 +77,6 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
             parsed.filter_level = try config.parseFilterLevel(value);
         } else if (keyMatches(key, "reap-hours")) {
             parsed.reap_ms = try parseReapHours(value);
-        } else if (keyMatches(key, "tombstone-hours")) {
-            parsed.tombstone_retention_ms = try parseTombstoneHours(value);
         } else {
             return error.UnknownConfigKey;
         }
@@ -127,10 +124,6 @@ pub fn parseReapHours(value: []const u8) !u64 {
     return parseHoursMs(value, error.InvalidReapHours);
 }
 
-pub fn parseTombstoneHours(value: []const u8) !u64 {
-    return parseHoursMs(value, error.InvalidTombstoneHours);
-}
-
 fn parseHoursMs(value: []const u8, invalid_error: anyerror) !u64 {
     const parsed = std.fmt.parseFloat(f64, value) catch return invalid_error;
     if (parsed != parsed) return invalid_error;
@@ -167,7 +160,6 @@ test "parseEnvConfig accepts sessh env keys" {
         \\terminal-emulator=no
         \\filter-level=hygienic
         \\reap-hours=1.5
-        \\tombstone-hours=2
         \\
     );
     try std.testing.expectEqual(@as(?u32, 42), parsed.scrollback_row_count);
@@ -178,7 +170,6 @@ test "parseEnvConfig accepts sessh env keys" {
     try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
     try std.testing.expectEqual(@as(?config.FilterLevel, .hygienic), parsed.filter_level);
     try std.testing.expectEqual(@as(?u64, 5_400_000), parsed.reap_ms);
-    try std.testing.expectEqual(@as(?u64, 7_200_000), parsed.tombstone_retention_ms);
 }
 
 test "parseEnvConfig maps initial scrollback minus one to all retained rows" {
@@ -187,13 +178,10 @@ test "parseEnvConfig maps initial scrollback minus one to all retained rows" {
     try std.testing.expectEqual(@as(?u32, null), parsed.initial_scrollback_row_count);
 }
 
-test "parseEnvConfig maps non-positive reap and tombstone hours to disabled" {
+test "parseEnvConfig maps non-positive reap hours to disabled" {
     const negative = try parseEnvConfig("reap-hours=-1\n");
     try std.testing.expectEqual(@as(?u64, 0), negative.reap_ms);
 
     const zero = try parseEnvConfig("reap_hours=0\n");
     try std.testing.expectEqual(@as(?u64, 0), zero.reap_ms);
-
-    const tombstone_zero = try parseEnvConfig("tombstone-hours=0\n");
-    try std.testing.expectEqual(@as(?u64, 0), tombstone_zero.tombstone_retention_ms);
 }

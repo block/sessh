@@ -7,7 +7,6 @@ pub const default_debug_unresponsive_seconds = 10;
 pub const default_filter_level: FilterLevel = .emulated;
 pub const hour_ms: u64 = 60 * 60 * 1000;
 pub const default_reap_ms: u64 = 168 * hour_ms;
-pub const default_tombstone_retention_ms: u64 = 168 * hour_ms;
 
 pub const session_guid_env = "SESSH_GUID";
 pub const client_version_env = "SESSH_CLIENT_VERSION";

@@ -18,7 +18,6 @@ pub const MessageType = enum {
     te_resize,
     te_repaint_request,
 
-    te_session_created,
     te_session_attached,
     te_session_ended,
     te_draw,
@@ -160,7 +159,6 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .te_input => |message| ownedFrameFromMessage(allocator, .te_input, message),
             .te_resize => |message| ownedFrameFromMessage(allocator, .te_resize, message),
             .te_repaint_request => |message| ownedFrameFromMessage(allocator, .te_repaint_request, message),
-            .te_session_created => |message| ownedFrameFromMessage(allocator, .te_session_created, message),
             .te_session_attached => |message| ownedFrameFromMessage(allocator, .te_session_attached, message),
             .te_session_ended => |message| ownedFrameFromMessage(allocator, .te_session_ended, message),
             .te_draw => |message| ownedFrameFromMessage(allocator, .te_draw, message),
@@ -253,11 +251,6 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.TeRepaintRequest, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_repaint_request = message } });
-        },
-        .te_session_created => blk: {
-            var message = try decodePayload(pb.TeSessionCreated, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_created = message } });
         },
         .te_session_attached => blk: {
             var message = try decodePayload(pb.TeSessionAttached, allocator, payload);

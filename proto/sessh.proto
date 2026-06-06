@@ -26,7 +26,6 @@ message Frame {
     TeInput te_input = 13;
     TeResize te_resize = 14;
     TeRepaintRequest te_repaint_request = 15;
-    TeSessionCreated te_session_created = 17;
     TeSessionAttached te_session_attached = 18;
     TeSessionEnded te_session_ended = 19;
     TeDraw te_draw = 20;
@@ -143,16 +142,6 @@ message Pong {
 
 // Embedded in TeSessionCreate.
 //
-// Initial terminal size used when creating a new PTY session.
-message TeTerminalSize {
-  // Rows visible in the terminal. The session agent bounds this to u16.
-  uint32 terminal_rows = 1;
-  // Columns visible in the terminal. The session agent bounds this to u16.
-  uint32 terminal_cols = 2;
-}
-
-// Embedded in TeSessionCreate.
-//
 // Portable PTY settings captured from the client-side tty before sessh puts it
 // into raw mode. This follows SSH's pty-req model: do not send a native
 // termios struct, because those layouts and flag values are OS-specific.
@@ -214,13 +203,12 @@ message TeShellCommand {
 
 // Framed payload, client -> session agent.
 //
-// Creates a new interactive PTY session without attaching this client. A
-// successful TeSessionCreate is followed by TeSessionCreated. The client may
-// then attach using TeSessionAttach on the same connection, or close the connection
-// and leave the session detached.
+// Creates a new interactive PTY session and attaches this client. A successful
+// TeSessionCreate is followed by TeSessionAttached for the new session, then
+// TeDraw/TeRepaintResponse messages.
 message TeSessionCreate {
-  // Initial PTY size.
-  TeTerminalSize terminal_size = 1;
+  // Initial PTY size and repaint request for the attaching client.
+  TeResize resize = 1;
   // Maximum session-agent-retained scrollback rows for this session.
   uint32 scrollback_row_limit = 2;
   // Session environment entries. Currently SHELL is the only used key.
@@ -246,9 +234,12 @@ message TeSessionCreate {
   // Maximum time the session may remain detached before the agent ends it.
   // Zero means disabled.
   uint64 reap_ms = 11;
-  // How long tombstones for this session should be retained after it exits.
-  // Zero means no automatic tombstone cleanup.
-  uint64 tombstone_retention_ms = 12;
+  // Canonical client GUID in c-prefixed hyphenated UUID form. This identifies
+  // the attaching client, not the durable session.
+  string client_guid = 12;
+  // When true, the session agent sends raw inner PTY transcript chunks for this
+  // attached client. The client still owns archive creation and storage.
+  bool capture_tty_transcript = 13;
 }
 
 // Framed payload, client -> session agent.
@@ -326,16 +317,6 @@ message TeRepaintRequest {
   // Optional cap for retained scrollback rows included with an initial attach
   // repaint. Absent means all available retained scrollback.
   optional uint32 initial_scrollback_rows = 3;
-}
-
-// Framed payload, session agent -> client.
-//
-// Confirms that a TeSessionCreate created the requested session.
-message TeSessionCreated {
-  // Canonical session GUID in s-prefixed hyphenated UUID form.
-  string session_guid = 1;
-  // Absolute path to this session's GUID directory
-  string session_dir = 3;
 }
 
 // Framed payload, session agent -> client.

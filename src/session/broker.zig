@@ -37,10 +37,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                         try sendError(1, "SESSION_REF_NOT_LOCAL", "session reference resolves to another host", "");
                         return;
                     },
-                    error.SessionAlreadyExited => {
-                        try sendError(1, "SESSION_ALREADY_EXITED", "session already exited", "");
-                        return;
-                    },
                     error.InvalidSessionId, error.MissingSessionRef, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
                         try sendError(1, "SESSION_NOT_FOUND", "session not found", "");
                         return;
@@ -89,21 +85,11 @@ fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.f
 
 fn pathsForLocalSessionRef(allocator: std.mem.Allocator, ref: []const u8) !session_registry.SessionPaths {
     if (!session_registry.isValidSessionRef(ref)) return error.InvalidSessionId;
-    const guid = session_registry.resolveRefToGuid(allocator, ref) catch |err| switch (err) {
-        error.FileNotFound => {
-            if (session_registry.tombstoneExistsForRef(allocator, ref)) return error.SessionAlreadyExited;
-            return err;
-        },
-        else => return err,
-    };
+    const guid = try session_registry.resolveRefToGuid(allocator, ref);
     defer allocator.free(guid);
 
     var route = session_registry.readRouteForRef(allocator, ref) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            if (session_registry.tombstoneExistsForRef(allocator, ref) or
-                session_registry.tombstoneExistsForRef(allocator, guid)) return error.SessionAlreadyExited;
-            break :blk null;
-        },
+        error.FileNotFound => null,
         else => return err,
     };
     if (route) |*value| {

@@ -51,7 +51,6 @@ pub const Frame = struct {
         te_input,
         te_resize,
         te_repaint_request,
-        te_session_created,
         te_session_attached,
         te_session_ended,
         te_draw,
@@ -80,7 +79,6 @@ pub const Frame = struct {
         te_input: TeInput,
         te_resize: TeResize,
         te_repaint_request: TeRepaintRequest,
-        te_session_created: TeSessionCreated,
         te_session_attached: TeSessionAttached,
         te_session_ended: TeSessionEnded,
         te_draw: TeDraw,
@@ -108,7 +106,6 @@ pub const Frame = struct {
             .te_input = fd(13, .submessage),
             .te_resize = fd(14, .submessage),
             .te_repaint_request = fd(15, .submessage),
-            .te_session_created = fd(17, .submessage),
             .te_session_attached = fd(18, .submessage),
             .te_session_ended = fd(19, .submessage),
             .te_draw = fd(20, .submessage),
@@ -956,77 +953,6 @@ pub const Pong = struct {
 
 /// Embedded in TeSessionCreate.
 ///
-/// Initial terminal size used when creating a new PTY session.
-pub const TeTerminalSize = struct {
-    terminal_rows: u32 = 0,
-    terminal_cols: u32 = 0,
-
-    pub const _desc_table = .{
-        .terminal_rows = fd(1, .{ .scalar = .uint32 }),
-        .terminal_cols = fd(2, .{ .scalar = .uint32 }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Embedded in TeSessionCreate.
-///
 /// Portable PTY settings captured from the client-side tty before sessh puts it
 /// into raw mode. This follows SSH's pty-req model: do not send a native
 /// termios struct, because those layouts and flag values are OS-specific.
@@ -1452,12 +1378,11 @@ pub const TeShellCommand = struct {
 
 /// Framed payload, client -> session agent.
 ///
-/// Creates a new interactive PTY session without attaching this client. A
-/// successful TeSessionCreate is followed by TeSessionCreated. The client may
-/// then attach using TeSessionAttach on the same connection, or close the connection
-/// and leave the session detached.
+/// Creates a new interactive PTY session and attaches this client. A successful
+/// TeSessionCreate is followed by TeSessionAttached for the new session, then
+/// TeDraw/TeRepaintResponse messages.
 pub const TeSessionCreate = struct {
-    terminal_size: ?TeTerminalSize = null,
+    resize: ?TeResize = null,
     scrollback_row_limit: u32 = 0,
     environment: std.ArrayListUnmanaged(TeEnvironmentEntry) = .empty,
     query_default_colors: ?TeDefaultColors = null,
@@ -1465,7 +1390,8 @@ pub const TeSessionCreate = struct {
     legacy_command_argv: std.ArrayListUnmanaged([]const u8) = .empty,
     tty_settings: ?TeTtySettings = null,
     reap_ms: u64 = 0,
-    tombstone_retention_ms: u64 = 0,
+    client_guid: []const u8 = &.{},
+    capture_tty_transcript: bool = false,
     command: ?command_union = null,
 
     pub const _command_case = enum {
@@ -1482,7 +1408,7 @@ pub const TeSessionCreate = struct {
     };
 
     pub const _desc_table = .{
-        .terminal_size = fd(1, .submessage),
+        .resize = fd(1, .submessage),
         .scrollback_row_limit = fd(2, .{ .scalar = .uint32 }),
         .environment = fd(3, .{ .repeated = .submessage }),
         .query_default_colors = fd(4, .submessage),
@@ -1490,7 +1416,8 @@ pub const TeSessionCreate = struct {
         .legacy_command_argv = fd(7, .{ .repeated = .{ .scalar = .string } }),
         .tty_settings = fd(10, .submessage),
         .reap_ms = fd(11, .{ .scalar = .uint64 }),
-        .tombstone_retention_ms = fd(12, .{ .scalar = .uint64 }),
+        .client_guid = fd(12, .{ .scalar = .string }),
+        .capture_tty_transcript = fd(13, .{ .scalar = .bool }),
         .command = fd(null, .{ .oneof = command_union }),
     };
 
@@ -1858,77 +1785,6 @@ pub const TeRepaintRequest = struct {
         .repaint_request_seq = fd(1, .{ .scalar = .uint64 }),
         .scrollback_cursor = fd(2, .{ .scalar = .bytes }),
         .initial_scrollback_rows = fd(3, .{ .scalar = .uint32 }),
-    };
-
-    /// Encodes the message to the writer
-    /// The allocator is used to generate submessages internally.
-    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-    pub fn encode(
-        self: @This(),
-        writer: *std.Io.Writer,
-        allocator: std.mem.Allocator,
-    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        return protobuf.encode(writer, allocator, self);
-    }
-
-    /// Decodes the message from the bytes read from the reader.
-    pub fn decode(
-        reader: *std.Io.Reader,
-        allocator: std.mem.Allocator,
-    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-        return protobuf.decode(@This(), reader, allocator);
-    }
-
-    /// Deinitializes and frees the memory associated with the message.
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        return protobuf.deinit(allocator, self);
-    }
-
-    /// Duplicates the message.
-    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
-    }
-
-    /// Decodes the message from the JSON string.
-    pub fn jsonDecode(
-        input: []const u8,
-        options: std.json.ParseOptions,
-        allocator: std.mem.Allocator,
-    ) !std.json.Parsed(@This()) {
-        return protobuf.json.decode(@This(), input, options, allocator);
-    }
-
-    /// Encodes the message to a JSON string.
-    pub fn jsonEncode(
-        self: @This(),
-        options: std.json.Stringify.Options,
-        pb_options: protobuf.json.Options,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        return protobuf.json.encode(self, options, pb_options, allocator);
-    }
-
-    /// This method is used by std.json
-    /// internally for deserialization. DO NOT RENAME!
-    pub fn jsonParse(
-        allocator: std.mem.Allocator,
-        source: anytype,
-        options: std.json.ParseOptions,
-    ) !@This() {
-        return protobuf.json.parse(@This(), allocator, source, options);
-    }
-};
-
-/// Framed payload, session agent -> client.
-///
-/// Confirms that a TeSessionCreate created the requested session.
-pub const TeSessionCreated = struct {
-    session_guid: []const u8 = &.{},
-    session_dir: []const u8 = &.{},
-
-    pub const _desc_table = .{
-        .session_guid = fd(1, .{ .scalar = .string }),
-        .session_dir = fd(3, .{ .scalar = .string }),
     };
 
     /// Encodes the message to the writer

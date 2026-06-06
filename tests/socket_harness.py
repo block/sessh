@@ -42,7 +42,6 @@ SESSION_ATTACH = "te_session_attach"
 INPUT = "te_input"
 RESIZE = "te_resize"
 REPAINT_REQUEST = "te_repaint_request"
-SESSION_CREATED = "te_session_created"
 SESSION_ATTACHED = "te_session_attached"
 SESSION_ENDED = "te_session_ended"
 DRAW = "te_draw"
@@ -65,7 +64,6 @@ _FRAME_FIELDS = {
     INPUT: INPUT,
     RESIZE: RESIZE,
     REPAINT_REQUEST: REPAINT_REQUEST,
-    SESSION_CREATED: SESSION_CREATED,
     SESSION_ATTACHED: SESSION_ATTACHED,
     SESSION_ENDED: SESSION_ENDED,
     DRAW: DRAW,
@@ -361,15 +359,31 @@ def pack_session_create(
     legacy_command_argv=None,
     shell_command=None,
     tty_settings=None,
+    initial_scrollback=None,
+    client_guid=None,
 ):
+    global _NEXT_REPAINT_REQUEST_SEQ, _NEXT_CLIENT_GUID
     pb = sessh_pb()
     message = pb.TeSessionCreate(scrollback_row_limit=scrollback)
     if session_id is None:
         session_id = test_session_guid(1)
     message.session_guid = guid_for_ref(session_id)
+    if client_guid is None:
+        client_guid = client_guid_for_index(_NEXT_CLIENT_GUID)
+        _NEXT_CLIENT_GUID += 1
+    if not _CLIENT_GUID_RE.match(client_guid):
+        raise AssertionError(f"invalid client guid: {client_guid}")
+    message.client_guid = client_guid
     rows, cols = _LAST_RESIZE
-    message.terminal_size.terminal_rows = rows
-    message.terminal_size.terminal_cols = cols
+    message.resize.terminal_rows = rows
+    message.resize.terminal_cols = cols
+    repaint = message.resize.repaint_request
+    repaint.repaint_request_seq = _NEXT_REPAINT_REQUEST_SEQ
+    _NEXT_REPAINT_REQUEST_SEQ += 1
+    if initial_scrollback != 0:
+        repaint.scrollback_cursor = b""
+    if initial_scrollback is not None:
+        repaint.initial_scrollback_rows = initial_scrollback
     entry = message.environment.add()
     entry.name = "SHELL"
     entry.value = str(shell)
@@ -471,12 +485,6 @@ def assert_session_attached(payload):
     return message
 
 
-def assert_session_created(payload):
-    message = sessh_pb().TeSessionCreated()
-    message.ParseFromString(payload)
-    return message
-
-
 def create_and_attach_session(
     conn,
     shell,
@@ -504,15 +512,7 @@ def create_and_attach_session(
             legacy_command_argv=legacy_command_argv,
             shell_command=shell_command,
             tty_settings=tty_settings,
-        ),
-    )
-    created = assert_session_created(recv_until_message(conn, SESSION_CREATED))
-    send_frame(
-        conn,
-        SESSION_ATTACH,
-        pack_session_attach(
             initial_scrollback=initial_scrollback,
-            session_ref=created.session_guid,
             client_guid=client_guid,
         ),
     )
@@ -1240,52 +1240,6 @@ def run_synchronized_output_protocol_test(base_env):
                     raise AssertionError(f"synchronized wrapper did not cover full draw: {output!r}")
             finally:
                 conn.close()
-        finally:
-            cleanup_runtime(env)
-
-
-def run_session_create_without_attach_protocol_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-create-detached-", dir="/tmp") as tmp:
-        env = isolated_env(tmp)
-        shell = Path(tmp) / "detached-shell"
-        shell.write_text(
-            "#!/bin/sh\n"
-            "printf 'DETACHED_READY\\n'\n"
-            "while IFS= read -r line; do\n"
-            "  [ \"$line\" = exit ] && exit 0\n"
-            "done\n"
-        )
-        shell.chmod(0o700)
-        cleanup_runtime(env)
-        try:
-            start_session_agent(env)
-
-            create = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            create.settimeout(5.0)
-            try:
-                create.connect(str(socket_path(env)))
-                send_hello(create)
-                send_resize(create)
-                send_frame(create, SESSION_CREATE, pack_session_create(shell))
-                created = assert_session_created(recv_until_message(create, SESSION_CREATED))
-            finally:
-                create.close()
-
-            attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            attach.settimeout(5.0)
-            try:
-                attach.connect(str(socket_path(env)))
-                send_hello(attach)
-                send_frame(attach, SESSION_ATTACH, pack_session_attach(session_ref=created.session_guid))
-                message_type, payload = recv_frame(attach)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
-                recv_draw_until(attach, b"DETACHED_READY")
-                send_frame(attach, INPUT, pack_bytes(b"exit\n"))
-                recv_until_message(attach, SESSION_ENDED)
-            finally:
-                attach.close()
         finally:
             cleanup_runtime(env)
 
@@ -2655,25 +2609,13 @@ def run_session_agent_registry_test(base_env):
             assert_session_attached(payload)
             send_frame(rescued_attach, INPUT, pack_bytes(b"new-client\n"))
             recv_draw_until(rescued_attach, b"AGENT:new-client")
+            send_frame(rescued_attach, INPUT, pack_bytes(b"exit\n"))
+            recv_until_message(rescued_attach, SESSION_ENDED)
             rescued_attach.close()
             rescued_attach = None
 
             conn.close()
             conn = None
-
-            attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            attach.settimeout(5.0)
-            attach.connect(str(socket_file))
-            send_hello(attach)
-            send_resize(attach, rows=4, cols=40)
-            send_frame(attach, SESSION_ATTACH, pack_session_attach(session_ref=session_42_guid))
-            message_type, payload = recv_frame(attach)
-            if message_type != SESSION_ATTACHED:
-                raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-            assert_session_attached(payload)
-
-            send_frame(attach, INPUT, pack_bytes(b"exit\n"))
-            recv_until_message(attach, SESSION_ENDED)
             proc.wait(timeout=5.0)
             wait_missing(socket_file)
             wait_missing(socket_link)
@@ -2885,7 +2827,6 @@ def main():
             run_session_agent_registry_test(env)
             run_broker_starts_session_agent_test(env)
             run_minor_version_compatibility_test(env)
-            run_session_create_without_attach_protocol_test(env)
             run_live_draw_protocol_test(env)
             run_synchronized_output_protocol_test(env)
             run_input_ack_protocol_test(env)

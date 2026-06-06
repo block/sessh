@@ -53,13 +53,11 @@ bootstrap=true
 terminal-emulator=true
 filter-level=emulated
 reap-hours=168
-tombstone-hours=168
 ```
 
 `reap-hours` controls how long a disconnected remote session agent may remain
-alive. Values less than or equal to zero disable the timeout. `tombstone-hours`
-controls how long exited-session tombstones are retained, and is recorded when
-the agent is created.
+alive. Values less than or equal to zero disable the timeout, and the value is
+recorded when the agent is created.
 
 # Sessions
 

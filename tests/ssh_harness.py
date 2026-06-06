@@ -1091,10 +1091,6 @@ def state_sessions_dir(env):
     return state_root(env) / "guid"
 
 
-def tombstones_dir(env):
-    return state_root(env) / "tombstone"
-
-
 def write_live_proxy_runtime(runtime_root_path, guid, agent_pid):
     compact = guid[2:].replace("-", "").lower()
     guid_dir = runtime_root_path / "guid" / guid
@@ -1413,22 +1409,12 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(result)
     if f"SESSH_BIN={installed.resolve()}" not in result.stdout:
         raise AssertionError(result)
-    tombstones = list(tombstones_dir(env).glob("*.json"))
-    if len(tombstones) != 1:
-        raise AssertionError("uploaded broker did not create a session tombstone")
-    tombstone = tombstones[0]
-    tombstone_json = json.loads(tombstone.read_text())
-    if tombstone_json.get("guid") != tombstone.stem:
-        raise AssertionError(tombstone_json)
-    if "primary_alias" in tombstone_json or "aliases" in tombstone_json:
-        raise AssertionError(tombstone_json)
-    if tombstone_json.get("end_reason") != "process_exited":
-        raise AssertionError(tombstone_json)
-    if tombstone_json.get("exit_status") != {"kind": "exited", "status": 0}:
-        raise AssertionError(tombstone_json)
+    routes = list(state_sessions_dir(env).glob("*/route.json"))
+    if routes:
+        raise AssertionError(f"completed uploaded session left route files: {routes}")
 
 
-def test_ssh_clean_remote_exit_tombstones_local_route(tmp):
+def test_ssh_clean_remote_exit_removes_routes(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1454,28 +1440,12 @@ def test_ssh_clean_remote_exit_tombstones_local_route(tmp):
     if marker not in result.stdout:
         raise AssertionError(result)
 
-    tombstones = list(tombstones_dir(env).glob("*.json"))
-    if len(tombstones) != 1:
-        raise AssertionError(f"expected one local tombstone, found {tombstones}")
-    row = json.loads(tombstones[0].read_text())
-    if row.get("host") != "test-host" or not str(row.get("guid", "")).startswith("s-"):
-        raise AssertionError(row)
-    if row.get("end_reason") != "process_exited":
-        raise AssertionError(row)
-    if row.get("exit_status") != {"kind": "exited", "status": 7}:
-        raise AssertionError(row)
-
-    guid = row.get("guid")
-    if not guid:
-        raise AssertionError(row)
-    if (state_sessions_dir(env) / guid / "route.json").exists():
-        raise AssertionError("local cached route was not tombstoned")
-    remote_tombstone = remote_state / "sessh" / "tombstone" / f"{guid}.json"
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline and not remote_tombstone.exists():
-        time.sleep(0.05)
-    if not remote_tombstone.exists():
-        raise AssertionError("remote session did not write its own tombstone")
+    local_routes = list(state_sessions_dir(env).glob("*/route.json"))
+    if local_routes:
+        raise AssertionError(f"clean remote exit left local route files: {local_routes}")
+    remote_routes = list((remote_state / "sessh" / "guid").glob("*/route.json"))
+    if remote_routes:
+        raise AssertionError(f"clean remote exit left remote route files: {remote_routes}")
 
 
 def test_ssh_pre_attach_stderr_forwards_immediately(tmp):
@@ -3761,8 +3731,8 @@ def main(argv=None):
             test_ssh_transport_uploads_artifact_and_reaches_broker,
         ),
         (
-            "ssh clean remote exit tombstones local route",
-            test_ssh_clean_remote_exit_tombstones_local_route,
+            "ssh clean remote exit removes routes",
+            test_ssh_clean_remote_exit_removes_routes,
         ),
         (
             "ssh pre-attach stderr forwards immediately",
