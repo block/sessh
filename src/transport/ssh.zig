@@ -119,11 +119,6 @@ const RemoteAttachSession = struct {
     session_dir: []const u8 = "",
 };
 
-const RemoteSessionFlow = union(enum) {
-    new: RemoteNewSession,
-    attach: RemoteAttachSession,
-};
-
 const RemoteMuxKind = enum {
     list,
     kill,
@@ -500,18 +495,17 @@ fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8) !
         try io.writeAll(2, "sessh: \".\" is not a valid ssh host\n");
         return process_exit.request(64);
     }
-    return runRemoteSession(
+    return runRemoteNewSession(
         allocator,
         args[0],
         parsed_sessh.ssh_options,
         parsed_sessh.host,
         parsed_sessh.common,
-        .{ .new = .{
+        .{
             .shell_command_args = parsed_sessh.command_args,
             .tty_request = parsed_sessh.tty_request,
             .proxy_required = parsed_sessh.proxy_required,
-        } },
-        null,
+        },
         .{
             .unsupported_action = "start a persistent sessh session",
             .allow_plain_ssh_fallback = parsed_sessh.command_args.len == 0,
@@ -555,20 +549,19 @@ fn runRemoteMuxNewCommand(
         .host => |host| host,
         .local => unreachable,
     };
-    return runRemoteSession(
+    return runRemoteNewSession(
         allocator,
         exe,
         new.ssh_options,
         host,
         new.common,
-        .{ .new = .{
+        .{
             .detached = new.detached,
             .command_argv = if (new.eval_args) &.{} else new.command_argv,
             .shell_command_args = if (new.eval_args) new.command_argv else &.{},
             .tty_request = tty_request,
             .proxy_required = proxy_required,
-        } },
-        null,
+        },
         .{
             .unsupported_action = "start a persistent sessh session",
             .allow_plain_ssh_fallback = !new.detached and new.command_argv.len == 0,
@@ -596,7 +589,6 @@ fn runMuxAttachCommand(
             host,
             attach.common,
             .{ .session_ref = attach.id },
-            null,
         ),
         .route_ref => |ref| {
             var route = session_registry.readRouteForRef(allocator, ref) catch |err| switch (err) {
@@ -646,7 +638,6 @@ fn runAttachRoute(
             .session_ref = route.guid,
             .session_dir = route.session_dir,
         },
-        route,
     );
 }
 
@@ -657,7 +648,6 @@ fn runRemoteAttach(
     host: []const u8,
     common: mux_cli.CommonSessionOptions,
     attach: RemoteAttachSession,
-    route: ?*const session_registry.Route,
 ) !void {
     var tty_request: SshTtyRequest = .none;
     var proxy_required = false;
@@ -666,14 +656,13 @@ fn runRemoteAttach(
         try io.writeAll(2, "sessh: proxy stream mode is only supported for new sessions\n");
         return process_exit.request(64);
     }
-    return runRemoteSession(
+    return runRemoteAttachSession(
         allocator,
         exe,
         ssh_options,
         host,
         common,
-        .{ .attach = attach },
-        route,
+        attach,
         .{ .unsupported_action = "attach a sessh session" },
     );
 }
@@ -1168,45 +1157,34 @@ fn muxClientControlNeedsDefaultSessionRef(control: mux_cli.ClientControl) bool {
     return control.session_ref == null and mux_cli.clientControlTarget(control) != .client_guid;
 }
 
-fn runRemoteSession(
+fn runRemoteNewSession(
     allocator: std.mem.Allocator,
     exe: []const u8,
     ssh_options: []const []const u8,
     host: []const u8,
     common: mux_cli.CommonSessionOptions,
-    flow: RemoteSessionFlow,
-    route: ?*const session_registry.Route,
+    new: RemoteNewSession,
     failure_policy: BootstrapFailurePolicy,
 ) !void {
-    var runtime_config = remoteSessionConfig(allocator, common, ssh_options) catch |err| {
+    const runtime_config = remoteSessionConfig(allocator, common, ssh_options) catch |err| {
         try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
         return process_exit.request(64);
     };
     client_log.setLevel(runtime_config.common.client_log_level);
 
-    switch (flow) {
-        .new => |new| {
-            if (new.detached) {
-                if (runtime_config.common.capture_tty_transcript != null) {
-                    try io.writeAll(2, "sesshmux: new --detached does not support --capture-tty-transcript\n");
-                    return process_exit.request(64);
-                }
-                if (!runtime_config.common.terminal_emulator) {
-                    try io.writeAll(2, "sesshmux: new --detached requires terminal-emulator mode\n");
-                    return process_exit.request(64);
-                }
-                if (filterLevelForcesProxy(runtime_config.common.filter_level) or new.proxy_required) {
-                    try io.writeAll(2, "sesshmux: new --detached does not support proxy stream mode\n");
-                    return process_exit.request(64);
-                }
-            }
-        },
-        .attach => {
-            if (filterLevelForcesProxy(runtime_config.common.filter_level)) {
-                try io.writeAll(2, "sessh: proxy stream mode is only supported for new sessions\n");
-                return process_exit.request(64);
-            }
-        },
+    if (new.detached) {
+        if (runtime_config.common.capture_tty_transcript != null) {
+            try io.writeAll(2, "sesshmux: new --detached does not support --capture-tty-transcript\n");
+            return process_exit.request(64);
+        }
+        if (!runtime_config.common.terminal_emulator) {
+            try io.writeAll(2, "sesshmux: new --detached requires terminal-emulator mode\n");
+            return process_exit.request(64);
+        }
+        if (filterLevelForcesProxy(runtime_config.common.filter_level) or new.proxy_required) {
+            try io.writeAll(2, "sesshmux: new --detached does not support proxy stream mode\n");
+            return process_exit.request(64);
+        }
     }
 
     var resolved_target = try resolveSshTarget(allocator, ssh_options, host);
@@ -1214,18 +1192,15 @@ fn runRemoteSession(
     const target = resolved_target.target;
 
     const stdin_is_tty = c.isatty(0) != 0;
-    if (flow == .new and shouldUseProxyStream(flow.new, runtime_config.common, stdin_is_tty)) {
+    if (shouldUseProxyStream(new, runtime_config.common, stdin_is_tty)) {
         if (runtime_config.common.capture_tty_transcript != null) {
             try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with proxy stream mode\n");
             return process_exit.request(64);
         }
-        try runProxyStreamSsh(allocator, exe, target, runtime_config.common, flow.new);
+        try runProxyStreamSsh(allocator, exe, target, runtime_config.common, new);
     }
 
-    const shell_command = switch (flow) {
-        .new => |new| try shellCommandFromRemoteArgs(allocator, new.shell_command_args),
-        .attach => null,
-    };
+    const shell_command = try shellCommandFromRemoteArgs(allocator, new.shell_command_args);
     defer if (shell_command) |command| allocator.free(command);
 
     var artifacts_storage: ?ArtifactSet = if (runtime_config.common.bootstrap) try loadArtifactSet(allocator) else null;
@@ -1239,46 +1214,27 @@ fn runRemoteSession(
     defer allocator.free(remote_command);
 
     var transcript_recorder: ?tty_transcript.Recorder = null;
-    if (runtime_config.common.capture_tty_transcript) |path| {
-        transcript_recorder = try tty_transcript.Recorder.init(allocator, path);
-        if (transcript_recorder) |*recorder| {
-            try recorder.warnEnabled();
-            tty_transcript.activate(recorder);
-        }
-    }
-    defer if (transcript_recorder) |*recorder| {
-        tty_transcript.deactivate();
-        recorder.deinit();
-    };
+    try setupTranscriptRecorder(allocator, runtime_config.common.capture_tty_transcript, &transcript_recorder);
+    defer teardownTranscriptRecorder(&transcript_recorder);
 
-    var new_guid: ?[]u8 = null;
-    defer if (new_guid) |guid| allocator.free(guid);
-    if (flow == .new) {
-        new_guid = try session_registry.generateGuid(allocator);
-    }
+    const new_guid = try session_registry.generateGuid(allocator);
+    defer allocator.free(new_guid);
 
-    var child = try startRuntimeConnection(
+    var child = try startRemoteSessionBroker(
         allocator,
         target,
         artifacts,
         remote_command,
-        .session_broker,
-        &.{},
-        false,
-        null,
-        false,
-        null,
-        null,
         failure_policy,
     );
 
-    if (flow == .new and flow.new.detached) {
+    if (new.detached) {
         var created = attached_client.createSessionOnRuntime(
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
             runtime_config.common.scrollback_row_count,
-            new_guid.?,
-            flow.new.command_argv,
+            new_guid,
+            new.command_argv,
             shell_command,
             target.host,
             runtime_config.reap_ms,
@@ -1317,27 +1273,17 @@ fn runRemoteSession(
         return;
     }
 
-    var session = (switch (flow) {
-        .new => |new| attached_client.startNewSessionOnRuntime(
-            child.child.stdout.?.handle,
-            child.child.stdin.?.handle,
-            runtime_config.common.scrollback_row_count,
-            new_guid.?,
-            new.command_argv,
-            shell_command,
-            target.host,
-            runtime_config.reap_ms,
-            runtime_config.tombstone_retention_ms,
-        ),
-        .attach => |attach| attached_client.startAttachSessionOnRuntime(
-            child.child.stdout.?.handle,
-            child.child.stdin.?.handle,
-            attach.session_ref orelse "",
-            attach.session_dir,
-            runtime_config.common.initial_scrollback_row_count,
-            target.host,
-        ),
-    }) catch |err| {
+    var session = attached_client.startNewSessionOnRuntime(
+        child.child.stdout.?.handle,
+        child.child.stdin.?.handle,
+        runtime_config.common.scrollback_row_count,
+        new_guid,
+        new.command_argv,
+        shell_command,
+        target.host,
+        runtime_config.reap_ms,
+        runtime_config.tombstone_retention_ms,
+    ) catch |err| {
         if (err == error.VersionMismatch) {
             child.closeStdin();
             _ = child.wait() catch {};
@@ -1345,11 +1291,11 @@ fn runRemoteSession(
                 try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with compat-fallback\n");
                 return process_exit.request(1);
             }
-            if (flow == .new and (flow.new.command_argv.len > 0 or shell_command != null)) {
+            if (new.command_argv.len > 0 or shell_command != null) {
                 try io.writeAll(2, "sessh: persistent command sessions require a compatible sesshmux agent\n");
                 return process_exit.request(1);
             }
-            try runRemoteCompat(allocator, target, runtime_config, flow, .version_mismatch);
+            try runRemoteNewCompat(allocator, target, runtime_config, .version_mismatch);
         }
         waitAfterRuntimeAttachFailure(&child, "start");
         if (process_exit.is(err)) return err;
@@ -1362,26 +1308,184 @@ fn runRemoteSession(
     try attached_client.ensureLocalRouteForRemoteSession(
         allocator,
         &session,
-        switch (flow) {
-            .new => "",
-            .attach => |attach| attach.session_ref orelse "",
-        },
+        "",
         target.host,
         target.resolved_host,
         target.resolved_port,
         target.options,
         runtime_config.tombstone_retention_ms,
     );
-    _ = route;
+    try runAttachedRemoteClient(
+        allocator,
+        exe,
+        target,
+        runtime_config,
+        artifacts,
+        remote_command,
+        failure_policy,
+        &child,
+        &session,
+    );
+}
 
+fn runRemoteAttachSession(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    ssh_options: []const []const u8,
+    host: []const u8,
+    common: mux_cli.CommonSessionOptions,
+    attach: RemoteAttachSession,
+    failure_policy: BootstrapFailurePolicy,
+) !void {
+    const runtime_config = remoteSessionConfig(allocator, common, ssh_options) catch |err| {
+        try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
+        return process_exit.request(64);
+    };
+    client_log.setLevel(runtime_config.common.client_log_level);
+
+    if (filterLevelForcesProxy(runtime_config.common.filter_level)) {
+        try io.writeAll(2, "sessh: proxy stream mode is only supported for new sessions\n");
+        return process_exit.request(64);
+    }
+
+    var resolved_target = try resolveSshTarget(allocator, ssh_options, host);
+    defer resolved_target.deinit(allocator);
+    const target = resolved_target.target;
+
+    var artifacts_storage: ?ArtifactSet = if (runtime_config.common.bootstrap) try loadArtifactSet(allocator) else null;
+    defer if (artifacts_storage) |*artifacts| artifacts.deinit();
+    const artifacts = if (artifacts_storage) |*value| value else null;
+
+    const remote_command = if (runtime_config.common.bootstrap)
+        try bootstrapCommand(allocator)
+    else
+        try directSessionBrokerCommand(allocator);
+    defer allocator.free(remote_command);
+
+    var transcript_recorder: ?tty_transcript.Recorder = null;
+    try setupTranscriptRecorder(allocator, runtime_config.common.capture_tty_transcript, &transcript_recorder);
+    defer teardownTranscriptRecorder(&transcript_recorder);
+
+    var child = try startRemoteSessionBroker(
+        allocator,
+        target,
+        artifacts,
+        remote_command,
+        failure_policy,
+    );
+
+    var session = attached_client.startAttachSessionOnRuntime(
+        child.child.stdout.?.handle,
+        child.child.stdin.?.handle,
+        attach.session_ref orelse "",
+        attach.session_dir,
+        runtime_config.common.initial_scrollback_row_count,
+        target.host,
+    ) catch |err| {
+        if (err == error.VersionMismatch) {
+            child.closeStdin();
+            _ = child.wait() catch {};
+            if (runtime_config.common.capture_tty_transcript != null) {
+                try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with compat-fallback\n");
+                return process_exit.request(1);
+            }
+            try runRemoteAttachCompat(allocator, target, runtime_config, attach, .version_mismatch);
+        }
+        waitAfterRuntimeAttachFailure(&child, "start");
+        if (process_exit.is(err)) return err;
+        try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
+        return process_exit.request(1);
+    };
+    defer session.deinit();
+    session.setTitleFallback(target.host);
+    child.suppressSshStderr();
+    try attached_client.ensureLocalRouteForRemoteSession(
+        allocator,
+        &session,
+        attach.session_ref orelse "",
+        target.host,
+        target.resolved_host,
+        target.resolved_port,
+        target.options,
+        runtime_config.tombstone_retention_ms,
+    );
+    try runAttachedRemoteClient(
+        allocator,
+        exe,
+        target,
+        runtime_config,
+        artifacts,
+        remote_command,
+        failure_policy,
+        &child,
+        &session,
+    );
+}
+
+fn startRemoteSessionBroker(
+    allocator: std.mem.Allocator,
+    target: SshTarget,
+    artifacts: ?*const ArtifactSet,
+    remote_command: []const u8,
+    failure_policy: BootstrapFailurePolicy,
+) !RuntimeConnection {
+    return startRuntimeConnection(
+        allocator,
+        target,
+        artifacts,
+        remote_command,
+        .session_broker,
+        &.{},
+        false,
+        null,
+        false,
+        null,
+        null,
+        failure_policy,
+    );
+}
+
+fn setupTranscriptRecorder(
+    allocator: std.mem.Allocator,
+    capture_tty_transcript: ?[]const u8,
+    transcript_recorder: *?tty_transcript.Recorder,
+) !void {
+    if (capture_tty_transcript) |path| {
+        transcript_recorder.* = try tty_transcript.Recorder.init(allocator, path);
+        if (transcript_recorder.*) |*recorder| {
+            try recorder.warnEnabled();
+            tty_transcript.activate(recorder);
+        }
+    }
+}
+
+fn teardownTranscriptRecorder(transcript_recorder: *?tty_transcript.Recorder) void {
+    if (transcript_recorder.*) |*recorder| {
+        tty_transcript.deactivate();
+        recorder.deinit();
+        transcript_recorder.* = null;
+    }
+}
+
+fn runAttachedRemoteClient(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    target: SshTarget,
+    runtime_config: SessionRuntimeConfig,
+    artifacts: ?*const ArtifactSet,
+    remote_command: []const u8,
+    failure_policy: BootstrapFailurePolicy,
+    child: *RuntimeConnection,
+    session: *attached_client.RuntimeSession,
+) !void {
     while (true) {
         const end = attached_client.runAttachedClient(
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
-            &session,
+            session,
             .{ .monitor_connection = true },
         ) catch |err| {
-            waitAfterRuntimeAttachFailure(&child, "attached client");
+            waitAfterRuntimeAttachFailure(child, "attached client");
             if (process_exit.is(err)) return err;
             try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
             return process_exit.request(1);
@@ -1392,20 +1496,20 @@ fn runRemoteSession(
             .detach => {
                 client_log.debug("event=detach host={s} session={s}", .{ target.host, session.idSlice() });
                 child.terminate();
-                try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
+                try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
                 return;
             },
             .kill_detach => {
                 client_log.debug("event=kill_detach host={s} session={s}", .{ target.host, session.idSlice() });
-                attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
+                attached_client.recordRuntimeSessionKillRequested(allocator, target.host, session);
                 route_commands.spawnRemoteKillJsonl(allocator, exe, target.host, target.options, &.{session.guidSlice()});
                 child.terminate();
-                try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
+                try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
                 return;
             },
             .kill_wait => {
                 client_log.debug("event=kill_wait host={s} session={s}", .{ target.host, session.idSlice() });
-                attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
+                attached_client.recordRuntimeSessionKillRequested(allocator, target.host, session);
                 const killed = try route_commands.runRemoteKillJsonlAndProcess(allocator, exe, target.host, target.options, &.{session.guidSlice()}, session.guidSlice());
                 child.terminate();
                 if (!killed) return process_exit.request(1);
@@ -1417,7 +1521,7 @@ fn runRemoteSession(
             },
             .session_ended => {
                 client_log.debug("event=session_ended host={s} session={s}", .{ target.host, session.idSlice() });
-                const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
+                const exit_status = try finishEndedRemoteSession(allocator, child, session);
                 return process_exit.request(exit_status);
             },
             .unresponsive => {
@@ -1454,8 +1558,8 @@ fn runRemoteSession(
                 failure_policy,
                 artifacts,
                 remote_command,
-                &child,
-                &session,
+                child,
+                session,
                 &reconnect_ui,
                 pending_input_at_disconnect,
                 pending_paste_like_input_at_disconnect,
@@ -1467,10 +1571,10 @@ fn runRemoteSession(
                     attached_client.repaintRuntimeSession(
                         child.child.stdout.?.handle,
                         child.child.stdin.?.handle,
-                        &session,
+                        session,
                     ) catch |err| switch (err) {
                         error.SessionEnded => {
-                            const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
+                            const exit_status = try finishEndedRemoteSession(allocator, child, session);
                             return process_exit.request(exit_status);
                         },
                         else => return err,
@@ -1482,12 +1586,12 @@ fn runRemoteSession(
                 },
                 .reconnected => |new_child| {
                     child.terminate();
-                    child = new_child;
+                    child.* = new_child;
                     session.discardPendingInputAcks();
                     session.viewport_offset = try reconnect_ui.clearOverlay();
-                    attached_client.finishReconnectRepaint(child.child.stdout.?.handle, child.child.stdin.?.handle, &session) catch |err| switch (err) {
+                    attached_client.finishReconnectRepaint(child.child.stdout.?.handle, child.child.stdin.?.handle, session) catch |err| switch (err) {
                         error.SessionEnded => {
-                            const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
+                            const exit_status = try finishEndedRemoteSession(allocator, child, session);
                             return process_exit.request(exit_status);
                         },
                         else => return err,
@@ -1502,13 +1606,13 @@ fn runRemoteSession(
                     continue;
                 },
                 .session_ended => {
-                    const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
+                    const exit_status = try finishEndedRemoteSession(allocator, child, session);
                     return process_exit.request(exit_status);
                 },
                 .detach => {
                     child.terminate();
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
                     return;
                 },
                 .failed => |err| {
@@ -1552,22 +1656,22 @@ fn runRemoteSession(
                         reconnect_attempt,
                     });
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
                     return;
                 },
                 .kill_detach => {
-                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
+                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, session);
                     client_log.debug("event=reconnect_kill_detach host={s} session={s} attempt={}", .{
                         target.host,
                         session.idSlice(),
                         reconnect_attempt,
                     });
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
                     return;
                 },
                 .kill_wait => {
-                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
+                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, session);
                     client_log.debug("event=reconnect_kill_wait host={s} session={s} attempt={}", .{
                         target.host,
                         session.idSlice(),
@@ -1625,7 +1729,7 @@ fn runRemoteSession(
                 continue;
             }
 
-            child = startRuntimeConnection(
+            child.* = startRuntimeConnection(
                 allocator,
                 target,
                 artifacts,
@@ -1642,7 +1746,7 @@ fn runRemoteSession(
                 error.ExitRequested => return err,
                 error.ReconnectDetached => {
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
                     return;
                 },
                 error.OutOfMemory => return err,
@@ -1663,7 +1767,7 @@ fn runRemoteSession(
             attached_client.reconnectSessionOnRuntimeCancellable(
                 child.child.stdout.?.handle,
                 child.child.stdin.?.handle,
-                &session,
+                session,
                 reconnect_ui.cancellationFlag(),
             ) catch |err| {
                 child.closeStdin();
@@ -1693,19 +1797,19 @@ fn runRemoteSession(
                 .detach => {
                     child.terminate();
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
                     return;
                 },
                 .kill_detach => {
-                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
+                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, session);
                     route_commands.spawnRemoteKillJsonl(allocator, exe, target.host, target.options, &.{session.guidSlice()});
                     child.terminate();
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
                     return;
                 },
                 .kill_wait => {
-                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
+                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, session);
                     const killed = try route_commands.runRemoteKillJsonlAndProcess(allocator, exe, target.host, target.options, &.{session.guidSlice()}, session.guidSlice());
                     child.terminate();
                     if (!killed) return process_exit.request(1);
@@ -1722,7 +1826,7 @@ fn runRemoteSession(
             attached_client.finishReconnectRepaint(
                 child.child.stdout.?.handle,
                 child.child.stdin.?.handle,
-                &session,
+                session,
             ) catch |err| {
                 child.closeStdin();
                 _ = child.wait() catch {};
@@ -1822,22 +1926,40 @@ fn reconnectPresentationForFilterLevel(level: config.FilterLevel) client_ui.Reco
     };
 }
 
-fn runRemoteCompat(
+fn runRemoteNewCompat(
     allocator: std.mem.Allocator,
     target: SshTarget,
     runtime_config: SessionRuntimeConfig,
-    flow: RemoteSessionFlow,
     reason: CompatModeReason,
 ) !noreturn {
+    try writeRemoteCompatNotice(reason);
+
+    const command_script = try remoteNewCompatCommandScript(allocator, runtime_config);
+    defer allocator.free(command_script);
+
+    try runRemoteCompatCommandScript(allocator, target, command_script, reason, "-T");
+}
+
+fn runRemoteAttachCompat(
+    allocator: std.mem.Allocator,
+    target: SshTarget,
+    runtime_config: SessionRuntimeConfig,
+    attach: RemoteAttachSession,
+    reason: CompatModeReason,
+) !noreturn {
+    try writeRemoteCompatNotice(reason);
+
+    const command_script = try remoteAttachCompatCommandScript(allocator, runtime_config, attach);
+    defer allocator.free(command_script);
+
+    const tty_option = compatSshTtyOptionForAttach(c.isatty(0) != 0, c.isatty(1) != 0);
+    try runRemoteCompatCommandScript(allocator, target, command_script, reason, tty_option);
+}
+
+fn writeRemoteCompatNotice(reason: CompatModeReason) !void {
     if (reason == .version_mismatch) {
         try io.writeAll(2, "sessh: existing remote sessh is incompatible; falling back to compat-mode\n");
     }
-
-    const command_script = try remoteCompatCommandScript(allocator, runtime_config, flow);
-    defer allocator.free(command_script);
-
-    const tty_option = compatSshTtyOption(flow, c.isatty(0) != 0, c.isatty(1) != 0);
-    try runRemoteCompatCommandScript(allocator, target, command_script, reason, tty_option);
 }
 
 fn runRemoteCompatCommandScript(
@@ -1903,8 +2025,8 @@ pub fn runRemoteCompatCommandScriptForTransport(
     }
 }
 
-fn compatSshTtyOption(flow: RemoteSessionFlow, stdin_is_tty: bool, stdout_is_tty: bool) []const u8 {
-    if (flow == .attach and stdin_is_tty and stdout_is_tty) {
+fn compatSshTtyOptionForAttach(stdin_is_tty: bool, stdout_is_tty: bool) []const u8 {
+    if (stdin_is_tty and stdout_is_tty) {
         return "-t";
     }
     return "-T";
@@ -1967,22 +2089,23 @@ fn nowUnixMs() u64 {
     return @intCast(ms);
 }
 
-fn remoteCompatCommandScript(
+fn remoteNewCompatCommandScript(
     allocator: std.mem.Allocator,
     runtime_config: SessionRuntimeConfig,
-    flow: RemoteSessionFlow,
 ) ![]u8 {
-    const local_args = try localCompatArgs(allocator, runtime_config, flow);
+    const local_args = try localNewCompatArgs(allocator, runtime_config);
     defer allocator.free(local_args);
-    const action = switch (flow) {
-        .new => "new",
-        .attach => "attach",
-    };
-    const session_id = switch (flow) {
-        .new => "",
-        .attach => |attach| attach.session_ref orelse "",
-    };
-    return remoteCompatCommandScriptFor(allocator, action, session_id, local_args);
+    return remoteCompatCommandScriptFor(allocator, "new", "", local_args);
+}
+
+fn remoteAttachCompatCommandScript(
+    allocator: std.mem.Allocator,
+    runtime_config: SessionRuntimeConfig,
+    attach: RemoteAttachSession,
+) ![]u8 {
+    const local_args = try localAttachCompatArgs(allocator, runtime_config, attach);
+    defer allocator.free(local_args);
+    return remoteCompatCommandScriptFor(allocator, "attach", attach.session_ref orelse "", local_args);
 }
 
 pub fn remoteCompatCommandScriptFor(
@@ -2189,39 +2312,51 @@ pub fn remoteCompatCommandScriptFor(
     });
 }
 
-fn localCompatArgs(
+fn localNewCompatArgs(
     allocator: std.mem.Allocator,
     runtime_config: SessionRuntimeConfig,
-    flow: RemoteSessionFlow,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
-    switch (flow) {
-        .new => {},
-        .attach => |attach| {
-            try appendCompatArg(allocator, &out, "attach");
-            if (attach.session_ref) |id| try appendCompatArg(allocator, &out, id);
-        },
-    }
+    try appendSessionCompatOptions(allocator, &out, runtime_config);
+    return out.toOwnedSlice(allocator);
+}
 
+fn localAttachCompatArgs(
+    allocator: std.mem.Allocator,
+    runtime_config: SessionRuntimeConfig,
+    attach: RemoteAttachSession,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    try appendCompatArg(allocator, &out, "attach");
+    if (attach.session_ref) |id| try appendCompatArg(allocator, &out, id);
+    try appendSessionCompatOptions(allocator, &out, runtime_config);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendSessionCompatOptions(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    runtime_config: SessionRuntimeConfig,
+) !void {
     var scrollback_buf: [16]u8 = undefined;
     const scrollback_count = try std.fmt.bufPrint(&scrollback_buf, "{}", .{runtime_config.common.scrollback_row_count});
-    try appendCompatArg(allocator, &out, "--scrollback-limit");
-    try appendCompatArg(allocator, &out, scrollback_count);
+    try appendCompatArg(allocator, out, "--scrollback-limit");
+    try appendCompatArg(allocator, out, scrollback_count);
 
     var initial_scrollback_buf: [16]u8 = undefined;
     const initial_scrollback_count = if (runtime_config.common.initial_scrollback_row_count) |value|
         try std.fmt.bufPrint(&initial_scrollback_buf, "{}", .{value})
     else
         "-1";
-    try appendCompatArg(allocator, &out, "--initial-scrollback");
-    try appendCompatArg(allocator, &out, initial_scrollback_count);
+    try appendCompatArg(allocator, out, "--initial-scrollback");
+    try appendCompatArg(allocator, out, initial_scrollback_count);
 
-    try appendCompatArg(allocator, &out, "--log-level");
-    try appendCompatArg(allocator, &out, client_log.levelName(runtime_config.common.client_log_level));
-
-    return out.toOwnedSlice(allocator);
+    try appendCompatArg(allocator, out, "--log-level");
+    try appendCompatArg(allocator, out, client_log.levelName(runtime_config.common.client_log_level));
 }
 
 fn appendCompatArg(allocator: std.mem.Allocator, out: *std.ArrayList(u8), arg: []const u8) !void {
