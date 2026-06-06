@@ -1,23 +1,16 @@
 const std = @import("std");
 
-const runtime_commands = @import("../runtime/commands.zig");
-
-pub fn start(allocator: std.mem.Allocator, exe: []const u8, broker_args: []const []const u8) !std.process.Child {
-    const argv = try allocator.alloc([]const u8, 2 + broker_args.len);
+pub fn start(allocator: std.mem.Allocator, exe: []const u8) !std.process.Child {
+    const argv = try allocator.alloc([]const u8, 2);
     defer allocator.free(argv);
     argv[0] = exe;
     argv[1] = ":internal-session-broker:";
-    @memcpy(argv[2..], broker_args);
     var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Inherit;
     try child.spawn();
     return child;
-}
-
-pub fn anySessionExists(allocator: std.mem.Allocator) bool {
-    return runtime_commands.anyLiveSessionExists(allocator);
 }
 
 pub fn closeChildStdin(child: *std.process.Child) void {

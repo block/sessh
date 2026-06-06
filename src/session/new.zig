@@ -4,9 +4,10 @@ const attached_client = @import("attached_client.zig");
 const client_log = @import("../core/client_log.zig");
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
-const local_broker = @import("local_broker.zig");
+const broker_process = @import("broker_process.zig");
 const process_exit = @import("../core/process_exit.zig");
 const reconnect_title = @import("../reconnect/title.zig");
+const runtime_commands = @import("../runtime/commands.zig");
 const route_commands = @import("../runtime/route_commands.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 const tty_transcript = @import("../tty/transcript.zig");
@@ -45,8 +46,7 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
     const generated_guid = try session_registry.generateGuid(allocator);
     defer allocator.free(generated_guid);
 
-    const runtime_broker_args: []const []const u8 = &.{};
-    var child = try local_broker.start(allocator, request.exe, runtime_broker_args);
+    var child = try broker_process.start(allocator, request.exe);
     const child_read_fd = child.stdout.?.handle;
     const child_write_fd = child.stdin.?.handle;
 
@@ -63,7 +63,7 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
             request.tombstone_retention_ms,
         ) catch |err| {
             if (process_exit.is(err)) return err;
-            local_broker.terminateChild(&child);
+            broker_process.terminateChild(&child);
             try io.stderrPrint("sessh: local runtime create failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -72,7 +72,7 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
         session_registry.markRouteDetachedNow(allocator, created.guid) catch |err| {
             client_log.debug("event=local_route_detached_mark_failed session={s} error={t}", .{ created.guid, err });
         };
-        local_broker.closeChildStdin(&child);
+        broker_process.closeChildStdin(&child);
         _ = child.wait() catch {};
         var created_buf: [128]u8 = undefined;
         const created_line = try std.fmt.bufPrint(&created_buf, "CREATED {s}\n", .{created.guid});
@@ -92,7 +92,7 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
         request.tombstone_retention_ms,
     ) catch |err| {
         if (process_exit.is(err)) return err;
-        local_broker.terminateChild(&child);
+        broker_process.terminateChild(&child);
         try io.stderrPrint("sessh: local runtime attach failed: {t}\n", .{err});
         return process_exit.request(1);
     };
@@ -109,7 +109,7 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
             .{},
         ) catch |err| {
             if (process_exit.is(err)) return err;
-            local_broker.terminateChild(&child);
+            broker_process.terminateChild(&child);
             try io.stderrPrint("sessh: local runtime attach failed: {t}\n", .{err});
             return process_exit.request(1);
         };
@@ -117,7 +117,7 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
         switch (end) {
             .detach => {
                 session.restoreAttachedClientEndPresentationForExit();
-                local_broker.terminateChild(&child);
+                broker_process.terminateChild(&child);
                 attached_client.markRouteDetachedForSession(allocator, &session);
                 try tty_transcript.finishActiveOrReport();
                 attached_client.writeDetachOverlayForTarget(&.{}, ".", request.overlay_args, session.idSlice());
@@ -128,7 +128,7 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
                 attached_client.recordRuntimeSessionKillRequested(allocator, ".", &session);
                 route_commands.requestLocalKillNoWait(allocator, &.{session.guidSlice()});
                 session.restoreAttachedClientEndPresentationForExit();
-                local_broker.terminateChild(&child);
+                broker_process.terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 return;
             },
@@ -140,24 +140,24 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
                     .end_reason = .killed_by_request,
                 };
                 session.restoreAttachedClientEndPresentationForExit();
-                local_broker.terminateChild(&child);
+                broker_process.terminateChild(&child);
                 try tty_transcript.finishActiveOrReport();
                 return;
             },
             .session_ended => {
                 session.restoreAttachedClientEndPresentationForExit();
-                local_broker.closeChildStdin(&child);
+                broker_process.closeChildStdin(&child);
                 _ = child.wait() catch {};
                 try tty_transcript.finishActiveOrReport();
                 return;
             },
             .unresponsive => {
-                local_broker.terminateChild(&child);
+                broker_process.terminateChild(&child);
             },
             .transport_closed => {
-                local_broker.closeChildStdin(&child);
+                broker_process.closeChildStdin(&child);
                 _ = child.wait() catch {};
-                if (!local_broker.anySessionExists(allocator)) {
+                if (!runtime_commands.anyLiveSessionExists(allocator)) {
                     session.restoreAttachedClientEndPresentationForExit();
                     try io.writeAll(2, "\r\nsessh: session agent crashed\r\n");
                     return process_exit.request(1);
@@ -168,14 +168,14 @@ pub fn runLocal(allocator: std.mem.Allocator, request: Request) !void {
         try io.writeAll(2, "\r\n");
         try io.writeAll(2, reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
         try io.writeAll(2, "\r\n");
-        child = local_broker.start(allocator, request.exe, runtime_broker_args) catch |err| {
+        child = broker_process.start(allocator, request.exe) catch |err| {
             session.restoreAttachedClientEndPresentationForExit();
             try io.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);
         };
         attached_client.reconnectSessionOnRuntime(child.stdout.?.handle, child.stdin.?.handle, &session) catch |err| {
             if (process_exit.is(err)) return err;
-            local_broker.terminateChild(&child);
+            broker_process.terminateChild(&child);
             session.restoreAttachedClientEndPresentationForExit();
             try io.stderrPrint("sessh: reconnect failed: {t}\n", .{err});
             return process_exit.request(1);

@@ -4,41 +4,9 @@ const client_log = @import("../core/client_log.zig");
 const io_helpers = @import("../core/io.zig");
 const list_format = @import("list_format.zig");
 const mux_remote_args = @import("../mux/remote_args.zig");
+const remote_command = @import("remote_command.zig");
 const runtime_commands = @import("commands.zig");
 const session_registry = @import("session_registry.zig");
-
-pub const RemoteCommandResult = struct {
-    stdout: []u8,
-    stderr: []u8,
-    exit_code: u8,
-
-    pub fn deinit(self: *RemoteCommandResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.stderr);
-        allocator.free(self.stdout);
-        self.* = undefined;
-    }
-};
-
-pub const RemoteCommandRunner = struct {
-    context: *anyopaque,
-    runFn: *const fn (
-        context: *anyopaque,
-        allocator: std.mem.Allocator,
-        host: []const u8,
-        ssh_options: []const []const u8,
-        argv: []const []const u8,
-    ) anyerror!RemoteCommandResult,
-
-    pub fn run(
-        self: *RemoteCommandRunner,
-        allocator: std.mem.Allocator,
-        host: []const u8,
-        ssh_options: []const []const u8,
-        argv: []const []const u8,
-    ) !RemoteCommandResult {
-        return self.runFn(self.context, allocator, host, ssh_options, argv);
-    }
-};
 
 pub fn runLocalListCommand(
     allocator: std.mem.Allocator,
@@ -48,7 +16,7 @@ pub fn runLocalListCommand(
     jsonl: bool,
     exited: bool,
     all: bool,
-    remote_runner: ?*RemoteCommandRunner,
+    remote_runner: ?*remote_command.Runner,
 ) !u8 {
     if (include_cached_routes and refresh) try refreshCachedRemoteRoutes(allocator, exe, remote_runner);
 
@@ -155,7 +123,7 @@ fn loadCachedRemoteRoutes(allocator: std.mem.Allocator, routes: *std.ArrayList(s
     }
 }
 
-fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8, remote_runner: ?*RemoteCommandRunner) !void {
+fn refreshCachedRemoteRoutes(allocator: std.mem.Allocator, exe: []const u8, remote_runner: ?*remote_command.Runner) !void {
     var routes: std.ArrayList(session_registry.Route) = .empty;
     defer {
         for (routes.items) |*route| route.deinit(allocator);
@@ -240,7 +208,7 @@ fn sameRouteConnection(a: *const session_registry.Route, b: *const session_regis
 fn refreshPendingKillsWithoutCachedRoute(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    remote_runner: ?*RemoteCommandRunner,
+    remote_runner: ?*remote_command.Runner,
     routes: []const session_registry.Route,
 ) !void {
     var pending_hosts = try session_registry.readPendingKillHosts(allocator);
@@ -268,7 +236,7 @@ fn hostMatchesAnyRoute(routes: []const session_registry.Route, host_guid: []cons
 fn queryRemoteRouteList(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    remote_runner: ?*RemoteCommandRunner,
+    remote_runner: ?*remote_command.Runner,
     route: *const session_registry.Route,
     exited: bool,
     all: bool,
@@ -279,7 +247,7 @@ fn queryRemoteRouteList(
 fn queryRemoteHostList(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    remote_runner: ?*RemoteCommandRunner,
+    remote_runner: ?*remote_command.Runner,
     host: []const u8,
     ssh_options: []const []const u8,
     exited: bool,
@@ -343,7 +311,7 @@ fn queryRemoteHostKillJsonl(
 pub fn drainPendingRemoteRequests(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    remote_runner: ?*RemoteCommandRunner,
+    remote_runner: ?*remote_command.Runner,
     host: []const u8,
     ssh_options: []const []const u8,
     pending_host_guid: []const u8,
@@ -393,7 +361,7 @@ pub fn drainPendingRemoteRequests(
 fn queryRemoteHostKillJsonlWithRequests(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    remote_runner: ?*RemoteCommandRunner,
+    remote_runner: ?*remote_command.Runner,
     host: []const u8,
     ssh_options: []const []const u8,
     targets: []const []const u8,

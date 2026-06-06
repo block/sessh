@@ -17,6 +17,7 @@ const pty_process = @import("../tty/pty_process.zig");
 const reconnect = @import("../reconnect/mod.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect_title = @import("../reconnect/title.zig");
+const runtime_remote_command = @import("../runtime/remote_command.zig");
 const route_commands = @import("../runtime/route_commands.zig");
 const session_attach = @import("../session/attach.zig");
 const session_new = @import("../session/new.zig");
@@ -73,7 +74,7 @@ const ArtifactSet = struct {
         self: *const ArtifactSet,
         fd: c.fd_t,
         entrypoint: BootstrapEntrypoint,
-        broker_args: []const []const u8,
+        entrypoint_args: []const []const u8,
         reconnect_ui: ?*client_ui.ReconnectUi,
         poll_reconnect_input: bool,
     ) !void {
@@ -86,7 +87,7 @@ const ArtifactSet = struct {
         try writeAllMaybeCancellable(fd, " --", reconnect_ui, poll_reconnect_input);
         try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
         try writeAllMaybeCancellable(fd, entrypoint.arg(), reconnect_ui, poll_reconnect_input);
-        for (broker_args) |arg| {
+        for (entrypoint_args) |arg| {
             try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
             try self.writeExecArg(fd, arg, reconnect_ui, poll_reconnect_input);
         }
@@ -360,7 +361,7 @@ const RemoteControlRunner = struct {
         self.* = undefined;
     }
 
-    fn interface(self: *RemoteControlRunner) route_commands.RemoteCommandRunner {
+    fn interface(self: *RemoteControlRunner) runtime_remote_command.Runner {
         return .{
             .context = self,
             .runFn = runOpaque,
@@ -373,7 +374,7 @@ const RemoteControlRunner = struct {
         host: []const u8,
         ssh_options: []const []const u8,
         argv: []const []const u8,
-    ) anyerror!route_commands.RemoteCommandResult {
+    ) anyerror!runtime_remote_command.Result {
         const self: *RemoteControlRunner = @ptrCast(@alignCast(context));
         return self.run(allocator, host, ssh_options, argv);
     }
@@ -384,7 +385,7 @@ const RemoteControlRunner = struct {
         host: []const u8,
         ssh_options: []const []const u8,
         argv: []const []const u8,
-    ) !route_commands.RemoteCommandResult {
+    ) !runtime_remote_command.Result {
         const active = try self.activeFor(host, ssh_options);
         const request_id = self.next_request_id;
         self.next_request_id +%= 1;
@@ -479,7 +480,7 @@ fn readRunResponse(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     request_id: u64,
-) !route_commands.RemoteCommandResult {
+) !runtime_remote_command.Result {
     while (true) {
         var frame = try protocol.readFrameAlloc(allocator, read_fd);
         defer frame.deinit(allocator);
@@ -519,8 +520,6 @@ const ParallelReconnectState = struct {
     parsed_ssh_args: SessionInvocation,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
-    bootstrap_entrypoint: BootstrapEntrypoint,
-    broker_args: []const []const u8,
     reconnect_ui: *client_ui.ReconnectUi,
     session: attached_client.RuntimeSession,
 
@@ -691,7 +690,7 @@ pub fn runInvocation(
             .tombstone_retention_ms = parsed_ssh_args.tombstone_retention_ms,
         });
     }
-    if ((parsed_ssh_args.action == .attach or isOneShotBrokerCommandAction(parsed_ssh_args.action)) and
+    if ((parsed_ssh_args.action == .attach or isRemoteMuxCommandAction(parsed_ssh_args.action)) and
         (parsed_ssh_args.host.len == 0 or std.mem.eql(u8, parsed_ssh_args.host, ".")))
     {
         applyFileConfigToLocalMux(allocator, parsed_ssh_args) catch |err| {
@@ -714,7 +713,7 @@ pub fn runInvocation(
             else
                 null;
             defer if (remote_control_runner) |*runner| runner.deinit();
-            var remote_runner_interface: ?route_commands.RemoteCommandRunner = if (remote_control_runner) |*runner|
+            var remote_runner_interface: ?runtime_remote_command.Runner = if (remote_control_runner) |*runner|
                 runner.interface()
             else
                 null;
@@ -756,7 +755,7 @@ pub fn runInvocation(
         try io.writeAll(2, "sessh: proxy stream mode is only supported for new sessions\n");
         return process_exit.request(64);
     }
-    if (parsed_ssh_args.capture_tty_transcript != null and isOneShotBrokerCommandAction(parsed_ssh_args.action)) {
+    if (parsed_ssh_args.capture_tty_transcript != null and isRemoteMuxCommandAction(parsed_ssh_args.action)) {
         try io.writeAll(2, "sessh: --capture-tty-transcript is only supported for new and attach sessions\n");
         return process_exit.request(64);
     }
@@ -789,21 +788,20 @@ pub fn runInvocation(
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
     const artifacts = if (artifacts_storage) |*value| value else null;
 
-    const broker_args: []const []const u8 = &.{};
-    const command_args = if (isOneShotBrokerCommandAction(parsed_ssh_args.action))
+    const command_args = if (isRemoteMuxCommandAction(parsed_ssh_args.action))
         parsed_ssh_args.remote_local_args
     else
         &.{};
-    if (isOneShotBrokerCommandAction(parsed_ssh_args.action) and command_args.len == 0) return error.MissingRemoteLocalArgs;
+    if (isRemoteMuxCommandAction(parsed_ssh_args.action) and command_args.len == 0) return error.MissingRemoteLocalArgs;
     const remote_command = if (parsed_ssh_args.bootstrap)
         try bootstrapCommand(allocator)
-    else if (isOneShotBrokerCommandAction(parsed_ssh_args.action))
+    else if (isRemoteMuxCommandAction(parsed_ssh_args.action))
         try directMuxCommand(allocator, command_args)
     else
-        try directBrokerCommand(allocator, broker_args);
+        try directSessionBrokerCommand(allocator);
     defer allocator.free(remote_command);
 
-    if (isOneShotBrokerCommandAction(parsed_ssh_args.action)) {
+    if (isRemoteMuxCommandAction(parsed_ssh_args.action)) {
         var command_child = try startRuntimeConnection(
             allocator,
             parsed_ssh_args.*,
@@ -817,7 +815,7 @@ pub fn runInvocation(
             null,
             null,
         );
-        const exit_status = runRemoteBrokerCommandAndForward(&command_child) catch |err| {
+        const exit_status = runRemoteMuxCommandAndForward(&command_child) catch |err| {
             command_child.closeStdin();
             _ = command_child.wait() catch {};
             if (process_exit.is(err)) return err;
@@ -860,7 +858,7 @@ pub fn runInvocation(
         artifacts,
         remote_command,
         .session_broker,
-        broker_args,
+        &.{},
         false,
         null,
         false,
@@ -1048,7 +1046,6 @@ pub fn runInvocation(
                 parsed_ssh_args.*,
                 artifacts,
                 remote_command,
-                broker_args,
                 &child,
                 &session,
                 &reconnect_ui,
@@ -1226,7 +1223,7 @@ pub fn runInvocation(
                 artifacts,
                 remote_command,
                 .session_broker,
-                broker_args,
+                &.{},
                 true,
                 &reconnect_ui,
                 true,
@@ -1502,7 +1499,7 @@ pub fn compatSshTtyOptionForLocalArgs(args: []const []const u8, stdin_is_tty: bo
     return "-T";
 }
 
-fn runRemoteBrokerCommandAndForward(connection: *RuntimeConnection) !u8 {
+fn runRemoteMuxCommandAndForward(connection: *RuntimeConnection) !u8 {
     connection.closeStdin();
     var buf: [4096]u8 = undefined;
     while (true) {
@@ -2082,7 +2079,6 @@ fn raceExistingConnectionWithReconnect(
     parsed_ssh_args: SessionInvocation,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
-    broker_args: []const []const u8,
     old_child: *RuntimeConnection,
     session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
@@ -2096,7 +2092,6 @@ fn raceExistingConnectionWithReconnect(
             parsed_ssh_args,
             artifacts,
             remote_command,
-            broker_args,
             old_child,
             session,
             reconnect_ui,
@@ -2184,7 +2179,6 @@ fn raceExistingConnectionWithReconnectAttempt(
     parsed_ssh_args: SessionInvocation,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
-    broker_args: []const []const u8,
     old_child: *RuntimeConnection,
     session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
@@ -2196,8 +2190,6 @@ fn raceExistingConnectionWithReconnectAttempt(
         .parsed_ssh_args = parsed_ssh_args,
         .artifacts = artifacts,
         .remote_command = remote_command,
-        .bootstrap_entrypoint = .session_broker,
-        .broker_args = broker_args,
         .reconnect_ui = reconnect_ui,
         .session = session.*,
     };
@@ -2467,8 +2459,8 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
         state.parsed_ssh_args,
         state.artifacts,
         state.remote_command,
-        state.bootstrap_entrypoint,
-        state.broker_args,
+        .session_broker,
+        &.{},
         true,
         state.reconnect_ui,
         false,
@@ -2817,7 +2809,7 @@ const StreamClientStarter = struct {
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
     bootstrap_entrypoint: BootstrapEntrypoint,
-    broker_args: []const []const u8,
+    stream_broker_args: []const []const u8,
     stderr_mode: SshStderrMode,
     last_failure_mutex: std.Thread.Mutex = .{},
     last_failure_term: ?std.process.Child.Term = null,
@@ -2831,7 +2823,7 @@ const StreamClientStarter = struct {
             self.artifacts,
             self.remote_command,
             self.bootstrap_entrypoint,
-            self.broker_args,
+            self.stream_broker_args,
             true,
             null,
             false,
@@ -3214,7 +3206,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
 
     const proxy_target_arg = try encodeBase64Arg(allocator, "localhost");
     defer allocator.free(proxy_target_arg);
-    const broker_args = [_][]const u8{
+    const stream_broker_args = [_][]const u8{
         proxy_guid,
         "proxy",
         "1",
@@ -3237,7 +3229,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
         .artifacts = &artifacts,
         .remote_command = remote_command,
         .bootstrap_entrypoint = .stream_broker,
-        .broker_args = broker_args[0..],
+        .stream_broker_args = stream_broker_args[0..],
         .stderr_mode = .forward,
     };
 
@@ -3981,8 +3973,8 @@ fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
     return shCommand(allocator, bootstrapper_script);
 }
 
-fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []const u8) ![]u8 {
-    return directEntrypointCommand(allocator, .session_broker, broker_args);
+fn directSessionBrokerCommand(allocator: std.mem.Allocator) ![]u8 {
+    return directEntrypointCommand(allocator, .session_broker, &.{});
 }
 
 fn directMuxCommand(allocator: std.mem.Allocator, mux_args: []const []const u8) ![]u8 {
@@ -4257,7 +4249,7 @@ fn isConfigOnlyDirectSesshOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--ssh-options");
 }
 
-fn isOneShotBrokerCommandAction(action: SessionAction) bool {
+fn isRemoteMuxCommandAction(action: SessionAction) bool {
     return switch (action) {
         .list,
         .kill,

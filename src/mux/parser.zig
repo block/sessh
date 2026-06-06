@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const mux_attach = @import("attach.zig");
+const mux_client_control = @import("client_control.zig");
 const mux_cli = @import("cli.zig");
 const mux_debug = @import("debug.zig");
 const mux_detach = @import("detach.zig");
@@ -69,8 +70,8 @@ pub fn remoteLocalArgsForCommand(
         .attach => |attach| try mux_attach.appendRemoteArgs(allocator, &out, attach),
         .list => |list| try mux_remote_args.appendList(allocator, &out, list),
         .kill => |kill| try mux_remote_args.appendKill(allocator, &out, kill, route),
-        .detach => |control| try mux_detach.appendRemoteArgs(allocator, &out, control, default_session_ref),
-        .repaint => |control| try mux_repaint.appendRemoteArgs(allocator, &out, control, default_session_ref),
+        .detach => |control| try mux_client_control.appendRemoteArgs(allocator, &out, "detach", null, control, default_session_ref),
+        .repaint => |control| try mux_client_control.appendRemoteArgs(allocator, &out, "repaint", null, control, default_session_ref),
         .debug => |debug| try mux_debug.appendRemoteArgs(allocator, &out, debug, default_session_ref),
     }
     return out.toOwnedSlice(allocator);

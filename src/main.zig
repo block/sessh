@@ -288,6 +288,7 @@ test {
     _ = @import("reconnect/title.zig");
     _ = @import("runtime/list_format.zig");
     _ = @import("runtime/commands.zig");
+    _ = @import("runtime/remote_command.zig");
     _ = @import("runtime/route_commands.zig");
     _ = @import("runtime/refresher.zig");
     _ = @import("runtime/session_registry.zig");
@@ -297,7 +298,7 @@ test {
     _ = @import("session/broker.zig");
     _ = @import("session/client_config.zig");
     _ = @import("session/client_ui.zig");
-    _ = @import("session/local_broker.zig");
+    _ = @import("session/broker_process.zig");
     _ = @import("session/new.zig");
     _ = @import("session/renderer.zig");
     _ = @import("session/vt.zig");
