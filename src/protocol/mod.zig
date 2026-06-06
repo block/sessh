@@ -25,13 +25,7 @@ pub const MessageType = enum {
     te_repaint_response,
     te_tty_transcript_chunk,
     te_input_ack,
-    te_session_live_state_query,
-    te_session_live_state,
     te_session_client_control_response,
-    te_client_repaint_request,
-    te_client_detach_request,
-    te_session_client_detach_request,
-    te_session_client_repaint_request,
     te_session_client_debug_sever_connection_request,
     te_session_client_debug_unresponsive_connection_request,
     ping,
@@ -173,13 +167,7 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .te_repaint_response => |message| ownedFrameFromMessage(allocator, .te_repaint_response, message),
             .te_tty_transcript_chunk => |message| ownedFrameFromMessage(allocator, .te_tty_transcript_chunk, message),
             .te_input_ack => |message| ownedFrameFromMessage(allocator, .te_input_ack, message),
-            .te_session_live_state_query => |message| ownedFrameFromMessage(allocator, .te_session_live_state_query, message),
-            .te_session_live_state => |message| ownedFrameFromMessage(allocator, .te_session_live_state, message),
             .te_session_client_control_response => |message| ownedFrameFromMessage(allocator, .te_session_client_control_response, message),
-            .te_client_repaint_request => |message| ownedFrameFromMessage(allocator, .te_client_repaint_request, message),
-            .te_client_detach_request => |message| ownedFrameFromMessage(allocator, .te_client_detach_request, message),
-            .te_session_client_detach_request => |message| ownedFrameFromMessage(allocator, .te_session_client_detach_request, message),
-            .te_session_client_repaint_request => |message| ownedFrameFromMessage(allocator, .te_session_client_repaint_request, message),
             .te_session_client_debug_sever_connection_request => |message| ownedFrameFromMessage(allocator, .te_session_client_debug_sever_connection_request, message),
             .te_session_client_debug_unresponsive_connection_request => |message| ownedFrameFromMessage(allocator, .te_session_client_debug_unresponsive_connection_request, message),
             .ping => |message| ownedFrameFromMessage(allocator, .ping, message),
@@ -301,40 +289,10 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_input_ack = message } });
         },
-        .te_session_live_state_query => blk: {
-            var message = try decodePayload(pb.TeSessionLiveStateQuery, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_live_state_query = message } });
-        },
-        .te_session_live_state => blk: {
-            var message = try decodePayload(pb.TeSessionLiveState, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_live_state = message } });
-        },
         .te_session_client_control_response => blk: {
             var message = try decodePayload(pb.TeSessionClientControlResponse, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_client_control_response = message } });
-        },
-        .te_client_repaint_request => blk: {
-            var message = try decodePayload(pb.TeClientRepaintRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_client_repaint_request = message } });
-        },
-        .te_client_detach_request => blk: {
-            var message = try decodePayload(pb.TeClientDetachRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_client_detach_request = message } });
-        },
-        .te_session_client_detach_request => blk: {
-            var message = try decodePayload(pb.TeSessionClientDetachRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_client_detach_request = message } });
-        },
-        .te_session_client_repaint_request => blk: {
-            var message = try decodePayload(pb.TeSessionClientRepaintRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_session_client_repaint_request = message } });
         },
         .te_session_client_debug_sever_connection_request => blk: {
             var message = try decodePayload(pb.TeSessionClientDebugSeverConnectionRequest, allocator, payload);

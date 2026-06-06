@@ -340,7 +340,7 @@ test "parse permits explicit safe config overrides" {
     try expectArgvEqual(&.{ "-oRequestTTY=no", "-o", "SessionType=default" }, parsed.ssh_options);
 }
 
-test "parse treats post-host mux words as remote command" {
+test "parse treats post-host words as remote command" {
     var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 

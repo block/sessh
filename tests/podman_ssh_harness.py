@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import hashlib
 import fcntl
-import json
 import os
 import pty
 import re
@@ -722,45 +721,6 @@ def sessh_version():
         if line.startswith("pub const version = "):
             return line.split('"')[1]
     raise AssertionError("could not find sessh version")
-
-
-def first_session_id(list_stdout):
-    for line in list_stdout.splitlines()[1:]:
-        if not line:
-            continue
-        return line.split(None, 1)[0]
-    raise AssertionError(f"no sessions in list output: {list_stdout!r}")
-
-
-def first_session_row(jsonl_stdout):
-    for line in jsonl_stdout.splitlines():
-        if not line.strip():
-            continue
-        return json.loads(line)
-    raise AssertionError(f"no sessions in jsonl list output: {jsonl_stdout!r}")
-
-
-def first_session_guid(jsonl_stdout):
-    return first_session_row(jsonl_stdout)["guid"]
-
-
-def has_list_header(list_stdout):
-    header = list_stdout.splitlines()[0] if list_stdout.splitlines() else ""
-    return all(column in header for column in ("ID", "ATTACHED", "INPUT", "HOST", "VERSION"))
-
-
-def has_session_row(list_stdout):
-    for line in list_stdout.splitlines()[1:]:
-        if not line.strip():
-            continue
-        return True
-    return False
-
-
-def compact_session_id(session_id):
-    if session_id.startswith("s-"):
-        session_id = session_id[2:]
-    return session_id.replace("-", "")
 
 
 def generate_key(tmp):

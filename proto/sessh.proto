@@ -33,13 +33,7 @@ message Frame {
     TeRepaintResponse te_repaint_response = 22;
     TeTtyTranscriptChunk te_tty_transcript_chunk = 23;
     TeInputAck te_input_ack = 24;
-    TeSessionLiveStateQuery te_session_live_state_query = 25;
-    TeSessionLiveState te_session_live_state = 26;
     TeSessionClientControlResponse te_session_client_control_response = 28;
-    TeClientRepaintRequest te_client_repaint_request = 29;
-    TeClientDetachRequest te_client_detach_request = 30;
-    TeSessionClientDetachRequest te_session_client_detach_request = 27;
-    TeSessionClientRepaintRequest te_session_client_repaint_request = 31;
     TeSessionClientDebugSeverConnectionRequest te_session_client_debug_sever_connection_request = 32;
     TeSessionClientDebugUnresponsiveConnectionRequest te_session_client_debug_unresponsive_connection_request = 33;
     Ping ping = 39;
@@ -263,8 +257,7 @@ message TeSessionCreate {
 // TeSessionAttached for the selected session, then TeDraw/TeRepaintResponse messages.
 message TeSessionAttach {
   TeResize resize = 1;
-  // Session GUID or compact session GUID. Empty means attach the most recent
-  // session known to the selected broker.
+  // Session GUID or compact session GUID. Required unless session_dir is set.
   string session_ref = 2;
   // When true, the session agent sends raw inner PTY transcript chunks for
   // this attached client. The client still owns archive creation and storage.
@@ -335,24 +328,6 @@ message TeRepaintRequest {
   optional uint32 initial_scrollback_rows = 3;
 }
 
-
-
-// Framed payload, session agent -> client.
-//
-// Requests that an attached client initiate its normal repaint flow by sending
-// a TeRepaintRequest back to the session agent.
-message TeClientRepaintRequest {
-  // When true, the client clears outer terminal scrollback and requests all
-  // retained inner scrollback plus the current screen. When false, it requests
-  // only the current screen.
-  bool include_scrollback = 1;
-}
-
-// Framed payload, session agent -> client.
-//
-// Requests that an attached client detach using its normal local detach flow.
-message TeClientDetachRequest {}
-
 // Framed payload, session agent -> client.
 //
 // Confirms that a TeSessionCreate created the requested session.
@@ -375,84 +350,22 @@ message TeSessionAttached {
 
 // Framed payload, broker/client -> session agent.
 //
-// Queries the agent's current in-memory state for its live session.
-message TeSessionLiveStateQuery {
-}
-
-// Framed payload, session agent -> broker/client.
-//
-// In-memory live state for the session currently hosted by this agent.
-message TeSessionLiveState {
-  // Present only when the session is detached.
-  optional uint64 detached_at_unix_ms = 1;
-  repeated TeAttachedClient attached_clients = 2;
-  // Present after any attached client has sent non-control-sequence input.
-  optional uint64 last_input_at_unix_ms = 3;
-}
-
-message TeAttachedClient {
-  // Canonical client GUID in c-prefixed hyphenated UUID form.
-  string client_guid = 1;
-  TeTerminalSize terminal_size = 2;
-  uint64 attached_at_unix_ms = 3;
-  // Present after the client has sent non-control-sequence input.
-  optional uint64 last_input_at_unix_ms = 4;
-}
-
-enum TeClientControlTargetKind {
-  TE_CLIENT_CONTROL_TARGET_KIND_UNSPECIFIED = 0;
-  TE_CLIENT_CONTROL_TARGET_KIND_DEFAULT = 1;
-  TE_CLIENT_CONTROL_TARGET_KIND_ALL = 2;
-  TE_CLIENT_CONTROL_TARGET_KIND_LAST_INPUT = 3;
-  TE_CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID = 4;
-}
-
-// Embedded in session-client-management requests.
-message TeClientControlTarget {
-  TeClientControlTargetKind target_kind = 1;
-  string client_guid = 2;
-}
+// Debug-only request that severs all attached client connections.
+message TeSessionClientDebugSeverConnectionRequest {}
 
 // Framed payload, broker/client -> session agent.
 //
-// Requests normal detach behavior on one or more attached clients.
-message TeSessionClientDetachRequest {
-  TeClientControlTarget target = 1;
-}
-
-// Framed payload, broker/client -> session agent.
-//
-// Requests repaint behavior on one or more attached clients.
-message TeSessionClientRepaintRequest {
-  TeClientControlTarget target = 1;
-  // When true, the selected client clears outer terminal scrollback and
-  // requests retained inner scrollback plus the current screen.
-  bool include_scrollback = 2;
-}
-
-// Framed payload, broker/client -> session agent.
-//
-// Debug-only request that severs one or more attached client connections.
-message TeSessionClientDebugSeverConnectionRequest {
-  TeClientControlTarget target = 1;
-}
-
-// Framed payload, broker/client -> session agent.
-//
-// Debug-only request that makes one or more attached client connections stop
-// responding for a bounded duration. Omitted or zero seconds asks the receiver
-// to use its default debug-unresponsive duration.
+// Debug-only request that makes all attached client connections stop responding
+// for a bounded duration. Omitted or zero seconds asks the receiver to use its
+// default debug-unresponsive duration.
 message TeSessionClientDebugUnresponsiveConnectionRequest {
-  TeClientControlTarget target = 1;
-  uint32 seconds = 2;
+  uint32 seconds = 1;
 }
 
 // Framed payload, session agent -> broker/client.
 //
-// Confirms which attached clients were affected by a client-control request.
-message TeSessionClientControlResponse {
-  repeated string affected_client_guid = 1;
-}
+// Confirms that a debug client-control request was accepted.
+message TeSessionClientControlResponse {}
 
 enum TeSessionEndReason {
   TE_SESSION_END_REASON_UNSPECIFIED = 0;

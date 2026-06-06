@@ -13,7 +13,7 @@ TESTS = ROOT / "tests"
 sys.path.insert(0, str(TESTS))
 
 from harness_cleanup import cleanup_runtime
-from socket_harness import BIN, close_client, read_available, read_until, wait_child_draining_fd
+from socket_harness import close_client, read_available, read_until, wait_child_draining_fd
 from test_env import isolated_env
 
 
@@ -230,9 +230,6 @@ def print_summary(name, summary):
 
 
 def main():
-    if not BIN.exists():
-        raise SystemExit(f"missing binary: {BIN}")
-
     with tempfile.TemporaryDirectory(prefix="sessh-render-overhead-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         env["TERM"] = "xterm-256color"
@@ -244,20 +241,16 @@ def main():
             direct = capture_seq100_output([shell], env)
             tmux = capture_tmux_output(shell, env, tmp)
             screen = capture_screen_output(shell, env, tmp)
-            through_sessh = capture_seq100_output([BIN, "."], env)
         finally:
             cleanup_runtime(env)
 
     if not direct:
         raise RuntimeError("direct seq output was empty")
-    if not through_sessh:
-        raise RuntimeError("sessh seq output was empty")
 
     results = [
         ("direct PTY", direct),
         ("tmux", tmux),
         ("screen", screen),
-        ("sessh .", through_sessh),
     ]
     summaries = {}
     for name, data in results:
@@ -269,7 +262,7 @@ def main():
 
     direct_bytes = summaries["direct PTY"]["bytes"]
     print("overhead vs direct PTY:")
-    for name in ("tmux", "screen", "sessh ."):
+    for name in ("tmux", "screen"):
         summary = summaries.get(name)
         if summary is None:
             continue

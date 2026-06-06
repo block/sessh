@@ -1,7 +1,6 @@
 const std = @import("std");
 const app_allocator = @import("../core/app_allocator.zig");
 const c = std.c;
-const posix = std.posix;
 
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
@@ -34,10 +33,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
             .te_resize => continue,
             .te_session_attach => {
                 const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
-                    error.NoSessions => {
-                        try sendError(1, "SESSION_NOT_FOUND", "no sessions", "");
-                        return;
-                    },
                     error.SessionRefNotLocal => {
                         try sendError(1, "SESSION_REF_NOT_LOCAL", "session reference resolves to another host", "");
                         return;
@@ -46,7 +41,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
                         try sendError(1, "SESSION_ALREADY_EXITED", "session already exited", "");
                         return;
                     },
-                    error.InvalidSessionId, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
+                    error.InvalidSessionId, error.MissingSessionRef, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
                         try sendError(1, "SESSION_NOT_FOUND", "session not found", "");
                         return;
                     },
@@ -72,11 +67,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     }
 }
 
-fn processExists(pid: c.pid_t) bool {
-    posix.kill(pid, 0) catch return false;
-    return true;
-}
-
 fn fileExists(path: []const u8) bool {
     const file = std.fs.openFileAbsolute(path, .{}) catch return false;
     file.close();
@@ -92,7 +82,7 @@ fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.f
     } else if (request.session_ref.len > 0)
         try pathsForLocalSessionRef(allocator, request.session_ref)
     else
-        (try mostRecentAgent(allocator)) orelse return error.NoSessions;
+        return error.MissingSessionRef;
     defer paths.deinit(allocator);
     return socket_transport.connectSocket(paths.socket);
 }
@@ -136,102 +126,6 @@ fn pathsForLocalSessionRef(allocator: std.mem.Allocator, ref: []const u8) !sessi
     errdefer paths.deinit(allocator);
     if (fileExists(paths.route) and !fileExists(paths.meta)) return error.SessionRefNotLocal;
     return paths;
-}
-
-fn mostRecentAgent(allocator: std.mem.Allocator) !?session_registry.SessionPaths {
-    const sessions_dir = try session_registry.sessionsDir(allocator);
-    defer allocator.free(sessions_dir);
-    var dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer dir.close();
-
-    var selected: ?session_registry.SessionPaths = null;
-    var selected_detached_ts: u64 = 0;
-    var iterator = dir.iterate();
-    while (try iterator.next()) |entry| {
-        if (entry.kind != .directory or !session_registry.isValidSessionId(entry.name)) continue;
-        var paths = try session_registry.pathsForSessionId(allocator, entry.name);
-        errdefer paths.deinit(allocator);
-        _ = statAbsolute(paths.socket) catch |err| switch (err) {
-            error.FileNotFound => {
-                paths.deinit(allocator);
-                continue;
-            },
-            else => return err,
-        };
-        var meta = session_registry.readMeta(allocator, paths) catch {
-            session_registry.removeStaleHints(paths) catch {};
-            paths.deinit(allocator);
-            continue;
-        };
-        defer meta.deinit(allocator);
-        if (!processExists(meta.agent_pid)) {
-            session_registry.removeStaleHints(paths) catch {};
-            paths.deinit(allocator);
-            continue;
-        }
-        const maybe_detached_ts: ?u64 = querySessionLiveStateDetachedAt(allocator, paths) catch blk: {
-            break :blk legacyDetachedMarkerTimestampMs(allocator, paths) catch null;
-        };
-        const detached_ts = maybe_detached_ts orelse {
-            paths.deinit(allocator);
-            continue;
-        };
-        if (selected == null or detached_ts > selected_detached_ts) {
-            if (selected) |*old| old.deinit(allocator);
-            selected = paths;
-            selected_detached_ts = detached_ts;
-        } else {
-            paths.deinit(allocator);
-        }
-    }
-    return selected;
-}
-
-fn querySessionLiveStateDetachedAt(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !?u64 {
-    var state = try querySessionLiveState(allocator, paths);
-    defer state.deinit(allocator);
-    return state.detached_at_unix_ms;
-}
-
-fn querySessionLiveState(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !pb.TeSessionLiveState {
-    return querySessionLiveStateFromSocketPath(allocator, paths.socket);
-}
-
-fn querySessionLiveStateFromSocketPath(allocator: std.mem.Allocator, socket_path: []const u8) !pb.TeSessionLiveState {
-    const fd = try socket_transport.connectSocket(socket_path);
-    defer _ = c.close(fd);
-
-    try initiateRuntimeHandshake(allocator, fd);
-
-    const query_payload = try protocol.encodePayload(allocator, pb.TeSessionLiveStateQuery{});
-    defer allocator.free(query_payload);
-    try protocol.sendFrame(fd, .te_session_live_state_query, query_payload);
-
-    var frame = try protocol.readFrameAlloc(allocator, fd);
-    defer frame.deinit(allocator);
-    switch (frame.message_type) {
-        .te_session_live_state => return protocol.decodePayload(pb.TeSessionLiveState, allocator, frame.payload),
-        .error_message => return error.SessionLiveStateUnavailable,
-        else => return error.UnexpectedFrame,
-    }
-}
-
-fn legacyDetachedMarkerTimestampMs(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) !?u64 {
-    const marker = try std.fmt.allocPrint(allocator, "{s}/detached", .{paths.dir});
-    defer allocator.free(marker);
-    const stat = std.fs.cwd().statFile(marker) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    if (stat.mtime <= 0) return 0;
-    return @intCast(@divTrunc(stat.mtime, std.time.ns_per_ms));
-}
-
-fn statAbsolute(path: []const u8) !std.fs.File.Stat {
-    return std.fs.cwd().statFile(path);
 }
 
 fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_create_payload: []const u8) !c.fd_t {

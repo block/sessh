@@ -996,149 +996,6 @@ test "runtime repaint after local ui requests screen-only repaint" {
     try std.testing.expectEqual(@as(i32, 6), session.viewport_offset);
 }
 
-test "client repaint request sends screen-only repaint request" {
-    const remote_to_client = try posix.pipe();
-    defer posix.close(remote_to_client[0]);
-    defer posix.close(remote_to_client[1]);
-    const client_to_remote = try posix.pipe();
-    defer posix.close(client_to_remote[0]);
-    defer posix.close(client_to_remote[1]);
-
-    next_repaint_request_seq = 123;
-
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeClientRepaintRequest{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(remote_to_client[1], .te_client_repaint_request, payload);
-
-    var connection_monitor = ConnectionMonitor{};
-    var scrollback_cursor = ScrollbackCursor{};
-    var viewport_offset: i32 = 0;
-    var pending_repaint = PendingRepaint{};
-    var attached_client_end_restore = std.ArrayList(u8).empty;
-    defer attached_client_end_restore.deinit(app_allocator.allocator());
-    var input_ack_tracker = InputAckTracker{};
-    var app_title_present: ?bool = null;
-
-    try std.testing.expectEqual(
-        @as(?AttachedClientEnd, null),
-        try handleAttachedClientRuntimeFrame(
-            remote_to_client[0],
-            client_to_remote[1],
-            &connection_monitor,
-            &scrollback_cursor,
-            &viewport_offset,
-            &pending_repaint,
-            &attached_client_end_restore,
-            &input_ack_tracker,
-            null,
-            &app_title_present,
-        ),
-    );
-
-    try std.testing.expect(pending_repaint.active());
-    try std.testing.expectEqual(@as(u64, 123), pending_repaint.repaint_request_seq);
-
-    var frame = try protocol.readFrameAlloc(app_allocator.allocator(), client_to_remote[0]);
-    defer frame.deinit(app_allocator.allocator());
-    try std.testing.expectEqual(protocol.MessageType.te_repaint_request, frame.message_type);
-    var request = try protocol.decodePayload(pb.TeRepaintRequest, app_allocator.allocator(), frame.payload);
-    defer request.deinit(app_allocator.allocator());
-    try std.testing.expectEqual(@as(u64, 123), request.repaint_request_seq);
-    try std.testing.expect(request.scrollback_cursor == null);
-}
-
-test "client repaint request can request retained scrollback" {
-    const remote_to_client = try posix.pipe();
-    defer posix.close(remote_to_client[0]);
-    defer posix.close(remote_to_client[1]);
-    const client_to_remote = try posix.pipe();
-    defer posix.close(client_to_remote[0]);
-    defer posix.close(client_to_remote[1]);
-
-    next_repaint_request_seq = 456;
-
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeClientRepaintRequest{
-        .include_scrollback = true,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(remote_to_client[1], .te_client_repaint_request, payload);
-
-    var connection_monitor = ConnectionMonitor{};
-    var scrollback_cursor = ScrollbackCursor{};
-    var viewport_offset: i32 = 0;
-    var pending_repaint = PendingRepaint{};
-    var attached_client_end_restore = std.ArrayList(u8).empty;
-    defer attached_client_end_restore.deinit(app_allocator.allocator());
-    var input_ack_tracker = InputAckTracker{};
-    var app_title_present: ?bool = null;
-
-    try std.testing.expectEqual(
-        @as(?AttachedClientEnd, null),
-        try handleAttachedClientRuntimeFrame(
-            remote_to_client[0],
-            client_to_remote[1],
-            &connection_monitor,
-            &scrollback_cursor,
-            &viewport_offset,
-            &pending_repaint,
-            &attached_client_end_restore,
-            &input_ack_tracker,
-            null,
-            &app_title_present,
-        ),
-    );
-
-    try std.testing.expect(pending_repaint.active());
-    try std.testing.expectEqual(@as(u64, 456), pending_repaint.repaint_request_seq);
-
-    var frame = try protocol.readFrameAlloc(app_allocator.allocator(), client_to_remote[0]);
-    defer frame.deinit(app_allocator.allocator());
-    try std.testing.expectEqual(protocol.MessageType.te_repaint_request, frame.message_type);
-    var request = try protocol.decodePayload(pb.TeRepaintRequest, app_allocator.allocator(), frame.payload);
-    defer request.deinit(app_allocator.allocator());
-    try std.testing.expectEqual(@as(u64, 456), request.repaint_request_seq);
-    const cursor = request.scrollback_cursor orelse return error.ExpectedScrollbackCursor;
-    try std.testing.expectEqual(@as(usize, 0), cursor.len);
-}
-
-test "client detach request uses normal detach attached client end" {
-    const remote_to_client = try posix.pipe();
-    defer posix.close(remote_to_client[0]);
-    defer posix.close(remote_to_client[1]);
-    const client_to_remote = try posix.pipe();
-    defer posix.close(client_to_remote[0]);
-    defer posix.close(client_to_remote[1]);
-
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeClientDetachRequest{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(remote_to_client[1], .te_client_detach_request, payload);
-
-    var connection_monitor = ConnectionMonitor{};
-    var scrollback_cursor = ScrollbackCursor{};
-    var viewport_offset: i32 = 0;
-    var pending_repaint = PendingRepaint{};
-    var attached_client_end_restore = std.ArrayList(u8).empty;
-    defer attached_client_end_restore.deinit(app_allocator.allocator());
-    var input_ack_tracker = InputAckTracker{};
-    var app_title_present: ?bool = null;
-
-    try std.testing.expectEqual(
-        AttachedClientEnd.detach,
-        (try handleAttachedClientRuntimeFrame(
-            remote_to_client[0],
-            client_to_remote[1],
-            &connection_monitor,
-            &scrollback_cursor,
-            &viewport_offset,
-            &pending_repaint,
-            &attached_client_end_restore,
-            &input_ack_tracker,
-            null,
-            &app_title_present,
-        )).?,
-    );
-}
-
 pub fn startNewSessionOnRuntime(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
@@ -1251,7 +1108,6 @@ pub fn startAttachSessionOnRuntime(
 pub fn ensureLocalRouteForRemoteSession(
     allocator: std.mem.Allocator,
     session: *const RuntimeSession,
-    requested_ref: []const u8,
     host: []const u8,
     resolved_host: []const u8,
     port: []const u8,
@@ -1259,7 +1115,6 @@ pub fn ensureLocalRouteForRemoteSession(
     tombstone_retention_ms: u64,
 ) !void {
     if (session.guidSlice().len == 0) return;
-    _ = requested_ref;
     try session_registry.writeSshRoute(
         allocator,
         session.guidSlice(),
@@ -1272,15 +1127,6 @@ pub fn ensureLocalRouteForRemoteSession(
         config.version,
         tombstone_retention_ms,
     );
-    if (session.clientGuidSlice().len > 0) {
-        session_registry.writeClientRouteHint(allocator, session.clientGuidSlice(), session.guidSlice()) catch |err| {
-            client_log.debug("event=client_route_hint_write_failed session={s} client={s} error={t}", .{
-                session.guidSlice(),
-                session.clientGuidSlice(),
-                err,
-            });
-        };
-    }
 }
 
 pub fn ensureLocalRouteForCreatedRemoteSession(
@@ -1304,42 +1150,6 @@ pub fn ensureLocalRouteForCreatedRemoteSession(
         config.version,
         tombstone_retention_ms,
     );
-}
-
-pub fn removeClientRouteHintForRemoteSession(allocator: std.mem.Allocator, session: *const RuntimeSession) void {
-    removeClientRouteHintForSession(allocator, session);
-}
-
-pub fn markRouteDetachedForSession(allocator: std.mem.Allocator, session: *const RuntimeSession) void {
-    if (session.guidSlice().len == 0) return;
-    session_registry.markRouteDetachedNow(allocator, session.guidSlice()) catch |err| {
-        client_log.debug("event=route_detached_mark_failed session={s} error={t}", .{
-            session.guidSlice(),
-            err,
-        });
-    };
-}
-
-pub fn writeClientRouteHintForSession(allocator: std.mem.Allocator, session: *const RuntimeSession) void {
-    if (session.clientGuidSlice().len == 0 or session.guidSlice().len == 0) return;
-    session_registry.writeClientRouteHint(allocator, session.clientGuidSlice(), session.guidSlice()) catch |err| {
-        client_log.debug("event=client_route_hint_write_failed session={s} client={s} error={t}", .{
-            session.guidSlice(),
-            session.clientGuidSlice(),
-            err,
-        });
-    };
-}
-
-pub fn removeClientRouteHintForSession(allocator: std.mem.Allocator, session: *const RuntimeSession) void {
-    if (session.clientGuidSlice().len == 0) return;
-    session_registry.removeClientRouteHint(allocator, session.clientGuidSlice()) catch |err| {
-        client_log.debug("event=client_route_hint_remove_failed session={s} client={s} error={t}", .{
-            session.guidSlice(),
-            session.clientGuidSlice(),
-            err,
-        });
-    };
 }
 
 pub fn tombstoneLocalRouteForRemoteSession(allocator: std.mem.Allocator, session: *const RuntimeSession) !void {
@@ -1452,7 +1262,6 @@ fn finishReconnectRepaintInner(
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
-            .te_client_repaint_request => {},
             .te_tty_transcript_chunk => try handleTtyTranscriptChunkFrame(frame.payload),
             .te_session_ended => {
                 try session.recordSessionEndedPayload(frame.payload);
@@ -1534,13 +1343,6 @@ pub fn pollRuntimeRecovery(
             _ = try handleInputAckFrame(frame.payload, &session.input_ack_tracker);
             if (session.pending_repaint.requiresRepaintForRecovery()) return null;
             return .recovered;
-        },
-        .te_client_repaint_request => return null,
-        .te_client_detach_request => {
-            var request = try protocol.decodePayload(pb.TeClientDetachRequest, app_allocator.allocator(), frame.payload);
-            defer request.deinit(app_allocator.allocator());
-            _ = finishAttachedClient(.detach, &session.attached_client_end_restore);
-            return .detach;
         },
         .te_tty_transcript_chunk => {
             try handleTtyTranscriptChunkFrame(frame.payload);
@@ -2473,12 +2275,7 @@ fn handleEscapeHelpRuntimeFrame(
         // The overlay sits on top of the last rendered screen. Applying remote
         // draws here would interleave two renderers; repaint-after-dismiss is
         // the boundary that gets us back to a single source of screen truth.
-        .te_draw, .te_repaint_response, .te_client_repaint_request => return null,
-        .te_client_detach_request => {
-            var request = try protocol.decodePayload(pb.TeClientDetachRequest, app_allocator.allocator(), frame.payload);
-            defer request.deinit(app_allocator.allocator());
-            return .detach;
-        },
+        .te_draw, .te_repaint_response => return null,
         .te_tty_transcript_chunk => {
             try handleTtyTranscriptChunkFrame(frame.payload);
             return null;
@@ -2606,27 +2403,6 @@ fn handleAttachedClientRuntimeFrame(
                 app_title_present,
             );
             return null;
-        },
-        .te_client_repaint_request => {
-            var request = try protocol.decodePayload(pb.TeClientRepaintRequest, app_allocator.allocator(), frame.payload);
-            defer request.deinit(app_allocator.allocator());
-            if (request.include_scrollback) {
-                sendRepaint(write_fd, "", pending_repaint) catch |err| switch (err) {
-                    error.WriteFailed => return .transport_closed,
-                    else => return err,
-                };
-            } else {
-                sendScreenRepaint(write_fd, pending_repaint) catch |err| switch (err) {
-                    error.WriteFailed => return .transport_closed,
-                    else => return err,
-                };
-            }
-            return null;
-        },
-        .te_client_detach_request => {
-            var request = try protocol.decodePayload(pb.TeClientDetachRequest, app_allocator.allocator(), frame.payload);
-            defer request.deinit(app_allocator.allocator());
-            return .detach;
         },
         .te_tty_transcript_chunk => {
             try handleTtyTranscriptChunkFrame(frame.payload);

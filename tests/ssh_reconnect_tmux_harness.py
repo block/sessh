@@ -147,10 +147,7 @@ def actual_socket_path(env, session_ref):
 
 def sever_attached_clients(env, timeout=10.0):
     session_ref = latest_remote_session_ref(env)
-    target = sessh_pb().TeClientControlTarget(
-        target_kind=sessh_pb().TE_CLIENT_CONTROL_TARGET_KIND_ALL,
-    )
-    request = sessh_pb().TeSessionClientDebugSeverConnectionRequest(target=target)
+    request = sessh_pb().TeSessionClientDebugSeverConnectionRequest()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
         conn.connect(str(actual_socket_path(env, session_ref)))

@@ -426,7 +426,6 @@ fn runRemoteNewSession(
     try attached_client.ensureLocalRouteForRemoteSession(
         allocator,
         &session,
-        "",
         target.host,
         target.resolved_host,
         target.resolved_port,
@@ -794,8 +793,7 @@ fn finishDetachedSshSession(
     session: *attached_client.RuntimeSession,
 ) !void {
     session.restoreAttachedClientEndPresentationForExit();
-    attached_client.markRouteDetachedForSession(allocator, session);
-    attached_client.removeClientRouteHintForRemoteSession(allocator, session);
+    _ = allocator;
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
     attached_client.writeDetachOverlayForSessionRef(overlay_args, session.idSlice());
@@ -808,7 +806,6 @@ fn finishEndedRemoteSession(
 ) !u8 {
     const exit_status = session.endedProcessExitCode();
     session.restoreAttachedClientEndPresentationForExit();
-    attached_client.removeClientRouteHintForRemoteSession(allocator, session);
     attached_client.tombstoneLocalRouteForRemoteSession(allocator, session) catch |err| {
         client_log.debug("event=local_tombstone_failed session={s} error={t}", .{ session.idSlice(), err });
     };

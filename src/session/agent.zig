@@ -50,7 +50,6 @@ const Session = struct {
     detached_at_unix_ms: u64 = 0,
     reap_ms: u64 = 0,
     tombstone_retention_ms: u64 = 0,
-    last_input_at_unix_ms: u64 = 0,
     alive: bool = false,
     pending_plain_output: std.ArrayList(u8) = .empty,
     pending_plain_starts_at_boundary: bool = false,
@@ -97,7 +96,6 @@ const AttachedClient = struct {
     rows: u16 = 24,
     cols: u16 = 80,
     attached_at_unix_ms: u64 = 0,
-    last_input_at_unix_ms: u64 = 0,
     origin: ?TerminalOrigin = null,
     active: bool = false,
     close_after_flush: bool = false,
@@ -1585,18 +1583,6 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                 try sendSessionCreatedForSession(session_agent, fd, session);
                 continue;
             },
-            .te_session_live_state_query => {
-                try sendSessionLiveState(session_agent, fd);
-                return false;
-            },
-            .te_session_client_detach_request => {
-                try handleSessionClientDetachRequest(session_agent, fd, frame.payload);
-                return false;
-            },
-            .te_session_client_repaint_request => {
-                try handleSessionClientRepaintRequest(session_agent, fd, frame.payload);
-                return false;
-            },
             .te_session_client_debug_sever_connection_request => {
                 try handleSessionClientDebugSeverConnectionRequest(session_agent, fd, frame.payload);
                 return false;
@@ -1611,7 +1597,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                 const session_index = if (request.session_ref.len > 0)
                     try findSessionIndexForRef(session_agent, request.session_ref)
                 else
-                    findMostRecentSessionIndex(session_agent);
+                    return error.MissingSessionRef;
                 const resolved_session_index = session_index orelse {
                     try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
                     return false;
@@ -1870,324 +1856,48 @@ fn sendSessionCreatedForSession(session_agent: *const SessionAgent, fd: c.fd_t, 
     try protocol.sendFrame(fd, .te_session_created, payload);
 }
 
-fn sendSessionLiveState(session_agent: *SessionAgent, fd: c.fd_t) !void {
-    const session_index = findMostRecentSessionIndex(session_agent) orelse {
-        try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
-        return;
-    };
-    const session = &session_agent.sessions[session_index];
-    var response = pb.TeSessionLiveState{};
-    defer response.attached_clients.deinit(app_allocator.allocator());
-
-    if (session.detached_at_unix_ms != 0) response.detached_at_unix_ms = session.detached_at_unix_ms;
-    if (session.last_input_at_unix_ms != 0) response.last_input_at_unix_ms = session.last_input_at_unix_ms;
-    for (&session_agent.attached_clients) |*attached_client| {
-        if (!attached_client.active or attached_client.close_after_flush or attached_client.session_index != session_index) continue;
-        try response.attached_clients.append(app_allocator.allocator(), .{
-            .client_guid = attached_client.clientGuidSlice(),
-            .terminal_size = .{
-                .terminal_rows = attached_client.rows,
-                .terminal_cols = attached_client.cols,
-            },
-            .attached_at_unix_ms = attached_client.attached_at_unix_ms,
-            .last_input_at_unix_ms = if (attached_client.last_input_at_unix_ms == 0) null else attached_client.last_input_at_unix_ms,
-        });
-    }
-
-    const payload = try protocol.encodePayload(app_allocator.allocator(), response);
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .te_session_live_state, payload);
-}
-
-const CapturedClientControlGuids = struct {
-    bufs: [max_attached_clients][session_registry.client_guid_len]u8 = undefined,
-    lens: [max_attached_clients]usize = undefined,
-    count: usize = 0,
-};
-
-fn handleSessionClientDetachRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.TeSessionClientDetachRequest, app_allocator.allocator(), payload);
-    defer request.deinit(app_allocator.allocator());
-    var selected: [max_attached_clients]usize = undefined;
-    const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
-    const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
-
-    for (selected[0..selected_count]) |attached_client_index| {
-        requestClientDetachFromControl(session_agent, attached_client_index);
-    }
-    try sendClientControlResponse(fd, captured);
-}
-
-fn handleSessionClientRepaintRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.TeSessionClientRepaintRequest, app_allocator.allocator(), payload);
-    defer request.deinit(app_allocator.allocator());
-    var selected: [max_attached_clients]usize = undefined;
-    const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
-    const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
-
-    for (selected[0..selected_count]) |attached_client_index| {
-        requestClientRepaintFromControl(session_agent, attached_client_index, request.include_scrollback);
-    }
-    try sendClientControlResponse(fd, captured);
-}
-
 fn handleSessionClientDebugSeverConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
     var request = try protocol.decodePayload(pb.TeSessionClientDebugSeverConnectionRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
-    var selected: [max_attached_clients]usize = undefined;
-    const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
-    const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
-
-    for (selected[0..selected_count]) |attached_client_index| {
+    var severed = false;
+    for (0..session_agent.attached_clients.len) |attached_client_index| {
+        const attached_client = &session_agent.attached_clients[attached_client_index];
+        if (!attached_client.active or attached_client.close_after_flush) continue;
         detachAttachedClient(session_agent, attached_client_index);
+        severed = true;
     }
-    try sendClientControlResponse(fd, captured);
+    if (!severed) {
+        try sendError(session_agent, fd, "NO_ATTACHED_CLIENTS", "no attached clients", "");
+        return;
+    }
+    try sendClientControlResponse(fd);
 }
 
 fn handleSessionClientDebugUnresponsiveConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
     var request = try protocol.decodePayload(pb.TeSessionClientDebugUnresponsiveConnectionRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
-    var selected: [max_attached_clients]usize = undefined;
-    const selected_count = (try resolveClientControlTargetsOrSend(session_agent, fd, request.target, &selected)) orelse return;
-    const captured = captureSelectedClientControlGuids(session_agent, selected[0..selected_count]);
-
     const seconds = if (request.seconds == 0)
         config.default_debug_unresponsive_seconds
     else
         request.seconds;
     const until_ms = sessionAgentMonotonicMs(session_agent) + @as(i64, seconds) * std.time.ms_per_s;
-    for (selected[0..selected_count]) |attached_client_index| {
-        if (attached_client_index < session_agent.attached_clients.len and session_agent.attached_clients[attached_client_index].active) {
-            session_agent.attached_clients[attached_client_index].debug_unresponsive_until_ms = until_ms;
-        }
+    var updated = false;
+    for (&session_agent.attached_clients) |*attached_client| {
+        if (!attached_client.active or attached_client.close_after_flush) continue;
+        attached_client.debug_unresponsive_until_ms = until_ms;
+        updated = true;
     }
-    try sendClientControlResponse(fd, captured);
+    if (!updated) {
+        try sendError(session_agent, fd, "NO_ATTACHED_CLIENTS", "no attached clients", "");
+        return;
+    }
+    try sendClientControlResponse(fd);
 }
 
-fn resolveClientControlTargetsOrSend(
-    session_agent: *SessionAgent,
-    fd: c.fd_t,
-    maybe_target: ?pb.TeClientControlTarget,
-    selected: *[max_attached_clients]usize,
-) !?usize {
-    const session_index = findMostRecentSessionIndex(session_agent) orelse {
-        try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
-        return null;
-    };
-    const target = maybe_target orelse {
-        try sendError(session_agent, fd, "INVALID_TARGET", "invalid client target", "");
-        return null;
-    };
-    return resolveClientControlTargets(session_agent, session_index, target, selected) catch |err| {
-        switch (err) {
-            error.NoAttachedClients => try sendError(session_agent, fd, "NO_ATTACHED_CLIENTS", "no attached clients", ""),
-            error.MultipleAttachedClients => try sendError(session_agent, fd, "MULTIPLE_ATTACHED_CLIENTS", "multiple clients are attached", "Pass --all, --last-input, or a client GUID"),
-            error.NoLastInputClient => try sendError(session_agent, fd, "NO_LAST_INPUT_CLIENT", "no attached client has sent user input", ""),
-            error.ClientNotFound => try sendError(session_agent, fd, "CLIENT_NOT_FOUND", "client not found", ""),
-            error.AmbiguousClientControlTarget => try sendError(session_agent, fd, "AMBIGUOUS_CLIENT_TARGET", "client target is ambiguous", ""),
-            error.InvalidClientControlTarget => try sendError(session_agent, fd, "INVALID_TARGET", "invalid client target", ""),
-            else => return err,
-        }
-        return null;
-    };
-}
-
-fn captureSelectedClientControlGuids(session_agent: *const SessionAgent, selected: []const usize) CapturedClientControlGuids {
-    var captured = CapturedClientControlGuids{ .count = selected.len };
-    for (selected, 0..) |attached_client_index, i| {
-        const client_guid = session_agent.attached_clients[attached_client_index].clientGuidSlice();
-        @memcpy(captured.bufs[i][0..client_guid.len], client_guid);
-        captured.lens[i] = client_guid.len;
-    }
-    return captured;
-}
-
-fn sendClientControlResponse(fd: c.fd_t, captured: CapturedClientControlGuids) !void {
-    var response = pb.TeSessionClientControlResponse{};
-    defer response.affected_client_guid.deinit(app_allocator.allocator());
-    for (captured.bufs[0..captured.count], captured.lens[0..captured.count]) |*buf, len| {
-        try response.affected_client_guid.append(app_allocator.allocator(), buf[0..len]);
-    }
-    const response_payload = try protocol.encodePayload(app_allocator.allocator(), response);
+fn sendClientControlResponse(fd: c.fd_t) !void {
+    const response_payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionClientControlResponse{});
     defer app_allocator.allocator().free(response_payload);
     try protocol.sendFrame(fd, .te_session_client_control_response, response_payload);
-}
-
-fn resolveClientControlTargets(
-    session_agent: *const SessionAgent,
-    session_index: usize,
-    target: pb.TeClientControlTarget,
-    selected: *[max_attached_clients]usize,
-) !usize {
-    return switch (target.target_kind) {
-        .TE_CLIENT_CONTROL_TARGET_KIND_DEFAULT => resolveDefaultClientTarget(session_agent, session_index, selected),
-        .TE_CLIENT_CONTROL_TARGET_KIND_ALL => resolveAllClientTargets(session_agent, session_index, selected),
-        .TE_CLIENT_CONTROL_TARGET_KIND_LAST_INPUT => resolveLastInputClientTarget(session_agent, session_index, selected),
-        .TE_CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID => resolveClientGuidTarget(session_agent, session_index, target.client_guid, selected),
-        else => error.InvalidClientControlTarget,
-    };
-}
-
-fn controlTargetActive(attached_client: *const AttachedClient, session_index: usize) bool {
-    return attached_client.active and attached_client.session_index == session_index and !attached_client.close_after_flush;
-}
-
-fn resolveDefaultClientTarget(
-    session_agent: *const SessionAgent,
-    session_index: usize,
-    selected: *[max_attached_clients]usize,
-) !usize {
-    var found: ?usize = null;
-    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
-        if (!controlTargetActive(attached_client, session_index)) continue;
-        if (found != null) return error.MultipleAttachedClients;
-        found = i;
-    }
-    selected[0] = found orelse return error.NoAttachedClients;
-    return 1;
-}
-
-fn resolveAllClientTargets(
-    session_agent: *const SessionAgent,
-    session_index: usize,
-    selected: *[max_attached_clients]usize,
-) !usize {
-    var count: usize = 0;
-    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
-        if (!controlTargetActive(attached_client, session_index)) continue;
-        selected[count] = i;
-        count += 1;
-    }
-    if (count == 0) return error.NoAttachedClients;
-    return count;
-}
-
-fn resolveLastInputClientTarget(
-    session_agent: *const SessionAgent,
-    session_index: usize,
-    selected: *[max_attached_clients]usize,
-) !usize {
-    var found: ?usize = null;
-    var found_ts: u64 = 0;
-    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
-        if (!controlTargetActive(attached_client, session_index)) continue;
-        if (attached_client.last_input_at_unix_ms == 0) continue;
-        if (found == null or attached_client.last_input_at_unix_ms >= found_ts) {
-            found = i;
-            found_ts = attached_client.last_input_at_unix_ms;
-        }
-    }
-    selected[0] = found orelse return error.NoLastInputClient;
-    return 1;
-}
-
-fn resolveClientGuidTarget(
-    session_agent: *const SessionAgent,
-    session_index: usize,
-    client_guid: []const u8,
-    selected: *[max_attached_clients]usize,
-) !usize {
-    if (!session_registry.isValidClientGuid(client_guid) and
-        !session_registry.isValidClientGuidPrefix(client_guid)) return error.InvalidClientControlTarget;
-    const prefix = if (session_registry.isValidClientGuidPrefix(client_guid))
-        client_guid
-    else
-        null;
-    var found: ?usize = null;
-    for (&session_agent.attached_clients, 0..) |*attached_client, i| {
-        if (!controlTargetActive(attached_client, session_index)) continue;
-        const matches = if (prefix) |value|
-            clientGuidMatchesPrefix(attached_client.clientGuidSlice(), value)
-        else
-            std.mem.eql(u8, attached_client.clientGuidSlice(), client_guid);
-        if (!matches) continue;
-        if (found != null) return error.AmbiguousClientControlTarget;
-        found = i;
-    }
-    selected[0] = found orelse return error.ClientNotFound;
-    return 1;
-}
-
-fn clientGuidMatchesPrefix(client_guid: []const u8, prefix: []const u8) bool {
-    var prefix_buf: [session_registry.compact_guid_len]u8 = undefined;
-    const prefix_len = compactClientGuidPrefix(prefix, &prefix_buf) orelse return false;
-    var compact_buf: [session_registry.compact_guid_len]u8 = undefined;
-    var dst: usize = 0;
-    for (client_guid[session_registry.client_guid_prefix.len..]) |byte| {
-        if (byte == '-') continue;
-        compact_buf[dst] = std.ascii.toLower(byte);
-        dst += 1;
-    }
-    return std.mem.startsWith(u8, compact_buf[0..dst], prefix_buf[0..prefix_len]);
-}
-
-fn compactClientGuidPrefix(prefix: []const u8, out: *[session_registry.compact_guid_len]u8) ?usize {
-    if (!std.mem.startsWith(u8, prefix, session_registry.client_guid_prefix)) return null;
-    const body = prefix[session_registry.client_guid_prefix.len..];
-    if (body.len == 0) return null;
-    if (body.len <= session_registry.compact_guid_len) {
-        var len: usize = 0;
-        for (body) |byte| {
-            if (!std.ascii.isHex(byte)) {
-                len = 0;
-                break;
-            }
-            out[len] = std.ascii.toLower(byte);
-            len += 1;
-        }
-        if (len == body.len) return len;
-    }
-
-    if (body.len >= session_registry.guid_body_len) return null;
-    var len: usize = 0;
-    for (body, 0..) |byte, i| {
-        switch (i) {
-            8, 13, 18, 23 => {
-                if (byte != '-') return null;
-            },
-            else => {
-                if (!std.ascii.isHex(byte)) return null;
-                out[len] = std.ascii.toLower(byte);
-                len += 1;
-            },
-        }
-    }
-    if (len == 0) return null;
-    return len;
-}
-
-fn requestClientDetachFromControl(session_agent: *SessionAgent, attached_client_index: usize) void {
-    if (attached_client_index >= session_agent.attached_clients.len) return;
-    const attached_client = &session_agent.attached_clients[attached_client_index];
-    if (!attached_client.active or attached_client.close_after_flush) return;
-    const payload = protocol.encodePayload(app_allocator.allocator(), pb.TeClientDetachRequest{}) catch {
-        detachAttachedClient(session_agent, attached_client_index);
-        return;
-    };
-    defer app_allocator.allocator().free(payload);
-    queueAttachedClientFrame(attached_client, .te_client_detach_request, payload) catch {
-        detachAttachedClient(session_agent, attached_client_index);
-        return;
-    };
-    flushAttachedClientOutput(session_agent, attached_client_index);
-}
-
-fn requestClientRepaintFromControl(session_agent: *SessionAgent, attached_client_index: usize, include_scrollback: bool) void {
-    if (attached_client_index >= session_agent.attached_clients.len) return;
-    const attached_client = &session_agent.attached_clients[attached_client_index];
-    if (!attached_client.active or attached_client.close_after_flush) return;
-    const payload = protocol.encodePayload(app_allocator.allocator(), pb.TeClientRepaintRequest{
-        .include_scrollback = include_scrollback,
-    }) catch {
-        detachAttachedClient(session_agent, attached_client_index);
-        return;
-    };
-    defer app_allocator.allocator().free(payload);
-    queueAttachedClientFrame(attached_client, .te_client_repaint_request, payload) catch {
-        detachAttachedClient(session_agent, attached_client_index);
-        return;
-    };
-    flushAttachedClientOutput(session_agent, attached_client_index);
 }
 
 fn sessionDirSlice(session_agent: *const SessionAgent) []const u8 {
@@ -3144,7 +2854,6 @@ fn attachSession(
         } else {
             try sendSessionSnapshot(attached_client, session);
         }
-        writeClientAgentSocketHintForAttachedClient(session_agent, session, attached_client);
         refreshAttachedFlag(session_agent, session_index);
         logSessionAgent(session_agent, "event=attach id={s} client={s} rows={} cols={} attached_clients={}", .{
             session.idSlice(),
@@ -3158,26 +2867,6 @@ fn attachSession(
     }
 
     return error.TooManyAttachedClients;
-}
-
-fn writeClientAgentSocketHintForAttachedClient(session_agent: *SessionAgent, session: *const Session, attached_client: *const AttachedClient) void {
-    session_registry.writeClientAgentSocketHint(app_allocator.allocator(), attached_client.clientGuidSlice(), session.idSlice()) catch |err| {
-        logSessionAgent(session_agent, "event=client_agent_socket_hint_write_failed id={s} client={s} error={t}", .{
-            session.idSlice(),
-            attached_client.clientGuidSlice(),
-            err,
-        });
-    };
-}
-
-fn removeClientAgentSocketHintForAttachedClient(session_agent: *SessionAgent, session: *const Session, attached_client: *const AttachedClient) void {
-    session_registry.removeClientAgentSocketHint(app_allocator.allocator(), attached_client.clientGuidSlice()) catch |err| {
-        logSessionAgent(session_agent, "event=client_agent_socket_hint_remove_failed id={s} client={s} error={t}", .{
-            session.idSlice(),
-            attached_client.clientGuidSlice(),
-            err,
-        });
-    };
 }
 
 fn detachExistingAttachedClientWithClientGuid(session_agent: *SessionAgent, session_index: usize, client_guid: []const u8) void {
@@ -3395,11 +3084,6 @@ fn handleInputFrame(session_agent: *SessionAgent, attached_client_index: usize, 
         detachAttachedClient(session_agent, attached_client_index);
         return;
     };
-    if (inputBytesContainUserInput(attached_client, input.data)) {
-        const now_ms = nowUnixMs();
-        attached_client.last_input_at_unix_ms = now_ms;
-        session.last_input_at_unix_ms = now_ms;
-    }
     if (translated.items.len == 0) return;
 
     queueTtyTranscriptChunk(attached_client, .TE_TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {
@@ -3670,82 +3354,6 @@ fn parseSgrMouseNumber(input: []const u8, index: *usize) ?u32 {
     return value;
 }
 
-const EscapeSequenceClassification = union(enum) {
-    incomplete,
-    terminal_response: usize,
-    user_input: usize,
-};
-
-fn inputBytesContainUserInput(attached_client: *const AttachedClient, bytes: []const u8) bool {
-    var index: usize = 0;
-    while (index < bytes.len) {
-        const byte = bytes[index];
-        if (byte == 0x1b) {
-            switch (parseSgrMouseReport(bytes, index)) {
-                .complete => |report| {
-                    index = report.end;
-                    continue;
-                },
-                .incomplete => if (attachedClientSgrMouseActive(attached_client)) return false,
-                .not_mouse => {},
-            }
-            switch (classifyEscapeSequence(bytes, index)) {
-                .terminal_response => |end| {
-                    index = end;
-                    continue;
-                },
-                .incomplete, .user_input => return true,
-            }
-        }
-        // Treat C0 controls such as ENTER and CTRL-A as user input. The
-        // terminal-generated responses we filter are escape sequences.
-        return true;
-    }
-    return false;
-}
-
-fn classifyEscapeSequence(bytes: []const u8, start: usize) EscapeSequenceClassification {
-    if (start + 1 >= bytes.len) return .incomplete;
-    return switch (bytes[start + 1]) {
-        ']' => classifyStringControl(bytes, start + 2),
-        'P', '_', '^', 'X' => classifyStringControl(bytes, start + 2),
-        '[' => classifyCsiSequence(bytes, start + 2),
-        else => .{ .user_input = start + 2 },
-    };
-}
-
-fn classifyStringControl(bytes: []const u8, start: usize) EscapeSequenceClassification {
-    var index = start;
-    while (index < bytes.len) : (index += 1) {
-        if (bytes[index] == 0x07) return .{ .terminal_response = index + 1 };
-        if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '\\') {
-            return .{ .terminal_response = index + 2 };
-        }
-    }
-    return .incomplete;
-}
-
-fn classifyCsiSequence(bytes: []const u8, start: usize) EscapeSequenceClassification {
-    var index = start;
-    while (index < bytes.len) : (index += 1) {
-        const byte = bytes[index];
-        if (byte < 0x40 or byte > 0x7e) continue;
-        const end = index + 1;
-        if (isTerminalGeneratedCsiResponse(bytes[start..index], byte)) return .{ .terminal_response = end };
-        return .{ .user_input = end };
-    }
-    return .incomplete;
-}
-
-fn isTerminalGeneratedCsiResponse(params_and_intermediates: []const u8, final: u8) bool {
-    switch (final) {
-        'c', 'n', 'R', 't', 'x' => return true,
-        'I', 'O' => return params_and_intermediates.len == 0,
-        'y' => return std.mem.indexOfScalar(u8, params_and_intermediates, '$') != null,
-        else => return false,
-    }
-}
-
 fn appendTranslatedSgrMouseReport(
     attached_client: *const AttachedClient,
     session: *const Session,
@@ -3912,25 +3520,6 @@ test "bare escape is not held by kitty keyboard translation" {
     try translateAttachedClientInput(&attached_client, &session, "\x1b", &out);
     try std.testing.expectEqualStrings("\x1b", out.items);
     try std.testing.expectEqual(@as(usize, 0), attached_client.input_pending_len);
-}
-
-test "last input classifier ignores terminal generated responses" {
-    var attached_client = AttachedClient{
-        .origin = .{ .row = 0, .col = 0 },
-        .presentation = .{
-            .terminal_modes = .{ .mouse_tracking = .normal, .mouse_sgr = true },
-            .terminal_modes_initialized = true,
-        },
-    };
-
-    try std.testing.expect(!inputBytesContainUserInput(&attached_client, "\x1b[<0;12;5M"));
-    try std.testing.expect(!inputBytesContainUserInput(&attached_client, "\x1b]10;rgb:ffff/ffff/ffff\x07"));
-    try std.testing.expect(!inputBytesContainUserInput(&attached_client, "\x1b[?1;2c"));
-    try std.testing.expect(!inputBytesContainUserInput(&attached_client, "\x1b[24;80R"));
-    try std.testing.expect(!inputBytesContainUserInput(&attached_client, "\x1b[0n"));
-    try std.testing.expect(inputBytesContainUserInput(&attached_client, "\x1b[A"));
-    try std.testing.expect(inputBytesContainUserInput(&attached_client, "\x01"));
-    try std.testing.expect(inputBytesContainUserInput(&attached_client, "\x1b]10;rgb:ffff/ffff/ffff\x07x"));
 }
 
 fn handleResizeFrame(session_agent: *SessionAgent, attached_client_index: usize, payload: []const u8) void {
@@ -4111,7 +3700,6 @@ fn detachAttachedClient(session_agent: *SessionAgent, attached_client_index: usi
     if (session_index < session_agent.sessions.len) {
         const session = &session_agent.sessions[session_index];
         logSessionAgent(session_agent, "event=detach id={s} rows={} cols={}", .{ session.idSlice(), attached_client.rows, attached_client.cols });
-        removeClientAgentSocketHintForAttachedClient(session_agent, session, attached_client);
     }
     _ = c.close(attached_client.fd);
     attached_client.output.deinit(app_allocator.allocator());
@@ -4141,24 +3729,6 @@ fn refreshAttachedFlag(session_agent: *SessionAgent, session_index: usize) void 
     } else if (was_attached or session_agent.sessions[session_index].detached_at_unix_ms == 0) {
         session_agent.sessions[session_index].detached_at_unix_ms = nowUnixMs();
     }
-    if (now_attached != was_attached) updateRouteAttachedClientState(session_agent, session_index, count);
-}
-
-fn updateRouteAttachedClientState(session_agent: *SessionAgent, session_index: usize, attached_count_value: u32) void {
-    const session = &session_agent.sessions[session_index];
-    session_registry.updateRouteStatus(
-        app_allocator.allocator(),
-        session.idSlice(),
-        true,
-        null,
-        .{
-            .attached_count = attached_count_value,
-            .last_input_at_unix_ms = if (session.last_input_at_unix_ms == 0) null else session.last_input_at_unix_ms,
-            .detached_at_unix_ms = if (session.detached_at_unix_ms == 0) null else session.detached_at_unix_ms,
-        },
-    ) catch |err| {
-        logSessionAgent(session_agent, "event=route_attached_client_state_update_failed id={s} error={t}", .{ session.idSlice(), err });
-    };
 }
 
 fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, exit_info: ExitInfo) void {
@@ -4187,7 +3757,6 @@ fn endSession(session_agent: *SessionAgent, session_index: usize, reason: u8, ex
         });
     }
     sendSessionEndedToAttachedClients(session_agent, session_index, reason, exit_info);
-    removeClientAgentSocketHintsForSession(session_agent, session_index);
     writeEndedSessionTombstone(session_agent, session, reason, exit_info);
     if (session.pty_fd >= 0) _ = c.close(session.pty_fd);
     if (session.terminal_model) |model| {
@@ -4231,15 +3800,6 @@ fn clearAttachedClientHints(session_agent: *SessionAgent) void {
     if (session_agent.session_paths) |paths| session_registry.removeEndedHints(paths) catch {};
 }
 
-fn removeClientAgentSocketHintsForSession(session_agent: *SessionAgent, session_index: usize) void {
-    if (session_index >= session_agent.sessions.len) return;
-    const session = &session_agent.sessions[session_index];
-    for (&session_agent.attached_clients) |*attached_client| {
-        if (!attached_client.active or attached_client.session_index != session_index) continue;
-        removeClientAgentSocketHintForAttachedClient(session_agent, session, attached_client);
-    }
-}
-
 fn stopSessionAgentIfComplete(session_agent: *SessionAgent) void {
     if (session_agent.shutting_down) {
         for (&session_agent.attached_clients) |*attached_client| {
@@ -4274,14 +3834,6 @@ fn findSessionIndexForRef(session_agent: *SessionAgent, ref: []const u8) !?usize
     const guid = try session_registry.resolveRefToGuid(app_allocator.allocator(), ref);
     defer app_allocator.allocator().free(guid);
     return findSessionIndex(session_agent, guid);
-}
-
-fn findMostRecentSessionIndex(session_agent: *SessionAgent) ?usize {
-    for (&session_agent.sessions, 0..) |*session, i| {
-        if (!session.alive) continue;
-        return i;
-    }
-    return null;
 }
 
 fn endSessionFromPtyClose(session_agent: *SessionAgent, session_index: usize) void {

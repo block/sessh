@@ -116,7 +116,7 @@ def test_cache_hit_decodes_encoded_exec_args(tmp):
     encoded_request = "b64:" + base64.b64encode(request.encode()).decode()
 
     result = run_bootstrapper(
-        f"EXEC test-set {artifact_hash} -- kill --host . --jsonl --request {encoded_request}\n",
+        f"EXEC test-set {artifact_hash} -- maintenance --target local --jsonl --request {encoded_request}\n",
         env,
     )
 
@@ -124,9 +124,9 @@ def test_cache_hit_decodes_encoded_exec_args(tmp):
     expected = (
         "OK\n"
         "CACHED argc=6\n"
-        "<kill>\n"
-        "<--host>\n"
-        "<.>\n"
+        "<maintenance>\n"
+        "<--target>\n"
+        "<local>\n"
         "<--jsonl>\n"
         "<--request>\n"
         f"<{request}>\n"

@@ -565,10 +565,7 @@ def env_with_session_guid(env, session_ref):
 def sever_session_clients(env, timeout=30.0, session_ref=None):
     if session_ref is None:
         session_ref = test_session_guid(1)
-    target = sessh_pb().TeClientControlTarget(
-        target_kind=sessh_pb().TE_CLIENT_CONTROL_TARGET_KIND_ALL,
-    )
-    request = sessh_pb().TeSessionClientDebugSeverConnectionRequest(target=target)
+    request = sessh_pb().TeSessionClientDebugSeverConnectionRequest()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
         conn.connect(str(actual_socket_path(env, session_ref)))
@@ -580,13 +577,7 @@ def sever_session_clients(env, timeout=30.0, session_ref=None):
 def make_session_clients_unresponsive(env, seconds, timeout=30.0, session_ref=None):
     if session_ref is None:
         session_ref = test_session_guid(1)
-    target = sessh_pb().TeClientControlTarget(
-        target_kind=sessh_pb().TE_CLIENT_CONTROL_TARGET_KIND_ALL,
-    )
-    request = sessh_pb().TeSessionClientDebugUnresponsiveConnectionRequest(
-        target=target,
-        seconds=seconds,
-    )
+    request = sessh_pb().TeSessionClientDebugUnresponsiveConnectionRequest(seconds=seconds)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
         conn.connect(str(actual_socket_path(env, session_ref)))
@@ -1156,54 +1147,8 @@ def test_session_guid(index):
     return f"s-{index:08x}-0000-4000-8000-{index:012x}"
 
 
-def test_session_id(index):
-    return f"s-{index:08x}"
-
-
 def short_session_id(guid):
     return "s-" + compact_guid(guid)[:8]
-
-
-def list_rows(list_stdout):
-    rows = []
-    for line in list_stdout.splitlines()[1:]:
-        if not line.strip():
-            continue
-        if len(line) < 58:
-            raise AssertionError(f"invalid list row: {line!r}\n{list_stdout}")
-        rows.append(
-            [
-                line[0:10].strip(),
-                line[12:20].strip(),
-                line[22:30].strip(),
-                line[32:56].strip(),
-                line[58:].strip(),
-            ]
-        )
-    return rows
-
-
-def has_list_header(list_stdout):
-    header = list_stdout.splitlines()[0] if list_stdout.splitlines() else ""
-    return all(column in header for column in ("ID", "ATTACHED", "INPUT", "HOST", "VERSION"))
-
-
-def list_has_session(list_stdout, session_id):
-    for row in list_rows(list_stdout):
-        if row[0] == session_id:
-            return True
-    return False
-
-
-def jsonl_rows(stdout):
-    return [json.loads(line) for line in stdout.splitlines() if line.strip()]
-
-
-def only_jsonl_row(stdout):
-    rows = jsonl_rows(stdout)
-    if len(rows) != 1:
-        raise AssertionError(stdout)
-    return rows[0]
 
 
 def single_live_session_row(env):
@@ -1235,25 +1180,6 @@ def single_live_session_guid(env):
     if not guid:
         raise AssertionError(row)
     return guid
-
-
-def write_client_route_hint(env, client_guid, session_id):
-    hint = runtime_root(env) / "guid" / client_guid / "route.json"
-    hint.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if hint.exists() or hint.is_symlink():
-        hint.unlink()
-    hint.symlink_to(route_file(env, session_id))
-    (hint.parent / "outgoing-meta.json").write_text(
-        json.dumps(
-            {
-                "type": "outgoing-client",
-                "created_at_unix_ms": 1,
-            },
-            separators=(",", ":"),
-        )
-        + "\n"
-    )
-    return hint
 
 
 def session_path(env, session_id=None):
