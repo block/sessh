@@ -28,27 +28,25 @@ pub fn build(b: *std.Build) void {
     addPlatformLibraries(exe_mod, target);
 
     const exe = b.addExecutable(.{
-        .name = "sesshmux-dev",
+        .name = "sessh-dev",
         .root_module = exe_mod,
     });
     exe.step.dependOn(&protoc_step.step);
 
     const sessh_wrapper_step = installWrapper(b, "bin/sessh");
-    const sesshmux_wrapper_step = installWrapper(b, "bin/sesshmux");
 
-    const run_step = b.step("run", "Run sesshmux");
+    const run_step = b.step("run", "Run sessh");
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| run_cmd.addArgs(args);
     run_step.dependOn(&run_cmd.step);
 
-    const install_dev_step = b.step("install-dev", "Install the current sesshmux-dev executable for tests");
+    const install_dev_step = b.step("install-dev", "Install the current sessh-dev executable for tests");
     const install_dev = b.addInstallArtifact(exe, .{
         .dest_dir = .{ .override = .prefix },
-        .dest_sub_path = "bin/sesshmux-dev",
+        .dest_sub_path = "bin/sessh-dev",
     });
     install_dev_step.dependOn(&install_dev.step);
     install_dev_step.dependOn(sessh_wrapper_step);
-    install_dev_step.dependOn(sesshmux_wrapper_step);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -98,31 +96,31 @@ fn addArtifactsStep(b: *std.Build, protoc_step: *std.Build.Step) *std.Build.Step
 
     const artifact_targets = [_]ArtifactTarget{
         .{
-            .filename = "sesshmux-macos-aarch64",
+            .filename = "sessh-macos-aarch64",
             .query = .{ .cpu_arch = .aarch64, .os_tag = .macos },
         },
         .{
-            .filename = "sesshmux-macos-x86_64",
+            .filename = "sessh-macos-x86_64",
             .query = .{ .cpu_arch = .x86_64, .os_tag = .macos },
         },
         .{
-            .filename = "sesshmux-linux-arm32",
+            .filename = "sessh-linux-arm32",
             .query = .{ .cpu_arch = .arm, .os_tag = .linux, .abi = .musleabihf },
         },
         .{
-            .filename = "sesshmux-linux-aarch64",
+            .filename = "sessh-linux-aarch64",
             .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
         },
         .{
-            .filename = "sesshmux-linux-x86_64",
+            .filename = "sessh-linux-x86_64",
             .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
         },
         .{
-            .filename = "sesshmux-linux-x86",
+            .filename = "sessh-linux-x86",
             .query = .{ .cpu_arch = .x86, .os_tag = .linux, .abi = .musl },
         },
         .{
-            .filename = "sesshmux-linux-riscv64",
+            .filename = "sessh-linux-riscv64",
             .query = .{
                 .cpu_arch = .riscv64,
                 .os_tag = .linux,

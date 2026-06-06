@@ -1,8 +1,9 @@
 const std = @import("std");
 
+const client_config = @import("../session/client_config.zig");
 const client_log = @import("../core/client_log.zig");
+const client_ui = @import("../session/client_ui.zig");
 const config = @import("../core/config.zig");
-const mux_cli = @import("cli.zig");
 const ssh_opts = @import("../transport/ssh_options.zig");
 
 const SshTtyRequest = ssh_opts.SshTtyRequest;
@@ -13,13 +14,50 @@ pub const Invocation = struct {
     command_args: []const []const u8 = &.{},
     tty_request: SshTtyRequest = .none,
     proxy_required: bool = false,
-    common: mux_cli.CommonSessionOptions = .{},
+    common: CommonSessionOptions = .{},
 };
 
-pub fn parse(scratch: *mux_cli.Scratch, args: []const []const u8) !Invocation {
+pub const CommonSessionOptions = struct {
+    overlay_args: client_ui.DetachOverlayArgs = .{},
+    scrollback_row_count: u32 = config.default_scrollback_row_count,
+    scrollback_row_count_set: bool = false,
+    initial_scrollback_row_count: ?u32 = null,
+    initial_scrollback_row_count_set: bool = false,
+    client_log_level: client_log.Level = .warn,
+    client_log_level_set: bool = false,
+    bootstrap: bool = true,
+    bootstrap_set: bool = false,
+    terminal_emulator: bool = true,
+    terminal_emulator_set: bool = false,
+    filter_level: config.FilterLevel = config.default_filter_level,
+    filter_level_set: bool = false,
+    capture_tty_transcript: ?[]const u8 = null,
+};
+
+pub const Scratch = struct {
+    allocator: std.mem.Allocator,
+    owned_ssh_words: std.ArrayList([]u8) = .empty,
+    owned_ssh_options: ?[][]const u8 = null,
+
+    pub fn deinit(self: *Scratch) void {
+        if (self.owned_ssh_options) |options| self.allocator.free(options);
+        for (self.owned_ssh_words.items) |word| self.allocator.free(word);
+        self.owned_ssh_words.deinit(self.allocator);
+    }
+
+    fn ownSshOptions(self: *Scratch, options: *std.ArrayList([]const u8)) ![]const []const u8 {
+        if (options.items.len == 0) return &.{};
+        std.debug.assert(self.owned_ssh_options == null);
+        const owned = try options.toOwnedSlice(self.allocator);
+        self.owned_ssh_options = owned;
+        return owned;
+    }
+};
+
+pub fn parse(scratch: *Scratch, args: []const []const u8) !Invocation {
     if (args.len < 2) return error.MissingHost;
 
-    var common = mux_cli.CommonSessionOptions{};
+    var common = CommonSessionOptions{};
     var ssh_options: std.ArrayList([]const u8) = .empty;
     defer ssh_options.deinit(scratch.allocator);
     var tty_request: SshTtyRequest = .none;
@@ -54,9 +92,9 @@ pub fn parse(scratch: *mux_cli.Scratch, args: []const []const u8) !Invocation {
 }
 
 fn finish(
-    scratch: *mux_cli.Scratch,
+    scratch: *Scratch,
     ssh_options: *std.ArrayList([]const u8),
-    common: mux_cli.CommonSessionOptions,
+    common: CommonSessionOptions,
     host: []const u8,
     command_args: []const []const u8,
     tty_request: SshTtyRequest,
@@ -72,7 +110,7 @@ fn finish(
     };
 }
 
-fn parseSesshOptionBeforeHost(args: []const []const u8, index: *usize, common: *mux_cli.CommonSessionOptions) !void {
+fn parseSesshOptionBeforeHost(args: []const []const u8, index: *usize, common: *CommonSessionOptions) !void {
     const arg = args[index.*];
     if (isConfigOnlyDirectSesshOption(arg)) return error.UnsupportedSesshOption;
 
@@ -137,7 +175,7 @@ fn expectArgvEqual(expected: []const []const u8, actual: []const []const u8) !vo
 }
 
 test "parse passes through ssh options before host" {
-    var scratch = mux_cli.Scratch{ .allocator = std.testing.allocator };
+    var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 
     const parsed = try parse(&scratch, &.{
@@ -156,7 +194,7 @@ test "parse passes through ssh options before host" {
 }
 
 test "parse accepts public sessh options before ssh options and host" {
-    var scratch = mux_cli.Scratch{ .allocator = std.testing.allocator };
+    var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 
     const parsed = try parse(&scratch, &.{
@@ -174,7 +212,7 @@ test "parse accepts public sessh options before ssh options and host" {
 }
 
 test "parse accepts interleaved ssh and sessh options before host" {
-    var scratch = mux_cli.Scratch{ .allocator = std.testing.allocator };
+    var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 
     const parsed = try parse(&scratch, &.{
@@ -200,7 +238,7 @@ test "parse accepts interleaved ssh and sessh options before host" {
 }
 
 test "parse treats every direct post-host token as remote command" {
-    var scratch = mux_cli.Scratch{ .allocator = std.testing.allocator };
+    var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 
     const parsed = try parse(&scratch, &.{
@@ -220,7 +258,7 @@ test "parse treats every direct post-host token as remote command" {
 }
 
 test "parse rejects config-only sessh options on direct ssh transport" {
-    var scratch = mux_cli.Scratch{ .allocator = std.testing.allocator };
+    var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 
     try std.testing.expectError(error.UnsupportedSesshOption, parse(&scratch, &.{
@@ -254,7 +292,7 @@ test "parse rejects config-only sessh options on direct ssh transport" {
 }
 
 test "parse rejects protocol-breaking ssh options" {
-    var scratch = mux_cli.Scratch{ .allocator = std.testing.allocator };
+    var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 
     try std.testing.expectError(error.UnsafeSshOption, parse(&scratch, &.{
@@ -271,7 +309,7 @@ test "parse rejects protocol-breaking ssh options" {
 }
 
 test "parse uses ssh tty request to preserve shell-evaluated command args" {
-    var scratch = mux_cli.Scratch{ .allocator = std.testing.allocator };
+    var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 
     const parsed = try parse(&scratch, &.{
@@ -281,13 +319,13 @@ test "parse uses ssh tty request to preserve shell-evaluated command args" {
         "echo",
         "$SESSH_TEST_HOST",
     });
-    try expectArgvEqual(&.{ "-t" }, parsed.ssh_options);
+    try expectArgvEqual(&.{"-t"}, parsed.ssh_options);
     try expectArgvEqual(&.{ "echo", "$SESSH_TEST_HOST" }, parsed.command_args);
     try std.testing.expectEqual(SshTtyRequest.requested, parsed.tty_request);
 }
 
 test "parse permits explicit safe config overrides" {
-    var scratch = mux_cli.Scratch{ .allocator = std.testing.allocator };
+    var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 
     const parsed = try parse(&scratch, &.{
@@ -303,7 +341,7 @@ test "parse permits explicit safe config overrides" {
 }
 
 test "parse treats post-host mux words as remote command" {
-    var scratch = mux_cli.Scratch{ .allocator = std.testing.allocator };
+    var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 
     const parsed = try parse(&scratch, &.{
@@ -321,7 +359,7 @@ test "parse treats post-host mux words as remote command" {
 }
 
 test "parse preserves lower filter levels" {
-    var scratch = mux_cli.Scratch{ .allocator = std.testing.allocator };
+    var scratch = Scratch{ .allocator = std.testing.allocator };
     defer scratch.deinit();
 
     const parsed = try parse(&scratch, &.{

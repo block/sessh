@@ -8,13 +8,11 @@ pub const bootstrap_exec_encoded_arg_prefix = "b64:";
 pub const Entrypoint = enum {
     session_broker,
     stream_broker,
-    control,
 
     pub fn arg(self: Entrypoint) []const u8 {
         return switch (self) {
             .session_broker => ":internal-session-broker:",
             .stream_broker => ":internal-stream-broker:",
-            .control => ":internal-control:",
         };
     }
 };
@@ -31,28 +29,6 @@ pub fn directSessionBrokerCommand(allocator: std.mem.Allocator) ![]u8 {
     return directEntrypointCommand(allocator, .session_broker, &.{});
 }
 
-pub fn directMuxCommand(allocator: std.mem.Allocator, mux_args: []const []const u8) ![]u8 {
-    var script: std.ArrayList(u8) = .empty;
-    defer script.deinit(allocator);
-    const client_version = try shellQuote(allocator, config.version);
-    defer allocator.free(client_version);
-    try script.appendSlice(allocator, "SESSH_CLIENT_VERSION=");
-    try script.appendSlice(allocator, client_version);
-    try script.appendSlice(allocator, " exec sesshmux");
-    for (mux_args) |arg| {
-        const quoted = try shellQuote(allocator, arg);
-        defer allocator.free(quoted);
-        try script.append(allocator, ' ');
-        try script.appendSlice(allocator, quoted);
-    }
-    try script.append(allocator, '\n');
-    return shCommand(allocator, script.items);
-}
-
-pub fn directControlCommand(allocator: std.mem.Allocator) ![]u8 {
-    return directEntrypointCommand(allocator, .control, &.{});
-}
-
 pub fn directEntrypointCommand(
     allocator: std.mem.Allocator,
     entrypoint: Entrypoint,
@@ -64,7 +40,7 @@ pub fn directEntrypointCommand(
     defer allocator.free(client_version);
     try script.appendSlice(allocator, "SESSH_CLIENT_VERSION=");
     try script.appendSlice(allocator, client_version);
-    try script.appendSlice(allocator, " exec sesshmux ");
+    try script.appendSlice(allocator, " exec sessh ");
     try script.appendSlice(allocator, entrypoint.arg());
     for (entrypoint_args) |arg| {
         const quoted = try shellQuote(allocator, arg);
@@ -116,7 +92,7 @@ pub fn needsEncodedExecArg(arg: []const u8) bool {
 // OpenSSH does not preserve argv for `ssh HOST cmd args...`; it joins the
 // remaining local argv with spaces and lets the remote login shell interpret
 // the result. The caller is responsible for only using this for that ssh-shaped
-// command form. `sesshmux new HOST cmd args...` uses command_argv instead.
+// command form.
 pub fn joinRemoteShellCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);

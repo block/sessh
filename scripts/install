@@ -8,7 +8,6 @@ usage: scripts/install
 Builds this checkout and installs it for local dogfooding:
   ~/.local/opt/sessh-dev
   ~/.local/bin/sessh -> ~/.local/opt/sessh-dev/bin/sessh
-  ~/.local/bin/sesshmux -> ~/.local/opt/sessh-dev/bin/sesshmux
 EOF
 }
 
@@ -81,7 +80,6 @@ bin_dir=$local_root/bin
 opt_dir=$local_root/opt
 prefix=$opt_dir/sessh-dev
 sessh_link=$bin_dir/sessh
-sesshmux_link=$bin_dir/sesshmux
 
 missing_dirs=
 if [ ! -d "$bin_dir" ]; then
@@ -100,11 +98,6 @@ if [ -e "$sessh_link" ] && [ ! -L "$sessh_link" ]; then
   printf 'scripts/install: refusing to replace non-symlink %s\n' "$sessh_link" >&2
   exit 1
 fi
-if [ -e "$sesshmux_link" ] && [ ! -L "$sesshmux_link" ]; then
-  printf 'scripts/install: refusing to replace non-symlink %s\n' "$sesshmux_link" >&2
-  exit 1
-fi
-
 zig_bin=$(find_zig)
 zig_version=$("$zig_bin" version)
 if [ "$zig_version" != "0.15.2" ]; then
@@ -117,11 +110,9 @@ export SESSH_PROTOC=$protoc_bin
 
 "$zig_bin" build --prefix "$prefix"
 ln -sfn "$prefix/bin/sessh" "$sessh_link"
-ln -sfn "$prefix/bin/sesshmux" "$sesshmux_link"
 
 printf 'installed %s\n' "$prefix"
 printf 'linked %s -> %s\n' "$sessh_link" "$prefix/bin/sessh"
-printf 'linked %s -> %s\n' "$sesshmux_link" "$prefix/bin/sesshmux"
 
 resolved=$(command -v sessh 2>/dev/null || true)
 if [ "$resolved" != "$sessh_link" ]; then
@@ -132,20 +123,6 @@ if [ "$resolved" != "$sessh_link" ]; then
   fi
   printf 'Expected:\n  %s\n' "$sessh_link" >&2
   printf 'Put %s before any other sessh on PATH:\n' "$bin_dir" >&2
-  printf '  export PATH="%s:$PATH"\n' "$bin_dir" >&2
-  printf 'If your shell caches command paths, run:\n  rehash\n' >&2
-  exit 1
-fi
-
-resolved=$(command -v sesshmux 2>/dev/null || true)
-if [ "$resolved" != "$sesshmux_link" ]; then
-  if [ -n "$resolved" ]; then
-    printf 'scripts/install: sesshmux resolves to the wrong executable: %s\n' "$resolved" >&2
-  else
-    printf 'scripts/install: sesshmux does not resolve on PATH\n' >&2
-  fi
-  printf 'Expected:\n  %s\n' "$sesshmux_link" >&2
-  printf 'Put %s before any other sesshmux on PATH:\n' "$bin_dir" >&2
   printf '  export PATH="%s:$PATH"\n' "$bin_dir" >&2
   printf 'If your shell caches command paths, run:\n  rehash\n' >&2
   exit 1

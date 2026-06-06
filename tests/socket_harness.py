@@ -59,8 +59,6 @@ SESSION_CLIENT_REPAINT_REQUEST = "te_session_client_repaint_request"
 SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST = "te_session_client_debug_sever_connection_request"
 SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST = "te_session_client_debug_unresponsive_connection_request"
 HOST_GUID = "host_guid"
-RUN_REQUEST = "run_request"
-RUN_RESPONSE = "run_response"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -90,8 +88,6 @@ _FRAME_FIELDS = {
     SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
     SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST,
     HOST_GUID: HOST_GUID,
-    RUN_REQUEST: RUN_REQUEST,
-    RUN_RESPONSE: RUN_RESPONSE,
 }
 
 
@@ -156,32 +152,7 @@ def run_public(args, env, **kwargs):
     )
 
 
-def local_mux_args(args):
-    if not args or args[0] != ".":
-        return args
-    if len(args) == 1:
-        return ["new", "."]
-    command = args[1]
-    rest = args[2:]
-    if command == "new":
-        return ["new", *rest, "."]
-    if command == "attach":
-        return ["attach", "--host", ".", *rest]
-    if command == "list":
-        if any(arg == "--client" or arg.startswith("--client=") for arg in rest):
-            return ["list", *rest]
-        return ["list", *rest, "."]
-    if command == "kill":
-        if rest and rest[0] == "--all":
-            return ["kill", "--host", ".", "--all", *rest[1:]]
-        return ["kill", ".", *rest]
-    if command in {"force-compat", "detach", "repaint", "debug"}:
-        return [command, *rest]
-    return args[1:]
-
-
 def run(args, env, **kwargs):
-    args = local_mux_args(args)
     return run_public(args, env, **kwargs)
 
 
@@ -247,7 +218,7 @@ def read_until_count(fd, needle, count, timeout=5.0):
 def send_escape_detach(fd):
     os.write(fd, b"\n")
     time.sleep(0.05)
-    os.write(fd, b"~d\n")
+    os.write(fd, b"~.\n")
 
 
 def read_available(fd, timeout=0.2):
@@ -2920,7 +2891,7 @@ def run_session_agent_registry_test(base_env):
             assert_session_attached(payload)
             live_state = wait_session_attached(env, session_42_guid)
             if live_state.HasField("detached_at_unix_ms"):
-                raise AssertionError("live detached state survived reattach")
+                raise AssertionError("live detached state survived resume")
 
             send_frame(attach, INPUT, pack_bytes(b"exit\n"))
             recv_until_message(attach, SESSION_ENDED)
@@ -3824,62 +3795,17 @@ def main():
 
         try:
             help_text = run(["--help"], env, timeout=5.0)
-            if help_text.returncode != 0 or "sesshmux new" not in help_text.stdout:
+            if help_text.returncode != 0 or "sessh [ssh-option" not in help_text.stdout:
                 raise AssertionError(help_text)
-            if "sessh [ssh-option" in help_text.stdout:
-                raise AssertionError(help_text.stdout)
             version_text = run(["--version"], env, timeout=5.0)
-            if version_text.returncode != 0 or version_text.stdout != f"sesshmux {sessh_version()}\n":
+            if version_text.returncode != 0 or version_text.stdout != f"sessh {sessh_version()}\n":
                 raise AssertionError(version_text)
             short_help_text = run(["-h"], env, timeout=5.0)
             if short_help_text.returncode != 0 or short_help_text.stdout != help_text.stdout:
                 raise AssertionError(short_help_text)
-            internal_sessh_help = run([":internal-sessh:", "--help"], env, timeout=5.0)
-            if internal_sessh_help.returncode != 0 or "sessh [ssh-option" not in internal_sessh_help.stdout:
-                raise AssertionError(internal_sessh_help)
-            if "sesshmux new" in internal_sessh_help.stdout:
-                raise AssertionError(internal_sessh_help.stdout)
-            internal_sessh_version = run([":internal-sessh:", "--version"], env, timeout=5.0)
-            if internal_sessh_version.returncode != 0 or internal_sessh_version.stdout != f"sessh {sessh_version()}\n":
-                raise AssertionError(internal_sessh_version)
-            internal_sessh_short_version = run([":internal-sessh:", "-V"], env, timeout=5.0)
-            if internal_sessh_short_version.returncode != 0 or internal_sessh_short_version.stdout != f"sessh {sessh_version()}\n":
-                raise AssertionError(internal_sessh_short_version)
-            internal_local = run([":internal-sessh:", "."], env, timeout=5.0)
-            if internal_local.returncode != 64 or '"." is not a valid ssh host' not in internal_local.stderr:
-                raise AssertionError(internal_local)
-
-            local_mux_env = isolated_env(Path(tmp) / "local-mux")
-            local_shell = Path(tmp) / "local-mux-shell"
-            # Keep the shell alive until the harness has observed the marker.
-            # If it exits immediately after printing, session cleanup can race
-            # final draw delivery and leave the client with only cleanup bytes.
-            local_shell.write_text(
-                "#!/bin/sh\n"
-                "printf 'local-mux-ok\\n'\n"
-                "while IFS= read -r line; do\n"
-                "  [ \"$line\" = exit ] && exit 0\n"
-                "done\n"
-            )
-            local_shell.chmod(0o700)
-            local_mux_env["SHELL"] = str(local_shell)
-            cleanup_runtime(local_mux_env)
-            pid, fd = spawn_bin(local_mux_env, ["new", "."])
-            child_exited = False
-            try:
-                read_until(fd, b"local-mux-ok", timeout=5.0)
-                os.write(fd, b"exit\n")
-                status = wait_child_draining_fd(pid, fd, timeout=5.0)
-                child_exited = True
-                if status != 0:
-                    raise AssertionError(f"local mux session exited with status {status}")
-            finally:
-                if child_exited:
-                    os.close(fd)
-                else:
-                    close_client(pid, fd)
             sessh_wrapper = ROOT / "zig-out" / "bin" / "sessh"
-            if sessh_wrapper.exists():
+            release_artifact_dir = ROOT / "zig-out" / "libexec" / "sessh"
+            if sessh_wrapper.exists() and release_artifact_dir.exists() and any(release_artifact_dir.glob("sessh-*")):
                 sessh_help = subprocess.run(
                     [str(sessh_wrapper), "--help"],
                     cwd=ROOT,
@@ -3893,8 +3819,6 @@ def main():
                 )
                 if sessh_help.returncode != 0 or "sessh [ssh-option" not in sessh_help.stdout:
                     raise AssertionError(sessh_help)
-                if "sesshmux new" in sessh_help.stdout:
-                    raise AssertionError(sessh_help.stdout)
                 sessh_version_text = subprocess.run(
                     [str(sessh_wrapper), "--version"],
                     cwd=ROOT,
@@ -3921,63 +3845,14 @@ def main():
                 )
                 if sessh_short_version_text.returncode != 0 or sessh_short_version_text.stdout != f"sessh {sessh_version()}\n":
                     raise AssertionError(sessh_short_version_text)
-            sesshmux_wrapper = ROOT / "zig-out" / "bin" / "sesshmux"
-            if sesshmux_wrapper.exists():
-                sesshmux_version_text = subprocess.run(
-                    [str(sesshmux_wrapper), "--version"],
-                    cwd=ROOT,
-                    env=env,
-                    text=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=5.0,
-                    check=False,
-                )
-                if sesshmux_version_text.returncode != 0 or sesshmux_version_text.stdout != f"sesshmux {sessh_version()}\n":
-                    raise AssertionError(sesshmux_version_text)
-
-            bad = run([".", "/tmp/not-a-socket-path"], env, timeout=5.0)
-            if bad.returncode != 64:
-                raise AssertionError(bad)
-
-            bare_local = run_public(["."], env, timeout=5.0)
-            if bare_local.returncode != 64 or "unsupported command" not in bare_local.stderr:
-                raise AssertionError(bare_local)
-            public_dot_list = run_public([".", "list"], env, timeout=5.0)
-            if public_dot_list.returncode != 64 or "unsupported command" not in public_dot_list.stderr:
-                raise AssertionError(public_dot_list)
-
-            listed = run([".", "list"], env, check=True, timeout=5.0)
-            assert_list_header(listed.stdout)
-
-            missing_id = test_session_id(1)
-            missing = run([".", "kill", missing_id], env, timeout=5.0)
-            if missing.returncode != 1 or f"ERROR {missing_id} not found" not in missing.stderr:
-                raise AssertionError(missing)
-
-            bad = run([".", "--scrollback-limit", "0"], env, timeout=5.0)
-            if bad.returncode != 64:
-                raise AssertionError(bad)
-
-            stopped = run([".", "kill", "--all"], env, timeout=5.0)
-            if stopped.returncode != 0 or stopped.stdout != "KILLING_ALL\n":
-                raise AssertionError(stopped)
-            if sessions_dir(env).exists() and any(sessions_dir(env).iterdir()):
-                raise AssertionError("kill all started a session agent")
 
             run_login_shell_profile_test(env)
             run_session_create_command_argv_test(env)
             run_session_create_legacy_command_argv_test(env)
             run_session_create_shell_command_test(env)
             run_session_create_tty_settings_test(env)
-            run_session_agent_crash_client_error_test(env)
             run_session_agent_registry_test(env)
             run_broker_starts_session_agent_test(env)
-            run_broker_registry_commands_test(env)
-            run_client_control_commands_test(env)
-            run_broker_attach_without_id_uses_latest_detached_test(env)
-            run_broker_kill_edge_cases_test(env)
             run_minor_version_compatibility_test(env)
             run_session_create_without_attach_protocol_test(env)
             run_live_draw_protocol_test(env)
@@ -3991,8 +3866,6 @@ def main():
             run_active_screen_barrier_protocol_test(env)
             run_terminal_modes_protocol_test(env)
             run_cursor_shape_protocol_test(env)
-            run_state_only_client_render_test(env)
-            run_display_clear_not_forwarded_test(env)
             run_complete_display_clear_protocol_test(env)
             run_title_protocol_test(env)
             run_default_colors_protocol_test(env)
@@ -4003,249 +3876,6 @@ def main():
             run_reconnect_scrollback_gap_protocol_test(env)
             run_resize_epoch_does_not_clear_reconnect_scrollback_test(env)
             run_screen_repaint_after_presentation_reset_clears_rows_test(env)
-            run_slow_attached_client_does_not_block_commands_test(env)
-            run_env_config_client_test(tmp)
-            run_tty_transcript_capture_test(tmp)
-            run_initial_kitty_keyboard_restore_test(tmp)
-
-            listed = run([".", "list"], env, check=True, timeout=5.0)
-            assert_list_header(listed.stdout)
-
-            remote_guid = test_session_guid(7)
-            remote_id = test_session_id(7)
-            write_cached_remote_route(env, remote_guid, "example.com")
-            listed = run(["list"], env, check=True, timeout=5.0)
-            if "cached remote session status may be out of date" not in listed.stderr:
-                raise AssertionError(listed)
-            current_sessions = sessions(listed.stdout)
-            remote_route = current_sessions.get(remote_id)
-            if remote_route is None:
-                raise AssertionError(listed.stdout)
-            if (
-                remote_route.get("host") != "example.com"
-                or remote_route.get("version") != "cached-test"
-                or remote_route.get("attached") != "???"
-                or remote_route.get("input") != "???"
-            ):
-                raise AssertionError(listed.stdout)
-            listed_jsonl = run(["list", "--jsonl"], env, check=True, timeout=5.0)
-            if "cached remote session status may be out of date" not in listed_jsonl.stderr:
-                raise AssertionError(listed_jsonl)
-            jsonl_route = jsonl_sessions(listed_jsonl.stdout).get(remote_id)
-            if jsonl_route != {
-                "host": "example.com",
-                "version": "cached-test",
-                "guid": remote_guid,
-                "attached_count": None,
-                "last_input_at_unix_ms": None,
-            }:
-                raise AssertionError(listed_jsonl.stdout)
-            listed = run(["list", "."], env, check=True, timeout=5.0)
-            if listed.stderr:
-                raise AssertionError(listed)
-            if remote_id in sessions(listed.stdout):
-                raise AssertionError(listed.stdout)
-
-            pid, fd = spawn_client(env, [])
-            try:
-                read_until(fd, b"$ ")
-                os.write(fd, b"echo TERM=$TERM\n")
-                read_until(fd, b"TERM=xterm-256color")
-                os.write(fd, b"echo SESSH_ID=${SESSH_ID-unset}\n")
-                read_until(fd, b"SESSH_ID=unset")
-                os.write(fd, b"echo SESSH_GUID=$SESSH_GUID\n")
-                read_until(fd, b"SESSH_GUID=")
-                os.write(fd, b"echo sessh_before_reconnect\n")
-                read_until_count(fd, b"sessh_before_reconnect", 2)
-                send_escape_detach(fd)
-                read_until(fd, startup_cwd_title_sequence(), timeout=2.0)
-            finally:
-                close_client(pid, fd)
-
-            listed = run([".", "list"], env, check=True, timeout=5.0)
-            assert_list_header(listed.stdout)
-            current_sessions = sessions(listed.stdout)
-            first_session = single_jsonl_session(env)
-            first_id = first_session["id"]
-            first_guid = first_session["guid"]
-            if first_id not in current_sessions:
-                raise AssertionError(listed.stdout)
-            if current_sessions[first_id].get("version") != sessh_version():
-                raise AssertionError(listed.stdout)
-            route_text = route_file(env, first_guid).read_text()
-            route = json.loads(route_text)
-            if (
-                route.get("session_dir") != str(session_dir(env, first_guid))
-                or route.get("host") != "."
-                or route.get("agent_version") != sessh_version()
-            ):
-                raise AssertionError(route_text)
-            if "session_dir=2f" in route_text or "host=2e" in route_text:
-                raise AssertionError(route_text)
-
-            pid, fd = spawn_client(env, ["attach"])
-            closed = False
-            try:
-                read_until(fd, b"$ ")
-                os.write(fd, b"echo sessh_after_reconnect\n")
-                read_until_count(fd, b"sessh_after_reconnect", 2)
-                os.write(fd, b"exit\n")
-                wait_child_draining_fd(pid, fd)
-                os.close(fd)
-                closed = True
-            finally:
-                if not closed:
-                    close_client(pid, fd)
-
-            config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
-            config_dir.mkdir(parents=True, exist_ok=True)
-            (config_dir / "sessh.env").write_text("scrollback-limit=7\n")
-            pid, fd = spawn_client(env, [])
-            try:
-                read_until(fd, b"$ ")
-                send_escape_detach(fd)
-            finally:
-                close_client(pid, fd)
-
-            listed = run([".", "list"], env, check=True, timeout=5.0)
-            current_sessions = sessions(listed.stdout)
-            second_session = single_jsonl_session(env)
-            second_id = second_session["id"]
-            if second_id not in current_sessions:
-                raise AssertionError(listed.stdout)
-
-            killed = run([".", "kill", second_id], env, check=True, timeout=5.0)
-            if f"ENDED {second_id}" not in killed.stdout:
-                raise AssertionError(killed.stdout)
-
-            listed = run([".", "list"], env, check=True, timeout=5.0)
-            if second_id in sessions(listed.stdout):
-                raise AssertionError(listed.stdout)
-
-            missing = run([".", "kill", "missing"], env, timeout=5.0)
-            if missing.returncode != 1 or "ERROR missing not found" not in missing.stderr:
-                raise AssertionError(missing)
-
-            pid, fd = spawn_client(env, [])
-            try:
-                read_until(fd, b"$ ")
-                send_escape_detach(fd)
-            finally:
-                close_client(pid, fd)
-
-            listed = run([".", "list"], env, check=True, timeout=5.0)
-            current_sessions = sessions(listed.stdout)
-            third_session = single_jsonl_session(env)
-            third_id = third_session["id"]
-            if third_id not in current_sessions:
-                raise AssertionError(listed.stdout)
-
-            changed_runtime_env = dict(env)
-            changed_runtime_env["XDG_RUNTIME_DIR"] = str(Path(tmp) / "changed-runtime")
-            pid, fd = spawn_bin(changed_runtime_env, ["attach", third_id])
-            try:
-                read_until(fd, b"$ ")
-                os.write(fd, b"echo sessh_runtime_route_attach\n")
-                read_until_count(fd, b"sessh_runtime_route_attach", 2)
-                send_escape_detach(fd)
-            finally:
-                close_client(pid, fd)
-
-            killed = run(["kill", third_id], changed_runtime_env, check=True, timeout=5.0)
-            if f"ENDED {third_id}" not in killed.stdout:
-                raise AssertionError(killed.stdout)
-
-            pid, fd = spawn_client(env, [])
-            try:
-                read_until(fd, b"$ ")
-                fourth_session = single_jsonl_session(env)
-                fourth_id = fourth_session["id"]
-                os.write(fd, b"echo sessh_before_sever\n")
-                read_until_count(fd, b"sessh_before_sever", 2)
-                severed = run([".", "debug", "sever-connection", "--last-input", fourth_id], env, check=True, timeout=5.0)
-                if "SEVERED" not in severed.stdout:
-                    raise AssertionError(severed.stdout)
-                read_until(fd, b"sessh: disconnected: Reconnecting")
-                os.write(fd, b"\x12")
-                read_until(fd, b"$ ")
-                os.write(fd, b"echo sessh_after_sever\n")
-                read_until_count(fd, b"sessh_after_sever", 2)
-                send_escape_detach(fd)
-            finally:
-                close_client(pid, fd)
-
-            killed = run([".", "kill", fourth_id], env, check=True, timeout=5.0)
-            if f"ENDED {fourth_id}" not in killed.stdout:
-                raise AssertionError(killed.stdout)
-
-            pid1, fd1 = spawn_client(env, [])
-            try:
-                read_until(fd1, b"$ ")
-                listed = run([".", "list"], env, check=True, timeout=5.0)
-                current_sessions = sessions(listed.stdout)
-                fifth_session = single_jsonl_session(env)
-                fifth_id = fifth_session["id"]
-                if fifth_id not in current_sessions:
-                    raise AssertionError(listed.stdout)
-
-                pid2, fd2 = spawn_client(env, ["attach", fifth_id])
-                try:
-                    read_until(fd2, b"$ ")
-                    os.write(fd2, b"echo sessh_multi_from_second\n")
-                    read_until_count(fd1, b"sessh_multi_from_second", 2)
-                    os.write(fd1, b"echo sessh_multi_attach\n")
-                    read_until_count(fd2, b"sessh_multi_attach", 2)
-                    send_escape_detach(fd2)
-                finally:
-                    close_client(pid2, fd2)
-                send_escape_detach(fd1)
-            finally:
-                close_client(pid1, fd1)
-
-            killed = run([".", "kill", fifth_id], env, check=True, timeout=5.0)
-            if f"ENDED {fifth_id}" not in killed.stdout:
-                raise AssertionError(killed.stdout)
-
-            drain_done = Path(env["XDG_RUNTIME_DIR"]) / "detached_drain_done"
-            pid, fd = spawn_client(env, [])
-            try:
-                read_until(fd, b"$ ")
-                sixth_session = single_jsonl_session(env)
-                sixth_id = sixth_session["id"]
-                sixth_guid = sixth_session["guid"]
-                os.write(
-                    fd,
-                    b"python3 -c 'import os,sys; sys.stdout.write(\"x\"*200000); sys.stdout.flush(); open(os.environ[\"XDG_RUNTIME_DIR\"]+\"/detached_drain_done\",\"w\").write(\"done\")'\n",
-                )
-                # Wait for real command output, not text from the echoed command
-                # line; PTY wrapping can split the path substring.
-                read_until(fd, b"x" * 64)
-                send_escape_detach(fd)
-            finally:
-                close_client(pid, fd)
-            wait_file(drain_done)
-
-            log_path = agent_log_file(env, sixth_guid)
-            killed = run([".", "kill", sixth_id], env, check=True, timeout=5.0)
-            if f"ENDED {sixth_id}" not in killed.stdout:
-                raise AssertionError(killed.stdout)
-
-            log_text = wait_log_contains(log_path, "event=session_agent_stop")
-            for needle in (
-                "event=session_agent_start",
-                "event=session_create",
-                "event=attach",
-                "event=detach",
-                "event=session_agent_shutdown_requested",
-                "event=session_end",
-                "event=session_agent_stop",
-            ):
-                if needle not in log_text:
-                    raise AssertionError(f"missing session-agent log entry {needle!r}; log was {log_text!r}")
-
-            stopped = run([".", "kill", "--all"], env, check=True, timeout=5.0)
-            if "KILLING_ALL" not in stopped.stdout:
-                raise AssertionError(stopped.stdout)
         finally:
             cleanup_runtime(env)
 

@@ -1,46 +1,40 @@
 # Architecture
 
-## Timeline (simplified)
+`sessh` is a single ssh-shaped binary. Public invocation parses ssh-compatible
+arguments, chooses either the terminal-emulator path or the ProxyCommand stream
+path, and then lets the remote runtime do the small amount of work sessh still
+owns.
 
-The path when `sessh` connects to a remote for the first time:
+## Remote Startup
 
-1. `sesshmux` client invokes `ssh <HOST> <script>`.
-2. The script (i.e. the bootstrapper) runs on the remote, reading
-   newline-separated commands from stdin.
-3. The client tells the script to execute a binary, identified by a list of
-   sha256sums (there are multiple because the client doesn't yet know the
-   remote os/arch)
-4. The script writes to stdout, telling the client that it doesn't have the
-   binary, but informing it of its os/arch.
-5. The client sends the base64-encoded binary for the given os/arch.
-6. The script saves the binary, writes OK to stdout, and executes the binary
-   (the binary is running in broker mode)
-7. The client sees the OK, switches to a protobuf-based protocol, and sends a
-   request for the remote to start a new session.
-8. The broker reads the request, and fork/execs itself (the
-   binary is running in session-agent mode)
-9. The session-agent creates a unix domain socket and listens for requests.
-10. The broker connects to the unix domain socket and forwards messages
-   between the socket and its stdin/stdout (i.e. back to the client)
-11. The session-agent allocates a PTY and implements a
-    [headless terminal emulator](TERMINAL_EMULATOR.md) using libghostty-vt.
-12. The client and session-agent exchange messages. The client forwards its
-    stdin while the session-agent sends rendering instructions (in the form of
-    ASCII and escape codes)
+For a terminal-emulator session, the first connection looks like this:
 
-## Modality
+1. The visible client runs `ssh HOST <bootstrap-script>`.
+2. The bootstrapper finds or installs the matching `sessh-<os>-<arch>` binary.
+3. The client asks that binary to start `:internal-session-broker:`.
+4. The broker starts a session agent for one `s-` GUID.
+5. The agent allocates the remote PTY and implements the
+   [headless terminal emulator](TERMINAL_EMULATOR.md).
+6. The visible client and agent exchange protobuf frames for input, output,
+   repaint, resize, reconnect, and shutdown state.
 
-`sesshmux` is a binary with four modalities:
+ProxyCommand streams also use the bootstrapper, but the remote process is a
+stream broker/agent rather than a terminal-emulator session agent. The public
+shape remains `sessh [ssh-option ...] host [command ...]`.
 
-1. `sessh` (the tiny frontend around `sesshmux` that gives it the same CLI as
-   `ssh`)
-2. `sesshmux` client
-3. `sesshmux` broker
-4. `sesshmux` session-agent
+## Internal Modalities
 
-The default modality is client, but `sesshmux` switches to the other modalities
-when special sentinel values are passed as the first argument.
+Special first arguments are internal entrypoints, not public commands:
+
+- `:internal-session-broker:`
+- `:internal-session-agent:`
+- `:internal-stream-broker:`
+- `:internal-stream-agent:`
+- `:internal-proxy-stream:`
+
+Everything else is parsed as a normal ssh-shaped `sessh` invocation.
 
 ## Other Docs
 
-Networking behavior is documented in [NETWORKING](NETWORKING.md).
+Networking behavior is documented in [NETWORKING](NETWORKING.md). Runtime and
+state layout is documented in [FILESYSTEM_LAYOUT](FILESYSTEM_LAYOUT.md).

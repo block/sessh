@@ -60,8 +60,6 @@ var cached_probe_output_fd: c.fd_t = -1;
 pub const FilterEnd = enum {
     detach,
     help,
-    kill,
-    kill_wait,
     repaint,
 };
 
@@ -72,9 +70,7 @@ pub const FilterResult = struct {
 
 pub const escape_help_lines = [_][]const u8{
     "Supported escape sequences:",
-    "~.  kill session and detach",
-    "~k  kill session and wait",
-    "~d  detach",
+    "~.  disconnect",
     "~p  repaint",
     "~?  show this help",
     "~~  send ~",
@@ -82,9 +78,7 @@ pub const escape_help_lines = [_][]const u8{
 
 pub const escape_help_overlay_lines = [_][]const u8{
     "Supported escape sequences. Any key to dismiss",
-    "~.  kill session and detach",
-    "~k  kill session and wait",
-    "~d  detach",
+    "~.  disconnect",
     "~p  repaint",
     "~?  show this help",
     "~~  send ~",
@@ -102,9 +96,7 @@ pub const EscapeFilter = struct {
         for (input, 0..) |byte, index| {
             if (self.pending_tilde) {
                 self.pending_tilde = false;
-                if (byte == '.') return .{ .bytes = out[0..written], .end = .kill };
-                if (byte == 'k') return .{ .bytes = out[0..written], .end = .kill_wait };
-                if (byte == 'd') return .{ .bytes = out[0..written], .end = .detach };
+                if (byte == '.') return .{ .bytes = out[0..written], .end = .detach };
                 if (byte == 'p') return .{ .bytes = out[0..written], .end = .repaint };
                 if (byte == '?') return .{ .bytes = out[0..written], .end = .help };
                 if (byte == '~') {
@@ -137,16 +129,6 @@ test "EscapeFilter handles ssh line-start escapes" {
     var out: [16]u8 = undefined;
 
     var result = filter.filter("~.", &out);
-    try std.testing.expectEqualStrings("", result.bytes);
-    try std.testing.expectEqual(FilterEnd.kill, result.end.?);
-
-    filter = .{};
-    result = filter.filter("~k", &out);
-    try std.testing.expectEqualStrings("", result.bytes);
-    try std.testing.expectEqual(FilterEnd.kill_wait, result.end.?);
-
-    filter = .{};
-    result = filter.filter("~d", &out);
     try std.testing.expectEqualStrings("", result.bytes);
     try std.testing.expectEqual(FilterEnd.detach, result.end.?);
 
@@ -181,7 +163,7 @@ test "EscapeFilter handles ssh line-start escapes" {
     try std.testing.expectEqual(@as(?FilterEnd, null), result.end);
 
     filter = .{ .at_line_start = false };
-    result = filter.filter("~d\n", &out);
+    result = filter.filter("~.\n", &out);
     try std.testing.expectEqualStrings("", result.bytes);
     try std.testing.expectEqual(FilterEnd.detach, result.end.?);
 }

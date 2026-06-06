@@ -50,22 +50,10 @@ case "$(uname -m)" in
     ;;
 esac
 
-name=$(basename "$self")
-real="$bindir/../libexec/sessh/sesshmux-$os-$arch"
+real="$bindir/../libexec/sessh/sessh-$os-$arch"
 if [ ! -x "$real" ]; then
   printf 'sessh: missing platform binary: %s\n' "$real" >&2
   exit 127
-fi
-
-if [ "$name" = "sessh" ]; then
-  if [ "${1:-}" = "-V" ]; then
-    exec "$real" :internal-sessh: --version
-  fi
-  if [ "${1:-}" = "." ]; then
-    printf 'sessh: "." is not a valid ssh host\n' >&2
-    exit 64
-  fi
-  exec "$real" :internal-sessh: "$@"
 fi
 
 exec "$real" "$@"

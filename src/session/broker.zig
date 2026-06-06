@@ -72,141 +72,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     }
 }
 
-pub fn runControl(allocator: std.mem.Allocator) !void {
-    socket_transport.publishRuntimeRootSymlinkOnce(allocator);
-
-    const handshake_result = try acceptRuntimeHandshake(allocator, 0, 1);
-    if (handshake_result == .mismatch) return;
-
-    while (true) {
-        var frame = protocol.readFrameAlloc(allocator, 0) catch |err| switch (err) {
-            error.EndOfStream => return,
-            else => return err,
-        };
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .run_request => try handleRunRequest(allocator, frame.payload),
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, 1);
-            },
-            else => return error.UnexpectedFrame,
-        }
-    }
-}
-
-fn handleRunRequest(allocator: std.mem.Allocator, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.RunRequest, allocator, payload);
-    defer request.deinit(allocator);
-
-    if (request.argv.items.len == 0) {
-        try sendRunResponse(allocator, request.request_id, 64, "", "ERROR run request requires argv\n");
-        return;
-    }
-
-    var env_map = try controlChildEnv(allocator);
-    defer env_map.deinit();
-    var child_argv = try controlChildArgv(allocator, request.argv.items);
-    defer child_argv.deinit(allocator);
-
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = child_argv.argv,
-        .env_map = &env_map,
-        .max_output_bytes = 1024 * 1024,
-        .expand_arg0 = .expand,
-    }) catch |err| {
-        const stderr = try std.fmt.allocPrint(allocator, "ERROR failed to run command: {t}\n", .{err});
-        defer allocator.free(stderr);
-        try sendRunResponse(allocator, request.request_id, 127, "", stderr);
-        return;
-    };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    try sendRunResponse(
-        allocator,
-        request.request_id,
-        termExitCode(result.term),
-        result.stdout,
-        result.stderr,
-    );
-}
-
-fn sendRunResponse(
-    allocator: std.mem.Allocator,
-    request_id: u64,
-    exit_code: i32,
-    stdout: []const u8,
-    stderr: []const u8,
-) !void {
-    const payload = try protocol.encodePayload(allocator, pb.RunResponse{
-        .request_id = request_id,
-        .exit_code = exit_code,
-        .stdout = stdout,
-        .stderr = stderr,
-    });
-    defer allocator.free(payload);
-    try protocol.sendFrame(1, .run_response, payload);
-}
-
-const ControlChildArgv = struct {
-    argv: []const []const u8,
-    owned_argv: ?[][]const u8 = null,
-    owned_exe: ?[]u8 = null,
-
-    fn deinit(self: *ControlChildArgv, allocator: std.mem.Allocator) void {
-        if (self.owned_argv) |argv| allocator.free(argv);
-        if (self.owned_exe) |exe| allocator.free(exe);
-        self.* = undefined;
-    }
-};
-
-fn controlChildArgv(allocator: std.mem.Allocator, argv: []const []const u8) !ControlChildArgv {
-    if (argv.len == 0 or !std.mem.eql(u8, argv[0], "sesshmux")) return .{ .argv = argv };
-
-    const exe = try std.fs.selfExePathAlloc(allocator);
-    errdefer allocator.free(exe);
-    const owned = try allocator.alloc([]const u8, argv.len);
-    errdefer allocator.free(owned);
-    @memcpy(owned, argv);
-    owned[0] = exe;
-    return .{
-        .argv = owned,
-        .owned_argv = owned,
-        .owned_exe = exe,
-    };
-}
-
-fn controlChildEnv(allocator: std.mem.Allocator) !std.process.EnvMap {
-    var env_map = try std.process.getEnvMap(allocator);
-    errdefer env_map.deinit();
-
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
-    defer allocator.free(exe_path);
-    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.InvalidExecutablePath;
-    try env_map.put("SESSH_PATH", exe_dir);
-    try env_map.put(config.client_version_env, config.version);
-
-    const existing_path = env_map.get("PATH") orelse "";
-    const path = if (existing_path.len > 0)
-        try std.fmt.allocPrint(allocator, "{s}:{s}", .{ exe_dir, existing_path })
-    else
-        try allocator.dupe(u8, exe_dir);
-    defer allocator.free(path);
-    try env_map.put("PATH", path);
-
-    return env_map;
-}
-
-fn termExitCode(term: std.process.Child.Term) i32 {
-    return switch (term) {
-        .Exited => |code| @intCast(code),
-        .Signal => |signal| 128 + @as(i32, @intCast(signal)),
-        else => 255,
-    };
-}
-
-
 fn processExists(pid: c.pid_t) bool {
     posix.kill(pid, 0) catch return false;
     return true;
@@ -409,7 +274,7 @@ fn createSessionAndForwardFrames(
 ) !void {
     initiateRuntimeHandshake(allocator, agent_fd) catch |err| switch (err) {
         error.VersionMismatch => {
-            try sendError(1, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
+            try sendError(1, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Start a fresh sessh connection with matching binaries");
             return;
         },
         else => return err,
@@ -425,7 +290,7 @@ fn attachAgentAndForwardFrames(
 ) !void {
     initiateRuntimeHandshake(allocator, agent_fd) catch |err| switch (err) {
         error.VersionMismatch => {
-            try sendError(1, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
+            try sendError(1, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Start a fresh sessh connection with matching binaries");
             return;
         },
         else => return err,
@@ -477,7 +342,7 @@ fn initiateRuntimeHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     var peer_hello = try readHelloRequest(allocator, fd, fd);
     defer peer_hello.deinit(allocator);
     if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
+        try sendHelloError(fd, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Start a fresh sessh connection with matching binaries");
         return error.VersionMismatch;
     }
     try sendHelloOk(fd);

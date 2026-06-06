@@ -237,7 +237,7 @@ cache_root=${XDG_CACHE_HOME:-${HOME:-}/.cache}/sessh/bin
 cache_dir=$cache_root/$artifact_set_id
 
 for hash in $hashes; do
-  candidate=$cache_dir/$hash/sesshmux
+  candidate=$cache_dir/$hash/sessh
   if [ -f "$candidate" ] && [ -x "$candidate" ]; then
     printf 'OK\n'
     exec_candidate "$candidate" || err EXEC_FAILED exec_failed
@@ -261,15 +261,15 @@ probe_base64 || err MISSING_TOOL base64
 artifact_dir=$cache_dir/$upload_hash
 mkdir -p "$artifact_dir" || err INSTALL_FAILED mkdir
 
-tmp=$artifact_dir/.sesshmux.tmp.$$
+tmp=$artifact_dir/.sessh.tmp.$$
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
 decode_base64_to_file "$payload" "$tmp" || err INVALID_UPLOAD base64_decode_failed
 probe_sha256 || err MISSING_TOOL sha256
 actual=$(sha256_file "$tmp") || err INSTALL_FAILED sha256_failed
 [ "$actual" = "$upload_hash" ] || err CHECKSUM_MISMATCH expected_$upload_hash
 chmod 700 "$tmp" || err INSTALL_FAILED chmod
-mv "$tmp" "$artifact_dir/sesshmux" || err INSTALL_FAILED rename
+mv "$tmp" "$artifact_dir/sessh" || err INSTALL_FAILED rename
 trap - EXIT HUP INT TERM
 
 printf 'OK\n'
-exec_candidate "$artifact_dir/sesshmux" || err EXEC_FAILED exec_failed
+exec_candidate "$artifact_dir/sessh" || err EXEC_FAILED exec_failed

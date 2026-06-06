@@ -41,7 +41,7 @@ def write_executable(path, data):
 
 
 def artifact_path(env, artifact_hash):
-    return Path(env["XDG_CACHE_HOME"]) / "sessh" / "bin" / "test-set" / artifact_hash / "sesshmux"
+    return Path(env["XDG_CACHE_HOME"]) / "sessh" / "bin" / "test-set" / artifact_hash / "sessh"
 
 
 def write_fake_uname(path):

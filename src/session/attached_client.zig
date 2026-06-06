@@ -12,9 +12,7 @@ const io_helpers = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const process_exit = @import("../core/process_exit.zig");
 const reconnect_title = @import("../reconnect/title.zig");
-const route_commands = @import("../runtime/route_commands.zig");
 const session_registry = @import("../runtime/session_registry.zig");
-const shell = @import("../core/shell.zig");
 const socket_transport = @import("../transport/socket.zig");
 const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
@@ -35,8 +33,6 @@ const ErrorPayload = struct {
 
 pub const AttachedClientEnd = enum {
     detach,
-    kill_detach,
-    kill_wait,
     unresponsive,
     transport_closed,
     session_ended,
@@ -46,8 +42,6 @@ pub const ReconnectInputPumpResult = enum {
     wait_elapsed,
     reconnect_now,
     detach,
-    kill_detach,
-    kill_wait,
     transport_closed,
 };
 
@@ -307,7 +301,6 @@ pub const RuntimeSession = struct {
     input_escape_filter: terminal.EscapeFilter = .{},
     paste_like_input_classifier: PasteLikeInputClassifier = .{},
     ended_tombstone_details: ?session_registry.TombstoneDetails = null,
-    kill_requested: bool = false,
     /// Local-only fallback for the terminal title while this session is active.
     /// For remote sessh this is the host string the user passed locally. We do
     /// not send it to the session agent because ssh aliases can reveal local
@@ -456,36 +449,6 @@ fn tombstoneDetailsFromSessionEnded(ended: pb.TeSessionEnded) session_registry.T
             else => null,
         } else null,
     };
-}
-
-pub fn recordRuntimeSessionKillRequested(allocator: std.mem.Allocator, host: []const u8, session: *RuntimeSession) void {
-    session.kill_requested = true;
-    if (session.guidSlice().len == 0) return;
-    session_registry.markRouteKillRequested(allocator, session.guidSlice()) catch |err| {
-        client_log.debug("event=route_kill_requested_mark_failed session={s} error={t}", .{ session.guidSlice(), err });
-    };
-    if (host.len == 0 or std.mem.eql(u8, host, ".")) return;
-    var route = session_registry.readRouteForRef(allocator, session.guidSlice()) catch null;
-    defer if (route) |*value| value.deinit(allocator);
-    const pending_host_guid = if (route) |*value| value.host_guid else session.hostGuidSlice();
-    if (pending_host_guid.len == 0) {
-        client_log.debug("event=pending_kill_queue_skipped_missing_host_guid host={s} session={s}", .{ host, session.guidSlice() });
-        return;
-    }
-    const pending_host = if (route) |*value| value.resolved_host else host;
-    const pending_port = if (route) |*value| value.port else session_registry.default_pending_port;
-    session_registry.queuePendingKill(allocator, pending_host_guid, pending_host, pending_port, session.guidSlice()) catch |err| {
-        client_log.debug("event=pending_kill_queue_failed host_guid={s} host={s} port={s} session={s} error={t}", .{ pending_host_guid, pending_host, pending_port, session.guidSlice(), err });
-    };
-}
-
-fn tombstoneLocalRouteForPendingKill(allocator: std.mem.Allocator, guid: []const u8, details: session_registry.TombstoneDetails) !void {
-    var route = session_registry.readRouteForRef(allocator, guid) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer route.deinit(allocator);
-    try session_registry.writeTombstoneForRoute(allocator, &route, details);
 }
 
 fn processExitCodeFromTombstoneDetails(details: ?session_registry.TombstoneDetails) u8 {
@@ -685,7 +648,6 @@ test "attached client drains pending session end before monitor timeout" {
     var app_title_present: ?bool = null;
     var input_escape_filter = terminal.EscapeFilter{};
     var paste_like_input_classifier = PasteLikeInputClassifier{};
-    var kill_requested = false;
 
     try std.testing.expectEqual(
         AttachedClientEnd.session_ended,
@@ -701,7 +663,6 @@ test "attached client drains pending session end before monitor timeout" {
             &attached_client_end_restore,
             &input_ack_tracker,
             &paste_like_input_classifier,
-            &kill_requested,
             null,
             &app_title_present,
             .{ .monitor_connection = true },
@@ -726,7 +687,6 @@ test "attached client treats input write failure as transport closed" {
     var input_ack_tracker = InputAckTracker{};
     var input_escape_filter = terminal.EscapeFilter{};
     var paste_like_input_classifier = PasteLikeInputClassifier{};
-    var kill_requested = false;
     var app_title_present: ?bool = null;
 
     try io_helpers.writeAll(input[1], "typed");
@@ -745,7 +705,6 @@ test "attached client treats input write failure as transport closed" {
             &attached_client_end_restore,
             &input_ack_tracker,
             &paste_like_input_classifier,
-            &kill_requested,
             null,
             &app_title_present,
             .{ .monitor_connection = true },
@@ -1187,7 +1146,6 @@ pub fn startNewSessionOnRuntime(
     session_guid: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
-    pending_kill_host: ?[]const u8,
     reap_ms: u64,
     tombstone_retention_ms: u64,
 ) !RuntimeSession {
@@ -1201,7 +1159,6 @@ pub fn startNewSessionOnRuntime(
         session_guid,
         command_argv,
         shell_command,
-        pending_kill_host,
         reap_ms,
         tombstone_retention_ms,
     );
@@ -1224,7 +1181,6 @@ pub fn createSessionOnRuntime(
     session_guid: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
-    pending_kill_host: ?[]const u8,
     reap_ms: u64,
     tombstone_retention_ms: u64,
 ) !CreatedSession {
@@ -1236,7 +1192,6 @@ pub fn createSessionOnRuntime(
         session_guid,
         command_argv,
         shell_command,
-        pending_kill_host,
         reap_ms,
         tombstone_retention_ms,
     );
@@ -1250,12 +1205,10 @@ fn createSessionOnRuntimeWithSize(
     session_guid: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
-    pending_kill_host: ?[]const u8,
     reap_ms: u64,
     tombstone_retention_ms: u64,
 ) !CreatedSession {
     const handshake = try runtimeHandshakeWithPeerProtocol(read_fd, write_fd);
-    _ = pending_kill_host;
     const peer_supports_command_oneof = peerSupportsSessionCreateCommandOneof(handshake.peer_protocol);
     if (shell_command != null and !peer_supports_command_oneof) return error.VersionMismatch;
     var created = try sendSessionCreateAndReadCreated(
@@ -1281,11 +1234,9 @@ pub fn startAttachSessionOnRuntime(
     session_ref: []const u8,
     session_dir: []const u8,
     initial_scrollback_row_count: ?u32,
-    pending_kill_host: ?[]const u8,
 ) !RuntimeSession {
     const viewport_offset = queryInitialViewportOffset();
     const handshake = try runtimeHandshakeResult(read_fd, write_fd);
-    _ = pending_kill_host;
     const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
     defer app_allocator.allocator().free(client_guid);
     const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, client_guid, session_dir);
@@ -1532,7 +1483,6 @@ pub fn runAttachedClient(
         &session.attached_client_end_restore,
         &session.input_ack_tracker,
         &session.paste_like_input_classifier,
-        &session.kill_requested,
         &session.ended_tombstone_details,
         &session.app_title_present,
         .{
@@ -1650,11 +1600,6 @@ pub fn pollAndForwardReconnectInput(
     const bytes = input[0..@intCast(n)];
     io_helpers.noteRead(0, bytes);
 
-    if (session.kill_requested) {
-        if (inputRequestsImmediateKillDetach(&session.input_escape_filter, bytes, &filtered)) return .detach;
-        return .wait_elapsed;
-    }
-
     for (bytes) |byte| {
         if (byte == 0x03) return .detach;
         if (byte == 0x12) {
@@ -1682,8 +1627,6 @@ pub fn pollAndForwardReconnectInput(
             error.WriteFailed => return .transport_closed,
             else => return err,
         },
-        .kill => return .kill_detach,
-        .kill_wait => return .kill_wait,
     };
 
     try reconnect_ui.refreshOverlayIfDiagnosticsChanged();
@@ -1695,76 +1638,19 @@ pub fn writeDetachOverlayForTarget(ssh_options: []const []const u8, target: []co
     _ = ssh_options;
     _ = target;
     _ = sessh_options;
-    writeDetachOverlayForSessionRefInner(session_id) catch {};
+    _ = session_id;
+    writeDetachOverlay() catch {};
 }
 
 pub fn writeDetachOverlayForSessionRef(sessh_options: []const []const u8, session_ref: []const u8) void {
     if (c.isatty(1) == 0) return;
     _ = sessh_options;
-    writeDetachOverlayForSessionRefInner(session_ref) catch {};
+    _ = session_ref;
+    writeDetachOverlay() catch {};
 }
 
-pub fn writeUnconfirmedKillDetachWarningForSessionRef(session_ref: []const u8) void {
-    if (c.isatty(1) == 0) return;
-    writeUnconfirmedKillDetachWarningForSessionRefInner(session_ref) catch {};
-}
-
-fn writeDetachOverlayForSessionRefInner(session_ref: []const u8) !void {
-    var display_ref_storage: [session_registry.session_guid_prefix.len + session_registry.short_guid_hex_len]u8 = undefined;
-    const display_ref = sessionRefForOverlay(session_ref, &display_ref_storage);
-    try io_helpers.writeAll(1, "--- sessh: detached. Re-attach: `");
-    try shell.writeArg(1, "sesshmux");
-    try io_helpers.writeAll(1, " ");
-    try shell.writeArg(1, "attach");
-    if (display_ref.len > 0) {
-        try io_helpers.writeAll(1, " ");
-        try shell.writeArg(1, display_ref);
-    }
-    try io_helpers.writeAll(1, "` / Kill: `");
-    try shell.writeArg(1, "sesshmux");
-    try io_helpers.writeAll(1, " ");
-    try shell.writeArg(1, "kill");
-    if (display_ref.len > 0) {
-        try io_helpers.writeAll(1, " ");
-        try shell.writeArg(1, display_ref);
-    }
-    try io_helpers.writeAll(1, "` ---\r\n");
-}
-
-fn writeUnconfirmedKillDetachWarningForSessionRefInner(session_ref: []const u8) !void {
-    var display_ref_storage: [session_registry.session_guid_prefix.len + session_registry.short_guid_hex_len]u8 = undefined;
-    const display_ref = sessionRefForOverlay(session_ref, &display_ref_storage);
-    try io_helpers.writeAll(1, "--- sessh: remote session might still be alive. Kill it with `");
-    try shell.writeArg(1, "sesshmux");
-    try io_helpers.writeAll(1, " ");
-    try shell.writeArg(1, "kill");
-    if (display_ref.len > 0) {
-        try io_helpers.writeAll(1, " ");
-        try shell.writeArg(1, display_ref);
-    }
-    try io_helpers.writeAll(1, "` ---\r\n");
-}
-
-fn sessionRefForOverlay(session_ref: []const u8, storage: *[session_registry.session_guid_prefix.len + session_registry.short_guid_hex_len]u8) []const u8 {
-    if (session_registry.isValidSessionGuid(session_ref)) {
-        @memcpy(storage[0..session_registry.session_guid_prefix.len], session_registry.session_guid_prefix);
-        var out_index: usize = session_registry.session_guid_prefix.len;
-        for (session_ref[session_registry.session_guid_prefix.len..]) |byte| {
-            if (byte == '-') continue;
-            storage[out_index] = std.ascii.toLower(byte);
-            out_index += 1;
-            if (out_index == storage.len) break;
-        }
-        return storage[0..];
-    }
-    if (session_registry.isValidCompactGuid(session_ref)) {
-        @memcpy(storage[0..session_registry.session_guid_prefix.len], session_registry.session_guid_prefix);
-        for (session_ref[0..session_registry.short_guid_hex_len], 0..) |byte, i| {
-            storage[session_registry.session_guid_prefix.len + i] = std.ascii.toLower(byte);
-        }
-        return storage[0..];
-    }
-    return session_ref;
+fn writeDetachOverlay() !void {
+    try io_helpers.writeAll(1, "--- sessh: disconnected ---\r\n");
 }
 
 fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
@@ -2285,7 +2171,6 @@ fn runAttachedClientLoop(
     attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
-    kill_requested: *bool,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     app_title_present: *?bool,
     options: AttachedClientOptions,
@@ -2317,7 +2202,6 @@ fn runAttachedClientLoop(
         attached_client_end_restore,
         input_ack_tracker,
         paste_like_input_classifier,
-        kill_requested,
         ended_tombstone_details,
         app_title_present,
         options,
@@ -2338,12 +2222,10 @@ fn runAttachedTerminal(
     attached_client_end_restore: *std.ArrayList(u8),
     input_ack_tracker: *InputAckTracker,
     paste_like_input_classifier: *PasteLikeInputClassifier,
-    kill_requested: *bool,
     ended_tombstone_details: ?*?session_registry.TombstoneDetails,
     app_title_present: *?bool,
     options: AttachedClientOptions,
 ) !AttachedClientEnd {
-    _ = kill_requested;
     var pollfds = [_]posix.pollfd{
         .{ .fd = input_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = read_fd, .events = posix.POLL.IN, .revents = 0 },
@@ -2400,8 +2282,6 @@ fn runAttachedTerminal(
             }
             if (result.end) |end| switch (end) {
                 .detach => return finishAttachedClient(requestSessionDetach(read_fd, write_fd), attached_client_end_restore),
-                .kill => return finishAttachedClient(.kill_detach, attached_client_end_restore),
-                .kill_wait => return finishAttachedClient(.kill_wait, attached_client_end_restore),
                 .help => {
                     if (try showEscapeHelpModal(
                         input_fd,
@@ -3019,14 +2899,6 @@ fn sendScreenRepaint(socket_fd: c.fd_t, pending_repaint: *PendingRepaint) !void 
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(socket_fd, .te_repaint_request, payload);
-}
-
-fn inputRequestsImmediateKillDetach(filter: *terminal.EscapeFilter, input: []const u8, scratch: []u8) bool {
-    for (input) |byte| {
-        if (byte == 0x03) return true;
-    }
-    const result = filter.filter(input, scratch);
-    return if (result.end) |end| end == .kill else false;
 }
 
 fn allocateRepaintRequestSeq() u64 {

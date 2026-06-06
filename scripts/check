@@ -8,10 +8,9 @@ usage: scripts/check [--fast|--ci|--full]
 Runs sessh verification. With no mode, defaults to --fast.
 
 Options:
-  --fast    Build sesshmux-dev and run a fake-ssh smoke connect.
-  --ci      Run the CI suite: Zig build/tests, Termless smoke tests,
-            bootstrapper harness, fake-ssh harness, socket harness,
-            tmux terminal harness, and terminal conformance harness.
+  --fast    Build sessh-dev and run a fake-ssh smoke connect.
+  --ci      Run the CI suite: Zig build/tests, bootstrapper harness,
+            fake-ssh harness, and socket harness.
   --full    Run --ci plus the slow Podman ssh harness.
 EOF
 }
@@ -73,7 +72,7 @@ run_isolated() {
   printf '\n==> %s\n' "$*"
   HOME=$SESSH_CHECK_HOME \
     HISTFILE=/dev/null \
-    SESSH_BIN=zig-out/bin/sesshmux-dev \
+    SESSH_BIN=zig-out/bin/sessh-dev \
     XDG_RUNTIME_DIR=$SESSH_CHECK_XDG_RUNTIME_DIR \
     XDG_CACHE_HOME=$SESSH_CHECK_XDG_CACHE_HOME \
     XDG_CONFIG_HOME=$SESSH_CHECK_XDG_CONFIG_HOME \
@@ -93,7 +92,7 @@ run_with_host_podman_environment() {
     # creates isolated sessh client environments internally, so only point it at
     # the freshly built binary here.
     HISTFILE=/dev/null
-    SESSH_BIN=zig-out/bin/sesshmux-dev
+    SESSH_BIN=zig-out/bin/sessh-dev
     export HISTFILE SESSH_BIN
     "$@"
   )
@@ -211,12 +210,11 @@ case "$mode" in
     check_python_protobuf
 
     run "$zig_bin" build gen-proto
-    run sh -n scripts/build scripts/check scripts/check-termless scripts/download-ghostty-deps scripts/install
+    run sh -n scripts/build scripts/check scripts/download-ghostty-deps scripts/install
     run python3 -m py_compile scripts/release
     run "$zig_bin" fmt --check build.zig build.zig.zon src/*.zig
     run "$zig_bin" build
     run "$zig_bin" build install-dev
-    run scripts/check-termless --no-build
     run "$zig_bin" build test
     setup_isolation
     trap cleanup_isolation EXIT
@@ -224,9 +222,6 @@ case "$mode" in
     run_isolated python3 tests/ssh_harness.py
     run_isolated python3 tests/ssh_reconnect_tmux_harness.py
     run_isolated python3 tests/socket_harness.py
-    run_isolated python3 tests/tmux_harness.py
-    # Tmux-only conformance catches renderer regressions without the Podman setup.
-    run_isolated python3 tests/terminal_conformance_harness.py
     if [ "$mode" = "full" ]; then
       printf '\n==> Slow Podman ssh harness is about to start. Run `scripts/check --ci` to skip it.\n'
       run_with_host_podman_environment python3 tests/podman_ssh_harness.py

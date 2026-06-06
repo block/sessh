@@ -128,13 +128,13 @@ const PackagedArtifactTarget = struct {
 };
 
 const packaged_artifact_targets = [_]PackagedArtifactTarget{
-    .{ .os = "macos", .arch = "aarch64", .filename = "sesshmux-macos-aarch64" },
-    .{ .os = "macos", .arch = "x86_64", .filename = "sesshmux-macos-x86_64" },
-    .{ .os = "linux", .arch = "arm32", .filename = "sesshmux-linux-arm32" },
-    .{ .os = "linux", .arch = "aarch64", .filename = "sesshmux-linux-aarch64" },
-    .{ .os = "linux", .arch = "x86_64", .filename = "sesshmux-linux-x86_64" },
-    .{ .os = "linux", .arch = "x86", .filename = "sesshmux-linux-x86" },
-    .{ .os = "linux", .arch = "riscv64", .filename = "sesshmux-linux-riscv64" },
+    .{ .os = "macos", .arch = "aarch64", .filename = "sessh-macos-aarch64" },
+    .{ .os = "macos", .arch = "x86_64", .filename = "sessh-macos-x86_64" },
+    .{ .os = "linux", .arch = "arm32", .filename = "sessh-linux-arm32" },
+    .{ .os = "linux", .arch = "aarch64", .filename = "sessh-linux-aarch64" },
+    .{ .os = "linux", .arch = "x86_64", .filename = "sessh-linux-x86_64" },
+    .{ .os = "linux", .arch = "x86", .filename = "sessh-linux-x86" },
+    .{ .os = "linux", .arch = "riscv64", .filename = "sessh-linux-riscv64" },
 };
 
 pub fn loadArtifactSet(allocator: std.mem.Allocator) !ArtifactSet {
@@ -152,7 +152,7 @@ pub fn loadArtifactSet(allocator: std.mem.Allocator) !ArtifactSet {
 }
 
 fn isDevelopmentExecutable(exe_path: []const u8) bool {
-    return std.mem.eql(u8, std.fs.path.basename(exe_path), "sesshmux-dev");
+    return std.mem.eql(u8, std.fs.path.basename(exe_path), "sessh-dev");
 }
 
 fn loadPackagedArtifactSet(allocator: std.mem.Allocator, exe_path: []const u8) !ArtifactSet {
@@ -547,11 +547,11 @@ test "parseMissingPlatform parses canonical platform fields" {
 
 test "artifactFilenameForPlatform maps canonical platform fields to packaged names" {
     try std.testing.expectEqualStrings(
-        "sesshmux-linux-aarch64",
+        "sessh-linux-aarch64",
         artifactFilenameForPlatform(.{ .os = "linux", .arch = "aarch64" }) orelse return error.MissingArtifactName,
     );
     try std.testing.expectEqualStrings(
-        "sesshmux-macos-x86_64",
+        "sessh-macos-x86_64",
         artifactFilenameForPlatform(.{ .os = "macos", .arch = "x86_64" }) orelse return error.MissingArtifactName,
     );
     try std.testing.expectEqual(@as(?[]const u8, null), artifactFilenameForPlatform(.{
@@ -589,10 +589,9 @@ test "packaged artifact manifest supplies hashes without hashing artifact conten
     try std.testing.expectEqualStrings(zero_hash, entry.hash_hex[0..]);
 }
 
-test "sesshmux-dev uses development artifact upload" {
-    try std.testing.expect(isDevelopmentExecutable("/tmp/sesshmux-dev"));
-    try std.testing.expect(isDevelopmentExecutable("/tmp/build/bin/sesshmux-dev"));
-    try std.testing.expect(!isDevelopmentExecutable("/tmp/sessh-dev"));
+test "sessh-dev uses development artifact upload" {
+    try std.testing.expect(isDevelopmentExecutable("/tmp/sessh-dev"));
+    try std.testing.expect(isDevelopmentExecutable("/tmp/build/bin/sessh-dev"));
     try std.testing.expect(!isDevelopmentExecutable("/tmp/build/bin/sessh"));
-    try std.testing.expect(!isDevelopmentExecutable("/tmp/libexec/sessh/sesshmux-macos-aarch64"));
+    try std.testing.expect(!isDevelopmentExecutable("/tmp/libexec/sessh/sessh-macos-aarch64"));
 }

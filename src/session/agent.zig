@@ -1671,7 +1671,7 @@ fn acceptRemoteHandshake(session_agent: *SessionAgent, fd: c.fd_t) !HandshakeRes
     var peer_hello = try readHelloRequest(fd);
     defer peer_hello.deinit(app_allocator.allocator());
     if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Use the session agent's matching sessh binary through compat-mode");
+        try sendHelloError(fd, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Start a fresh sessh connection with matching binaries");
         return .mismatch;
     }
     try sendHelloOk(fd);

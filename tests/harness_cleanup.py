@@ -29,31 +29,9 @@ def state_root(env):
 
 
 def cleanup_runtime(env, timeout=5.0):
-    kill_all(env, timeout=timeout)
     kill_build_sessh_processes(timeout=timeout)
     shutil.rmtree(Path(env["XDG_RUNTIME_DIR"]), ignore_errors=True)
     shutil.rmtree(state_root(env), ignore_errors=True)
-
-
-def kill_all(env, timeout=5.0):
-    if not BIN.exists():
-        return
-
-    # Avoid starting a broker just to kill every session. The harness controls
-    # runtime discovery env vars, so the registry path is deterministic.
-    if not sessions_dir(env).exists() or not any(sessions_dir(env).iterdir()):
-        return
-
-    subprocess.run(
-        [str(BIN), ".", "kill", "--all"],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-    )
 
 
 def kill_build_sessh_processes(timeout=5.0):
@@ -121,7 +99,7 @@ def is_build_sessh_executable(resolved, expected_wrapper):
         resolved.relative_to(libexec.resolve(strict=False))
     except ValueError:
         return False
-    return resolved.name.startswith("sesshmux-")
+    return resolved.name.startswith("sessh-")
 
 
 def is_test_cached_sessh_command(resolved, command):

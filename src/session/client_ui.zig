@@ -44,8 +44,6 @@ pub const ReconnectDecision = enum {
     wait_elapsed,
     reconnect_now,
     detach,
-    kill_detach,
-    kill_wait,
 };
 
 pub const ReconnectSwitchDisposition = enum {
@@ -75,7 +73,7 @@ pub const ReconnectUi = struct {
     cursor_hidden: bool = false,
     reconnect_acknowledged: bool = false,
     input_during_disconnect: bool = false,
-    kill_escape_filter: terminal.EscapeFilter = .{},
+    escape_filter: terminal.EscapeFilter = .{},
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     title_enabled: bool = false,
     title_fd: c.fd_t = 1,
@@ -160,7 +158,7 @@ pub const ReconnectUi = struct {
             try self.refreshForResize();
             try self.refreshOverlayIfDiagnosticsChanged();
             switch (decision) {
-                .detach, .kill_detach, .kill_wait => return decision,
+                .detach => return decision,
                 .reconnect_now => {
                     self.showReconnectingTitle();
                     try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
@@ -181,26 +179,6 @@ pub const ReconnectUi = struct {
     pub fn showDisconnectedReconnectInProgress(self: *ReconnectUi) !void {
         self.showReconnectingTitle();
         try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
-    }
-
-    pub fn showKillingRemoteSession(self: *ReconnectUi) !void {
-        self.showKillingTitle();
-        try self.drawStaticOverlay("--- Killing remote session. ~. to detach immediately ---");
-    }
-
-    pub fn waitForKillConfirmation(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
-        try self.showKillingRemoteSession();
-        var timer = try std.time.Timer.start();
-        while (true) {
-            const elapsed_ms = elapsedTimerMs(&timer);
-            if (elapsed_ms >= delay_ms) return .wait_elapsed;
-            const wait_ms: i32 = @intCast(@min(delay_ms - elapsed_ms, @as(u64, 50)));
-            switch (try self.pollKillingDecision(wait_ms)) {
-                .detach, .kill_detach, .kill_wait => |decision| return decision,
-                .reconnect_now => unreachable,
-                .wait_elapsed => {},
-            }
-        }
     }
 
     pub fn showUnresponsiveReconnectInProgressTitle(self: *ReconnectUi) void {
@@ -239,7 +217,7 @@ pub const ReconnectUi = struct {
         try self.showReconnectReady(disposition);
         while (true) {
             switch (try self.pollDecision(-1)) {
-                .detach, .kill_detach, .kill_wait => |decision| return decision,
+                .detach => |decision| return decision,
                 .reconnect_now => return .reconnect_now,
                 .wait_elapsed => {},
             }
@@ -259,7 +237,7 @@ pub const ReconnectUi = struct {
             const next_wake_ms = @min(delay_ms, next_overlay_update_ms);
             const wait_ms: i32 = @intCast(@min(next_wake_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
             switch (try self.pollDecision(wait_ms)) {
-                .detach, .kill_detach, .kill_wait => |decision| return decision,
+                .detach => |decision| return decision,
                 .reconnect_now => return .reconnect_now,
                 .wait_elapsed => {},
             }
@@ -276,7 +254,7 @@ pub const ReconnectUi = struct {
     pub fn pollDetach(self: *ReconnectUi, timeout_ms: i32) !bool {
         const decision = try self.pollDecision(timeout_ms);
         return switch (decision) {
-            .detach, .kill_detach, .kill_wait => true,
+            .detach => true,
             .reconnect_now, .wait_elapsed => false,
         };
     }
@@ -286,16 +264,6 @@ pub const ReconnectUi = struct {
         try self.refreshForResize();
         try self.refreshOverlayIfDiagnosticsChanged();
         const decision = try self.pollInput(timeout_ms);
-        try self.refreshForResize();
-        try self.refreshOverlayIfDiagnosticsChanged();
-        return decision;
-    }
-
-    pub fn pollKillingDecision(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        if (self.isCancelled()) return .detach;
-        try self.refreshForResize();
-        try self.refreshOverlayIfDiagnosticsChanged();
-        const decision = try self.pollKillingInput(timeout_ms);
         try self.refreshForResize();
         try self.refreshOverlayIfDiagnosticsChanged();
         return decision;
@@ -378,11 +346,9 @@ pub const ReconnectUi = struct {
             },
             .none => {},
         }
-        const result = self.kill_escape_filter.filter(bytes, &filtered);
+        const result = self.escape_filter.filter(bytes, &filtered);
         if (result.end) |end| switch (end) {
             .detach => return .detach,
-            .kill => return .kill_detach,
-            .kill_wait => return .kill_wait,
             .help => {},
             .repaint => {},
         };
@@ -390,45 +356,6 @@ pub const ReconnectUi = struct {
             self.input_during_disconnect = true;
             try self.alertDisconnectedInput();
         }
-        return .wait_elapsed;
-    }
-
-    fn pollKillingInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        var pollfds = [_]posix.pollfd{
-            .{
-                .fd = 0,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-            .{
-                .fd = self.diagnostic_notify_read_fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-        };
-        const poll_count: usize = if (self.diagnostic_notify_read_fd >= 0) 2 else 1;
-        const ready = try posix.poll(pollfds[0..poll_count], self.effectivePollTimeout(timeout_ms));
-        if (ready == 0) return .wait_elapsed;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .detach;
-        if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
-            self.drainDiagnosticNotifier();
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
-
-        var input: [256]u8 = undefined;
-        var filtered: [512]u8 = undefined;
-        const n = c.read(0, &input, input.len);
-        if (n <= 0) return .detach;
-        const bytes = input[0..@intCast(n)];
-        io_helpers.noteRead(0, bytes);
-        const result = self.kill_escape_filter.filter(bytes, &filtered);
-        if (result.end) |end| switch (end) {
-            .detach, .kill => return .detach,
-            .kill_wait => return .kill_wait,
-            .help => {},
-            .repaint => {},
-        };
-        if (bytes.len > 0) try self.alertDisconnectedInput();
         return .wait_elapsed;
     }
 
@@ -664,12 +591,6 @@ pub const ReconnectUi = struct {
     fn showConnectionReadyTitle(self: *ReconnectUi) void {
         if (!self.title_enabled or self.title_fd < 0) return;
         reconnect_title.writeConnectionReadyTitle(self.title_fd) catch return;
-        self.title_visible = true;
-    }
-
-    fn showKillingTitle(self: *ReconnectUi) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeTitle(self.title_fd, "killing remote session") catch return;
         self.title_visible = true;
     }
 

@@ -1,12 +1,14 @@
-sessh must bootstrap remote hosts whose OS/architecture differs from the local
-client. For example, a macOS `aarch64` client may need to upload a Linux
-`x86_64` binary.
+# Packaging
 
-Each release archive contains binaries for all of the OS/architectures that we
-support, in `libexec/sessh/sesshmux-<os>-<arch>`.
+Sessh bootstraps remote hosts whose OS/architecture differs from the local
+client. Release archives include one binary per supported platform under:
 
-In order to benefit from Zig's runtime safety checks, we ship ReleaseSafe binaries.
+```text
+libexec/sessh/sessh-<os>-<arch>
+```
 
-The release archive contains a manifest of the sha256sums of each of the
-binaries - `libexec/sessh/artifacts.manifest` - so that the bootstrapping
-process doesn't need to recompute them.
+Release archives also include `libexec/sessh/artifacts.manifest`, which records
+sha256 sums so the bootstrapper can identify and install the right binary
+without recomputing every artifact hash.
+
+Release builds use Zig's ReleaseSafe mode.

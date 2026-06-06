@@ -54,7 +54,7 @@ pub fn resolveSshConfig(allocator: std.mem.Allocator, ssh_options: []const []con
 }
 
 fn fallbackResolvedSshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) !ResolvedSshConfig {
-    const explicit_port = explicitSshPort(ssh_options) orelse session_registry.default_pending_port;
+    const explicit_port = explicitSshPort(ssh_options) orelse session_registry.default_ssh_port;
     return .{
         .hostname = try allocator.dupe(u8, host),
         .port = try allocator.dupe(u8, explicit_port),
@@ -119,7 +119,7 @@ pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_opti
     }
     if (hostname == null) hostname = try allocator.dupe(u8, fallback_host);
     if (port == null) {
-        const explicit_port = explicitSshPort(ssh_options) orelse session_registry.default_pending_port;
+        const explicit_port = explicitSshPort(ssh_options) orelse session_registry.default_ssh_port;
         port = try allocator.dupe(u8, explicit_port);
     }
     return .{

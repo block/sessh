@@ -44,9 +44,6 @@ pub const LocalStreamOptions = struct {
     ctrl_r_status_enabled: ?bool = null,
     proxy_control_output_mode: proxy_control.OutputMode = .update,
     title_fallback: []const u8 = "",
-    pending_kill_host: []const u8 = "",
-    pending_kill_port: []const u8 = session_registry.default_pending_port,
-    pending_kill_guid: []const u8 = "",
 };
 
 // Stream channels are internal fd-shaped identities. The proxy stream protocol
@@ -332,8 +329,6 @@ const StreamInputControl = struct {
     status_visible: bool = false,
     reconnect_requested: bool = false,
     disconnect_requested: bool = false,
-    kill_detach_requested: bool = false,
-    kill_wait_requested: bool = false,
     help_requested: bool = false,
     escape_filter: terminal.EscapeFilter = .{},
 
@@ -344,8 +339,6 @@ const StreamInputControl = struct {
             const result = self.escape_filter.filter(bytes, &scratch);
             if (result.end) |end| switch (end) {
                 .detach => self.disconnect_requested = true,
-                .kill => self.kill_detach_requested = true,
-                .kill_wait => self.kill_wait_requested = true,
                 .help => self.help_requested = true,
                 .repaint => {},
             };
@@ -372,22 +365,8 @@ const StreamInputControl = struct {
         if (self.disconnect_requested) {
             self.disconnect_requested = false;
             self.reconnect_requested = false;
-            self.kill_detach_requested = false;
-            self.kill_wait_requested = false;
             self.help_requested = false;
             return .disconnect;
-        }
-        if (self.kill_detach_requested) {
-            self.kill_detach_requested = false;
-            self.reconnect_requested = false;
-            self.help_requested = false;
-            return .kill_detach;
-        }
-        if (self.kill_wait_requested) {
-            self.kill_wait_requested = false;
-            self.reconnect_requested = false;
-            self.help_requested = false;
-            return .kill_wait;
         }
         if (self.help_requested) {
             self.help_requested = false;
@@ -403,8 +382,6 @@ const StreamControlAction = enum {
     none,
     reconnect,
     disconnect,
-    kill_detach,
-    kill_wait,
     help,
     interrupt,
 };
@@ -1160,10 +1137,6 @@ pub fn runLocalStream(
                 const delay_ms = reconnect.delayMs(attempt);
                 const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
                 if (action == .disconnect) return 0;
-                if (action == .kill_detach or action == .kill_wait) {
-                    queueLocalPendingKill(options, &state);
-                    return 0;
-                }
                 if (action == .interrupt) return 255;
                 attempt = reconnect.nextAttempt(attempt, action == .reconnect);
                 retrying = true;
@@ -1261,16 +1234,6 @@ pub fn runLocalStream(
                         abortTransport(&transport);
                         return 0;
                     },
-                    .kill_detach => {
-                        queueLocalPendingKill(options, &state);
-                        abortTransport(&transport);
-                        return 0;
-                    },
-                    .kill_wait => {
-                        queueLocalPendingKill(options, &state);
-                        abortTransport(&transport);
-                        return 0;
-                    },
                     .reconnect => if (old_unresponsive and pending == null) {
                         pending = Pending.start(allocator, start_transport) catch |err| {
                             client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
@@ -1358,10 +1321,6 @@ pub fn runLocalStream(
                     if (pollfds[index].revents != 0) {
                         switch (readReconnectInput(&state, options.source_fd, &input_control)) {
                             .disconnect => return 0,
-                            .kill_detach, .kill_wait => {
-                                queueLocalPendingKill(options, &state);
-                                return 0;
-                            },
                             .help => reconnect_status.showEscapeHelp(),
                             .none, .reconnect => {},
                             .interrupt => unreachable,
@@ -1392,10 +1351,6 @@ pub fn runLocalStream(
         const delay_ms = reconnect.delayMs(attempt);
         const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
         if (action == .disconnect) return 0;
-        if (action == .kill_detach or action == .kill_wait) {
-            queueLocalPendingKill(options, &state);
-            return 0;
-        }
         if (action == .interrupt) return 255;
         attempt = reconnect.nextAttempt(attempt, action == .reconnect);
         retrying = true;
@@ -2000,20 +1955,6 @@ fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl) bool
         else => {},
     }
     return true;
-}
-
-fn queueLocalPendingKill(options: LocalStreamOptions, state: *const StreamState) void {
-    const host_guid = state.peerHostGuidSlice();
-    if (host_guid.len == 0 or options.pending_kill_host.len == 0 or options.pending_kill_guid.len == 0) return;
-    session_registry.queuePendingKill(std.heap.smp_allocator, host_guid, options.pending_kill_host, options.pending_kill_port, options.pending_kill_guid) catch |err| {
-        client_log.debug("event=stream_pending_kill_queue_failed host_guid={s} host={s} port={s} guid={s} error={t}", .{
-            host_guid,
-            options.pending_kill_host,
-            options.pending_kill_port,
-            options.pending_kill_guid,
-            err,
-        });
-    };
 }
 
 pub const TerminalTitleTracker = struct {
@@ -2668,7 +2609,7 @@ test "stream input control intercepts only reconnect UI controls" {
     try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
 }
 
-test "stream input control uses ssh kill escapes for no-terminal-emulator streams" {
+test "stream input control uses ssh disconnect escape for no-terminal-emulator streams" {
     var control = StreamInputControl{
         .enabled = true,
         .escape_enabled = true,
@@ -2677,10 +2618,10 @@ test "stream input control uses ssh kill escapes for no-terminal-emulator stream
     var out: [16]u8 = undefined;
 
     try std.testing.expectEqualStrings("", control.filter("~.", &out));
-    try std.testing.expectEqual(StreamControlAction.kill_detach, control.consumeAction());
+    try std.testing.expectEqual(StreamControlAction.disconnect, control.consumeAction());
 
-    try std.testing.expectEqualStrings("", control.filter("~k", &out));
-    try std.testing.expectEqual(StreamControlAction.kill_wait, control.consumeAction());
+    try std.testing.expectEqualStrings("~k", control.filter("~k", &out));
+    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
 }
 
 test "stream input control supports ssh help and doubled tilde escapes" {

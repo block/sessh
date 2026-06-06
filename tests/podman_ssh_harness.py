@@ -1113,68 +1113,10 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         if "ssh runtime attach is not implemented yet" in result.stderr:
             raise AssertionError(result.stderr)
 
-        remote_shell = "/tmp/sessh-e2e-shell-reconnect"
-        reconnect_marker = f"PODMAN_SESSH_RECONNECT_{arch}"
-        run(
-            [
-                "podman",
-                "exec",
-                container,
-                "sh",
-                "-c",
-                f"cat > {remote_shell} <<'EOF'\n#!/bin/sh\nif [ \"$1\" = -c ]; then exec /bin/zsh \"$@\"; fi\nprintf '{reconnect_marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\nEOF\nchmod +x {remote_shell}",
-            ],
-            timeout=10.0,
-        )
-        set_remote_login_shell(container, remote_shell)
-        config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        ssh_options = f"-F {config}"
-
-        def reconnect_sever_cmd():
-            listed_jsonl = run(
-                [str(prefix / "bin" / "sesshmux"), "list", "--jsonl", "--ssh-options", ssh_options, host_alias],
-                env=env,
-                timeout=60.0,
-                check=False,
-            )
-            if listed_jsonl.returncode != 0:
-                raise AssertionError(listed_jsonl)
-            session_id = first_session_row(listed_jsonl.stdout)["id"]
-            return [
-                str(prefix / "bin" / "sesshmux"),
-                "debug",
-                "--ssh-options",
-                ssh_options,
-                "--host",
-                host_alias,
-                "--id",
-                session_id,
-                "sever-connection",
-                "--all",
-            ]
-
-        reconnected = run_reconnect_probe(
-            [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias],
-            env,
-            reconnect_marker,
-            f"after-reconnect-{arch}",
-            reconnect_sever_cmd,
-            timeout=90.0,
-        )
-        if reconnected.returncode != 0:
-            raise AssertionError(reconnected)
-        if "sessh: disconnected: Retry connecting 10sec" not in reconnected.stdout:
-            raise AssertionError(reconnected)
-        if f"REMOTE:after-reconnect-{arch}" not in reconnected.stdout:
-            raise AssertionError(reconnected)
-        if "ReconnectUnsupported" in reconnected.stderr:
-            raise AssertionError(reconnected.stderr)
-
-        artifact_path = prefix / "libexec" / "sessh" / f"sesshmux-{os_name}-{arch}"
+        artifact_path = prefix / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
         if not artifact_path.exists():
             raise AssertionError(f"missing packaged artifact: {artifact_path}")
-        remote_artifact = f"/root/.cache/sessh/bin/{sessh_version()}/{sha256(artifact_path)}/sesshmux"
+        remote_artifact = f"/root/.cache/sessh/bin/{sessh_version()}/{sha256(artifact_path)}/sessh"
         installed = run(
             ["podman", "exec", container, "test", "-x", remote_artifact],
             timeout=10.0,
@@ -1182,100 +1124,6 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         )
         if installed.returncode != 0:
             raise AssertionError(f"remote artifact was not installed at {remote_artifact}")
-
-        remote_shell = "/tmp/sessh-e2e-shell-loop"
-        command_marker = f"PODMAN_SESSH_COMMAND_{arch}"
-        run(
-            [
-                "podman",
-                "exec",
-                container,
-                "sh",
-                "-c",
-                f"cat > {remote_shell} <<'EOF'\n#!/bin/sh\nif [ \"$1\" = -c ]; then exec /bin/zsh \"$@\"; fi\nprintf '{command_marker}\\n'\nwhile :; do sleep 1; done\nEOF\nchmod +x {remote_shell}",
-            ],
-            timeout=10.0,
-        )
-        set_remote_login_shell(container, remote_shell)
-
-        started = run_until_stdout(
-            [str(prefix / "bin" / "sessh"), "-F", str(config), host_alias],
-            env,
-            command_marker,
-            timeout=60.0,
-        )
-        if started.returncode != 0:
-            raise AssertionError(started)
-
-        ssh_options = f"-F {config}"
-        listed = run(
-            [str(prefix / "bin" / "sesshmux"), "list", "--ssh-options", ssh_options, host_alias],
-            env=env,
-            timeout=60.0,
-            check=False,
-        )
-        if listed.returncode != 0:
-            raise AssertionError(listed)
-        if not has_list_header(listed.stdout) or not has_session_row(listed.stdout):
-            raise AssertionError(listed)
-        session_id = first_session_id(listed.stdout)
-        listed_jsonl = run(
-            [str(prefix / "bin" / "sesshmux"), "list", "--jsonl", "--ssh-options", ssh_options, host_alias],
-            env=env,
-            timeout=60.0,
-            check=False,
-        )
-        if listed_jsonl.returncode != 0:
-            raise AssertionError(listed_jsonl)
-        session_guid = first_session_guid(listed_jsonl.stdout)
-        compat_path = f"/tmp/sessh-0/guid/{session_guid}/compat"
-        compat = run(
-            [
-                "podman",
-                "exec",
-                container,
-                "sh",
-                "-c",
-                f"test -L {compat_path} && test -x \"$(readlink {compat_path})\"",
-            ],
-            timeout=10.0,
-            check=False,
-        )
-        if compat.returncode != 0:
-            raise AssertionError(f"remote session compat symlink was not installed at {compat_path}")
-
-        killed = run(
-            [str(prefix / "bin" / "sesshmux"), "kill", "--ssh-options", ssh_options, host_alias, session_id],
-            env=env,
-            timeout=60.0,
-            check=False,
-        )
-        if killed.returncode != 0:
-            raise AssertionError(killed)
-        if f"ENDED {session_id}" not in killed.stdout:
-            raise AssertionError(killed)
-
-        stopped = run(
-            [str(prefix / "bin" / "sesshmux"), "kill", "--all", "--ssh-options", ssh_options, host_alias],
-            env=env,
-            timeout=60.0,
-            check=False,
-        )
-        if stopped.returncode != 0:
-            raise AssertionError(stopped)
-        if "KILLING_ALL" not in stopped.stdout:
-            raise AssertionError(stopped)
-
-        stopped_again = run(
-            [str(prefix / "bin" / "sesshmux"), "kill", "--all", "--ssh-options", ssh_options, host_alias],
-            env=env,
-            timeout=60.0,
-            check=False,
-        )
-        if stopped_again.returncode != 0:
-            raise AssertionError(stopped_again)
-        if "KILLING_ALL" not in stopped_again.stdout:
-            raise AssertionError(stopped_again)
     finally:
         run(["podman", "stop", "-t", "0", container], timeout=30.0, check=False)
         run(["podman", "rmi", "-f", tag], timeout=30.0, check=False)
