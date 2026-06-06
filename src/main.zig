@@ -270,7 +270,6 @@ test {
     _ = @import("mux/cli.zig");
     _ = @import("mux/client_control_args.zig");
     _ = @import("mux/client_control.zig");
-    _ = @import("mux/common.zig");
     _ = @import("mux/debug.zig");
     _ = @import("mux/detach.zig");
     _ = @import("mux/force_compat.zig");
@@ -282,6 +281,7 @@ test {
     _ = @import("mux/parser.zig");
     _ = @import("mux/repaint.zig");
     _ = @import("mux/routed.zig");
+    _ = @import("mux/sessh.zig");
     _ = @import("protocol/mod.zig");
     _ = @import("reconnect/control.zig");
     _ = @import("reconnect/mod.zig");
@@ -309,7 +309,11 @@ test {
     _ = @import("tty/terminal.zig");
     _ = @import("tty/transcript.zig");
     _ = @import("transport/artifact_manifest.zig");
+    _ = @import("transport/bootstrap.zig");
     _ = @import("transport/frame_forwarder.zig");
+    _ = @import("transport/plain_ssh.zig");
+    _ = @import("transport/remote_shell.zig");
     _ = @import("transport/socket.zig");
+    _ = @import("transport/ssh_options.zig");
     _ = @import("transport/ssh.zig");
 }

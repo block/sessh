@@ -1,9 +1,6 @@
 const std = @import("std");
 
 const mux_cli = @import("cli.zig");
-const mux_common = @import("common.zig");
-const session_registry = @import("../runtime/session_registry.zig");
-const ssh_client = @import("../transport/ssh.zig");
 
 pub fn parse(scratch: *mux_cli.Scratch, args: []const []const u8) !mux_cli.Kill {
     var parsed = mux_cli.CommandParts{};
@@ -115,43 +112,6 @@ pub fn parse(scratch: *mux_cli.Scratch, args: []const []const u8) !mux_cli.Kill 
     }
     kill.ssh_options = try scratch.ownSshOptions(&parsed.ssh_options);
     return kill;
-}
-
-pub fn toInvocation(
-    allocator: std.mem.Allocator,
-    kill: mux_cli.Kill,
-    route_storage: *?session_registry.Route,
-) !ssh_client.SessionInvocation {
-    var parsed = try mux_common.baseInvocation(kill.ssh_options, if (kill.all) .kill_all else .kill, kill.common);
-    parsed.kill_current = kill.current;
-    parsed.kill_jsonl = kill.jsonl;
-    parsed.kill_request_jsons = kill.request_jsons;
-    switch (kill.command_target) {
-        .local => {
-            parsed.host = "";
-            parsed.kill_ids = kill.ids;
-            if (parsed.kill_ids.len > 0) parsed.kill_id = parsed.kill_ids[0];
-        },
-        .host => |host| {
-            parsed.host = host;
-            parsed.kill_ids = kill.ids;
-            if (parsed.kill_ids.len > 0) parsed.kill_id = parsed.kill_ids[0];
-        },
-        .route_ref_or_local_id => |ref| {
-            const routed = mux_common.tryReadRouteForRef(allocator, route_storage, ref) catch |err| switch (err) {
-                error.SessionAlreadyExited => false,
-                else => return err,
-            };
-            if (routed) {
-                mux_common.fillFromRoute(.kill, &parsed, route_storage.*.?);
-            } else {
-                parsed.host = "";
-                parsed.kill_ids = &.{ref};
-                parsed.kill_id = ref;
-            }
-        },
-    }
-    return parsed;
 }
 
 test "parse accepts ids as options" {

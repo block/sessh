@@ -2,84 +2,97 @@ const std = @import("std");
 
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
+const mux_cli = @import("cli.zig");
 const process_exit = @import("../core/process_exit.zig");
+const remote_command = @import("../runtime/remote_command.zig");
 const route_commands = @import("../runtime/route_commands.zig");
 const runtime_commands = @import("../runtime/commands.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 
-pub fn runInvocation(
+pub fn runCommand(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    parsed: anytype,
+    command: mux_cli.Command,
+    remote_runner: ?*remote_command.Runner,
 ) !void {
-    if (parsed.capture_tty_transcript != null and parsed.action != .new and parsed.action != .attach) {
-        try io.writeAll(2, "sessh: --capture-tty-transcript is only supported for new and attach sessions\n");
+    return switch (command) {
+        .list => |list| runListCommand(allocator, exe, list, remote_runner),
+        .kill => |kill| runKillCommand(allocator, kill),
+        .detach => |control| runLocalClientControlCommandOrExit(allocator, .detach, control),
+        .repaint => |control| runLocalClientControlCommandOrExit(allocator, .repaint, control),
+        .debug => |debug| runLocalClientControlCommandOrExit(allocator, switch (debug.action) {
+            .sever_connection => .debug_sever_connection,
+            .unresponsive_connection => .debug_unresponsive_connection,
+        }, debug.control),
+        .new, .attach => unreachable,
+    };
+}
+
+pub fn runListCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    list: mux_cli.List,
+    remote_runner: ?*remote_command.Runner,
+) !void {
+    if (list.common.capture_tty_transcript != null) {
+        try writeCaptureTranscriptUnsupported();
         return process_exit.request(64);
     }
 
-    switch (parsed.action) {
-        .list => {
-            if (parsed.list_client_target) |target| {
-                const exit_status = try runtime_commands.runListCommand(allocator, .{
-                    .format = if (parsed.list_jsonl) .jsonl else .table,
-                    .client_selector = clientListSelector(target),
-                });
-                if (exit_status != 0) return process_exit.request(exit_status);
-                return;
-            }
-            const exit_status = try route_commands.runLocalListCommand(
-                allocator,
-                exe,
-                parsed.list_refresh,
-                parsed.list_include_cached_routes,
-                parsed.list_jsonl,
-                parsed.list_exited,
-                parsed.list_all,
-                null,
-            );
-            if (exit_status != 0) return process_exit.request(exit_status);
-            return;
-        },
-        .kill => {
-            var kill_refs: ?LocalKillRefs = null;
-            defer if (kill_refs) |*refs| refs.deinit(allocator);
-            if (parsed.kill_request_jsons.len == 0) {
-                kill_refs = resolveLocalKillRefs(allocator, parsed) catch |err| switch (err) {
-                    error.MissingCurrentSession, error.MissingKillTarget => {
-                        try writeLocalArgError(err);
-                        return process_exit.request(64);
-                    },
-                    else => return err,
-                };
-            }
-            return runLocalKillCommand(allocator, parsed, if (kill_refs) |refs| refs.refs else &.{});
-        },
-        .kill_all => {
-            return runtime_commands.runKillCommand(allocator, .{
-                .format = if (parsed.kill_jsonl) .jsonl else .text,
-                .all = true,
-            });
-        },
-        .detach_client, .repaint_client, .debug_client => {
-            runLocalClientControlCommand(allocator, parsed) catch |err| switch (err) {
-                error.MissingSessionRef => {
-                    try io.writeAll(2, "sessh: client command requires an ID outside a sessh session\n");
-                    return process_exit.request(64);
-                },
-                error.AmbiguousClientId => {
-                    try io.writeAll(2, "sessh: client id is ambiguous\n");
-                    return process_exit.request(1);
-                },
-                error.InvalidClientId => {
-                    try io.writeAll(2, "sessh: invalid client id\n");
-                    return process_exit.request(64);
-                },
-                else => return err,
-            };
-            return;
-        },
-        .new, .attach => unreachable,
+    if (list.client_target) |target| {
+        const exit_status = try runtime_commands.runListCommand(allocator, .{
+            .format = if (list.jsonl) .jsonl else .table,
+            .client_selector = clientListSelector(target),
+        });
+        if (exit_status != 0) return process_exit.request(exit_status);
+        return;
     }
+
+    const exit_status = try route_commands.runLocalListCommand(
+        allocator,
+        exe,
+        list.refresh,
+        list.include_cached_routes,
+        list.jsonl,
+        list.exited,
+        list.all,
+        remote_runner,
+    );
+    if (exit_status != 0) return process_exit.request(exit_status);
+}
+
+pub fn runKillCommand(
+    allocator: std.mem.Allocator,
+    kill: mux_cli.Kill,
+) !void {
+    if (kill.common.capture_tty_transcript != null) {
+        try writeCaptureTranscriptUnsupported();
+        return process_exit.request(64);
+    }
+
+    if (kill.all) {
+        return runtime_commands.runKillCommand(allocator, .{
+            .format = if (kill.jsonl) .jsonl else .text,
+            .all = true,
+        });
+    }
+
+    var kill_refs: ?LocalKillRefs = null;
+    defer if (kill_refs) |*refs| refs.deinit(allocator);
+    if (kill.request_jsons.len == 0) {
+        kill_refs = resolveLocalKillRefs(allocator, kill) catch |err| switch (err) {
+            error.MissingCurrentSession, error.MissingKillTarget => {
+                try writeLocalArgError(err);
+                return process_exit.request(64);
+            },
+            else => return err,
+        };
+    }
+    return runLocalKillCommand(allocator, kill, if (kill_refs) |refs| refs.refs else &.{});
+}
+
+fn writeCaptureTranscriptUnsupported() !void {
+    try io.writeAll(2, "sessh: --capture-tty-transcript is only supported for new and attach sessions\n");
 }
 
 fn writeLocalArgError(err: anyerror) !void {
@@ -102,9 +115,18 @@ const LocalKillRefs = struct {
     }
 };
 
-fn resolveLocalKillRefs(allocator: std.mem.Allocator, parsed: anytype) !LocalKillRefs {
-    if (parsed.kill_ids.len > 0) return .{ .refs = parsed.kill_ids };
-    if (parsed.kill_current) {
+fn resolveLocalKillRefs(allocator: std.mem.Allocator, kill: mux_cli.Kill) !LocalKillRefs {
+    const ids = switch (kill.command_target) {
+        .route_ref_or_local_id => |ref| {
+            const refs = try allocator.alloc([]const u8, 1);
+            refs[0] = ref;
+            return .{ .refs = refs, .owned_refs = refs };
+        },
+        .local => kill.ids,
+        .host => unreachable,
+    };
+    if (ids.len > 0) return .{ .refs = ids };
+    if (kill.current) {
         const current = resolveClientSessionRef(allocator, null) catch |err| switch (err) {
             error.MissingSessionRef => return error.MissingCurrentSession,
             else => return err,
@@ -127,7 +149,7 @@ fn clientListSelector(target: []const u8) runtime_commands.ClientListSelector {
 
 fn runLocalKillCommand(
     allocator: std.mem.Allocator,
-    parsed: anytype,
+    kill: mux_cli.Kill,
     targets: []const []const u8,
 ) !void {
     var requests: std.ArrayList(runtime_commands.KillRequest) = .empty;
@@ -135,29 +157,69 @@ fn runLocalKillCommand(
         for (requests.items) |*request| request.deinit(allocator);
         requests.deinit(allocator);
     }
-    for (parsed.kill_request_jsons) |request_json| {
+    for (kill.request_jsons) |request_json| {
         try requests.append(allocator, try runtime_commands.parseKillRequestJson(allocator, request_json));
     }
     return runtime_commands.runKillCommand(allocator, .{
-        .format = if (parsed.kill_jsonl) .jsonl else .text,
+        .format = if (kill.jsonl) .jsonl else .text,
         .targets = targets,
         .requests = requests.items,
     });
 }
 
-fn runLocalClientControlCommand(
+pub const ClientControlKind = enum {
+    detach,
+    repaint,
+    debug_sever_connection,
+    debug_unresponsive_connection,
+};
+
+fn runLocalClientControlCommandOrExit(
     allocator: std.mem.Allocator,
-    parsed: anytype,
+    kind: ClientControlKind,
+    control: mux_cli.ClientControl,
 ) !void {
-    const session_ref = try resolveClientControlSessionRef(allocator, parsed.client_session_ref, parsed.client_guid);
-    defer if (session_ref) |ref| allocator.free(ref);
-    return runtime_commands.runClientControlCommand(allocator, clientControlCommand(parsed, session_ref));
+    runLocalClientControlCommand(allocator, kind, control) catch |err| switch (err) {
+        error.MissingSessionRef => {
+            try io.writeAll(2, "sessh: client command requires an ID outside a sessh session\n");
+            return process_exit.request(64);
+        },
+        error.AmbiguousClientId => {
+            try io.writeAll(2, "sessh: client id is ambiguous\n");
+            return process_exit.request(1);
+        },
+        error.InvalidClientId => {
+            try io.writeAll(2, "sessh: invalid client id\n");
+            return process_exit.request(64);
+        },
+        else => return err,
+    };
 }
 
-fn clientControlCommand(parsed: anytype, session_ref: ?[]const u8) runtime_commands.ClientControlCommand {
+fn runLocalClientControlCommand(
+    allocator: std.mem.Allocator,
+    kind: ClientControlKind,
+    control: mux_cli.ClientControl,
+) !void {
+    if (control.common.capture_tty_transcript != null) {
+        try writeCaptureTranscriptUnsupported();
+        return process_exit.request(64);
+    }
+
+    const session_ref = try resolveClientControlSessionRef(allocator, control.session_ref, control.client_guid);
+    defer if (session_ref) |ref| allocator.free(ref);
+    return runtime_commands.runClientControlCommand(allocator, clientControlCommand(kind, control, session_ref));
+}
+
+fn clientControlCommand(
+    kind: ClientControlKind,
+    control: mux_cli.ClientControl,
+    session_ref: ?[]const u8,
+) runtime_commands.ClientControlCommand {
+    const target_kind = mux_cli.clientControlTarget(control);
     const target = runtime_commands.ClientControlTarget{
-        .kind = switch (parsed.client_target) {
-            .default => if (parsed.action == .repaint_client)
+        .kind = switch (target_kind) {
+            .default => if (kind == .repaint)
                 .TE_CLIENT_CONTROL_TARGET_KIND_ALL
             else
                 .TE_CLIENT_CONTROL_TARGET_KIND_DEFAULT,
@@ -165,33 +227,30 @@ fn clientControlCommand(parsed: anytype, session_ref: ?[]const u8) runtime_comma
             .last_input => .TE_CLIENT_CONTROL_TARGET_KIND_LAST_INPUT,
             .client_guid => .TE_CLIENT_CONTROL_TARGET_KIND_CLIENT_GUID,
         },
-        .client_guid = if (parsed.client_target == .client_guid) parsed.client_guid.? else "",
+        .client_guid = if (target_kind == .client_guid) control.client_guid.? else "",
     };
-    return switch (parsed.action) {
-        .detach_client => .{ .detach = .{
+    return switch (kind) {
+        .detach => .{ .detach = .{
             .session_ref = session_ref,
             .target = target,
         } },
-        .repaint_client => .{ .repaint = .{
+        .repaint => .{ .repaint = .{
             .session_ref = session_ref,
             .target = target,
-            .include_scrollback = parsed.client_repaint_scrollback,
+            .include_scrollback = control.scrollback,
         } },
-        .debug_client => switch (parsed.debug_client_action.?) {
-            .sever_connection => .{ .debug_sever_connection = .{
-                .session_ref = session_ref,
-                .target = target,
-            } },
-            .unresponsive_connection => .{ .debug_unresponsive_connection = .{
-                .session_ref = session_ref,
-                .target = target,
-                .seconds = if (parsed.debug_unresponsive_seconds) |seconds|
-                    std.fmt.parseInt(u32, seconds, 10) catch unreachable
-                else
-                    config.default_debug_unresponsive_seconds,
-            } },
-        },
-        else => unreachable,
+        .debug_sever_connection => .{ .debug_sever_connection = .{
+            .session_ref = session_ref,
+            .target = target,
+        } },
+        .debug_unresponsive_connection => .{ .debug_unresponsive_connection = .{
+            .session_ref = session_ref,
+            .target = target,
+            .seconds = if (control.seconds) |seconds|
+                std.fmt.parseInt(u32, seconds, 10) catch unreachable
+            else
+                config.default_debug_unresponsive_seconds,
+        } },
     };
 }
 

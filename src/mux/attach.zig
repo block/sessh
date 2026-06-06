@@ -1,9 +1,6 @@
 const std = @import("std");
 
 const mux_cli = @import("cli.zig");
-const mux_common = @import("common.zig");
-const session_registry = @import("../runtime/session_registry.zig");
-const ssh_client = @import("../transport/ssh.zig");
 
 pub fn parse(scratch: *mux_cli.Scratch, args: []const []const u8) !mux_cli.Attach {
     var parsed = mux_cli.CommandParts{};
@@ -42,34 +39,6 @@ pub fn appendRemoteArgs(allocator: std.mem.Allocator, out: *std.ArrayList([]cons
         .latest, .local, .host => {},
     }
     try mux_cli.appendRemoteCommonArgs(allocator, out, attach.common);
-}
-
-pub fn toInvocation(
-    allocator: std.mem.Allocator,
-    attach: mux_cli.Attach,
-    route_storage: *?session_registry.Route,
-) !ssh_client.SessionInvocation {
-    var parsed = try mux_common.baseInvocation(attach.ssh_options, .attach, attach.common);
-    switch (attach.target) {
-        .latest => {
-            route_storage.* = (try session_registry.readLatestDetachedRouteNotAttachedByThisMachine(allocator)) orelse return parsed;
-            mux_common.fillFromRoute(.attach, &parsed, route_storage.*.?);
-            parsed.attach_id_from_latest_route = true;
-        },
-        .local => {
-            parsed.host = ".";
-            parsed.attach_id = attach.id;
-        },
-        .host => |host| {
-            parsed.host = host;
-            parsed.attach_id = attach.id;
-        },
-        .route_ref => |ref| {
-            try mux_common.readRouteForRef(allocator, route_storage, ref);
-            mux_common.fillFromRoute(.attach, &parsed, route_storage.*.?);
-        },
-    }
-    return parsed;
 }
 
 test "parse keeps target inside attach command" {

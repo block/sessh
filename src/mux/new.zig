@@ -1,8 +1,6 @@
 const std = @import("std");
 
 const mux_cli = @import("cli.zig");
-const mux_common = @import("common.zig");
-const ssh_client = @import("../transport/ssh.zig");
 
 pub fn parse(scratch: *mux_cli.Scratch, args: []const []const u8) !mux_cli.New {
     var ssh_options: std.ArrayList([]const u8) = .empty;
@@ -76,21 +74,6 @@ pub fn appendRemoteArgs(allocator: std.mem.Allocator, out: *std.ArrayList([]cons
         try out.append(allocator, "--");
         try out.appendSlice(allocator, new.command_argv);
     }
-}
-
-pub fn toInvocation(new: mux_cli.New) !ssh_client.SessionInvocation {
-    var parsed = try mux_common.baseInvocation(new.ssh_options, .new, new.common);
-    parsed.host = switch (new.target) {
-        .local => ".",
-        .host => |host| host,
-    };
-    parsed.new_detached = new.detached;
-    if (new.eval_args) {
-        parsed.shell_command_args = new.command_argv;
-    } else {
-        parsed.command_argv = new.command_argv;
-    }
-    return parsed;
 }
 
 test "parse accepts explicit host option" {

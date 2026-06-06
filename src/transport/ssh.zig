@@ -1,277 +1,73 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
 const attached_client = @import("../session/attached_client.zig");
+const transport_bootstrap = @import("bootstrap.zig");
 const client_config = @import("../session/client_config.zig");
 const client_log = @import("../core/client_log.zig");
 const client_ui = @import("../session/client_ui.zig");
+const mux_cli = @import("../mux/cli.zig");
+const mux_parser = @import("../mux/parser.zig");
 const mux_routed = @import("../mux/routed.zig");
 const proxy_control = @import("../stream/proxy_control.zig");
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
 const protocol = @import("../protocol/mod.zig");
-const pty_process = @import("../tty/pty_process.zig");
+const mux_sessh = @import("../mux/sessh.zig");
 const reconnect = @import("../reconnect/mod.zig");
-const reconnect_control = @import("../reconnect/control.zig");
-const reconnect_title = @import("../reconnect/title.zig");
+const plain_ssh = @import("plain_ssh.zig");
+const remote_shell = @import("remote_shell.zig");
 const runtime_remote_command = @import("../runtime/remote_command.zig");
 const route_commands = @import("../runtime/route_commands.zig");
 const session_attach = @import("../session/attach.zig");
 const session_new = @import("../session/new.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 const socket_transport = @import("socket.zig");
+const ssh_opts = @import("ssh_options.zig");
 const stream_agent = @import("../stream/agent.zig");
-const terminal = @import("../tty/terminal.zig");
-const tty_settings = @import("../tty/settings.zig");
 const tty_transcript = @import("../tty/transcript.zig");
 const pb = protocol.pb;
 
-const bootstrapper_script = @embedFile("../bootstrapper.sh");
-const max_artifact_bytes = 64 * 1024 * 1024;
-const max_artifact_manifest_bytes = 16 * 1024;
-const artifact_manifest_filename = "artifacts.manifest";
-const default_ipqos_option_prefix = "-oIPQoS=";
-const ssh_config_query_max_output_bytes = 256 * 1024;
+pub const SshTtyRequest = ssh_opts.SshTtyRequest;
+pub const ResolvedSshConfig = ssh_opts.ResolvedSshConfig;
+pub const classifySshOptions = ssh_opts.classifySshOptions;
+pub const resolveSshConfig = ssh_opts.resolveSshConfig;
+
+const appendTransportSshOptions = ssh_opts.appendTransportSshOptions;
+const isProxyRequiredSshFlag = ssh_opts.isProxyRequiredSshFlag;
+const isProxyRequiredSshOptionWithValue = ssh_opts.isProxyRequiredSshOptionWithValue;
+const isSshTtyRequestOption = ssh_opts.isSshTtyRequestOption;
+const isUnsafeSshOptionWithValue = ssh_opts.isUnsafeSshOptionWithValue;
+const sshConfigKey = ssh_opts.sshConfigKey;
+const sshConfigKeyIs = ssh_opts.sshConfigKeyIs;
+const sshConfigOptionRequiresProxy = ssh_opts.sshConfigOptionRequiresProxy;
+const sshConfigValueIs = ssh_opts.sshConfigValueIs;
+const sshOptionRequiresValue = ssh_opts.sshOptionRequiresValue;
+const sshOptionSeparateValueIndex = ssh_opts.sshOptionSeparateValueIndex;
+const transportSshOptionsLen = ssh_opts.transportSshOptionsLen;
+
+const BootstrapEntrypoint = remote_shell.Entrypoint;
+const bootstrapCommand = remote_shell.bootstrapCommand;
+const directControlCommand = remote_shell.directControlCommand;
+const directMuxCommand = remote_shell.directMuxCommand;
+const directSessionBrokerCommand = remote_shell.directSessionBrokerCommand;
+const isPlainShellArg = remote_shell.isPlainShellArg;
+const joinRemoteShellCommandArgs = remote_shell.joinRemoteShellCommandArgs;
+const shellCommandFromRemoteArgs = remote_shell.shellCommandFromRemoteArgs;
+const shellQuote = remote_shell.shellQuote;
+const shCommand = remote_shell.shCommand;
+
 const client_list_target_help = "incoming, outgoing, session, or a guid";
-const bootstrap_exec_encoded_arg_prefix = "b64:";
 
-const BootstrapEntrypoint = enum {
-    session_broker,
-    stream_broker,
-    control,
-
-    fn arg(self: BootstrapEntrypoint) []const u8 {
-        return switch (self) {
-            .session_broker => ":internal-session-broker:",
-            .stream_broker => ":internal-stream-broker:",
-            .control => ":internal-control:",
-        };
-    }
-};
-
-pub const SshTtyRequest = enum {
-    none,
-    requested,
-    forced,
-};
-
-const ArtifactSet = struct {
-    allocator: std.mem.Allocator,
-    artifact_set_id: []u8,
-    entries: []ArtifactEntry,
-
-    fn deinit(self: *ArtifactSet) void {
-        self.allocator.free(self.artifact_set_id);
-        for (self.entries) |*entry| entry.deinit(self.allocator);
-        self.allocator.free(self.entries);
-        self.* = undefined;
-    }
-
-    fn sendExec(
-        self: *const ArtifactSet,
-        fd: c.fd_t,
-        entrypoint: BootstrapEntrypoint,
-        entrypoint_args: []const []const u8,
-        reconnect_ui: ?*client_ui.ReconnectUi,
-        poll_reconnect_input: bool,
-    ) !void {
-        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_ui, poll_reconnect_input);
-        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_ui, poll_reconnect_input);
-        for (self.entries) |entry| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_ui, poll_reconnect_input);
-        }
-        try writeAllMaybeCancellable(fd, " --", reconnect_ui, poll_reconnect_input);
-        try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-        try writeAllMaybeCancellable(fd, entrypoint.arg(), reconnect_ui, poll_reconnect_input);
-        for (entrypoint_args) |arg| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-            try self.writeExecArg(fd, arg, reconnect_ui, poll_reconnect_input);
-        }
-        try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
-    }
-
-    fn sendExecArgs(
-        self: *const ArtifactSet,
-        fd: c.fd_t,
-        exec_args: []const []const u8,
-        reconnect_ui: ?*client_ui.ReconnectUi,
-        poll_reconnect_input: bool,
-    ) !void {
-        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_ui, poll_reconnect_input);
-        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_ui, poll_reconnect_input);
-        for (self.entries) |entry| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_ui, poll_reconnect_input);
-        }
-        try writeAllMaybeCancellable(fd, " --", reconnect_ui, poll_reconnect_input);
-        for (exec_args) |arg| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-            try self.writeExecArg(fd, arg, reconnect_ui, poll_reconnect_input);
-        }
-        try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
-    }
-
-    fn writeExecArg(
-        self: *const ArtifactSet,
-        fd: c.fd_t,
-        arg: []const u8,
-        reconnect_ui: ?*client_ui.ReconnectUi,
-        poll_reconnect_input: bool,
-    ) !void {
-        if (!needsEncodedExecArg(arg)) {
-            try writeAllMaybeCancellable(fd, arg, reconnect_ui, poll_reconnect_input);
-            return;
-        }
-
-        const encoded = try self.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(arg.len));
-        defer self.allocator.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, arg);
-        try writeAllMaybeCancellable(fd, bootstrap_exec_encoded_arg_prefix, reconnect_ui, poll_reconnect_input);
-        try writeAllMaybeCancellable(fd, encoded, reconnect_ui, poll_reconnect_input);
-    }
-
-    fn find(self: *const ArtifactSet, platform: Platform) ?*const ArtifactEntry {
-        for (self.entries) |*entry| {
-            if (platformsEqual(entry.platform(), platform)) return entry;
-        }
-        return null;
-    }
-};
-
-const ArtifactEntry = struct {
-    id: []u8,
-    os: []u8,
-    arch: []u8,
-    path: []u8,
-    hash_hex: [64]u8,
-
-    fn deinit(self: *ArtifactEntry, allocator: std.mem.Allocator) void {
-        allocator.free(self.id);
-        allocator.free(self.os);
-        allocator.free(self.arch);
-        allocator.free(self.path);
-        self.* = undefined;
-    }
-
-    fn platform(self: *const ArtifactEntry) Platform {
-        return .{ .os = self.os, .arch = self.arch };
-    }
-};
-
-const Platform = struct {
-    os: []const u8,
-    arch: []const u8,
-};
-
-const PackagedArtifactTarget = struct {
-    os: []const u8,
-    arch: []const u8,
-    filename: []const u8,
-};
-
-const packaged_artifact_targets = [_]PackagedArtifactTarget{
-    .{ .os = "macos", .arch = "aarch64", .filename = "sesshmux-macos-aarch64" },
-    .{ .os = "macos", .arch = "x86_64", .filename = "sesshmux-macos-x86_64" },
-    .{ .os = "linux", .arch = "arm32", .filename = "sesshmux-linux-arm32" },
-    .{ .os = "linux", .arch = "aarch64", .filename = "sesshmux-linux-aarch64" },
-    .{ .os = "linux", .arch = "x86_64", .filename = "sesshmux-linux-x86_64" },
-    .{ .os = "linux", .arch = "x86", .filename = "sesshmux-linux-x86" },
-    .{ .os = "linux", .arch = "riscv64", .filename = "sesshmux-linux-riscv64" },
-};
-
-pub const SessionAction = enum {
-    new,
-    attach,
-    list,
-    kill,
-    kill_all,
-    detach_client,
-    repaint_client,
-    debug_client,
-};
-
-pub const SessionInvocation = struct {
-    options: []const []const u8,
-    owned_options: ?[][]const u8 = null,
-    host: []const u8,
-    action: SessionAction = .new,
-    attach_id: ?[]const u8 = null,
-    attach_id_from_latest_route: bool = false,
-    attach_session_dir: []const u8 = "",
-    kill_id: ?[]const u8 = null,
-    kill_ids: []const []const u8 = &.{},
-    kill_current: bool = false,
-    kill_jsonl: bool = false,
-    kill_request_jsons: []const []const u8 = &.{},
-    owned_kill_request_jsons: ?[][]const u8 = null,
-    list_refresh: bool = false,
-    list_include_cached_routes: bool = true,
-    list_jsonl: bool = false,
-    list_exited: bool = false,
-    list_all: bool = false,
-    list_client_target: ?[]const u8 = null,
-    list_client_option_arg: ?[]const u8 = null,
-    client_session_ref: ?[]const u8 = null,
-    client_target: ClientTarget = .default,
-    client_guid: ?[]const u8 = null,
-    client_repaint_scrollback: bool = false,
-    debug_client_action: ?DebugClientAction = null,
-    debug_unresponsive_seconds: ?[]const u8 = null,
-    new_detached: bool = false,
-    command_argv: []const []const u8 = &.{},
-    shell_command_args: []const []const u8 = &.{},
-    tty_request: SshTtyRequest = .none,
-    overlay_args: client_ui.DetachOverlayArgs = .{},
-    scrollback_row_count: u32 = config.default_scrollback_row_count,
-    scrollback_row_count_set: bool = false,
-    initial_scrollback_row_count: ?u32 = null,
-    initial_scrollback_row_count_set: bool = false,
-    client_log_level: client_log.Level = .warn,
-    client_log_level_set: bool = false,
-    bootstrap: bool = true,
-    bootstrap_set: bool = false,
-    terminal_emulator: bool = true,
-    terminal_emulator_set: bool = false,
-    filter_level: config.FilterLevel = config.default_filter_level,
-    filter_level_set: bool = false,
-    reap_ms: u64 = config.default_reap_ms,
-    tombstone_retention_ms: u64 = config.default_tombstone_retention_ms,
-    proxy_required: bool = false,
-    default_ipqos_option: ?[]const u8 = null,
-    resolved_host: []const u8 = "",
-    resolved_port: []const u8 = session_registry.default_pending_port,
-    capture_tty_transcript: ?[]const u8 = null,
-    remote_local_args: []const []const u8 = &.{},
-
-    pub fn deinit(self: *SessionInvocation, allocator: std.mem.Allocator) void {
-        if (self.owned_options) |options| {
-            allocator.free(options);
-            self.owned_options = null;
-            self.options = &.{};
-        }
-        if (self.owned_kill_request_jsons) |requests| {
-            allocator.free(requests);
-            self.owned_kill_request_jsons = null;
-            self.kill_request_jsons = &.{};
-        }
-    }
-};
-
-pub const ClientTarget = enum {
-    default,
-    all,
-    last_input,
-    client_guid,
-};
-
-pub const DebugClientAction = enum {
-    sever_connection,
-    unresponsive_connection,
-};
+const ArtifactSet = transport_bootstrap.ArtifactSet;
+const Platform = transport_bootstrap.Platform;
+const artifactFilenameForPlatform = transport_bootstrap.artifactFilenameForPlatform;
+const loadArtifactSet = transport_bootstrap.loadArtifactSet;
+const parseMissingPlatform = transport_bootstrap.parseMissingPlatform;
+const readBootstrapLine = transport_bootstrap.readBootstrapLine;
+const sendUpload = transport_bootstrap.sendUpload;
 
 pub const CompatModeReason = enum {
     version_mismatch,
@@ -282,6 +78,64 @@ pub const CompatTransport = struct {
     options: []const []const u8,
     host: []const u8,
     default_ipqos_option: ?[]const u8 = null,
+};
+
+const SshTarget = struct {
+    options: []const []const u8,
+    host: []const u8,
+    default_ipqos_option: ?[]const u8 = null,
+    resolved_host: []const u8 = "",
+    resolved_port: []const u8 = session_registry.default_pending_port,
+};
+
+const ResolvedSshTarget = struct {
+    target: SshTarget,
+    config: ResolvedSshConfig,
+    default_ipqos_option: ?[]const u8 = null,
+
+    fn deinit(self: *ResolvedSshTarget, allocator: std.mem.Allocator) void {
+        if (self.default_ipqos_option) |option| allocator.free(option);
+        self.config.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const SessionRuntimeConfig = struct {
+    common: mux_cli.CommonSessionOptions,
+    reap_ms: u64 = config.default_reap_ms,
+    tombstone_retention_ms: u64 = config.default_tombstone_retention_ms,
+};
+
+const RemoteNewSession = struct {
+    detached: bool = false,
+    command_argv: []const []const u8 = &.{},
+    shell_command_args: []const []const u8 = &.{},
+    tty_request: SshTtyRequest = .none,
+    proxy_required: bool = false,
+};
+
+const RemoteAttachSession = struct {
+    session_ref: ?[]const u8,
+    session_dir: []const u8 = "",
+};
+
+const RemoteSessionFlow = union(enum) {
+    new: RemoteNewSession,
+    attach: RemoteAttachSession,
+};
+
+const RemoteMuxKind = enum {
+    list,
+    kill,
+    kill_all,
+    detach_client,
+    repaint_client,
+    debug_client,
+};
+
+const BootstrapFailurePolicy = struct {
+    unsupported_action: []const u8,
+    allow_plain_ssh_fallback: bool = false,
 };
 
 const RuntimeConnection = struct {
@@ -405,17 +259,8 @@ const RemoteControlRunner = struct {
             self.active = null;
         }
 
-        var parsed = SessionInvocation{
-            .host = host,
-            .options = ssh_options,
-            .bootstrap = self.bootstrap,
-        };
-        var resolved_ssh_config = try resolveSshConfig(self.allocator, parsed.options, parsed.host);
-        defer resolved_ssh_config.deinit(self.allocator);
-        parsed.default_ipqos_option = try resolved_ssh_config.defaultIpQosOption(self.allocator);
-        defer if (parsed.default_ipqos_option) |option| self.allocator.free(option);
-        parsed.resolved_host = resolved_ssh_config.hostname;
-        parsed.resolved_port = resolved_ssh_config.port;
+        var resolved_target = try resolveSshTarget(self.allocator, ssh_options, host);
+        defer resolved_target.deinit(self.allocator);
 
         const remote_command = if (self.bootstrap)
             try bootstrapCommand(self.allocator)
@@ -425,7 +270,7 @@ const RemoteControlRunner = struct {
 
         var connection = try startRuntimeConnection(
             self.allocator,
-            parsed,
+            resolved_target.target,
             if (self.artifacts) |*artifacts| artifacts else null,
             remote_command,
             .control,
@@ -435,6 +280,7 @@ const RemoteControlRunner = struct {
             false,
             .diagnostics,
             null,
+            .{ .unsupported_action = "run a remote control command" },
         );
         errdefer connection.terminate();
         try attached_client.runtimeHandshake(connection.child.stdout.?.handle, connection.child.stdin.?.handle);
@@ -457,6 +303,28 @@ fn remoteControlKey(allocator: std.mem.Allocator, host: []const u8, ssh_options:
         try out.append(allocator, 0);
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn resolveSshTarget(
+    allocator: std.mem.Allocator,
+    options: []const []const u8,
+    host: []const u8,
+) !ResolvedSshTarget {
+    var resolved_config = try resolveSshConfig(allocator, options, host);
+    errdefer resolved_config.deinit(allocator);
+    const default_ipqos_option = try resolved_config.defaultIpQosOption(allocator);
+    errdefer if (default_ipqos_option) |option| allocator.free(option);
+    return .{
+        .target = .{
+            .options = options,
+            .host = host,
+            .default_ipqos_option = default_ipqos_option,
+            .resolved_host = resolved_config.hostname,
+            .resolved_port = resolved_config.port,
+        },
+        .config = resolved_config,
+        .default_ipqos_option = default_ipqos_option,
+    };
 }
 
 fn sendRunRequest(allocator: std.mem.Allocator, fd: c.fd_t, request_id: u64, argv: []const []const u8) !void {
@@ -517,11 +385,12 @@ const ParallelReconnectResult = reconnect.AsyncResult(RuntimeConnection);
 
 const ParallelReconnectState = struct {
     task: reconnect.AsyncTask(RuntimeConnection) = .{},
-    parsed_ssh_args: SessionInvocation,
+    target: SshTarget,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
     reconnect_ui: *client_ui.ReconnectUi,
     session: attached_client.RuntimeSession,
+    failure_policy: BootstrapFailurePolicy,
 
     fn store(self: *ParallelReconnectState, result: ParallelReconnectResult) void {
         self.task.store(result);
@@ -608,17 +477,6 @@ fn stderrPumpMain(state: *SshStderrPump.State) void {
     }
 }
 
-pub fn classifySshOptions(
-    options: []const []const u8,
-    tty_request: *SshTtyRequest,
-    proxy_required: *bool,
-) !void {
-    var i: usize = 0;
-    while (i < options.len) {
-        try consumeSshOption(options, &i, tty_request, proxy_required);
-    }
-}
-
 /// Start the ssh transport by running the bootstrapper as the remote command.
 ///
 /// The bootstrapper installs or finds the remote sesshmux binary, then execs
@@ -631,210 +489,757 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     return runWithParseOptions(allocator, args);
 }
 
-const CliParseOptions = struct {};
-
 fn runWithParseOptions(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    var route_storage: ?session_registry.Route = null;
-    defer if (route_storage) |*route| route.deinit(allocator);
-
-    var parsed_ssh_args = parseSshArgs(allocator, args, .{}) catch |err| {
+    var scratch = mux_cli.Scratch{ .allocator = allocator };
+    defer scratch.deinit();
+    const parsed_sessh = mux_sessh.parse(&scratch, args) catch |err| {
         try printSshArgError(err);
         return process_exit.request(64);
     };
-    defer parsed_ssh_args.deinit(allocator);
-    return runInvocation(allocator, args, &parsed_ssh_args, &route_storage, false);
-}
-
-pub fn runInvocation(
-    allocator: std.mem.Allocator,
-    args: []const []const u8,
-    parsed_ssh_args: *SessionInvocation,
-    route_storage: *?session_registry.Route,
-    mux_command_mode: bool,
-) !void {
-    if (!mux_command_mode and
-        parsed_ssh_args.action == .new and
-        std.mem.eql(u8, parsed_ssh_args.host, "."))
-    {
+    if (std.mem.eql(u8, parsed_sessh.host, ".")) {
         try io.writeAll(2, "sessh: \".\" is not a valid ssh host\n");
         return process_exit.request(64);
     }
-    if (mux_command_mode and
-        parsed_ssh_args.action == .new and
-        std.mem.eql(u8, parsed_ssh_args.host, "."))
-    {
-        applyFileConfigToLocalMux(allocator, parsed_ssh_args) catch |err| {
-            try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
-            return process_exit.request(64);
-        };
-        client_log.setLevel(parsed_ssh_args.client_log_level);
-        if (parsed_ssh_args.terminal_emulator_set and !parsed_ssh_args.terminal_emulator) {
-            try io.writeAll(2, "sesshmux: new . requires terminal-emulator mode\n");
-            return process_exit.request(64);
-        }
-        if (parsed_ssh_args.filter_level_set and filterLevelForcesProxy(parsed_ssh_args.filter_level)) {
-            try io.writeAll(2, "sesshmux: new . does not support proxy stream filter levels\n");
-            return process_exit.request(64);
-        }
-        const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
-        defer if (shell_command) |command| allocator.free(command);
-        return session_new.runLocal(allocator, .{
-            .exe = args[0],
-            .new_detached = parsed_ssh_args.new_detached,
-            .scrollback_row_count = parsed_ssh_args.scrollback_row_count,
-            .overlay_args = parsed_ssh_args.overlay_args.slice(),
-            .capture_tty_transcript = parsed_ssh_args.capture_tty_transcript,
-            .command_argv = parsed_ssh_args.command_argv,
-            .shell_command = shell_command,
-            .reap_ms = parsed_ssh_args.reap_ms,
-            .tombstone_retention_ms = parsed_ssh_args.tombstone_retention_ms,
-        });
+    return runRemoteSession(
+        allocator,
+        args[0],
+        parsed_sessh.ssh_options,
+        parsed_sessh.host,
+        parsed_sessh.common,
+        .{ .new = .{
+            .shell_command_args = parsed_sessh.command_args,
+            .tty_request = parsed_sessh.tty_request,
+            .proxy_required = parsed_sessh.proxy_required,
+        } },
+        null,
+        .{
+            .unsupported_action = "start a persistent sessh session",
+            .allow_plain_ssh_fallback = parsed_sessh.command_args.len == 0,
+        },
+    );
+}
+
+pub fn runMuxCommand(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    command: mux_cli.Command,
+) !void {
+    switch (command) {
+        .new => |new| switch (new.target) {
+            .local => return runLocalMuxNewCommand(allocator, args[0], new),
+            .host => return runRemoteMuxNewCommand(allocator, args[0], new),
+        },
+        .attach => |attach| switch (attach.target) {
+            .local => return runLocalMuxAttachCommand(allocator, args[0], attach),
+            .latest, .host, .route_ref => return runMuxAttachCommand(allocator, args[0], attach),
+        },
+        .list, .kill, .detach, .repaint, .debug => {},
     }
-    if ((parsed_ssh_args.action == .attach or isRemoteMuxCommandAction(parsed_ssh_args.action)) and
-        (parsed_ssh_args.host.len == 0 or std.mem.eql(u8, parsed_ssh_args.host, ".")))
-    {
-        applyFileConfigToLocalMux(allocator, parsed_ssh_args) catch |err| {
-            try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
-            return process_exit.request(64);
-        };
-        client_log.setLevel(parsed_ssh_args.client_log_level);
-        if (parsed_ssh_args.action == .attach) return session_attach.runLocal(allocator, .{
-            .exe = args[0],
-            .session_ref = parsed_ssh_args.attach_id,
-            .session_dir = parsed_ssh_args.attach_session_dir,
-            .initial_scrollback_row_count = parsed_ssh_args.initial_scrollback_row_count,
-            .overlay_args = parsed_ssh_args.overlay_args.slice(),
-            .capture_tty_transcript = parsed_ssh_args.capture_tty_transcript,
-            .compat_mode = compatModeFromEnv(),
-        });
-        if (parsed_ssh_args.action == .list and parsed_ssh_args.list_client_target == null) {
-            var remote_control_runner: ?RemoteControlRunner = if (parsed_ssh_args.list_refresh and parsed_ssh_args.list_include_cached_routes)
-                try RemoteControlRunner.init(allocator)
-            else
-                null;
-            defer if (remote_control_runner) |*runner| runner.deinit();
-            var remote_runner_interface: ?runtime_remote_command.Runner = if (remote_control_runner) |*runner|
-                runner.interface()
-            else
-                null;
-            const exit_status = try route_commands.runLocalListCommand(
-                allocator,
-                args[0],
-                parsed_ssh_args.list_refresh,
-                parsed_ssh_args.list_include_cached_routes,
-                parsed_ssh_args.list_jsonl,
-                parsed_ssh_args.list_exited,
-                parsed_ssh_args.list_all,
-                if (remote_runner_interface) |*runner| runner else null,
-            );
-            if (exit_status != 0) return process_exit.request(exit_status);
-            return;
-        }
-        return mux_routed.runInvocation(allocator, args[0], parsed_ssh_args.*);
+
+    if (!muxCommandNeedsTransportBridge(command)) {
+        return runLocalOrRoutedMuxCommand(allocator, args[0], command);
     }
-    applyFileConfigToSsh(allocator, parsed_ssh_args) catch |err| {
-        try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
-        return process_exit.request(64);
+
+    return runRemoteMuxCommand(allocator, args[0], command);
+}
+
+fn runRemoteMuxNewCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    new: mux_cli.New,
+) !void {
+    var tty_request: SshTtyRequest = .none;
+    var proxy_required = false;
+    try classifySshOptions(new.ssh_options, &tty_request, &proxy_required);
+    const host = switch (new.target) {
+        .host => |host| host,
+        .local => unreachable,
     };
-    client_log.setLevel(parsed_ssh_args.client_log_level);
-    if (parsed_ssh_args.new_detached) {
-        if (parsed_ssh_args.capture_tty_transcript != null) {
-            try io.writeAll(2, "sesshmux: new --detached does not support --capture-tty-transcript\n");
-            return process_exit.request(64);
-        }
-        if (!parsed_ssh_args.terminal_emulator) {
-            try io.writeAll(2, "sesshmux: new --detached requires terminal-emulator mode\n");
-            return process_exit.request(64);
-        }
-        if (filterLevelForcesProxy(parsed_ssh_args.filter_level) or parsed_ssh_args.proxy_required) {
-            try io.writeAll(2, "sesshmux: new --detached does not support proxy stream mode\n");
-            return process_exit.request(64);
-        }
+    return runRemoteSession(
+        allocator,
+        exe,
+        new.ssh_options,
+        host,
+        new.common,
+        .{ .new = .{
+            .detached = new.detached,
+            .command_argv = if (new.eval_args) &.{} else new.command_argv,
+            .shell_command_args = if (new.eval_args) new.command_argv else &.{},
+            .tty_request = tty_request,
+            .proxy_required = proxy_required,
+        } },
+        null,
+        .{
+            .unsupported_action = "start a persistent sessh session",
+            .allow_plain_ssh_fallback = !new.detached and new.command_argv.len == 0,
+        },
+    );
+}
+
+fn runMuxAttachCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    attach: mux_cli.Attach,
+) !void {
+    switch (attach.target) {
+        .latest => {
+            var route = (try session_registry.readLatestDetachedRouteNotAttachedByThisMachine(allocator)) orelse {
+                return runLocalMuxAttachCommand(allocator, exe, attach);
+            };
+            defer route.deinit(allocator);
+            return runAttachRoute(allocator, exe, attach.common, &route);
+        },
+        .host => |host| return runRemoteAttach(
+            allocator,
+            exe,
+            attach.ssh_options,
+            host,
+            attach.common,
+            .{ .session_ref = attach.id },
+            null,
+        ),
+        .route_ref => |ref| {
+            var route = session_registry.readRouteForRef(allocator, ref) catch |err| switch (err) {
+                error.FileNotFound => {
+                    if (session_registry.tombstoneExistsForRef(allocator, ref)) {
+                        try printSshArgError(error.SessionAlreadyExited);
+                    } else {
+                        try printSshArgError(err);
+                    }
+                    return process_exit.request(64);
+                },
+                else => {
+                    try printSshArgError(err);
+                    return process_exit.request(64);
+                },
+            };
+            defer route.deinit(allocator);
+            return runAttachRoute(allocator, exe, attach.common, &route);
+        },
+        .local => unreachable,
     }
-    if (parsed_ssh_args.action != .new and (filterLevelForcesProxy(parsed_ssh_args.filter_level) or parsed_ssh_args.proxy_required)) {
+}
+
+fn runAttachRoute(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    common: mux_cli.CommonSessionOptions,
+    route: *const session_registry.Route,
+) !void {
+    if (route.host.len == 0 or std.mem.eql(u8, route.host, ".")) {
+        return runLocalAttachResolved(
+            allocator,
+            exe,
+            common,
+            route.ssh_options,
+            route.guid,
+            route.session_dir,
+        );
+    }
+    return runRemoteAttach(
+        allocator,
+        exe,
+        route.ssh_options,
+        route.host,
+        common,
+        .{
+            .session_ref = route.guid,
+            .session_dir = route.session_dir,
+        },
+        route,
+    );
+}
+
+fn runRemoteAttach(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    ssh_options: []const []const u8,
+    host: []const u8,
+    common: mux_cli.CommonSessionOptions,
+    attach: RemoteAttachSession,
+    route: ?*const session_registry.Route,
+) !void {
+    var tty_request: SshTtyRequest = .none;
+    var proxy_required = false;
+    try classifySshOptions(ssh_options, &tty_request, &proxy_required);
+    if (filterLevelForcesProxy(common.filter_level) or proxy_required) {
         try io.writeAll(2, "sessh: proxy stream mode is only supported for new sessions\n");
         return process_exit.request(64);
     }
-    if (parsed_ssh_args.capture_tty_transcript != null and isRemoteMuxCommandAction(parsed_ssh_args.action)) {
+    return runRemoteSession(
+        allocator,
+        exe,
+        ssh_options,
+        host,
+        common,
+        .{ .attach = attach },
+        route,
+        .{ .unsupported_action = "attach a sessh session" },
+    );
+}
+
+fn runLocalMuxNewCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    new: mux_cli.New,
+) !void {
+    const local_config = localMuxSessionConfig(allocator, new.common, new.ssh_options) catch |err| {
+        try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
+        return process_exit.request(64);
+    };
+    client_log.setLevel(local_config.common.client_log_level);
+    if (local_config.common.terminal_emulator_set and !local_config.common.terminal_emulator) {
+        try io.writeAll(2, "sesshmux: new . requires terminal-emulator mode\n");
+        return process_exit.request(64);
+    }
+    if (local_config.common.filter_level_set and filterLevelForcesProxy(local_config.common.filter_level)) {
+        try io.writeAll(2, "sesshmux: new . does not support proxy stream filter levels\n");
+        return process_exit.request(64);
+    }
+    const shell_command = if (new.eval_args)
+        try shellCommandFromRemoteArgs(allocator, new.command_argv)
+    else
+        null;
+    defer if (shell_command) |command| allocator.free(command);
+    return session_new.runLocal(allocator, .{
+        .exe = exe,
+        .new_detached = new.detached,
+        .scrollback_row_count = local_config.common.scrollback_row_count,
+        .overlay_args = local_config.common.overlay_args.slice(),
+        .capture_tty_transcript = local_config.common.capture_tty_transcript,
+        .command_argv = if (new.eval_args) &.{} else new.command_argv,
+        .shell_command = shell_command,
+        .reap_ms = local_config.reap_ms,
+        .tombstone_retention_ms = local_config.tombstone_retention_ms,
+    });
+}
+
+fn runLocalMuxAttachCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    attach: mux_cli.Attach,
+) !void {
+    return runLocalAttachResolved(allocator, exe, attach.common, attach.ssh_options, attach.id, "");
+}
+
+fn runLocalAttachResolved(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    common: mux_cli.CommonSessionOptions,
+    ssh_options: []const []const u8,
+    session_ref: ?[]const u8,
+    session_dir: []const u8,
+) !void {
+    const local_config = localMuxSessionConfig(allocator, common, ssh_options) catch |err| {
+        try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
+        return process_exit.request(64);
+    };
+    client_log.setLevel(local_config.common.client_log_level);
+    return session_attach.runLocal(allocator, .{
+        .exe = exe,
+        .session_ref = session_ref,
+        .session_dir = session_dir,
+        .initial_scrollback_row_count = local_config.common.initial_scrollback_row_count,
+        .overlay_args = local_config.common.overlay_args.slice(),
+        .capture_tty_transcript = local_config.common.capture_tty_transcript,
+        .compat_mode = compatModeFromEnv(),
+    });
+}
+
+const LocalMuxSessionConfig = struct {
+    common: mux_cli.CommonSessionOptions,
+    reap_ms: u64,
+    tombstone_retention_ms: u64,
+};
+
+fn localMuxSessionConfig(
+    allocator: std.mem.Allocator,
+    common: mux_cli.CommonSessionOptions,
+    ssh_options: []const []const u8,
+) !LocalMuxSessionConfig {
+    var result = LocalMuxSessionConfig{
+        .common = common,
+        .reap_ms = config.default_reap_ms,
+        .tombstone_retention_ms = config.default_tombstone_retention_ms,
+    };
+    const file_config = try client_config.loadFileConfig(allocator);
+    if (!result.common.scrollback_row_count_set) {
+        if (file_config.scrollback_row_count) |count| result.common.scrollback_row_count = count;
+    }
+    if (!result.common.initial_scrollback_row_count_set and file_config.initial_scrollback_row_count_set) {
+        result.common.initial_scrollback_row_count = file_config.initial_scrollback_row_count;
+    }
+    if (file_config.reap_ms) |ms| result.reap_ms = ms;
+    if (file_config.tombstone_retention_ms) |ms| result.tombstone_retention_ms = ms;
+    if (!result.common.client_log_level_set) {
+        if (file_config.client_log_level) |level| {
+            result.common.client_log_level = level;
+        } else {
+            result.common.client_log_level = inferredClientLogLevel(ssh_options);
+        }
+    }
+    return result;
+}
+
+fn remoteSessionConfig(
+    allocator: std.mem.Allocator,
+    common: mux_cli.CommonSessionOptions,
+    ssh_options: []const []const u8,
+) !SessionRuntimeConfig {
+    var result = SessionRuntimeConfig{
+        .common = common,
+    };
+    const file_config = try client_config.loadFileConfig(allocator);
+    if (!result.common.scrollback_row_count_set) {
+        if (file_config.scrollback_row_count) |count| result.common.scrollback_row_count = count;
+    }
+    if (!result.common.initial_scrollback_row_count_set and file_config.initial_scrollback_row_count_set) {
+        result.common.initial_scrollback_row_count = file_config.initial_scrollback_row_count;
+    }
+    if (!result.common.bootstrap_set) {
+        if (file_config.bootstrap) |enabled| result.common.bootstrap = enabled;
+    }
+    if (!result.common.terminal_emulator_set) {
+        if (file_config.terminal_emulator) |enabled| result.common.terminal_emulator = enabled;
+    }
+    if (!result.common.filter_level_set) {
+        if (file_config.filter_level) |level| result.common.filter_level = level;
+    }
+    if (file_config.reap_ms) |ms| result.reap_ms = ms;
+    if (file_config.tombstone_retention_ms) |ms| result.tombstone_retention_ms = ms;
+    if (!result.common.client_log_level_set) {
+        if (file_config.client_log_level) |level| {
+            result.common.client_log_level = level;
+        } else {
+            result.common.client_log_level = inferredClientLogLevel(ssh_options);
+        }
+    }
+    return result;
+}
+
+fn runRemoteMuxCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    command: mux_cli.Command,
+) !void {
+    var route_storage: ?session_registry.Route = null;
+    defer if (route_storage) |*route| route.deinit(allocator);
+
+    const target = try remoteMuxTarget(allocator, exe, command, &route_storage);
+    if (target == null) return;
+
+    var default_session_ref: ?[]u8 = null;
+    defer if (default_session_ref) |session_ref| allocator.free(session_ref);
+    if (muxCommandNeedsDefaultSessionRef(command)) {
+        default_session_ref = std.process.getEnvVarOwned(allocator, config.session_guid_env) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => {
+                try io.writeAll(2, "sessh: client command requires an ID outside a sessh session\n");
+                return process_exit.request(64);
+            },
+            else => return err,
+        };
+    }
+
+    const remote_control_args = try mux_parser.remoteLocalArgsForCommand(
+        allocator,
+        command,
+        default_session_ref,
+        if (route_storage) |*route| route else null,
+    );
+    defer allocator.free(remote_control_args);
+    if (remote_control_args.len == 0) return error.MissingRemoteLocalArgs;
+    const remote_exec_args = remoteMuxExecArgs(remote_control_args);
+
+    const kind = remoteMuxKind(command);
+    const command_common = muxCommandCommon(command);
+    if (command_common.capture_tty_transcript != null) {
         try io.writeAll(2, "sessh: --capture-tty-transcript is only supported for new and attach sessions\n");
         return process_exit.request(64);
     }
-    const resolved_ref_storage = try resolveLocalRefs(allocator, parsed_ssh_args);
-    defer if (resolved_ref_storage) |ref| allocator.free(ref);
-    var resolved_ssh_config = try resolveSshConfig(allocator, parsed_ssh_args.options, parsed_ssh_args.host);
-    defer resolved_ssh_config.deinit(allocator);
-    parsed_ssh_args.default_ipqos_option = try resolved_ssh_config.defaultIpQosOption(allocator);
-    defer if (parsed_ssh_args.default_ipqos_option) |option| allocator.free(option);
-    parsed_ssh_args.resolved_host = resolved_ssh_config.hostname;
-    parsed_ssh_args.resolved_port = resolved_ssh_config.port;
+    const runtime_config = remoteSessionConfig(allocator, command_common, target.?.options) catch |err| {
+        try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
+        return process_exit.request(64);
+    };
+    client_log.setLevel(runtime_config.common.client_log_level);
 
-    const stdin_is_tty = c.isatty(0) != 0;
-    if (shouldUseProxyStream(parsed_ssh_args.*, stdin_is_tty)) {
-        if (parsed_ssh_args.capture_tty_transcript != null) {
-            try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with proxy stream mode\n");
-            return process_exit.request(64);
-        }
-        try runProxyStreamSsh(allocator, args[0], parsed_ssh_args.*);
+    var resolved_target = try resolveSshTarget(allocator, target.?.options, target.?.host);
+    defer resolved_target.deinit(allocator);
+    if (isClientControlMuxKind(kind)) {
+        return runRemoteMuxClientControlCommand(
+            allocator,
+            resolved_target.target,
+            runtime_config.common.bootstrap,
+            remote_control_args,
+        );
     }
 
-    if (isRemoteClientControlAction(parsed_ssh_args.*)) {
-        return runRemoteMuxClientControlCommand(allocator, parsed_ssh_args.*);
-    }
-
-    const shell_command = try shellCommandFromRemoteArgs(allocator, parsed_ssh_args.shell_command_args);
-    defer if (shell_command) |command| allocator.free(command);
-
-    var artifacts_storage: ?ArtifactSet = if (parsed_ssh_args.bootstrap) try loadArtifactSet(allocator) else null;
+    var artifacts_storage: ?ArtifactSet = if (runtime_config.common.bootstrap) try loadArtifactSet(allocator) else null;
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
     const artifacts = if (artifacts_storage) |*value| value else null;
 
-    const command_args = if (isRemoteMuxCommandAction(parsed_ssh_args.action))
-        parsed_ssh_args.remote_local_args
-    else
-        &.{};
-    if (isRemoteMuxCommandAction(parsed_ssh_args.action) and command_args.len == 0) return error.MissingRemoteLocalArgs;
-    const remote_command = if (parsed_ssh_args.bootstrap)
+    const remote_command = if (runtime_config.common.bootstrap)
         try bootstrapCommand(allocator)
-    else if (isRemoteMuxCommandAction(parsed_ssh_args.action))
-        try directMuxCommand(allocator, command_args)
+    else
+        try directMuxCommand(allocator, remote_exec_args);
+    defer allocator.free(remote_command);
+
+    var command_child = try startRuntimeConnection(
+        allocator,
+        resolved_target.target,
+        artifacts,
+        remote_command,
+        null,
+        remote_exec_args,
+        false,
+        null,
+        false,
+        null,
+        null,
+        .{ .unsupported_action = unsupportedPlatformActionForMux(kind) },
+    );
+    const exit_status = runRemoteMuxCommandAndForward(&command_child) catch |err| {
+        command_child.closeStdin();
+        _ = command_child.wait() catch {};
+        if (process_exit.is(err)) return err;
+        try io.stderrPrint("sessh: remote command failed: {t}\n", .{err});
+        return process_exit.request(1);
+    };
+    if (exit_status != 0) return process_exit.request(exit_status);
+    if (kind == .kill) {
+        if (route_storage) |*route| {
+            tombstoneLocalRouteForRemoteKill(allocator, route) catch |err| {
+                client_log.debug("event=local_kill_tombstone_failed session={s} error={t}", .{ route.guid, err });
+            };
+        }
+    }
+}
+
+fn remoteMuxExecArgs(argv: []const []const u8) []const []const u8 {
+    if (argv.len > 0 and std.mem.eql(u8, argv[0], "sesshmux")) return argv[1..];
+    return argv;
+}
+
+fn remoteMuxTarget(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    command: mux_cli.Command,
+    route_storage: *?session_registry.Route,
+) !?SshTarget {
+    return switch (command) {
+        .list => |list| switch (list.target) {
+            .host => |host| .{ .options = list.ssh_options, .host = host },
+            .local => null,
+        },
+        .kill => |kill| try remoteKillTarget(allocator, exe, kill, route_storage),
+        .detach => |control| remoteClientControlTarget(control),
+        .repaint => |control| remoteClientControlTarget(control),
+        .debug => |debug| remoteClientControlTarget(debug.control),
+        .new, .attach => unreachable,
+    };
+}
+
+fn remoteKillTarget(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    kill: mux_cli.Kill,
+    route_storage: *?session_registry.Route,
+) !?SshTarget {
+    switch (kill.command_target) {
+        .host => |host| return .{ .options = kill.ssh_options, .host = host },
+        .local => return null,
+        .route_ref_or_local_id => |ref| {
+            route_storage.* = session_registry.readRouteForRef(allocator, ref) catch |err| switch (err) {
+                error.FileNotFound => {
+                    try runLocalKillForSingleId(allocator, exe, kill, ref);
+                    return null;
+                },
+                else => return err,
+            };
+            const route = &route_storage.*.?;
+            if (route.host.len == 0 or std.mem.eql(u8, route.host, ".")) {
+                try runLocalKillForSingleId(allocator, exe, kill, route.guid);
+                return null;
+            }
+            return .{
+                .options = route.ssh_options,
+                .host = route.host,
+            };
+        },
+    }
+}
+
+fn runLocalKillForSingleId(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    kill: mux_cli.Kill,
+    id: []const u8,
+) !void {
+    var local_kill = kill;
+    var ids = [_][]const u8{id};
+    local_kill.command_target = .local;
+    local_kill.ids = ids[0..];
+    try applyLocalMuxLogConfig(allocator, .{ .kill = local_kill });
+    try mux_routed.runCommand(allocator, exe, .{ .kill = local_kill }, null);
+}
+
+fn remoteClientControlTarget(control: mux_cli.ClientControl) ?SshTarget {
+    return switch (control.target) {
+        .host => |host| .{ .options = control.ssh_options, .host = host },
+        .local => null,
+    };
+}
+
+fn muxCommandCommon(command: mux_cli.Command) mux_cli.CommonSessionOptions {
+    return switch (command) {
+        .new => |new| new.common,
+        .attach => |attach| attach.common,
+        .list => |list| list.common,
+        .kill => |kill| kill.common,
+        .detach => |control| control.common,
+        .repaint => |control| control.common,
+        .debug => |debug| debug.control.common,
+    };
+}
+
+fn remoteMuxKind(command: mux_cli.Command) RemoteMuxKind {
+    return switch (command) {
+        .list => .list,
+        .kill => |kill| if (kill.all) .kill_all else .kill,
+        .detach => .detach_client,
+        .repaint => .repaint_client,
+        .debug => .debug_client,
+        .new, .attach => unreachable,
+    };
+}
+
+fn isClientControlMuxKind(kind: RemoteMuxKind) bool {
+    return switch (kind) {
+        .detach_client, .repaint_client, .debug_client => true,
+        .list, .kill, .kill_all => false,
+    };
+}
+
+fn runRemoteMuxClientControlCommand(
+    allocator: std.mem.Allocator,
+    target: SshTarget,
+    bootstrap: bool,
+    argv: []const []const u8,
+) !void {
+    if (argv.len == 0) return error.MissingRemoteLocalArgs;
+
+    var runner = try RemoteControlRunner.initWithBootstrap(allocator, bootstrap);
+    defer runner.deinit();
+    var result = try runner.run(allocator, target.host, target.options, argv);
+    defer result.deinit(allocator);
+
+    if (result.stdout.len > 0) try io.writeAll(1, result.stdout);
+    if (result.stderr.len > 0) try io.writeAll(2, result.stderr);
+    if (result.exit_code != 0) return process_exit.request(result.exit_code);
+}
+
+fn runLocalOrRoutedMuxCommand(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    command: mux_cli.Command,
+) !void {
+    applyLocalMuxLogConfig(allocator, command) catch |err| {
+        try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
+        return process_exit.request(64);
+    };
+    var remote_control_runner: ?RemoteControlRunner = if (muxCommandNeedsRemoteRefresh(command))
+        try RemoteControlRunner.init(allocator)
+    else
+        null;
+    defer if (remote_control_runner) |*runner| runner.deinit();
+    var remote_runner_interface: ?runtime_remote_command.Runner = if (remote_control_runner) |*runner|
+        runner.interface()
+    else
+        null;
+    return mux_routed.runCommand(
+        allocator,
+        exe,
+        command,
+        if (remote_runner_interface) |*runner| runner else null,
+    );
+}
+
+fn applyLocalMuxLogConfig(allocator: std.mem.Allocator, command: mux_cli.Command) !void {
+    const command_log = muxCommandLogConfig(command);
+    if (command_log.set) {
+        client_log.setLevel(command_log.level);
+        return;
+    }
+    const file_config = try client_config.loadFileConfig(allocator);
+    if (file_config.client_log_level) |level| {
+        client_log.setLevel(level);
+    } else {
+        client_log.setLevel(inferredClientLogLevel(command_log.ssh_options));
+    }
+}
+
+const MuxCommandLogConfig = struct {
+    level: client_log.Level,
+    set: bool,
+    ssh_options: []const []const u8,
+};
+
+fn muxCommandLogConfig(command: mux_cli.Command) MuxCommandLogConfig {
+    return switch (command) {
+        .new => |new| .{
+            .level = new.common.client_log_level,
+            .set = new.common.client_log_level_set,
+            .ssh_options = new.ssh_options,
+        },
+        .attach => |attach| .{
+            .level = attach.common.client_log_level,
+            .set = attach.common.client_log_level_set,
+            .ssh_options = attach.ssh_options,
+        },
+        .list => |list| .{
+            .level = list.common.client_log_level,
+            .set = list.common.client_log_level_set,
+            .ssh_options = list.ssh_options,
+        },
+        .kill => |kill| .{
+            .level = kill.common.client_log_level,
+            .set = kill.common.client_log_level_set,
+            .ssh_options = kill.ssh_options,
+        },
+        .detach => |control| .{
+            .level = control.common.client_log_level,
+            .set = control.common.client_log_level_set,
+            .ssh_options = control.ssh_options,
+        },
+        .repaint => |control| .{
+            .level = control.common.client_log_level,
+            .set = control.common.client_log_level_set,
+            .ssh_options = control.ssh_options,
+        },
+        .debug => |debug| .{
+            .level = debug.control.common.client_log_level,
+            .set = debug.control.common.client_log_level_set,
+            .ssh_options = debug.control.ssh_options,
+        },
+    };
+}
+
+fn muxCommandNeedsTransportBridge(command: mux_cli.Command) bool {
+    return switch (command) {
+        .new, .attach => true,
+        .list => |list| switch (list.target) {
+            .local => false,
+            .host => true,
+        },
+        .kill => |kill| switch (kill.command_target) {
+            .local => false,
+            .host, .route_ref_or_local_id => true,
+        },
+        .detach => |control| muxClientControlNeedsTransportBridge(control),
+        .repaint => |control| muxClientControlNeedsTransportBridge(control),
+        .debug => |debug| muxClientControlNeedsTransportBridge(debug.control),
+    };
+}
+
+fn muxClientControlNeedsTransportBridge(control: mux_cli.ClientControl) bool {
+    return switch (control.target) {
+        .local => false,
+        .host => true,
+    };
+}
+
+fn muxCommandNeedsRemoteLocalArgs(command: mux_cli.Command, host: []const u8) bool {
+    if (host.len == 0 or std.mem.eql(u8, host, ".")) return false;
+    return switch (command) {
+        .list, .kill, .detach, .repaint, .debug => true,
+        .new, .attach => false,
+    };
+}
+
+fn muxCommandNeedsDefaultSessionRef(command: mux_cli.Command) bool {
+    return switch (command) {
+        .detach => |control| muxClientControlNeedsDefaultSessionRef(control),
+        .repaint => |control| muxClientControlNeedsDefaultSessionRef(control),
+        .debug => |debug| muxClientControlNeedsDefaultSessionRef(debug.control),
+        .new, .attach, .list, .kill => false,
+    };
+}
+
+fn muxClientControlNeedsDefaultSessionRef(control: mux_cli.ClientControl) bool {
+    return control.session_ref == null and mux_cli.clientControlTarget(control) != .client_guid;
+}
+
+fn runRemoteSession(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    ssh_options: []const []const u8,
+    host: []const u8,
+    common: mux_cli.CommonSessionOptions,
+    flow: RemoteSessionFlow,
+    route: ?*const session_registry.Route,
+    failure_policy: BootstrapFailurePolicy,
+) !void {
+    var runtime_config = remoteSessionConfig(allocator, common, ssh_options) catch |err| {
+        try io.stderrPrint("sessh: invalid config: {t}\n", .{err});
+        return process_exit.request(64);
+    };
+    client_log.setLevel(runtime_config.common.client_log_level);
+
+    switch (flow) {
+        .new => |new| {
+            if (new.detached) {
+                if (runtime_config.common.capture_tty_transcript != null) {
+                    try io.writeAll(2, "sesshmux: new --detached does not support --capture-tty-transcript\n");
+                    return process_exit.request(64);
+                }
+                if (!runtime_config.common.terminal_emulator) {
+                    try io.writeAll(2, "sesshmux: new --detached requires terminal-emulator mode\n");
+                    return process_exit.request(64);
+                }
+                if (filterLevelForcesProxy(runtime_config.common.filter_level) or new.proxy_required) {
+                    try io.writeAll(2, "sesshmux: new --detached does not support proxy stream mode\n");
+                    return process_exit.request(64);
+                }
+            }
+        },
+        .attach => {
+            if (filterLevelForcesProxy(runtime_config.common.filter_level)) {
+                try io.writeAll(2, "sessh: proxy stream mode is only supported for new sessions\n");
+                return process_exit.request(64);
+            }
+        },
+    }
+
+    var resolved_target = try resolveSshTarget(allocator, ssh_options, host);
+    defer resolved_target.deinit(allocator);
+    const target = resolved_target.target;
+
+    const stdin_is_tty = c.isatty(0) != 0;
+    if (flow == .new and shouldUseProxyStream(flow.new, runtime_config.common, stdin_is_tty)) {
+        if (runtime_config.common.capture_tty_transcript != null) {
+            try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with proxy stream mode\n");
+            return process_exit.request(64);
+        }
+        try runProxyStreamSsh(allocator, exe, target, runtime_config.common, flow.new);
+    }
+
+    const shell_command = switch (flow) {
+        .new => |new| try shellCommandFromRemoteArgs(allocator, new.shell_command_args),
+        .attach => null,
+    };
+    defer if (shell_command) |command| allocator.free(command);
+
+    var artifacts_storage: ?ArtifactSet = if (runtime_config.common.bootstrap) try loadArtifactSet(allocator) else null;
+    defer if (artifacts_storage) |*artifacts| artifacts.deinit();
+    const artifacts = if (artifacts_storage) |*value| value else null;
+
+    const remote_command = if (runtime_config.common.bootstrap)
+        try bootstrapCommand(allocator)
     else
         try directSessionBrokerCommand(allocator);
     defer allocator.free(remote_command);
 
-    if (isRemoteMuxCommandAction(parsed_ssh_args.action)) {
-        var command_child = try startRuntimeConnection(
-            allocator,
-            parsed_ssh_args.*,
-            artifacts,
-            remote_command,
-            null,
-            command_args,
-            false,
-            null,
-            false,
-            null,
-            null,
-        );
-        const exit_status = runRemoteMuxCommandAndForward(&command_child) catch |err| {
-            command_child.closeStdin();
-            _ = command_child.wait() catch {};
-            if (process_exit.is(err)) return err;
-            try io.stderrPrint("sessh: remote command failed: {t}\n", .{err});
-            return process_exit.request(1);
-        };
-        if (exit_status != 0) return process_exit.request(exit_status);
-        if (parsed_ssh_args.action == .kill) {
-            if (route_storage.*) |*route| {
-                tombstoneLocalRouteForRemoteKill(allocator, route) catch |err| {
-                    client_log.debug("event=local_kill_tombstone_failed session={s} error={t}", .{ route.guid, err });
-                };
-            }
-        }
-        return;
-    }
-
     var transcript_recorder: ?tty_transcript.Recorder = null;
-    if (parsed_ssh_args.capture_tty_transcript) |path| {
+    if (runtime_config.common.capture_tty_transcript) |path| {
         transcript_recorder = try tty_transcript.Recorder.init(allocator, path);
         if (transcript_recorder) |*recorder| {
             try recorder.warnEnabled();
@@ -848,13 +1253,13 @@ pub fn runInvocation(
 
     var new_guid: ?[]u8 = null;
     defer if (new_guid) |guid| allocator.free(guid);
-    if (parsed_ssh_args.action == .new) {
+    if (flow == .new) {
         new_guid = try session_registry.generateGuid(allocator);
     }
 
     var child = try startRuntimeConnection(
         allocator,
-        parsed_ssh_args.*,
+        target,
         artifacts,
         remote_command,
         .session_broker,
@@ -864,19 +1269,20 @@ pub fn runInvocation(
         false,
         null,
         null,
+        failure_policy,
     );
 
-    if (parsed_ssh_args.action == .new and parsed_ssh_args.new_detached) {
+    if (flow == .new and flow.new.detached) {
         var created = attached_client.createSessionOnRuntime(
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
-            parsed_ssh_args.scrollback_row_count,
+            runtime_config.common.scrollback_row_count,
             new_guid.?,
-            parsed_ssh_args.command_argv,
+            flow.new.command_argv,
             shell_command,
-            parsed_ssh_args.host,
-            parsed_ssh_args.reap_ms,
-            parsed_ssh_args.tombstone_retention_ms,
+            target.host,
+            runtime_config.reap_ms,
+            runtime_config.tombstone_retention_ms,
         ) catch |err| {
             if (err == error.VersionMismatch) {
                 child.closeStdin();
@@ -894,11 +1300,11 @@ pub fn runInvocation(
         try attached_client.ensureLocalRouteForCreatedRemoteSession(
             allocator,
             &created,
-            parsed_ssh_args.host,
-            parsed_ssh_args.resolved_host,
-            parsed_ssh_args.resolved_port,
-            parsed_ssh_args.options,
-            parsed_ssh_args.tombstone_retention_ms,
+            target.host,
+            target.resolved_host,
+            target.resolved_port,
+            target.options,
+            runtime_config.tombstone_retention_ms,
         );
         session_registry.markRouteDetachedNow(allocator, created.guid) catch |err| {
             client_log.debug("event=remote_route_detached_mark_failed session={s} error={t}", .{ created.guid, err });
@@ -911,40 +1317,39 @@ pub fn runInvocation(
         return;
     }
 
-    var session = (switch (parsed_ssh_args.action) {
-        .new => attached_client.startNewSessionOnRuntime(
+    var session = (switch (flow) {
+        .new => |new| attached_client.startNewSessionOnRuntime(
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
-            parsed_ssh_args.scrollback_row_count,
+            runtime_config.common.scrollback_row_count,
             new_guid.?,
-            parsed_ssh_args.command_argv,
+            new.command_argv,
             shell_command,
-            parsed_ssh_args.host,
-            parsed_ssh_args.reap_ms,
-            parsed_ssh_args.tombstone_retention_ms,
+            target.host,
+            runtime_config.reap_ms,
+            runtime_config.tombstone_retention_ms,
         ),
-        .attach => attached_client.startAttachSessionOnRuntime(
+        .attach => |attach| attached_client.startAttachSessionOnRuntime(
             child.child.stdout.?.handle,
             child.child.stdin.?.handle,
-            parsed_ssh_args.attach_id orelse "",
-            parsed_ssh_args.attach_session_dir,
-            parsed_ssh_args.initial_scrollback_row_count,
-            parsed_ssh_args.host,
+            attach.session_ref orelse "",
+            attach.session_dir,
+            runtime_config.common.initial_scrollback_row_count,
+            target.host,
         ),
-        .list, .kill, .kill_all, .detach_client, .repaint_client, .debug_client => unreachable,
     }) catch |err| {
         if (err == error.VersionMismatch) {
             child.closeStdin();
             _ = child.wait() catch {};
-            if (parsed_ssh_args.capture_tty_transcript != null) {
+            if (runtime_config.common.capture_tty_transcript != null) {
                 try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with compat-fallback\n");
                 return process_exit.request(1);
             }
-            if (parsed_ssh_args.command_argv.len > 0 or shell_command != null) {
+            if (flow == .new and (flow.new.command_argv.len > 0 or shell_command != null)) {
                 try io.writeAll(2, "sessh: persistent command sessions require a compatible sesshmux agent\n");
                 return process_exit.request(1);
             }
-            try runRemoteCompat(allocator, parsed_ssh_args.*, .version_mismatch);
+            try runRemoteCompat(allocator, target, runtime_config, flow, .version_mismatch);
         }
         waitAfterRuntimeAttachFailure(&child, "start");
         if (process_exit.is(err)) return err;
@@ -952,20 +1357,22 @@ pub fn runInvocation(
         return process_exit.request(1);
     };
     defer session.deinit();
-    session.setTitleFallback(parsed_ssh_args.host);
+    session.setTitleFallback(target.host);
     child.suppressSshStderr();
-    if (parsed_ssh_args.action == .new or parsed_ssh_args.action == .attach) {
-        try attached_client.ensureLocalRouteForRemoteSession(
-            allocator,
-            &session,
-            parsed_ssh_args.attach_id orelse "",
-            parsed_ssh_args.host,
-            parsed_ssh_args.resolved_host,
-            parsed_ssh_args.resolved_port,
-            parsed_ssh_args.options,
-            parsed_ssh_args.tombstone_retention_ms,
-        );
-    }
+    try attached_client.ensureLocalRouteForRemoteSession(
+        allocator,
+        &session,
+        switch (flow) {
+            .new => "",
+            .attach => |attach| attach.session_ref orelse "",
+        },
+        target.host,
+        target.resolved_host,
+        target.resolved_port,
+        target.options,
+        runtime_config.tombstone_retention_ms,
+    );
+    _ = route;
 
     while (true) {
         const end = attached_client.runAttachedClient(
@@ -983,23 +1390,23 @@ pub fn runInvocation(
         var race_existing_connection = false;
         switch (end) {
             .detach => {
-                client_log.debug("event=detach host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
+                client_log.debug("event=detach host={s} session={s}", .{ target.host, session.idSlice() });
                 child.terminate();
-                try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
+                try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
                 return;
             },
             .kill_detach => {
-                client_log.debug("event=kill_detach host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
-                attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
-                route_commands.spawnRemoteKillJsonl(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()});
+                client_log.debug("event=kill_detach host={s} session={s}", .{ target.host, session.idSlice() });
+                attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
+                route_commands.spawnRemoteKillJsonl(allocator, exe, target.host, target.options, &.{session.guidSlice()});
                 child.terminate();
-                try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
+                try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
                 return;
             },
             .kill_wait => {
-                client_log.debug("event=kill_wait host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
-                attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
-                const killed = try route_commands.runRemoteKillJsonlAndProcess(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()}, session.guidSlice());
+                client_log.debug("event=kill_wait host={s} session={s}", .{ target.host, session.idSlice() });
+                attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
+                const killed = try route_commands.runRemoteKillJsonlAndProcess(allocator, exe, target.host, target.options, &.{session.guidSlice()}, session.guidSlice());
                 child.terminate();
                 if (!killed) return process_exit.request(1);
                 session.ended_tombstone_details = .{
@@ -1009,23 +1416,23 @@ pub fn runInvocation(
                 return process_exit.request(0);
             },
             .session_ended => {
-                client_log.debug("event=session_ended host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
+                client_log.debug("event=session_ended host={s} session={s}", .{ target.host, session.idSlice() });
                 const exit_status = try finishEndedRemoteSession(allocator, &child, &session);
                 return process_exit.request(exit_status);
             },
             .unresponsive => {
-                client_log.debug("event=disconnect reason=unresponsive host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
+                client_log.debug("event=disconnect reason=unresponsive host={s} session={s}", .{ target.host, session.idSlice() });
                 race_existing_connection = true;
             },
             .transport_closed => {
-                client_log.debug("event=disconnect reason=transport_closed host={s} session={s}", .{ parsed_ssh_args.host, session.idSlice() });
+                client_log.debug("event=disconnect reason=transport_closed host={s} session={s}", .{ target.host, session.idSlice() });
                 child.closeStdin();
                 const term: ?std.process.Child.Term = child.wait() catch |err| blk: {
-                    client_log.debug("event=transport_closed_wait_failed host={s} session={s} error={t}", .{ parsed_ssh_args.host, session.idSlice(), err });
+                    client_log.debug("event=transport_closed_wait_failed host={s} session={s} error={t}", .{ target.host, session.idSlice(), err });
                     break :blk null;
                 };
                 if (term) |value| {
-                    client_log.debug("event=transport_closed_ssh_exit host={s} session={s} term={t}", .{ parsed_ssh_args.host, session.idSlice(), value });
+                    client_log.debug("event=transport_closed_ssh_exit host={s} session={s} term={t}", .{ target.host, session.idSlice(), value });
                 }
             },
         }
@@ -1034,7 +1441,7 @@ pub fn runInvocation(
         const pending_paste_like_input_at_disconnect = session.hasPendingPasteLikeInputAck();
         var reconnect_ui = try client_ui.ReconnectUi.beginWithPresentation(
             session.viewport_offset,
-            reconnectPresentationForFilterLevel(parsed_ssh_args.filter_level),
+            reconnectPresentationForFilterLevel(runtime_config.common.filter_level),
         );
         var reconnect_ui_active = true;
         defer if (reconnect_ui_active) reconnect_ui.deinit();
@@ -1043,7 +1450,8 @@ pub fn runInvocation(
             child.terminate();
         } else if (race_existing_connection) {
             switch (try raceExistingConnectionWithReconnect(
-                parsed_ssh_args.*,
+                target,
+                failure_policy,
                 artifacts,
                 remote_command,
                 &child,
@@ -1086,7 +1494,7 @@ pub fn runInvocation(
                     };
                     reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
                     client_log.debug("event=reconnect_success host={s} session={s} attempt=0", .{
-                        parsed_ssh_args.host,
+                        target.host,
                         session.idSlice(),
                     });
                     reconnect_ui.deinit();
@@ -1100,12 +1508,12 @@ pub fn runInvocation(
                 .detach => {
                     child.terminate();
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
                     return;
                 },
                 .failed => |err| {
                     client_log.debug("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
-                        parsed_ssh_args.host,
+                        target.host,
                         session.idSlice(),
                         err,
                     });
@@ -1114,7 +1522,7 @@ pub fn runInvocation(
                 },
                 .disconnected => |err| {
                     client_log.debug("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
-                        parsed_ssh_args.host,
+                        target.host,
                         session.idSlice(),
                         err,
                     });
@@ -1127,7 +1535,7 @@ pub fn runInvocation(
         while (true) {
             const delay_ms = reconnect.delayMs(reconnect_attempt);
             client_log.debug("event=reconnect_wait host={s} session={s} attempt={} delay_ms={}", .{
-                parsed_ssh_args.host,
+                target.host,
                 session.idSlice(),
                 reconnect_attempt,
                 delay_ms,
@@ -1139,29 +1547,29 @@ pub fn runInvocation(
             switch (wait_decision) {
                 .detach => {
                     client_log.debug("event=reconnect_detach host={s} session={s} attempt={}", .{
-                        parsed_ssh_args.host,
+                        target.host,
                         session.idSlice(),
                         reconnect_attempt,
                     });
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
                     return;
                 },
                 .kill_detach => {
-                    attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
                     client_log.debug("event=reconnect_kill_detach host={s} session={s} attempt={}", .{
-                        parsed_ssh_args.host,
+                        target.host,
                         session.idSlice(),
                         reconnect_attempt,
                     });
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
                     return;
                 },
                 .kill_wait => {
-                    attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
+                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
                     client_log.debug("event=reconnect_kill_wait host={s} session={s} attempt={}", .{
-                        parsed_ssh_args.host,
+                        target.host,
                         session.idSlice(),
                         reconnect_attempt,
                     });
@@ -1169,13 +1577,13 @@ pub fn runInvocation(
                 .reconnect_now, .wait_elapsed => {
                     if (session.kill_requested) {
                         client_log.debug("event=kill_reconnect_attempt host={s} session={s} attempt={}", .{
-                            parsed_ssh_args.host,
+                            target.host,
                             session.idSlice(),
                             reconnect_attempt,
                         });
                     } else {
                         client_log.debug("event=reconnect_attempt host={s} session={s} attempt={}", .{
-                            parsed_ssh_args.host,
+                            target.host,
                             session.idSlice(),
                             reconnect_attempt,
                         });
@@ -1186,14 +1594,14 @@ pub fn runInvocation(
             if (session.kill_requested) {
                 const killed = route_commands.runRemoteKillJsonlAndProcess(
                     allocator,
-                    args[0],
-                    parsed_ssh_args.host,
-                    parsed_ssh_args.options,
+                    exe,
+                    target.host,
+                    target.options,
                     &.{session.guidSlice()},
                     session.guidSlice(),
                 ) catch |err| {
                     client_log.debug("event=kill_failed stage=command host={s} session={s} attempt={} error={t}", .{
-                        parsed_ssh_args.host,
+                        target.host,
                         session.idSlice(),
                         reconnect_attempt,
                         err,
@@ -1209,7 +1617,7 @@ pub fn runInvocation(
                     return process_exit.request(0);
                 }
                 client_log.debug("event=kill_failed stage=command host={s} session={s} attempt={} error=NotKilled", .{
-                    parsed_ssh_args.host,
+                    target.host,
                     session.idSlice(),
                     reconnect_attempt,
                 });
@@ -1219,7 +1627,7 @@ pub fn runInvocation(
 
             child = startRuntimeConnection(
                 allocator,
-                parsed_ssh_args.*,
+                target,
                 artifacts,
                 remote_command,
                 .session_broker,
@@ -1229,17 +1637,18 @@ pub fn runInvocation(
                 true,
                 null,
                 null,
+                failure_policy,
             ) catch |err| switch (err) {
                 error.ExitRequested => return err,
                 error.ReconnectDetached => {
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
                     return;
                 },
                 error.OutOfMemory => return err,
                 else => {
                     client_log.debug("event=reconnect_failed stage=transport host={s} session={s} attempt={} error={t}", .{
-                        parsed_ssh_args.host,
+                        target.host,
                         session.idSlice(),
                         reconnect_attempt,
                         err,
@@ -1263,7 +1672,7 @@ pub fn runInvocation(
                     error.OutOfMemory => return err,
                     else => {
                         client_log.debug("event=reconnect_failed stage=attach host={s} session={s} attempt={} error={t}", .{
-                            parsed_ssh_args.host,
+                            target.host,
                             session.idSlice(),
                             reconnect_attempt,
                             err,
@@ -1284,20 +1693,20 @@ pub fn runInvocation(
                 .detach => {
                     child.terminate();
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
                     return;
                 },
                 .kill_detach => {
-                    attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
-                    route_commands.spawnRemoteKillJsonl(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()});
+                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
+                    route_commands.spawnRemoteKillJsonl(allocator, exe, target.host, target.options, &.{session.guidSlice()});
                     child.terminate();
                     finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, parsed_ssh_args.*, &session);
+                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), &session);
                     return;
                 },
                 .kill_wait => {
-                    attached_client.recordRuntimeSessionKillRequested(allocator, parsed_ssh_args.host, &session);
-                    const killed = try route_commands.runRemoteKillJsonlAndProcess(allocator, args[0], parsed_ssh_args.host, parsed_ssh_args.options, &.{session.guidSlice()}, session.guidSlice());
+                    attached_client.recordRuntimeSessionKillRequested(allocator, target.host, &session);
+                    const killed = try route_commands.runRemoteKillJsonlAndProcess(allocator, exe, target.host, target.options, &.{session.guidSlice()}, session.guidSlice());
                     child.terminate();
                     if (!killed) return process_exit.request(1);
                     reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
@@ -1321,7 +1730,7 @@ pub fn runInvocation(
                     error.OutOfMemory => return err,
                     else => {
                         client_log.debug("event=reconnect_failed stage=repaint host={s} session={s} attempt={} error={t}", .{
-                            parsed_ssh_args.host,
+                            target.host,
                             session.idSlice(),
                             reconnect_attempt,
                             err,
@@ -1334,7 +1743,7 @@ pub fn runInvocation(
             };
 
             client_log.debug("event=reconnect_success host={s} session={s} attempt={}", .{
-                parsed_ssh_args.host,
+                target.host,
                 session.idSlice(),
                 reconnect_attempt,
             });
@@ -1344,6 +1753,13 @@ pub fn runInvocation(
             break;
         }
     }
+}
+
+fn muxCommandNeedsRemoteRefresh(command: mux_cli.Command) bool {
+    return switch (command) {
+        .list => |list| list.refresh and list.include_cached_routes and list.client_target == null,
+        .new, .attach, .kill, .detach, .repaint, .debug => false,
+    };
 }
 
 fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) void {
@@ -1357,13 +1773,17 @@ fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) v
     io.stderrPrint("sessh: ssh runtime ended after attach {s} failure: {t}\n", .{ stage, term }) catch {};
 }
 
-fn finishDetachedSshSession(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation, session: *attached_client.RuntimeSession) !void {
+fn finishDetachedSshSession(
+    allocator: std.mem.Allocator,
+    overlay_args: []const []const u8,
+    session: *attached_client.RuntimeSession,
+) !void {
     session.restoreAttachedClientEndPresentationForExit();
     attached_client.markRouteDetachedForSession(allocator, session);
     attached_client.removeClientRouteHintForRemoteSession(allocator, session);
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
-    attached_client.writeDetachOverlayForSessionRef(parsed_ssh_args.overlay_args.slice(), session.idSlice());
+    attached_client.writeDetachOverlayForSessionRef(overlay_args, session.idSlice());
     if (session.kill_requested) attached_client.writeUnconfirmedKillDetachWarningForSessionRef(session.guidSlice());
 }
 
@@ -1402,29 +1822,35 @@ fn reconnectPresentationForFilterLevel(level: config.FilterLevel) client_ui.Reco
     };
 }
 
-fn runRemoteCompat(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation, reason: CompatModeReason) !noreturn {
+fn runRemoteCompat(
+    allocator: std.mem.Allocator,
+    target: SshTarget,
+    runtime_config: SessionRuntimeConfig,
+    flow: RemoteSessionFlow,
+    reason: CompatModeReason,
+) !noreturn {
     if (reason == .version_mismatch) {
         try io.writeAll(2, "sessh: existing remote sessh is incompatible; falling back to compat-mode\n");
     }
 
-    const command_script = try remoteCompatCommandScript(allocator, parsed_ssh_args);
+    const command_script = try remoteCompatCommandScript(allocator, runtime_config, flow);
     defer allocator.free(command_script);
 
-    const tty_option = compatSshTtyOption(parsed_ssh_args, c.isatty(0) != 0, c.isatty(1) != 0);
-    try runRemoteCompatCommandScript(allocator, parsed_ssh_args, command_script, reason, tty_option);
+    const tty_option = compatSshTtyOption(flow, c.isatty(0) != 0, c.isatty(1) != 0);
+    try runRemoteCompatCommandScript(allocator, target, command_script, reason, tty_option);
 }
 
 fn runRemoteCompatCommandScript(
     allocator: std.mem.Allocator,
-    parsed_ssh_args: SessionInvocation,
+    target: SshTarget,
     command_script: []const u8,
     reason: CompatModeReason,
     tty_option: []const u8,
 ) !noreturn {
     return runRemoteCompatCommandScriptForTransport(allocator, .{
-        .options = parsed_ssh_args.options,
-        .host = parsed_ssh_args.host,
-        .default_ipqos_option = parsed_ssh_args.default_ipqos_option,
+        .options = target.options,
+        .host = target.host,
+        .default_ipqos_option = target.default_ipqos_option,
     }, command_script, reason, tty_option);
 }
 
@@ -1477,8 +1903,8 @@ pub fn runRemoteCompatCommandScriptForTransport(
     }
 }
 
-fn compatSshTtyOption(parsed_ssh_args: SessionInvocation, stdin_is_tty: bool, stdout_is_tty: bool) []const u8 {
-    if (parsed_ssh_args.action == .attach and stdin_is_tty and stdout_is_tty) {
+fn compatSshTtyOption(flow: RemoteSessionFlow, stdin_is_tty: bool, stdout_is_tty: bool) []const u8 {
+    if (flow == .attach and stdin_is_tty and stdout_is_tty) {
         return "-t";
     }
     return "-T";
@@ -1541,11 +1967,21 @@ fn nowUnixMs() u64 {
     return @intCast(ms);
 }
 
-fn remoteCompatCommandScript(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation) ![]u8 {
-    const local_args = try localCompatArgs(allocator, parsed_ssh_args);
+fn remoteCompatCommandScript(
+    allocator: std.mem.Allocator,
+    runtime_config: SessionRuntimeConfig,
+    flow: RemoteSessionFlow,
+) ![]u8 {
+    const local_args = try localCompatArgs(allocator, runtime_config, flow);
     defer allocator.free(local_args);
-    const action = compatActionName(parsed_ssh_args.action);
-    const session_id = compatSessionId(parsed_ssh_args) orelse "";
+    const action = switch (flow) {
+        .new => "new",
+        .attach => "attach",
+    };
+    const session_id = switch (flow) {
+        .new => "",
+        .attach => |attach| attach.session_ref orelse "",
+    };
     return remoteCompatCommandScriptFor(allocator, action, session_id, local_args);
 }
 
@@ -1753,61 +2189,29 @@ pub fn remoteCompatCommandScriptFor(
     });
 }
 
-fn compatActionName(action: SessionAction) []const u8 {
-    return switch (action) {
-        .new => "new",
-        .attach => "attach",
-        .list => "list",
-        .kill => "kill",
-        .kill_all => "kill-all",
-        .detach_client, .repaint_client, .debug_client => "client-command",
-    };
-}
-
-fn compatSessionId(parsed_ssh_args: SessionInvocation) ?[]const u8 {
-    return switch (parsed_ssh_args.action) {
-        .attach => parsed_ssh_args.attach_id,
-        .kill => if (parsed_ssh_args.kill_ids.len == 1) parsed_ssh_args.kill_ids[0] else parsed_ssh_args.kill_id,
-        .new, .list, .kill_all, .detach_client, .repaint_client, .debug_client => null,
-    };
-}
-
-fn localCompatArgs(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation) ![]u8 {
+fn localCompatArgs(
+    allocator: std.mem.Allocator,
+    runtime_config: SessionRuntimeConfig,
+    flow: RemoteSessionFlow,
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
-    switch (parsed_ssh_args.action) {
+    switch (flow) {
         .new => {},
-        .attach => {
+        .attach => |attach| {
             try appendCompatArg(allocator, &out, "attach");
-            if (parsed_ssh_args.attach_id) |id| try appendCompatArg(allocator, &out, id);
+            if (attach.session_ref) |id| try appendCompatArg(allocator, &out, id);
         },
-        .list => try appendCompatArg(allocator, &out, "list"),
-        .kill => {
-            try appendCompatArg(allocator, &out, "kill");
-            if (parsed_ssh_args.kill_ids.len > 0) {
-                if (parsed_ssh_args.kill_ids.len != 1) return error.UnsupportedCompatCommand;
-                try appendCompatArg(allocator, &out, parsed_ssh_args.kill_ids[0]);
-            } else if (parsed_ssh_args.kill_current) {
-                try appendCompatArg(allocator, &out, "--current");
-            } else {
-                return error.MissingKillTarget;
-            }
-        },
-        .kill_all => {
-            try appendCompatArg(allocator, &out, "kill");
-            try appendCompatArg(allocator, &out, "--all");
-        },
-        .detach_client, .repaint_client, .debug_client => return error.UnsupportedCompatCommand,
     }
 
     var scrollback_buf: [16]u8 = undefined;
-    const scrollback_count = try std.fmt.bufPrint(&scrollback_buf, "{}", .{parsed_ssh_args.scrollback_row_count});
+    const scrollback_count = try std.fmt.bufPrint(&scrollback_buf, "{}", .{runtime_config.common.scrollback_row_count});
     try appendCompatArg(allocator, &out, "--scrollback-limit");
     try appendCompatArg(allocator, &out, scrollback_count);
 
     var initial_scrollback_buf: [16]u8 = undefined;
-    const initial_scrollback_count = if (parsed_ssh_args.initial_scrollback_row_count) |value|
+    const initial_scrollback_count = if (runtime_config.common.initial_scrollback_row_count) |value|
         try std.fmt.bufPrint(&initial_scrollback_buf, "{}", .{value})
     else
         "-1";
@@ -1815,7 +2219,7 @@ fn localCompatArgs(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocat
     try appendCompatArg(allocator, &out, initial_scrollback_count);
 
     try appendCompatArg(allocator, &out, "--log-level");
-    try appendCompatArg(allocator, &out, client_log.levelName(parsed_ssh_args.client_log_level));
+    try appendCompatArg(allocator, &out, client_log.levelName(runtime_config.common.client_log_level));
 
     return out.toOwnedSlice(allocator);
 }
@@ -1825,56 +2229,6 @@ fn appendCompatArg(allocator: std.mem.Allocator, out: *std.ArrayList(u8), arg: [
     defer allocator.free(quoted);
     try out.append(allocator, ' ');
     try out.appendSlice(allocator, quoted);
-}
-
-fn applyFileConfigToSsh(allocator: std.mem.Allocator, parsed: *SessionInvocation) !void {
-    const file_config = try client_config.loadFileConfig(allocator);
-    if (!parsed.scrollback_row_count_set) {
-        if (file_config.scrollback_row_count) |count| parsed.scrollback_row_count = count;
-    }
-    if (!parsed.initial_scrollback_row_count_set and file_config.initial_scrollback_row_count_set) {
-        parsed.initial_scrollback_row_count = file_config.initial_scrollback_row_count;
-    }
-    if (!parsed.bootstrap_set) {
-        if (file_config.bootstrap) |enabled| parsed.bootstrap = enabled;
-    }
-    if (!parsed.terminal_emulator_set) {
-        if (file_config.terminal_emulator) |enabled| parsed.terminal_emulator = enabled;
-    }
-    if (!parsed.filter_level_set) {
-        if (file_config.filter_level) |level| parsed.filter_level = level;
-    }
-    if (file_config.reap_ms) |ms| parsed.reap_ms = ms;
-    if (file_config.tombstone_retention_ms) |ms| parsed.tombstone_retention_ms = ms;
-    if (!parsed.client_log_level_set) {
-        if (file_config.client_log_level) |level| {
-            parsed.client_log_level = level;
-        } else {
-            parsed.client_log_level = inferredClientLogLevel(parsed.options);
-        }
-    }
-}
-
-// Local mux commands have no ssh transport, so ssh-only config such as
-// `terminal-emulator` and `filter-level` must not change their execution path.
-// Apply only the fields that already make sense for local mux sessions.
-fn applyFileConfigToLocalMux(allocator: std.mem.Allocator, parsed: *SessionInvocation) !void {
-    const file_config = try client_config.loadFileConfig(allocator);
-    if (!parsed.scrollback_row_count_set) {
-        if (file_config.scrollback_row_count) |count| parsed.scrollback_row_count = count;
-    }
-    if (!parsed.initial_scrollback_row_count_set and file_config.initial_scrollback_row_count_set) {
-        parsed.initial_scrollback_row_count = file_config.initial_scrollback_row_count;
-    }
-    if (file_config.reap_ms) |ms| parsed.reap_ms = ms;
-    if (file_config.tombstone_retention_ms) |ms| parsed.tombstone_retention_ms = ms;
-    if (!parsed.client_log_level_set) {
-        if (file_config.client_log_level) |level| {
-            parsed.client_log_level = level;
-        } else {
-            parsed.client_log_level = inferredClientLogLevel(parsed.options);
-        }
-    }
 }
 
 fn inferredClientLogLevel(ssh_options: []const []const u8) client_log.Level {
@@ -1914,169 +2268,9 @@ fn sshVerbosity(ssh_options: []const []const u8) usize {
     return total;
 }
 
-pub const ResolvedSshConfig = struct {
-    hostname: []u8,
-    port: []u8,
-    ipqos: ?[]u8 = null,
-
-    pub fn deinit(self: *ResolvedSshConfig, allocator: std.mem.Allocator) void {
-        if (self.ipqos) |value| allocator.free(value);
-        allocator.free(self.port);
-        allocator.free(self.hostname);
-        self.* = undefined;
-    }
-
-    pub fn defaultIpQosOption(self: *const ResolvedSshConfig, allocator: std.mem.Allocator) !?[]u8 {
-        const value = self.ipqos orelse return null;
-        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ default_ipqos_option_prefix, value });
-    }
-};
-
-pub fn resolveSshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) !ResolvedSshConfig {
-    const output = querySshConfig(allocator, ssh_options, host) catch |err| {
-        client_log.debug("event=ssh_config_query_failed host={s} error={t}", .{ host, err });
-        return fallbackResolvedSshConfig(allocator, ssh_options, host);
-    };
-    defer allocator.free(output);
-    return parseSshConfig(allocator, output, ssh_options, host) catch |err| {
-        client_log.debug("event=ssh_config_parse_failed host={s} error={t}", .{ host, err });
-        return fallbackResolvedSshConfig(allocator, ssh_options, host);
-    };
-}
-
-fn fallbackResolvedSshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) !ResolvedSshConfig {
-    const explicit_port = explicitSshPort(ssh_options) orelse session_registry.default_pending_port;
-    return .{
-        .hostname = try allocator.dupe(u8, host),
-        .port = try allocator.dupe(u8, explicit_port),
-        .ipqos = null,
-    };
-}
-
-fn querySshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) ![]u8 {
-    const transport_options = transportSshOptionsLen(ssh_options);
-    const argv = try allocator.alloc([]const u8, transport_options + 3);
-    defer allocator.free(argv);
-    argv[0] = "ssh";
-    var arg_index: usize = 1;
-    appendTransportSshOptions(argv, &arg_index, ssh_options);
-    argv[arg_index] = "-G";
-    argv[arg_index + 1] = host;
-
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = ssh_config_query_max_output_bytes,
-        .expand_arg0 = .expand,
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return error.SshConfigQueryFailed,
-        else => return error.SshConfigQueryFailed,
-    }
-    return try allocator.dupe(u8, result.stdout);
-}
-
-fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_options: []const []const u8, fallback_host: []const u8) !ResolvedSshConfig {
-    var hostname: ?[]u8 = null;
-    var port: ?[]u8 = null;
-    var ipqos: ?[]u8 = null;
-    errdefer {
-        if (hostname) |value| allocator.free(value);
-        if (port) |value| allocator.free(value);
-        if (ipqos) |value| allocator.free(value);
-    }
-
-    var lines = std.mem.splitScalar(u8, output, '\n');
-    while (lines.next()) |line| {
-        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
-        const key = fields.next() orelse continue;
-        if (std.ascii.eqlIgnoreCase(key, "hostname")) {
-            const value = fields.next() orelse continue;
-            if (hostname) |old| allocator.free(old);
-            hostname = try allocator.dupe(u8, value);
-        } else if (std.ascii.eqlIgnoreCase(key, "port")) {
-            const value = fields.next() orelse continue;
-            if (!isValidSshPort(value)) continue;
-            if (port) |old| allocator.free(old);
-            port = try allocator.dupe(u8, value);
-        } else if (std.ascii.eqlIgnoreCase(key, "ipqos")) {
-            const interactive = fields.next() orelse continue;
-            if (ipqos) |old| allocator.free(old);
-            ipqos = try allocator.dupe(u8, interactive);
-        }
-    }
-    if (hostname == null) hostname = try allocator.dupe(u8, fallback_host);
-    if (port == null) {
-        const explicit_port = explicitSshPort(ssh_options) orelse session_registry.default_pending_port;
-        port = try allocator.dupe(u8, explicit_port);
-    }
-    return .{
-        .hostname = hostname.?,
-        .port = port.?,
-        .ipqos = ipqos,
-    };
-}
-
-fn explicitSshPort(ssh_options: []const []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i < ssh_options.len) : (i += 1) {
-        const option = ssh_options[i];
-        if (std.mem.eql(u8, option, "-p")) {
-            if (i + 1 < ssh_options.len and isValidSshPort(ssh_options[i + 1])) return ssh_options[i + 1];
-            continue;
-        }
-        if (std.mem.startsWith(u8, option, "-p") and option.len > 2) {
-            const value = option[2..];
-            if (isValidSshPort(value)) return value;
-            continue;
-        }
-        if (std.mem.eql(u8, option, "-o")) {
-            if (i + 1 < ssh_options.len) {
-                if (sshConfigOptionValue(ssh_options[i + 1], "Port")) |value| {
-                    if (isValidSshPort(value)) return value;
-                }
-            }
-            continue;
-        }
-        if (std.mem.startsWith(u8, option, "-o") and option.len > 2) {
-            if (sshConfigOptionValue(option[2..], "Port")) |value| {
-                if (isValidSshPort(value)) return value;
-            }
-        }
-    }
-    return null;
-}
-
-fn isValidSshPort(value: []const u8) bool {
-    if (value.len == 0) return false;
-    const port = std.fmt.parseInt(u16, value, 10) catch return false;
-    return port != 0;
-}
-
-fn sshConfigOptionValue(raw_option: []const u8, expected_key: []const u8) ?[]const u8 {
-    const key = sshConfigKey(raw_option);
-    if (!std.ascii.eqlIgnoreCase(key, expected_key)) return null;
-    var value_start = key.len;
-    while (value_start < raw_option.len and
-        (raw_option[value_start] == ' ' or raw_option[value_start] == '\t'))
-    {
-        value_start += 1;
-    }
-    if (value_start < raw_option.len and raw_option[value_start] == '=') value_start += 1;
-    while (value_start < raw_option.len and
-        (raw_option[value_start] == ' ' or raw_option[value_start] == '\t'))
-    {
-        value_start += 1;
-    }
-    if (value_start >= raw_option.len) return null;
-    return raw_option[value_start..];
-}
-
 fn raceExistingConnectionWithReconnect(
-    parsed_ssh_args: SessionInvocation,
+    target: SshTarget,
+    failure_policy: BootstrapFailurePolicy,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
     old_child: *RuntimeConnection,
@@ -2089,7 +2283,8 @@ fn raceExistingConnectionWithReconnect(
     var reconnect_attempt: usize = 0;
     while (true) {
         const outcome = try raceExistingConnectionWithReconnectAttempt(
-            parsed_ssh_args,
+            target,
+            failure_policy,
             artifacts,
             remote_command,
             old_child,
@@ -2101,7 +2296,7 @@ fn raceExistingConnectionWithReconnect(
         switch (outcome) {
             .failed => |err| {
                 client_log.debug("event=reconnect_failed stage=parallel host={s} session={s} attempt={} error={t}", .{
-                    parsed_ssh_args.host,
+                    target.host,
                     session.idSlice(),
                     reconnect_attempt,
                     err,
@@ -2110,7 +2305,7 @@ fn raceExistingConnectionWithReconnect(
                 const delay_ms = reconnect.delayMs(reconnect_attempt);
                 reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, reconnect_ui);
                 client_log.debug("event=reconnect_wait_unresponsive host={s} session={s} attempt={} delay_ms={}", .{
-                    parsed_ssh_args.host,
+                    target.host,
                     session.idSlice(),
                     reconnect_attempt,
                     delay_ms,
@@ -2176,7 +2371,8 @@ fn waitForUnresponsiveReconnectRetry(
 }
 
 fn raceExistingConnectionWithReconnectAttempt(
-    parsed_ssh_args: SessionInvocation,
+    target: SshTarget,
+    failure_policy: BootstrapFailurePolicy,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
     old_child: *RuntimeConnection,
@@ -2187,11 +2383,12 @@ fn raceExistingConnectionWithReconnectAttempt(
 ) !ReconnectRaceOutcome {
     session.viewport_offset = reconnect_ui.currentViewportOffset();
     var state = ParallelReconnectState{
-        .parsed_ssh_args = parsed_ssh_args,
+        .target = target,
         .artifacts = artifacts,
         .remote_command = remote_command,
         .reconnect_ui = reconnect_ui,
         .session = session.*,
+        .failure_policy = failure_policy,
     };
     const thread_allocator = std.heap.smp_allocator;
     var thread = try std.Thread.spawn(.{}, parallelReconnectMain, .{ &state, thread_allocator });
@@ -2222,7 +2419,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                             reconnect_ui,
                             pending_input_at_disconnect,
                             pending_paste_like_input_at_disconnect,
-                            parsed_ssh_args.host,
+                            target.host,
                         );
                     }
                     const disposition = reconnect_ui.reconnectSwitchDisposition(
@@ -2289,7 +2486,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                                 reconnect_ui,
                                 pending_input_at_disconnect,
                                 pending_paste_like_input_at_disconnect,
-                                parsed_ssh_args.host,
+                                target.host,
                             );
                         }
                         try reconnect_ui.showDisconnectedReconnectInProgress();
@@ -2325,7 +2522,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                         }
                     },
                     .kill_detach => {
-                        attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                        attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, target.host, session);
                         reconnect_ui.cancel();
                         if (!joined) {
                             joined = true;
@@ -2335,7 +2532,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                         return .detach;
                     },
                     .kill_wait => {
-                        attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                        attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, target.host, session);
                         if (ready_connection != null) {
                             return try attachReadyReconnectConnection(
                                 &ready_connection,
@@ -2357,7 +2554,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                                 reconnect_ui,
                                 pending_input_at_disconnect,
                                 pending_paste_like_input_at_disconnect,
-                                parsed_ssh_args.host,
+                                target.host,
                             );
                         }
                         try reconnect_ui.showDisconnectedReconnectInProgress();
@@ -2376,7 +2573,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                     return .detach;
                 },
                 .kill_detach => {
-                    attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                    attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, target.host, session);
                     reconnect_ui.cancel();
                     if (!joined) {
                         joined = true;
@@ -2386,7 +2583,7 @@ fn raceExistingConnectionWithReconnectAttempt(
                     return .detach;
                 },
                 .kill_wait => {
-                    attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, parsed_ssh_args.host, session);
+                    attached_client.recordRuntimeSessionKillRequested(std.heap.smp_allocator, target.host, session);
                     if (ready_connection) |connection| {
                         ready_connection = null;
                         return .{ .reconnected = connection };
@@ -2456,7 +2653,7 @@ fn attachReadyReconnectConnection(
 fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allocator) void {
     var connection = startRuntimeConnection(
         allocator,
-        state.parsed_ssh_args,
+        state.target,
         state.artifacts,
         state.remote_command,
         .session_broker,
@@ -2466,6 +2663,7 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
         false,
         null,
         null,
+        state.failure_policy,
     ) catch |err| {
         state.store(.{ .failed = err });
         return;
@@ -2523,8 +2721,8 @@ fn nextReconnectAttemptAfterFailure(attempt: usize, reconnect_ui: *client_ui.Rec
     return reconnect.nextAttempt(attempt, reconnect_ui.consumeReconnectAcknowledgement());
 }
 
-fn defaultSshOptionsLen(parsed_ssh_args: SessionInvocation) usize {
-    return if (parsed_ssh_args.default_ipqos_option == null) 0 else 1;
+fn defaultSshOptionsLen(target: SshTarget) usize {
+    return if (target.default_ipqos_option == null) 0 else 1;
 }
 
 fn appendDefaultSshOptions(ssh_argv: [][]const u8, arg_index: *usize, default_ipqos_option: ?[]const u8) void {
@@ -2534,54 +2732,9 @@ fn appendDefaultSshOptions(ssh_argv: [][]const u8, arg_index: *usize, default_ip
     }
 }
 
-fn transportSshOptionsLen(options: []const []const u8) usize {
-    var len: usize = 0;
-    var i: usize = 0;
-    while (i < options.len) : (i += 1) {
-        const option = options[i];
-        if (isSshTtyRequestOption(option)) continue;
-        len += 1;
-        if (sshOptionSeparateValueIndex(options, i)) |value_index| {
-            len += 1;
-            i = value_index;
-        }
-    }
-    return len;
-}
-
-// The runtime transport always uses `ssh -T` because sessh owns the PTY
-// protocol. User-provided `-t`/`-tt` only decides whether ssh-shaped remote
-// command args are accepted, so those options must not be forwarded to the
-// transport ssh invocation.
-fn appendTransportSshOptions(ssh_argv: [][]const u8, arg_index: *usize, options: []const []const u8) void {
-    var i: usize = 0;
-    while (i < options.len) : (i += 1) {
-        const option = options[i];
-        if (isSshTtyRequestOption(option)) continue;
-        ssh_argv[arg_index.*] = option;
-        arg_index.* += 1;
-        if (sshOptionSeparateValueIndex(options, i)) |value_index| {
-            ssh_argv[arg_index.*] = options[value_index];
-            arg_index.* += 1;
-            i = value_index;
-        }
-    }
-}
-
-fn sshOptionSeparateValueIndex(options: []const []const u8, index: usize) ?usize {
-    const arg = options[index];
-    if (arg.len < 2 or arg[0] != '-' or std.mem.startsWith(u8, arg, "--")) return null;
-    var pos: usize = 1;
-    while (pos < arg.len) : (pos += 1) {
-        if (!sshOptionConsumesValueForHostScan(arg[pos])) continue;
-        return if (pos + 1 < arg.len or index + 1 >= options.len) null else index + 1;
-    }
-    return null;
-}
-
 fn startRuntimeConnection(
     allocator: std.mem.Allocator,
-    parsed_ssh_args: SessionInvocation,
+    target: SshTarget,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
     bootstrap_entrypoint: ?BootstrapEntrypoint,
@@ -2591,11 +2744,12 @@ fn startRuntimeConnection(
     poll_reconnect_input: bool,
     stderr_mode_override: ?SshStderrMode,
     bootstrap_failure_term: ?*?std.process.Child.Term,
+    failure_policy: BootstrapFailurePolicy,
 ) !RuntimeConnection {
     if (bootstrap_failure_term) |term| term.* = null;
     const reconnect_options: usize = if (batch_mode) 1 else 0;
-    const default_options = defaultSshOptionsLen(parsed_ssh_args);
-    const transport_options = transportSshOptionsLen(parsed_ssh_args.options);
+    const default_options = defaultSshOptionsLen(target);
+    const transport_options = transportSshOptionsLen(target.options);
     const ssh_argv = try allocator.alloc([]const u8, transport_options + reconnect_options + default_options + 4);
     defer allocator.free(ssh_argv);
     ssh_argv[0] = "ssh";
@@ -2607,10 +2761,10 @@ fn startRuntimeConnection(
         ssh_argv[arg_index] = "-oBatchMode=yes";
         arg_index += 1;
     }
-    appendDefaultSshOptions(ssh_argv, &arg_index, parsed_ssh_args.default_ipqos_option);
-    appendTransportSshOptions(ssh_argv, &arg_index, parsed_ssh_args.options);
+    appendDefaultSshOptions(ssh_argv, &arg_index, target.default_ipqos_option);
+    appendTransportSshOptions(ssh_argv, &arg_index, target.options);
     ssh_argv[arg_index] = "-T";
-    ssh_argv[arg_index + 1] = parsed_ssh_args.host;
+    ssh_argv[arg_index + 1] = target.host;
     ssh_argv[ssh_argv.len - 1] = remote_command;
 
     var child = std.process.Child.init(ssh_argv, allocator);
@@ -2666,7 +2820,7 @@ fn startRuntimeConnection(
         if (batch_mode) {
             return err;
         }
-        try exitAfterSshBootstrapFailure(allocator, parsed_ssh_args, term, err);
+        try exitAfterSshBootstrapFailure(allocator, target, term, err);
     };
     defer allocator.free(line);
 
@@ -2680,11 +2834,11 @@ fn startRuntimeConnection(
         const artifact = artifact_set.find(remote_platform) orelse {
             connection.closeStdin();
             _ = connection.wait() catch {};
-            if (artifactFilenameForPlatform(remote_platform) == null and canUsePlainSshFallback(parsed_ssh_args, batch_mode, reconnect_ui)) {
-                try runPlainSshFallback(allocator, parsed_ssh_args, remote_platform);
+            if (artifactFilenameForPlatform(remote_platform) == null and canUsePlainSshFallback(failure_policy, batch_mode, reconnect_ui)) {
+                try runPlainSshFallback(allocator, target, remote_platform);
             }
             if (artifactFilenameForPlatform(remote_platform) == null) {
-                try exitUnsupportedPlatform(parsed_ssh_args, remote_platform);
+                try exitUnsupportedPlatform(failure_policy.unsupported_action, remote_platform);
             }
             try io.stderrPrint(
                 "sessh: no packaged artifact is available for {s} {s}\n",
@@ -2719,7 +2873,7 @@ fn startRuntimeConnection(
             if (batch_mode) {
                 return err;
             }
-            try exitAfterSshBootstrapFailure(allocator, parsed_ssh_args, term, err);
+            try exitAfterSshBootstrapFailure(allocator, target, term, err);
         };
     }
 
@@ -2731,11 +2885,11 @@ fn startRuntimeConnection(
     if (std.mem.startsWith(u8, line, "ERR ")) {
         connection.closeStdin();
         _ = connection.wait() catch {};
-        if (isUnsupportedPlatformBootstrapError(line) and canUsePlainSshFallback(parsed_ssh_args, batch_mode, reconnect_ui)) {
-            try runPlainSshFallback(allocator, parsed_ssh_args, null);
+        if (isUnsupportedPlatformBootstrapError(line) and canUsePlainSshFallback(failure_policy, batch_mode, reconnect_ui)) {
+            try runPlainSshFallback(allocator, target, null);
         }
         if (isUnsupportedPlatformBootstrapError(line)) {
-            try exitUnsupportedPlatform(parsed_ssh_args, null);
+            try exitUnsupportedPlatform(failure_policy.unsupported_action, null);
         }
         try io.stderrPrint("sessh: remote bootstrap failed: {s}\n", .{line});
         return process_exit.request(1);
@@ -2752,22 +2906,19 @@ fn isUnsupportedPlatformBootstrapError(line: []const u8) bool {
 }
 
 fn canUsePlainSshFallback(
-    parsed_ssh_args: SessionInvocation,
+    policy: BootstrapFailurePolicy,
     batch_mode: bool,
     reconnect_ui: ?*client_ui.ReconnectUi,
 ) bool {
-    return parsed_ssh_args.action == .new and
-        parsed_ssh_args.command_argv.len == 0 and
-        parsed_ssh_args.shell_command_args.len == 0 and
+    return policy.allow_plain_ssh_fallback and
         !batch_mode and
         reconnect_ui == null;
 }
 
-fn shouldUseStreamPath(parsed_ssh_args: SessionInvocation, stdin_is_tty: bool) bool {
-    if (parsed_ssh_args.action != .new) return false;
-    if (parsed_ssh_args.command_argv.len != 0) return false;
-    if (!parsed_ssh_args.terminal_emulator) return true;
-    if (!hasRemoteShellCommand(parsed_ssh_args.shell_command_args)) return false;
+fn shouldUseStreamPath(new: RemoteNewSession, common: mux_cli.CommonSessionOptions, stdin_is_tty: bool) bool {
+    if (new.command_argv.len != 0) return false;
+    if (!common.terminal_emulator) return true;
+    if (!hasRemoteShellCommand(new.shell_command_args)) return false;
 
     // Match ssh's PTY allocation rules for remote commands. Plain
     // `ssh HOST command` does not allocate a remote tty even when local stdin is
@@ -2775,7 +2926,7 @@ fn shouldUseStreamPath(parsed_ssh_args: SessionInvocation, stdin_is_tty: bool) b
     // local stdin is a tty. `-tt` with local stdin still uses sessh's normal
     // terminal-emulator session path; without local stdin it stays on the
     // stream path and lets the visible outer ssh allocate the PTY.
-    return switch (parsed_ssh_args.tty_request) {
+    return switch (new.tty_request) {
         .none => true,
         .requested => !stdin_is_tty,
         .forced => !stdin_is_tty,
@@ -2805,7 +2956,7 @@ const StreamClientTransport = struct {
 
 const StreamClientStarter = struct {
     allocator: std.mem.Allocator,
-    parsed_ssh_args: SessionInvocation,
+    target: SshTarget,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
     bootstrap_entrypoint: BootstrapEntrypoint,
@@ -2819,7 +2970,7 @@ const StreamClientStarter = struct {
         var failure_term: ?std.process.Child.Term = null;
         const connection = startRuntimeConnection(
             self.allocator,
-            self.parsed_ssh_args,
+            self.target,
             self.artifacts,
             self.remote_command,
             self.bootstrap_entrypoint,
@@ -2829,6 +2980,7 @@ const StreamClientStarter = struct {
             false,
             self.stderr_mode,
             &failure_term,
+            .{ .unsupported_action = "start a proxy stream" },
         ) catch |err| {
             self.recordFailureTerm(failure_term);
             return err;
@@ -2881,12 +3033,11 @@ fn filterLevelForcesProxy(level: config.FilterLevel) bool {
     };
 }
 
-fn shouldUseProxyStream(parsed_ssh_args: SessionInvocation, stdin_is_tty: bool) bool {
-    if (parsed_ssh_args.action != .new) return false;
-    if (parsed_ssh_args.command_argv.len != 0) return false;
-    if (filterLevelForcesProxy(parsed_ssh_args.filter_level) or parsed_ssh_args.proxy_required) return true;
-    if (!hasRemoteShellCommand(parsed_ssh_args.shell_command_args)) return !parsed_ssh_args.terminal_emulator;
-    return shouldUseStreamPath(parsed_ssh_args, stdin_is_tty);
+fn shouldUseProxyStream(new: RemoteNewSession, common: mux_cli.CommonSessionOptions, stdin_is_tty: bool) bool {
+    if (new.command_argv.len != 0) return false;
+    if (filterLevelForcesProxy(common.filter_level) or new.proxy_required) return true;
+    if (!hasRemoteShellCommand(new.shell_command_args)) return !common.terminal_emulator;
+    return shouldUseStreamPath(new, common, stdin_is_tty);
 }
 
 fn hasRemoteShellCommand(args: []const []const u8) bool {
@@ -2901,9 +3052,18 @@ fn hasRemoteShellCommand(args: []const []const u8) bool {
 // ProxyCommand. That ProxyCommand is a local sessh process that reconnects a
 // byte-clean stream to a remote stream agent, and the remote stream agent then
 // opens a TCP connection to sshd on the remote machine.
-fn runProxyStreamSsh(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_args: SessionInvocation) !noreturn {
+fn runProxyStreamSsh(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    target: SshTarget,
+    common: mux_cli.CommonSessionOptions,
+    new: RemoteNewSession,
+) !noreturn {
     const diagnostics_plan = proxyDiagnosticsPlan(
-        parsed_ssh_args,
+        target.options,
+        common.filter_level,
+        new.tty_request,
+        new.shell_command_args,
         c.isatty(0) != 0,
         c.isatty(1) != 0,
     );
@@ -2927,15 +3087,15 @@ fn runProxyStreamSsh(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_a
     const proxy_command_option = try proxyCommandOption(
         allocator,
         exe,
-        parsed_ssh_args,
+        target.options,
         if (client_socket_allocation) |allocation| allocation.path else null,
         diagnostics_plan.command_level,
         diagnostics_plan.client_ctrl_r,
     );
     defer allocator.free(proxy_command_option);
 
-    const default_options = defaultSshOptionsLen(parsed_ssh_args);
-    const ssh_arg_count = 1 + default_options + parsed_ssh_args.options.len + 1 + parsed_ssh_args.shell_command_args.len;
+    const default_options = defaultSshOptionsLen(target);
+    const ssh_arg_count = 1 + default_options + target.options.len + 1 + new.shell_command_args.len;
     const ssh_args = try allocator.alloc([]const u8, ssh_arg_count);
     defer allocator.free(ssh_args);
 
@@ -2945,20 +3105,20 @@ fn runProxyStreamSsh(allocator: std.mem.Allocator, exe: []const u8, parsed_ssh_a
     // inner bootstrap ssh while ensuring the outer ssh talks over our stream.
     ssh_args[index] = proxy_command_option;
     index += 1;
-    appendDefaultSshOptions(ssh_args, &index, parsed_ssh_args.default_ipqos_option);
-    @memcpy(ssh_args[index .. index + parsed_ssh_args.options.len], parsed_ssh_args.options);
-    index += parsed_ssh_args.options.len;
-    ssh_args[index] = parsed_ssh_args.host;
+    appendDefaultSshOptions(ssh_args, &index, target.default_ipqos_option);
+    @memcpy(ssh_args[index .. index + target.options.len], target.options);
+    index += target.options.len;
+    ssh_args[index] = target.host;
     index += 1;
-    @memcpy(ssh_args[index..], parsed_ssh_args.shell_command_args);
+    @memcpy(ssh_args[index..], new.shell_command_args);
 
     if (diagnostics_plan.wrap_visible_ssh and client_socket_listen_fd >= 0) {
-        try runPlainSshArgvUnderLocalPty(allocator, ssh_args, client_socket_listen_fd, diagnostics_plan.client_ctrl_r, "proxy-stream");
+        try plain_ssh.runArgvUnderLocalPty(allocator, ssh_args, client_socket_listen_fd, diagnostics_plan.client_ctrl_r, "proxy-stream");
     }
     if (diagnostics_plan.use_client_socket and client_socket_listen_fd >= 0) {
-        try runPlainSshArgvWithDiagnosticsThread(allocator, ssh_args, client_socket_listen_fd, "proxy-stream");
+        try plain_ssh.runArgvWithDiagnosticsThread(allocator, ssh_args, client_socket_listen_fd, "proxy-stream");
     }
-    try runPlainSshArgv(allocator, ssh_args, "proxy-stream");
+    try plain_ssh.runArgv(allocator, ssh_args, "proxy-stream");
 }
 
 const ProxyDiagnosticsPlan = struct {
@@ -2968,8 +3128,15 @@ const ProxyDiagnosticsPlan = struct {
     client_ctrl_r: bool,
 };
 
-fn proxyDiagnosticsPlan(parsed_ssh_args: SessionInvocation, stdin_is_tty: bool, stdout_is_tty: bool) ProxyDiagnosticsPlan {
-    return switch (parsed_ssh_args.filter_level) {
+fn proxyDiagnosticsPlan(
+    ssh_options: []const []const u8,
+    filter_level: config.FilterLevel,
+    tty_request: SshTtyRequest,
+    shell_command_args: []const []const u8,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) ProxyDiagnosticsPlan {
+    return switch (filter_level) {
         .raw => .{
             .command_level = .raw,
             .use_client_socket = false,
@@ -2989,7 +3156,7 @@ fn proxyDiagnosticsPlan(parsed_ssh_args: SessionInvocation, stdin_is_tty: bool, 
                 .wrap_visible_ssh = false,
                 .client_ctrl_r = false,
             };
-            const wrap_visible_ssh = outerSshAllocatesTty(parsed_ssh_args, stdin_is_tty);
+            const wrap_visible_ssh = outerSshAllocatesTty(ssh_options, tty_request, shell_command_args, stdin_is_tty);
             break :blk .{
                 .command_level = .hygienic,
                 .use_client_socket = true,
@@ -3000,15 +3167,20 @@ fn proxyDiagnosticsPlan(parsed_ssh_args: SessionInvocation, stdin_is_tty: bool, 
     };
 }
 
-fn outerSshAllocatesTty(parsed_ssh_args: SessionInvocation, stdin_is_tty: bool) bool {
-    const explicit = explicitTtyRequest(parsed_ssh_args.options);
+fn outerSshAllocatesTty(
+    ssh_options: []const []const u8,
+    tty_request: SshTtyRequest,
+    shell_command_args: []const []const u8,
+    stdin_is_tty: bool,
+) bool {
+    const explicit = explicitTtyRequest(ssh_options);
     if (explicit) |request| return switch (request) {
         .none => false,
         .requested => stdin_is_tty,
         .forced => true,
     };
-    return switch (parsed_ssh_args.tty_request) {
-        .none => stdin_is_tty and parsed_ssh_args.shell_command_args.len == 0,
+    return switch (tty_request) {
+        .none => stdin_is_tty and shell_command_args.len == 0,
         .requested => stdin_is_tty,
         .forced => true,
     };
@@ -3070,7 +3242,7 @@ fn explicitTtyRequest(options: []const []const u8) ?SshTtyRequest {
 fn proxyCommandOption(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    parsed_ssh_args: SessionInvocation,
+    ssh_options: []const []const u8,
     client_socket: ?[]const u8,
     filter_level: config.FilterLevel,
     client_ctrl_r: bool,
@@ -3096,7 +3268,7 @@ fn proxyCommandOption(
         try appendShellToken(allocator, &command, "--client-ctrl-r");
         try appendShellToken(allocator, &command, if (client_ctrl_r) "1" else "0");
     }
-    try appendProxyTransportSshOptions(allocator, &command, parsed_ssh_args.options);
+    try appendProxyTransportSshOptions(allocator, &command, ssh_options);
 
     return std.fmt.allocPrint(allocator, "-oProxyCommand={s}", .{command.items});
 }
@@ -3216,7 +3388,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
         "-",
     };
 
-    const parsed_transport_args = SessionInvocation{
+    const stream_target = SshTarget{
         .options = invocation.ssh_options.items,
         .host = invocation.host,
         .default_ipqos_option = default_ipqos_option,
@@ -3225,7 +3397,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
     };
     var starter = StreamClientStarter{
         .allocator = allocator,
-        .parsed_ssh_args = parsed_transport_args,
+        .target = stream_target,
         .artifacts = &artifacts,
         .remote_command = remote_command,
         .bootstrap_entrypoint = .stream_broker,
@@ -3381,8 +3553,7 @@ fn sshOptionConsumesValueForHostScan(option: u8) bool {
         isUnsafeSshOptionWithValue(option);
 }
 
-fn exitUnsupportedPlatform(parsed_ssh_args: SessionInvocation, platform: ?Platform) !noreturn {
-    const action = unsupportedPlatformAction(parsed_ssh_args.action);
+fn exitUnsupportedPlatform(action: []const u8, platform: ?Platform) !noreturn {
     if (platform) |remote_platform| {
         try io.stderrPrint(
             "sessh: remote platform {s} {s} is unsupported; cannot {s}\n",
@@ -3394,10 +3565,8 @@ fn exitUnsupportedPlatform(parsed_ssh_args: SessionInvocation, platform: ?Platfo
     return process_exit.request(1);
 }
 
-fn unsupportedPlatformAction(action: SessionAction) []const u8 {
-    return switch (action) {
-        .new => "start a persistent sessh session",
-        .attach => "attach a sessh session",
+fn unsupportedPlatformActionForMux(kind: RemoteMuxKind) []const u8 {
+    return switch (kind) {
         .list => "list sessh sessions",
         .kill => "kill a sessh session",
         .kill_all => "kill all sessh sessions",
@@ -3407,7 +3576,7 @@ fn unsupportedPlatformAction(action: SessionAction) []const u8 {
     };
 }
 
-fn runPlainSshFallback(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation, platform: ?Platform) !noreturn {
+fn runPlainSshFallback(allocator: std.mem.Allocator, target: SshTarget, platform: ?Platform) !noreturn {
     if (platform) |remote_platform| {
         try io.stderrPrint(
             "sessh: no matching sessh binary for remote platform {s} {s}; falling back to plain ssh without persistence\n",
@@ -3417,452 +3586,17 @@ fn runPlainSshFallback(allocator: std.mem.Allocator, parsed_ssh_args: SessionInv
         try io.writeAll(2, "sessh: remote platform is unsupported and no matching sessh binary is available; falling back to plain ssh without persistence\n");
     }
 
-    const ssh_argv = try allocator.alloc([]const u8, parsed_ssh_args.options.len + 1);
+    const ssh_argv = try allocator.alloc([]const u8, target.options.len + 1);
     defer allocator.free(ssh_argv);
-    @memcpy(ssh_argv[0..parsed_ssh_args.options.len], parsed_ssh_args.options);
-    ssh_argv[ssh_argv.len - 1] = parsed_ssh_args.host;
+    @memcpy(ssh_argv[0..target.options.len], target.options);
+    ssh_argv[ssh_argv.len - 1] = target.host;
 
-    try runPlainSshArgv(allocator, ssh_argv, "plain-ssh-fallback");
-}
-
-const ProxyClientControl = struct {
-    const max_title_bytes = 128;
-    const max_status_bytes = 192;
-    const max_cleanup_title_bytes = 512;
-
-    control_fd: c.fd_t = -1,
-    title_tracker: stream_agent.TerminalTitleTracker = .{},
-    pending_title: [max_title_bytes]u8 = undefined,
-    pending_title_len: usize = 0,
-    status_line: [max_status_bytes]u8 = undefined,
-    status_line_len: usize = 0,
-    cleanup_title: [max_cleanup_title_bytes]u8 = [_]u8{0} ** max_cleanup_title_bytes,
-    cleanup_title_len: usize = 0,
-    title_visible: bool = false,
-    status_visible: bool = false,
-    intercept_requested: bool = false,
-    ctrl_r_allowed: bool = false,
-    output_mode: proxy_control.OutputMode = .update,
-    onscreen_status: bool = false,
-
-    fn init(allocator: std.mem.Allocator, ctrl_r_allowed: bool, onscreen_status: bool) ProxyClientControl {
-        var diagnostics = ProxyClientControl{
-            .ctrl_r_allowed = ctrl_r_allowed,
-            .onscreen_status = onscreen_status,
-        };
-        const cwd = std.process.getCwdAlloc(allocator) catch null;
-        if (cwd) |title| {
-            defer allocator.free(title);
-            diagnostics.cleanup_title_len = copyBytes(&diagnostics.cleanup_title, title);
-        }
-        return diagnostics;
-    }
-
-    fn setControlFd(self: *ProxyClientControl, fd: c.fd_t) void {
-        if (self.control_fd >= 0) posix.close(self.control_fd);
-        self.control_fd = fd;
-        proxy_control.serverHandshake(std.heap.smp_allocator, fd, .{
-            .output_mode = self.output_mode,
-            .ctrl_r_available = self.ctrl_r_allowed,
-        }) catch {
-            self.closeControl();
-            return;
-        };
-        setNonBlockingFd(fd) catch {};
-    }
-
-    fn closeControl(self: *ProxyClientControl) void {
-        if (self.control_fd >= 0) {
-            posix.close(self.control_fd);
-            self.control_fd = -1;
-        }
-    }
-
-    fn observeOutput(self: *ProxyClientControl, bytes: []const u8) void {
-        self.title_tracker.observe(bytes);
-        self.flushPendingTitle();
-    }
-
-    fn readControl(self: *ProxyClientControl) void {
-        if (self.control_fd < 0) return;
-        var message = proxy_control.readMessage(std.heap.smp_allocator, self.control_fd) catch {
-            self.closeControl();
-            return;
-        };
-        defer message.deinit(std.heap.smp_allocator);
-        self.handleMessage(message.message);
-    }
-
-    fn handleMessage(self: *ProxyClientControl, message: proxy_control.Message) void {
-        switch (message) {
-            .diagnostic => |diagnostic| self.handleDiagnostic(diagnostic),
-            .ctrl_r => {},
-        }
-    }
-
-    fn handleDiagnostic(self: *ProxyClientControl, diagnostic: proxy_control.Diagnostic) void {
-        if (diagnostic.update) |line| {
-            self.showUpdate(line);
-        } else if (diagnostic.diagnostic_line == null) {
-            self.clearUpdate();
-        }
-        if (diagnostic.diagnostic_line) |line| self.showDiagnostic(line);
-        self.intercept_requested = diagnostic.intercept_ctrl_r;
-    }
-
-    fn shouldInterceptCtrlR(self: *const ProxyClientControl) bool {
-        return self.ctrl_r_allowed and self.intercept_requested and self.control_fd >= 0;
-    }
-
-    fn sendCtrlR(self: *ProxyClientControl) void {
-        if (self.control_fd < 0) return;
-        proxy_control.writeCtrlR(self.control_fd) catch {};
-    }
-
-    fn showUpdate(self: *ProxyClientControl, line: []const u8) void {
-        self.showTitle(line);
-        self.showStatus(line);
-    }
-
-    fn showStatus(self: *ProxyClientControl, line: []const u8) void {
-        self.status_line_len = copyBytes(&self.status_line, line);
-        if (!self.onscreen_status) return;
-        self.status_visible = true;
-        self.redrawStatusLine();
-    }
-
-    fn showDiagnostic(self: *ProxyClientControl, line: []const u8) void {
-        if (!self.onscreen_status) return;
-        if (self.status_visible) io.writeAll(2, "\r\x1b[K") catch {};
-        io.writeAll(2, line) catch {};
-        io.writeAll(2, "\r\n") catch {};
-        if (self.status_visible) self.redrawStatusLine();
-    }
-
-    fn showTitle(self: *ProxyClientControl, title: []const u8) void {
-        self.pending_title_len = copyBytes(&self.pending_title, title);
-        self.flushPendingTitle();
-    }
-
-    fn flushPendingTitle(self: *ProxyClientControl) void {
-        if (self.pending_title_len == 0) return;
-        if (!self.title_tracker.safeForLocalTitle()) return;
-        reconnect_title.writeTitle(1, self.pending_title[0..self.pending_title_len]) catch return;
-        self.title_visible = true;
-        self.pending_title_len = 0;
-    }
-
-    fn clear(self: *ProxyClientControl) void {
-        self.intercept_requested = false;
-        self.clearUpdate();
-    }
-
-    fn clearUpdate(self: *ProxyClientControl) void {
-        self.pending_title_len = 0;
-        if (self.onscreen_status and self.status_visible) {
-            io.writeAll(2, "\r\x1b[K") catch {};
-            self.status_visible = false;
-        }
-        self.restoreTitle();
-    }
-
-    fn restoreTitle(self: *ProxyClientControl) void {
-        if (!self.title_visible) return;
-        const title = if (self.title_tracker.titlePresent())
-            self.title_tracker.titleSlice()
-        else
-            self.cleanup_title[0..self.cleanup_title_len];
-        reconnect_title.writeTitle(1, title) catch {};
-        self.title_visible = false;
-    }
-
-    fn redrawStatusLine(self: *ProxyClientControl) void {
-        if (!self.status_visible) return;
-        io.writeAll(2, "\r\x1b[K") catch {};
-        io.writeAll(2, self.status_line[0..self.status_line_len]) catch {};
-    }
-};
-
-fn copyBytes(dest: []u8, source: []const u8) usize {
-    const len = @min(dest.len, source.len);
-    @memcpy(dest[0..len], source[0..len]);
-    return len;
-}
-
-const DiagnosticsThreadState = struct {
-    listen_fd: c.fd_t,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-};
-
-fn diagnosticsThreadMain(state: *DiagnosticsThreadState, allocator: std.mem.Allocator) void {
-    var diagnostics = ProxyClientControl.init(allocator, false, true);
-    defer {
-        diagnostics.clear();
-        diagnostics.closeControl();
-    }
-
-    while (!state.done.load(.acquire)) {
-        var pollfds: [2]posix.pollfd = undefined;
-        var count: usize = 0;
-        pollfds[count] = .{ .fd = state.listen_fd, .events = posix.POLL.IN, .revents = 0 };
-        count += 1;
-        var control_index: ?usize = null;
-        if (diagnostics.control_fd >= 0) {
-            control_index = count;
-            pollfds[count] = .{ .fd = diagnostics.control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-            count += 1;
-        }
-        _ = posix.poll(pollfds[0..count], 100) catch continue;
-        if ((pollfds[0].revents & posix.POLL.IN) != 0) {
-            const fd = c.accept(state.listen_fd, null, null);
-            if (fd >= 0) diagnostics.setControlFd(fd);
-        }
-        if (control_index) |index| {
-            if (pollfds[index].revents != 0) diagnostics.readControl();
-        }
-    }
-}
-
-fn runPlainSshArgvWithDiagnosticsThread(
-    allocator: std.mem.Allocator,
-    ssh_args: []const []const u8,
-    client_socket_listen_fd: c.fd_t,
-    diagnostic_name: []const u8,
-) !noreturn {
-    var state = DiagnosticsThreadState{ .listen_fd = client_socket_listen_fd };
-    const thread_allocator = std.heap.smp_allocator;
-    var thread = try std.Thread.spawn(.{}, diagnosticsThreadMain, .{ &state, thread_allocator });
-    var joined = false;
-    defer if (!joined) {
-        state.done.store(true, .release);
-        thread.join();
-    };
-
-    const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
-    defer allocator.free(ssh_argv);
-    ssh_argv[0] = "ssh";
-    @memcpy(ssh_argv[1..], ssh_args);
-
-    var child = std.process.Child.init(ssh_argv, allocator);
-    child.expand_arg0 = .expand;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-
-    const term = try child.wait();
-    state.done.store(true, .release);
-    thread.join();
-    joined = true;
-    return exitAfterPlainSshTerm(term, diagnostic_name);
-}
-
-fn runPlainSshArgvUnderLocalPty(
-    allocator: std.mem.Allocator,
-    ssh_args: []const []const u8,
-    client_socket_listen_fd: c.fd_t,
-    client_ctrl_r: bool,
-    diagnostic_name: []const u8,
-) !noreturn {
-    const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
-    defer allocator.free(ssh_argv);
-    ssh_argv[0] = "ssh";
-    @memcpy(ssh_argv[1..], ssh_args);
-
-    var size = terminal.currentWindowSize();
-    var captured_tty_settings: ?tty_settings.Settings = try tty_settings.capture(allocator, 0, .{});
-    defer if (captured_tty_settings) |*settings| settings.deinit(allocator);
-
-    var child = try pty_process.spawn(allocator, .{
-        .rows = size.rows,
-        .cols = size.cols,
-        .command_argv = ssh_argv,
-        .tty_settings = if (captured_tty_settings) |settings| settings else null,
-    });
-    defer child.terminate();
-
-    var mode_guard = try terminal.TerminalModeGuard.enable(0);
-    defer mode_guard.restore();
-
-    var stdin_flags_guard = try FdStatusFlagsGuard.setNonBlocking(0);
-    defer stdin_flags_guard.restore();
-    setNonBlockingFd(child.master_fd) catch {};
-
-    var diagnostics = ProxyClientControl.init(allocator, client_ctrl_r, false);
-    defer {
-        diagnostics.clear();
-        diagnostics.closeControl();
-    }
-
-    while (true) {
-        refreshLocalPtySize(child.master_fd, &size);
-
-        var pollfds: [3]posix.pollfd = undefined;
-        var count: usize = 0;
-        const pty_index = count;
-        pollfds[count] = .{ .fd = child.master_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-        count += 1;
-        const stdin_index = count;
-        pollfds[count] = .{ .fd = 0, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-        count += 1;
-        var control_index: ?usize = null;
-        const control_fd = if (diagnostics.control_fd >= 0) diagnostics.control_fd else client_socket_listen_fd;
-        control_index = count;
-        pollfds[count] = .{ .fd = control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-        count += 1;
-
-        _ = posix.poll(pollfds[0..count], -1) catch continue;
-        refreshLocalPtySize(child.master_fd, &size);
-
-        if ((pollfds[pty_index].revents & posix.POLL.IN) != 0) {
-            var buf: [8192]u8 = undefined;
-            switch (try pty_process.readMaster(child.master_fd, &buf)) {
-                .bytes => |bytes| {
-                    diagnostics.observeOutput(bytes);
-                    try io.writeAll(1, bytes);
-                },
-                .would_block => {},
-                .eof => {
-                    const term = child.wait();
-                    child.closeMaster();
-                    diagnostics.clear();
-                    return exitAfterLocalPtySshTerm(term, diagnostic_name, &mode_guard, &stdin_flags_guard);
-                },
-            }
-        }
-        if ((pollfds[pty_index].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[pty_index].revents & posix.POLL.IN) == 0)
-        {
-            const term = child.wait();
-            child.closeMaster();
-            diagnostics.clear();
-            return exitAfterLocalPtySshTerm(term, diagnostic_name, &mode_guard, &stdin_flags_guard);
-        }
-
-        if ((pollfds[stdin_index].revents & posix.POLL.IN) != 0) {
-            var input: [4096]u8 = undefined;
-            const n = c.read(0, &input, input.len);
-            if (n > 0) {
-                const bytes = input[0..@intCast(n)];
-                try writePtyInput(child.master_fd, bytes, &diagnostics);
-            }
-        }
-
-        if (control_index) |index| {
-            if (pollfds[index].revents != 0) {
-                if (diagnostics.control_fd >= 0) {
-                    diagnostics.readControl();
-                } else {
-                    const fd = c.accept(client_socket_listen_fd, null, null);
-                    if (fd >= 0) diagnostics.setControlFd(fd);
-                }
-            }
-        }
-    }
-}
-
-fn exitAfterLocalPtySshTerm(
-    term: std.process.Child.Term,
-    diagnostic_name: []const u8,
-    mode_guard: *terminal.TerminalModeGuard,
-    stdin_flags_guard: *FdStatusFlagsGuard,
-) !noreturn {
-    stdin_flags_guard.restore();
-    mode_guard.restore();
-    return exitAfterPlainSshTerm(term, diagnostic_name);
-}
-
-fn refreshLocalPtySize(pty_fd: c.fd_t, size: *terminal.WindowSize) void {
-    const current_size = terminal.currentWindowSize();
-    if (current_size.rows == size.rows and current_size.cols == size.cols) return;
-    _ = terminal.setPtySize(pty_fd, current_size.rows, current_size.cols);
-    size.* = current_size;
-}
-
-fn writePtyInput(pty_fd: c.fd_t, bytes: []const u8, diagnostics: *ProxyClientControl) !void {
-    if (!diagnostics.shouldInterceptCtrlR()) {
-        try io.writeAll(pty_fd, bytes);
-        return;
-    }
-    var start: usize = 0;
-    for (bytes, 0..) |byte, index| {
-        if (byte != reconnect_control.ctrl_r) continue;
-        if (index > start) try io.writeAll(pty_fd, bytes[start..index]);
-        diagnostics.sendCtrlR();
-        start = index + 1;
-    }
-    if (start < bytes.len) try io.writeAll(pty_fd, bytes[start..]);
-}
-
-fn exitAfterPlainSshTerm(term: std.process.Child.Term, diagnostic_name: []const u8) !noreturn {
-    switch (term) {
-        .Exited => |code| return process_exit.request(code),
-        .Signal => |signal| {
-            try io.stderrPrint("sessh: {s} ended by signal {}\n", .{ diagnostic_name, signal });
-            return process_exit.request(255);
-        },
-        else => {
-            try io.stderrPrint("sessh: {s} ended unexpectedly: {t}\n", .{ diagnostic_name, term });
-            return process_exit.request(255);
-        },
-    }
-}
-
-fn setNonBlockingFd(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    if ((flags & nonblocking_flag) != 0) return;
-    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-}
-
-const FdStatusFlagsGuard = struct {
-    fd: c.fd_t,
-    original: c_int,
-    active: bool = false,
-
-    // We use F_SETFL to put stdin into non-blocking mode so that we can
-    // process IO across multiple file descriptors without additional threads.
-    // But the open file description of stdin is shared with the invoking
-    // shell, so we need to restore it prior to exiting. Otherwise the shell
-    // might get EAGAIN instead of waiting for input, which could cause all
-    // kinds of problems.
-    fn setNonBlocking(fd: c.fd_t) !FdStatusFlagsGuard {
-        const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-        if (flags < 0) return error.FcntlFailed;
-        const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-        if ((flags & nonblocking_flag) != 0) return .{ .fd = fd, .original = flags };
-        if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-        return .{ .fd = fd, .original = flags, .active = true };
-    }
-
-    fn restore(self: *FdStatusFlagsGuard) void {
-        if (!self.active) return;
-        _ = c.fcntl(self.fd, c.F.SETFL, self.original);
-        self.active = false;
-    }
-};
-
-fn runPlainSshArgv(allocator: std.mem.Allocator, ssh_args: []const []const u8, diagnostic_name: []const u8) !noreturn {
-    const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
-    defer allocator.free(ssh_argv);
-    ssh_argv[0] = "ssh";
-    @memcpy(ssh_argv[1..], ssh_args);
-
-    var child = std.process.Child.init(ssh_argv, allocator);
-    child.expand_arg0 = .expand;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-
-    const term = try child.wait();
-    return exitAfterPlainSshTerm(term, diagnostic_name);
+    try plain_ssh.runArgv(allocator, ssh_argv, "plain-ssh-fallback");
 }
 
 fn exitAfterSshBootstrapFailure(
     allocator: std.mem.Allocator,
-    parsed_ssh_args: SessionInvocation,
+    target: SshTarget,
     term: ?std.process.Child.Term,
     cause: anyerror,
 ) !noreturn {
@@ -3871,7 +3605,7 @@ fn exitAfterSshBootstrapFailure(
         switch (value) {
             .Exited => |code| {
                 if (code != 0) {
-                    try writeVisibleSshCommand(allocator, parsed_ssh_args);
+                    try writeVisibleSshCommand(allocator, target);
                     try io.stderrPrint(" failed (exitcode={})\n", .{code});
                     return process_exit.request(code);
                 }
@@ -3879,12 +3613,12 @@ fn exitAfterSshBootstrapFailure(
                 return process_exit.request(1);
             },
             .Signal => |signal| {
-                try writeVisibleSshCommand(allocator, parsed_ssh_args);
+                try writeVisibleSshCommand(allocator, target);
                 try io.stderrPrint(" failed (signal {})\n", .{signal});
                 return process_exit.request(255);
             },
             else => {
-                try writeVisibleSshCommand(allocator, parsed_ssh_args);
+                try writeVisibleSshCommand(allocator, target);
                 try io.stderrPrint(" failed ({t})\n", .{value});
                 return process_exit.request(1);
             },
@@ -3895,14 +3629,14 @@ fn exitAfterSshBootstrapFailure(
     return process_exit.request(1);
 }
 
-fn writeVisibleSshCommand(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation) !void {
+fn writeVisibleSshCommand(allocator: std.mem.Allocator, target: SshTarget) !void {
     try io.writeAll(2, "sessh: `ssh");
-    for (parsed_ssh_args.options) |arg| {
+    for (target.options) |arg| {
         try io.writeAll(2, " ");
         try writeDiagnosticShellArg(allocator, arg);
     }
     try io.writeAll(2, " ");
-    try writeDiagnosticShellArg(allocator, parsed_ssh_args.host);
+    try writeDiagnosticShellArg(allocator, target.host);
     try io.writeAll(2, "`");
 }
 
@@ -3916,566 +3650,9 @@ fn writeDiagnosticShellArg(allocator: std.mem.Allocator, arg: []const u8) !void 
     try io.writeAll(2, quoted);
 }
 
-fn isPlainShellArg(arg: []const u8) bool {
-    if (arg.len == 0) return false;
-    for (arg) |byte| {
-        switch (byte) {
-            'A'...'Z', 'a'...'z', '0'...'9', '_', '-', '.', '/', ':', '@', '%', '+', '=' => {},
-            else => return false,
-        }
-    }
-    return true;
-}
-
-fn needsEncodedExecArg(arg: []const u8) bool {
-    return !isPlainShellArg(arg) or std.mem.startsWith(u8, arg, bootstrap_exec_encoded_arg_prefix);
-}
-
-test "bootstrap EXEC arg encoding is used for unsafe or reserved tokens" {
-    try std.testing.expect(!needsEncodedExecArg("kill"));
-    try std.testing.expect(!needsEncodedExecArg("--jsonl"));
-    try std.testing.expect(needsEncodedExecArg("{\"guid\":\"s-1\"}"));
-    try std.testing.expect(needsEncodedExecArg("b64:literal"));
-}
-
-// OpenSSH does not preserve argv for `ssh HOST cmd args...`; it joins the
-// remaining local argv with spaces and lets the remote login shell interpret
-// the result. The caller is responsible for only using this for that ssh-shaped
-// command form. `sesshmux new HOST cmd args...` uses command_argv instead.
-fn joinRemoteShellCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    for (args, 0..) |arg, i| {
-        if (i > 0) try out.append(allocator, ' ');
-        try out.appendSlice(allocator, arg);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn shellCommandFromRemoteArgs(allocator: std.mem.Allocator, args: []const []const u8) !?[]u8 {
-    if (args.len == 0) return null;
-    const command = try joinRemoteShellCommandArgs(allocator, args);
-    if (command.len == 0) {
-        // OpenSSH treats an empty remote command as no command at all. That is
-        // different from a non-empty command string such as `""`, which the
-        // remote shell evaluates and typically fails to execute.
-        allocator.free(command);
-        return null;
-    }
-    return command;
-}
-
-/// ssh remote commands are evaluated by the remote account's login shell. Wrap
-/// the embedded script so that shell only execs POSIX sh. This gives the
-/// bootstrapper one shell contract to implement and test instead of inheriting
-/// every possible remote login shell's behavior.
-fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
-    return shCommand(allocator, bootstrapper_script);
-}
-
-fn directSessionBrokerCommand(allocator: std.mem.Allocator) ![]u8 {
-    return directEntrypointCommand(allocator, .session_broker, &.{});
-}
-
-fn directMuxCommand(allocator: std.mem.Allocator, mux_args: []const []const u8) ![]u8 {
-    var script: std.ArrayList(u8) = .empty;
-    defer script.deinit(allocator);
-    const client_version = try shellQuote(allocator, config.version);
-    defer allocator.free(client_version);
-    try script.appendSlice(allocator, "SESSH_CLIENT_VERSION=");
-    try script.appendSlice(allocator, client_version);
-    try script.appendSlice(allocator, " exec sesshmux");
-    for (mux_args) |arg| {
-        const quoted = try shellQuote(allocator, arg);
-        defer allocator.free(quoted);
-        try script.append(allocator, ' ');
-        try script.appendSlice(allocator, quoted);
-    }
-    try script.append(allocator, '\n');
-    return shCommand(allocator, script.items);
-}
-
-fn directControlCommand(allocator: std.mem.Allocator) ![]u8 {
-    return directEntrypointCommand(allocator, .control, &.{});
-}
-
-fn directEntrypointCommand(
-    allocator: std.mem.Allocator,
-    entrypoint: BootstrapEntrypoint,
-    entrypoint_args: []const []const u8,
-) ![]u8 {
-    var script: std.ArrayList(u8) = .empty;
-    defer script.deinit(allocator);
-    const client_version = try shellQuote(allocator, config.version);
-    defer allocator.free(client_version);
-    try script.appendSlice(allocator, "SESSH_CLIENT_VERSION=");
-    try script.appendSlice(allocator, client_version);
-    try script.appendSlice(allocator, " exec sesshmux ");
-    try script.appendSlice(allocator, entrypoint.arg());
-    for (entrypoint_args) |arg| {
-        const quoted = try shellQuote(allocator, arg);
-        defer allocator.free(quoted);
-        try script.append(allocator, ' ');
-        try script.appendSlice(allocator, quoted);
-    }
-    try script.append(allocator, '\n');
-    return shCommand(allocator, script.items);
-}
-
-fn shCommand(allocator: std.mem.Allocator, script: []const u8) ![]u8 {
-    const quoted_script = try shellQuote(allocator, script);
-    defer allocator.free(quoted_script);
-    return std.fmt.allocPrint(allocator, "exec /bin/sh -c {s}", .{quoted_script});
-}
-
-fn shellQuote(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
-    try out.append(allocator, '\'');
-    for (value) |byte| {
-        if (byte == '\'') {
-            try out.appendSlice(allocator, "'\\''");
-        } else {
-            try out.append(allocator, byte);
-        }
-    }
-    try out.append(allocator, '\'');
-    return out.toOwnedSlice(allocator);
-}
-
 fn compatModeFromEnv() bool {
     const value_z = c.getenv(config.compat_env) orelse return false;
     return std.mem.eql(u8, std.mem.span(value_z), "1");
-}
-
-fn resolveLocalRefs(allocator: std.mem.Allocator, parsed: *SessionInvocation) !?[]u8 {
-    switch (parsed.action) {
-        .attach => {
-            const ref = parsed.attach_id orelse return null;
-            if (ref.len == 0) return null;
-            if (parsed.host.len > 0) return null;
-            const guid = try session_registry.resolveRefToGuid(allocator, ref);
-            parsed.attach_id = guid;
-            return guid;
-        },
-        .kill => {
-            const ref = parsed.kill_id orelse return null;
-            if (parsed.kill_ids.len != 1) return null;
-            if (parsed.host.len > 0) return null;
-            const guid = session_registry.resolveRefToGuid(allocator, ref) catch |err| switch (err) {
-                error.FileNotFound => return null,
-                else => return err,
-            };
-            parsed.kill_id = guid;
-            parsed.kill_ids = &.{guid};
-            return guid;
-        },
-        .new, .list, .kill_all, .detach_client, .repaint_client, .debug_client => return null,
-    }
-}
-
-fn parseSshArgs(allocator: std.mem.Allocator, args: []const []const u8, _: CliParseOptions) !SessionInvocation {
-    if (args.len < 2) return error.MissingHost;
-
-    var i: usize = 1;
-    var pre_host = SessionInvocation{ .options = &.{}, .host = "" };
-    try parseSesshOptionsBeforeHost(args, &i, &pre_host);
-    const ssh_options_start = i;
-    // ssh allows options before the host, and sessh has its own pre-host
-    // options. If users interleave them, keep only real ssh options in the
-    // transport option list so sessh-only flags are not forwarded to ssh.
-    var pending_ssh_options_start = i;
-    var mixed_ssh_options: std.ArrayList([]const u8) = .empty;
-    var has_mixed_ssh_options = false;
-    errdefer mixed_ssh_options.deinit(allocator);
-
-    while (i < args.len) {
-        const arg = args[i];
-        if (arg.len == 0) return error.MissingHost;
-
-        if (std.mem.eql(u8, arg, "--")) {
-            i += 1;
-            if (i >= args.len) return error.MissingHost;
-            var parsed = pre_host;
-            try finishParsedSshOptions(
-                allocator,
-                &parsed,
-                args,
-                ssh_options_start,
-                i - 1,
-                pending_ssh_options_start,
-                i - 1,
-                &mixed_ssh_options,
-                has_mixed_ssh_options,
-            );
-            parsed.host = args[i];
-            i += 1;
-            errdefer parsed.deinit(allocator);
-            parseSesshOptionsAfterHost(args, &i, &parsed);
-            return parsed;
-        }
-
-        if (!std.mem.startsWith(u8, arg, "-") or std.mem.eql(u8, arg, "-")) {
-            var parsed = pre_host;
-            try finishParsedSshOptions(
-                allocator,
-                &parsed,
-                args,
-                ssh_options_start,
-                i,
-                pending_ssh_options_start,
-                i,
-                &mixed_ssh_options,
-                has_mixed_ssh_options,
-            );
-            parsed.host = arg;
-            i += 1;
-            errdefer parsed.deinit(allocator);
-            parseSesshOptionsAfterHost(args, &i, &parsed);
-            return parsed;
-        }
-
-        if (isSesshLongOption(arg)) {
-            if (!has_mixed_ssh_options) {
-                has_mixed_ssh_options = true;
-                try mixed_ssh_options.appendSlice(allocator, args[ssh_options_start..i]);
-            } else {
-                try mixed_ssh_options.appendSlice(allocator, args[pending_ssh_options_start..i]);
-            }
-            try parseSesshOptionsBeforeHost(args, &i, &pre_host);
-            pending_ssh_options_start = i;
-            continue;
-        }
-        const ssh_option_start = i;
-        try consumeSshOption(args, &i, &pre_host.tty_request, &pre_host.proxy_required);
-        if (has_mixed_ssh_options) {
-            try mixed_ssh_options.appendSlice(allocator, args[ssh_option_start..i]);
-            pending_ssh_options_start = i;
-        }
-    }
-
-    return error.MissingHost;
-}
-
-fn finishParsedSshOptions(
-    allocator: std.mem.Allocator,
-    parsed: *SessionInvocation,
-    args: []const []const u8,
-    contiguous_start: usize,
-    contiguous_end: usize,
-    pending_start: usize,
-    pending_end: usize,
-    mixed_ssh_options: *std.ArrayList([]const u8),
-    has_mixed_ssh_options: bool,
-) !void {
-    if (!has_mixed_ssh_options) {
-        parsed.options = args[contiguous_start..contiguous_end];
-        return;
-    }
-
-    try mixed_ssh_options.appendSlice(allocator, args[pending_start..pending_end]);
-    const owned = try mixed_ssh_options.toOwnedSlice(allocator);
-    parsed.owned_options = owned;
-    parsed.options = owned;
-}
-
-fn parseSesshOptionsBeforeHost(args: []const []const u8, index: *usize, parsed: *SessionInvocation) !void {
-    while (index.* < args.len) {
-        const arg = args[index.*];
-        if (!isSesshLongOption(arg)) return;
-        if (isConfigOnlyDirectSesshOption(arg)) return error.UnsupportedSesshOption;
-
-        if (std.mem.eql(u8, arg, "--log-level")) {
-            index.* += 1;
-            if (index.* >= args.len) return error.MissingClientLogLevel;
-            parsed.client_log_level = try client_log.parseLevel(args[index.*]);
-            parsed.client_log_level_set = true;
-            try parsed.overlay_args.append(arg);
-            try parsed.overlay_args.append(args[index.*]);
-            index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--terminal-emulator")) {
-            parsed.terminal_emulator = true;
-            parsed.terminal_emulator_set = true;
-            index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--no-terminal-emulator")) {
-            parsed.terminal_emulator = false;
-            parsed.terminal_emulator_set = true;
-            index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--filter-level")) {
-            index.* += 1;
-            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingFilterLevel;
-            parsed.filter_level = try config.parseFilterLevel(args[index.*]);
-            parsed.filter_level_set = true;
-            index.* += 1;
-        } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
-            index.* += 1;
-            if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingTtyTranscriptPath;
-            parsed.capture_tty_transcript = args[index.*];
-            index.* += 1;
-        } else {
-            return error.MissingHost;
-        }
-    }
-}
-
-// Direct `sessh` follows ssh's command-line boundary: the first non-option
-// token is the host, and every later token is part of the remote command.
-fn parseSesshOptionsAfterHost(args: []const []const u8, index: *usize, parsed: *SessionInvocation) void {
-    if (index.* < args.len) {
-        parsed.shell_command_args = args[index.*..];
-        index.* = args.len;
-    }
-}
-
-fn isSesshLongOption(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--scrollback-limit") or
-        std.mem.eql(u8, arg, "--initial-scrollback") or
-        std.mem.eql(u8, arg, "--log-level") or
-        std.mem.eql(u8, arg, "--bootstrap") or
-        std.mem.eql(u8, arg, "--no-bootstrap") or
-        std.mem.eql(u8, arg, "--terminal-emulator") or
-        std.mem.eql(u8, arg, "--no-terminal-emulator") or
-        std.mem.eql(u8, arg, "--filter-level") or
-        std.mem.eql(u8, arg, "--ssh-options") or
-        std.mem.eql(u8, arg, "--capture-tty-transcript");
-}
-
-fn isConfigOnlyDirectSesshOption(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--scrollback-limit") or
-        std.mem.eql(u8, arg, "--initial-scrollback") or
-        std.mem.eql(u8, arg, "--bootstrap") or
-        std.mem.eql(u8, arg, "--no-bootstrap") or
-        std.mem.eql(u8, arg, "--ssh-options");
-}
-
-fn isRemoteMuxCommandAction(action: SessionAction) bool {
-    return switch (action) {
-        .list,
-        .kill,
-        .kill_all,
-        .detach_client,
-        .repaint_client,
-        .debug_client,
-        => true,
-        .new, .attach => false,
-    };
-}
-
-fn isClientControlAction(action: SessionAction) bool {
-    return switch (action) {
-        .detach_client, .repaint_client, .debug_client => true,
-        .new, .attach, .list, .kill, .kill_all => false,
-    };
-}
-
-fn isRemoteClientControlAction(parsed: SessionInvocation) bool {
-    return isClientControlAction(parsed.action) and
-        parsed.host.len > 0 and
-        !std.mem.eql(u8, parsed.host, ".");
-}
-
-fn runRemoteMuxClientControlCommand(
-    allocator: std.mem.Allocator,
-    parsed: SessionInvocation,
-) !void {
-    const argv = parsed.remote_local_args;
-    if (argv.len == 0) return error.MissingRemoteLocalArgs;
-
-    var runner = try RemoteControlRunner.initWithBootstrap(allocator, parsed.bootstrap);
-    defer runner.deinit();
-    var result = try runner.run(allocator, parsed.host, parsed.options, argv);
-    defer result.deinit(allocator);
-
-    if (result.stdout.len > 0) try io.writeAll(1, result.stdout);
-    if (result.stderr.len > 0) try io.writeAll(2, result.stderr);
-    if (result.exit_code != 0) return process_exit.request(result.exit_code);
-}
-
-fn consumeSshOption(
-    args: []const []const u8,
-    index: *usize,
-    tty_request: *SshTtyRequest,
-    proxy_required: *bool,
-) !void {
-    const arg = args[index.*];
-    if (std.mem.startsWith(u8, arg, "--")) return error.UnsupportedSshOption;
-
-    if (sshTtyRequestCount(arg)) |count| {
-        noteSshTtyRequest(tty_request, count);
-        index.* += 1;
-        return;
-    }
-
-    var pos: usize = 1;
-    while (pos < arg.len) {
-        const option = arg[pos];
-        if (isProxyRequiredSshFlag(option)) {
-            proxy_required.* = true;
-            pos += 1;
-            continue;
-        }
-        if (isProxyRequiredSshOptionWithValue(option)) {
-            _ = try optionValue(args, index, pos);
-            proxy_required.* = true;
-            return;
-        }
-        if (isUnsafeSshFlag(option) or isUnsafeSshOptionWithValue(option)) {
-            return error.UnsafeSshOption;
-        }
-
-        if (option == 'o') {
-            const value = try optionValue(args, index, pos);
-            if (try sshConfigOptionRequiresProxy(value)) {
-                proxy_required.* = true;
-            } else {
-                try validateSshConfigOption(value);
-            }
-            return;
-        }
-
-        if (sshOptionRequiresValue(option)) {
-            _ = try optionValue(args, index, pos);
-            return;
-        }
-
-        if (!isSafeSshFlag(option)) return error.UnsupportedSshOption;
-        pos += 1;
-    }
-
-    index.* += 1;
-}
-
-fn isSshTtyRequestOption(arg: []const u8) bool {
-    return sshTtyRequestCount(arg) != null;
-}
-
-fn sshTtyRequestCount(arg: []const u8) ?usize {
-    if (arg.len < 2 or arg[0] != '-') return null;
-    for (arg[1..]) |byte| {
-        if (byte != 't') return null;
-    }
-    return arg.len - 1;
-}
-
-fn noteSshTtyRequest(tty_request: *SshTtyRequest, count: usize) void {
-    if (count >= 2 or tty_request.* == .requested) {
-        tty_request.* = .forced;
-    } else if (count == 1 and tty_request.* == .none) {
-        tty_request.* = .requested;
-    }
-}
-
-fn optionValue(args: []const []const u8, index: *usize, option_pos: usize) ![]const u8 {
-    const arg = args[index.*];
-    if (option_pos + 1 < arg.len) {
-        index.* += 1;
-        return arg[option_pos + 1 ..];
-    }
-
-    if (index.* + 1 >= args.len) return error.MissingSshOptionValue;
-    const value = args[index.* + 1];
-    index.* += 2;
-    return value;
-}
-
-fn isSafeSshFlag(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "46CgKkqsTv", option) != null;
-}
-
-fn isUnsafeSshFlag(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "GtV", option) != null;
-}
-
-fn sshOptionRequiresValue(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "BbcDEeFIiJLlmOPpRSwW", option) != null;
-}
-
-fn isUnsafeSshOptionWithValue(option: u8) bool {
-    return option == 'Q';
-}
-
-fn isProxyRequiredSshFlag(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "AafMNsXxYyn", option) != null;
-}
-
-fn isProxyRequiredSshOptionWithValue(option: u8) bool {
-    return std.mem.indexOfScalar(u8, "DLORWw", option) != null;
-}
-
-fn validateSshConfigOption(raw_option: []const u8) !void {
-    const key = sshConfigKey(raw_option);
-    if (std.ascii.eqlIgnoreCase(key, "RemoteCommand")) return error.UnsafeSshOption;
-
-    if (std.ascii.eqlIgnoreCase(key, "RequestTTY")) {
-        if (!sshConfigValueIs(raw_option, key.len, "no")) return error.UnsafeSshOption;
-        return;
-    }
-    if (std.ascii.eqlIgnoreCase(key, "SessionType")) {
-        if (!sshConfigValueIs(raw_option, key.len, "default")) return error.UnsafeSshOption;
-        return;
-    }
-    if (std.ascii.eqlIgnoreCase(key, "StdinNull")) {
-        if (!sshConfigValueIs(raw_option, key.len, "no")) return error.UnsafeSshOption;
-        return;
-    }
-    if (std.ascii.eqlIgnoreCase(key, "ForkAfterAuthentication")) {
-        if (!sshConfigValueIs(raw_option, key.len, "no")) return error.UnsafeSshOption;
-        return;
-    }
-}
-
-fn sshConfigOptionRequiresProxy(raw_option: []const u8) !bool {
-    const key = sshConfigKey(raw_option);
-    if (sshConfigKeyIs(raw_option, "RemoteCommand")) return true;
-    if (sshConfigKeyIs(raw_option, "ForwardAgent")) return !sshConfigValueIs(raw_option, key.len, "no");
-    if (sshConfigKeyIs(raw_option, "ForwardX11")) return !sshConfigValueIs(raw_option, key.len, "no");
-    if (sshConfigKeyIs(raw_option, "ForwardX11Trusted")) return !sshConfigValueIs(raw_option, key.len, "no");
-    if (sshConfigKeyIs(raw_option, "LocalForward")) return true;
-    if (sshConfigKeyIs(raw_option, "RemoteForward")) return true;
-    if (sshConfigKeyIs(raw_option, "DynamicForward")) return true;
-    if (sshConfigKeyIs(raw_option, "StreamLocalBindUnlink")) return true;
-    if (sshConfigKeyIs(raw_option, "StreamLocalForward")) return true;
-    if (sshConfigKeyIs(raw_option, "ClearAllForwardings")) return true;
-    if (sshConfigKeyIs(raw_option, "PermitLocalCommand")) return !sshConfigValueIs(raw_option, key.len, "no");
-    if (sshConfigKeyIs(raw_option, "RequestTTY")) return !sshConfigValueIs(raw_option, key.len, "no");
-    if (sshConfigKeyIs(raw_option, "SessionType")) return !sshConfigValueIs(raw_option, key.len, "default");
-    if (sshConfigKeyIs(raw_option, "StdinNull")) return !sshConfigValueIs(raw_option, key.len, "no");
-    if (sshConfigKeyIs(raw_option, "ForkAfterAuthentication")) return !sshConfigValueIs(raw_option, key.len, "no");
-    if (sshConfigKeyIs(raw_option, "Tunnel")) return !sshConfigValueIs(raw_option, key.len, "no");
-    if (sshConfigKeyIs(raw_option, "TunnelDevice")) return true;
-    return false;
-}
-
-fn sshConfigKeyIs(raw_option: []const u8, expected: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(sshConfigKey(raw_option), expected);
-}
-
-fn sshConfigKey(raw_option: []const u8) []const u8 {
-    var end: usize = 0;
-    while (end < raw_option.len) : (end += 1) {
-        switch (raw_option[end]) {
-            '=', ' ', '\t' => break,
-            else => {},
-        }
-    }
-    return raw_option[0..end];
-}
-
-fn sshConfigValueIs(raw_option: []const u8, key_len: usize, expected: []const u8) bool {
-    var value_start = key_len;
-    while (value_start < raw_option.len and
-        (raw_option[value_start] == ' ' or raw_option[value_start] == '\t'))
-    {
-        value_start += 1;
-    }
-    if (value_start < raw_option.len and raw_option[value_start] == '=') value_start += 1;
-    while (value_start < raw_option.len and
-        (raw_option[value_start] == ' ' or raw_option[value_start] == '\t'))
-    {
-        value_start += 1;
-    }
-    return std.ascii.eqlIgnoreCase(raw_option[value_start..], expected);
 }
 
 pub fn printSshArgError(err: anyerror) !void {
@@ -4515,317 +3692,6 @@ pub fn printSshArgError(err: anyerror) !void {
     }
 }
 
-fn loadArtifactSet(allocator: std.mem.Allocator) !ArtifactSet {
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
-    defer allocator.free(exe_path);
-
-    if (isDevelopmentExecutable(exe_path)) {
-        return loadDevelopmentArtifactSet(allocator, exe_path);
-    }
-
-    return loadPackagedArtifactSet(allocator, exe_path) catch |err| switch (err) {
-        error.NoPackagedArtifacts => loadDevelopmentArtifactSet(allocator, exe_path),
-        else => err,
-    };
-}
-
-fn isDevelopmentExecutable(exe_path: []const u8) bool {
-    return std.mem.eql(u8, std.fs.path.basename(exe_path), "sesshmux-dev");
-}
-
-fn loadPackagedArtifactSet(allocator: std.mem.Allocator, exe_path: []const u8) !ArtifactSet {
-    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.InvalidExePath;
-    if (try loadPackagedArtifactSetFromDir(allocator, exe_dir)) |artifact_set| {
-        return artifact_set;
-    }
-
-    const prefix_dir = std.fs.path.dirname(exe_dir) orelse return error.NoPackagedArtifacts;
-    const libexec_dir = try std.fs.path.join(allocator, &.{ prefix_dir, "libexec", "sessh" });
-    defer allocator.free(libexec_dir);
-    if (try loadPackagedArtifactSetFromDir(allocator, libexec_dir)) |artifact_set| {
-        return artifact_set;
-    }
-
-    return error.NoPackagedArtifacts;
-}
-
-fn loadPackagedArtifactSetFromDir(allocator: std.mem.Allocator, artifact_dir: []const u8) !?ArtifactSet {
-    if (try loadPackagedArtifactManifest(allocator, artifact_dir)) |artifact_set| {
-        return artifact_set;
-    }
-
-    var found_any = false;
-    for (packaged_artifact_targets) |target| {
-        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.filename });
-        defer allocator.free(path);
-
-        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
-        };
-        file.close();
-        found_any = true;
-        break;
-    }
-    if (!found_any) return null;
-
-    var entries = try allocator.alloc(ArtifactEntry, packaged_artifact_targets.len);
-    errdefer allocator.free(entries);
-    var initialized: usize = 0;
-    errdefer {
-        for (entries[0..initialized]) |*entry| entry.deinit(allocator);
-    }
-
-    for (packaged_artifact_targets, 0..) |target, i| {
-        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.filename });
-        errdefer allocator.free(path);
-
-        entries[i] = try loadArtifactEntryForPlatform(allocator, path, .{
-            .os = target.os,
-            .arch = target.arch,
-        });
-        allocator.free(path);
-        initialized += 1;
-    }
-
-    return .{
-        .allocator = allocator,
-        .artifact_set_id = try allocator.dupe(u8, config.version),
-        .entries = entries,
-    };
-}
-
-fn loadPackagedArtifactManifest(allocator: std.mem.Allocator, artifact_dir: []const u8) !?ArtifactSet {
-    const manifest_path = try std.fs.path.join(allocator, &.{ artifact_dir, artifact_manifest_filename });
-    defer allocator.free(manifest_path);
-
-    const file = std.fs.openFileAbsolute(manifest_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer file.close();
-
-    const bytes = try file.readToEndAlloc(allocator, max_artifact_manifest_bytes);
-    defer allocator.free(bytes);
-
-    return try parsePackagedArtifactManifest(allocator, artifact_dir, bytes);
-}
-
-fn parsePackagedArtifactManifest(
-    allocator: std.mem.Allocator,
-    artifact_dir: []const u8,
-    bytes: []const u8,
-) !ArtifactSet {
-    var entries = try allocator.alloc(ArtifactEntry, packaged_artifact_targets.len);
-    errdefer allocator.free(entries);
-    var seen = [_]bool{false} ** packaged_artifact_targets.len;
-    errdefer {
-        for (seen, 0..) |entry_seen, i| {
-            if (entry_seen) entries[i].deinit(allocator);
-        }
-    }
-
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, "\r");
-        if (line.len == 0) continue;
-
-        var fields = std.mem.splitScalar(u8, line, ' ');
-        const filename = fields.next() orelse return error.InvalidArtifactManifest;
-        const hash_hex = fields.next() orelse return error.InvalidArtifactManifest;
-        if (fields.next() != null) return error.InvalidArtifactManifest;
-
-        const target_index = packagedArtifactTargetIndex(filename) orelse return error.InvalidArtifactManifest;
-        if (seen[target_index]) return error.InvalidArtifactManifest;
-        const target = packaged_artifact_targets[target_index];
-        if (!isLowerSha256Hex(hash_hex)) return error.InvalidArtifactManifest;
-
-        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.filename });
-        entries[target_index] = try artifactEntryFromManifest(allocator, path, target, hash_hex);
-        seen[target_index] = true;
-    }
-
-    for (seen) |entry_seen| {
-        if (!entry_seen) return error.InvalidArtifactManifest;
-    }
-
-    return .{
-        .allocator = allocator,
-        .artifact_set_id = try allocator.dupe(u8, config.version),
-        .entries = entries,
-    };
-}
-
-fn artifactEntryFromManifest(
-    allocator: std.mem.Allocator,
-    path: []u8,
-    target: PackagedArtifactTarget,
-    hash_text: []const u8,
-) !ArtifactEntry {
-    errdefer allocator.free(path);
-
-    const id = try std.fmt.allocPrint(
-        allocator,
-        "sessh-{s}-{s}-{s}",
-        .{ config.version, target.os, target.arch },
-    );
-    errdefer allocator.free(id);
-
-    const os = try allocator.dupe(u8, target.os);
-    errdefer allocator.free(os);
-    const arch = try allocator.dupe(u8, target.arch);
-    errdefer allocator.free(arch);
-
-    var hash_hex: [64]u8 = undefined;
-    @memcpy(hash_hex[0..], hash_text);
-
-    return .{
-        .id = id,
-        .os = os,
-        .arch = arch,
-        .path = path,
-        .hash_hex = hash_hex,
-    };
-}
-
-fn loadDevelopmentArtifactSet(allocator: std.mem.Allocator, exe_path: []const u8) !ArtifactSet {
-    const entry = try loadCurrentArtifactEntry(allocator, exe_path);
-    errdefer {
-        var mutable = entry;
-        mutable.deinit(allocator);
-    }
-
-    const entries = try allocator.alloc(ArtifactEntry, 1);
-    entries[0] = entry;
-    errdefer allocator.free(entries);
-
-    return .{
-        .allocator = allocator,
-        .artifact_set_id = try allocator.dupe(u8, config.version),
-        .entries = entries,
-    };
-}
-
-fn loadCurrentArtifactEntry(allocator: std.mem.Allocator, exe_path: []const u8) !ArtifactEntry {
-    return loadArtifactEntryForPlatform(allocator, exe_path, localPlatform());
-}
-
-fn loadArtifactEntryForPlatform(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    platform: Platform,
-) !ArtifactEntry {
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-
-    const bytes = try file.readToEndAlloc(allocator, max_artifact_bytes);
-    defer allocator.free(bytes);
-
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-
-    return .{
-        .id = try std.fmt.allocPrint(
-            allocator,
-            "sessh-{s}-{s}-{s}",
-            .{ config.version, platform.os, platform.arch },
-        ),
-        .os = try allocator.dupe(u8, platform.os),
-        .arch = try allocator.dupe(u8, platform.arch),
-        .path = try allocator.dupe(u8, path),
-        .hash_hex = std.fmt.bytesToHex(digest, .lower),
-    };
-}
-
-fn sendUpload(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    artifact: *const ArtifactEntry,
-    reconnect_ui: ?*client_ui.ReconnectUi,
-    poll_reconnect_input: bool,
-) !void {
-    const file = try std.fs.openFileAbsolute(artifact.path, .{});
-    defer file.close();
-
-    const bytes = try file.readToEndAlloc(allocator, max_artifact_bytes);
-    defer allocator.free(bytes);
-
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    const actual_hash = std.fmt.bytesToHex(digest, .lower);
-    if (!std.mem.eql(u8, &actual_hash, &artifact.hash_hex)) return error.ArtifactHashMismatch;
-
-    const encoded = try allocator.alloc(
-        u8,
-        std.base64.standard.Encoder.calcSize(bytes.len),
-    );
-    defer allocator.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, bytes);
-
-    try writeAllMaybeCancellable(fd, "UPLOAD ", reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, artifact.id, reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, &artifact.hash_hex, reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, encoded, reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
-}
-
-fn parseMissingPlatform(line: []const u8) !Platform {
-    if (!std.mem.startsWith(u8, line, "MISSING ")) return error.InvalidMissingResponse;
-    var fields = std.mem.splitScalar(u8, line["MISSING ".len..], ' ');
-    const os = fields.next() orelse return error.InvalidMissingResponse;
-    const arch = fields.next() orelse return error.InvalidMissingResponse;
-    if (fields.next() != null or os.len == 0 or arch.len == 0) return error.InvalidMissingResponse;
-    return .{ .os = os, .arch = arch };
-}
-
-fn localPlatform() Platform {
-    const os = switch (builtin.os.tag) {
-        .linux => "linux",
-        .macos => "macos",
-        else => "unsupported",
-    };
-    const arch = switch (builtin.cpu.arch) {
-        .x86 => "x86",
-        .x86_64 => "x86_64",
-        .arm => "arm32",
-        .aarch64 => "aarch64",
-        .riscv64 => "riscv64",
-        else => "unsupported",
-    };
-    return .{ .os = os, .arch = arch };
-}
-
-fn platformsEqual(a: Platform, b: Platform) bool {
-    return std.mem.eql(u8, a.os, b.os) and std.mem.eql(u8, a.arch, b.arch);
-}
-
-fn artifactFilenameForPlatform(platform: Platform) ?[]const u8 {
-    for (packaged_artifact_targets) |target| {
-        if (platformsEqual(.{ .os = target.os, .arch = target.arch }, platform)) {
-            return target.filename;
-        }
-    }
-    return null;
-}
-
-fn packagedArtifactTargetIndex(filename: []const u8) ?usize {
-    for (packaged_artifact_targets, 0..) |target, i| {
-        if (std.mem.eql(u8, target.filename, filename)) return i;
-    }
-    return null;
-}
-
-fn isLowerSha256Hex(value: []const u8) bool {
-    if (value.len != 64) return false;
-    for (value) |byte| switch (byte) {
-        '0'...'9', 'a'...'f' => {},
-        else => return false,
-    };
-    return true;
-}
-
 fn closeChildStdin(child: *std.process.Child) void {
     if (child.stdin) |*stdin| {
         stdin.close();
@@ -4839,299 +3705,59 @@ fn terminateChild(child: *std.process.Child) void {
     _ = child.wait() catch {};
 }
 
-fn writeAllMaybeCancellable(
-    fd: c.fd_t,
-    bytes: []const u8,
-    reconnect_ui: ?*client_ui.ReconnectUi,
-    poll_reconnect_input: bool,
-) !void {
-    if (reconnect_ui == null) {
-        try io.writeAll(fd, bytes);
-        return;
+const ParsedSesshForTest = struct {
+    invocation: mux_sessh.Invocation,
+    owned_ssh_options: ?[][]const u8 = null,
+
+    fn deinit(self: *ParsedSesshForTest, allocator: std.mem.Allocator) void {
+        if (self.owned_ssh_options) |options| allocator.free(options);
+        self.* = undefined;
     }
+};
 
-    var written: usize = 0;
-    while (written < bytes.len) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.OUT,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, 50);
-        if (try reconnectShouldDetach(reconnect_ui.?, poll_reconnect_input)) return error.ReconnectDetached;
-        if (ready == 0) continue;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
-        if ((pollfds[0].revents & posix.POLL.OUT) == 0) continue;
-
-        const chunk_len = @min(bytes.len - written, 4096);
-        const n = c.write(fd, bytes[written..].ptr, chunk_len);
-        if (n <= 0) return error.WriteFailed;
-        written += @intCast(n);
-    }
-}
-
-fn readBootstrapLine(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    reconnect_ui: ?*client_ui.ReconnectUi,
-    poll_reconnect_input: bool,
-) ![]u8 {
-    var line: std.ArrayList(u8) = .empty;
-    defer line.deinit(allocator);
-
-    while (line.items.len < 4096) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, if (reconnect_ui == null) -1 else 50);
-        if (reconnect_ui) |ui| {
-            if (try reconnectShouldDetach(ui, poll_reconnect_input)) return error.ReconnectDetached;
-        }
-        if (ready == 0) continue;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[0].revents & posix.POLL.IN) == 0)
-        {
-            if (line.items.len == 0) return error.EndOfStream;
-            return try line.toOwnedSlice(allocator);
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
-        var byte: [1]u8 = undefined;
-        const n = c.read(fd, &byte, 1);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) {
-            if (line.items.len == 0) return error.EndOfStream;
-            return try line.toOwnedSlice(allocator);
-        }
-        if (byte[0] == '\n') return try line.toOwnedSlice(allocator);
-        try line.append(allocator, byte[0]);
-    }
-
-    return error.BootstrapLineTooLong;
-}
-
-fn reconnectShouldDetach(reconnect_ui: *client_ui.ReconnectUi, poll_reconnect_input: bool) !bool {
-    if (!poll_reconnect_input) return reconnect_ui.isCancelled();
-    return reconnect_ui.pollDetach(0);
-}
-
-test "readBootstrapLine returns the first line without the newline" {
-    var fds: [2]c.fd_t = undefined;
-    if (c.pipe(&fds) != 0) return error.PipeFailed;
-    defer _ = c.close(fds[0]);
-    defer _ = c.close(fds[1]);
-
-    try io.writeAll(fds[1], "MISSING linux x86_64\nextra\n");
-    const line = try readBootstrapLine(std.testing.allocator, fds[0], null, false);
-    defer std.testing.allocator.free(line);
-
-    try std.testing.expectEqualStrings("MISSING linux x86_64", line);
-}
-
-test "parseMissingPlatform parses canonical platform fields" {
-    const platform = try parseMissingPlatform("MISSING macos aarch64");
-
-    try std.testing.expectEqualStrings("macos", platform.os);
-    try std.testing.expectEqualStrings("aarch64", platform.arch);
-}
-
-test "artifactFilenameForPlatform maps canonical platform fields to packaged names" {
-    try std.testing.expectEqualStrings(
-        "sesshmux-linux-aarch64",
-        artifactFilenameForPlatform(.{ .os = "linux", .arch = "aarch64" }) orelse return error.MissingArtifactName,
-    );
-    try std.testing.expectEqualStrings(
-        "sesshmux-macos-x86_64",
-        artifactFilenameForPlatform(.{ .os = "macos", .arch = "x86_64" }) orelse return error.MissingArtifactName,
-    );
-    try std.testing.expectEqual(@as(?[]const u8, null), artifactFilenameForPlatform(.{
-        .os = "linux",
-        .arch = "sparc",
-    }));
-}
-
-test "packaged artifact manifest supplies hashes without hashing artifact contents" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const zero_hash = "0000000000000000000000000000000000000000000000000000000000000000";
-    var manifest: std.ArrayList(u8) = .empty;
-    defer manifest.deinit(std.testing.allocator);
-    for (packaged_artifact_targets) |target| {
-        try tmp.dir.writeFile(.{ .sub_path = target.filename, .data = "x" });
-        try manifest.writer(std.testing.allocator).print(
-            "{s} {s}\n",
-            .{ target.filename, zero_hash },
-        );
-    }
-    try tmp.dir.writeFile(.{ .sub_path = artifact_manifest_filename, .data = manifest.items });
-
-    const artifact_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(artifact_dir);
-    var artifact_set = (try loadPackagedArtifactSetFromDir(std.testing.allocator, artifact_dir)) orelse {
-        return error.MissingArtifactSet;
+fn parseSshArgsForTest(allocator: std.mem.Allocator, args: []const []const u8, _: anytype) !ParsedSesshForTest {
+    var scratch = mux_cli.Scratch{ .allocator = allocator };
+    defer scratch.deinit();
+    const parsed = try mux_sessh.parse(&scratch, args);
+    const owned_ssh_options = scratch.owned_ssh_options;
+    scratch.owned_ssh_options = null;
+    return .{
+        .invocation = parsed,
+        .owned_ssh_options = owned_ssh_options,
     };
-    defer artifact_set.deinit();
+}
 
-    const entry = artifact_set.find(.{ .os = "linux", .arch = "x86_64" }) orelse {
-        return error.MissingArtifactEntry;
+fn remoteNewFromParsedSessh(parsed: ParsedSesshForTest) RemoteNewSession {
+    return .{
+        .shell_command_args = parsed.invocation.command_args,
+        .tty_request = parsed.invocation.tty_request,
+        .proxy_required = parsed.invocation.proxy_required,
     };
-    try std.testing.expectEqualStrings(zero_hash, entry.hash_hex[0..]);
 }
 
-test "shellQuote produces single-quoted shell words" {
-    const quoted = try shellQuote(std.testing.allocator, "alpha ' beta");
-    defer std.testing.allocator.free(quoted);
-
-    try std.testing.expectEqualStrings("'alpha '\\'' beta'", quoted);
+fn shouldUseStreamPathForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool) bool {
+    return shouldUseStreamPath(remoteNewFromParsedSessh(parsed), parsed.invocation.common, stdin_is_tty);
 }
 
-test "joinRemoteShellCommandArgs matches ssh remote command joining" {
-    const joined = try joinRemoteShellCommandArgs(std.testing.allocator, &.{ "echo", "$SESSH_TEST_HOST" });
-    defer std.testing.allocator.free(joined);
+fn shouldUseProxyStreamForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool) bool {
+    return shouldUseProxyStream(remoteNewFromParsedSessh(parsed), parsed.invocation.common, stdin_is_tty);
+}
 
-    try std.testing.expectEqualStrings("echo $SESSH_TEST_HOST", joined);
+fn proxyDiagnosticsPlanForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool, stdout_is_tty: bool) ProxyDiagnosticsPlan {
+    return proxyDiagnosticsPlan(
+        parsed.invocation.ssh_options,
+        parsed.invocation.common.filter_level,
+        parsed.invocation.tty_request,
+        parsed.invocation.command_args,
+        stdin_is_tty,
+        stdout_is_tty,
+    );
+}
 
-    const empty = try joinRemoteShellCommandArgs(std.testing.allocator, &.{""});
-    defer std.testing.allocator.free(empty);
-    try std.testing.expectEqualStrings("", empty);
-
+test "remote shell command detection treats empty command like OpenSSH" {
     try std.testing.expect(!hasRemoteShellCommand(&.{""}));
     try std.testing.expect(hasRemoteShellCommand(&.{"\"\""}));
     try std.testing.expect(hasRemoteShellCommand(&.{ "", "" }));
-
-    const no_command = try shellCommandFromRemoteArgs(std.testing.allocator, &.{""});
-    try std.testing.expectEqual(@as(?[]u8, null), no_command);
-
-    const quoted_empty_command = try shellCommandFromRemoteArgs(std.testing.allocator, &.{"\"\""});
-    defer std.testing.allocator.free(quoted_empty_command.?);
-    try std.testing.expectEqualStrings("\"\"", quoted_empty_command.?);
-}
-
-test "transport ssh option filtering only removes tty request options" {
-    const options = &.{ "-F", "-tt", "-t", "-p2222", "-o", "BatchMode=yes" };
-    var out: [5][]const u8 = undefined;
-    var index: usize = 0;
-
-    try std.testing.expectEqual(@as(usize, 5), transportSshOptionsLen(options));
-    appendTransportSshOptions(out[0..], &index, options);
-
-    try expectArgvEqual(&.{ "-F", "-tt", "-p2222", "-o", "BatchMode=yes" }, out[0..index]);
-}
-
-test "parseSshArgs passes through ssh options before host" {
-    const args = [_][]const u8{
-        "sessh",
-        "-F",
-        "ssh_config",
-        "-p2222",
-        "-o",
-        "BatchMode=yes",
-        "-vvC",
-        "example.com",
-    };
-
-    const parsed = try parseSshArgs(std.testing.allocator, &args, .{});
-
-    try std.testing.expectEqualStrings("example.com", parsed.host);
-    try std.testing.expectEqual(@as(usize, 6), parsed.options.len);
-    try std.testing.expectEqualStrings("-F", parsed.options[0]);
-    try std.testing.expectEqualStrings("ssh_config", parsed.options[1]);
-    try std.testing.expectEqualStrings("-p2222", parsed.options[2]);
-    try std.testing.expectEqualStrings("-o", parsed.options[3]);
-    try std.testing.expectEqualStrings("BatchMode=yes", parsed.options[4]);
-    try std.testing.expectEqualStrings("-vvC", parsed.options[5]);
-}
-
-test "parseSshArgs accepts public sessh options before ssh options and host" {
-    const parsed = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "--log-level",
-        "debug",
-        "-F",
-        "ssh_config",
-        "example.com",
-    }, .{});
-
-    try std.testing.expectEqualStrings("example.com", parsed.host);
-    try std.testing.expectEqual(client_log.Level.debug, parsed.client_log_level);
-    try std.testing.expectEqual(@as(usize, 2), parsed.options.len);
-    try std.testing.expectEqualStrings("-F", parsed.options[0]);
-    try std.testing.expectEqualStrings("ssh_config", parsed.options[1]);
-}
-
-test "parseSshArgs accepts interleaved ssh and sessh options before host" {
-    var parsed = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "-t",
-        "--no-terminal-emulator",
-        "-p",
-        "2222",
-        "--log-level",
-        "debug",
-        "example.com",
-        "exit",
-        "3",
-    }, .{});
-    defer parsed.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("example.com", parsed.host);
-    try std.testing.expectEqual(client_log.Level.debug, parsed.client_log_level);
-    try std.testing.expect(!parsed.terminal_emulator);
-    try std.testing.expect(parsed.terminal_emulator_set);
-    try std.testing.expectEqual(SshTtyRequest.requested, parsed.tty_request);
-    try expectArgvEqual(&.{ "-t", "-p", "2222" }, parsed.options);
-    try expectArgvEqual(&.{ "exit", "3" }, parsed.shell_command_args);
-}
-
-test "parseSshArgs treats every direct post-host token as remote command" {
-    const parsed = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "example.com",
-        "rsync",
-        "--version",
-        "--no-terminal-emulator",
-        "--remote-name",
-        "work",
-        "-t",
-    }, .{});
-
-    try std.testing.expectEqualStrings("example.com", parsed.host);
-    try std.testing.expectEqual(SessionAction.new, parsed.action);
-    try std.testing.expect(!parsed.terminal_emulator_set);
-    try expectArgvEqual(&.{ "rsync", "--version", "--no-terminal-emulator", "--remote-name", "work", "-t" }, parsed.shell_command_args);
-}
-
-test "parseSshArgs rejects config-only sessh options on direct ssh transport" {
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "--scrollback-limit",
-        "100",
-        "example.com",
-    }, .{}));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "--initial-scrollback",
-        "0",
-        "example.com",
-    }, .{}));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "--bootstrap",
-        "example.com",
-    }, .{}));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "--no-bootstrap",
-        "example.com",
-    }, .{}));
-    try std.testing.expectError(error.UnsupportedSesshOption, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "--ssh-options",
-        "-F cfg",
-        "example.com",
-    }, .{}));
 }
 
 test "ssh verbosity maps to inferred client log level" {
@@ -5142,103 +3768,98 @@ test "ssh verbosity maps to inferred client log level" {
     try std.testing.expectEqual(client_log.Level.verbose, inferredClientLogLevel(&.{ "-vC", "-vv" }));
 }
 
-test "parseSshArgs rejects protocol-breaking ssh options" {
-    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "-G",
-        "example.com",
-    }, .{}));
-    try std.testing.expectError(error.UnsafeSshOption, parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "-Q",
-        "cipher",
-        "example.com",
-    }, .{}));
-}
-
 test "parseSshArgs routes OpenSSH-owned options to proxy stream mode" {
-    const x11 = try parseSshArgs(std.testing.allocator, &.{
+    var x11 = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-X",
         "example.com",
     }, .{});
-    try std.testing.expect(x11.proxy_required);
-    try std.testing.expect(shouldUseProxyStream(x11, true));
+    defer x11.deinit(std.testing.allocator);
+    try std.testing.expect(x11.invocation.proxy_required);
+    try std.testing.expect(shouldUseProxyStreamForTest(x11, true));
 
-    const agent = try parseSshArgs(std.testing.allocator, &.{
+    var agent = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-A",
         "example.com",
     }, .{});
-    try std.testing.expect(agent.proxy_required);
-    try std.testing.expect(shouldUseProxyStream(agent, true));
+    defer agent.deinit(std.testing.allocator);
+    try std.testing.expect(agent.invocation.proxy_required);
+    try std.testing.expect(shouldUseProxyStreamForTest(agent, true));
 
-    const stdin_null = try parseSshArgs(std.testing.allocator, &.{
+    var stdin_null = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-n",
         "example.com",
     }, .{});
-    try std.testing.expect(stdin_null.proxy_required);
-    try std.testing.expect(shouldUseProxyStream(stdin_null, true));
+    defer stdin_null.deinit(std.testing.allocator);
+    try std.testing.expect(stdin_null.invocation.proxy_required);
+    try std.testing.expect(shouldUseProxyStreamForTest(stdin_null, true));
 
-    const fork_after_auth = try parseSshArgs(std.testing.allocator, &.{
+    var fork_after_auth = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-f",
         "example.com",
     }, .{});
-    try std.testing.expect(fork_after_auth.proxy_required);
-    try std.testing.expect(shouldUseProxyStream(fork_after_auth, true));
+    defer fork_after_auth.deinit(std.testing.allocator);
+    try std.testing.expect(fork_after_auth.invocation.proxy_required);
+    try std.testing.expect(shouldUseProxyStreamForTest(fork_after_auth, true));
 
-    const forward = try parseSshArgs(std.testing.allocator, &.{
+    var forward = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-L",
         "8080:localhost:80",
         "example.com",
     }, .{});
-    try std.testing.expect(forward.proxy_required);
-    try std.testing.expect(shouldUseProxyStream(forward, true));
+    defer forward.deinit(std.testing.allocator);
+    try std.testing.expect(forward.invocation.proxy_required);
+    try std.testing.expect(shouldUseProxyStreamForTest(forward, true));
 
-    const direct = try parseSshArgs(std.testing.allocator, &.{
+    var direct = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-W",
         "host:22",
         "example.com",
     }, .{});
-    try std.testing.expect(direct.proxy_required);
-    try std.testing.expect(shouldUseProxyStream(direct, true));
+    defer direct.deinit(std.testing.allocator);
+    try std.testing.expect(direct.invocation.proxy_required);
+    try std.testing.expect(shouldUseProxyStreamForTest(direct, true));
 
-    const request_tty = try parseSshArgs(std.testing.allocator, &.{
+    var request_tty = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-o",
         "RequestTTY=force",
         "example.com",
     }, .{});
-    try std.testing.expect(request_tty.proxy_required);
-    try std.testing.expect(shouldUseProxyStream(request_tty, true));
+    defer request_tty.deinit(std.testing.allocator);
+    try std.testing.expect(request_tty.invocation.proxy_required);
+    try std.testing.expect(shouldUseProxyStreamForTest(request_tty, true));
 
-    const explicit = try parseSshArgs(std.testing.allocator, &.{
+    var explicit = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--filter-level",
         "hygienic",
         "example.com",
     }, .{});
-    try std.testing.expectEqual(config.FilterLevel.hygienic, explicit.filter_level);
-    try std.testing.expect(explicit.filter_level_set);
-    try std.testing.expect(shouldUseProxyStream(explicit, true));
+    defer explicit.deinit(std.testing.allocator);
+    try std.testing.expectEqual(config.FilterLevel.hygienic, explicit.invocation.common.filter_level);
+    try std.testing.expect(explicit.invocation.common.filter_level_set);
+    try std.testing.expect(shouldUseProxyStreamForTest(explicit, true));
 
-    const explicit_disabled = try parseSshArgs(std.testing.allocator, &.{
+    var explicit_disabled = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--filter-level",
         "emulated",
         "example.com",
     }, .{});
-    try std.testing.expectEqual(config.FilterLevel.emulated, explicit_disabled.filter_level);
-    try std.testing.expect(explicit_disabled.filter_level_set);
-    try std.testing.expect(!shouldUseProxyStream(explicit_disabled, true));
+    defer explicit_disabled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(config.FilterLevel.emulated, explicit_disabled.invocation.common.filter_level);
+    try std.testing.expect(explicit_disabled.invocation.common.filter_level_set);
+    try std.testing.expect(!shouldUseProxyStreamForTest(explicit_disabled, true));
 }
 
 test "proxy command keeps outer-only options off bootstrap ssh" {
-    const parsed = try parseSshArgs(std.testing.allocator, &.{
+    var parsed = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-X",
         "-tt",
@@ -5251,9 +3872,10 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
         "-v",
         "example.com",
     }, .{});
-    try std.testing.expect(shouldUseProxyStream(parsed, true));
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expect(shouldUseProxyStreamForTest(parsed, true));
 
-    const option = try proxyCommandOption(std.testing.allocator, "sesshmux-dev", parsed, "/tmp/sessh-test/c/abc", .hygienic, true);
+    const option = try proxyCommandOption(std.testing.allocator, "sesshmux-dev", parsed.invocation.ssh_options, "/tmp/sessh-test/c/abc", .hygienic, true);
     defer std.testing.allocator.free(option);
 
     try std.testing.expect(std.mem.indexOf(u8, option, ":internal-proxy-stream:") != null);
@@ -5273,172 +3895,121 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "'-tt'") == null);
 }
 
-test "parseSshArgs uses ssh tty request to enable shell-evaluated commands" {
-    const single = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "-t",
-        "example.com",
-        "echo",
-        "$SESSH_TEST_HOST",
-    }, .{});
-    try std.testing.expectEqual(SshTtyRequest.requested, single.tty_request);
-    try std.testing.expectEqual(@as(usize, 2), single.shell_command_args.len);
-    try std.testing.expectEqualStrings("echo", single.shell_command_args[0]);
-    try std.testing.expectEqualStrings("$SESSH_TEST_HOST", single.shell_command_args[1]);
-
-    const forced = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "-tt",
-        "example.com",
-        "uname",
-        "-a",
-    }, .{});
-    try std.testing.expectEqual(SshTtyRequest.forced, forced.tty_request);
-    try std.testing.expectEqual(@as(usize, 2), forced.shell_command_args.len);
-    try std.testing.expectEqualStrings("uname", forced.shell_command_args[0]);
-    try std.testing.expectEqualStrings("-a", forced.shell_command_args[1]);
-
-    const repeated = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "-t",
-        "-t",
-        "example.com",
-        "tty",
-    }, .{});
-    try std.testing.expectEqual(SshTtyRequest.forced, repeated.tty_request);
-
-    const empty = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "-t",
-        "example.com",
-        "",
-    }, .{});
-    try std.testing.expectEqual(SshTtyRequest.requested, empty.tty_request);
-    try std.testing.expectEqual(@as(usize, 1), empty.shell_command_args.len);
-    try std.testing.expectEqualStrings("", empty.shell_command_args[0]);
-    try std.testing.expect(!shouldUseStreamPath(empty, false));
-    try std.testing.expect(!shouldUseProxyStream(empty, false));
-}
-
 test "stream routing preserves ssh remote command tty semantics" {
-    const command = try parseSshArgs(std.testing.allocator, &.{
+    var command = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "example.com",
         "echo",
         "hello",
     }, .{});
-    try std.testing.expectEqual(SshTtyRequest.none, command.tty_request);
-    try std.testing.expectEqual(@as(usize, 2), command.shell_command_args.len);
-    try std.testing.expect(shouldUseStreamPath(command, false));
-    try std.testing.expect(shouldUseStreamPath(command, true));
-    try std.testing.expect(shouldUseProxyStream(command, false));
-    try std.testing.expect(shouldUseProxyStream(command, true));
+    defer command.deinit(std.testing.allocator);
+    try std.testing.expectEqual(SshTtyRequest.none, command.invocation.tty_request);
+    try std.testing.expectEqual(@as(usize, 2), command.invocation.command_args.len);
+    try std.testing.expect(shouldUseStreamPathForTest(command, false));
+    try std.testing.expect(shouldUseStreamPathForTest(command, true));
+    try std.testing.expect(shouldUseProxyStreamForTest(command, false));
+    try std.testing.expect(shouldUseProxyStreamForTest(command, true));
 
-    const single = try parseSshArgs(std.testing.allocator, &.{
+    var single = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-t",
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(shouldUseStreamPath(single, false));
-    try std.testing.expect(!shouldUseStreamPath(single, true));
-    try std.testing.expect(shouldUseProxyStream(single, false));
-    try std.testing.expect(!shouldUseProxyStream(single, true));
+    defer single.deinit(std.testing.allocator);
+    try std.testing.expect(shouldUseStreamPathForTest(single, false));
+    try std.testing.expect(!shouldUseStreamPathForTest(single, true));
+    try std.testing.expect(shouldUseProxyStreamForTest(single, false));
+    try std.testing.expect(!shouldUseProxyStreamForTest(single, true));
 
-    const forced = try parseSshArgs(std.testing.allocator, &.{
+    var forced = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-tt",
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(shouldUseStreamPath(forced, false));
-    try std.testing.expect(!shouldUseStreamPath(forced, true));
-    try std.testing.expect(shouldUseProxyStream(forced, false));
-    try std.testing.expect(!shouldUseProxyStream(forced, true));
+    defer forced.deinit(std.testing.allocator);
+    try std.testing.expect(shouldUseStreamPathForTest(forced, false));
+    try std.testing.expect(!shouldUseStreamPathForTest(forced, true));
+    try std.testing.expect(shouldUseProxyStreamForTest(forced, false));
+    try std.testing.expect(!shouldUseProxyStreamForTest(forced, true));
 }
 
 test "no terminal emulator forces stream path and preserves ssh tty semantics" {
-    const terminal_emulator = try parseSshArgs(std.testing.allocator, &.{
+    var terminal_emulator = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--terminal-emulator",
         "example.com",
     }, .{});
-    try std.testing.expect(terminal_emulator.terminal_emulator);
-    try std.testing.expect(terminal_emulator.terminal_emulator_set);
-    try std.testing.expect(!shouldUseStreamPath(terminal_emulator, true));
-    try std.testing.expect(!shouldUseStreamPath(terminal_emulator, false));
+    defer terminal_emulator.deinit(std.testing.allocator);
+    try std.testing.expect(terminal_emulator.invocation.common.terminal_emulator);
+    try std.testing.expect(terminal_emulator.invocation.common.terminal_emulator_set);
+    try std.testing.expect(!shouldUseStreamPathForTest(terminal_emulator, true));
+    try std.testing.expect(!shouldUseStreamPathForTest(terminal_emulator, false));
 
-    const interactive = try parseSshArgs(std.testing.allocator, &.{
+    var interactive = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "example.com",
     }, .{});
-    try std.testing.expect(!interactive.terminal_emulator);
-    try std.testing.expect(interactive.terminal_emulator_set);
-    try std.testing.expect(shouldUseStreamPath(interactive, true));
-    try std.testing.expect(shouldUseStreamPath(interactive, false));
-    try std.testing.expect(shouldUseProxyStream(interactive, true));
-    try std.testing.expect(shouldUseProxyStream(interactive, false));
+    defer interactive.deinit(std.testing.allocator);
+    try std.testing.expect(!interactive.invocation.common.terminal_emulator);
+    try std.testing.expect(interactive.invocation.common.terminal_emulator_set);
+    try std.testing.expect(shouldUseStreamPathForTest(interactive, true));
+    try std.testing.expect(shouldUseStreamPathForTest(interactive, false));
+    try std.testing.expect(shouldUseProxyStreamForTest(interactive, true));
+    try std.testing.expect(shouldUseProxyStreamForTest(interactive, false));
 
-    const command = try parseSshArgs(std.testing.allocator, &.{
+    var command = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "example.com",
         "echo",
         "hello",
     }, .{});
-    try std.testing.expect(!command.terminal_emulator);
-    try std.testing.expect(shouldUseStreamPath(command, true));
-    try std.testing.expect(shouldUseProxyStream(command, true));
+    defer command.deinit(std.testing.allocator);
+    try std.testing.expect(!command.invocation.common.terminal_emulator);
+    try std.testing.expect(shouldUseStreamPathForTest(command, true));
+    try std.testing.expect(shouldUseProxyStreamForTest(command, true));
 
-    const forced = try parseSshArgs(std.testing.allocator, &.{
+    var forced = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "-tt",
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(!forced.terminal_emulator);
-    try std.testing.expect(shouldUseStreamPath(forced, false));
-    try std.testing.expect(shouldUseProxyStream(forced, false));
+    defer forced.deinit(std.testing.allocator);
+    try std.testing.expect(!forced.invocation.common.terminal_emulator);
+    try std.testing.expect(shouldUseStreamPathForTest(forced, false));
+    try std.testing.expect(shouldUseProxyStreamForTest(forced, false));
 
-    const requested_with_tty = try parseSshArgs(std.testing.allocator, &.{
+    var requested_with_tty = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "-t",
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(!requested_with_tty.terminal_emulator);
-    try std.testing.expect(shouldUseStreamPath(requested_with_tty, true));
-    try std.testing.expect(shouldUseProxyStream(requested_with_tty, true));
+    defer requested_with_tty.deinit(std.testing.allocator);
+    try std.testing.expect(!requested_with_tty.invocation.common.terminal_emulator);
+    try std.testing.expect(shouldUseStreamPathForTest(requested_with_tty, true));
+    try std.testing.expect(shouldUseProxyStreamForTest(requested_with_tty, true));
 
-    const requested_without_tty = try parseSshArgs(std.testing.allocator, &.{
+    var requested_without_tty = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "-t",
         "example.com",
         "tty",
     }, .{});
-    try std.testing.expect(shouldUseStreamPath(requested_without_tty, false));
-    try std.testing.expect(shouldUseProxyStream(requested_without_tty, false));
-}
-
-test "parseSshArgs permits explicit safe config overrides" {
-    const parsed = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "-oRequestTTY=no",
-        "-o",
-        "SessionType=default",
-        "example.com",
-    }, .{});
-
-    try std.testing.expectEqualStrings("example.com", parsed.host);
-    try std.testing.expectEqual(@as(usize, 3), parsed.options.len);
+    defer requested_without_tty.deinit(std.testing.allocator);
+    try std.testing.expect(shouldUseStreamPathForTest(requested_without_tty, false));
+    try std.testing.expect(shouldUseProxyStreamForTest(requested_without_tty, false));
 }
 
 test "default ssh options append resolved interactive IPQoS value" {
-    var parsed = SessionInvocation{
+    var parsed = SshTarget{
         .options = &.{},
         .host = "example.com",
         .default_ipqos_option = "-oIPQoS=af21",
@@ -5453,55 +4024,6 @@ test "default ssh options append resolved interactive IPQoS value" {
 
     parsed.default_ipqos_option = null;
     try std.testing.expectEqual(@as(usize, 0), defaultSshOptionsLen(parsed));
-}
-
-test "parseSshConfig returns resolved endpoint and first configured ipqos value" {
-    var resolved = try parseSshConfig(std.testing.allocator,
-        \\hostname example.com
-        \\port 2200
-        \\ipqos ef cs0
-        \\user tomm
-        \\
-    , &.{}, "alias");
-    defer resolved.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("example.com", resolved.hostname);
-    try std.testing.expectEqualStrings("2200", resolved.port);
-    try std.testing.expectEqualStrings("ef", resolved.ipqos.?);
-}
-
-test "parseSshConfig defaults endpoint fields" {
-    var resolved = try parseSshConfig(std.testing.allocator,
-        \\user tomm
-        \\
-    , &.{ "-p", "2022" }, "alias");
-    defer resolved.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("alias", resolved.hostname);
-    try std.testing.expectEqualStrings("2022", resolved.port);
-    try std.testing.expectEqual(@as(?[]u8, null), resolved.ipqos);
-}
-
-test "explicitSshPort parses common ssh port options" {
-    try std.testing.expectEqualStrings("2022", explicitSshPort(&.{ "-p", "2022" }).?);
-    try std.testing.expectEqualStrings("2023", explicitSshPort(&.{"-p2023"}).?);
-    try std.testing.expectEqualStrings("2024", explicitSshPort(&.{ "-o", "Port=2024" }).?);
-    try std.testing.expectEqualStrings("2025", explicitSshPort(&.{"-oPort 2025"}).?);
-    try std.testing.expectEqual(@as(?[]const u8, null), explicitSshPort(&.{"-p0"}));
-}
-
-test "parseSshArgs treats post-host mux words as remote command" {
-    const parsed = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "example.com",
-        "attach",
-        "s12",
-        "--no-bootstrap",
-    }, .{});
-
-    try std.testing.expectEqualStrings("example.com", parsed.host);
-    try std.testing.expectEqual(SessionAction.new, parsed.action);
-    try std.testing.expect(parsed.bootstrap);
-    try std.testing.expect(!parsed.bootstrap_set);
-    try expectArgvEqual(&.{ "attach", "s12", "--no-bootstrap" }, parsed.shell_command_args);
 }
 
 test "proxy stream reconnect status follows filter level" {
@@ -5520,19 +4042,20 @@ test "terminal reconnect presentation follows filter level" {
 }
 
 test "proxy diagnostics plan maps emulated to hygienic client socket" {
-    const parsed = try parseSshArgs(std.testing.allocator, &.{
+    var parsed = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
         "example.com",
     }, .{});
+    defer parsed.deinit(std.testing.allocator);
 
-    const interactive = proxyDiagnosticsPlan(parsed, true, true);
+    const interactive = proxyDiagnosticsPlanForTest(parsed, true, true);
     try std.testing.expectEqual(config.FilterLevel.hygienic, interactive.command_level);
     try std.testing.expect(interactive.use_client_socket);
     try std.testing.expect(interactive.wrap_visible_ssh);
     try std.testing.expect(interactive.client_ctrl_r);
 
-    const no_stdout = proxyDiagnosticsPlan(parsed, true, false);
+    const no_stdout = proxyDiagnosticsPlanForTest(parsed, true, false);
     try std.testing.expectEqual(config.FilterLevel.unhygienic, no_stdout.command_level);
     try std.testing.expect(!no_stdout.use_client_socket);
     try std.testing.expect(!no_stdout.wrap_visible_ssh);
@@ -5540,69 +4063,46 @@ test "proxy diagnostics plan maps emulated to hygienic client socket" {
 }
 
 test "proxy diagnostics plan honors raw and unhygienic levels" {
-    const raw = try parseSshArgs(std.testing.allocator, &.{
+    var raw = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--filter-level",
         "raw",
         "--no-terminal-emulator",
         "example.com",
     }, .{});
-    try std.testing.expectEqual(config.FilterLevel.raw, raw.filter_level);
-    const raw_plan = proxyDiagnosticsPlan(raw, true, true);
+    defer raw.deinit(std.testing.allocator);
+    try std.testing.expectEqual(config.FilterLevel.raw, raw.invocation.common.filter_level);
+    const raw_plan = proxyDiagnosticsPlanForTest(raw, true, true);
     try std.testing.expectEqual(config.FilterLevel.raw, raw_plan.command_level);
     try std.testing.expect(!raw_plan.use_client_socket);
 
-    const unhygienic = try parseSshArgs(std.testing.allocator, &.{
+    var unhygienic = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--filter-level",
         "unhygienic",
         "--no-terminal-emulator",
         "example.com",
     }, .{});
-    try std.testing.expectEqual(config.FilterLevel.unhygienic, unhygienic.filter_level);
-    const noisy_plan = proxyDiagnosticsPlan(unhygienic, true, true);
+    defer unhygienic.deinit(std.testing.allocator);
+    try std.testing.expectEqual(config.FilterLevel.unhygienic, unhygienic.invocation.common.filter_level);
+    const noisy_plan = proxyDiagnosticsPlanForTest(unhygienic, true, true);
     try std.testing.expectEqual(config.FilterLevel.unhygienic, noisy_plan.command_level);
     try std.testing.expect(!noisy_plan.use_client_socket);
 }
 
 test "proxy diagnostics plan disables ctrl-r when visible ssh is not wrapped" {
-    const parsed = try parseSshArgs(std.testing.allocator, &.{
+    var parsed = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--filter-level",
         "hygienic",
         "-T",
         "example.com",
     }, .{});
+    defer parsed.deinit(std.testing.allocator);
 
-    const plan = proxyDiagnosticsPlan(parsed, true, true);
+    const plan = proxyDiagnosticsPlanForTest(parsed, true, true);
     try std.testing.expectEqual(config.FilterLevel.hygienic, plan.command_level);
     try std.testing.expect(plan.use_client_socket);
     try std.testing.expect(!plan.wrap_visible_ssh);
     try std.testing.expect(!plan.client_ctrl_r);
-}
-
-fn expectArgvEqual(expected: []const []const u8, actual: []const []const u8) !void {
-    try std.testing.expectEqual(expected.len, actual.len);
-    for (expected, actual) |expected_arg, actual_arg| {
-        try std.testing.expectEqualStrings(expected_arg, actual_arg);
-    }
-}
-
-test "sesshmux-dev uses development artifact upload" {
-    try std.testing.expect(isDevelopmentExecutable("/tmp/sesshmux-dev"));
-    try std.testing.expect(isDevelopmentExecutable("/tmp/build/bin/sesshmux-dev"));
-    try std.testing.expect(!isDevelopmentExecutable("/tmp/sessh-dev"));
-    try std.testing.expect(!isDevelopmentExecutable("/tmp/build/bin/sessh"));
-    try std.testing.expect(!isDevelopmentExecutable("/tmp/libexec/sessh/sesshmux-macos-aarch64"));
-}
-
-test "parseSshArgs accepts ssh-style remote commands without a tty request" {
-    const parsed = try parseSshArgs(std.testing.allocator, &.{
-        "sessh",
-        "example.com",
-        "uname",
-    }, .{});
-    try std.testing.expectEqual(SshTtyRequest.none, parsed.tty_request);
-    try std.testing.expectEqual(@as(usize, 1), parsed.shell_command_args.len);
-    try std.testing.expectEqualStrings("uname", parsed.shell_command_args[0]);
 }

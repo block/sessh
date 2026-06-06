@@ -1,8 +1,6 @@
 const std = @import("std");
 
 const mux_cli = @import("cli.zig");
-const mux_common = @import("common.zig");
-const ssh_client = @import("../transport/ssh.zig");
 
 pub fn parse(scratch: *mux_cli.Scratch, args: []const []const u8) !mux_cli.List {
     var parsed = mux_cli.CommandParts{};
@@ -63,22 +61,6 @@ pub fn parse(scratch: *mux_cli.Scratch, args: []const []const u8) !mux_cli.List 
     if (list.client_target != null and (list.refresh or list.exited or !list.include_cached_routes)) return error.UnsupportedMuxOption;
     list.ssh_options = try scratch.ownSshOptions(&parsed.ssh_options);
     return list;
-}
-
-pub fn toInvocation(list: mux_cli.List) !ssh_client.SessionInvocation {
-    var parsed = try mux_common.baseInvocation(list.ssh_options, .list, list.common);
-    parsed.host = switch (list.target) {
-        .local => "",
-        .host => |host| host,
-    };
-    parsed.list_refresh = list.refresh;
-    parsed.list_include_cached_routes = list.include_cached_routes;
-    parsed.list_jsonl = list.jsonl;
-    parsed.list_exited = list.exited;
-    parsed.list_all = list.all;
-    parsed.list_client_target = list.client_target;
-    parsed.list_client_option_arg = list.client_option_arg;
-    return parsed;
 }
 
 test "parse dot is explicit local-only target" {

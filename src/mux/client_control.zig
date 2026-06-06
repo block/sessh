@@ -1,8 +1,6 @@
 const std = @import("std");
 
 const mux_cli = @import("cli.zig");
-const mux_common = @import("common.zig");
-const ssh_client = @import("../transport/ssh.zig");
 
 pub fn parse(
     scratch: *mux_cli.Scratch,
@@ -124,34 +122,4 @@ pub fn appendRemoteArgs(
         try out.append(allocator, "--seconds");
         try out.append(allocator, seconds);
     }
-}
-
-pub fn toInvocation(
-    action: ssh_client.SessionAction,
-    control: mux_cli.ClientControl,
-    debug_action: ?mux_cli.DebugAction,
-) !ssh_client.SessionInvocation {
-    var parsed = try mux_common.baseInvocation(control.ssh_options, action, control.common);
-    parsed.host = switch (control.target) {
-        .local => "",
-        .host => |host| host,
-    };
-    if (control.all) {
-        parsed.client_target = .all;
-    } else if (control.last_input) {
-        parsed.client_target = .last_input;
-    } else if (control.client_guid) |guid| {
-        parsed.client_target = .client_guid;
-        parsed.client_guid = guid;
-    }
-    parsed.client_session_ref = control.session_ref;
-    parsed.client_repaint_scrollback = control.scrollback;
-    if (debug_action) |value| {
-        parsed.debug_client_action = switch (value) {
-            .sever_connection => .sever_connection,
-            .unresponsive_connection => .unresponsive_connection,
-        };
-        parsed.debug_unresponsive_seconds = control.seconds;
-    }
-    return parsed;
 }
