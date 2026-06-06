@@ -65,26 +65,6 @@ pub fn parse(scratch: *mux_cli.Scratch, args: []const []const u8) !mux_cli.List 
     return list;
 }
 
-pub fn appendRemoteArgs(allocator: std.mem.Allocator, out: *std.ArrayList([]const u8), list: mux_cli.List) !void {
-    try out.append(allocator, "list");
-    try out.append(allocator, "--host");
-    try out.append(allocator, ".");
-    try mux_cli.appendRemoteCommonArgs(allocator, out, list.common);
-    if (list.refresh) try out.append(allocator, "--refresh");
-    if (list.exited) try out.append(allocator, "--exited");
-    if (list.all) try out.append(allocator, "--all");
-    if (list.jsonl) try out.append(allocator, "--jsonl");
-    if (list.client_target) |target| {
-        if (list.client_option_arg) |client_arg| {
-            try out.append(allocator, client_arg);
-            if (std.mem.eql(u8, client_arg, "--client")) try out.append(allocator, target);
-        } else {
-            try out.append(allocator, "--client");
-            try out.append(allocator, target);
-        }
-    }
-}
-
 pub fn toInvocation(list: mux_cli.List) !ssh_client.SessionInvocation {
     var parsed = try mux_common.baseInvocation(list.ssh_options, .list, list.common);
     parsed.host = switch (list.target) {

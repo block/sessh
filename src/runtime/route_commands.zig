@@ -3,9 +3,9 @@ const std = @import("std");
 const client_log = @import("../core/client_log.zig");
 const io_helpers = @import("../core/io.zig");
 const list_format = @import("list_format.zig");
+const mux_remote_args = @import("../mux/remote_args.zig");
 const runtime_commands = @import("commands.zig");
 const session_registry = @import("session_registry.zig");
-const shell = @import("../core/shell.zig");
 
 pub const RemoteCommandResult = struct {
     stdout: []u8,
@@ -286,24 +286,14 @@ fn queryRemoteHostList(
     all: bool,
 ) ![]u8 {
     if (remote_runner) |runner| {
-        const extra_args: usize = 5 + (if (exited) @as(usize, 1) else 0) + (if (all) @as(usize, 1) else 0);
-        const argv = try allocator.alloc([]const u8, extra_args);
-        defer allocator.free(argv);
-        argv[0] = "sesshmux";
-        argv[1] = "list";
-        argv[2] = "--host";
-        argv[3] = ".";
-        argv[4] = "--jsonl";
-        var arg_index: usize = 5;
-        if (exited) {
-            argv[arg_index] = "--exited";
-            arg_index += 1;
-        }
-        if (all) {
-            argv[arg_index] = "--all";
-            arg_index += 1;
-        }
-        var result = try runner.run(allocator, host, ssh_options, argv);
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(allocator);
+        try mux_remote_args.appendProgramLocalList(allocator, &argv, "sesshmux", .{
+            .jsonl = true,
+            .exited = exited,
+            .all = all,
+        });
+        var result = try runner.run(allocator, host, ssh_options, argv.items);
         errdefer result.deinit(allocator);
         if (result.exit_code == 0) {
             allocator.free(result.stderr);
@@ -313,38 +303,18 @@ fn queryRemoteHostList(
         return error.RemoteListFailed;
     }
 
-    const extra_args: usize = (if (exited) @as(usize, 1) else 0) +
-        (if (all) @as(usize, 1) else 0);
-    const ssh_options_arg = if (ssh_options.len > 0) try shell.joinArgs(allocator, ssh_options) else null;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    const ssh_options_arg = try mux_remote_args.appendRoutedList(allocator, &argv, exe, host, ssh_options, .{
+        .jsonl = true,
+        .exited = exited,
+        .all = all,
+    });
     defer if (ssh_options_arg) |value| allocator.free(value);
-    const ssh_option_args: usize = if (ssh_options_arg != null) 2 else 0;
-    const argv = try allocator.alloc([]const u8, 2 + ssh_option_args + 2 + extra_args);
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = "list";
-    var arg_index: usize = 2;
-    if (ssh_options_arg) |value| {
-        argv[arg_index] = "--ssh-options";
-        arg_index += 1;
-        argv[arg_index] = value;
-        arg_index += 1;
-    }
-    argv[arg_index] = host;
-    arg_index += 1;
-    argv[arg_index] = "--jsonl";
-    arg_index += 1;
-    if (exited) {
-        argv[arg_index] = "--exited";
-        arg_index += 1;
-    }
-    if (all) {
-        argv[arg_index] = "--all";
-        arg_index += 1;
-    }
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
-        .argv = argv,
+        .argv = argv.items,
         .max_output_bytes = 1024 * 1024,
         .expand_arg0 = .expand,
     });
@@ -430,24 +400,14 @@ fn queryRemoteHostKillJsonlWithRequests(
     request_jsons: []const []const u8,
 ) ![]u8 {
     if (remote_runner) |runner| {
-        const request_args = request_jsons.len * 2;
-        const argv = try allocator.alloc([]const u8, 5 + request_args + targets.len);
-        defer allocator.free(argv);
-        argv[0] = "sesshmux";
-        argv[1] = "kill";
-        argv[2] = "--host";
-        argv[3] = ".";
-        argv[4] = "--jsonl";
-        var arg_index: usize = 5;
-        for (request_jsons) |request_json| {
-            argv[arg_index] = "--request";
-            arg_index += 1;
-            argv[arg_index] = request_json;
-            arg_index += 1;
-        }
-        @memcpy(argv[arg_index..], targets);
-
-        var result = try runner.run(allocator, host, ssh_options, argv);
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(allocator);
+        try mux_remote_args.appendProgramLocalKill(allocator, &argv, "sesshmux", .{
+            .jsonl = true,
+            .ids = targets,
+            .request_jsons = request_jsons,
+        });
+        var result = try runner.run(allocator, host, ssh_options, argv.items);
         errdefer result.deinit(allocator);
         if (result.exit_code == 0 or result.stdout.len > 0) {
             allocator.free(result.stderr);
@@ -457,36 +417,18 @@ fn queryRemoteHostKillJsonlWithRequests(
         return error.RemoteKillFailed;
     }
 
-    const ssh_options_arg = if (ssh_options.len > 0) try shell.joinArgs(allocator, ssh_options) else null;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    const ssh_options_arg = try mux_remote_args.appendRoutedKill(allocator, &argv, exe, host, ssh_options, .{
+        .jsonl = true,
+        .ids = targets,
+        .request_jsons = request_jsons,
+    });
     defer if (ssh_options_arg) |value| allocator.free(value);
-    const ssh_option_args: usize = if (ssh_options_arg != null) 2 else 0;
-    const request_args = request_jsons.len * 2;
-    const argv = try allocator.alloc([]const u8, 2 + ssh_option_args + 1 + 1 + request_args + targets.len);
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = "kill";
-    var arg_index: usize = 2;
-    if (ssh_options_arg) |value| {
-        argv[arg_index] = "--ssh-options";
-        arg_index += 1;
-        argv[arg_index] = value;
-        arg_index += 1;
-    }
-    argv[arg_index] = host;
-    arg_index += 1;
-    argv[arg_index] = "--jsonl";
-    arg_index += 1;
-    for (request_jsons) |request_json| {
-        argv[arg_index] = "--request";
-        arg_index += 1;
-        argv[arg_index] = request_json;
-        arg_index += 1;
-    }
-    @memcpy(argv[arg_index..], targets);
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
-        .argv = argv,
+        .argv = argv.items,
         .max_output_bytes = 1024 * 1024,
         .expand_arg0 = .expand,
     });
@@ -522,27 +464,15 @@ pub fn spawnRemoteKillJsonl(
     ssh_options: []const []const u8,
     targets: []const []const u8,
 ) void {
-    const ssh_options_arg = if (ssh_options.len > 0) shell.joinArgs(allocator, ssh_options) catch return else null;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    const ssh_options_arg = mux_remote_args.appendRoutedKill(allocator, &argv, exe, host, ssh_options, .{
+        .jsonl = true,
+        .ids = targets,
+    }) catch return;
     defer if (ssh_options_arg) |value| allocator.free(value);
-    const ssh_option_args: usize = if (ssh_options_arg != null) 2 else 0;
-    const argv = allocator.alloc([]const u8, 2 + ssh_option_args + 1 + 1 + targets.len) catch return;
-    defer allocator.free(argv);
-    argv[0] = exe;
-    argv[1] = "kill";
-    var arg_index: usize = 2;
-    if (ssh_options_arg) |value| {
-        argv[arg_index] = "--ssh-options";
-        arg_index += 1;
-        argv[arg_index] = value;
-        arg_index += 1;
-    }
-    argv[arg_index] = host;
-    arg_index += 1;
-    argv[arg_index] = "--jsonl";
-    arg_index += 1;
-    @memcpy(argv[arg_index..], targets);
 
-    var child = std.process.Child.init(argv, allocator);
+    var child = std.process.Child.init(argv.items, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;

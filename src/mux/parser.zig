@@ -7,7 +7,9 @@ const mux_detach = @import("detach.zig");
 const mux_kill = @import("kill.zig");
 const mux_list = @import("list.zig");
 const mux_new = @import("new.zig");
+const mux_remote_args = @import("remote_args.zig");
 const mux_repaint = @import("repaint.zig");
+const session_registry = @import("../runtime/session_registry.zig");
 
 pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !mux_cli.Invocation {
     if (args.len < 2) return error.UnsupportedMuxCommand;
@@ -50,15 +52,23 @@ pub fn remoteLocalArgs(
 ) ![]const []const u8 {
     var invocation = try parse(allocator, original_args);
     defer invocation.deinit(allocator);
+    return remoteLocalArgsForCommand(allocator, invocation.command, default_session_ref, null);
+}
 
+pub fn remoteLocalArgsForCommand(
+    allocator: std.mem.Allocator,
+    command: mux_cli.Command,
+    default_session_ref: ?[]const u8,
+    route: ?*const session_registry.Route,
+) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     defer out.deinit(allocator);
     try out.append(allocator, "sesshmux");
-    switch (invocation.command) {
+    switch (command) {
         .new => |new| try mux_new.appendRemoteArgs(allocator, &out, new),
         .attach => |attach| try mux_attach.appendRemoteArgs(allocator, &out, attach),
-        .list => |list| try mux_list.appendRemoteArgs(allocator, &out, list),
-        .kill => |kill| try mux_kill.appendRemoteArgs(allocator, &out, kill),
+        .list => |list| try mux_remote_args.appendList(allocator, &out, list),
+        .kill => |kill| try mux_remote_args.appendKill(allocator, &out, kill, route),
         .detach => |control| try mux_detach.appendRemoteArgs(allocator, &out, control, default_session_ref),
         .repaint => |control| try mux_repaint.appendRemoteArgs(allocator, &out, control, default_session_ref),
         .debug => |debug| try mux_debug.appendRemoteArgs(allocator, &out, debug, default_session_ref),
@@ -151,6 +161,85 @@ test "remote local args applies default session ref without leaking ssh options"
         "s-00000000-0000-4000-8000-000000000001",
         "sever-connection",
         "--last-input",
+    }, argv);
+}
+
+test "remote local args cover list and kill public commands" {
+    const list_argv = try remoteLocalArgs(std.testing.allocator, &.{
+        "sesshmux-dev",
+        "list",
+        "--ssh-options",
+        "-F cfg -p 2222",
+        "--host",
+        "test-host",
+        "--jsonl",
+        "--client=s1",
+    }, null);
+    defer std.testing.allocator.free(list_argv);
+    try expectArgvEqual(&.{
+        "sesshmux",
+        "list",
+        "--host",
+        ".",
+        "--jsonl",
+        "--client=s1",
+    }, list_argv);
+
+    const request_json = "{\"guid\":\"s-00000000-0000-4000-8000-000000000001\",\"requested_age_ms\":123}";
+    const kill_argv = try remoteLocalArgs(std.testing.allocator, &.{
+        "sesshmux-dev",
+        "kill",
+        "--host",
+        "test-host",
+        "--jsonl",
+        "--request",
+        request_json,
+    }, null);
+    defer std.testing.allocator.free(kill_argv);
+    try expectArgvEqual(&.{
+        "sesshmux",
+        "kill",
+        "--host",
+        ".",
+        "--jsonl",
+        "--request",
+        request_json,
+    }, kill_argv);
+}
+
+test "remote local args use resolved route guid for kill refs" {
+    var invocation = try parse(std.testing.allocator, &.{
+        "sesshmux-dev",
+        "kill",
+        "s-remote",
+    });
+    defer invocation.deinit(std.testing.allocator);
+    var route = session_registry.Route{
+        .guid = @constCast("s-00000000-0000-4000-8000-000000000001"),
+        .session_dir = @constCast(""),
+        .host_guid = @constCast(""),
+        .host = @constCast("test-host"),
+        .resolved_host = @constCast("test-host"),
+        .port = @constCast("22"),
+        .agent_version = @constCast("test"),
+        .ssh_options = &.{},
+        .last_known_alive = true,
+        .attached_count = null,
+        .last_input_at_unix_ms = null,
+        .detached_at_unix_ms = null,
+        .kill_requested = false,
+        .tombstone_retention_ms = 0,
+    };
+
+    const argv = try remoteLocalArgsForCommand(std.testing.allocator, invocation.command, null, &route);
+    defer std.testing.allocator.free(argv);
+    try expectArgvEqual(&.{
+        "sesshmux",
+        "kill",
+        "--host",
+        ".",
+        "--id",
+        "s-00000000-0000-4000-8000-000000000001",
     }, argv);
 }
 

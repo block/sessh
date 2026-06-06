@@ -50,7 +50,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 else => return err,
             };
         }
-        remote_local_args = try mux_parser.remoteLocalArgs(allocator, args, default_session_ref);
+        remote_local_args = try mux_parser.remoteLocalArgsForCommand(
+            allocator,
+            mux_invocation.command,
+            default_session_ref,
+            if (route_storage) |*route| route else null,
+        );
         parsed_ssh_args.remote_local_args = remote_local_args.?;
     }
 
@@ -58,9 +63,16 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn needsRemoteLocalArgs(parsed: ssh_client.SessionInvocation) bool {
-    return isClientControlAction(parsed.action) and
+    return isRemoteLocalCommandAction(parsed.action) and
         parsed.host.len > 0 and
         !std.mem.eql(u8, parsed.host, ".");
+}
+
+fn isRemoteLocalCommandAction(action: ssh_client.SessionAction) bool {
+    return switch (action) {
+        .list, .kill, .kill_all, .detach_client, .repaint_client, .debug_client => true,
+        .new, .attach => false,
+    };
 }
 
 fn isClientControlAction(action: ssh_client.SessionAction) bool {
@@ -71,7 +83,9 @@ fn isClientControlAction(action: ssh_client.SessionAction) bool {
 }
 
 fn remoteClientControlNeedsDefaultSession(parsed: ssh_client.SessionInvocation) bool {
-    return parsed.client_session_ref == null and parsed.client_target != .client_guid;
+    return isClientControlAction(parsed.action) and
+        parsed.client_session_ref == null and
+        parsed.client_target != .client_guid;
 }
 
 fn invocationFromCommand(

@@ -791,10 +791,10 @@ pub fn runInvocation(
 
     const broker_args: []const []const u8 = &.{};
     const command_args = if (isOneShotBrokerCommandAction(parsed_ssh_args.action))
-        try remoteMuxArgsForAction(allocator, parsed_ssh_args.*)
+        parsed_ssh_args.remote_local_args
     else
         &.{};
-    defer if (command_args.len > 0) allocator.free(command_args);
+    if (isOneShotBrokerCommandAction(parsed_ssh_args.action) and command_args.len == 0) return error.MissingRemoteLocalArgs;
     const remote_command = if (parsed_ssh_args.bootstrap)
         try bootstrapCommand(allocator)
     else if (isOneShotBrokerCommandAction(parsed_ssh_args.action))
@@ -1500,84 +1500,6 @@ pub fn compatSshTtyOptionForLocalArgs(args: []const []const u8, stdin_is_tty: bo
         return if (std.mem.eql(u8, args[i], "attach")) "-t" else "-T";
     }
     return "-T";
-}
-
-fn remoteMuxArgsForAction(allocator: std.mem.Allocator, parsed_ssh_args: SessionInvocation) ![]const []const u8 {
-    var args: std.ArrayList([]const u8) = .empty;
-    defer args.deinit(allocator);
-    switch (parsed_ssh_args.action) {
-        .new, .attach => {},
-        .list => {
-            try args.appendSlice(allocator, &.{ "list", "--host", "." });
-            if (parsed_ssh_args.list_refresh) try args.append(allocator, "--refresh");
-            if (parsed_ssh_args.list_jsonl) try args.append(allocator, "--jsonl");
-            if (parsed_ssh_args.list_all) try args.append(allocator, "--all");
-            if (parsed_ssh_args.list_client_target) |target| {
-                if (parsed_ssh_args.list_client_option_arg) |client_arg| {
-                    try args.append(allocator, client_arg);
-                    if (std.mem.eql(u8, client_arg, "--client")) {
-                        try args.append(allocator, target);
-                    }
-                } else {
-                    try args.append(allocator, "--client");
-                    try args.append(allocator, target);
-                }
-            }
-            if (parsed_ssh_args.list_exited) try args.append(allocator, "--exited");
-        },
-        .kill => {
-            try args.appendSlice(allocator, &.{ "kill", "--host", "." });
-            if (parsed_ssh_args.kill_jsonl) try args.append(allocator, "--jsonl");
-            for (parsed_ssh_args.kill_request_jsons) |request_json| {
-                try args.append(allocator, "--request");
-                try args.append(allocator, request_json);
-            }
-            if (parsed_ssh_args.kill_current) {
-                try args.append(allocator, "--current");
-            } else {
-                for (parsed_ssh_args.kill_ids) |id| {
-                    try args.append(allocator, "--id");
-                    try args.append(allocator, id);
-                }
-            }
-        },
-        .kill_all => {
-            try args.appendSlice(allocator, &.{ "kill", "--host", "." });
-            if (parsed_ssh_args.kill_jsonl) try args.append(allocator, "--jsonl");
-            try args.append(allocator, "--all");
-        },
-        .detach_client, .repaint_client, .debug_client => {
-            try args.append(allocator, switch (parsed_ssh_args.action) {
-                .detach_client => "detach",
-                .repaint_client => "repaint",
-                .debug_client => "debug",
-                else => unreachable,
-            });
-            try args.appendSlice(allocator, &.{ "--host", "." });
-            if (parsed_ssh_args.client_session_ref) |session_ref| {
-                try args.append(allocator, "--id");
-                try args.append(allocator, session_ref);
-            }
-            if (parsed_ssh_args.action == .debug_client) {
-                try args.append(allocator, switch (parsed_ssh_args.debug_client_action.?) {
-                    .sever_connection => "sever-connection",
-                    .unresponsive_connection => "unresponsive-connection",
-                });
-            }
-            switch (parsed_ssh_args.client_target) {
-                .default => {},
-                .all => try args.append(allocator, "--all"),
-                .last_input => try args.append(allocator, "--last-input"),
-                .client_guid => try args.append(allocator, parsed_ssh_args.client_guid.?),
-            }
-            if (parsed_ssh_args.client_repaint_scrollback) try args.append(allocator, "--scrollback");
-            if (parsed_ssh_args.debug_unresponsive_seconds) |seconds| {
-                try args.append(allocator, "--seconds");
-                try args.append(allocator, seconds);
-            }
-        },
-    }
-    return args.toOwnedSlice(allocator);
 }
 
 fn runRemoteBrokerCommandAndForward(connection: *RuntimeConnection) !u8 {
@@ -5588,134 +5510,6 @@ test "parseSshArgs treats post-host mux words as remote command" {
     try std.testing.expect(parsed.bootstrap);
     try std.testing.expect(!parsed.bootstrap_set);
     try expectArgvEqual(&.{ "attach", "s12", "--no-bootstrap" }, parsed.shell_command_args);
-}
-
-test "remoteMuxArgsForAction uses public local mux commands" {
-    try expectRemoteMuxArgs(&.{ "list", "--host", "." }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .list,
-    });
-    try expectRemoteMuxArgs(&.{ "list", "--host", ".", "--jsonl" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .list,
-        .list_jsonl = true,
-    });
-    try expectRemoteMuxArgs(&.{ "list", "--host", ".", "--jsonl", "--all" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .list,
-        .list_jsonl = true,
-        .list_all = true,
-    });
-    try expectRemoteMuxArgs(&.{ "list", "--host", ".", "--jsonl", "--exited" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .list,
-        .list_jsonl = true,
-        .list_exited = true,
-    });
-
-    try expectRemoteMuxArgs(&.{ "kill", "--host", ".", "--id", "s1" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .kill,
-        .kill_id = "s1",
-        .kill_ids = &.{"s1"},
-    });
-
-    try expectRemoteMuxArgs(&.{ "kill", "--host", ".", "--jsonl", "--id", "s1", "--id", "p1" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .kill,
-        .kill_id = "s1",
-        .kill_ids = &.{ "s1", "p1" },
-        .kill_jsonl = true,
-    });
-
-    const request_json = "{\"guid\":\"s-00000000-0000-4000-8000-000000000001\",\"requested_age_ms\":123}";
-    try expectRemoteMuxArgs(&.{ "kill", "--host", ".", "--jsonl", "--request", request_json }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .kill,
-        .kill_jsonl = true,
-        .kill_request_jsons = &.{request_json},
-    });
-
-    try expectRemoteMuxArgs(&.{ "kill", "--host", ".", "--current" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .kill,
-        .kill_current = true,
-    });
-
-    try expectRemoteMuxArgs(&.{ "kill", "--host", ".", "--all" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .kill_all,
-    });
-
-    try expectRemoteMuxArgs(&.{ "list", "--host", ".", "--jsonl", "--client=s1" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .list,
-        .list_jsonl = true,
-        .list_client_target = "s1",
-        .list_client_option_arg = "--client=s1",
-    });
-
-    try expectRemoteMuxArgs(&.{ "list", "--host", ".", "--jsonl", "--client", "s1" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .list,
-        .list_jsonl = true,
-        .list_client_target = "s1",
-        .list_client_option_arg = "--client",
-    });
-
-    try expectRemoteMuxArgs(&.{ "debug", "--host", ".", "--id", "s1", "unresponsive-connection", "c1" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .debug_client,
-        .debug_client_action = .unresponsive_connection,
-        .client_target = .client_guid,
-        .client_guid = "c1",
-        .client_session_ref = "s1",
-    });
-
-    try expectRemoteMuxArgs(&.{ "detach", "--host", ".", "c1" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .detach_client,
-        .client_target = .client_guid,
-        .client_guid = "c1",
-    });
-
-    try expectRemoteMuxArgs(&.{ "debug", "--host", ".", "--id", "s1", "unresponsive-connection", "--last-input", "--seconds", "3" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .debug_client,
-        .debug_client_action = .unresponsive_connection,
-        .debug_unresponsive_seconds = "3",
-        .client_target = .last_input,
-        .client_session_ref = "s1",
-    });
-
-    try expectRemoteMuxArgs(&.{ "repaint", "--host", ".", "--id", "s1", "--last-input", "--scrollback" }, .{
-        .options = &.{},
-        .host = "example.com",
-        .action = .repaint_client,
-        .client_target = .last_input,
-        .client_repaint_scrollback = true,
-        .client_session_ref = "s1",
-    });
-}
-
-fn expectRemoteMuxArgs(expected: []const []const u8, parsed: SessionInvocation) !void {
-    const actual = try remoteMuxArgsForAction(std.testing.allocator, parsed);
-    defer std.testing.allocator.free(actual);
-    try expectArgvEqual(expected, actual);
 }
 
 test "proxy stream reconnect status follows filter level" {

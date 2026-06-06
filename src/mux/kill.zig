@@ -117,24 +117,6 @@ pub fn parse(scratch: *mux_cli.Scratch, args: []const []const u8) !mux_cli.Kill 
     return kill;
 }
 
-pub fn appendRemoteArgs(allocator: std.mem.Allocator, out: *std.ArrayList([]const u8), kill: mux_cli.Kill) !void {
-    try out.append(allocator, "kill");
-    try out.append(allocator, "--host");
-    try out.append(allocator, ".");
-    for (kill.ids) |id| {
-        try out.append(allocator, "--id");
-        try out.append(allocator, id);
-    }
-    try mux_cli.appendRemoteCommonArgs(allocator, out, kill.common);
-    if (kill.jsonl) try out.append(allocator, "--jsonl");
-    if (kill.all) try out.append(allocator, "--all");
-    if (kill.current) try out.append(allocator, "--current");
-    for (kill.request_jsons) |request_json| {
-        try out.append(allocator, "--request");
-        try out.append(allocator, request_json);
-    }
-}
-
 pub fn toInvocation(
     allocator: std.mem.Allocator,
     kill: mux_cli.Kill,
