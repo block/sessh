@@ -29,9 +29,7 @@ _LAST_RESIZE = (24, 80)
 _NEXT_REPAINT_REQUEST_SEQ = 1
 _SCROLLBACK_CURSOR_LEN = 16
 _GUID_RE = re.compile(r"^s-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-_CLIENT_GUID_RE = re.compile(r"^c-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _COMPACT_GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
-_NEXT_CLIENT_GUID = 1
 
 HELLO_REQUEST = "hello_request"
 HELLO_OK = "hello_ok"
@@ -50,7 +48,6 @@ INPUT_ACK = "te_input_ack"
 SESSION_CLIENT_CONTROL_RESPONSE = "te_session_client_control_response"
 SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST = "te_session_client_debug_sever_connection_request"
 SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST = "te_session_client_debug_unresponsive_connection_request"
-HOST_GUID = "host_guid"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -72,7 +69,6 @@ _FRAME_FIELDS = {
     SESSION_CLIENT_CONTROL_RESPONSE: SESSION_CLIENT_CONTROL_RESPONSE,
     SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
     SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST,
-    HOST_GUID: HOST_GUID,
 }
 
 
@@ -360,20 +356,13 @@ def pack_session_create(
     shell_command=None,
     tty_settings=None,
     initial_scrollback=None,
-    client_guid=None,
 ):
-    global _NEXT_REPAINT_REQUEST_SEQ, _NEXT_CLIENT_GUID
+    global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
     message = pb.TeSessionCreate(scrollback_row_limit=scrollback)
     if session_id is None:
         session_id = test_session_guid(1)
     message.session_guid = guid_for_ref(session_id)
-    if client_guid is None:
-        client_guid = client_guid_for_index(_NEXT_CLIENT_GUID)
-        _NEXT_CLIENT_GUID += 1
-    if not _CLIENT_GUID_RE.match(client_guid):
-        raise AssertionError(f"invalid client guid: {client_guid}")
-    message.client_guid = client_guid
     rows, cols = _LAST_RESIZE
     message.resize.terminal_rows = rows
     message.resize.terminal_cols = cols
@@ -405,17 +394,11 @@ def pack_session_create(
     return message.SerializeToString()
 
 
-def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_ref="", client_guid=None):
-    global _NEXT_REPAINT_REQUEST_SEQ, _NEXT_CLIENT_GUID
+def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_ref=""):
+    global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
     message = pb.TeSessionAttach()
     message.session_ref = session_ref
-    if client_guid is None:
-        client_guid = client_guid_for_index(_NEXT_CLIENT_GUID)
-        _NEXT_CLIENT_GUID += 1
-    if not _CLIENT_GUID_RE.match(client_guid):
-        raise AssertionError(f"invalid client guid: {client_guid}")
-    message.client_guid = client_guid
     rows, cols = _LAST_RESIZE
     message.resize.terminal_rows = rows
     message.resize.terminal_cols = cols
@@ -497,7 +480,6 @@ def create_and_attach_session(
     legacy_command_argv=None,
     shell_command=None,
     tty_settings=None,
-    client_guid=None,
 ):
     send_frame(
         conn,
@@ -513,7 +495,6 @@ def create_and_attach_session(
             shell_command=shell_command,
             tty_settings=tty_settings,
             initial_scrollback=initial_scrollback,
-            client_guid=client_guid,
         ),
     )
 
@@ -691,10 +672,6 @@ def guid_for_ref(ref):
         compact = ref.lower()
         return f"s-{compact[0:8]}-{compact[8:12]}-{compact[12:16]}-{compact[16:20]}-{compact[20:32]}"
     raise AssertionError(f"invalid guid ref: {ref}")
-
-
-def client_guid_for_index(index):
-    return f"c-00000000-0000-4000-8000-{index:012x}"
 
 
 def write_cached_remote_route(env, session_id, host, guid=None, alive=True, agent_version="cached-test"):
@@ -1057,13 +1034,6 @@ def send_hello(conn, major_delta=0, minor_delta=0, version_override=None, expect
     if peer.protocol_major != major or peer.protocol_minor != minor or peer.version != version:
         raise AssertionError(f"unexpected peer HELLO_REQUEST: {peer!r}")
     send_frame(conn, HELLO_OK, sessh_hpb().HelloOk().SerializeToString())
-    message_type, payload = recv_frame(conn)
-    if message_type != HOST_GUID:
-        raise AssertionError(f"expected HOST_GUID, got {message_type}")
-    host_guid = sessh_pb().HostGuid()
-    host_guid.ParseFromString(payload)
-    if not host_guid.host_guid.startswith("h-"):
-        raise AssertionError(f"unexpected HOST_GUID: {host_guid!r}")
     return message_type, payload
 
 

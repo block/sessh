@@ -264,10 +264,6 @@ pub const RuntimeSession = struct {
 
     guid: [session_registry.session_guid_len]u8 = [_]u8{0} ** session_registry.session_guid_len,
     guid_len: usize = 0,
-    host_guid: [session_registry.host_guid_len]u8 = [_]u8{0} ** session_registry.host_guid_len,
-    host_guid_len: usize = 0,
-    client_guid: [session_registry.client_guid_len]u8 = [_]u8{0} ** session_registry.client_guid_len,
-    client_guid_len: usize = 0,
     session_dir: [4096]u8 = [_]u8{0} ** 4096,
     session_dir_len: usize = 0,
     scrollback_cursor: ScrollbackCursor = .{},
@@ -335,14 +331,6 @@ pub const RuntimeSession = struct {
         return self.guid[0..self.guid_len];
     }
 
-    pub fn hostGuidSlice(self: *const RuntimeSession) []const u8 {
-        return self.host_guid[0..self.host_guid_len];
-    }
-
-    pub fn clientGuidSlice(self: *const RuntimeSession) []const u8 {
-        return self.client_guid[0..self.client_guid_len];
-    }
-
     pub fn titleFallbackSlice(self: *const RuntimeSession) []const u8 {
         if (self.title_fallback_len > 0) return self.title_fallback[0..self.title_fallback_len];
         return self.idSlice();
@@ -350,33 +338,6 @@ pub const RuntimeSession = struct {
 
     pub fn sessionDirSlice(self: *const RuntimeSession) []const u8 {
         return self.session_dir[0..self.session_dir_len];
-    }
-
-    pub fn ensureClientGuid(self: *RuntimeSession) ![]const u8 {
-        if (self.client_guid_len == 0) {
-            const generated = try session_registry.generateClientGuid(app_allocator.allocator());
-            defer app_allocator.allocator().free(generated);
-            try self.setClientGuid(generated);
-        }
-        return self.clientGuidSlice();
-    }
-
-    pub fn setClientGuid(self: *RuntimeSession, client_guid: []const u8) !void {
-        if (!session_registry.isValidClientGuid(client_guid)) return error.InvalidClientGuid;
-        if (client_guid.len > self.client_guid.len) return error.ClientGuidTooLarge;
-        @memcpy(self.client_guid[0..client_guid.len], client_guid);
-        self.client_guid_len = client_guid.len;
-    }
-
-    pub fn setHostGuid(self: *RuntimeSession, host_guid: []const u8) !void {
-        if (host_guid.len == 0) {
-            self.host_guid_len = 0;
-            return;
-        }
-        if (!session_registry.isValidHostGuid(host_guid)) return error.InvalidHostGuid;
-        if (host_guid.len > self.host_guid.len) return error.HostGuidTooLarge;
-        @memcpy(self.host_guid[0..host_guid.len], host_guid);
-        self.host_guid_len = host_guid.len;
     }
 
     pub fn setSessionDir(self: *RuntimeSession, session_dir: []const u8) !void {
@@ -882,12 +843,6 @@ test "reconnect waits for repaint response before returning" {
     defer app_allocator.allocator().free(hello_request);
     try protocol.sendFrame(remote_to_client[1], .hello_request, hello_request);
 
-    const host_guid = try protocol.encodePayload(app_allocator.allocator(), pb.HostGuid{
-        .host_guid = "h-550e8400-e29b-41d4-a716-446655440001",
-    });
-    defer app_allocator.allocator().free(host_guid);
-    try protocol.sendFrame(remote_to_client[1], .host_guid, host_guid);
-
     const session_attached = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionAttached{});
     defer app_allocator.allocator().free(session_attached);
     try protocol.sendFrame(remote_to_client[1], .te_session_attached, session_attached);
@@ -972,8 +927,6 @@ pub fn startNewSessionOnRuntime(
     const handshake = try runtimeHandshakeWithPeerProtocol(read_fd, write_fd);
     const peer_supports_command_oneof = peerSupportsSessionCreateCommandOneof(handshake.peer_protocol);
     if (shell_command != null and !peer_supports_command_oneof) return error.VersionMismatch;
-    const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
-    defer app_allocator.allocator().free(client_guid);
     const repaint_request_seq = try sendSessionCreate(
         write_fd,
         size,
@@ -984,11 +937,8 @@ pub fn startNewSessionOnRuntime(
         shell_command,
         peer_supports_command_oneof,
         reap_ms,
-        client_guid,
     );
     var session = try readRuntimeSession(read_fd);
-    try session.setClientGuid(client_guid);
-    try session.setHostGuid(handshake.hostGuidSlice());
     session.viewport_offset = viewport_offset orelse 0;
     session.pending_repaint.repaint_request_seq = repaint_request_seq;
     return session;
@@ -1002,13 +952,9 @@ pub fn startAttachSessionOnRuntime(
     initial_scrollback_row_count: ?u32,
 ) !RuntimeSession {
     const viewport_offset = queryInitialViewportOffset();
-    const handshake = try runtimeHandshakeResult(read_fd, write_fd);
-    const client_guid = try session_registry.generateClientGuid(app_allocator.allocator());
-    defer app_allocator.allocator().free(client_guid);
-    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, client_guid, session_dir);
+    try runtimeHandshake(read_fd, write_fd);
+    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, session_dir);
     var session = try readRuntimeSession(read_fd);
-    try session.setClientGuid(client_guid);
-    try session.setHostGuid(handshake.hostGuidSlice());
     session.viewport_offset = viewport_offset orelse 0;
     session.pending_repaint.repaint_request_seq = repaint_request_seq;
     return session;
@@ -1027,7 +973,6 @@ pub fn ensureLocalRouteForRemoteSession(
         allocator,
         session.guidSlice(),
         session.sessionDirSlice(),
-        session.hostGuidSlice(),
         host,
         resolved_host,
         port,
@@ -1077,8 +1022,7 @@ fn reconnectSessionOnRuntimeInner(
     cancelled: ?*const std.atomic.Value(bool),
     wait_for_repaint: bool,
 ) !void {
-    const handshake = try runtimeHandshakeInner(read_fd, write_fd, cancelled);
-    try session.setHostGuid(handshake.hostGuidSlice());
+    _ = try runtimeHandshakeInner(read_fd, write_fd, cancelled);
     try attachReconnectRuntimeInner(read_fd, write_fd, session, cancelled, wait_for_repaint);
 }
 
@@ -1089,8 +1033,7 @@ fn attachReconnectRuntimeInner(
     cancelled: ?*const std.atomic.Value(bool),
     wait_for_repaint: bool,
 ) !void {
-    const client_guid = try session.ensureClientGuid();
-    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice(), client_guid, session.sessionDirSlice());
+    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice(), session.sessionDirSlice());
     try readSessionAttachedInner(read_fd, write_fd, cancelled);
     if (wait_for_repaint) try finishReconnectRepaintInner(read_fd, write_fd, session, cancelled);
 }
@@ -1444,19 +1387,6 @@ const PeerProtocol = struct {
 
 const RuntimeHandshakeResult = struct {
     peer_protocol: PeerProtocol,
-    host_guid: [session_registry.host_guid_len]u8 = [_]u8{0} ** session_registry.host_guid_len,
-    host_guid_len: usize = 0,
-
-    fn setHostGuid(self: *RuntimeHandshakeResult, host_guid: []const u8) !void {
-        if (!session_registry.isValidHostGuid(host_guid)) return error.InvalidHostGuid;
-        if (host_guid.len > self.host_guid.len) return error.HostGuidTooLarge;
-        @memcpy(self.host_guid[0..host_guid.len], host_guid);
-        self.host_guid_len = host_guid.len;
-    }
-
-    fn hostGuidSlice(self: *const RuntimeHandshakeResult) []const u8 {
-        return self.host_guid[0..self.host_guid_len];
-    }
 };
 
 pub fn runtimeHandshake(read_fd: c.fd_t, write_fd: c.fd_t) !void {
@@ -1488,7 +1418,7 @@ fn runtimeHandshakeInner(
 
     var peer_hello = try readHelloRequest(read_fd, write_fd, cancelled);
     defer peer_hello.deinit(app_allocator.allocator());
-    var result = RuntimeHandshakeResult{
+    const result = RuntimeHandshakeResult{
         .peer_protocol = .{
             .major = peer_hello.protocol_major,
             .minor = peer_hello.protocol_minor,
@@ -1500,7 +1430,6 @@ fn runtimeHandshakeInner(
         try sendHelloError(write_fd, "VERSION_MISMATCH", "existing remote sessh is incompatible with this client", "");
         return error.VersionMismatch;
     }
-    try readHostGuidFrame(read_fd, write_fd, cancelled, &result);
     return result;
 }
 
@@ -1581,30 +1510,6 @@ fn readHelloRequest(
     }
 }
 
-fn readHostGuidFrame(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    cancelled: ?*const std.atomic.Value(bool),
-    result: *RuntimeHandshakeResult,
-) !void {
-    while (true) {
-        var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
-        defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .host_guid => {
-                var message = try protocol.decodePayload(pb.HostGuid, app_allocator.allocator(), frame.payload);
-                defer message.deinit(app_allocator.allocator());
-                try result.setHostGuid(message.host_guid);
-                return;
-            },
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
-            },
-            else => return error.UnexpectedFrame,
-        }
-    }
-}
-
 fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
 }
@@ -1627,7 +1532,6 @@ fn sendSessionCreate(
     shell_command: ?[]const u8,
     peer_supports_command_oneof: bool,
     reap_ms: u64,
-    client_guid: []const u8,
 ) !u64 {
     if (command_argv.len > 0 and shell_command != null) return error.InvalidSessionCommand;
     const repaint_request_seq = allocateRepaintRequestSeq();
@@ -1644,7 +1548,6 @@ fn sendSessionCreate(
         .scrollback_row_limit = scrollback_row_count,
         .session_guid = session_guid,
         .reap_ms = reap_ms,
-        .client_guid = client_guid,
         .capture_tty_transcript = tty_transcript.enabled(),
     };
     defer message.environment.deinit(app_allocator.allocator());
@@ -1717,7 +1620,6 @@ fn sendSessionAttach(
     initial_scrollback_row_count: ?u32,
     reconnect_cursor: ?*const ScrollbackCursor,
     session_ref: []const u8,
-    client_guid: []const u8,
     session_dir: []const u8,
 ) !u64 {
     const repaint_request_seq = allocateRepaintRequestSeq();
@@ -1740,7 +1642,6 @@ fn sendSessionAttach(
         },
         .session_ref = session_ref,
         .capture_tty_transcript = tty_transcript.enabled(),
-        .client_guid = client_guid,
         .session_dir = session_dir,
     };
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);

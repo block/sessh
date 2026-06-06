@@ -45,17 +45,7 @@ message Frame {
     ProxyControlCapabilities proxy_control_capabilities = 48;
     ProxyControlDiagnostic proxy_control_diagnostic = 49;
     ProxyControlCtrlR proxy_control_ctrl_r = 50;
-    HostGuid host_guid = 51;
   }
-}
-
-// Connection-level identity for the sessh host on the sending side.
-//
-// On runtime transports this is the first regular Frame sent by the remote
-// immediately after the HelloFrame exchange is accepted. Proxy-stream transports
-// do not currently run HelloFrame, so they send HostGuid before ProxyStreamResume.
-message HostGuid {
-  string host_guid = 1;
 }
 
 // Sent at the start of every ssh transport that carries an opaque proxy stream.
@@ -234,9 +224,6 @@ message TeSessionCreate {
   // Maximum time the session may remain detached before the agent ends it.
   // Zero means disabled.
   uint64 reap_ms = 11;
-  // Canonical client GUID in c-prefixed hyphenated UUID form. This identifies
-  // the attaching client, not the durable session.
-  string client_guid = 12;
   // When true, the session agent sends raw inner PTY transcript chunks for this
   // attached client. The client still owns archive creation and storage.
   bool capture_tty_transcript = 13;
@@ -253,9 +240,6 @@ message TeSessionAttach {
   // When true, the session agent sends raw inner PTY transcript chunks for
   // this attached client. The client still owns archive creation and storage.
   bool capture_tty_transcript = 3;
-  // Canonical client GUID in c-prefixed hyphenated UUID form. This identifies
-  // the attaching client, not the durable session.
-  string client_guid = 4;
   // Absolute path to the selected session GUID directory. This is used for
   // route-based reconnects when the broker's current runtime directory no
   // longer matches where the session was created.

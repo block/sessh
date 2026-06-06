@@ -4,15 +4,15 @@
 
 - `XDG_CONFIG_HOME` for user config
 - `XDG_CACHE_HOME` for bootstrapped binaries
-- `XDG_STATE_HOME` for durable session state, host identity, and logs
+- `XDG_STATE_HOME` for durable session state and logs
 - `XDG_RUNTIME_DIR` for live sockets and process-local runtime files
 
 If `XDG_RUNTIME_DIR` is missing, sessh falls back to `/tmp/sessh-<uid>`.
 
 # Runtime
 
-Runtime guid directories live under `guid/<s-guid>/`. A session directory may
-contain:
+Runtime guid directories live under `guid/<s-guid>/` for sessions and
+`guid/<p-guid>/` for proxy streams. A session directory may contain:
 
 - `agent.sock`: symlink to the live agent socket
 - `meta.json`: runtime identity for the agent
@@ -26,7 +26,6 @@ run on the same machine.
 
 State lives under `$XDG_STATE_HOME/sessh` or `~/.local/state/sessh`.
 
-- `host.json` stores the remote host GUID.
 - `guid/<s-guid>/agent.log` stores session-agent diagnostics.
 
 # Cache

@@ -669,11 +669,9 @@ const ScreenBufferState = struct {
 const AttachRequest = struct {
     resize: ResizePayload,
     session_ref: []u8,
-    client_guid: []u8,
     capture_tty_transcript: bool,
 
     fn deinit(self: *AttachRequest) void {
-        app_allocator.allocator().free(self.client_guid);
         app_allocator.allocator().free(self.session_ref);
         self.* = undefined;
     }
@@ -685,7 +683,6 @@ const SessionCreateRequest = struct {
     environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
     session_guid: []u8,
-    client_guid: []u8,
     command_argv: [][]u8,
     shell_command: ?[]u8,
     tty_settings: ?tty_settings.Settings,
@@ -693,7 +690,6 @@ const SessionCreateRequest = struct {
     capture_tty_transcript: bool,
 
     fn deinit(self: *SessionCreateRequest) void {
-        app_allocator.allocator().free(self.client_guid);
         app_allocator.allocator().free(self.session_guid);
         for (self.command_argv) |arg| app_allocator.allocator().free(arg);
         app_allocator.allocator().free(self.command_argv);
@@ -1568,7 +1564,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                 if (session_agent.session_paths) |paths| {
                     try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), paths.dir, config.version);
                 }
-                try attachSession(session_agent, session_index, fd, request.resize, request.client_guid, request.capture_tty_transcript);
+                try attachSession(session_agent, session_index, fd, request.resize, request.capture_tty_transcript);
                 return true;
             },
             .te_session_client_debug_sever_connection_request => {
@@ -1591,7 +1587,7 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     return false;
                 };
                 updateSessionSize(&session_agent.sessions[resolved_session_index], request.resize.rows, request.resize.cols);
-                try attachSession(session_agent, resolved_session_index, fd, request.resize, request.client_guid, request.capture_tty_transcript);
+                try attachSession(session_agent, resolved_session_index, fd, request.resize, request.capture_tty_transcript);
                 return true;
             },
             else => {
@@ -1659,9 +1655,6 @@ fn acceptRemoteHandshake(session_agent: *SessionAgent, fd: c.fd_t) !HandshakeRes
         });
         return .mismatch;
     }
-    const host_guid = try session_registry.ensureHostGuid(app_allocator.allocator());
-    defer app_allocator.allocator().free(host_guid);
-    try protocol.sendHostGuid(fd, host_guid);
     return .accepted;
 }
 
@@ -2459,7 +2452,6 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
     defer message.deinit(app_allocator.allocator());
     const resize = message.resize orelse return error.MissingResize;
     if (!session_registry.isValidSessionGuid(message.session_guid)) return error.InvalidSessionGuid;
-    if (!session_registry.isValidClientGuid(message.client_guid)) return error.InvalidClientGuid;
     var environment = SessionEnvironment{};
     errdefer environment.deinit();
     var query_default_colors = vt.DefaultColors{};
@@ -2502,7 +2494,6 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
         .environment = environment,
         .query_default_colors = query_default_colors,
         .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
-        .client_guid = try app_allocator.allocator().dupe(u8, message.client_guid),
         .command_argv = command_argv,
         .shell_command = if (shell_command) |command|
             try app_allocator.allocator().dupe(u8, command)
@@ -2577,11 +2568,9 @@ fn readAttachRequest(payload: []const u8) !AttachRequest {
     defer message.deinit(app_allocator.allocator());
     const resize = message.resize orelse return error.MissingResize;
     if (message.session_ref.len > 0 and !session_registry.isValidSessionRef(message.session_ref)) return error.InvalidSessionRef;
-    if (!session_registry.isValidClientGuid(message.client_guid)) return error.InvalidClientGuid;
     return .{
         .resize = try resizePayloadFromMessage(resize),
         .session_ref = try app_allocator.allocator().dupe(u8, message.session_ref),
-        .client_guid = try app_allocator.allocator().dupe(u8, message.client_guid),
         .capture_tty_transcript = message.capture_tty_transcript,
     };
 }
@@ -2791,7 +2780,6 @@ fn attachSession(
     session_index: usize,
     client_fd: c.fd_t,
     resize: ResizePayload,
-    client_guid: []const u8,
     capture_tty_transcript: bool,
 ) !void {
     const session = &session_agent.sessions[session_index];
@@ -2820,9 +2808,8 @@ fn attachSession(
             try sendSessionSnapshot(attached_client, session);
         }
         refreshAttachedFlag(session_agent, session_index);
-        logSessionAgent(session_agent, "event=attach id={s} client={s} rows={} cols={} attached_clients={}", .{
+        logSessionAgent(session_agent, "event=attach id={s} rows={} cols={} attached_clients={}", .{
             session.idSlice(),
-            client_guid,
             resize.rows,
             resize.cols,
             attachedCount(session_agent, session_index),

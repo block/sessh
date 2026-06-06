@@ -37,7 +37,6 @@ pub const MessageType = enum {
     proxy_control_capabilities,
     proxy_control_diagnostic,
     proxy_control_ctrl_r,
-    host_guid,
 };
 
 pub const frame_header_len = 4;
@@ -95,14 +94,6 @@ pub fn sendPong(fd: c.fd_t) !void {
     const payload = try encodePayload(app_allocator.allocator(), pb.Pong{});
     defer app_allocator.allocator().free(payload);
     try sendFrame(fd, .pong, payload);
-}
-
-pub fn sendHostGuid(fd: c.fd_t, host_guid: []const u8) !void {
-    const payload = try encodePayload(app_allocator.allocator(), pb.HostGuid{
-        .host_guid = host_guid,
-    });
-    defer app_allocator.allocator().free(payload);
-    try sendFrame(fd, .host_guid, payload);
 }
 
 pub fn handleTransportControlFrame(message_type: MessageType, payload: []const u8, write_fd: c.fd_t) !bool {
@@ -178,7 +169,6 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .proxy_control_capabilities => |message| ownedFrameFromMessage(allocator, .proxy_control_capabilities, message),
             .proxy_control_diagnostic => |message| ownedFrameFromMessage(allocator, .proxy_control_diagnostic, message),
             .proxy_control_ctrl_r => |message| ownedFrameFromMessage(allocator, .proxy_control_ctrl_r, message),
-            .host_guid => |message| ownedFrameFromMessage(allocator, .host_guid, message),
         };
     }
 
@@ -346,11 +336,6 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.ProxyControlCtrlR, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_control_ctrl_r = message } });
-        },
-        .host_guid => blk: {
-            var message = try decodePayload(pb.HostGuid, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .host_guid = message } });
         },
     };
 }

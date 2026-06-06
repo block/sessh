@@ -127,10 +127,6 @@ const StreamState = struct {
     active_outbound: ChannelMask,
     active_inbound: ChannelMask,
     peer_ready: bool = false,
-    local_host_guid: [session_registry.host_guid_len]u8 = [_]u8{0} ** session_registry.host_guid_len,
-    local_host_guid_len: usize = 0,
-    peer_host_guid: [session_registry.host_guid_len]u8 = [_]u8{0} ** session_registry.host_guid_len,
-    peer_host_guid_len: usize = 0,
 
     fn init(allocator: std.mem.Allocator, active_outbound: ChannelMask, active_inbound: ChannelMask) StreamState {
         var state = StreamState{
@@ -151,33 +147,6 @@ const StreamState = struct {
     fn deinit(self: *StreamState) void {
         for (&self.channels) |*channel_state| channel_state.deinit(self.allocator);
         self.* = undefined;
-    }
-
-    fn setLocalHostGuid(self: *StreamState, host_guid: []const u8) !void {
-        if (host_guid.len == 0) {
-            self.local_host_guid_len = 0;
-            return;
-        }
-        if (!session_registry.isValidHostGuid(host_guid)) return error.InvalidHostGuid;
-        if (host_guid.len > self.local_host_guid.len) return error.HostGuidTooLarge;
-        @memcpy(self.local_host_guid[0..host_guid.len], host_guid);
-        self.local_host_guid_len = host_guid.len;
-    }
-
-    fn setPeerHostGuid(self: *StreamState, host_guid: []const u8) !void {
-        if (host_guid.len == 0) return;
-        if (!session_registry.isValidHostGuid(host_guid)) return error.InvalidHostGuid;
-        if (host_guid.len > self.peer_host_guid.len) return error.HostGuidTooLarge;
-        @memcpy(self.peer_host_guid[0..host_guid.len], host_guid);
-        self.peer_host_guid_len = host_guid.len;
-    }
-
-    fn localHostGuidSlice(self: *const StreamState) []const u8 {
-        return self.local_host_guid[0..self.local_host_guid_len];
-    }
-
-    fn peerHostGuidSlice(self: *const StreamState) []const u8 {
-        return self.peer_host_guid[0..self.peer_host_guid_len];
     }
 
     fn channel(self: *StreamState, stream_channel: StreamChannel) *StreamChannelState {
@@ -456,7 +425,6 @@ const StreamAttachedClient = struct {
                 state.channel(channel).outbound_eof_sent = false;
             }
         }
-        sendHostGuidMessage(state, transport_write_fd) catch return error.StreamTransportClosed;
         sendResumeMessage(state, transport_write_fd) catch return error.StreamTransportClosed;
         const now_ms = nowMillis();
         return .{
@@ -992,9 +960,6 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
 
     var state = StreamState.init(allocator, .{ .stdout = true }, .{ .stdin = true });
     defer state.deinit();
-    const host_guid = try session_registry.ensureHostGuid(allocator);
-    defer allocator.free(host_guid);
-    try state.setLocalHostGuid(host_guid);
 
     var attach_fd: c.fd_t = -1;
     defer {
@@ -1091,9 +1056,6 @@ pub fn runLocalStream(
         .{ .stdout = true },
     );
     defer state.deinit();
-    const host_guid = try session_registry.ensureHostGuid(allocator);
-    defer allocator.free(host_guid);
-    try state.setLocalHostGuid(host_guid);
     var input_control = StreamInputControl{
         .enabled = options.intercept_ctrl_r,
         .escape_enabled = options.intercept_escape,
@@ -1402,11 +1364,6 @@ fn handleFrame(
                 else => return err,
             };
         },
-        .host_guid => {
-            var message = try protocol.decodePayload(pb.HostGuid, state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
-            try state.setPeerHostGuid(message.host_guid);
-        },
         .proxy_stream_ack => {
             var message = try protocol.decodePayload(pb.ProxyStreamAck, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
@@ -1550,14 +1507,6 @@ fn sendResumeMessage(state: *StreamState, fd: c.fd_t) !void {
     const channel = try singleActiveChannel(state.active_inbound);
     try sendStreamMessage(state.allocator, fd, .proxy_stream_resume, pb.ProxyStreamResume{
         .recv_next_offset = state.constChannel(channel).recv_next_offset,
-    });
-}
-
-fn sendHostGuidMessage(state: *StreamState, fd: c.fd_t) !void {
-    const host_guid = state.localHostGuidSlice();
-    if (host_guid.len == 0) return;
-    try sendStreamMessage(state.allocator, fd, .host_guid, pb.HostGuid{
-        .host_guid = host_guid,
     });
 }
 

@@ -9,13 +9,9 @@ const socket_transport = @import("../transport/socket.zig");
 pub const guid_body_len = 36;
 pub const compact_guid_len = 32;
 pub const session_guid_prefix = "s-";
-pub const client_guid_prefix = "c-";
 pub const proxy_guid_prefix = "p-";
-pub const host_guid_prefix = "h-";
 pub const session_guid_len = session_guid_prefix.len + guid_body_len;
-pub const client_guid_len = client_guid_prefix.len + guid_body_len;
 pub const proxy_guid_len = proxy_guid_prefix.len + guid_body_len;
-pub const host_guid_len = host_guid_prefix.len + guid_body_len;
 pub const short_guid_hex_len = 8;
 pub const default_ssh_port = "22";
 
@@ -274,23 +270,13 @@ pub fn isValidSessionGuid(guid: []const u8) bool {
         isValidGuidBody(guid[session_guid_prefix.len..]);
 }
 
-pub fn isValidClientGuid(guid: []const u8) bool {
-    return std.mem.startsWith(u8, guid, client_guid_prefix) and
-        isValidGuidBody(guid[client_guid_prefix.len..]);
-}
-
 pub fn isValidProxyGuid(guid: []const u8) bool {
     return std.mem.startsWith(u8, guid, proxy_guid_prefix) and
         isValidGuidBody(guid[proxy_guid_prefix.len..]);
 }
 
-pub fn isValidHostGuid(guid: []const u8) bool {
-    return std.mem.startsWith(u8, guid, host_guid_prefix) and
-        isValidGuidBody(guid[host_guid_prefix.len..]);
-}
-
 pub fn isValidGuid(guid: []const u8) bool {
-    return isValidSessionGuid(guid) or isValidClientGuid(guid) or isValidProxyGuid(guid) or isValidHostGuid(guid);
+    return isValidSessionGuid(guid) or isValidProxyGuid(guid);
 }
 
 pub fn isValidCompactGuid(guid: []const u8) bool {
@@ -307,10 +293,6 @@ pub fn isValidSessionRef(ref: []const u8) bool {
 
 pub fn isValidSessionGuidPrefix(ref: []const u8) bool {
     return compactGuidPrefix(ref, session_guid_prefix) != null;
-}
-
-pub fn isValidClientGuidPrefix(ref: []const u8) bool {
-    return compactGuidPrefix(ref, client_guid_prefix) != null;
 }
 
 const CompactGuidPrefix = struct {
@@ -386,17 +368,6 @@ pub fn canonicalGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     return error.InvalidSessionId;
 }
 
-pub fn canonicalClientGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    if (!isValidClientGuid(guid)) return error.InvalidClientId;
-    const out = try allocator.alloc(u8, client_guid_len);
-    out[0] = client_guid_prefix[0];
-    out[1] = client_guid_prefix[1];
-    for (guid[client_guid_prefix.len..], 0..) |byte, i| {
-        out[client_guid_prefix.len + i] = std.ascii.toLower(byte);
-    }
-    return out;
-}
-
 pub fn canonicalProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (!isValidProxyGuid(guid)) return error.InvalidProxyId;
     const out = try allocator.alloc(u8, proxy_guid_len);
@@ -408,20 +379,8 @@ pub fn canonicalProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 
     return out;
 }
 
-pub fn canonicalHostGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    if (!isValidHostGuid(guid)) return error.InvalidHostId;
-    const out = try allocator.alloc(u8, host_guid_len);
-    out[0] = host_guid_prefix[0];
-    out[1] = host_guid_prefix[1];
-    for (guid[host_guid_prefix.len..], 0..) |byte, i| {
-        out[host_guid_prefix.len + i] = std.ascii.toLower(byte);
-    }
-    return out;
-}
-
 fn canonicalRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidSessionGuid(guid) or isValidCompactGuid(guid)) return canonicalGuid(allocator, guid);
-    if (isValidClientGuid(guid)) return canonicalClientGuid(allocator, guid);
     if (isValidProxyGuid(guid)) return canonicalProxyGuid(allocator, guid);
     return error.InvalidSessionId;
 }
@@ -443,18 +402,6 @@ pub fn compactGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     return out;
 }
 
-pub fn compactClientGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    if (!isValidClientGuid(guid)) return error.InvalidClientId;
-    var out = try allocator.alloc(u8, compact_guid_len);
-    var dst: usize = 0;
-    for (guid[client_guid_prefix.len..]) |byte| {
-        if (byte == '-') continue;
-        out[dst] = std.ascii.toLower(byte);
-        dst += 1;
-    }
-    return out;
-}
-
 pub fn compactProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (!isValidProxyGuid(guid)) return error.InvalidProxyId;
     var out = try allocator.alloc(u8, compact_guid_len);
@@ -469,7 +416,6 @@ pub fn compactProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
 
 fn compactRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidSessionGuid(guid) or isValidCompactGuid(guid)) return compactGuid(allocator, guid);
-    if (isValidClientGuid(guid)) return compactClientGuid(allocator, guid);
     if (isValidProxyGuid(guid)) return compactProxyGuid(allocator, guid);
     return error.InvalidSessionId;
 }
@@ -481,22 +427,6 @@ pub fn generateGuid(allocator: std.mem.Allocator) ![]u8 {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     const compact = std.fmt.bytesToHex(bytes, .lower);
     return canonicalGuid(allocator, &compact);
-}
-
-pub fn generateClientGuid(allocator: std.mem.Allocator) ![]u8 {
-    var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    const compact = std.fmt.bytesToHex(bytes, .lower);
-    const session_guid = try canonicalGuid(allocator, &compact);
-    defer allocator.free(session_guid);
-
-    const out = try allocator.alloc(u8, client_guid_len);
-    out[0] = client_guid_prefix[0];
-    out[1] = client_guid_prefix[1];
-    @memcpy(out[client_guid_prefix.len..], session_guid[session_guid_prefix.len..]);
-    return out;
 }
 
 pub fn generateProxyGuid(allocator: std.mem.Allocator) ![]u8 {
@@ -515,22 +445,6 @@ pub fn generateProxyGuid(allocator: std.mem.Allocator) ![]u8 {
     return out;
 }
 
-pub fn generateHostGuid(allocator: std.mem.Allocator) ![]u8 {
-    var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    const compact = std.fmt.bytesToHex(bytes, .lower);
-    const session_guid = try canonicalGuid(allocator, &compact);
-    defer allocator.free(session_guid);
-
-    const out = try allocator.alloc(u8, host_guid_len);
-    out[0] = host_guid_prefix[0];
-    out[1] = host_guid_prefix[1];
-    @memcpy(out[host_guid_prefix.len..], session_guid[session_guid_prefix.len..]);
-    return out;
-}
-
 pub const Meta = struct {
     agent_pid: c.pid_t,
     version: []u8,
@@ -542,8 +456,6 @@ pub const Meta = struct {
 };
 
 pub const RuntimeGuidType = enum {
-    incoming_client,
-    outgoing_client,
     local_session,
     incoming_proxy,
     outgoing_proxy,
@@ -551,8 +463,6 @@ pub const RuntimeGuidType = enum {
 
 pub fn runtimeGuidTypeName(guid_type: RuntimeGuidType) []const u8 {
     return switch (guid_type) {
-        .incoming_client => "incoming-client",
-        .outgoing_client => "outgoing-client",
         .local_session => "local-session",
         .incoming_proxy => "incoming-proxy",
         .outgoing_proxy => "outgoing-proxy",
@@ -568,24 +478,22 @@ const runtime_guid_empty_meta_filenames = [_][]const u8{};
 
 pub fn runtimeGuidMetaFilenamesForGuid(guid: []const u8) []const []const u8 {
     if (isValidSessionGuid(guid)) return runtime_guid_session_meta_filenames[0..];
-    if (isValidClientGuid(guid) or isValidProxyGuid(guid)) return runtime_guid_directional_meta_filenames[0..];
+    if (isValidProxyGuid(guid)) return runtime_guid_directional_meta_filenames[0..];
     return runtime_guid_empty_meta_filenames[0..];
 }
 
-// Client and reconnectable-stream GUID directories can exist on both sides of
-// a connection at once. Each side owns one directional metadata file so teardown
-// can remove its own record without clobbering the other side's record.
+// Reconnectable-stream GUID directories can exist on both sides of a connection
+// at once. Each side owns one directional metadata file so teardown can remove
+// its own record without clobbering the other side's record.
 fn runtimeGuidMetaFilenameForType(guid_type: RuntimeGuidType) []const u8 {
     return switch (guid_type) {
         .local_session => "meta.json",
-        .incoming_client, .incoming_proxy => "incoming-meta.json",
-        .outgoing_client, .outgoing_proxy => "outgoing-meta.json",
+        .incoming_proxy => "incoming-meta.json",
+        .outgoing_proxy => "outgoing-meta.json",
     };
 }
 
 fn runtimeGuidTypeFromName(value: []const u8) !RuntimeGuidType {
-    if (std.mem.eql(u8, value, "incoming-client")) return .incoming_client;
-    if (std.mem.eql(u8, value, "outgoing-client")) return .outgoing_client;
     if (std.mem.eql(u8, value, "local-session")) return .local_session;
     if (std.mem.eql(u8, value, "incoming-proxy")) return .incoming_proxy;
     if (std.mem.eql(u8, value, "outgoing-proxy")) return .outgoing_proxy;
@@ -680,54 +588,6 @@ pub fn readRuntimeGuidMeta(allocator: std.mem.Allocator, path: []const u8) !Runt
     };
 }
 
-pub fn ensureHostGuid(allocator: std.mem.Allocator) ![]u8 {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return ensureHostGuidInRoot(allocator, root);
-}
-
-fn ensureHostGuidInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    try ensureRegistryRoot(allocator, root);
-
-    const lock_path = try hostGuidLockPathInRoot(allocator, root);
-    defer allocator.free(lock_path);
-    var lock = try std.fs.createFileAbsolute(lock_path, .{
-        .read = true,
-        .truncate = false,
-        .mode = 0o600,
-        .lock = .exclusive,
-    });
-    defer {
-        lock.unlock();
-        lock.close();
-    }
-
-    const path = try hostGuidPathInRoot(allocator, root);
-    defer allocator.free(path);
-    if (readHostGuidFile(allocator, path)) |guid| return guid else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
-
-    const generated = try generateHostGuid(allocator);
-    defer allocator.free(generated);
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
-    try text.writer(allocator).print("{{\"guid\":{f}}}\n", .{std.json.fmt(generated, .{})});
-    try writeAtomicFile(path, text.items);
-    return readHostGuidFile(allocator, path);
-}
-
-fn readHostGuidFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 4096);
-    defer allocator.free(bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
-    defer parsed.deinit();
-    const object = try jsonObject(parsed.value);
-    const guid_value = try jsonRequiredString(object, "guid");
-    return canonicalHostGuid(allocator, guid_value);
-}
-
 pub fn readMeta(allocator: std.mem.Allocator, paths: SessionPaths) !Meta {
     const bytes = try std.fs.cwd().readFileAlloc(allocator, paths.meta, 4096);
     defer allocator.free(bytes);
@@ -748,7 +608,6 @@ pub fn readMeta(allocator: std.mem.Allocator, paths: SessionPaths) !Meta {
 pub const Route = struct {
     guid: []u8,
     session_dir: []u8,
-    host_guid: []u8,
     host: []u8,
     resolved_host: []u8,
     port: []u8,
@@ -763,7 +622,6 @@ pub const Route = struct {
         allocator.free(self.port);
         allocator.free(self.resolved_host);
         allocator.free(self.host);
-        allocator.free(self.host_guid);
         allocator.free(self.session_dir);
         allocator.free(self.guid);
         self.* = undefined;
@@ -774,7 +632,6 @@ pub fn writeSshRoute(
     allocator: std.mem.Allocator,
     guid: []const u8,
     session_dir: []const u8,
-    host_guid: []const u8,
     host: []const u8,
     resolved_host: []const u8,
     port: []const u8,
@@ -782,7 +639,6 @@ pub fn writeSshRoute(
     agent_version: []const u8,
 ) !void {
     return writeRoute(allocator, guid, session_dir, host, ssh_options, .{
-        .host_guid = host_guid,
         .port = port,
         .resolved_host = resolved_host,
         .agent_version = agent_version,
@@ -802,7 +658,6 @@ pub fn writeLocalRoute(
 
 const RouteStatus = struct {
     last_known_alive: bool = true,
-    host_guid: []const u8 = "",
     port: []const u8 = default_ssh_port,
     resolved_host: []const u8 = "",
     agent_version: []const u8 = "",
@@ -826,13 +681,11 @@ fn writeRoute(
     defer text.deinit(allocator);
     const writer = text.writer(allocator);
     const resolved_host = if (status.resolved_host.len == 0) host else status.resolved_host;
-    if (status.host_guid.len != 0 and !isValidHostGuid(status.host_guid)) return error.InvalidHostId;
     try writer.print(
-        "{{\"guid\":{f},\"session_dir\":{f},\"host_guid\":{f},\"host\":{f},\"resolved_host\":{f},\"port\":{f},\"agent_version\":{f},\"alive\":{},\"ssh_options\":[",
+        "{{\"guid\":{f},\"session_dir\":{f},\"host\":{f},\"resolved_host\":{f},\"port\":{f},\"agent_version\":{f},\"alive\":{},\"ssh_options\":[",
         .{
             std.json.fmt(canonical, .{}),
             std.json.fmt(session_dir, .{}),
-            std.json.fmt(status.host_guid, .{}),
             std.json.fmt(host, .{}),
             std.json.fmt(resolved_host, .{}),
             std.json.fmt(status.port, .{}),
@@ -985,7 +838,6 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
 
 fn runtimeIncomingMetaTypeForGuid(guid: []const u8) RuntimeGuidType {
     if (isValidProxyGuid(guid)) return .incoming_proxy;
-    if (isValidClientGuid(guid)) return .incoming_client;
     return .local_session;
 }
 
@@ -1011,14 +863,6 @@ fn routePathForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
 
 fn routePathForGuidInStateRoot(allocator: std.mem.Allocator, state_root: []const u8, guid: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/guid/{s}/route.json", .{ state_root, guid });
-}
-
-fn hostGuidPathInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/host.json", .{root});
-}
-
-fn hostGuidLockPathInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/host.lock", .{root});
 }
 
 fn ensureRouteDirForGuid(allocator: std.mem.Allocator, guid: []const u8) !void {
@@ -1055,11 +899,6 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
     const session_dir = try allocator.dupe(u8, session_dir_value);
     errdefer allocator.free(session_dir);
 
-    const host_guid_value = jsonOptionalString(object, "host_guid") orelse "";
-    if (host_guid_value.len != 0 and !isValidHostGuid(host_guid_value)) return error.InvalidRoute;
-    const host_guid = try allocator.dupe(u8, host_guid_value);
-    errdefer allocator.free(host_guid);
-
     const host = try allocator.dupe(u8, jsonOptionalString(object, "host") orelse "");
     errdefer allocator.free(host);
 
@@ -1080,7 +919,6 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
     return .{
         .guid = guid,
         .session_dir = session_dir,
-        .host_guid = host_guid,
         .host = host,
         .resolved_host = resolved_host,
         .port = port,
@@ -1201,17 +1039,12 @@ pub fn shortSessionGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     return shortTypedGuid(allocator, guid, session_guid_prefix);
 }
 
-pub fn shortClientGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    return shortTypedGuid(allocator, guid, client_guid_prefix);
-}
-
 pub fn shortProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     return shortTypedGuid(allocator, guid, proxy_guid_prefix);
 }
 
 pub fn shortRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidSessionGuid(guid)) return shortSessionGuid(allocator, guid);
-    if (isValidClientGuid(guid)) return shortClientGuid(allocator, guid);
     if (isValidProxyGuid(guid)) return shortProxyGuid(allocator, guid);
     return error.InvalidGuid;
 }
@@ -1219,10 +1052,8 @@ pub fn shortRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
 fn shortTypedGuid(allocator: std.mem.Allocator, guid: []const u8, prefix: []const u8) ![]u8 {
     const compact = if (std.mem.eql(u8, prefix, session_guid_prefix))
         try compactGuid(allocator, guid)
-    else if (std.mem.eql(u8, prefix, proxy_guid_prefix))
-        try compactProxyGuid(allocator, guid)
     else
-        try compactClientGuid(allocator, guid);
+        try compactProxyGuid(allocator, guid);
     defer allocator.free(compact);
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, compact[0..short_guid_hex_len] });
 }
@@ -1712,23 +1543,18 @@ test "validates session ids and short typed prefixes" {
     try std.testing.expect(isValidSessionId("s-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(isValidSessionId("550e8400e29b41d4a716446655440000"));
     try std.testing.expect(isValidSessionGuid("s-550e8400-e29b-41d4-a716-446655440000"));
-    try std.testing.expect(isValidClientGuid("c-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(isValidProxyGuid("p-550e8400-e29b-41d4-a716-446655440000"));
-    const generated_client = try generateClientGuid(std.testing.allocator);
-    defer std.testing.allocator.free(generated_client);
-    try std.testing.expect(isValidClientGuid(generated_client));
     const generated_proxy = try generateProxyGuid(std.testing.allocator);
     defer std.testing.allocator.free(generated_proxy);
     try std.testing.expect(isValidProxyGuid(generated_proxy));
     try std.testing.expect(!isValidSessionId("550e8400-e29b-41d4-a716-446655440000"));
-    try std.testing.expect(!isValidSessionId("c-550e8400-e29b-41d4-a716-446655440000"));
+    try std.testing.expect(!isValidSessionId("x-550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(!isValidSessionId(""));
     try std.testing.expect(!isValidSessionId("s1"));
     try std.testing.expect(!isValidSessionId("550e8400-e29b-41d4-a716-44665544000z"));
     try std.testing.expect(isValidSessionGuidPrefix("s-5"));
     try std.testing.expect(isValidSessionGuidPrefix("s-550e8400"));
     try std.testing.expect(isValidSessionGuidPrefix("s-550e8400-e"));
-    try std.testing.expect(isValidClientGuidPrefix("c-550e8400"));
 
     const short_session = try shortSessionGuid(std.testing.allocator, "s-550e8400-e29b-41d4-a716-446655440000");
     defer std.testing.allocator.free(short_session);
