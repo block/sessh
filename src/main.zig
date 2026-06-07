@@ -155,6 +155,7 @@ test {
     _ = @import("core/config.zig");
     _ = @import("core/io.zig");
     _ = @import("core/process_exit.zig");
+    _ = @import("core/reactor.zig");
     _ = @import("core/shell.zig");
     _ = @import("daemon/mod.zig");
     _ = @import("protocol/mod.zig");

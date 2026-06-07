@@ -5,6 +5,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const config = @import("../core/config.zig");
 const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
+const reactor = @import("../core/reactor.zig");
 const protocol = @import("../protocol/mod.zig");
 const session_broker = @import("../session/broker.zig");
 const socket_transport = @import("../transport/socket.zig");
@@ -165,29 +166,60 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     const listen_fd = try socket_transport.listenSocket(path);
     defer _ = c.close(listen_fd);
 
-    while (true) {
-        const client_fd = c.accept(listen_fd, null, null);
-        if (client_fd < 0) continue;
-        socket_transport.setCloseOnExec(client_fd) catch {
-            _ = c.close(client_fd);
-            continue;
-        };
-        const context = allocator.create(ClientContext) catch {
-            _ = c.close(client_fd);
-            continue;
-        };
-        context.* = .{
-            .allocator = allocator,
-            .exe = daemon_exe,
-            .fd = client_fd,
-        };
-        const thread = std.Thread.spawn(.{}, clientThread, .{context}) catch {
-            allocator.destroy(context);
-            _ = c.close(client_fd);
-            continue;
-        };
-        thread.detach();
-    }
+    var daemon_reactor = try reactor.Reactor.init(allocator);
+    defer daemon_reactor.deinit();
+
+    var accept_context = DaemonAcceptContext{
+        .allocator = allocator,
+        .exe = daemon_exe,
+        .listen_fd = listen_fd,
+    };
+    _ = try daemon_reactor.watchFd(listen_fd, .{ .readable = true }, .{
+        .ctx = &accept_context,
+        .callback = acceptDaemonClient,
+    });
+    try daemon_reactor.run();
+}
+
+const DaemonAcceptContext = struct {
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    listen_fd: c.fd_t,
+};
+
+fn acceptDaemonClient(ctx: *anyopaque, daemon_reactor: *reactor.Reactor, id: reactor.WatchId, event: reactor.Event) !void {
+    _ = daemon_reactor;
+    _ = id;
+    const accept_context: *DaemonAcceptContext = @ptrCast(@alignCast(ctx));
+
+    const fd_event = switch (event) {
+        .fd => |fd| fd,
+        .timer => return error.UnexpectedDaemonTimer,
+    };
+    if (fd_event.error_event or fd_event.invalid) return error.DaemonListenFailed;
+    if (!fd_event.readable) return;
+
+    const client_fd = c.accept(accept_context.listen_fd, null, null);
+    if (client_fd < 0) return;
+    socket_transport.setCloseOnExec(client_fd) catch {
+        _ = c.close(client_fd);
+        return;
+    };
+    const context = accept_context.allocator.create(ClientContext) catch {
+        _ = c.close(client_fd);
+        return;
+    };
+    context.* = .{
+        .allocator = accept_context.allocator,
+        .exe = accept_context.exe,
+        .fd = client_fd,
+    };
+    const thread = std.Thread.spawn(.{}, clientThread, .{context}) catch {
+        accept_context.allocator.destroy(context);
+        _ = c.close(client_fd);
+        return;
+    };
+    thread.detach();
 }
 
 const ClientContext = struct {
