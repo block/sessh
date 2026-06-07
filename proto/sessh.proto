@@ -21,79 +21,185 @@ message Frame {
 
   oneof payload {
     sessh.handshake.v1.Error error = 10;
-    TeSessionCreate te_session_create = 11;
-    TeSessionAttach te_session_attach = 12;
-    TeInput te_input = 13;
-    TeResize te_resize = 14;
-    TeRepaintRequest te_repaint_request = 15;
-    TeSessionAttached te_session_attached = 18;
-    TeSessionEnded te_session_ended = 19;
-    TeDraw te_draw = 20;
-    TeRepaintResponse te_repaint_response = 22;
-    TeTtyTranscriptChunk te_tty_transcript_chunk = 23;
-    TeInputAck te_input_ack = 24;
-    TeSessionClientControlResponse te_session_client_control_response = 28;
-    TeSessionClientDebugSeverConnectionRequest te_session_client_debug_sever_connection_request = 32;
-    TeSessionClientDebugUnresponsiveConnectionRequest te_session_client_debug_unresponsive_connection_request = 33;
     Ping ping = 39;
     Pong pong = 40;
-    ProxyStreamResume proxy_stream_resume = 43;
-    ProxyStreamData proxy_stream_data = 44;
-    ProxyStreamAck proxy_stream_ack = 45;
-    ProxyStreamEof proxy_stream_eof = 46;
-    ProxyStreamEofAck proxy_stream_eof_ack = 47;
-    ProxyControlCapabilities proxy_control_capabilities = 48;
-    ProxyControlDiagnostic proxy_control_diagnostic = 49;
-    ProxyControlCtrlR proxy_control_ctrl_r = 50;
-    ClientOpenProxyStream client_open_proxy_stream = 51;
+
+    // Coordinator-to-coordinator tunnel traffic. The stream id is scoped to
+    // one tunnel and is not durable.
+    MuxStreamFrame mux_stream_frame = 60;
+    // Single-stream IPC payloads. Local client/coordinator sockets do not need
+    // a mux stream id because the socket itself identifies the stream.
+    TeStreamItem te_stream_item = 61;
+    ProxyStreamItem proxy_stream_item = 62;
   }
 }
 
-// Framed payload, stream-broker shim -> local sesshd.
+// Framed payload, client coordinator <-> server coordinator.
 //
-// This opens or reattaches a durable opaque proxy stream. After sesshd accepts
-// this request, the same socket carries ProxyStream* frames for that stream.
-message ClientOpenProxyStream {
+// This is the only multiplexing envelope. All stream identity lives here; the
+// payload items inside remain usable on non-muxed local IPC sockets.
+message MuxStreamFrame {
+  uint64 stream_id = 1;
+
+  oneof payload {
+    MuxStreamOpen open = 2;
+    MuxStreamOpenOk open_ok = 3;
+    MuxStreamPayload payload = 4;
+    MuxStreamAck ack = 5;
+    MuxStreamReset reset = 6;
+  }
+}
+
+// Opens or resumes a mux stream. The detail oneof identifies the stream type;
+// there is no separate stream-kind field to keep in sync.
+message MuxStreamOpen {
+  // Durable stream/session GUID, e.g. s-... or p-...
   string guid = 1;
+  // First byte this side still needs from the peer's outbound stream.
+  uint64 recv_next_offset = 2;
+  // Backpressure credit this side grants the peer. The peer may send bytes in
+  // [recv_next_offset, recv_next_offset + receive_window_bytes) for this mux
+  // stream and must stop when that window is exhausted.
+  uint32 receive_window_bytes = 3;
+
+  oneof detail {
+    TeStreamOpen te = 10;
+    ProxyStreamOpen proxy = 11;
+  }
+}
+
+// Accepts a mux stream open and reports the acceptor's receive state. This is
+// not a required round-trip barrier; peers may pipeline payload after open when
+// they already have credit.
+message MuxStreamOpenOk {
+  uint64 recv_next_offset = 1;
+  // Initial backpressure credit granted by the stream acceptor. This has the
+  // same meaning as MuxStreamOpen.receive_window_bytes.
+  uint32 receive_window_bytes = 2;
+}
+
+// Ordered durable stream payload carried over a mux stream.
+message MuxStreamPayload {
+  uint64 offset = 1;
+
+  oneof item {
+    TeStreamItem te = 2;
+    ProxyStreamItem proxy = 3;
+  }
+}
+
+message MuxStreamAck {
+  // First byte offset not yet received from the peer.
+  uint64 recv_next_offset = 1;
+  // Updated backpressure credit. Receivers increase this as they drain their
+  // bounded per-stream buffer; senders stop sending on this mux stream when
+  // the advertised window is exhausted. Other mux streams have independent
+  // windows and may continue making progress.
+  uint32 receive_window_bytes = 2;
+}
+
+// Abrupt mux-stream termination, analogous to TCP RST or HTTP/2 RST_STREAM.
+// Graceful proxy EOF and terminal session exit are stream payload items instead.
+message MuxStreamReset {
+  string code = 1;
+  string message = 2;
+  optional string hint = 3;
+}
+
+// Terminal-emulator stream open details.
+message TeStreamOpen {
+  // Durable session GUID. This is redundant with MuxStreamOpen.guid on muxed
+  // tunnels, but direct non-muxed IPC has no MuxStreamOpen wrapper.
+  string session_guid = 1;
+  TeSessionCreate create = 2;
+}
+
+// Ordered terminal-emulator stream item. Direct local IPC can carry this as a
+// top-level Frame payload; mux tunnels carry it inside MuxStreamPayload.
+message TeStreamItem {
+  oneof payload {
+    TeStreamOpen open = 1;
+    TeInput input = 2;
+    TeInputAck input_ack = 3;
+    TeResize resize = 4;
+    TeRepaintRequest repaint_request = 5;
+    TeSessionAttached session_attached = 6;
+    TeSessionEnded session_ended = 7;
+    TeDraw draw = 8;
+    TeRepaintResponse repaint_response = 9;
+    TeTtyTranscriptChunk tty_transcript_chunk = 10;
+    TeDiagnostic diagnostic = 11;
+    TeSessionClientControlResponse session_client_control_response = 12;
+    TeSessionClientDebugSeverConnectionRequest debug_sever_connection_request = 13;
+    TeSessionClientDebugUnresponsiveConnectionRequest debug_unresponsive_connection_request = 14;
+  }
+}
+
+// Coordinator-injected terminal-emulator diagnostic. This is not remote process
+// output; the visible client renders it according to its filter level.
+message TeDiagnostic {
+  oneof payload {
+    TeDiagnosticDisconnected disconnected = 1;
+    TeDiagnosticConnecting connecting = 2;
+    TeDiagnosticReconnected reconnected = 3;
+    TeDiagnosticUnresponsive unresponsive = 4;
+    TeDiagnosticReconnectFailed reconnect_failed = 5;
+    TeDiagnosticCleanupPending cleanup_pending = 6;
+  }
+}
+
+message TeDiagnosticDisconnected {
+  optional uint64 next_retry_unix_ms = 1;
+}
+
+message TeDiagnosticConnecting {
+  uint64 attempt = 1;
+}
+
+message TeDiagnosticReconnected {
+}
+
+message TeDiagnosticUnresponsive {
+  uint64 attempt = 1;
+}
+
+message TeDiagnosticReconnectFailed {
+  uint64 attempt = 1;
+  string message = 2;
+  optional uint64 next_retry_unix_ms = 3;
+}
+
+message TeDiagnosticCleanupPending {
+  string message = 1;
+}
+
+// Proxy stream open details. This carries the durable p-guid because direct
+// non-muxed IPC has no MuxStreamOpen wrapper.
+message ProxyStreamOpen {
+  string proxy_guid = 1;
   string proxy_host = 2;
   uint32 proxy_port = 3;
 }
 
-// Sent at the start of every ssh transport that carries an opaque proxy stream.
-// The receiver uses the offset to drop bytes that the peer already received and
-// resume from the first unacknowledged byte.
-message ProxyStreamResume {
-  uint64 recv_next_offset = 1;
+// Ordered proxy stream item. Data is offset-free here; mux offsets live in
+// MuxStreamPayload, and direct local IPC relies on socket ordering.
+message ProxyStreamItem {
+  message Eof {
+  }
+
+  oneof payload {
+    ProxyStreamOpen open = 1;
+    bytes data = 2;
+    Eof eof = 3;
+    ProxyControlCapabilities control_capabilities = 10;
+    ProxyControlDiagnostic control_diagnostic = 11;
+    ProxyControlCtrlR control_ctrl_r = 12;
+  }
 }
 
-// Raw bytes from this peer's outbound opaque proxy stream.
-message ProxyStreamData {
-  // Offset of data[0] in this peer's outbound byte stream.
-  uint64 offset = 1;
-  bytes data = 2;
-}
-
-// Acknowledges received ProxyStreamData bytes.
-message ProxyStreamAck {
-  // First byte offset not yet received from the sender.
-  uint64 offset = 1;
-}
-
-// Marks the end of this peer's outbound opaque proxy stream.
-message ProxyStreamEof {
-  // Offset of the end of the sender's byte stream.
-  uint64 offset = 1;
-}
-
-// Acknowledges that ProxyStreamEof was received.
-message ProxyStreamEofAck {
-  // Offset of the end of the sender's byte stream.
-  uint64 offset = 1;
-}
-
-// Framed payload, visible client -> ProxyCommand process.
+// Embedded in ProxyStreamItem.
 //
-// Sent immediately after the local `c/` socket's normal HelloFrame handshake so
+// Sent immediately after the local IPC socket's normal HelloFrame handshake so
 // the ProxyCommand process can choose the right diagnostic stream shape.
 message ProxyControlCapabilities {
   enum OutputMode {
@@ -112,7 +218,7 @@ message ProxyControlCapabilities {
   bool ctrl_r_available = 2;
 }
 
-// Framed payload, ProxyCommand process -> visible client.
+// Embedded in ProxyStreamItem.
 //
 // One diagnostic item in the proxy-control stream. `update` is replaceable
 // connection state. `diagnostic_line` is append-only and should be emitted
@@ -124,7 +230,7 @@ message ProxyControlDiagnostic {
   bool intercept_ctrl_r = 3;
 }
 
-// Framed payload, visible client -> ProxyCommand process.
+// Embedded in ProxyStreamItem.
 //
 // Requests an immediate reconnect attempt after the visible client intercepted
 // CTRL-R.
@@ -202,11 +308,11 @@ message TeShellCommand {
   string command = 1;
 }
 
-// Framed payload, client -> remote session runtime.
+// Embedded in TeStreamOpen.
 //
-// Creates a new interactive PTY session and attaches this client. A successful
-// TeSessionCreate is followed by TeSessionAttached for the new session, then
-// TeDraw/TeRepaintResponse messages.
+// Creates a new interactive PTY session for this terminal-emulator stream. A
+// successful TeSessionCreate is followed by TeSessionAttached for the new
+// session, then TeDraw/TeRepaintResponse messages.
 message TeSessionCreate {
   // Initial PTY size and repaint request for the attaching client.
   TeResize resize = 1;
@@ -217,9 +323,6 @@ message TeSessionCreate {
   repeated TeEnvironmentEntry environment = 3;
   // Colors the remote session runtime may use to answer early OSC 10/11 queries.
   TeDefaultColors query_default_colors = 4;
-  // Canonical session GUID in s-prefixed hyphenated UUID form, e.g.
-  // s-550e8400-e29b-41d4-a716-446655440000.
-  string session_guid = 5;
   // At most one command form may be present. When command is unset, the agent
   // starts the user's interactive login shell. The shell_command variant
   // mirrors ssh's `ssh HOST cmd args...` behavior after the local argv has
@@ -238,22 +341,7 @@ message TeSessionCreate {
   bool capture_tty_transcript = 13;
 }
 
-// Framed payload, client -> remote session runtime.
-//
-// Attaches to an existing session. A successful TeSessionAttach is followed by
-// TeSessionAttached for the selected session, then TeDraw/TeRepaintResponse messages.
-message TeSessionAttach {
-  TeResize resize = 1;
-  // Full session GUID for the existing session.
-  string session_guid = 2;
-  // When true, the remote session runtime sends raw inner PTY transcript chunks for
-  // this attached client. The client still owns archive creation and storage.
-  bool capture_tty_transcript = 3;
-  // Absolute path to the selected session GUID directory.
-  string session_dir = 5;
-}
-
-// Framed payload, client -> remote session runtime.
+// Embedded in TeStreamItem.
 //
 // Local terminal input bytes.
 message TeInput {
@@ -264,14 +352,14 @@ message TeInput {
   uint64 input_seq = 2;
 }
 
-// Framed payload, remote session runtime -> client.
+// Embedded in TeStreamItem.
 //
 // Confirms that the remote session runtime received a TeInput frame.
 message TeInputAck {
   uint64 input_seq = 1;
 }
 
-// Framed payload, client -> remote session runtime.
+// Embedded in TeStreamItem.
 //
 // Current terminal size for this attached client.
 message TeResize {
@@ -279,9 +367,8 @@ message TeResize {
   uint32 terminal_rows = 1;
   // Columns visible in the local terminal. The remote session runtime bounds this to u16.
   uint32 terminal_cols = 2;
-  // Present for resize frames after attach and for embedded TeSessionAttach
-  // resizes. The remote session runtime applies the new size, then answers this request
-  // with a TeRepaintResponse.
+  // Present for resize frames that need a redraw. The remote session runtime
+  // applies the new size, then answers this request with a TeRepaintResponse.
   optional TeRepaintRequest repaint_request = 3;
   // Rows between the outer terminal viewport top and the sessh viewport top.
   // Omitted means the viewports are aligned. -1 means the client no longer
@@ -290,7 +377,7 @@ message TeResize {
   optional sint32 viewport_offset = 4;
 }
 
-// Framed payload, client -> remote session runtime.
+// Embedded in TeStreamItem.
 //
 // Requests that the remote session runtime redraw terminal state for this attached client.
 message TeRepaintRequest {
@@ -305,12 +392,12 @@ message TeRepaintRequest {
   // scrollback available; present non-empty bytes must come from a previous
   // TeDraw.scrollback_cursor.
   optional bytes scrollback_cursor = 2;
-  // Optional cap for retained scrollback rows included with an initial attach
-  // repaint. Absent means all available retained scrollback.
+  // Optional cap for retained scrollback rows included with an initial stream
+  // open repaint. Absent means all available retained scrollback.
   optional uint32 initial_scrollback_rows = 3;
 }
 
-// Framed payload, remote session runtime -> client.
+// Embedded in TeStreamItem.
 //
 // Confirms the session selected for this connection.
 message TeSessionAttached {
@@ -320,12 +407,12 @@ message TeSessionAttached {
   string session_dir = 3;
 }
 
-// Framed payload, broker/client -> remote session runtime.
+// Embedded in TeStreamItem.
 //
 // Debug-only request that severs all attached client connections.
 message TeSessionClientDebugSeverConnectionRequest {}
 
-// Framed payload, broker/client -> remote session runtime.
+// Embedded in TeStreamItem.
 //
 // Debug-only request that makes all attached client connections stop responding
 // for a bounded duration. Omitted or zero seconds asks the receiver to use its
@@ -334,7 +421,7 @@ message TeSessionClientDebugUnresponsiveConnectionRequest {
   uint32 seconds = 1;
 }
 
-// Framed payload, remote session runtime -> broker/client.
+// Embedded in TeStreamItem.
 //
 // Confirms that a debug client-control request was accepted.
 message TeSessionClientControlResponse {}
@@ -360,7 +447,7 @@ message ExitStatus {
   sint32 status = 2;
 }
 
-// Framed payload, remote session runtime -> client.
+// Embedded in TeStreamItem.
 //
 // Tells an attached client that the session has ended.
 message TeSessionEnded {
@@ -371,7 +458,7 @@ message TeSessionEnded {
   optional uint64 ended_at_unix_ms = 3;
 }
 
-// Framed payload, remote session runtime -> client.
+// Embedded in TeStreamItem.
 //
 // Session-agent-generated terminal bytes for the attached session.
 message TeDraw {
@@ -400,7 +487,7 @@ message TeDraw {
   optional bool app_title_present = 5;
 }
 
-// Framed payload, remote session runtime -> client.
+// Embedded in TeStreamItem.
 //
 // Response for a TeRepaintRequest. The embedded TeDraw is applied exactly like a
 // framed TeDraw.
@@ -415,7 +502,7 @@ enum TeTtyTranscriptStream {
   TE_TTY_TRANSCRIPT_STREAM_INNER_OUT = 2;
 }
 
-// Framed payload, remote session runtime -> client.
+// Embedded in TeStreamItem.
 //
 // Raw inner PTY bytes captured for a client-requested tty transcript.
 message TeTtyTranscriptChunk {
