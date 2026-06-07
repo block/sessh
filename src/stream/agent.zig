@@ -18,6 +18,7 @@ const max_buffered_bytes = 1024 * 1024;
 const max_chunk_bytes = 16 * 1024;
 const transport_ping_interval_ms: u64 = 1_000;
 const stream_unresponsive_after_ms: u64 = 10_000;
+const proxy_mux_stream_id: u64 = 1;
 
 const StreamOutcome = union(enum) {
     complete,
@@ -34,6 +35,7 @@ pub const StreamReconnectStatusMode = enum {
 };
 
 pub const LocalStreamOptions = struct {
+    guid: []const u8 = "",
     source_fd: c.fd_t,
     sink_fd: c.fd_t,
     status_mode: StreamReconnectStatusMode,
@@ -93,12 +95,16 @@ const StreamByteState = struct {
 // to `outbound`; peer data advances `inbound.recv_next_offset`.
 const StreamState = struct {
     allocator: std.mem.Allocator,
+    guid: []const u8,
     outbound: StreamByteState = .{},
     inbound: StreamByteState = .{},
     peer_ready: bool = false,
 
-    fn init(allocator: std.mem.Allocator) StreamState {
-        return .{ .allocator = allocator };
+    fn init(allocator: std.mem.Allocator, guid: []const u8) StreamState {
+        return .{
+            .allocator = allocator,
+            .guid = guid,
+        };
     }
 
     fn deinit(self: *StreamState) void {
@@ -786,11 +792,11 @@ const ProxyEndpoint = struct {
 pub fn clientOpenProxyStreamFromBrokerArgs(
     allocator: std.mem.Allocator,
     args: []const []const u8,
-) !pb.ClientOpenProxyStream {
+) !pb.ProxyStreamOpen {
     var config = try parseStreamAgentConfig(allocator, args);
     defer config.deinit(allocator);
     return .{
-        .guid = config.guid,
+        .proxy_guid = config.guid,
         .proxy_host = try allocator.dupe(u8, config.proxy_host.?),
         .proxy_port = @intCast(config.proxy_port),
     };
@@ -799,19 +805,19 @@ pub fn clientOpenProxyStreamFromBrokerArgs(
 pub fn serveProxyStreamOpen(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    request: pb.ClientOpenProxyStream,
+    request: pb.ProxyStreamOpen,
     fd: c.fd_t,
 ) !void {
-    if (!session_registry.isValidProxyGuid(request.guid)) return error.InvalidStreamGuid;
+    if (!session_registry.isValidProxyGuid(request.proxy_guid)) return error.InvalidStreamGuid;
     if (request.proxy_port == 0 or request.proxy_port > std.math.maxInt(u16)) return error.InvalidStreamArgs;
 
-    var socket_paths = try session_registry.runtimeAgentSocketPathsForGuid(allocator, request.guid);
+    var socket_paths = try session_registry.runtimeAgentSocketPathsForGuid(allocator, request.proxy_guid);
     defer socket_paths.deinit(allocator);
 
     const agent_fd = try connectOrStartProxyAgent(
         allocator,
         exe,
-        request.guid,
+        request.proxy_guid,
         request.proxy_host,
         @intCast(request.proxy_port),
         socket_paths.socket,
@@ -841,7 +847,7 @@ fn runProxyWorker(allocator: std.mem.Allocator, exe: []const u8, args: []const [
     var endpoint = try startStreamEndpoint(allocator, config);
     defer endpoint.deinit();
 
-    var state = StreamState.init(allocator);
+    var state = StreamState.init(allocator, config.guid);
     defer state.deinit();
 
     var attach_fd: c.fd_t = -1;
@@ -928,7 +934,7 @@ pub fn runLocalStream(
     var control_fd = options.control_fd;
     if (control_fd >= 0) setNonBlockingFd(control_fd) catch {};
 
-    var state = StreamState.init(allocator);
+    var state = StreamState.init(allocator, options.guid);
     defer state.deinit();
     var input_control = StreamInputControl{
         .enabled = options.intercept_ctrl_r,
@@ -1223,46 +1229,10 @@ fn handleFrame(
     defer mutable.deinit(state.allocator);
 
     switch (mutable.message_type) {
-        .proxy_stream_resume => {
-            var message = try protocol.decodePayload(pb.ProxyStreamResume, state.allocator, mutable.payload);
+        .mux_stream_frame => {
+            var message = try protocol.decodePayload(pb.MuxStreamFrame, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
-            state.peer_ready = true;
-            try handleResumeOffset(state, message.recv_next_offset);
-            sendPending(state, transport_write_fd) catch |err| switch (err) {
-                error.WriteFailed => return error.StreamTransportWriteFailed,
-                else => return err,
-            };
-        },
-        .proxy_stream_ack => {
-            var message = try protocol.decodePayload(pb.ProxyStreamAck, state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
-            try handleAck(state, message.offset);
-        },
-        .proxy_stream_eof_ack => {
-            var message = try protocol.decodePayload(pb.ProxyStreamEofAck, state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
-            try handleEofAck(state, message.offset);
-        },
-        .proxy_stream_data => {
-            var message = try protocol.decodePayload(pb.ProxyStreamData, state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
-            try handleInboundData(
-                state,
-                transport_write_fd,
-                options,
-                message.offset,
-                message.data,
-            );
-        },
-        .proxy_stream_eof => {
-            var message = try protocol.decodePayload(pb.ProxyStreamEof, state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
-            try handleInboundEof(
-                state,
-                transport_write_fd,
-                options,
-                message.offset,
-            );
+            try handleMuxStreamFrame(state, transport_write_fd, options, message);
         },
         .ping, .pong => {
             _ = protocol.handleTransportControlFrame(mutable.message_type, mutable.payload, transport_write_fd) catch |err| switch (err) {
@@ -1270,6 +1240,73 @@ fn handleFrame(
                 else => return err,
             };
         },
+        else => return error.StreamUnexpectedFrame,
+    }
+}
+
+fn handleMuxStreamFrame(
+    state: *StreamState,
+    transport_write_fd: c.fd_t,
+    options: *const StreamAttachedClientOptions,
+    frame: pb.MuxStreamFrame,
+) !void {
+    if (frame.stream_id != proxy_mux_stream_id) return error.StreamUnexpectedFrame;
+    const message = frame.message orelse return error.StreamUnexpectedFrame;
+    switch (message) {
+        .open => |open| {
+            state.peer_ready = true;
+            try handleResumeOffset(state, open.recv_next_offset);
+            sendOpenOk(state, transport_write_fd) catch |err| switch (err) {
+                error.WriteFailed => return error.StreamTransportWriteFailed,
+                else => return err,
+            };
+            sendPending(state, transport_write_fd) catch |err| switch (err) {
+                error.WriteFailed => return error.StreamTransportWriteFailed,
+                else => return err,
+            };
+        },
+        .open_ok => |open_ok| {
+            state.peer_ready = true;
+            try handleAck(state, open_ok.recv_next_offset);
+            sendPending(state, transport_write_fd) catch |err| switch (err) {
+                error.WriteFailed => return error.StreamTransportWriteFailed,
+                else => return err,
+            };
+        },
+        .ack => |ack| try handleAck(state, ack.recv_next_offset),
+        .payload => |payload| {
+            const item = payload.item orelse return error.StreamUnexpectedFrame;
+            switch (item) {
+                .proxy => |proxy_item| try handleProxyStreamPayload(state, transport_write_fd, options, payload.offset, proxy_item),
+                .te => return error.StreamUnexpectedFrame,
+            }
+        },
+        .reset => return error.StreamTransportClosed,
+    }
+}
+
+fn handleProxyStreamPayload(
+    state: *StreamState,
+    transport_write_fd: c.fd_t,
+    options: *const StreamAttachedClientOptions,
+    offset: u64,
+    item: pb.ProxyStreamItem,
+) !void {
+    const payload = item.payload orelse return error.StreamUnexpectedFrame;
+    switch (payload) {
+        .data => |data| try handleInboundData(
+            state,
+            transport_write_fd,
+            options,
+            offset,
+            data,
+        ),
+        .eof => try handleInboundEof(
+            state,
+            transport_write_fd,
+            options,
+            offset,
+        ),
         else => return error.StreamUnexpectedFrame,
     }
 }
@@ -1284,11 +1321,9 @@ fn handleAck(state: *StreamState, offset: u64) !void {
     state.outbound.peer_recv = offset;
     try state.dropOutboundThrough(offset);
     if (state.outbound.outbound_sent_next < offset) state.outbound.outbound_sent_next = offset;
-}
-
-fn handleEofAck(state: *StreamState, offset: u64) !void {
-    try handleAck(state, offset);
-    if (offset == state.outbound.outboundNext()) state.outbound.outbound_eof_acked = true;
+    if (state.outbound.outbound_eof_sent and offset == state.outbound.outboundNext()) {
+        state.outbound.outbound_eof_acked = true;
+    }
 }
 
 fn handleInboundData(
@@ -1344,7 +1379,7 @@ fn handleInboundEof(
     if (options.close_outbound_on_inbound_eof and state.inbound.inbound_eof) {
         state.outbound.outbound_eof = true;
     }
-    sendEofAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
+    sendAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
         error.WriteFailed => return error.StreamTransportWriteFailed,
         else => return err,
     };
@@ -1356,20 +1391,35 @@ fn deliverInboundData(options: *const StreamAttachedClientOptions, sink_fd: c.fd
 }
 
 fn sendResumeMessage(state: *StreamState, fd: c.fd_t) !void {
-    try sendStreamMessage(state.allocator, fd, .proxy_stream_resume, pb.ProxyStreamResume{
-        .recv_next_offset = state.inbound.recv_next_offset,
+    try sendMuxStreamFrame(state.allocator, fd, .{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .open = .{
+            .recv_next_offset = state.inbound.recv_next_offset,
+            .receive_window_bytes = max_buffered_bytes,
+            .detail = .{ .proxy = .{
+                .proxy_guid = state.guid,
+            } },
+        } },
+    });
+}
+
+fn sendOpenOk(state: *StreamState, fd: c.fd_t) !void {
+    try sendMuxStreamFrame(state.allocator, fd, .{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .open_ok = .{
+            .recv_next_offset = state.inbound.recv_next_offset,
+            .receive_window_bytes = max_buffered_bytes,
+        } },
     });
 }
 
 fn sendAck(state: *StreamState, fd: c.fd_t, offset: u64) !void {
-    try sendStreamMessage(state.allocator, fd, .proxy_stream_ack, pb.ProxyStreamAck{
-        .offset = offset,
-    });
-}
-
-fn sendEofAck(state: *StreamState, fd: c.fd_t, offset: u64) !void {
-    try sendStreamMessage(state.allocator, fd, .proxy_stream_eof_ack, pb.ProxyStreamEofAck{
-        .offset = offset,
+    try sendMuxStreamFrame(state.allocator, fd, .{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .ack = .{
+            .recv_next_offset = offset,
+            .receive_window_bytes = max_buffered_bytes,
+        } },
     });
 }
 
@@ -1379,15 +1429,22 @@ fn sendData(
     offset: u64,
     data: []const u8,
 ) !void {
-    try sendStreamMessage(state.allocator, fd, .proxy_stream_data, pb.ProxyStreamData{
-        .offset = offset,
-        .data = data,
+    try sendMuxStreamFrame(state.allocator, fd, .{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .payload = .{
+            .offset = offset,
+            .item = .{ .proxy = .{ .payload = .{ .data = data } } },
+        } },
     });
 }
 
 fn sendEof(state: *StreamState, fd: c.fd_t, offset: u64) !void {
-    try sendStreamMessage(state.allocator, fd, .proxy_stream_eof, pb.ProxyStreamEof{
-        .offset = offset,
+    try sendMuxStreamFrame(state.allocator, fd, .{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .payload = .{
+            .offset = offset,
+            .item = .{ .proxy = .{ .payload = .{ .eof = .{} } } },
+        } },
     });
 }
 
@@ -1424,15 +1481,14 @@ fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
     }
 }
 
-fn sendStreamMessage(
+fn sendMuxStreamFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    message_type: protocol.MessageType,
-    message: anytype,
+    message: pb.MuxStreamFrame,
 ) !void {
     const payload = try protocol.encodePayload(allocator, message);
     defer allocator.free(payload);
-    try protocol.sendFrame(fd, message_type, payload);
+    try protocol.sendFrame(fd, .mux_stream_frame, payload);
 }
 
 fn abortTransport(transport: anytype) void {
@@ -2229,6 +2285,102 @@ fn formatDiagnosticLine(
     return out[0 .. prefix.len + message.len];
 }
 
+fn encodeMuxProxyDataPayload(allocator: std.mem.Allocator, offset: u64, data: []const u8) ![]u8 {
+    return protocol.encodePayload(allocator, pb.MuxStreamFrame{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .payload = .{
+            .offset = offset,
+            .item = .{ .proxy = .{ .payload = .{ .data = data } } },
+        } },
+    });
+}
+
+fn encodeMuxProxyEofPayload(allocator: std.mem.Allocator, offset: u64) ![]u8 {
+    return protocol.encodePayload(allocator, pb.MuxStreamFrame{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .payload = .{
+            .offset = offset,
+            .item = .{ .proxy = .{ .payload = .{ .eof = .{} } } },
+        } },
+    });
+}
+
+fn encodeMuxAckPayload(allocator: std.mem.Allocator, recv_next_offset: u64) ![]u8 {
+    return protocol.encodePayload(allocator, pb.MuxStreamFrame{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .ack = .{
+            .recv_next_offset = recv_next_offset,
+            .receive_window_bytes = max_buffered_bytes,
+        } },
+    });
+}
+
+fn expectMuxStreamFrame(fd: c.fd_t) !pb.MuxStreamFrame {
+    var frame = try protocol.readFrameAlloc(std.testing.allocator, fd);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.mux_stream_frame, frame.message_type);
+    var mux = try protocol.decodePayload(pb.MuxStreamFrame, std.testing.allocator, frame.payload);
+    errdefer mux.deinit(std.testing.allocator);
+    try std.testing.expectEqual(proxy_mux_stream_id, mux.stream_id);
+    return mux;
+}
+
+fn expectProxyDataFrame(fd: c.fd_t, expected_offset: u64, expected_data: []const u8) !void {
+    var mux = try expectMuxStreamFrame(fd);
+    defer mux.deinit(std.testing.allocator);
+    const message = mux.message orelse return error.UnexpectedMuxFrame;
+    switch (message) {
+        .payload => |payload| {
+            try std.testing.expectEqual(expected_offset, payload.offset);
+            const item = payload.item orelse return error.UnexpectedMuxFrame;
+            switch (item) {
+                .proxy => |proxy_item| {
+                    const proxy_payload = proxy_item.payload orelse return error.UnexpectedMuxFrame;
+                    switch (proxy_payload) {
+                        .data => |data| try std.testing.expectEqualStrings(expected_data, data),
+                        else => return error.UnexpectedMuxFrame,
+                    }
+                },
+                else => return error.UnexpectedMuxFrame,
+            }
+        },
+        else => return error.UnexpectedMuxFrame,
+    }
+}
+
+fn expectProxyEofFrame(fd: c.fd_t, expected_offset: u64) !void {
+    var mux = try expectMuxStreamFrame(fd);
+    defer mux.deinit(std.testing.allocator);
+    const message = mux.message orelse return error.UnexpectedMuxFrame;
+    switch (message) {
+        .payload => |payload| {
+            try std.testing.expectEqual(expected_offset, payload.offset);
+            const item = payload.item orelse return error.UnexpectedMuxFrame;
+            switch (item) {
+                .proxy => |proxy_item| {
+                    const proxy_payload = proxy_item.payload orelse return error.UnexpectedMuxFrame;
+                    switch (proxy_payload) {
+                        .eof => {},
+                        else => return error.UnexpectedMuxFrame,
+                    }
+                },
+                else => return error.UnexpectedMuxFrame,
+            }
+        },
+        else => return error.UnexpectedMuxFrame,
+    }
+}
+
+fn expectAckFrame(fd: c.fd_t, expected_offset: u64) !void {
+    var mux = try expectMuxStreamFrame(fd);
+    defer mux.deinit(std.testing.allocator);
+    const message = mux.message orelse return error.UnexpectedMuxFrame;
+    switch (message) {
+        .ack => |ack| try std.testing.expectEqual(expected_offset, ack.recv_next_offset),
+        else => return error.UnexpectedMuxFrame,
+    }
+}
+
 test "proxy stream config uses proxy guid and tcp target" {
     var config = try parseStreamAgentConfig(std.testing.allocator, &.{
         "p-550e8400-e29b-41d4-a716-446655440000",
@@ -2270,18 +2422,10 @@ test "stream frames round trip through a pipe" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    try sendStreamMessage(std.testing.allocator, fds[1], .proxy_stream_data, pb.ProxyStreamData{
-        .offset = 42,
-        .data = "hello",
-    });
-    var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
-    defer frame.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(protocol.MessageType.proxy_stream_data, frame.message_type);
-    var message = try protocol.decodePayload(pb.ProxyStreamData, std.testing.allocator, frame.payload);
-    defer message.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 42), message.offset);
-    try std.testing.expectEqualStrings("hello", message.data);
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
+    defer state.deinit();
+    try sendData(&state, fds[1], 42, "hello");
+    try expectProxyDataFrame(fds[0], 42, "hello");
 }
 
 test "stream ping receives pong without changing offsets" {
@@ -2289,7 +2433,7 @@ test "stream ping receives pong without changing offsets" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator);
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
     defer state.deinit();
     const payload = try protocol.encodePayload(std.testing.allocator, pb.Ping{});
     const options = StreamAttachedClientOptions{};
@@ -2310,29 +2454,17 @@ test "stream sender sends only newly appended bytes on a live transport" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator);
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
     defer state.deinit();
     state.peer_ready = true;
 
     try state.appendOutbound("first");
     try sendPending(&state, fds[1]);
-    var first_frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
-    defer first_frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.proxy_stream_data, first_frame.message_type);
-    var first = try protocol.decodePayload(pb.ProxyStreamData, std.testing.allocator, first_frame.payload);
-    defer first.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 0), first.offset);
-    try std.testing.expectEqualStrings("first", first.data);
+    try expectProxyDataFrame(fds[0], 0, "first");
 
     try state.appendOutbound("second");
     try sendPending(&state, fds[1]);
-    var second_frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
-    defer second_frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.proxy_stream_data, second_frame.message_type);
-    var second = try protocol.decodePayload(pb.ProxyStreamData, std.testing.allocator, second_frame.payload);
-    defer second.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 5), second.offset);
-    try std.testing.expectEqualStrings("second", second.data);
+    try expectProxyDataFrame(fds[0], 5, "second");
 }
 
 test "stream receiver keeps suffix from overlapping data frame" {
@@ -2343,18 +2475,15 @@ test "stream receiver keeps suffix from overlapping data frame" {
     defer posix.close(ack[0]);
     defer posix.close(ack[1]);
 
-    var state = StreamState.init(std.testing.allocator);
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
     defer state.deinit();
     state.inbound.recv_next_offset = 5;
 
-    const payload = try protocol.encodePayload(std.testing.allocator, pb.ProxyStreamData{
-        .offset = 0,
-        .data = "firstsecond",
-    });
+    const payload = try encodeMuxProxyDataPayload(std.testing.allocator, 0, "firstsecond");
     var options = StreamAttachedClientOptions{};
     options.sink = .{ .fd = sink[1] };
     try handleFrame(&state, ack[1], &options, .{
-        .message_type = .proxy_stream_data,
+        .message_type = .mux_stream_frame,
         .payload = payload,
     });
 
@@ -2362,12 +2491,7 @@ test "stream receiver keeps suffix from overlapping data frame" {
     try io.readExact(sink[0], &delivered);
     try std.testing.expectEqualStrings("second", delivered[0..]);
 
-    var ack_frame = try protocol.readFrameAlloc(std.testing.allocator, ack[0]);
-    defer ack_frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.proxy_stream_ack, ack_frame.message_type);
-    var ack_message = try protocol.decodePayload(pb.ProxyStreamAck, std.testing.allocator, ack_frame.payload);
-    defer ack_message.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 11), ack_message.offset);
+    try expectAckFrame(ack[0], 11);
 }
 
 test "stream inbound eof promptly flushes generated outbound eof" {
@@ -2378,15 +2502,13 @@ test "stream inbound eof promptly flushes generated outbound eof" {
     defer posix.close(transport_out[0]);
     defer posix.close(transport_out[1]);
 
-    var state = StreamState.init(std.testing.allocator);
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
     defer state.deinit();
     state.peer_ready = true;
 
-    const payload = try protocol.encodePayload(std.testing.allocator, pb.ProxyStreamEof{
-        .offset = 0,
-    });
+    const payload = try encodeMuxProxyEofPayload(std.testing.allocator, 0);
     defer std.testing.allocator.free(payload);
-    try protocol.sendFrame(transport_in[1], .proxy_stream_eof, payload);
+    try protocol.sendFrame(transport_in[1], .mux_stream_frame, payload);
 
     var attached_client = StreamAttachedClient{
         .state = &state,
@@ -2400,9 +2522,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
 
     try std.testing.expectEqual(StreamStepOutcome.progress, try attached_client.step(1_000));
 
-    var ack_frame = try protocol.readFrameAlloc(std.testing.allocator, transport_out[0]);
-    defer ack_frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.proxy_stream_eof_ack, ack_frame.message_type);
+    try expectAckFrame(transport_out[0], 0);
 
     var pollfds = [_]posix.pollfd{.{
         .fd = transport_out[0],
@@ -2411,12 +2531,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
     }};
     try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 0));
 
-    var eof_frame = try protocol.readFrameAlloc(std.testing.allocator, transport_out[0]);
-    defer eof_frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.proxy_stream_eof, eof_frame.message_type);
-    var eof = try protocol.decodePayload(pb.ProxyStreamEof, std.testing.allocator, eof_frame.payload);
-    defer eof.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 0), eof.offset);
+    try expectProxyEofFrame(transport_out[0], 0);
 }
 
 test "stream liveness schedules probes before declaring unresponsive" {
@@ -2549,19 +2664,18 @@ test "pending stream replacement notifies failed preparation" {
 }
 
 test "stream completion waits for eof acknowledgement" {
-    var state = StreamState.init(std.testing.allocator);
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
     defer state.deinit();
     state.outbound.outbound_eof = true;
+    state.outbound.outbound_eof_sent = true;
     state.inbound.inbound_eof = true;
 
     try std.testing.expect(!state.complete());
 
-    const payload = try protocol.encodePayload(std.testing.allocator, pb.ProxyStreamEofAck{
-        .offset = 0,
-    });
+    const payload = try encodeMuxAckPayload(std.testing.allocator, 0);
     const options = StreamAttachedClientOptions{};
     try handleFrame(&state, -1, &options, .{
-        .message_type = .proxy_stream_eof_ack,
+        .message_type = .mux_stream_frame,
         .payload = payload,
     });
     try std.testing.expect(state.complete());

@@ -1504,9 +1504,25 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                 continue;
             },
             .te_resize => continue,
-            .te_session_create => {
+            .te_stream_open => {
+                var open = try protocol.decodePayload(pb.TeStreamOpen, app_allocator.allocator(), frame.payload);
+                defer open.deinit(app_allocator.allocator());
+                if (open.create == null) {
+                    var request = try attachRequestFromOpen(open);
+                    defer request.deinit();
+                    if (request.session_guid.len == 0) return error.MissingSessionGuid;
+                    const session = findSession(session_agent, request.session_guid);
+                    const resolved_session = session orelse {
+                        try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
+                        return false;
+                    };
+                    updateSessionSize(resolved_session, request.resize.rows, request.resize.cols);
+                    try attachSession(session_agent, fd, request.resize, request.capture_tty_transcript);
+                    return true;
+                }
+
                 var request = readSessionCreateRequest(frame.payload) catch {
-                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid SESSION_CREATE payload", "");
+                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid terminal stream open payload", "");
                     return false;
                 };
                 defer request.deinit();
@@ -1536,19 +1552,6 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
             .te_session_client_debug_unresponsive_connection_request => {
                 try handleSessionClientDebugUnresponsiveConnectionRequest(session_agent, fd, frame.payload);
                 return false;
-            },
-            .te_session_attach => {
-                var request = try readAttachRequest(frame.payload);
-                defer request.deinit();
-                if (request.session_guid.len == 0) return error.MissingSessionGuid;
-                const session = findSession(session_agent, request.session_guid);
-                const resolved_session = session orelse {
-                    try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
-                    return false;
-                };
-                updateSessionSize(resolved_session, request.resize.rows, request.resize.cols);
-                try attachSession(session_agent, fd, request.resize, request.capture_tty_transcript);
-                return true;
             },
             else => {
                 try sendError(session_agent, fd, "PROTOCOL_ERROR", "unexpected first action", "");
@@ -2387,10 +2390,11 @@ fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
 }
 
 fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
-    var message = try protocol.decodePayload(pb.TeSessionCreate, app_allocator.allocator(), payload);
-    defer message.deinit(app_allocator.allocator());
-    const resize = message.resize orelse return error.MissingResize;
-    if (!session_registry.isValidSessionGuid(message.session_guid)) return error.InvalidSessionGuid;
+    var open = try protocol.decodePayload(pb.TeStreamOpen, app_allocator.allocator(), payload);
+    defer open.deinit(app_allocator.allocator());
+    const message = open.create orelse return error.MissingSessionCreate;
+    const resize = open.resize orelse return error.MissingResize;
+    if (!session_registry.isValidSessionGuid(open.session_guid)) return error.InvalidSessionGuid;
     var environment = SessionEnvironment{};
     errdefer environment.deinit();
     var query_default_colors = vt.DefaultColors{};
@@ -2430,7 +2434,7 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
         .scrollback_row_count = message.scrollback_row_limit,
         .environment = environment,
         .query_default_colors = query_default_colors,
-        .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
+        .session_guid = try app_allocator.allocator().dupe(u8, open.session_guid),
         .command_argv = command_argv,
         .shell_command = if (shell_command) |command|
             try app_allocator.allocator().dupe(u8, command)
@@ -2438,7 +2442,7 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
             null,
         .tty_settings = request_tty_settings,
         .reap_ms = message.reap_ms,
-        .capture_tty_transcript = message.capture_tty_transcript,
+        .capture_tty_transcript = open.capture_tty_transcript,
     };
 }
 
@@ -2530,9 +2534,7 @@ fn resizePayloadFromMessage(message: pb.TeResize) !ResizePayload {
     };
 }
 
-fn readAttachRequest(payload: []const u8) !AttachRequest {
-    var message = try protocol.decodePayload(pb.TeSessionAttach, app_allocator.allocator(), payload);
-    defer message.deinit(app_allocator.allocator());
+fn attachRequestFromOpen(message: pb.TeStreamOpen) !AttachRequest {
     const resize = message.resize orelse return error.MissingResize;
     if (message.session_guid.len > 0 and !session_registry.isValidSessionGuid(message.session_guid)) return error.InvalidSessionGuid;
     return .{

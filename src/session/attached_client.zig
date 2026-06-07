@@ -1014,7 +1014,7 @@ fn attachReconnectRuntimeInner(
     cancelled: ?*const std.atomic.Value(bool),
     wait_for_repaint: bool,
 ) !void {
-    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice(), session.sessionDirSlice());
+    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice());
     try readSessionAttachedInner(read_fd, write_fd, cancelled);
     if (wait_for_repaint) try finishReconnectRepaintInner(read_fd, write_fd, session, cancelled);
 }
@@ -1472,22 +1472,11 @@ fn sendSessionCreate(
 ) !u64 {
     if (command_argv.len > 0 and shell_command != null) return error.InvalidSessionCommand;
     const repaint_request_seq = allocateRepaintRequestSeq();
-    var message = pb.TeSessionCreate{
-        .resize = .{
-            .terminal_rows = size.rows,
-            .terminal_cols = size.cols,
-            .viewport_offset = viewport_offset,
-            .repaint_request = .{
-                .repaint_request_seq = repaint_request_seq,
-                .scrollback_cursor = "",
-            },
-        },
+    var create = pb.TeSessionCreate{
         .scrollback_row_limit = scrollback_row_count,
-        .session_guid = session_guid,
         .reap_ms = reap_ms,
-        .capture_tty_transcript = tty_transcript.enabled(),
     };
-    defer message.environment.deinit(app_allocator.allocator());
+    defer create.environment.deinit(app_allocator.allocator());
     // The normal sessh path runs a terminal emulator on the remote side. Copy
     // portable line-discipline modes, but keep TERM tied to that emulator
     // contract instead of leaking the outer terminal's TERM.
@@ -1505,24 +1494,38 @@ fn sendSessionCreate(
                 .value = mode.value,
             });
         }
-        message.tty_settings = protocol_tty_settings;
+        create.tty_settings = protocol_tty_settings;
     }
     var exec_command = pb.TeExecCommand{};
     defer exec_command.argv.deinit(app_allocator.allocator());
     if (shell_command) |command| {
-        message.command = .{ .shell_command = .{ .command = command } };
+        create.command = .{ .shell_command = .{ .command = command } };
     } else if (command_argv.len > 0) {
         try exec_command.argv.appendSlice(app_allocator.allocator(), command_argv);
-        message.command = .{ .exec_command = exec_command };
+        create.command = .{ .exec_command = exec_command };
     }
     const default_colors = queryDefaultColorsForSession();
-    message.query_default_colors = .{
+    create.query_default_colors = .{
         .foreground_color = default_colors.foreground_color,
         .background_color = default_colors.background_color,
     };
+    const message = pb.TeStreamOpen{
+        .session_guid = session_guid,
+        .resize = .{
+            .terminal_rows = size.rows,
+            .terminal_cols = size.cols,
+            .viewport_offset = viewport_offset,
+            .repaint_request = .{
+                .repaint_request_seq = repaint_request_seq,
+                .scrollback_cursor = "",
+            },
+        },
+        .capture_tty_transcript = tty_transcript.enabled(),
+        .create = create,
+    };
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(conn, .te_session_create, payload);
+    try protocol.sendFrame(conn, .te_stream_open, payload);
     return repaint_request_seq;
 }
 
@@ -1554,10 +1557,10 @@ fn sendSessionAttach(
     initial_scrollback_row_count: ?u32,
     reconnect_cursor: ?*const ScrollbackCursor,
     session_guid: []const u8,
-    session_dir: []const u8,
 ) !u64 {
     const repaint_request_seq = allocateRepaintRequestSeq();
-    const message = pb.TeSessionAttach{
+    const message = pb.TeStreamOpen{
+        .session_guid = session_guid,
         .resize = .{
             .terminal_rows = size.rows,
             .terminal_cols = size.cols,
@@ -1574,13 +1577,11 @@ fn sendSessionAttach(
                 .initial_scrollback_rows = initial_scrollback_row_count,
             },
         },
-        .session_guid = session_guid,
         .capture_tty_transcript = tty_transcript.enabled(),
-        .session_dir = session_dir,
     };
     const payload = try protocol.encodePayload(app_allocator.allocator(), message);
     defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(conn, .te_session_attach, payload);
+    try protocol.sendFrame(conn, .te_stream_open, payload);
     return repaint_request_seq;
 }
 

@@ -53,9 +53,9 @@ pub fn forwardStreamBrokerToDaemon(
     const fd = try connectAndHandshake(allocator);
     defer _ = c.close(fd);
 
-    const payload = try protocol.encodePayload(allocator, request);
+    const payload = try protocol.encodePayload(allocator, pb.ProxyStreamItem{ .payload = .{ .open = request } });
     defer allocator.free(payload);
-    try protocol.sendFrame(fd, .client_open_proxy_stream, payload);
+    try protocol.sendFrame(fd, .proxy_stream_item, payload);
     try stream_agent.forwardRawDuplex(0, 1, fd);
 }
 
@@ -121,8 +121,8 @@ fn copyClientFrameToDaemon(allocator: std.mem.Allocator, read_fd: c.fd_t, write_
     };
     defer frame.deinit(allocator);
 
-    if (frame.message_type == .te_session_create) {
-        const payload = try session_broker.sessionCreatePayloadWithCurrentEnvironment(allocator, frame.payload);
+    if (frame.message_type == .te_stream_open) {
+        const payload = try session_broker.sessionOpenPayloadWithCurrentEnvironment(allocator, frame.payload);
         defer allocator.free(payload);
         try protocol.sendFrame(write_fd, frame.message_type, payload);
         return true;
@@ -220,7 +220,7 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
             },
             .te_resize => continue,
-            .te_session_create, .te_session_attach => {
+            .te_stream_open => {
                 try session_broker.serveFrameAfterHandshake(allocator, exe, frame, fd, fd);
                 return;
             },
@@ -230,10 +230,17 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                 try session_broker.serveDebugFrameAfterHandshake(allocator, frame, fd);
                 return;
             },
-            .client_open_proxy_stream => {
-                var request = try protocol.decodePayload(pb.ClientOpenProxyStream, allocator, frame.payload);
-                defer request.deinit(allocator);
-                try stream_agent.serveProxyStreamOpen(allocator, exe, request, fd);
+            .proxy_stream_item => {
+                var item = try protocol.decodePayload(pb.ProxyStreamItem, allocator, frame.payload);
+                defer item.deinit(allocator);
+                const payload = item.payload orelse {
+                    try sendError(fd, "PROTOCOL_ERROR", "missing proxy stream item", "");
+                    return;
+                };
+                switch (payload) {
+                    .open => |request| try stream_agent.serveProxyStreamOpen(allocator, exe, request, fd),
+                    else => try sendError(fd, "PROTOCOL_ERROR", "expected proxy stream open", ""),
+                }
                 return;
             },
             else => {

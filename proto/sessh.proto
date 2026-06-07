@@ -41,7 +41,7 @@ message Frame {
 message MuxStreamFrame {
   uint64 stream_id = 1;
 
-  oneof payload {
+  oneof message {
     MuxStreamOpen open = 2;
     MuxStreamOpenOk open_ok = 3;
     MuxStreamPayload payload = 4;
@@ -53,14 +53,12 @@ message MuxStreamFrame {
 // Opens or resumes a mux stream. The detail oneof identifies the stream type;
 // there is no separate stream-kind field to keep in sync.
 message MuxStreamOpen {
-  // Durable stream/session GUID, e.g. s-... or p-...
-  string guid = 1;
   // First byte this side still needs from the peer's outbound stream.
-  uint64 recv_next_offset = 2;
+  uint64 recv_next_offset = 1;
   // Backpressure credit this side grants the peer. The peer may send bytes in
   // [recv_next_offset, recv_next_offset + receive_window_bytes) for this mux
   // stream and must stop when that window is exhausted.
-  uint32 receive_window_bytes = 3;
+  uint32 receive_window_bytes = 2;
 
   oneof detail {
     TeStreamOpen te = 10;
@@ -108,10 +106,16 @@ message MuxStreamReset {
 
 // Terminal-emulator stream open details.
 message TeStreamOpen {
-  // Durable session GUID. This is redundant with MuxStreamOpen.guid on muxed
-  // tunnels, but direct non-muxed IPC has no MuxStreamOpen wrapper.
+  // Durable session GUID.
   string session_guid = 1;
-  TeSessionCreate create = 2;
+  // Initial terminal size and repaint request for this client view.
+  TeResize resize = 2;
+  // When true, the remote session runtime sends raw inner PTY transcript chunks
+  // for this client view. The client still owns archive creation and storage.
+  bool capture_tty_transcript = 3;
+  // Present for a new terminal-emulator stream. Absent means resume the
+  // existing stream identified by session_guid.
+  TeSessionCreate create = 4;
 }
 
 // Ordered terminal-emulator stream item. Direct local IPC can carry this as a
@@ -174,7 +178,7 @@ message TeDiagnosticCleanupPending {
 }
 
 // Proxy stream open details. This carries the durable p-guid because direct
-// non-muxed IPC has no MuxStreamOpen wrapper.
+// non-muxed IPC has no mux wrapper.
 message ProxyStreamOpen {
   string proxy_guid = 1;
   string proxy_host = 2;
@@ -310,12 +314,8 @@ message TeShellCommand {
 
 // Embedded in TeStreamOpen.
 //
-// Creates a new interactive PTY session for this terminal-emulator stream. A
-// successful TeSessionCreate is followed by TeSessionAttached for the new
-// session, then TeDraw/TeRepaintResponse messages.
+// Creates a new interactive PTY session for this terminal-emulator stream.
 message TeSessionCreate {
-  // Initial PTY size and repaint request for the attaching client.
-  TeResize resize = 1;
   // Maximum session-agent-retained scrollback rows for this session.
   uint32 scrollback_row_limit = 2;
   // Environment entries to apply to the PTY child. Entries already present in
@@ -336,9 +336,6 @@ message TeSessionCreate {
   // Maximum time the session may remain detached before the agent ends it.
   // Zero means disabled.
   uint64 reap_ms = 11;
-  // When true, the remote session runtime sends raw inner PTY transcript chunks for this
-  // attached client. The client still owns archive creation and storage.
-  bool capture_tty_transcript = 13;
 }
 
 // Embedded in TeStreamItem.

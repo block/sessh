@@ -22,30 +22,33 @@ pub fn serveFrameAfterHandshake(
 ) !void {
     switch (frame.message_type) {
         .te_resize => return,
-        .te_session_attach => {
-            const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
-                error.InvalidSessionDir, error.MissingSessionDir, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
-                    try sendError(write_fd, "SESSION_NOT_FOUND", "session not found", "");
-                    return;
-                },
+        .te_stream_open => {
+            var request = try protocol.decodePayload(pb.TeStreamOpen, allocator, frame.payload);
+            defer request.deinit(allocator);
+            if (request.create == null) {
+                const agent_fd = connectAgentForOpen(allocator, request) catch |err| switch (err) {
+                    error.InvalidSessionGuid, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
+                        try sendError(write_fd, "SESSION_NOT_FOUND", "session not found", "");
+                        return;
+                    },
+                    else => return err,
+                };
+                defer _ = c.close(agent_fd);
+                try openAgentAndForwardFrames(allocator, agent_fd, frame.payload, read_fd, write_fd);
+                return;
+            }
+
+            const open_payload = try sessionOpenPayloadWithCurrentEnvironment(allocator, frame.payload);
+            defer allocator.free(open_payload);
+            const agent_fd = startSessionAgentAndConnect(allocator, exe, open_payload) catch |err| switch (err) {
                 else => return err,
             };
             defer _ = c.close(agent_fd);
-            try attachAgentAndForwardFrames(allocator, agent_fd, frame.payload, read_fd, write_fd);
-            return;
-        },
-        .te_session_create => {
-            const session_create_payload = try sessionCreatePayloadWithCurrentEnvironment(allocator, frame.payload);
-            defer allocator.free(session_create_payload);
-            const agent_fd = startSessionAgentAndConnect(allocator, exe, session_create_payload) catch |err| switch (err) {
-                else => return err,
-            };
-            defer _ = c.close(agent_fd);
-            try createSessionAndForwardFrames(allocator, agent_fd, session_create_payload, read_fd, write_fd);
+            try openAgentAndForwardFrames(allocator, agent_fd, open_payload, read_fd, write_fd);
             return;
         },
         else => {
-            try sendError(write_fd, "PROTOCOL_ERROR", "broker only supports SESSION_CREATE or SESSION_ATTACH in this mode", "");
+            try sendError(write_fd, "PROTOCOL_ERROR", "broker only supports terminal stream open in this mode", "");
             return;
         },
     }
@@ -119,19 +122,23 @@ fn connectSingleLiveSessionAgent(allocator: std.mem.Allocator) !c.fd_t {
     return found_fd;
 }
 
-fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.fd_t {
-    var request = try protocol.decodePayload(pb.TeSessionAttach, allocator, payload);
-    defer request.deinit(allocator);
-    if (request.session_dir.len == 0) return error.MissingSessionDir;
-    if (!std.mem.startsWith(u8, request.session_dir, "/")) return error.InvalidSessionDir;
-    var paths = try session_registry.pathsForSessionDir(allocator, request.session_dir);
+fn connectAgentForOpen(allocator: std.mem.Allocator, request: pb.TeStreamOpen) !c.fd_t {
+    if (!session_registry.isValidSessionGuid(request.session_guid)) return error.InvalidSessionGuid;
+    const canonical = try session_registry.canonicalGuid(allocator, request.session_guid);
+    defer allocator.free(canonical);
+    const sessions_dir = try session_registry.sessionsDir(allocator);
+    defer allocator.free(sessions_dir);
+    const session_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, canonical });
+    defer allocator.free(session_dir);
+    var paths = try session_registry.pathsForSessionDir(allocator, session_dir);
     defer paths.deinit(allocator);
     return socket_transport.connectSocket(paths.socket);
 }
 
-fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_create_payload: []const u8) !c.fd_t {
-    var request = try protocol.decodePayload(pb.TeSessionCreate, allocator, session_create_payload);
+fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_open_payload: []const u8) !c.fd_t {
+    var request = try protocol.decodePayload(pb.TeStreamOpen, allocator, session_open_payload);
     defer request.deinit(allocator);
+    if (request.create == null) return error.MissingSessionCreate;
     var allocation = if (request.session_guid.len > 0)
         try session_registry.allocateSessionDirForGuid(allocator, request.session_guid)
     else
@@ -152,13 +159,18 @@ fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, se
     return error.SessionAgentDidNotStart;
 }
 
-pub fn sessionCreatePayloadWithCurrentEnvironment(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
-    var request = try protocol.decodePayload(pb.TeSessionCreate, allocator, payload);
+pub fn sessionOpenPayloadWithCurrentEnvironment(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+    var request = try protocol.decodePayload(pb.TeStreamOpen, allocator, payload);
     defer request.deinit(allocator);
-
-    try appendCurrentEnvironment(allocator, &request);
+    if (request.create) |*create| {
+        try appendCurrentEnvironment(allocator, create);
+    } else {
+        return allocator.dupe(u8, payload);
+    }
     return protocol.encodePayload(allocator, request);
 }
+
+pub const sessionCreatePayloadWithCurrentEnvironment = sessionOpenPayloadWithCurrentEnvironment;
 
 fn appendCurrentEnvironment(allocator: std.mem.Allocator, request: *pb.TeSessionCreate) !void {
     var index: usize = 0;
@@ -186,10 +198,10 @@ fn appendEnvironmentEntry(
     });
 }
 
-fn createSessionAndForwardFrames(
+fn openAgentAndForwardFrames(
     allocator: std.mem.Allocator,
     agent_fd: c.fd_t,
-    session_create_payload: []const u8,
+    session_open_payload: []const u8,
     read_fd: c.fd_t,
     write_fd: c.fd_t,
 ) !void {
@@ -200,25 +212,7 @@ fn createSessionAndForwardFrames(
         },
         else => return err,
     };
-    try protocol.sendFrame(agent_fd, .te_session_create, session_create_payload);
-    try frame_forwarder.forwardFrames(read_fd, write_fd, agent_fd);
-}
-
-fn attachAgentAndForwardFrames(
-    allocator: std.mem.Allocator,
-    agent_fd: c.fd_t,
-    session_attach_payload: []const u8,
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-) !void {
-    initiateRuntimeHandshake(allocator, agent_fd) catch |err| switch (err) {
-        error.VersionMismatch => {
-            try sendError(write_fd, "VERSION_MISMATCH", "existing remote session runtime is incompatible with this client", "Start a fresh sessh connection with matching binaries");
-            return;
-        },
-        else => return err,
-    };
-    try protocol.sendFrame(agent_fd, .te_session_attach, session_attach_payload);
+    try protocol.sendFrame(agent_fd, .te_stream_open, session_open_payload);
     try frame_forwarder.forwardFrames(read_fd, write_fd, agent_fd);
 }
 

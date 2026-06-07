@@ -1995,6 +1995,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
     );
 
     const exit_status = stream_agent.runLocalStream(allocator, &starter, .{
+        .guid = proxy_guid,
         .source_fd = 0,
         .sink_fd = 1,
         .status_mode = status_mode,

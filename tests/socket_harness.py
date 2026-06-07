@@ -35,8 +35,9 @@ HELLO_REQUEST = "hello_request"
 HELLO_OK = "hello_ok"
 HELLO_ERROR = "hello_error"
 ERROR = "error"
-SESSION_CREATE = "te_session_create"
-SESSION_ATTACH = "te_session_attach"
+TERMINAL_STREAM_OPEN = "te_stream_open"
+SESSION_CREATE = TERMINAL_STREAM_OPEN
+SESSION_ATTACH = TERMINAL_STREAM_OPEN
 INPUT = "te_input"
 RESIZE = "te_resize"
 REPAINT_REQUEST = "te_repaint_request"
@@ -58,21 +59,22 @@ _HELLO_FRAME_FIELDS = {
 }
 _FRAME_FIELDS = {
     ERROR: ERROR,
-    SESSION_CREATE: SESSION_CREATE,
-    SESSION_ATTACH: SESSION_ATTACH,
-    INPUT: INPUT,
-    RESIZE: RESIZE,
-    REPAINT_REQUEST: REPAINT_REQUEST,
-    SESSION_ATTACHED: SESSION_ATTACHED,
-    SESSION_ENDED: SESSION_ENDED,
-    DRAW: DRAW,
-    REPAINT_RESPONSE: REPAINT_RESPONSE,
-    INPUT_ACK: INPUT_ACK,
-    SESSION_CLIENT_CONTROL_RESPONSE: SESSION_CLIENT_CONTROL_RESPONSE,
-    SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
-    SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST,
     PING: PING,
     PONG: PONG,
+}
+_TE_STREAM_ITEM_FIELDS = {
+    TERMINAL_STREAM_OPEN: "open",
+    INPUT: "input",
+    RESIZE: "resize",
+    REPAINT_REQUEST: "repaint_request",
+    SESSION_ATTACHED: "session_attached",
+    SESSION_ENDED: "session_ended",
+    DRAW: "draw",
+    REPAINT_RESPONSE: "repaint_response",
+    INPUT_ACK: "input_ack",
+    SESSION_CLIENT_CONTROL_RESPONSE: "session_client_control_response",
+    SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST: "debug_sever_connection_request",
+    SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST: "debug_unresponsive_connection_request",
 }
 
 
@@ -362,7 +364,9 @@ def pack_session_create(
 ):
     global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
-    message = pb.TeSessionCreate(scrollback_row_limit=scrollback)
+    message = pb.TeStreamOpen()
+    create = message.create
+    create.scrollback_row_limit = scrollback
     if session_id is None:
         session_id = test_session_guid(1)
     message.session_guid = guid_for_ref(session_id)
@@ -376,31 +380,31 @@ def pack_session_create(
         repaint.scrollback_cursor = b""
     if initial_scrollback is not None:
         repaint.initial_scrollback_rows = initial_scrollback
-    entry = message.environment.add()
+    entry = create.environment.add()
     entry.name = "SHELL"
     entry.value = str(shell)
     if command_argv:
-        message.exec_command.argv.extend(str(arg) for arg in command_argv)
+        create.exec_command.argv.extend(str(arg) for arg in command_argv)
     if shell_command is not None:
-        message.shell_command.command = str(shell_command)
+        create.shell_command.command = str(shell_command)
     if tty_settings is not None:
         if "term" in tty_settings:
-            message.tty_settings.term = tty_settings["term"]
+            create.tty_settings.term = tty_settings["term"]
         for opcode, value in tty_settings.get("modes", ()):
-            mode = message.tty_settings.tty_mode.add()
+            mode = create.tty_settings.tty_mode.add()
             mode.opcode = opcode
             mode.value = value
-    message.query_default_colors.foreground_color = fg
-    message.query_default_colors.background_color = bg
+    create.query_default_colors.foreground_color = fg
+    create.query_default_colors.background_color = bg
     return message.SerializeToString()
 
 
 def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_guid="", session_dir_path=""):
     global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
-    message = pb.TeSessionAttach()
+    message = pb.TeStreamOpen()
     message.session_guid = session_guid
-    message.session_dir = str(session_dir_path)
+    _ = session_dir_path
     rows, cols = _LAST_RESIZE
     message.resize.terminal_rows = rows
     message.resize.terminal_cols = cols
@@ -596,6 +600,12 @@ def encode_frame_body(message_kind, payload):
         frame = sessh_pb().Frame()
         set_submessage(frame, _FRAME_FIELDS[message_kind], payload)
         return frame.SerializeToString()
+    if message_kind in _TE_STREAM_ITEM_FIELDS:
+        frame = sessh_pb().Frame()
+        item = sessh_pb().TeStreamItem()
+        set_submessage(item, _TE_STREAM_ITEM_FIELDS[message_kind], payload)
+        frame.te_stream_item.CopyFrom(item)
+        return frame.SerializeToString()
     raise AssertionError(f"unknown test message kind: {message_kind}")
 
 
@@ -621,6 +631,15 @@ def recv_frame(conn):
     field = frame.WhichOneof("payload")
     if field is None:
         raise AssertionError(f"missing frame payload: {body!r}")
+    if field == "te_stream_item":
+        item = frame.te_stream_item
+        item_field = item.WhichOneof("payload")
+        if item_field is None:
+            raise AssertionError(f"missing terminal stream item payload: {body!r}")
+        for message_kind, mapped_field in _TE_STREAM_ITEM_FIELDS.items():
+            if mapped_field == item_field:
+                return message_kind, getattr(item, item_field).SerializeToString()
+        raise AssertionError(f"unknown terminal stream item payload: {item_field}")
     return field, getattr(frame, field).SerializeToString()
 
 
