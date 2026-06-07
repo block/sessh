@@ -47,7 +47,7 @@ pub fn serveFrameAfterHandshake(
             return;
         },
         else => {
-            try sendError(write_fd, "PROTOCOL_ERROR", "broker only supports terminal stream open in this mode", "");
+            try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports terminal stream open in this mode", "");
             return;
         },
     }
@@ -63,7 +63,7 @@ pub fn serveDebugFrameAfterHandshake(
         .te_session_client_debug_unresponsive_connection_request,
         => {},
         else => {
-            try sendError(write_fd, "PROTOCOL_ERROR", "broker only supports session debug frames in this mode", "");
+            try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
             return;
         },
     }

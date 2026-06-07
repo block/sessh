@@ -6,13 +6,11 @@ const bootstrapper_script = @embedFile("../bootstrapper.sh");
 pub const bootstrap_exec_encoded_arg_prefix = "b64:";
 
 pub const Entrypoint = enum {
-    session_broker,
-    stream_broker,
+    broker,
 
     pub fn arg(self: Entrypoint) []const u8 {
         return switch (self) {
-            .session_broker => ":internal-session-broker:",
-            .stream_broker => ":internal-stream-broker:",
+            .broker => ":internal-broker:",
         };
     }
 };
@@ -25,8 +23,8 @@ pub fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
     return shCommand(allocator, bootstrapper_script);
 }
 
-pub fn directSessionBrokerCommand(allocator: std.mem.Allocator) ![]u8 {
-    return directEntrypointCommand(allocator, .session_broker, &.{});
+pub fn directBrokerCommand(allocator: std.mem.Allocator) ![]u8 {
+    return directEntrypointCommand(allocator, .broker, &.{});
 }
 
 pub fn directEntrypointCommand(

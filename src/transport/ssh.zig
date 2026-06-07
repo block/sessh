@@ -45,7 +45,7 @@ const transportSshOptionsLen = ssh_opts.transportSshOptionsLen;
 
 const BootstrapEntrypoint = remote_shell.Entrypoint;
 const bootstrapCommand = remote_shell.bootstrapCommand;
-const directSessionBrokerCommand = remote_shell.directSessionBrokerCommand;
+const directBrokerCommand = remote_shell.directBrokerCommand;
 const isPlainShellArg = remote_shell.isPlainShellArg;
 const joinRemoteShellCommandArgs = remote_shell.joinRemoteShellCommandArgs;
 const shellCommandFromRemoteArgs = remote_shell.shellCommandFromRemoteArgs;
@@ -261,8 +261,7 @@ fn stderrPumpMain(state: *SshStderrPump.State) void {
 /// Start the ssh transport by running the bootstrapper as the remote command.
 ///
 /// The bootstrapper installs or finds the remote sessh binary, then execs
-/// the internal entrypoint we send in the EXEC line. For normal sessions that
-/// is `:internal-session-broker:`; tty/proxy streams use `:internal-stream-broker:`.
+/// the internal `:internal-broker:` entrypoint we send in the EXEC line.
 /// Installed packages keep one binary per supported platform in libexec/sessh,
 /// named `sessh-<os>-<arch>`. If that layout is unavailable, upload the
 /// current binary for same-platform development tests.
@@ -372,7 +371,7 @@ fn runRemoteNewSession(
     const remote_command = if (runtime_config.common.bootstrap)
         try bootstrapCommand(allocator)
     else
-        try directSessionBrokerCommand(allocator);
+        try directBrokerCommand(allocator);
     defer allocator.free(remote_command);
 
     var transcript_recorder: ?tty_transcript.Recorder = null;
@@ -452,7 +451,7 @@ fn startRemoteSessionBroker(
         target,
         artifacts,
         remote_command,
-        .session_broker,
+        .broker,
         &.{},
         false,
         null,
@@ -665,7 +664,7 @@ fn runAttachedRemoteClient(
                 target,
                 artifacts,
                 remote_command,
-                .session_broker,
+                .broker,
                 &.{},
                 true,
                 &reconnect_ui,
@@ -1231,7 +1230,7 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
         state.target,
         state.artifacts,
         state.remote_command,
-        .session_broker,
+        .broker,
         &.{},
         true,
         state.reconnect_ui,
@@ -1534,8 +1533,6 @@ const StreamClientStarter = struct {
     target: SshTarget,
     artifacts: ?*const ArtifactSet,
     remote_command: []const u8,
-    bootstrap_entrypoint: BootstrapEntrypoint,
-    stream_broker_args: []const []const u8,
     stderr_mode: SshStderrMode,
     last_failure_mutex: std.Thread.Mutex = .{},
     last_failure_term: ?std.process.Child.Term = null,
@@ -1548,8 +1545,8 @@ const StreamClientStarter = struct {
             self.target,
             self.artifacts,
             self.remote_command,
-            self.bootstrap_entrypoint,
-            self.stream_broker_args,
+            .broker,
+            &.{},
             true,
             null,
             false,
@@ -1920,7 +1917,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
     defer allocator.free(proxy_guid);
 
     if (invocation.port.len == 0) return error.InvalidProxyStreamArgs;
-    _ = try std.fmt.parseInt(u16, invocation.port, 10);
+    const proxy_port = try std.fmt.parseInt(u16, invocation.port, 10);
 
     try invocation.ssh_options.append(allocator, "-p");
     try invocation.ssh_options.append(allocator, invocation.port);
@@ -1938,18 +1935,6 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
     const remote_command = try bootstrapCommand(allocator);
     defer allocator.free(remote_command);
 
-    const proxy_target_arg = try encodeBase64Arg(allocator, "localhost");
-    defer allocator.free(proxy_target_arg);
-    const stream_broker_args = [_][]const u8{
-        proxy_guid,
-        "proxy",
-        "1",
-        "1",
-        proxy_target_arg,
-        invocation.port,
-        "-",
-    };
-
     const stream_target = SshTarget{
         .options = invocation.ssh_options.items,
         .host = invocation.host,
@@ -1962,8 +1947,6 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
         .target = stream_target,
         .artifacts = &artifacts,
         .remote_command = remote_command,
-        .bootstrap_entrypoint = .stream_broker,
-        .stream_broker_args = stream_broker_args[0..],
         .stderr_mode = .forward,
     };
 
@@ -1996,6 +1979,8 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
 
     const exit_status = stream_runtime.runLocalStream(allocator, &starter, .{
         .guid = proxy_guid,
+        .proxy_host = "localhost",
+        .proxy_port = proxy_port,
         .source_fd = 0,
         .sink_fd = 1,
         .status_mode = status_mode,
@@ -2086,12 +2071,6 @@ fn parseProxyBool(value: []const u8) !bool {
     if (std.mem.eql(u8, value, "1")) return true;
     if (std.mem.eql(u8, value, "0")) return false;
     return error.InvalidBool;
-}
-
-fn encodeBase64Arg(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-    _ = std.base64.standard.Encoder.encode(encoded, bytes);
-    return encoded;
 }
 
 fn appendShellToken(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {

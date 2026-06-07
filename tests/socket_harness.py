@@ -982,7 +982,7 @@ def send_hello(conn, major_delta=0, minor_delta=0, version_override=None, expect
 
 def broker_hello(env, **kwargs):
     proc = subprocess.Popen(
-        [str(BIN), ":internal-session-broker:"],
+        [str(BIN), ":internal-broker:"],
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -2467,7 +2467,7 @@ def run_broker_starts_daemon_session_test(base_env):
         shell.chmod(0o700)
 
         proc = subprocess.Popen(
-            [str(BIN), ":internal-session-broker:"],
+            [str(BIN), ":internal-broker:"],
             cwd=ROOT,
             env=env,
             stdin=subprocess.PIPE,

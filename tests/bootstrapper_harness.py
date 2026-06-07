@@ -73,10 +73,10 @@ def test_cache_hit_execs_without_platform_or_tool_probe(tmp):
     artifact_hash = sha256(artifact)
     write_executable(artifact_path(env, artifact_hash), artifact)
 
-    result = run_bootstrapper(f"EXEC test-set {artifact_hash} -- :internal-session-broker:\n", env)
+    result = run_bootstrapper(f"EXEC test-set {artifact_hash} -- :internal-broker:\n", env)
 
     assert_ok(result)
-    if result.stdout != "OK\nCACHED :internal-session-broker:\n":
+    if result.stdout != "OK\nCACHED :internal-broker:\n":
         raise AssertionError(result.stdout)
 
 
@@ -90,12 +90,12 @@ def test_cache_hit_execs_explicit_internal_command(tmp):
     write_executable(artifact_path(env, artifact_hash), artifact)
 
     result = run_bootstrapper(
-        f"EXEC test-set {artifact_hash} -- :internal-stream-broker: p-00000000-0000-4000-8000-000000000001 proxy 1 1 bG9jYWxob3N0 22 -\n",
+        f"EXEC test-set {artifact_hash} -- :internal-broker:\n",
         env,
     )
 
     assert_ok(result)
-    expected = "OK\nCACHED :internal-stream-broker: p-00000000-0000-4000-8000-000000000001 proxy 1 1 bG9jYWxob3N0 22 -\n"
+    expected = "OK\nCACHED :internal-broker:\n"
     if result.stdout != expected:
         raise AssertionError(result.stdout)
 
@@ -142,7 +142,7 @@ def test_upload_installs_and_execs(tmp):
     encoded = base64.b64encode(artifact).decode()
 
     result = run_bootstrapper(
-        f"EXEC test-set {artifact_hash} -- :internal-session-broker:\n"
+        f"EXEC test-set {artifact_hash} -- :internal-broker:\n"
         f"UPLOAD sessh-test-linux-x86_64 {artifact_hash} {encoded}\n",
         env,
     )
@@ -155,7 +155,7 @@ def test_upload_installs_and_execs(tmp):
         raise AssertionError(result.stdout)
     if lines[1] != "OK":
         raise AssertionError(result.stdout)
-    if lines[2] != "UPLOADED :internal-session-broker:":
+    if lines[2] != "UPLOADED :internal-broker:":
         raise AssertionError(result.stdout)
 
     installed = artifact_path(env, artifact_hash)
@@ -196,7 +196,7 @@ def test_cache_hit_trusts_cached_executable(tmp):
     expected_hash = sha256(expected)
     write_executable(artifact_path(env, expected_hash), wrong)
 
-    result = run_bootstrapper(f"EXEC test-set {expected_hash} -- :internal-session-broker:\n", env)
+    result = run_bootstrapper(f"EXEC test-set {expected_hash} -- :internal-broker:\n", env)
 
     assert_ok(result)
     if result.stdout != "OK\nWRONG\n":
@@ -210,7 +210,7 @@ def test_cache_miss_reports_platform_before_tool_probe(tmp):
     env["PATH"] = str(fake_bin)
 
     result = run_bootstrapper(
-        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- :internal-session-broker:\n",
+        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- :internal-broker:\n",
         env,
         extra_env={
             "SESSH_FAKE_UNAME_S": "Linux",
@@ -238,7 +238,7 @@ def test_platform_strings_are_canonicalized(tmp):
     )
     for os_name, arch, expected in cases:
         result = run_bootstrapper(
-            "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- :internal-session-broker:\n",
+            "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- :internal-broker:\n",
             env,
             extra_env={
                 "SESSH_FAKE_UNAME_S": os_name,
@@ -257,7 +257,7 @@ def test_unsupported_platform_is_structured_error(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
 
     result = run_bootstrapper(
-        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- :internal-session-broker:\n",
+        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- :internal-broker:\n",
         env,
         extra_env={
             "SESSH_FAKE_UNAME_S": "Plan9",

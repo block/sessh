@@ -27,8 +27,7 @@ and `sesshd` owns the durable byte-stream endpoint.
 Special first arguments are internal entrypoints, not public commands:
 
 - `:internal-daemon:`
-- `:internal-session-broker:`
-- `:internal-stream-broker:`
+- `:internal-broker:`
 - `:internal-proxy-stream:`
 
 Everything else is parsed as a normal ssh-shaped `sessh` invocation.

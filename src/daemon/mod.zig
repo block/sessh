@@ -7,7 +7,7 @@ const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
-const session_broker = @import("../session/broker.zig");
+const session_daemon_handler = @import("../session/daemon_handler.zig");
 const socket_transport = @import("../transport/socket.zig");
 const stream_runtime = @import("../stream/runtime.zig");
 
@@ -35,29 +35,11 @@ pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
     if (frame.message_type != .pong) return error.UnexpectedDaemonFrame;
 }
 
-pub fn forwardStdioToDaemon(allocator: std.mem.Allocator, exe: []const u8) !void {
+pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8) !void {
     try ensureStarted(allocator, exe);
     const fd = try connect(allocator);
     defer _ = c.close(fd);
-    try forwardSessionBrokerFramesToDaemon(allocator, 0, 1, fd);
-}
-
-pub fn forwardStreamBrokerToDaemon(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    args: []const []const u8,
-) !void {
-    const request = try stream_runtime.clientOpenProxyStreamFromBrokerArgs(allocator, args);
-    defer allocator.free(request.proxy_host);
-
-    try ensureStarted(allocator, exe);
-    const fd = try connectAndHandshake(allocator);
-    defer _ = c.close(fd);
-
-    const payload = try protocol.encodePayload(allocator, pb.ProxyStreamItem{ .payload = .{ .open = request } });
-    defer allocator.free(payload);
-    try protocol.sendFrame(fd, .proxy_stream_item, payload);
-    try stream_runtime.forwardRawDuplex(0, 1, fd);
+    try forwardBrokerFramesToDaemon(allocator, 0, 1, fd);
 }
 
 fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
@@ -86,7 +68,7 @@ fn connectAndHandshake(allocator: std.mem.Allocator) !c.fd_t {
     return fd;
 }
 
-fn forwardSessionBrokerFramesToDaemon(
+fn forwardBrokerFramesToDaemon(
     allocator: std.mem.Allocator,
     stdin_fd: c.fd_t,
     stdout_fd: c.fd_t,
@@ -123,7 +105,7 @@ fn copyClientFrameToDaemon(allocator: std.mem.Allocator, read_fd: c.fd_t, write_
     defer frame.deinit(allocator);
 
     if (frame.message_type == .te_stream_open) {
-        const payload = try session_broker.sessionOpenPayloadWithCurrentEnvironment(allocator, frame.payload);
+        const payload = try session_daemon_handler.sessionOpenPayloadWithCurrentEnvironment(allocator, frame.payload);
         defer allocator.free(payload);
         try protocol.sendFrame(write_fd, frame.message_type, payload);
         return true;
@@ -253,26 +235,17 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
             },
             .te_resize => continue,
             .te_stream_open => {
-                try session_broker.serveFrameAfterHandshake(allocator, exe, frame, fd, fd);
+                try session_daemon_handler.serveFrameAfterHandshake(allocator, exe, frame, fd, fd);
                 return;
             },
             .te_session_client_debug_sever_connection_request,
             .te_session_client_debug_unresponsive_connection_request,
             => {
-                try session_broker.serveDebugFrameAfterHandshake(allocator, frame, fd);
+                try session_daemon_handler.serveDebugFrameAfterHandshake(allocator, frame, fd);
                 return;
             },
-            .proxy_stream_item => {
-                var item = try protocol.decodePayload(pb.ProxyStreamItem, allocator, frame.payload);
-                defer item.deinit(allocator);
-                const payload = item.payload orelse {
-                    try sendError(fd, "PROTOCOL_ERROR", "missing proxy stream item", "");
-                    return;
-                };
-                switch (payload) {
-                    .open => |request| try stream_runtime.serveProxyStreamOpen(allocator, exe, request, fd),
-                    else => try sendError(fd, "PROTOCOL_ERROR", "expected proxy stream open", ""),
-                }
+            .mux_stream_frame => {
+                try stream_runtime.serveMuxStreamFrameAfterHandshake(allocator, exe, frame, fd);
                 return;
             },
             else => {

@@ -1283,8 +1283,7 @@ pub const TeDiagnostic = struct {
     }
 };
 
-/// Proxy stream open details. This carries the durable p-guid because direct
-/// non-muxed IPC has no mux wrapper.
+/// Proxy stream open details carried by MuxStreamFrame.Open.detail.
 pub const ProxyStreamOpen = struct {
     proxy_guid: []const u8 = &.{},
     proxy_host: []const u8 = &.{},
@@ -1361,7 +1360,6 @@ pub const ProxyStreamItem = struct {
     payload: ?payload_union = null,
 
     pub const _payload_case = enum {
-        open,
         data,
         eof,
         control_capabilities,
@@ -1369,14 +1367,12 @@ pub const ProxyStreamItem = struct {
         control_ctrl_r,
     };
     pub const payload_union = union(_payload_case) {
-        open: ProxyStreamOpen,
         data: []const u8,
         eof: ProxyStreamItem.Eof,
         control_capabilities: ProxyStreamItem.ControlCapabilities,
         control_diagnostic: ProxyStreamItem.ControlDiagnostic,
         control_ctrl_r: ProxyStreamItem.ControlCtrlR,
         pub const _desc_table = .{
-            .open = fd(1, .submessage),
             .data = fd(2, .{ .scalar = .bytes }),
             .eof = fd(3, .submessage),
             .control_capabilities = fd(10, .submessage),

@@ -41,16 +41,12 @@ fn runMain() !void {
         return daemon.run(allocator, args[0], args[2..]);
     }
 
-    if (std.mem.eql(u8, args[1], ":internal-session-broker:")) {
+    if (std.mem.eql(u8, args[1], ":internal-broker:")) {
         if (args.len != 2) {
-            try io.writeAll(2, "sessh: :internal-session-broker: does not accept command arguments\n");
+            try io.writeAll(2, "sessh: :internal-broker: does not accept command arguments\n");
             return process_exit.request(64);
         }
-        return daemon.forwardStdioToDaemon(allocator, args[0]);
-    }
-
-    if (std.mem.eql(u8, args[1], ":internal-stream-broker:")) {
-        return daemon.forwardStreamBrokerToDaemon(allocator, args[0], args[2..]);
+        return daemon.forwardBrokerToDaemon(allocator, args[0]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-proxy-stream:")) {
@@ -166,7 +162,7 @@ test {
     _ = @import("sessh/cli.zig");
     _ = @import("session/attached_client.zig");
     _ = @import("session/runtime.zig");
-    _ = @import("session/broker.zig");
+    _ = @import("session/daemon_handler.zig");
     _ = @import("session/client_config.zig");
     _ = @import("session/client_ui.zig");
     _ = @import("session/renderer.zig");

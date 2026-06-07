@@ -11,6 +11,7 @@ const reconnect_control = @import("../reconnect/control.zig");
 const reconnect = @import("../reconnect/mod.zig");
 const reconnect_title = @import("../reconnect/title.zig");
 const session_registry = @import("../runtime/session_registry.zig");
+const session_attached_client = @import("../session/attached_client.zig");
 const terminal = @import("../tty/terminal.zig");
 const pb = protocol.pb;
 
@@ -36,6 +37,8 @@ pub const StreamReconnectStatusMode = enum {
 
 pub const LocalStreamOptions = struct {
     guid: []const u8 = "",
+    proxy_host: []const u8 = "",
+    proxy_port: u16 = 0,
     source_fd: c.fd_t,
     sink_fd: c.fd_t,
     status_mode: StreamReconnectStatusMode,
@@ -96,14 +99,18 @@ const StreamByteState = struct {
 const StreamState = struct {
     allocator: std.mem.Allocator,
     guid: []const u8,
+    proxy_host: []const u8 = "",
+    proxy_port: u16 = 0,
     outbound: StreamByteState = .{},
     inbound: StreamByteState = .{},
     peer_ready: bool = false,
 
-    fn init(allocator: std.mem.Allocator, guid: []const u8) StreamState {
+    fn init(allocator: std.mem.Allocator, guid: []const u8, proxy_host: []const u8, proxy_port: u16) StreamState {
         return .{
             .allocator = allocator,
             .guid = guid,
+            .proxy_host = proxy_host,
+            .proxy_port = proxy_port,
         };
     }
 
@@ -234,6 +241,7 @@ const StreamAttachedClientOptions = struct {
     control_input: ?*StreamInputControl = null,
     replacement_control: ?*ProxyRuntimeControl = null,
     close_outbound_on_inbound_eof: bool = false,
+    perform_handshake: bool = false,
 };
 
 const StreamInputControl = struct {
@@ -365,6 +373,9 @@ const StreamAttachedClient = struct {
     ) !StreamAttachedClient {
         state.peer_ready = false;
         state.outbound.outbound_eof_sent = false;
+        if (options.perform_handshake) {
+            session_attached_client.runtimeHandshake(transport_read_fd, transport_write_fd) catch return error.StreamTransportClosed;
+        }
         sendResumeMessage(state, transport_write_fd) catch return error.StreamTransportClosed;
         const now_ms = nowMillis();
         return .{
@@ -813,22 +824,6 @@ fn cleanupReplacementResult(comptime Transport: type, result: *reconnect.AsyncRe
     }
 }
 
-const StreamMode = enum {
-    proxy,
-};
-
-const StreamRuntimeConfig = struct {
-    guid: []const u8,
-    mode: StreamMode,
-    proxy_host: ?[]u8,
-    proxy_port: u16 = 0,
-
-    fn deinit(self: *StreamRuntimeConfig, allocator: std.mem.Allocator) void {
-        if (self.proxy_host) |host| allocator.free(host);
-        self.* = undefined;
-    }
-};
-
 const ProxyEndpoint = struct {
     stream: std.net.Stream,
     fd: c.fd_t,
@@ -861,25 +856,25 @@ const ProxyEndpoint = struct {
     }
 };
 
-pub fn clientOpenProxyStreamFromBrokerArgs(
-    allocator: std.mem.Allocator,
-    args: []const []const u8,
-) !pb.ProxyStreamOpen {
-    var config = try parseStreamRuntimeConfig(allocator, args);
-    defer config.deinit(allocator);
-    return .{
-        .proxy_guid = config.guid,
-        .proxy_host = try allocator.dupe(u8, config.proxy_host.?),
-        .proxy_port = @intCast(config.proxy_port),
-    };
-}
-
-pub fn serveProxyStreamOpen(
+pub fn serveMuxStreamFrameAfterHandshake(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    request: pb.ProxyStreamOpen,
+    frame: protocol.OwnedFrame,
     fd: c.fd_t,
 ) !void {
+    if (frame.message_type != .mux_stream_frame) return error.StreamUnexpectedFrame;
+
+    var mux_frame = try protocol.decodePayload(pb.MuxStreamFrame, allocator, frame.payload);
+    defer mux_frame.deinit(allocator);
+    const message = mux_frame.message orelse return error.StreamUnexpectedFrame;
+    const request = switch (message) {
+        .open => |open| switch (open.detail orelse return error.StreamUnexpectedFrame) {
+            .proxy => |proxy| proxy,
+            else => return error.StreamUnexpectedFrame,
+        },
+        else => return error.StreamUnexpectedFrame,
+    };
+
     if (!session_registry.isValidProxyGuid(request.proxy_guid)) return error.InvalidStreamGuid;
     if (request.proxy_port == 0 or request.proxy_port > std.math.maxInt(u16)) return error.InvalidStreamArgs;
 
@@ -892,6 +887,7 @@ pub fn serveProxyStreamOpen(
     );
     const runtime_fd = try connectProxyRuntime(runtime);
     defer _ = c.close(runtime_fd);
+    try protocol.sendFrame(runtime_fd, .mux_stream_frame, frame.payload);
     try forwardRawDuplex(fd, fd, runtime_fd);
 }
 
@@ -899,7 +895,7 @@ fn runProxyRuntime(allocator: std.mem.Allocator, control: *ProxyRuntimeControl, 
     var endpoint = try ProxyEndpoint.connect(allocator, proxy_host, proxy_port);
     defer endpoint.deinit();
 
-    var state = StreamState.init(allocator, control.guid);
+    var state = StreamState.init(allocator, control.guid, "", 0);
     defer state.deinit();
 
     var attach_fd: c.fd_t = -1;
@@ -972,8 +968,8 @@ fn waitForReplacementWhileDetached(
 }
 
 /// Runs in the local `sessh` process. `start_transport` creates ssh transports
-/// that execute the visible `:internal-stream-broker:` entrypoint remotely; this
-/// loop owns local stdin/stdout and the reconnect policy.
+/// that execute the remote `:internal-broker:` entrypoint; this loop owns local
+/// stdin/stdout and the reconnect policy.
 pub fn runLocalStream(
     allocator: std.mem.Allocator,
     start_transport: anytype,
@@ -985,7 +981,7 @@ pub fn runLocalStream(
     var control_fd = options.control_fd;
     if (control_fd >= 0) setNonBlockingFd(control_fd) catch {};
 
-    var state = StreamState.init(allocator, options.guid);
+    var state = StreamState.init(allocator, options.guid, options.proxy_host, options.proxy_port);
     defer state.deinit();
     var input_control = StreamInputControl{
         .enabled = options.intercept_ctrl_r,
@@ -1055,6 +1051,7 @@ pub fn runLocalStream(
                     .reconnect_status = &reconnect_status,
                     .control_fd = control_fd,
                     .control_input = &input_control,
+                    .perform_handshake = true,
                     // Once the remote side closes its output stream there is
                     // no peer left to consume local input, so close the local
                     // outbound side too.
@@ -1449,6 +1446,8 @@ fn sendResumeMessage(state: *StreamState, fd: c.fd_t) !void {
             .receive_window_bytes = max_buffered_bytes,
             .detail = .{ .proxy = .{
                 .proxy_guid = state.guid,
+                .proxy_host = state.proxy_host,
+                .proxy_port = state.proxy_port,
             } },
         } },
     });
@@ -1758,65 +1757,6 @@ fn lookupProxyRuntime(guid: []const u8) ?*ProxyRuntimeControl {
         if (std.mem.eql(u8, control.guid, guid)) return control;
     }
     return null;
-}
-
-fn parseStreamRuntimeConfig(allocator: std.mem.Allocator, args: []const []const u8) !StreamRuntimeConfig {
-    if (args.len != 7) {
-        try io.writeAll(2, "sessh: :internal-stream-broker: requires GUID MODE ROWS COLS HOST PORT -\n");
-        return error.InvalidStreamArgs;
-    }
-    const mode: StreamMode = if (std.mem.eql(u8, args[1], "proxy"))
-        .proxy
-    else
-        return error.InvalidStreamMode;
-
-    if (!session_registry.isValidProxyGuid(args[0])) return error.InvalidStreamGuid;
-
-    _ = try parseDimension(args[2]);
-    _ = try parseDimension(args[3]);
-    const proxy_host = try decodeCommandArg(allocator, args[4]) orelse return error.InvalidStreamArgs;
-    errdefer allocator.free(proxy_host);
-    const proxy_port = try parsePort(args[5]);
-    if (!std.mem.eql(u8, args[6], "-")) return error.InvalidStreamArgs;
-    return .{
-        .guid = args[0],
-        .mode = mode,
-        .proxy_host = proxy_host,
-        .proxy_port = proxy_port,
-    };
-}
-
-fn parseDimension(value: []const u8) !u16 {
-    const parsed = try std.fmt.parseInt(u16, value, 10);
-    return @max(parsed, 1);
-}
-
-fn parsePort(value: []const u8) !u16 {
-    const parsed = try std.fmt.parseInt(u16, value, 10);
-    if (parsed == 0) return error.InvalidStreamArgs;
-    return parsed;
-}
-
-fn decodeCommandArg(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
-    if (std.mem.eql(u8, value, "-")) return null;
-    const len = try std.base64.standard.Decoder.calcSizeForSlice(value);
-    const out = try allocator.alloc(u8, len);
-    errdefer allocator.free(out);
-    try std.base64.standard.Decoder.decode(out, value);
-    return out;
-}
-
-fn encodeCommandArg(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    const out = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(value.len));
-    errdefer allocator.free(out);
-    _ = std.base64.standard.Encoder.encode(out, value);
-    return out;
-}
-
-fn startStreamEndpoint(allocator: std.mem.Allocator, config: StreamRuntimeConfig) !ProxyEndpoint {
-    return switch (config.mode) {
-        .proxy => try ProxyEndpoint.connect(allocator, config.proxy_host.?, config.proxy_port),
-    };
 }
 
 fn nowMillis() u64 {
@@ -2478,42 +2418,6 @@ fn expectAckFrame(fd: c.fd_t, expected_offset: u64) !void {
     }
 }
 
-test "proxy stream config uses proxy guid and tcp target" {
-    var config = try parseStreamRuntimeConfig(std.testing.allocator, &.{
-        "p-550e8400-e29b-41d4-a716-446655440000",
-        "proxy",
-        "1",
-        "1",
-        "bG9jYWxob3N0",
-        "22",
-        "-",
-    });
-    defer config.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(StreamMode.proxy, config.mode);
-    try std.testing.expectEqualStrings("localhost", config.proxy_host.?);
-    try std.testing.expectEqual(@as(u16, 22), config.proxy_port);
-
-    try std.testing.expectError(error.InvalidStreamGuid, parseStreamRuntimeConfig(std.testing.allocator, &.{
-        "s-550e8400-e29b-41d4-a716-446655440000",
-        "proxy",
-        "1",
-        "1",
-        "bG9jYWxob3N0",
-        "22",
-        "-",
-    }));
-    try std.testing.expectError(error.InvalidStreamMode, parseStreamRuntimeConfig(std.testing.allocator, &.{
-        "p-550e8400-e29b-41d4-a716-446655440000",
-        "tty",
-        "1",
-        "1",
-        "-",
-        "-",
-        "-",
-    }));
-}
-
 test "raw duplex propagates right-side eof to the left peer" {
     const DuplexThread = struct {
         left_fd: c.fd_t,
@@ -2562,7 +2466,7 @@ test "stream frames round trip through a pipe" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
     defer state.deinit();
     try sendData(&state, fds[1], 42, "hello");
     try expectProxyDataFrame(fds[0], 42, "hello");
@@ -2573,7 +2477,7 @@ test "stream ping receives pong without changing offsets" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
     defer state.deinit();
     const payload = try protocol.encodePayload(std.testing.allocator, pb.Ping{});
     const options = StreamAttachedClientOptions{};
@@ -2594,7 +2498,7 @@ test "stream sender sends only newly appended bytes on a live transport" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
     defer state.deinit();
     state.peer_ready = true;
 
@@ -2615,7 +2519,7 @@ test "stream receiver keeps suffix from overlapping data frame" {
     defer posix.close(ack[0]);
     defer posix.close(ack[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
     defer state.deinit();
     state.inbound.recv_next_offset = 5;
 
@@ -2642,7 +2546,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
     defer posix.close(transport_out[0]);
     defer posix.close(transport_out[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
     defer state.deinit();
     state.peer_ready = true;
 
@@ -2804,7 +2708,7 @@ test "pending stream replacement notifies failed preparation" {
 }
 
 test "stream completion waits for eof acknowledgement" {
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000");
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
     defer state.deinit();
     state.outbound.outbound_eof = true;
     state.outbound.outbound_eof_sent = true;

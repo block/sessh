@@ -177,8 +177,7 @@ message TeDiagnostic {
   }
 }
 
-// Proxy stream open details. This carries the durable p-guid because direct
-// non-muxed IPC has no mux wrapper.
+// Proxy stream open details carried by MuxStreamFrame.Open.detail.
 message ProxyStreamOpen {
   string proxy_guid = 1;
   string proxy_host = 2;
@@ -226,7 +225,6 @@ message ProxyStreamItem {
   }
 
   oneof payload {
-    ProxyStreamOpen open = 1;
     bytes data = 2;
     Eof eof = 3;
     ControlCapabilities control_capabilities = 10;
