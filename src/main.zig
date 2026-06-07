@@ -153,9 +153,9 @@ test {
     _ = @import("core/app_allocator.zig");
     _ = @import("core/client_log.zig");
     _ = @import("core/config.zig");
+    _ = @import("core/dispatcher.zig");
     _ = @import("core/io.zig");
     _ = @import("core/process_exit.zig");
-    _ = @import("core/reactor.zig");
     _ = @import("core/shell.zig");
     _ = @import("daemon/mod.zig");
     _ = @import("protocol/mod.zig");
