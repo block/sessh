@@ -395,11 +395,12 @@ def pack_session_create(
     return message.SerializeToString()
 
 
-def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_ref=""):
+def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_guid="", session_dir_path=""):
     global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
     message = pb.TeSessionAttach()
-    message.session_ref = session_ref
+    message.session_guid = session_guid
+    message.session_dir = str(session_dir_path)
     rows, cols = _LAST_RESIZE
     message.resize.terminal_rows = rows
     message.resize.terminal_cols = cols
@@ -2013,7 +2014,14 @@ def run_scrollback_attach_draw_protocol_test(base_env):
                 attach.connect(str(socket_path(env)))
                 send_hello(attach)
                 send_resize(attach, 3, 40)
-                send_frame(attach, SESSION_ATTACH, pack_session_attach(session_ref=test_session_guid(1)))
+                send_frame(
+                    attach,
+                    SESSION_ATTACH,
+                    pack_session_attach(
+                        session_guid=test_session_guid(1),
+                        session_dir_path=session_dir(env, test_session_guid(1)),
+                    ),
+                )
 
                 message_type, _ = recv_frame(attach)
                 if message_type != SESSION_ATTACHED:
@@ -2078,7 +2086,14 @@ def run_scrollback_clear_protocol_test(base_env):
                 attach.connect(str(socket_path(env)))
                 send_hello(attach)
                 send_resize(attach, 3, 40)
-                send_frame(attach, SESSION_ATTACH, pack_session_attach(session_ref=test_session_guid(1)))
+                send_frame(
+                    attach,
+                    SESSION_ATTACH,
+                    pack_session_attach(
+                        session_guid=test_session_guid(1),
+                        session_dir_path=session_dir(env, test_session_guid(1)),
+                    ),
+                )
 
                 message_type, _ = recv_frame(attach)
                 if message_type != SESSION_ATTACHED:
@@ -2138,7 +2153,15 @@ def attach_gap_session(env, reconnect_cursor=None):
     attach.connect(str(socket_path(env)))
     send_hello(attach)
     send_resize(attach, 3, 40)
-    send_frame(attach, SESSION_ATTACH, pack_session_attach(session_ref=test_session_guid(1), reconnect_cursor=reconnect_cursor))
+    send_frame(
+        attach,
+        SESSION_ATTACH,
+        pack_session_attach(
+            session_guid=test_session_guid(1),
+            session_dir_path=session_dir(env, test_session_guid(1)),
+            reconnect_cursor=reconnect_cursor,
+        ),
+    )
     message_type, _ = recv_frame(attach)
     if message_type != SESSION_ATTACHED:
         raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
@@ -2292,7 +2315,15 @@ def run_resize_epoch_does_not_clear_reconnect_scrollback_test(base_env):
                 attach.connect(str(socket_path(env)))
                 send_hello(attach)
                 send_resize(attach, 3, 20)
-                send_frame(attach, SESSION_ATTACH, pack_session_attach(session_ref=test_session_guid(1), reconnect_cursor=cursor))
+                send_frame(
+                    attach,
+                    SESSION_ATTACH,
+                    pack_session_attach(
+                        session_guid=test_session_guid(1),
+                        session_dir_path=session_dir(env, test_session_guid(1)),
+                        reconnect_cursor=cursor,
+                    ),
+                )
 
                 message_type, _ = recv_frame(attach)
                 if message_type != SESSION_ATTACHED:

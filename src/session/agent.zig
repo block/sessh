@@ -661,11 +661,11 @@ const ScreenBufferState = struct {
 
 const AttachRequest = struct {
     resize: ResizePayload,
-    session_ref: []u8,
+    session_guid: []u8,
     capture_tty_transcript: bool,
 
     fn deinit(self: *AttachRequest) void {
-        app_allocator.allocator().free(self.session_ref);
+        app_allocator.allocator().free(self.session_guid);
         self.* = undefined;
     }
 };
@@ -1540,10 +1540,8 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
             .te_session_attach => {
                 var request = try readAttachRequest(frame.payload);
                 defer request.deinit();
-                const session = if (request.session_ref.len > 0)
-                    try findSessionForRef(session_agent, request.session_ref)
-                else
-                    return error.MissingSessionRef;
+                if (request.session_guid.len == 0) return error.MissingSessionGuid;
+                const session = findSession(session_agent, request.session_guid);
                 const resolved_session = session orelse {
                     try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
                     return false;
@@ -2536,10 +2534,10 @@ fn readAttachRequest(payload: []const u8) !AttachRequest {
     var message = try protocol.decodePayload(pb.TeSessionAttach, app_allocator.allocator(), payload);
     defer message.deinit(app_allocator.allocator());
     const resize = message.resize orelse return error.MissingResize;
-    if (message.session_ref.len > 0 and !session_registry.isValidSessionRef(message.session_ref)) return error.InvalidSessionRef;
+    if (message.session_guid.len > 0 and !session_registry.isValidSessionGuid(message.session_guid)) return error.InvalidSessionGuid;
     return .{
         .resize = try resizePayloadFromMessage(resize),
-        .session_ref = try app_allocator.allocator().dupe(u8, message.session_ref),
+        .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
         .capture_tty_transcript = message.capture_tty_transcript,
     };
 }
@@ -3671,12 +3669,6 @@ fn findSession(session_agent: *SessionAgent, id: []const u8) ?*Session {
     const session = &session_agent.session;
     if (session.alive and std.mem.eql(u8, session.idSlice(), id)) return session;
     return null;
-}
-
-fn findSessionForRef(session_agent: *SessionAgent, ref: []const u8) !?*Session {
-    const guid = try session_registry.resolveRefToGuid(app_allocator.allocator(), ref);
-    defer app_allocator.allocator().free(guid);
-    return findSession(session_agent, guid);
 }
 
 fn endSessionFromPtyClose(session_agent: *SessionAgent) void {

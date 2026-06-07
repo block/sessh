@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 import os
-import json
-import re
 import shutil
 import shlex
 import socket
@@ -28,8 +26,6 @@ BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
 TMUX = shutil.which("tmux")
 TMUX_ARGS = [TMUX, "-L", f"sessh-ssh-reconnect-{os.getpid()}"] if TMUX else []
 PROMPT = "OUTER_TEST>"
-GUID_RE = re.compile(r"^s-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-COMPACT_GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
 def sessh_argv(args):
@@ -105,6 +101,15 @@ if [ "$batch_mode" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_FAIL_BATCH_COUNT_FILE:-}" ]
     exit 98
   fi
 fi
+if [ -z "${SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+  SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}.remote
+fi
+if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR:-}" ]; then
+  mkdir -p "$SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"
+  chmod 700 "$SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"
+  XDG_RUNTIME_DIR=$SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR
+  export XDG_RUNTIME_DIR
+fi
 export SESSH_TEST_HOST=$host
 exec sh -c "$1"
 """
@@ -123,34 +128,12 @@ def run(env, args, **kwargs):
     )
 
 
-def latest_remote_session_ref(env, host="test-host"):
-    guid_root = Path(env["XDG_STATE_HOME"]) / "sessh" / "guid"
-    routes = sorted(guid_root.glob("s-*/route.json"), key=lambda path: path.stat().st_mtime, reverse=True)
-    for route_path in routes:
-        route = json.loads(route_path.read_text())
-        if route.get("host") == host and route.get("alive", False):
-            return route["guid"]
-    raise AssertionError(f"no live route found for host {host}")
-
-
-def compact_guid(guid):
-    if COMPACT_GUID_RE.match(guid):
-        return guid.lower()
-    if not GUID_RE.match(guid):
-        raise AssertionError(f"invalid guid: {guid}")
-    return guid[2:].replace("-", "").lower()
-
-
-def actual_socket_path(env, session_ref):
-    return Path(env["XDG_RUNTIME_DIR"]) / "a" / compact_guid(session_ref)
-
-
 def sever_attached_clients(env, timeout=10.0):
-    session_ref = latest_remote_session_ref(env)
     request = sessh_pb().TeSessionClientDebugSeverConnectionRequest()
+    runtime_root = Path(env.get("SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR", env["XDG_RUNTIME_DIR"] + ".remote"))
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
-        conn.connect(str(actual_socket_path(env, session_ref)))
+        conn.connect(str(runtime_root / "d" / "sesshd.sock"))
         send_hello(conn)
         send_frame(conn, SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST, request.SerializeToString())
         recv_until_message(conn, SESSION_CLIENT_CONTROL_RESPONSE, timeout=timeout)
@@ -287,6 +270,7 @@ def main():
         child_env["PATH"] = f"{fake_bin}{os.pathsep}{child_env['PATH']}"
         child_env["SHELL"] = str(remote_shell)
         child_env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "1"
+        child_env["SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"] = env["XDG_RUNTIME_DIR"] + ".remote"
         config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "sessh.env").write_text("scrollback-limit=321\n")
@@ -302,6 +286,7 @@ def main():
             f"export PATH={shlex.quote(child_env['PATH'])}\n"
             f"export SHELL={shlex.quote(str(remote_shell))}\n"
             "export SESSH_FAKE_SSH_DELAY_ON_BATCH=1\n"
+            f"export SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR={shlex.quote(child_env['SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR'])}\n"
             f"export SESSH_FAKE_SSH_FAIL_BATCH_COUNT_FILE={shlex.quote(str(fail_batch_count_file))}\n"
             f"exec {shell_join(sessh_argv(['test-host']))} \"$@\"\n"
         )
@@ -362,6 +347,7 @@ def main():
             if "OUTER_BEFORE_1" not in final or "OUTER_BEFORE_2" not in final:
                 raise AssertionError(f"reconnect damaged outer scrollback:\n{final}")
 
+            cleanup_runtime(env)
             new_tmux_session(env, reconnect_detach_session, 100, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", reconnect_detach_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
@@ -375,6 +361,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, "printf 'OUTER_RECONNECT_DETACHED\\n'", "Enter"])
             wait_capture(env, reconnect_detach_session, "OUTER_RECONNECT_DETACHED")
 
+            cleanup_runtime(env)
             new_tmux_session(env, bottom_session, 100, 8)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", bottom_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
@@ -417,6 +404,7 @@ def main():
                     f"after:\n{bottom_after}"
                 )
 
+            cleanup_runtime(env)
             new_tmux_session(env, bottom_failure_session, 100, 8)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", bottom_failure_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
@@ -453,6 +441,7 @@ def main():
             if "sessh: disconnected" in bottom_failure_after:
                 raise AssertionError(f"bottom reconnect after failed attempt leaked banner:\n{bottom_failure_after}")
 
+            cleanup_runtime(env)
             idle_detach_session = f"{detach_session}-idle"
             new_tmux_session(env, idle_detach_session, 140, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", idle_detach_session, "remain-on-exit", "on"])
@@ -470,6 +459,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "printf 'OUTER_IDLE_DETACHED\\n'", "Enter"])
             wait_capture(env, idle_detach_session, "OUTER_IDLE_DETACHED")
 
+            cleanup_runtime(env)
             new_tmux_session(env, detach_session, 80, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", detach_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
@@ -491,6 +481,7 @@ def main():
             if "REMOTE_SPAM_" not in detached:
                 raise AssertionError(f"detach lost flowing output from scrollback:\n{detached}")
 
+            cleanup_runtime(env)
             new_tmux_session(env, alt_detach_session, 80, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", alt_detach_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
@@ -507,6 +498,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "printf 'OUTER_ALT_DETACHED\\n'", "Enter"])
             wait_capture(env, alt_detach_session, "OUTER_ALT_DETACHED")
 
+            cleanup_runtime(env)
             new_tmux_session(env, alt_reconnect_detach_session, 140, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", alt_reconnect_detach_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])

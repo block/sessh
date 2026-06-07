@@ -941,22 +941,6 @@ pub fn startNewSessionOnRuntime(
     return session;
 }
 
-pub fn startAttachSessionOnRuntime(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    session_ref: []const u8,
-    session_dir: []const u8,
-    initial_scrollback_row_count: ?u32,
-) !RuntimeSession {
-    const viewport_offset = queryInitialViewportOffset();
-    try runtimeHandshake(read_fd, write_fd);
-    const repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), viewport_offset, initial_scrollback_row_count, null, session_ref, session_dir);
-    var session = try readRuntimeSession(read_fd);
-    session.viewport_offset = viewport_offset orelse 0;
-    session.pending_repaint.repaint_request_seq = repaint_request_seq;
-    return session;
-}
-
 pub fn ensureLocalRouteForRemoteSession(
     allocator: std.mem.Allocator,
     session: *const RuntimeSession,
@@ -1252,19 +1236,8 @@ pub fn pollAndForwardReconnectInput(
     return .wait_elapsed;
 }
 
-pub fn writeDetachOverlayForTarget(ssh_options: []const []const u8, target: []const u8, sessh_options: []const []const u8, session_id: []const u8) void {
+pub fn writeDetachOverlayForDisconnect() void {
     if (c.isatty(1) == 0) return;
-    _ = ssh_options;
-    _ = target;
-    _ = sessh_options;
-    _ = session_id;
-    writeDetachOverlay() catch {};
-}
-
-pub fn writeDetachOverlayForSessionRef(sessh_options: []const []const u8, session_ref: []const u8) void {
-    if (c.isatty(1) == 0) return;
-    _ = sessh_options;
-    _ = session_ref;
     writeDetachOverlay() catch {};
 }
 
@@ -1580,7 +1553,7 @@ fn sendSessionAttach(
     viewport_offset: ?i32,
     initial_scrollback_row_count: ?u32,
     reconnect_cursor: ?*const ScrollbackCursor,
-    session_ref: []const u8,
+    session_guid: []const u8,
     session_dir: []const u8,
 ) !u64 {
     const repaint_request_seq = allocateRepaintRequestSeq();
@@ -1601,7 +1574,7 @@ fn sendSessionAttach(
                 .initial_scrollback_rows = initial_scrollback_row_count,
             },
         },
-        .session_ref = session_ref,
+        .session_guid = session_guid,
         .capture_tty_transcript = tty_transcript.enabled(),
         .session_dir = session_dir,
     };

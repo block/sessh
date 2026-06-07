@@ -790,9 +790,10 @@ fn finishDetachedSshSession(
 ) !void {
     session.restoreAttachedClientEndPresentationForExit();
     _ = allocator;
+    _ = overlay_args;
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
-    attached_client.writeDetachOverlayForSessionRef(overlay_args, session.idSlice());
+    attached_client.writeDetachOverlayForDisconnect();
 }
 
 fn finishEndedRemoteSession(

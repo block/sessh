@@ -24,11 +24,7 @@ pub fn serveFrameAfterHandshake(
         .te_resize => return,
         .te_session_attach => {
             const agent_fd = connectAgentForAttach(allocator, frame.payload) catch |err| switch (err) {
-                error.SessionRefNotLocal => {
-                    try sendError(write_fd, "SESSION_REF_NOT_LOCAL", "session reference resolves to another host", "");
-                    return;
-                },
-                error.InvalidSessionId, error.MissingSessionRef, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
+                error.InvalidSessionDir, error.MissingSessionDir, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
                     try sendError(write_fd, "SESSION_NOT_FOUND", "session not found", "");
                     return;
                 },
@@ -84,12 +80,6 @@ pub fn serveDebugFrameAfterHandshake(
     try forwardAgentFramesToClient(allocator, agent_fd, write_fd);
 }
 
-fn fileExists(path: []const u8) bool {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
-    file.close();
-    return true;
-}
-
 fn connectSingleLiveSessionAgent(allocator: std.mem.Allocator) !c.fd_t {
     const runtime_root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(runtime_root);
@@ -132,46 +122,11 @@ fn connectSingleLiveSessionAgent(allocator: std.mem.Allocator) !c.fd_t {
 fn connectAgentForAttach(allocator: std.mem.Allocator, payload: []const u8) !c.fd_t {
     var request = try protocol.decodePayload(pb.TeSessionAttach, allocator, payload);
     defer request.deinit(allocator);
-    var paths = if (request.session_dir.len > 0) blk: {
-        if (!std.mem.startsWith(u8, request.session_dir, "/")) return error.InvalidSessionDir;
-        break :blk try session_registry.pathsForSessionDir(allocator, request.session_dir);
-    } else if (request.session_ref.len > 0)
-        try pathsForLocalSessionRef(allocator, request.session_ref)
-    else
-        return error.MissingSessionRef;
+    if (request.session_dir.len == 0) return error.MissingSessionDir;
+    if (!std.mem.startsWith(u8, request.session_dir, "/")) return error.InvalidSessionDir;
+    var paths = try session_registry.pathsForSessionDir(allocator, request.session_dir);
     defer paths.deinit(allocator);
     return socket_transport.connectSocket(paths.socket);
-}
-
-fn pathsForLocalSessionRef(allocator: std.mem.Allocator, ref: []const u8) !session_registry.SessionPaths {
-    if (!session_registry.isValidSessionRef(ref)) return error.InvalidSessionId;
-    const guid = try session_registry.resolveRefToGuid(allocator, ref);
-    defer allocator.free(guid);
-
-    var route = session_registry.readRouteForRef(allocator, ref) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
-    if (route) |*value| {
-        defer value.deinit(allocator);
-        if (value.session_dir.len > 0) {
-            var routed_paths = try session_registry.pathsForSessionDir(allocator, value.session_dir);
-            errdefer routed_paths.deinit(allocator);
-            if (fileExists(routed_paths.meta) or value.host.len == 0 or std.mem.eql(u8, value.host, ".")) return routed_paths;
-            return error.SessionRefNotLocal;
-        }
-        if (value.host.len > 0 and !std.mem.eql(u8, value.host, ".")) {
-            var current_paths = try session_registry.pathsForSessionId(allocator, guid);
-            errdefer current_paths.deinit(allocator);
-            if (!fileExists(current_paths.meta)) return error.SessionRefNotLocal;
-            return current_paths;
-        }
-    }
-
-    var paths = try session_registry.pathsForSessionId(allocator, guid);
-    errdefer paths.deinit(allocator);
-    if (fileExists(paths.route) and !fileExists(paths.meta)) return error.SessionRefNotLocal;
-    return paths;
 }
 
 fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_create_payload: []const u8) !c.fd_t {

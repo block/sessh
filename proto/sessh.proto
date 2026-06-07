@@ -244,14 +244,12 @@ message TeSessionCreate {
 // TeSessionAttached for the selected session, then TeDraw/TeRepaintResponse messages.
 message TeSessionAttach {
   TeResize resize = 1;
-  // Session GUID or compact session GUID. Required unless session_dir is set.
-  string session_ref = 2;
+  // Full session GUID for the existing session.
+  string session_guid = 2;
   // When true, the remote session runtime sends raw inner PTY transcript chunks for
   // this attached client. The client still owns archive creation and storage.
   bool capture_tty_transcript = 3;
-  // Absolute path to the selected session GUID directory. This is used for
-  // route-based reconnects when the broker's current runtime directory no
-  // longer matches where the session was created.
+  // Absolute path to the selected session GUID directory.
   string session_dir = 5;
 }
 

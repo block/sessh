@@ -1485,13 +1485,13 @@ pub const TeSessionCreate = struct {
 /// TeSessionAttached for the selected session, then TeDraw/TeRepaintResponse messages.
 pub const TeSessionAttach = struct {
     resize: ?TeResize = null,
-    session_ref: []const u8 = &.{},
+    session_guid: []const u8 = &.{},
     capture_tty_transcript: bool = false,
     session_dir: []const u8 = &.{},
 
     pub const _desc_table = .{
         .resize = fd(1, .submessage),
-        .session_ref = fd(2, .{ .scalar = .string }),
+        .session_guid = fd(2, .{ .scalar = .string }),
         .capture_tty_transcript = fd(3, .{ .scalar = .bool }),
         .session_dir = fd(5, .{ .scalar = .string }),
     };

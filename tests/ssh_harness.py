@@ -553,15 +553,7 @@ def process_diagnostics(result):
     )
 
 
-def env_with_session_guid(env, session_ref):
-    route = json.loads(route_file(env, session_ref).read_text())
-    scoped = env.copy()
-    scoped["SESSH_GUID"] = route["guid"]
-    return scoped
-
-
-def sever_session_clients(env, timeout=30.0, session_ref=None):
-    _ = session_ref
+def sever_session_clients(env, timeout=30.0):
     request = sessh_pb().TeSessionClientDebugSeverConnectionRequest()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
@@ -571,8 +563,7 @@ def sever_session_clients(env, timeout=30.0, session_ref=None):
         recv_until_message(conn, SESSION_CLIENT_CONTROL_RESPONSE, timeout=timeout)
 
 
-def make_session_clients_unresponsive(env, seconds, timeout=30.0, session_ref=None):
-    _ = session_ref
+def make_session_clients_unresponsive(env, seconds, timeout=30.0):
     request = sessh_pb().TeSessionClientDebugUnresponsiveConnectionRequest(seconds=seconds)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
@@ -878,7 +869,7 @@ def run_sessh_reconnect_probe(
         stderr=subprocess.PIPE,
     )
     stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
-    sever_session_clients(env, timeout, single_live_session_guid(env))
+    sever_session_clients(env, timeout)
     stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
     if expect_countdown:
         stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 9sec", timeout)
@@ -947,7 +938,7 @@ def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, tim
         proc.stdin.write(b"enter-alt\n")
         proc.stdin.flush()
         read_until_pipe(proc.stdout, alt_ready.encode("utf-8"), timeout)
-        sever_session_clients(env, timeout, single_live_session_guid(env))
+        sever_session_clients(env, timeout)
         stdout = read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
         proc.stdin.write(b"\x03")
         proc.stdin.flush()
@@ -977,7 +968,7 @@ def run_sessh_detach_reconnect_probe(args, env, ready, detach_bytes=b"\x03", tim
         stderr=subprocess.PIPE,
     )
     stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
-    sever_session_clients(env, timeout, single_live_session_guid(env))
+    sever_session_clients(env, timeout)
     stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
     proc.stdin.write(detach_bytes)
     proc.stdin.flush()
@@ -1130,41 +1121,6 @@ def canonical_guid(guid):
 
 def test_session_guid(index):
     return f"s-{index:08x}-0000-4000-8000-{index:012x}"
-
-
-def short_session_id(guid):
-    return "s-" + compact_guid(guid)[:8]
-
-
-def single_live_session_row(env):
-    root = sessions_dir(env)
-    rows = []
-    if root.exists():
-        for path in sorted(root.iterdir()):
-            if path.is_dir() and GUID_RE.match(path.name):
-                row = {"id": short_session_id(path.name), "guid": path.name, "host": "."}
-                route = route_file(env, path.name)
-                if route.exists():
-                    route_data = json.loads(route.read_text())
-                    row["host"] = route_data.get("host") or "."
-                rows.append(row)
-    if not rows:
-        raise AssertionError(f"no live session dirs under {root}")
-    guids = {row.get("guid") for row in rows}
-    if len(guids) != 1:
-        raise AssertionError(rows)
-    for row in rows:
-        if row.get("host") != ".":
-            return row
-    return rows[0]
-
-
-def single_live_session_guid(env):
-    row = single_live_session_row(env)
-    guid = row.get("guid")
-    if not guid:
-        raise AssertionError(row)
-    return guid
 
 
 def session_path(env, session_id=None):
@@ -2732,7 +2688,7 @@ def test_ssh_unresponsive_reconnect_failure_keeps_input_on_old_connection_withou
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
         before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
 
-        make_session_clients_unresponsive(env, 30, 30.0, single_live_session_guid(env))
+        make_session_clients_unresponsive(env, 30, 30.0)
 
         batch_fail_file.touch()
         proc.stdin.write(b"trigger-unresponsive\n")
@@ -2809,7 +2765,7 @@ def test_ssh_unresponsive_tty_sets_title_without_banner(tmp):
         output = read_pty_until(fd, output, marker.encode("utf-8"), timeout=30.0)
         before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
 
-        make_session_clients_unresponsive(env, 30, 30.0, single_live_session_guid(env))
+        make_session_clients_unresponsive(env, 30, 30.0)
 
         os.write(fd, b"trigger-unresponsive\r")
         wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 1, timeout=15.0)
@@ -2881,7 +2837,7 @@ def test_ssh_unresponsive_reconnect_retries_after_prepare_failure(tmp):
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
         before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
 
-        make_session_clients_unresponsive(env, 30, 30.0, single_live_session_guid(env))
+        make_session_clients_unresponsive(env, 30, 30.0)
 
         batch_fail_file.touch()
         proc.stdin.write(b"trigger-unresponsive\n")
@@ -2958,7 +2914,7 @@ def test_ssh_unresponsive_old_connection_recovers_without_switch_or_bell(tmp):
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
         before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
 
-        make_session_clients_unresponsive(env, 6, 30.0, single_live_session_guid(env))
+        make_session_clients_unresponsive(env, 6, 30.0)
 
         proc.stdin.write(b"trigger-unresponsive\n")
         proc.stdin.flush()
@@ -3035,7 +2991,7 @@ def test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner(tmp):
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
         before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
 
-        make_session_clients_unresponsive(env, 30, 30.0, single_live_session_guid(env))
+        make_session_clients_unresponsive(env, 30, 30.0)
 
         proc.stdin.write(b"trigger-unresponsive\n")
         proc.stdin.flush()
@@ -3044,7 +3000,7 @@ def test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner(tmp):
         if b"sessh: disconnected: Reconnecting" in stdout:
             raise AssertionError(f"unresponsive connection showed disconnected before transport close:\n{stdout!r}")
 
-        sever_session_clients(env, 30.0, single_live_session_guid(env))
+        sever_session_clients(env, 30.0)
 
         proc.stdin.write(b"\x12")
         proc.stdin.flush()
@@ -3107,7 +3063,7 @@ def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
     stdout = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
-        sever_session_clients(env, 30.0, single_live_session_guid(env))
+        sever_session_clients(env, 30.0)
         reconnect_output = read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", 10.0)
         proc.stdin.write(b"during-timer\n")
         proc.stdin.flush()
@@ -3186,7 +3142,7 @@ def test_ssh_retry_elapsed_without_input_switches_automatically(tmp):
     stdout = b""
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
-        sever_session_clients(env, 30.0, single_live_session_guid(env))
+        sever_session_clients(env, 30.0)
         stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", 10.0)
         stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Reconnecting... CTRL-C detach", 12.0)
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
