@@ -37,6 +37,7 @@ pub const MessageType = enum {
     proxy_control_capabilities,
     proxy_control_diagnostic,
     proxy_control_ctrl_r,
+    client_open_proxy_stream,
 };
 
 pub const frame_header_len = 4;
@@ -169,6 +170,7 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .proxy_control_capabilities => |message| ownedFrameFromMessage(allocator, .proxy_control_capabilities, message),
             .proxy_control_diagnostic => |message| ownedFrameFromMessage(allocator, .proxy_control_diagnostic, message),
             .proxy_control_ctrl_r => |message| ownedFrameFromMessage(allocator, .proxy_control_ctrl_r, message),
+            .client_open_proxy_stream => |message| ownedFrameFromMessage(allocator, .client_open_proxy_stream, message),
         };
     }
 
@@ -336,6 +338,11 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.ProxyControlCtrlR, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_control_ctrl_r = message } });
+        },
+        .client_open_proxy_stream => blk: {
+            var message = try decodePayload(pb.ClientOpenProxyStream, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_open_proxy_stream = message } });
         },
     };
 }

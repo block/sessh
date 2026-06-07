@@ -104,10 +104,9 @@ def is_build_sessh_executable(resolved, expected_wrapper):
 
 def is_test_cached_sessh_command(resolved, command):
     if (
-        ":internal-session-agent:" not in command
-        and ":internal-stream-agent:" not in command
-        and ":internal-stream-broker:" not in command
+        ":internal-stream-broker:" not in command
         and ":internal-session-broker:" not in command
+        and ":internal-daemon:" not in command
     ):
         return False
     parts = resolved.parts

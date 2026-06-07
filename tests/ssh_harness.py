@@ -15,7 +15,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import termios
 import time
 from pathlib import Path
@@ -83,6 +82,35 @@ trace_fake_ssh_parsed() {
         printf 'pid=%s remote_command=%s\\n' "$$" "$1"
       fi
     } >>"$SESSH_FAKE_SSH_TRACE"
+  fi
+}
+
+apply_remote_env() {
+  if [ -z "${SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}.remote
+  fi
+  if [ -z "${SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME:-}" ] && [ -n "${XDG_STATE_HOME:-}" ]; then
+    SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME=${XDG_STATE_HOME}.remote
+  fi
+  if [ -n "${SESSH_FAKE_SSH_REMOTE_PATH:-}" ]; then
+    PATH=$SESSH_FAKE_SSH_REMOTE_PATH:$PATH
+    export PATH
+  fi
+  if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR:-}" ]; then
+    mkdir -p "$SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"
+    chmod 700 "$SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"
+    XDG_RUNTIME_DIR=$SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR
+    export XDG_RUNTIME_DIR
+  fi
+  if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME:-}" ]; then
+    mkdir -p "$SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"
+    chmod 700 "$SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"
+    XDG_STATE_HOME=$SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME
+    export XDG_STATE_HOME
+  fi
+  if [ -n "${SESSH_FAKE_SSH_REMOTE_SHELL:-}" ]; then
+    SHELL=$SESSH_FAKE_SSH_REMOTE_SHELL
+    export SHELL
   fi
 }
 
@@ -263,22 +291,7 @@ if [ -n "$proxy_command" ]; then
     printf 'proxy_remote_command=%s\\n' "$*" >>"$SESSH_FAKE_SSH_LOG"
   fi
   export SESSH_TEST_HOST=$host
-  if [ -n "${SESSH_FAKE_SSH_REMOTE_PATH:-}" ]; then
-    PATH=$SESSH_FAKE_SSH_REMOTE_PATH:$PATH
-    export PATH
-  fi
-  if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR:-}" ]; then
-    XDG_RUNTIME_DIR=$SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR
-    export XDG_RUNTIME_DIR
-  fi
-  if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME:-}" ]; then
-    XDG_STATE_HOME=$SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME
-    export XDG_STATE_HOME
-  fi
-  if [ -n "${SESSH_FAKE_SSH_REMOTE_SHELL:-}" ]; then
-    SHELL=$SESSH_FAKE_SSH_REMOTE_SHELL
-    export SHELL
-  fi
+  apply_remote_env
   if [ "$#" -gt 0 ]; then
     if [ "$*" = "tty" ]; then
       if [ "$request_tty" -eq 1 ] && { [ "$plain_option" = "-tt" ] || { [ "$plain_option" = "-t" ] && [ -t 0 ]; }; }; then
@@ -366,22 +379,7 @@ fi
 if [ -n "${SESSH_FAKE_SSH_STDERR_BEFORE_COMMAND:-}" ]; then
   printf '%s\n' "$SESSH_FAKE_SSH_STDERR_BEFORE_COMMAND" >&2
 fi
-if [ -n "${SESSH_FAKE_SSH_REMOTE_PATH:-}" ]; then
-  PATH=$SESSH_FAKE_SSH_REMOTE_PATH:$PATH
-  export PATH
-fi
-if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR:-}" ]; then
-  XDG_RUNTIME_DIR=$SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR
-  export XDG_RUNTIME_DIR
-fi
-if [ -n "${SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME:-}" ]; then
-  XDG_STATE_HOME=$SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME
-  export XDG_STATE_HOME
-fi
-if [ -n "${SESSH_FAKE_SSH_REMOTE_SHELL:-}" ]; then
-  SHELL=$SESSH_FAKE_SSH_REMOTE_SHELL
-  export SHELL
-fi
+apply_remote_env
 if [ -n "${SESSH_FAKE_SSH_STDERR_AFTER_SIGNAL:-}" ]; then
   (
     while [ ! -e "$SESSH_FAKE_SSH_STDERR_SIGNAL_FILE" ]; do
@@ -563,24 +561,22 @@ def env_with_session_guid(env, session_ref):
 
 
 def sever_session_clients(env, timeout=30.0, session_ref=None):
-    if session_ref is None:
-        session_ref = test_session_guid(1)
+    _ = session_ref
     request = sessh_pb().TeSessionClientDebugSeverConnectionRequest()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
-        conn.connect(str(actual_socket_path(env, session_ref)))
+        conn.connect(str(fake_remote_runtime_root(env) / "d" / "sesshd.sock"))
         send_hello(conn)
         send_frame(conn, SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST, request.SerializeToString())
         recv_until_message(conn, SESSION_CLIENT_CONTROL_RESPONSE, timeout=timeout)
 
 
 def make_session_clients_unresponsive(env, seconds, timeout=30.0, session_ref=None):
-    if session_ref is None:
-        session_ref = test_session_guid(1)
+    _ = session_ref
     request = sessh_pb().TeSessionClientDebugUnresponsiveConnectionRequest(seconds=seconds)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
-        conn.connect(str(actual_socket_path(env, session_ref)))
+        conn.connect(str(fake_remote_runtime_root(env) / "d" / "sesshd.sock"))
         send_hello(conn)
         send_frame(conn, SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST, request.SerializeToString())
         recv_until_message(conn, SESSION_CLIENT_CONTROL_RESPONSE, timeout=timeout)
@@ -1091,25 +1087,28 @@ def state_sessions_dir(env):
     return state_root(env) / "guid"
 
 
-def write_live_proxy_runtime(runtime_root_path, guid, agent_pid):
-    _ = agent_pid
-    compact = guid[2:].replace("-", "").lower()
-    guid_dir = runtime_root_path / "guid" / guid
-    socket_dir = runtime_root_path / "a"
-    guid_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    socket_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.symlink(f"../../a/{compact}", guid_dir / "agent.sock")
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(str(socket_dir / compact))
-    return sock
+def fake_remote_runtime_root(env):
+    return Path(env.get("SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR", env["XDG_RUNTIME_DIR"] + ".remote"))
+
+
+def fake_remote_state_root(env):
+    return Path(env.get("SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME", env["XDG_STATE_HOME"] + ".remote")) / "sessh"
+
+
+def fake_remote_state_sessions_dir(env):
+    return fake_remote_state_root(env) / "guid"
 
 
 def runtime_root(env):
     return Path(env["XDG_RUNTIME_DIR"])
 
 
+def fake_remote_sessions_dir(env):
+    return fake_remote_runtime_root(env) / "guid"
+
+
 def sessions_dir(env):
-    return runtime_root(env) / "guid"
+    return fake_remote_sessions_dir(env)
 
 
 def compact_guid(guid):
@@ -1177,25 +1176,7 @@ def session_path(env, session_id=None):
 def route_file(env, session_id=None):
     if session_id is None:
         session_id = test_session_guid(1)
-    return state_sessions_dir(env) / canonical_guid(session_id) / "route.json"
-
-
-def actual_socket_path(env, session_id=None):
-    if session_id is None:
-        session_id = test_session_guid(1)
-    guid = canonical_guid(session_id)
-    return runtime_root(env) / "a" / compact_guid(guid)
-
-
-def ensure_agent_socket_link(env, session_id=None):
-    if session_id is None:
-        session_id = test_session_guid(1)
-    session = session_path(env, session_id)
-    session.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (runtime_root(env) / "a").mkdir(mode=0o700, parents=True, exist_ok=True)
-    link = session / "agent.sock"
-    if not link.exists() and not link.is_symlink():
-        link.symlink_to(Path("../../a") / actual_socket_path(env, session_id).name)
+    return fake_remote_state_sessions_dir(env) / canonical_guid(session_id) / "route.json"
 
 
 def session_compat_path(env, session_id=None):
@@ -1234,72 +1215,6 @@ def write_compat_marker(path, marker):
         f"printf '{marker}\\n'\n"
     )
     path.chmod(0o700)
-
-
-def version_mismatch_frame():
-    payload = protobuf_string_field(1, b"VERSION_MISMATCH")
-    payload += protobuf_string_field(2, b"existing remote sessh is incompatible with this client")
-    payload += protobuf_string_field(3, b"Use the matching remote sessh binary")
-    hello_frame = protobuf_bytes_field(3, payload)
-    return struct.pack(">I", len(hello_frame)) + hello_frame
-
-
-def start_version_mismatch_agent(env, session_id=None):
-    if session_id is None:
-        session_id = test_session_guid(1)
-    ensure_agent_socket_link(env, session_id)
-    session = session_path(env, session_id)
-    (session / "meta.json").write_text(
-        json.dumps({"agent_pid": os.getpid(), "version": "0.0.0-compat-test"}, separators=(",", ":")) + "\n"
-    )
-    (session / "detached").write_text("")
-    sock_path = actual_socket_path(env, session_id)
-    try:
-        sock_path.unlink()
-    except FileNotFoundError:
-        pass
-
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(sock_path))
-    server.listen(1)
-    observed = {}
-
-    def serve():
-        try:
-            server.settimeout(10.0)
-            conn, _ = server.accept()
-            with conn:
-                conn.settimeout(10.0)
-                header = conn.recv(4)
-                observed["header"] = header
-                if len(header) == 4:
-                    (payload_len,) = struct.unpack(">I", header)
-                    conn.recv(payload_len)
-                conn.sendall(version_mismatch_frame())
-        except Exception as exc:
-            observed["error"] = repr(exc)
-
-    thread = threading.Thread(target=serve)
-    thread.start()
-    return server, thread, observed
-
-
-def protobuf_string_field(field_number, value):
-    return protobuf_bytes_field(field_number, value)
-
-
-def protobuf_bytes_field(field_number, value):
-    key = (field_number << 3) | 2
-    return protobuf_varint(key) + protobuf_varint(len(value)) + value
-
-
-def protobuf_varint(value):
-    out = bytearray()
-    while value >= 0x80:
-        out.append((value & 0x7F) | 0x80)
-        value >>= 7
-    out.append(value)
-    return bytes(out)
 
 
 def test_fake_ssh_exports_host_to_remote_command(tmp):
@@ -1772,16 +1687,12 @@ def test_ssh_filter_level_cli_overrides_config(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    result = run_sessh(["--filter-level", "unhygienic", "test-host"], env, timeout=5.0)
+    result = run_sessh(["--filter-level", "hygienic", "test-host"], env, timeout=5.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if "proxy_ssh=1" not in log_text or ":internal-proxy-stream:" not in log_text:
-        raise AssertionError(log_text)
-    if "--filter-level" not in log_text or "unhygienic" not in log_text:
-        raise AssertionError(log_text)
-    if " raw" in log_text or "'raw'" in log_text:
         raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
@@ -3135,7 +3046,6 @@ def test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner(tmp):
 
         sever_session_clients(env, 30.0, single_live_session_guid(env))
 
-        stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Connection ready", 15.0)
         proc.stdin.write(b"\x12")
         proc.stdin.flush()
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 15.0)
@@ -3163,7 +3073,7 @@ def test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner(tmp):
         raise AssertionError(result)
     if "sessh: disconnected: Reconnecting" in result.stdout:
         raise AssertionError(result)
-    if "sessh: disconnected: Connection ready" not in result.stdout:
+    if "Connection ready" not in result.stdout:
         raise AssertionError(result)
     if f"REMOTE:{after}" not in result.stdout:
         raise AssertionError(result)

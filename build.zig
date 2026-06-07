@@ -34,6 +34,7 @@ pub fn build(b: *std.Build) void {
     exe.step.dependOn(&protoc_step.step);
 
     const sessh_wrapper_step = installWrapper(b, "bin/sessh");
+    const sesshd_wrapper_step = installWrapper(b, "bin/sesshd");
 
     const run_step = b.step("run", "Run sessh");
     const run_cmd = b.addRunArtifact(exe);
@@ -47,6 +48,7 @@ pub fn build(b: *std.Build) void {
     });
     install_dev_step.dependOn(&install_dev.step);
     install_dev_step.dependOn(sessh_wrapper_step);
+    install_dev_step.dependOn(sesshd_wrapper_step);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

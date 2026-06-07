@@ -12,7 +12,8 @@ pub const FileConfig = struct {
     bootstrap: ?bool = null,
     terminal_emulator: ?bool = null,
     filter_level: ?config.FilterLevel = null,
-    reap_ms: ?u64 = null,
+    cleanup_retry_ms: ?u64 = null,
+    disconnected_reap_ms: ?u64 = null,
 };
 
 pub fn loadFileConfig(allocator: std.mem.Allocator) !FileConfig {
@@ -75,8 +76,10 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
             parsed.terminal_emulator = try parseBool(value);
         } else if (keyMatches(key, "filter-level")) {
             parsed.filter_level = try config.parseFilterLevel(value);
-        } else if (keyMatches(key, "reap-hours")) {
-            parsed.reap_ms = try parseReapHours(value);
+        } else if (keyMatches(key, "cleanup-retry-hours")) {
+            parsed.cleanup_retry_ms = try parseHoursMs(value, error.InvalidCleanupRetryHours);
+        } else if (keyMatches(key, "disconnected-reap-hours")) {
+            parsed.disconnected_reap_ms = try parseHoursMs(value, error.InvalidDisconnectedReapHours);
         } else {
             return error.UnknownConfigKey;
         }
@@ -120,10 +123,6 @@ pub fn parseInitialScrollbackRowCount(value: []const u8) !?u32 {
     return @intCast(parsed);
 }
 
-pub fn parseReapHours(value: []const u8) !u64 {
-    return parseHoursMs(value, error.InvalidReapHours);
-}
-
 fn parseHoursMs(value: []const u8, invalid_error: anyerror) !u64 {
     const parsed = std.fmt.parseFloat(f64, value) catch return invalid_error;
     if (parsed != parsed) return invalid_error;
@@ -159,7 +158,8 @@ test "parseEnvConfig accepts sessh env keys" {
         \\bootstrap=false
         \\terminal-emulator=no
         \\filter-level=hygienic
-        \\reap-hours=1.5
+        \\cleanup-retry-hours=2
+        \\disconnected-reap-hours=1.5
         \\
     );
     try std.testing.expectEqual(@as(?u32, 42), parsed.scrollback_row_count);
@@ -169,7 +169,8 @@ test "parseEnvConfig accepts sessh env keys" {
     try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
     try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
     try std.testing.expectEqual(@as(?config.FilterLevel, .hygienic), parsed.filter_level);
-    try std.testing.expectEqual(@as(?u64, 5_400_000), parsed.reap_ms);
+    try std.testing.expectEqual(@as(?u64, 7_200_000), parsed.cleanup_retry_ms);
+    try std.testing.expectEqual(@as(?u64, 5_400_000), parsed.disconnected_reap_ms);
 }
 
 test "parseEnvConfig maps initial scrollback minus one to all retained rows" {
@@ -178,10 +179,10 @@ test "parseEnvConfig maps initial scrollback minus one to all retained rows" {
     try std.testing.expectEqual(@as(?u32, null), parsed.initial_scrollback_row_count);
 }
 
-test "parseEnvConfig maps non-positive reap hours to disabled" {
-    const negative = try parseEnvConfig("reap-hours=-1\n");
-    try std.testing.expectEqual(@as(?u64, 0), negative.reap_ms);
+test "parseEnvConfig maps non-positive disconnected reap hours to disabled" {
+    const negative = try parseEnvConfig("disconnected-reap-hours=-1\n");
+    try std.testing.expectEqual(@as(?u64, 0), negative.disconnected_reap_ms);
 
-    const zero = try parseEnvConfig("reap_hours=0\n");
-    try std.testing.expectEqual(@as(?u64, 0), zero.reap_ms);
+    const zero = try parseEnvConfig("disconnected_reap_hours=0\n");
+    try std.testing.expectEqual(@as(?u64, 0), zero.disconnected_reap_ms);
 }

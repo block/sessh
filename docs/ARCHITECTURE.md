@@ -1,35 +1,34 @@
 # Architecture
 
-`sessh` is a single ssh-shaped binary. Public invocation parses ssh-compatible
-arguments, chooses either the terminal-emulator path or the ProxyCommand stream
-path, and then lets the remote runtime do the small amount of work sessh still
-owns.
+`sessh` is an ssh-shaped client with a per-user daemon named `sesshd`.
+The same installed binary can be invoked as either name; daemon mode itself is
+entered as `sessh :internal-daemon:`.
 
-## Remote Startup
+The visible `sessh` process parses ssh-compatible arguments, starts or connects
+to local `sesshd`, then chooses either the terminal-emulator path or the
+OpenSSH-owned proxy stream path.
+
+## Startup
 
 For a terminal-emulator session, the first connection looks like this:
 
 1. The visible client runs `ssh HOST <bootstrap-script>`.
-2. The bootstrapper finds or installs the matching `sessh-<os>-<arch>` binary.
-3. The client asks that binary to start `:internal-session-broker:`.
-4. The broker starts a session agent for one `s-` GUID.
-5. The agent allocates the remote PTY and implements the
-   [headless terminal emulator](TERMINAL_EMULATOR.md).
-6. The visible client and agent exchange protobuf frames for input, output,
-   repaint, resize, reconnect, and shutdown state.
+2. The bootstrapper finds or installs the matching `sessh` binary.
+3. The remote binary starts or connects to remote `sesshd`.
+4. Remote `sesshd` owns the PTY and terminal model for one `s-` GUID.
+5. The visible client and remote daemon exchange protobuf frames for input,
+   output, repaint, resize, reconnect, and shutdown state.
 
-ProxyCommand streams also use the bootstrapper, but the remote process is a
-stream broker/agent rather than a terminal-emulator session agent. The public
-shape remains `sessh [ssh-option ...] host [command ...]`.
+Proxy streams use the same bootstrap path, but OpenSSH owns the visible stream
+and `sesshd` owns the durable byte-stream endpoint.
 
 ## Internal Modalities
 
 Special first arguments are internal entrypoints, not public commands:
 
+- `:internal-daemon:`
 - `:internal-session-broker:`
-- `:internal-session-agent:`
 - `:internal-stream-broker:`
-- `:internal-stream-agent:`
 - `:internal-proxy-stream:`
 
 Everything else is parsed as a normal ssh-shaped `sessh` invocation.

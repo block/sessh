@@ -56,4 +56,8 @@ if [ ! -x "$real" ]; then
   exit 127
 fi
 
+case "$(basename "$0")" in
+  sesshd) exec "$real" :internal-daemon: "$@" ;;
+esac
+
 exec "$real" "$@"

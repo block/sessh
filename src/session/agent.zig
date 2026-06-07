@@ -23,15 +23,6 @@ const synchronized_output_max_hold_ms: i64 = 1000;
 const pb = protocol.pb;
 const hpb = protocol.hpb;
 
-var shutdown_signal_write_fd: c.fd_t = -1;
-
-fn handleShutdownSignal(_: c_int) callconv(.c) void {
-    const fd = shutdown_signal_write_fd;
-    if (fd < 0) return;
-    var byte = [_]u8{1};
-    _ = c.write(fd, &byte, byte.len);
-}
-
 const Session = struct {
     id: [64]u8 = [_]u8{0} ** 64,
     id_len: usize = 0,
@@ -139,9 +130,15 @@ const ExitInfo = struct {
 
 const SessionEnvironment = struct {
     shell: ?[]const u8 = null,
+    entries: std.ArrayList(pty_process.EnvironmentEntry) = .empty,
 
     fn deinit(self: *SessionEnvironment) void {
         if (self.shell) |shell| app_allocator.allocator().free(shell);
+        for (self.entries.items) |entry| {
+            app_allocator.allocator().free(entry.name);
+            app_allocator.allocator().free(entry.value);
+        }
+        self.entries.deinit(app_allocator.allocator());
         self.* = .{};
     }
 };
@@ -758,7 +755,7 @@ fn isSafePlainReplay(bytes: []const u8) bool {
     if (bytes.len == 0) return false;
     // Starting at libghostty-vt ground state plus this byte allowlist preserves
     // ground state: there is no ESC/control introducer and no partial UTF-8.
-    // The session agent therefore only needs to record whether the batch started at a
+    // The remote session runtime therefore only needs to record whether the batch started at a
     // plain-text parser boundary before considering original-byte replay.
     // TAB is intentionally excluded because its visual effect depends on tab
     // stop state; add it only after modeling and testing that state boundary.
@@ -1100,24 +1097,41 @@ fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
     };
 }
 
-/// Run one long-lived agent for exactly one session directory.
-///
-/// This is the process shape used by the session-agent architecture. It still
-/// reuses the session agent's terminal and attached client machinery, but it fixes the
-/// session id to the registry directory name and exits after that session ends.
-pub fn runSessionAgent(session_dir: []const u8) !void {
-    closeInheritedFileDescriptorsForSessionAgent();
-    socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
+pub fn startSessionAgentThread(allocator: std.mem.Allocator, session_dir: []const u8) !void {
+    const context = try allocator.create(SessionAgentThreadContext);
+    errdefer allocator.destroy(context);
+    context.* = .{
+        .allocator = allocator,
+        .session_dir = try allocator.dupe(u8, session_dir),
+    };
+    errdefer allocator.free(context.session_dir);
 
-    const paths = try session_registry.pathsForSessionDir(app_allocator.allocator(), session_dir);
-    const shutdown_pipe = try posix.pipe();
+    const thread = try std.Thread.spawn(.{}, sessionAgentThreadMain, .{context});
+    thread.detach();
+}
+
+const SessionAgentThreadContext = struct {
+    allocator: std.mem.Allocator,
+    session_dir: []u8,
+};
+
+fn sessionAgentThreadMain(context: *SessionAgentThreadContext) void {
+    const allocator = context.allocator;
+    defer {
+        allocator.free(context.session_dir);
+        allocator.destroy(context);
+    }
+    socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
+    const shutdown_pipe = posix.pipe() catch return;
     defer {
         posix.close(shutdown_pipe[0]);
         posix.close(shutdown_pipe[1]);
     }
-    installShutdownSignalHandler(shutdown_pipe[1]);
-    defer uninstallShutdownSignalHandler();
+    runSessionAgentLoop(context.session_dir, shutdown_pipe[0]) catch {};
+}
 
+fn runSessionAgentLoop(session_dir: []const u8, shutdown_signal_fd: c.fd_t) !void {
+    const paths = try session_registry.pathsForSessionDir(app_allocator.allocator(), session_dir);
     const fixed_session_id = std.fs.path.basename(paths.dir);
     var session_agent = SessionAgent{
         .fixed_session_id = fixed_session_id,
@@ -1149,7 +1163,7 @@ pub fn runSessionAgent(session_dir: []const u8) !void {
     defer closeSessionAgent(&session_agent);
 
     while (session_agent.running) {
-        try sessionAgentPollOnce(&session_agent, &listen_fd, shutdown_pipe[0], runtime_repair_pipe[0]);
+        try sessionAgentPollOnce(&session_agent, &listen_fd, shutdown_signal_fd, runtime_repair_pipe[0]);
         stopSessionAgentIfComplete(&session_agent);
     }
 }
@@ -1161,47 +1175,6 @@ fn runtimeRefreshIntervalMs() u64 {
     const parsed = std.fmt.parseInt(u64, value, 10) catch return runtime_refresher.default_refresh_interval_ms;
     if (parsed == 0) return runtime_refresher.default_refresh_interval_ms;
     return parsed;
-}
-
-fn closeInheritedFileDescriptorsForSessionAgent() void {
-    // The broker runs behind ssh stdio and may inherit bootstrapper helper fds
-    // such as fd 3 pointing at protocol stdout. A session agent must not keep
-    // those pipes open after the broker exits, or transport EOF will be hidden
-    // from the local client.
-    const limit = inheritedFdCloseLimit();
-    var fd: c.fd_t = 3;
-    while (fd < limit) : (fd += 1) {
-        _ = c.close(fd);
-    }
-}
-
-fn inheritedFdCloseLimit() c.fd_t {
-    const fallback: c.fd_t = 1024;
-    const max_reasonable: u64 = 65_536;
-    const limits = posix.getrlimit(.NOFILE) catch return fallback;
-    if (limits.cur <= 3) return 3;
-    const capped = @min(limits.cur, max_reasonable);
-    return @intCast(capped);
-}
-
-fn installShutdownSignalHandler(write_fd: c.fd_t) void {
-    shutdown_signal_write_fd = write_fd;
-    const action = posix.Sigaction{
-        .handler = .{ .handler = handleShutdownSignal },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.TERM, &action, null);
-}
-
-fn uninstallShutdownSignalHandler() void {
-    const action = posix.Sigaction{
-        .handler = .{ .handler = null },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.TERM, &action, null);
-    shutdown_signal_write_fd = -1;
 }
 
 fn writeAgentCompatBinary(paths: session_registry.SessionPaths) !void {
@@ -1410,7 +1383,7 @@ fn sessionReapEnabled(session: *const Session) bool {
         session.reap_ms != 0;
 }
 
-test "session agent poll timeout includes reap deadline" {
+test "remote session runtime poll timeout includes reap deadline" {
     var session_agent = SessionAgent{};
     session_agent.session = .{
         .alive = true,
@@ -1509,7 +1482,7 @@ fn acceptSessionAgentClient(session_agent: *SessionAgent, listen_fd: c.fd_t) voi
 
     const keep_open = handleSessionAgentClient(session_agent, client_fd) catch |err| blk: {
         logSessionAgent(session_agent, "event=client_error error={t}", .{err});
-        io.stderrPrint("sessh session agent: client error: {t}\n", .{err}) catch {};
+        io.stderrPrint("sessh remote session runtime: client error: {t}\n", .{err}) catch {};
         break :blk false;
     };
     if (!keep_open) _ = c.close(client_fd);
@@ -1628,7 +1601,7 @@ fn acceptRemoteHandshake(session_agent: *SessionAgent, fd: c.fd_t) !HandshakeRes
     var peer_hello = try readHelloRequest(fd);
     defer peer_hello.deinit(app_allocator.allocator());
     if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "existing session agent is incompatible with this client", "Start a fresh sessh connection with matching binaries");
+        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote session runtime is incompatible with this client", "Start a fresh sessh connection with matching binaries");
         return .mismatch;
     }
     try sendHelloOk(fd);
@@ -2492,10 +2465,40 @@ fn readTtySettings(message: pb.TeTtySettings) !tty_settings.Settings {
 }
 
 fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.TeEnvironmentEntry) !void {
-    if (std.mem.eql(u8, entry.name, "SHELL") and entry.value.len > 0) {
+    if (!isValidEnvironmentEntry(entry)) return error.InvalidEnvironmentEntry;
+    if (sessionEnvironmentHasEntry(environment, entry.name)) return;
+
+    const name = try app_allocator.allocator().dupeZ(u8, entry.name);
+    errdefer app_allocator.allocator().free(name);
+    const value = try app_allocator.allocator().dupeZ(u8, entry.value);
+    errdefer app_allocator.allocator().free(value);
+    try environment.entries.append(app_allocator.allocator(), .{
+        .name = name,
+        .value = value,
+    });
+
+    if (std.mem.eql(u8, entry.name, "SHELL") and entry.value.len > 0 and environment.shell == null) {
         if (environment.shell) |shell| app_allocator.allocator().free(shell);
         environment.shell = try app_allocator.allocator().dupe(u8, entry.value);
     }
+}
+
+fn sessionEnvironmentHasEntry(environment: *const SessionEnvironment, name: []const u8) bool {
+    for (environment.entries.items) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return true;
+    }
+    return false;
+}
+
+fn isValidEnvironmentEntry(entry: pb.TeEnvironmentEntry) bool {
+    return isValidEnvironmentName(entry.name) and
+        std.mem.indexOfScalar(u8, entry.value, 0) == null;
+}
+
+fn isValidEnvironmentName(name: []const u8) bool {
+    return name.len > 0 and
+        std.mem.indexOfScalar(u8, name, '=') == null and
+        std.mem.indexOfScalar(u8, name, 0) == null;
 }
 
 fn readDefaultColors(colors: pb.TeDefaultColors) !vt.DefaultColors {
@@ -2593,6 +2596,7 @@ fn createSession(
         .shell = shell_path,
         .command_argv = command_argv,
         .shell_command = shell_command,
+        .environment = session_environment.entries.items,
         .session_guid = session_guid_z,
         .add_sessh_path_to_env = true,
         .tty_settings = settings,

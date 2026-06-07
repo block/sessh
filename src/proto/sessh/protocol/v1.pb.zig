@@ -70,6 +70,7 @@ pub const Frame = struct {
         proxy_control_capabilities,
         proxy_control_diagnostic,
         proxy_control_ctrl_r,
+        client_open_proxy_stream,
     };
     pub const payload_union = union(_payload_case) {
         @"error": sessh_handshake_v1.Error,
@@ -97,6 +98,7 @@ pub const Frame = struct {
         proxy_control_capabilities: ProxyControlCapabilities,
         proxy_control_diagnostic: ProxyControlDiagnostic,
         proxy_control_ctrl_r: ProxyControlCtrlR,
+        client_open_proxy_stream: ClientOpenProxyStream,
         pub const _desc_table = .{
             .@"error" = fd(10, .submessage),
             .te_session_create = fd(11, .submessage),
@@ -123,11 +125,86 @@ pub const Frame = struct {
             .proxy_control_capabilities = fd(48, .submessage),
             .proxy_control_diagnostic = fd(49, .submessage),
             .proxy_control_ctrl_r = fd(50, .submessage),
+            .client_open_proxy_stream = fd(51, .submessage),
         };
     };
 
     pub const _desc_table = .{
         .payload = fd(null, .{ .oneof = payload_union }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// Framed payload, stream-broker shim -> local sesshd.
+///
+/// This opens or reattaches a durable opaque proxy stream. After sesshd accepts
+/// this request, the same socket carries ProxyStream* frames for that stream.
+pub const ClientOpenProxyStream = struct {
+    guid: []const u8 = &.{},
+    proxy_host: []const u8 = &.{},
+    proxy_port: u32 = 0,
+
+    pub const _desc_table = .{
+        .guid = fd(1, .{ .scalar = .string }),
+        .proxy_host = fd(2, .{ .scalar = .string }),
+        .proxy_port = fd(3, .{ .scalar = .uint32 }),
     };
 
     /// Encodes the message to the writer
@@ -1302,7 +1379,7 @@ pub const TeShellCommand = struct {
     }
 };
 
-/// Framed payload, client -> session agent.
+/// Framed payload, client -> remote session runtime.
 ///
 /// Creates a new interactive PTY session and attaches this client. A successful
 /// TeSessionCreate is followed by TeSessionAttached for the new session, then
@@ -1402,7 +1479,7 @@ pub const TeSessionCreate = struct {
     }
 };
 
-/// Framed payload, client -> session agent.
+/// Framed payload, client -> remote session runtime.
 ///
 /// Attaches to an existing session. A successful TeSessionAttach is followed by
 /// TeSessionAttached for the selected session, then TeDraw/TeRepaintResponse messages.
@@ -1478,7 +1555,7 @@ pub const TeSessionAttach = struct {
     }
 };
 
-/// Framed payload, client -> session agent.
+/// Framed payload, client -> remote session runtime.
 ///
 /// Local terminal input bytes.
 pub const TeInput = struct {
@@ -1549,9 +1626,9 @@ pub const TeInput = struct {
     }
 };
 
-/// Framed payload, session agent -> client.
+/// Framed payload, remote session runtime -> client.
 ///
-/// Confirms that the session agent received a TeInput frame.
+/// Confirms that the remote session runtime received a TeInput frame.
 pub const TeInputAck = struct {
     input_seq: u64 = 0,
 
@@ -1618,7 +1695,7 @@ pub const TeInputAck = struct {
     }
 };
 
-/// Framed payload, client -> session agent.
+/// Framed payload, client -> remote session runtime.
 ///
 /// Current terminal size for this attached client.
 pub const TeResize = struct {
@@ -1693,9 +1770,9 @@ pub const TeResize = struct {
     }
 };
 
-/// Framed payload, client -> session agent.
+/// Framed payload, client -> remote session runtime.
 ///
-/// Requests that the session agent redraw terminal state for this attached client.
+/// Requests that the remote session runtime redraw terminal state for this attached client.
 pub const TeRepaintRequest = struct {
     repaint_request_seq: u64 = 0,
     scrollback_cursor: ?[]const u8 = null,
@@ -1766,7 +1843,7 @@ pub const TeRepaintRequest = struct {
     }
 };
 
-/// Framed payload, session agent -> client.
+/// Framed payload, remote session runtime -> client.
 ///
 /// Confirms the session selected for this connection.
 pub const TeSessionAttached = struct {
@@ -1837,7 +1914,7 @@ pub const TeSessionAttached = struct {
     }
 };
 
-/// Framed payload, broker/client -> session agent.
+/// Framed payload, broker/client -> remote session runtime.
 ///
 /// Debug-only request that severs all attached client connections.
 pub const TeSessionClientDebugSeverConnectionRequest = struct {
@@ -1902,7 +1979,7 @@ pub const TeSessionClientDebugSeverConnectionRequest = struct {
     }
 };
 
-/// Framed payload, broker/client -> session agent.
+/// Framed payload, broker/client -> remote session runtime.
 ///
 /// Debug-only request that makes all attached client connections stop responding
 /// for a bounded duration. Omitted or zero seconds asks the receiver to use its
@@ -1973,7 +2050,7 @@ pub const TeSessionClientDebugUnresponsiveConnectionRequest = struct {
     }
 };
 
-/// Framed payload, session agent -> broker/client.
+/// Framed payload, remote session runtime -> broker/client.
 ///
 /// Confirms that a debug client-control request was accepted.
 pub const TeSessionClientControlResponse = struct {
@@ -2106,7 +2183,7 @@ pub const ExitStatus = struct {
     }
 };
 
-/// Framed payload, session agent -> client.
+/// Framed payload, remote session runtime -> client.
 ///
 /// Tells an attached client that the session has ended.
 pub const TeSessionEnded = struct {
@@ -2179,7 +2256,7 @@ pub const TeSessionEnded = struct {
     }
 };
 
-/// Framed payload, session agent -> client.
+/// Framed payload, remote session runtime -> client.
 ///
 /// Session-agent-generated terminal bytes for the attached session.
 pub const TeDraw = struct {
@@ -2256,7 +2333,7 @@ pub const TeDraw = struct {
     }
 };
 
-/// Framed payload, session agent -> client.
+/// Framed payload, remote session runtime -> client.
 ///
 /// Response for a TeRepaintRequest. The embedded TeDraw is applied exactly like a
 /// framed TeDraw.
@@ -2328,7 +2405,7 @@ pub const TeRepaintResponse = struct {
     }
 };
 
-/// Framed payload, session agent -> client.
+/// Framed payload, remote session runtime -> client.
 ///
 /// Raw inner PTY bytes captured for a client-requested tty transcript.
 pub const TeTtyTranscriptChunk = struct {

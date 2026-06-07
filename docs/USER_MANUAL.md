@@ -28,13 +28,12 @@ Sessh accepts normal ssh options, plus a small set of sessh-specific options:
 
 - `--log-level quiet|error|warn|info|debug|verbose`
 - `--terminal-emulator` / `--no-terminal-emulator`
-- `--filter-level raw|unhygienic|hygienic|emulated`
+- `--filter-level raw|hygienic|emulated`
 - `--capture-tty-transcript PATH.tar.gz`
 
 `--filter-level emulated` is the default and naturally degrades when OpenSSH
-must own the stream. `raw` suppresses reconnect diagnostics, `unhygienic`
-prints direct stderr diagnostics with CRLF line endings, and `hygienic` uses
-the side-channel path when the visible client can support it.
+must own the stream. `raw` suppresses reconnect diagnostics, and `hygienic`
+uses the side-channel path when the visible client can support it.
 
 # Config File
 
@@ -52,22 +51,25 @@ client-log-level=warn
 bootstrap=true
 terminal-emulator=true
 filter-level=emulated
-reap-hours=168
+cleanup-retry-hours=168
+disconnected-reap-hours=168
 ```
 
-`reap-hours` controls how long a disconnected remote session agent may remain
-alive. Values less than or equal to zero disable the timeout, and the value is
-recorded when the agent is created.
+`cleanup-retry-hours` controls how long the client-side daemon retries remote
+cleanup after a local client disappears. `disconnected-reap-hours` controls how
+long a remote session or proxy stream may remain disconnected before the remote
+daemon hangs it up. Values less than or equal to zero disable the relevant
+timeout.
 
 # Sessions
 
 Running `sessh HOST` starts the user's interactive login shell under a remote
-PTY. The session agent models that PTY's screen, terminal state, and retained
+PTY. Remote `sesshd` models that PTY's screen, terminal state, and retained
 scrollback so the original client can recover after a disconnect.
 
 Each session has an `s-`-prefixed GUID exported as `$SESSH_GUID`. The session
 also exports `$SESSH_PATH`, the directory containing the sessh binary used by
-the session agent, and prepends that directory to `$PATH`.
+remote `sesshd`, and prepends that directory to `$PATH`.
 
 Available ssh-style escapes at the beginning of a line:
 

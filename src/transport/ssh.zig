@@ -82,7 +82,7 @@ const ResolvedSshTarget = struct {
 
 const SessionRuntimeConfig = struct {
     common: CommonSessionOptions,
-    reap_ms: u64 = config.default_reap_ms,
+    disconnected_reap_ms: u64 = config.default_disconnected_reap_ms,
 };
 
 const RemoteNewSession = struct {
@@ -323,7 +323,7 @@ fn remoteSessionConfig(
     if (!result.common.filter_level_set) {
         if (file_config.filter_level) |level| result.common.filter_level = level;
     }
-    if (file_config.reap_ms) |ms| result.reap_ms = ms;
+    if (file_config.disconnected_reap_ms) |ms| result.disconnected_reap_ms = ms;
     if (!result.common.client_log_level_set) {
         if (file_config.client_log_level) |level| {
             result.common.client_log_level = level;
@@ -397,7 +397,7 @@ fn runRemoteNewSession(
         new_guid,
         new.command_argv,
         shell_command,
-        runtime_config.reap_ms,
+        runtime_config.disconnected_reap_ms,
     ) catch |err| {
         if (err == error.VersionMismatch) {
             child.closeStdin();
@@ -831,7 +831,6 @@ fn finishReconnectUiForDetach(reconnect_ui: *client_ui.ReconnectUi, active: *boo
 fn reconnectPresentationForFilterLevel(level: config.FilterLevel) client_ui.ReconnectPresentation {
     return switch (level) {
         .raw => .none,
-        .unhygienic => .stderr_plain,
         .hygienic => .title,
         .emulated => .overlay,
     };
@@ -1596,14 +1595,13 @@ const StreamClientStarter = struct {
 fn proxyStreamReconnectStatusMode(level: config.FilterLevel, has_client_socket: bool) stream_agent.StreamReconnectStatusMode {
     return switch (level) {
         .raw => .disabled,
-        .unhygienic => .stderr_plain,
         .hygienic, .emulated => if (has_client_socket) .client_control else .stderr_plain,
     };
 }
 
 fn filterLevelForcesProxy(level: config.FilterLevel) bool {
     return switch (level) {
-        .raw, .unhygienic, .hygienic => true,
+        .raw, .hygienic => true,
         .emulated => false,
     };
 }
@@ -1625,7 +1623,7 @@ fn hasRemoteShellCommand(args: []const []const u8) bool {
 // as X11, agent forwarding, port forwarding, subsystems, and non-tty commands.
 // The visible outer `ssh` process gets the user's original options plus a
 // ProxyCommand. That ProxyCommand is a local sessh process that reconnects a
-// byte-clean stream to a remote stream agent, and the remote stream agent then
+// byte-clean stream to a remote stream runtime, and the remote stream runtime then
 // opens a TCP connection to sshd on the remote machine.
 fn runProxyStreamSsh(
     allocator: std.mem.Allocator,
@@ -1718,15 +1716,9 @@ fn proxyDiagnosticsPlan(
             .wrap_visible_ssh = false,
             .client_ctrl_r = false,
         },
-        .unhygienic => .{
-            .command_level = .unhygienic,
-            .use_client_socket = false,
-            .wrap_visible_ssh = false,
-            .client_ctrl_r = false,
-        },
         .hygienic, .emulated => blk: {
             if (!stdout_is_tty) break :blk .{
-                .command_level = .unhygienic,
+                .command_level = .raw,
                 .use_client_socket = false,
                 .wrap_visible_ssh = false,
                 .client_ctrl_r = false,
@@ -2219,7 +2211,7 @@ pub fn printSshArgError(err: anyerror) !void {
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),
         error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
-        error.MissingFilterLevel => try io.writeAll(2, "sessh: --filter-level requires one of: raw, unhygienic, hygienic, emulated\n"),
+        error.MissingFilterLevel => try io.writeAll(2, "sessh: --filter-level requires one of: raw, hygienic, emulated\n"),
         error.MissingTtyTranscriptPath => try io.writeAll(2, "sessh: --capture-tty-transcript requires a path\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: ssh option is missing its value\n"),
         error.SesshOptionAfterHost => try io.writeAll(2, "sessh: sessh options must appear before HOST\n"),
@@ -2227,7 +2219,7 @@ pub fn printSshArgError(err: anyerror) !void {
         error.InvalidScrollbackRowCount => try io.writeAll(2, "sessh: invalid scrollback row count\n"),
         error.InvalidInitialScrollback => try io.writeAll(2, "sessh: invalid initial scrollback\n"),
         error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
-        error.InvalidFilterLevel => try io.writeAll(2, "sessh: invalid filter level; expected one of: raw, unhygienic, hygienic, emulated\n"),
+        error.InvalidFilterLevel => try io.writeAll(2, "sessh: invalid filter level; expected one of: raw, hygienic, emulated\n"),
         error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
         error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands require -t or -tt for persistent sessions\n"),
         error.UnsafeSshOption => try io.writeAll(2, "sessh: ssh option is not safe for sessh transport\n"),
@@ -2574,7 +2566,6 @@ test "default ssh options append resolved interactive IPQoS value" {
 
 test "proxy stream reconnect status follows filter level" {
     try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.disabled, proxyStreamReconnectStatusMode(.raw, false));
-    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, proxyStreamReconnectStatusMode(.unhygienic, false));
     try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, proxyStreamReconnectStatusMode(.hygienic, false));
     try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.hygienic, true));
     try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.emulated, true));
@@ -2582,7 +2573,6 @@ test "proxy stream reconnect status follows filter level" {
 
 test "terminal reconnect presentation follows filter level" {
     try std.testing.expectEqual(client_ui.ReconnectPresentation.none, reconnectPresentationForFilterLevel(.raw));
-    try std.testing.expectEqual(client_ui.ReconnectPresentation.stderr_plain, reconnectPresentationForFilterLevel(.unhygienic));
     try std.testing.expectEqual(client_ui.ReconnectPresentation.title, reconnectPresentationForFilterLevel(.hygienic));
     try std.testing.expectEqual(client_ui.ReconnectPresentation.overlay, reconnectPresentationForFilterLevel(.emulated));
 }
@@ -2602,13 +2592,13 @@ test "proxy diagnostics plan maps emulated to hygienic client socket" {
     try std.testing.expect(interactive.client_ctrl_r);
 
     const no_stdout = proxyDiagnosticsPlanForTest(parsed, true, false);
-    try std.testing.expectEqual(config.FilterLevel.unhygienic, no_stdout.command_level);
+    try std.testing.expectEqual(config.FilterLevel.raw, no_stdout.command_level);
     try std.testing.expect(!no_stdout.use_client_socket);
     try std.testing.expect(!no_stdout.wrap_visible_ssh);
     try std.testing.expect(!no_stdout.client_ctrl_r);
 }
 
-test "proxy diagnostics plan honors raw and unhygienic levels" {
+test "proxy diagnostics plan honors raw level" {
     var raw = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--filter-level",
@@ -2621,19 +2611,6 @@ test "proxy diagnostics plan honors raw and unhygienic levels" {
     const raw_plan = proxyDiagnosticsPlanForTest(raw, true, true);
     try std.testing.expectEqual(config.FilterLevel.raw, raw_plan.command_level);
     try std.testing.expect(!raw_plan.use_client_socket);
-
-    var unhygienic = try parseSshArgsForTest(std.testing.allocator, &.{
-        "sessh",
-        "--filter-level",
-        "unhygienic",
-        "--no-terminal-emulator",
-        "example.com",
-    }, .{});
-    defer unhygienic.deinit(std.testing.allocator);
-    try std.testing.expectEqual(config.FilterLevel.unhygienic, unhygienic.invocation.common.filter_level);
-    const noisy_plan = proxyDiagnosticsPlanForTest(unhygienic, true, true);
-    try std.testing.expectEqual(config.FilterLevel.unhygienic, noisy_plan.command_level);
-    try std.testing.expect(!noisy_plan.use_client_socket);
 }
 
 test "proxy diagnostics plan disables ctrl-r when visible ssh is not wrapped" {

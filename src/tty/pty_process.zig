@@ -15,9 +15,15 @@ pub const SpawnOptions = struct {
     shell: ?[]const u8 = null,
     command_argv: []const []const u8 = &.{},
     shell_command: ?[]const u8 = null,
+    environment: []const EnvironmentEntry = &.{},
     session_guid: ?[]const u8 = null,
     add_sessh_path_to_env: bool = false,
     tty_settings: ?tty_settings.Settings = null,
+};
+
+pub const EnvironmentEntry = struct {
+    name: [:0]const u8,
+    value: [:0]const u8,
 };
 
 pub const Child = struct {
@@ -50,7 +56,7 @@ pub const Child = struct {
 // All PTY users should go through these master-read helpers instead of calling
 // read(2) directly. PTY EOF is not identical to pipe EOF on every platform:
 // Linux reports the closed slave side as EIO on the master. Keeping that rule
-// here prevents the stream and session agents from growing separate PTY lore.
+// here prevents the stream and remote session runtimes from growing separate PTY lore.
 pub const MasterRead = union(enum) {
     bytes: []const u8,
     would_block,
@@ -105,6 +111,9 @@ pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
     if (pid < 0) return error.ForkPtyFailed;
     if (pid == 0) {
         terminal.setSigpipe(posix.SIG.DFL);
+        for (options.environment) |entry| {
+            _ = setenv(entry.name.ptr, entry.value.ptr, 1);
+        }
         if (term_z) |term| {
             _ = setenv("TERM", term.ptr, 1);
         } else {

@@ -3,11 +3,9 @@ const posix = std.posix;
 
 const app_allocator = @import("core/app_allocator.zig");
 const config = @import("core/config.zig");
+const daemon = @import("daemon/mod.zig");
 const io = @import("core/io.zig");
 const process_exit = @import("core/process_exit.zig");
-const session_agent = @import("session/agent.zig");
-const session_broker = @import("session/broker.zig");
-const stream_agent = @import("stream/agent.zig");
 const terminal = @import("tty/terminal.zig");
 const transport_ssh = @import("transport/ssh.zig");
 
@@ -39,25 +37,20 @@ fn runMain() !void {
 
     if (args.len == 1) return usage(0);
 
-    if (std.mem.eql(u8, args[1], ":internal-session-agent:")) {
-        const agent_args = args[2..];
-        if (agent_args.len != 2 or !std.mem.eql(u8, agent_args[0], "--session-dir")) {
-            try io.writeAll(2, "sessh: :internal-session-agent: requires --session-dir DIR\n");
-            return process_exit.request(64);
-        }
-        return session_agent.runSessionAgent(agent_args[1]);
+    if (std.mem.eql(u8, args[1], ":internal-daemon:")) {
+        return daemon.run(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-session-broker:")) {
-        return session_broker.run(allocator, args[0], args[2..]);
+        if (args.len != 2) {
+            try io.writeAll(2, "sessh: :internal-session-broker: does not accept command arguments\n");
+            return process_exit.request(64);
+        }
+        return daemon.forwardStdioToDaemon(allocator, args[0]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-stream-broker:")) {
-        return stream_agent.runBroker(allocator, args[0], args[2..]);
-    }
-
-    if (std.mem.eql(u8, args[1], ":internal-stream-agent:")) {
-        return stream_agent.runAgent(allocator, args[0], args[2..]);
+        return daemon.forwardStreamBrokerToDaemon(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-proxy-stream:")) {
@@ -70,6 +63,7 @@ fn runMain() !void {
         return;
     }
 
+    try daemon.ensureStarted(allocator, args[0]);
     return transport_ssh.run(allocator, args);
 }
 
@@ -162,6 +156,7 @@ test {
     _ = @import("core/io.zig");
     _ = @import("core/process_exit.zig");
     _ = @import("core/shell.zig");
+    _ = @import("daemon/mod.zig");
     _ = @import("protocol/mod.zig");
     _ = @import("reconnect/control.zig");
     _ = @import("reconnect/mod.zig");

@@ -783,27 +783,47 @@ const ProxyEndpoint = struct {
     }
 };
 
-/// The stream broker is bound to one ssh transport. It connects that transport
-/// to the durable stream agent socket for the stream GUID, starting the agent
-/// when needed, then forwards bytes between ssh stdio and the agent socket.
-/// Stream brokers use `p-` GUIDs, but their durable sockets are still agent
-/// sockets under `a/`.
-pub fn runBroker(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+pub fn clientOpenProxyStreamFromBrokerArgs(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+) !pb.ClientOpenProxyStream {
     var config = try parseStreamAgentConfig(allocator, args);
     defer config.deinit(allocator);
-
-    var socket_paths = try session_registry.runtimeAgentSocketPathsForGuid(allocator, config.guid);
-    defer socket_paths.deinit(allocator);
-
-    const fd = try connectOrStartAgent(allocator, exe, args, socket_paths.socket);
-    defer _ = c.close(fd);
-    try forwardRawDuplex(0, 1, fd);
+    return .{
+        .guid = config.guid,
+        .proxy_host = try allocator.dupe(u8, config.proxy_host.?),
+        .proxy_port = @intCast(config.proxy_port),
+    };
 }
 
-pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+pub fn serveProxyStreamOpen(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    request: pb.ClientOpenProxyStream,
+    fd: c.fd_t,
+) !void {
+    if (!session_registry.isValidProxyGuid(request.guid)) return error.InvalidStreamGuid;
+    if (request.proxy_port == 0 or request.proxy_port > std.math.maxInt(u16)) return error.InvalidStreamArgs;
+
+    var socket_paths = try session_registry.runtimeAgentSocketPathsForGuid(allocator, request.guid);
+    defer socket_paths.deinit(allocator);
+
+    const agent_fd = try connectOrStartProxyAgent(
+        allocator,
+        exe,
+        request.guid,
+        request.proxy_host,
+        @intCast(request.proxy_port),
+        socket_paths.socket,
+    );
+    defer _ = c.close(agent_fd);
+    try forwardRawDuplex(fd, fd, agent_fd);
+}
+
+fn runProxyWorker(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     _ = exe;
     if (args.len != 8) {
-        try io.writeAll(2, "sessh: :internal-stream-agent: requires GUID SOCKET MODE ROWS COLS HOST PORT -\n");
+        try io.writeAll(2, "sessh: proxy stream worker requires GUID SOCKET MODE ROWS COLS HOST PORT -\n");
         return error.InvalidStreamArgs;
     }
     const socket_path = args[1];
@@ -860,7 +880,7 @@ fn waitForReplacementWhileDetached(
     options: *const StreamAttachedClientOptions,
 ) !c.fd_t {
     while (true) {
-        // The stream agent is durable even when no ssh transport is currently
+        // The proxy stream runtime is durable even when no ssh transport is currently
         // attached. It must keep draining remote fds into the offset-tracked
         // buffers; otherwise the remote TCP peer can block before a
         // replacement transport attaches.
@@ -1424,7 +1444,7 @@ fn abortTransport(transport: anytype) void {
     }
 }
 
-fn forwardRawDuplex(left_read_fd: c.fd_t, left_write_fd: c.fd_t, right_fd: c.fd_t) !void {
+pub fn forwardRawDuplex(left_read_fd: c.fd_t, left_write_fd: c.fd_t, right_fd: c.fd_t) !void {
     var left_open = true;
     var right_open = true;
     while (left_open or right_open) {
@@ -1505,36 +1525,18 @@ fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) !ReadSomeResult {
     return readSome(fd, buf);
 }
 
-fn connectOrStartAgent(
+fn connectOrStartProxyAgent(
     allocator: std.mem.Allocator,
     exe: []const u8,
-    agent_args: []const []const u8,
+    guid: []const u8,
+    proxy_host: []const u8,
+    proxy_port: u16,
     socket_path: []const u8,
 ) !c.fd_t {
+    _ = exe;
     if (socket_transport.connectSocket(socket_path)) |fd| return fd else |_| {}
 
-    if (agent_args.len != 7) return error.InvalidStreamArgs;
-    const argv = [_][]const u8{
-        exe,
-        ":internal-stream-agent:",
-        agent_args[0],
-        socket_path,
-        agent_args[1],
-        agent_args[2],
-        agent_args[3],
-        agent_args[4],
-        agent_args[5],
-        agent_args[6],
-    };
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    // The durable agent outlives this ssh channel, so it must not inherit the
-    // channel's stdio fds. Otherwise the local client can wait forever for an
-    // already-dead transport to close.
-    child.stderr_behavior = .Ignore;
-    child.pgid = 0;
-    try child.spawn();
+    try startProxyAgentThread(allocator, guid, socket_path, proxy_host, proxy_port);
 
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
@@ -1542,6 +1544,67 @@ fn connectOrStartAgent(
         io.sleepMillis(20);
     }
     return error.StreamAgentDidNotStart;
+}
+
+const ProxyAgentThreadContext = struct {
+    allocator: std.mem.Allocator,
+    guid: []u8,
+    socket_path: []u8,
+    proxy_host: []u8,
+    proxy_port: u16,
+};
+
+fn startProxyAgentThread(
+    allocator: std.mem.Allocator,
+    guid: []const u8,
+    socket_path: []const u8,
+    proxy_host: []const u8,
+    proxy_port: u16,
+) !void {
+    const context = try allocator.create(ProxyAgentThreadContext);
+    errdefer allocator.destroy(context);
+    context.* = .{
+        .allocator = allocator,
+        .guid = try allocator.dupe(u8, guid),
+        .socket_path = undefined,
+        .proxy_host = undefined,
+        .proxy_port = proxy_port,
+    };
+    errdefer allocator.free(context.guid);
+    context.socket_path = try allocator.dupe(u8, socket_path);
+    errdefer allocator.free(context.socket_path);
+    context.proxy_host = try allocator.dupe(u8, proxy_host);
+    errdefer allocator.free(context.proxy_host);
+
+    const thread = try std.Thread.spawn(.{}, proxyAgentThreadMain, .{context});
+    thread.detach();
+}
+
+fn proxyAgentThreadMain(context: *ProxyAgentThreadContext) void {
+    const allocator = context.allocator;
+    defer {
+        allocator.free(context.guid);
+        allocator.free(context.socket_path);
+        allocator.free(context.proxy_host);
+        allocator.destroy(context);
+    }
+
+    const encoded_proxy_host = encodeCommandArg(allocator, context.proxy_host) catch return;
+    defer allocator.free(encoded_proxy_host);
+    const proxy_port_arg = std.fmt.allocPrint(allocator, "{}", .{context.proxy_port}) catch return;
+    defer allocator.free(proxy_port_arg);
+
+    const args = [_][]const u8{
+        context.guid,
+        context.socket_path,
+        "proxy",
+        "1",
+        "1",
+        encoded_proxy_host,
+        proxy_port_arg,
+        "-",
+    };
+    runProxyWorker(allocator, "", args[0..]) catch {};
 }
 
 fn parseStreamAgentConfig(allocator: std.mem.Allocator, args: []const []const u8) !StreamAgentConfig {
@@ -1587,6 +1650,13 @@ fn decodeCommandArg(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
     const out = try allocator.alloc(u8, len);
     errdefer allocator.free(out);
     try std.base64.standard.Decoder.decode(out, value);
+    return out;
+}
+
+fn encodeCommandArg(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(value.len));
+    errdefer allocator.free(out);
+    _ = std.base64.standard.Encoder.encode(out, value);
     return out;
 }
 

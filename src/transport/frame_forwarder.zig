@@ -6,6 +6,12 @@ const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 
 pub fn forwardFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, agent_fd: c.fd_t) !void {
+    defer {
+        _ = c.shutdown(stdin_fd, c.SHUT.WR);
+        if (stdout_fd != stdin_fd) _ = c.shutdown(stdout_fd, c.SHUT.WR);
+        _ = c.shutdown(agent_fd, c.SHUT.WR);
+    }
+
     var pollfds = [_]posix.pollfd{
         .{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = agent_fd, .events = posix.POLL.IN, .revents = 0 },

@@ -278,7 +278,7 @@ pub const RuntimeSession = struct {
     ended_process_exit_code: ?u8 = null,
     /// Local-only fallback for the terminal title while this session is active.
     /// For remote sessh this is the host string the user passed locally. We do
-    /// not send it to the session agent because ssh aliases can reveal local
+    /// not send it to the remote session runtime because ssh aliases can reveal local
     /// naming that the remote machine would not otherwise know.
     title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
     title_fallback_len: usize = 0,
@@ -1847,7 +1847,7 @@ fn showEscapeHelpModal(
 ) !?AttachedClientEnd {
     // The help overlay is local UI, not part of the remote terminal model. While
     // it is visible, remote draw frames are discarded and a repaint is requested
-    // after dismissal so the client resumes from the session agent's latest
+    // after dismissal so the client resumes from the remote session runtime's latest
     // screen state.
     const renderer = client_renderer.Renderer.init(1);
     var overlay_state: ?client_ui.OverlayDrawState = null;

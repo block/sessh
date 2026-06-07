@@ -48,6 +48,8 @@ INPUT_ACK = "te_input_ack"
 SESSION_CLIENT_CONTROL_RESPONSE = "te_session_client_control_response"
 SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST = "te_session_client_debug_sever_connection_request"
 SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST = "te_session_client_debug_unresponsive_connection_request"
+PING = "ping"
+PONG = "pong"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -69,6 +71,8 @@ _FRAME_FIELDS = {
     SESSION_CLIENT_CONTROL_RESPONSE: SESSION_CLIENT_CONTROL_RESPONSE,
     SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
     SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST: SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST,
+    PING: PING,
+    PONG: PONG,
 }
 
 
@@ -716,41 +720,15 @@ def agent_log_file(env, session_id=None):
 
 
 def socket_path(env, session_id=None):
-    link = agent_sock_link_path(env, session_id)
-    if link.is_symlink():
-        return (link.parent / os.readlink(link)).resolve()
-    return actual_socket_path(env, session_id)
-
-
-def actual_socket_path(env, session_id=None):
-    if session_id is None:
-        session_id = test_session_guid(1)
-    return runtime_root(env) / "a" / compact_guid(guid_for_ref(session_id))
-
-
-def agent_sock_link_path(env, session_id=None):
-    return session_dir(env, session_id) / "agent.sock"
-
-
-def ensure_agent_socket_link(env, session_id=None):
-    if session_id is None:
-        session_id = test_session_guid(1)
-    path = session_dir(env, session_id)
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (runtime_root(env) / "a").mkdir(mode=0o700, parents=True, exist_ok=True)
-    link = path / "agent.sock"
-    if not link.exists() and not link.is_symlink():
-        link.symlink_to(Path("../../a") / compact_guid(guid_for_ref(session_id)))
+    _ = session_id
+    return runtime_root(env) / "d" / "sesshd.sock"
 
 
 def start_session_agent(env, session_id=None):
-    if session_id is None:
-        session_id = test_session_guid(1)
-    ensure_agent_socket_link(env, session_id)
+    _ = session_id
     path = socket_path(env, session_id)
-    session_path = session_dir(env, session_id)
     proc = subprocess.Popen(
-        [str(BIN), ":internal-session-agent:", "--session-dir", str(session_path)],
+        [str(BIN), ":internal-daemon:"],
         cwd=ROOT,
         env=env,
         stdin=subprocess.DEVNULL,
@@ -762,27 +740,17 @@ def start_session_agent(env, session_id=None):
 
 
 def session_agent_pids(env):
-    needle = f":internal-session-agent: --session-dir {sessions_dir(env)}"
-    result = subprocess.run(
-        ["ps", "-axo", "pid=,command="],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
     pids = []
-    for line in result.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        pid_text, _, command = stripped.partition(" ")
-        try:
-            pid = int(pid_text)
-        except ValueError:
-            continue
-        if needle in command:
-            pids.append(pid)
+    root = sessions_dir(env)
+    if root.exists():
+        for meta_file in sorted(root.glob("*/meta.json")):
+            try:
+                meta = json.loads(meta_file.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            pid = meta.get("agent_pid")
+            if isinstance(pid, int):
+                pids.append(pid)
     return pids
 
 
@@ -1012,6 +980,38 @@ def broker_hello(env, **kwargs):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=2.0)
+
+
+def run_daemon_ping_test(env):
+    proc = subprocess.Popen(
+        [str(BIN), ":internal-daemon:"],
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    socket_path = Path(env["XDG_RUNTIME_DIR"]) / "d" / "sesshd.sock"
+    try:
+        wait_file(socket_path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(5.0)
+            sock.connect(str(socket_path))
+            send_hello(sock)
+            send_frame(sock, PING, sessh_pb().Ping().SerializeToString())
+            message_type, payload = recv_frame(sock)
+            if message_type != PONG:
+                raise AssertionError(f"expected PONG from sesshd, got {message_type}")
+            pong = sessh_pb().Pong()
+            pong.ParseFromString(payload)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        cleanup_runtime(env)
 
 
 def run_minor_version_compatibility_test(base_env):
@@ -1245,46 +1245,6 @@ def run_session_ended_payload_protocol_test(base_env):
                 raise AssertionError(f"unexpected process exit status: {ended!r}")
             if not ended.HasField("ended_at_unix_ms"):
                 raise AssertionError(f"missing end timestamp: {ended!r}")
-        finally:
-            if conn is not None:
-                conn.close()
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=2.0)
-            cleanup_runtime(env)
-
-    with tempfile.TemporaryDirectory(prefix="sessh-session-ended-kill-", dir="/tmp") as tmp:
-        env = isolated_env(tmp)
-        shell = Path(tmp) / "kill-status-shell"
-        shell.write_text("#!/bin/sh\nprintf 'KILL_READY\\n'\nwhile :; do sleep 1; done\n")
-        shell.chmod(0o700)
-        env["SHELL"] = str(shell)
-        cleanup_runtime(env)
-        conn = None
-        proc = None
-        try:
-            proc = start_session_agent(env)
-            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            conn.settimeout(5.0)
-            conn.connect(str(socket_path(env)))
-            send_hello(conn)
-            send_resize(conn)
-            create_and_attach_session(conn, shell)
-            message_kind, payload = recv_frame(conn)
-            if message_kind != SESSION_ATTACHED:
-                raise AssertionError(f"expected SESSION_ATTACHED, got {message_kind}")
-            assert_session_attached(payload)
-            recv_draw_until(conn, b"KILL_READY")
-
-            os.kill(proc.pid, signal.SIGTERM)
-            ended = parse_session_ended(recv_until_message(conn, SESSION_ENDED))
-            pb = sessh_pb()
-            if ended.reason != pb.TE_SESSION_END_REASON_KILLED_BY_REQUEST:
-                raise AssertionError(f"unexpected killed reason: {ended!r}")
-            if ended.HasField("exit_status"):
-                raise AssertionError(f"killed-by-request should not report a wait status: {ended!r}")
-            if not ended.HasField("ended_at_unix_ms"):
-                raise AssertionError(f"missing killed timestamp: {ended!r}")
         finally:
             if conn is not None:
                 conn.close()
@@ -2394,8 +2354,8 @@ def run_screen_repaint_after_presentation_reset_clears_rows_test(base_env):
             cleanup_runtime(env)
 
 
-def run_session_agent_crash_client_error_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-agent-crash-", dir="/tmp") as tmp:
+def run_session_runtime_crash_client_error_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-runtime-crash-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         shell = Path(tmp) / "crash-shell"
         shell.write_text(
@@ -2417,15 +2377,15 @@ def run_session_agent_crash_client_error_test(base_env):
             output += read_until(fd, b"CRASH_UI_READY")
             pids = session_agent_pids(env)
             if len(pids) != 1:
-                raise AssertionError(f"expected one session agent, found {pids}")
+                raise AssertionError(f"expected one session runtime, found {pids}")
 
             os.kill(pids[0], signal.SIGKILL)
-            output += read_until(fd, b"sessh: session agent crashed", timeout=5.0)
-            if b"session agent crashed" not in output:
+            output += read_until(fd, b"sessh: ssh runtime attach failed", timeout=5.0)
+            if b"ssh runtime attach failed" not in output:
                 raise AssertionError(output)
             alt_leave = output.rfind(b"\x1b[?1049l")
             if alt_leave < 0:
-                raise AssertionError(f"agent crash did not leave alternate screen: {output!r}")
+                raise AssertionError(f"runtime crash did not leave alternate screen: {output!r}")
             final_cleanup = output[alt_leave:]
             for seq in (b"\x1b[?1000l", b"\x1b[?1006l", b"\x1b[?1004l", b"\x1b[?2004l", b"\x1b[0 q"):
                 if seq not in final_cleanup:
@@ -2442,127 +2402,7 @@ def run_session_agent_crash_client_error_test(base_env):
             cleanup_runtime(env)
 
 
-def run_session_agent_registry_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-agent-registry-", dir="/tmp") as tmp:
-        env = isolated_env(tmp)
-        env["SESSH_TEST_RUNTIME_REFRESH_MS"] = "50"
-        shell = Path(tmp) / "agent-shell"
-        shell.write_text(
-            "#!/bin/sh\n"
-            "printf 'AGENT_READY\\n'\n"
-            "while IFS= read -r line; do\n"
-            "  if [ \"$line\" = exit ]; then exit 0; fi\n"
-            "  printf 'AGENT:%s\\n' \"$line\"\n"
-            "done\n"
-        )
-        shell.chmod(0o700)
-
-        session_42_guid = test_session_guid(42)
-        session_path = session_dir(env, session_42_guid)
-        ensure_agent_socket_link(env, session_42_guid)
-        socket_file = socket_path(env, session_42_guid)
-        socket_link = agent_sock_link_path(env, session_42_guid)
-        meta_file = session_path / "meta.json"
-        compat_file = session_path / "compat"
-
-        proc = subprocess.Popen(
-            [str(BIN), ":internal-session-agent:", "--session-dir", str(session_path)],
-            cwd=ROOT,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        conn = None
-        attach = None
-        rescued_attach = None
-        try:
-            wait_file(socket_file)
-            wait_file(meta_file)
-            wait_file(compat_file)
-            wait_sticky(session_path)
-            wait_sticky(socket_file)
-            wait_sticky(meta_file)
-            if not socket_link.is_symlink():
-                raise AssertionError("session agent socket link is not a symlink")
-            meta = json.loads(meta_file.read_text())
-            if meta.get("agent_pid") != proc.pid or meta.get("version") != sessh_version():
-                raise AssertionError(meta)
-            if not os.path.islink(compat_file):
-                raise AssertionError("session compat path is not a symlink")
-
-            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            conn.settimeout(5.0)
-            conn.connect(str(socket_file))
-            send_hello(conn)
-            send_resize(conn, rows=4, cols=40)
-            create_and_attach_session(conn, shell, session_id=session_42_guid)
-            message_type, payload = recv_frame(conn)
-            if message_type != SESSION_ATTACHED:
-                raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-            assert_session_attached(payload)
-            recv_draw_until(conn, b"AGENT_READY")
-
-            # Remove only the runtime artifacts the agent is responsible for
-            # recreating. Recursively deleting the runtime root races the
-            # repair thread: it can recreate a child while the test is still
-            # walking the parent directory.
-            for path in (socket_file, socket_link, meta_file, compat_file):
-                unlink_existing(path)
-
-            send_frame(conn, INPUT, pack_bytes(b"old-client\n"))
-            recv_draw_until(conn, b"AGENT:old-client")
-
-            wait_file(socket_file, timeout=10.0)
-            wait_file(meta_file, timeout=10.0)
-            wait_file(compat_file, timeout=10.0)
-            wait_sticky(session_path, timeout=10.0)
-            wait_sticky(socket_file, timeout=10.0)
-            wait_sticky(meta_file, timeout=10.0)
-            if not socket_link.is_symlink():
-                raise AssertionError("session agent did not recreate socket link")
-
-            rescued_attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            rescued_attach.settimeout(5.0)
-            rescued_attach.connect(str(socket_file))
-            send_hello(rescued_attach)
-            send_resize(rescued_attach, rows=4, cols=40)
-            send_frame(rescued_attach, SESSION_ATTACH, pack_session_attach(session_ref=session_42_guid))
-            message_type, payload = recv_frame(rescued_attach)
-            if message_type != SESSION_ATTACHED:
-                raise AssertionError(f"expected SESSION_ATTACHED after runtime resurrection, got {message_type}")
-            assert_session_attached(payload)
-            send_frame(rescued_attach, INPUT, pack_bytes(b"new-client\n"))
-            recv_draw_until(rescued_attach, b"AGENT:new-client")
-            send_frame(rescued_attach, INPUT, pack_bytes(b"exit\n"))
-            recv_until_message(rescued_attach, SESSION_ENDED)
-            rescued_attach.close()
-            rescued_attach = None
-
-            conn.close()
-            conn = None
-            proc.wait(timeout=5.0)
-            wait_missing(socket_file)
-            wait_missing(socket_link)
-            wait_missing(compat_file)
-            wait_missing(session_path)
-        finally:
-            if conn is not None:
-                conn.close()
-            if attach is not None:
-                attach.close()
-            if rescued_attach is not None:
-                rescued_attach.close()
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2.0)
-
-
-def run_broker_starts_session_agent_test(base_env):
+def run_broker_starts_daemon_session_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-broker-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         shell = Path(tmp) / "broker-shell"
@@ -2597,12 +2437,13 @@ def run_broker_starts_session_agent_test(base_env):
 
             session_1_guid = test_session_guid(1)
             session_path = session_dir(env, session_1_guid)
-            if not agent_sock_link_path(env, session_1_guid).is_symlink():
-                raise AssertionError("broker did not create a session-agent socket link")
-            if not socket_path(env, session_1_guid).exists():
-                raise AssertionError("broker did not create a session-agent socket")
+            meta_file = session_path / "meta.json"
+            wait_file(meta_file)
+            meta = json.loads(meta_file.read_text())
+            if meta.get("type") != "local-session" or meta.get("version") != sessh_version():
+                raise AssertionError(meta)
             if not os.path.islink(session_path / "compat"):
-                raise AssertionError("broker session agent did not write compat symlink")
+                raise AssertionError("broker session did not write compat symlink")
             assert_runtime_dir_symlink(env, Path(env["XDG_RUNTIME_DIR"]))
 
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
@@ -2611,8 +2452,6 @@ def run_broker_starts_session_agent_test(base_env):
             proc.wait(timeout=5.0)
             if proc.returncode != 0:
                 raise AssertionError(proc.stderr.read().decode("utf-8", "replace"))
-            wait_missing(socket_path(env, session_1_guid))
-            wait_missing(agent_sock_link_path(env, session_1_guid))
             wait_missing(session_path / "compat")
             wait_missing(session_path)
         finally:
@@ -2745,11 +2584,11 @@ def main():
                     raise AssertionError(sessh_short_version_text)
 
             run_login_shell_profile_test(env)
+            run_daemon_ping_test(env)
             run_session_create_command_argv_test(env)
             run_session_create_shell_command_test(env)
             run_session_create_tty_settings_test(env)
-            run_session_agent_registry_test(env)
-            run_broker_starts_session_agent_test(env)
+            run_broker_starts_daemon_session_test(env)
             run_minor_version_compatibility_test(env)
             run_live_draw_protocol_test(env)
             run_synchronized_output_protocol_test(env)

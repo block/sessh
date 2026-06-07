@@ -76,7 +76,7 @@ native behavior: primary scrollback is hidden, wheel scrolling does not browse
 the primary history, and alternate-screen contents do not become primary
 scrollback.
 
-We still keep our own model of both screens. The session agent saves the
+We still keep our own model of both screens. Remote `sesshd` saves the
 outer-primary cursor/grid state before switching buffers, draws the modeled
 alternate screen in the outer alternate buffer, and sends the client a cleanup
 payload that leaves the outer alternate screen and restores the modeled primary

@@ -3,7 +3,7 @@ const config = @import("../core/config.zig");
 const ghostty_vt = @import("ghostty-vt");
 
 /// Boundary module for Ghostty's terminal emulator. Keep upstream API usage
-/// concentrated here as we learn which state the session agent needs to serialize.
+/// concentrated here as we learn which state the remote session runtime needs to serialize.
 pub const Terminal = ghostty_vt.Terminal;
 pub const RenderState = ghostty_vt.RenderState;
 const TerminalStream = ghostty_vt.Stream(ModelTrackingHandler);
@@ -27,7 +27,7 @@ pub const DisplayClear = struct {
     protected: bool,
 };
 
-// A render barrier is an ordered terminal transition that the session agent
+// A render barrier is an ordered terminal transition that the remote session runtime
 // must see before libghostty-vt mutates the model. The current use is
 // alternate-screen enter/exit: output before the transition belongs to one
 // screen buffer, and output after it belongs to another.
@@ -1793,7 +1793,7 @@ test "session terminal answers complex UI startup probes to the PTY" {
     try std.testing.expect(std.mem.indexOf(u8, responses, "\x1bP1$r0m\x1b\\") != null);
 }
 
-test "session terminal can drain query responses after session agent writes them" {
+test "session terminal can drain query responses after remote session runtime writes them" {
     const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
     defer terminal.destroy();
 

@@ -28,8 +28,8 @@ DSCP setting for the host as configured, then pass
 If the connection dies, the client will attempt a new connection, retrying
 failed reconnections with exponential backoff.
 
-The session agent ACKs client input. After a timeout, if the client doesn't see
-*any* messages from the session agent when there is unacknowledged input, then
+Remote `sesshd` ACKs client input. After a timeout, if the client doesn't see
+*any* messages from the remote session runtime when there is unacknowledged input, then
 the client will consider the connection unresponsive.
 
 When the client detects that the connection is unresponsive it will attempt a

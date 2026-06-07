@@ -45,7 +45,18 @@ message Frame {
     ProxyControlCapabilities proxy_control_capabilities = 48;
     ProxyControlDiagnostic proxy_control_diagnostic = 49;
     ProxyControlCtrlR proxy_control_ctrl_r = 50;
+    ClientOpenProxyStream client_open_proxy_stream = 51;
   }
+}
+
+// Framed payload, stream-broker shim -> local sesshd.
+//
+// This opens or reattaches a durable opaque proxy stream. After sesshd accepts
+// this request, the same socket carries ProxyStream* frames for that stream.
+message ClientOpenProxyStream {
+  string guid = 1;
+  string proxy_host = 2;
+  uint32 proxy_port = 3;
 }
 
 // Sent at the start of every ssh transport that carries an opaque proxy stream.
@@ -191,7 +202,7 @@ message TeShellCommand {
   string command = 1;
 }
 
-// Framed payload, client -> session agent.
+// Framed payload, client -> remote session runtime.
 //
 // Creates a new interactive PTY session and attaches this client. A successful
 // TeSessionCreate is followed by TeSessionAttached for the new session, then
@@ -201,9 +212,10 @@ message TeSessionCreate {
   TeResize resize = 1;
   // Maximum session-agent-retained scrollback rows for this session.
   uint32 scrollback_row_limit = 2;
-  // Session environment entries. Currently SHELL is the only used key.
+  // Environment entries to apply to the PTY child. Entries already present in
+  // the request take precedence over environment inherited by the broker.
   repeated TeEnvironmentEntry environment = 3;
-  // Colors the session agent may use to answer early OSC 10/11 queries.
+  // Colors the remote session runtime may use to answer early OSC 10/11 queries.
   TeDefaultColors query_default_colors = 4;
   // Canonical session GUID in s-prefixed hyphenated UUID form, e.g.
   // s-550e8400-e29b-41d4-a716-446655440000.
@@ -221,12 +233,12 @@ message TeSessionCreate {
   // Maximum time the session may remain detached before the agent ends it.
   // Zero means disabled.
   uint64 reap_ms = 11;
-  // When true, the session agent sends raw inner PTY transcript chunks for this
+  // When true, the remote session runtime sends raw inner PTY transcript chunks for this
   // attached client. The client still owns archive creation and storage.
   bool capture_tty_transcript = 13;
 }
 
-// Framed payload, client -> session agent.
+// Framed payload, client -> remote session runtime.
 //
 // Attaches to an existing session. A successful TeSessionAttach is followed by
 // TeSessionAttached for the selected session, then TeDraw/TeRepaintResponse messages.
@@ -234,7 +246,7 @@ message TeSessionAttach {
   TeResize resize = 1;
   // Session GUID or compact session GUID. Required unless session_dir is set.
   string session_ref = 2;
-  // When true, the session agent sends raw inner PTY transcript chunks for
+  // When true, the remote session runtime sends raw inner PTY transcript chunks for
   // this attached client. The client still owns archive creation and storage.
   bool capture_tty_transcript = 3;
   // Absolute path to the selected session GUID directory. This is used for
@@ -243,51 +255,51 @@ message TeSessionAttach {
   string session_dir = 5;
 }
 
-// Framed payload, client -> session agent.
+// Framed payload, client -> remote session runtime.
 //
 // Local terminal input bytes.
 message TeInput {
   // Raw bytes read from the local terminal.
   bytes data = 1;
-  // Client-assigned input sequence. The session agent acknowledges nonzero
+  // Client-assigned input sequence. The remote session runtime acknowledges nonzero
   // sequence numbers after receiving the input frame.
   uint64 input_seq = 2;
 }
 
-// Framed payload, session agent -> client.
+// Framed payload, remote session runtime -> client.
 //
-// Confirms that the session agent received a TeInput frame.
+// Confirms that the remote session runtime received a TeInput frame.
 message TeInputAck {
   uint64 input_seq = 1;
 }
 
-// Framed payload, client -> session agent.
+// Framed payload, client -> remote session runtime.
 //
 // Current terminal size for this attached client.
 message TeResize {
-  // Rows visible in the local terminal. The session agent bounds this to u16.
+  // Rows visible in the local terminal. The remote session runtime bounds this to u16.
   uint32 terminal_rows = 1;
-  // Columns visible in the local terminal. The session agent bounds this to u16.
+  // Columns visible in the local terminal. The remote session runtime bounds this to u16.
   uint32 terminal_cols = 2;
   // Present for resize frames after attach and for embedded TeSessionAttach
-  // resizes. The session agent applies the new size, then answers this request
+  // resizes. The remote session runtime applies the new size, then answers this request
   // with a TeRepaintResponse.
   optional TeRepaintRequest repaint_request = 3;
   // Rows between the outer terminal viewport top and the sessh viewport top.
   // Omitted means the viewports are aligned. -1 means the client no longer
   // knows the offset, typically after SIGWINCH resized an unaligned viewport;
-  // the session agent must align the viewports in its repaint response.
+  // the remote session runtime must align the viewports in its repaint response.
   optional sint32 viewport_offset = 4;
 }
 
-// Framed payload, client -> session agent.
+// Framed payload, client -> remote session runtime.
 //
-// Requests that the session agent redraw terminal state for this attached client.
+// Requests that the remote session runtime redraw terminal state for this attached client.
 message TeRepaintRequest {
   // Client-local repaint request sequence copied into TeRepaintResponse. While
   // this repaint is outstanding, the client ignores framed TeDraw messages and
   // resumes applying draws only after receiving the matching TeRepaintResponse.
-  // If multiple TeRepaintRequests are in flight, the session agent may ignore all
+  // If multiple TeRepaintRequests are in flight, the remote session runtime may ignore all
   // but the last one.
   uint64 repaint_request_seq = 1;
   // Opaque scrollback cursor. Absent means assume the client has current
@@ -300,7 +312,7 @@ message TeRepaintRequest {
   optional uint32 initial_scrollback_rows = 3;
 }
 
-// Framed payload, session agent -> client.
+// Framed payload, remote session runtime -> client.
 //
 // Confirms the session selected for this connection.
 message TeSessionAttached {
@@ -310,12 +322,12 @@ message TeSessionAttached {
   string session_dir = 3;
 }
 
-// Framed payload, broker/client -> session agent.
+// Framed payload, broker/client -> remote session runtime.
 //
 // Debug-only request that severs all attached client connections.
 message TeSessionClientDebugSeverConnectionRequest {}
 
-// Framed payload, broker/client -> session agent.
+// Framed payload, broker/client -> remote session runtime.
 //
 // Debug-only request that makes all attached client connections stop responding
 // for a bounded duration. Omitted or zero seconds asks the receiver to use its
@@ -324,7 +336,7 @@ message TeSessionClientDebugUnresponsiveConnectionRequest {
   uint32 seconds = 1;
 }
 
-// Framed payload, session agent -> broker/client.
+// Framed payload, remote session runtime -> broker/client.
 //
 // Confirms that a debug client-control request was accepted.
 message TeSessionClientControlResponse {}
@@ -350,18 +362,18 @@ message ExitStatus {
   sint32 status = 2;
 }
 
-// Framed payload, session agent -> client.
+// Framed payload, remote session runtime -> client.
 //
 // Tells an attached client that the session has ended.
 message TeSessionEnded {
   TeSessionEndReason reason = 1;
-  // Absent means the session agent did not observe a wait status, for example
+  // Absent means the remote session runtime did not observe a wait status, for example
   // because it is shutting down and synthesized the end notification.
   optional ExitStatus exit_status = 2;
   optional uint64 ended_at_unix_ms = 3;
 }
 
-// Framed payload, session agent -> client.
+// Framed payload, remote session runtime -> client.
 //
 // Session-agent-generated terminal bytes for the attached session.
 message TeDraw {
@@ -384,13 +396,13 @@ message TeDraw {
   // string. False means no app title is known. The client needs this bit so a
   // temporary local title such as reconnect status can be restored correctly:
   // use the app title when present, otherwise use a client-local fallback. Do
-  // not send that fallback to the session agent. It may contain the user's
+  // not send that fallback to the remote session runtime. It may contain the user's
   // local ssh alias or other client-private naming for the remote host, which
   // ssh does not normally reveal to the remote side.
   optional bool app_title_present = 5;
 }
 
-// Framed payload, session agent -> client.
+// Framed payload, remote session runtime -> client.
 //
 // Response for a TeRepaintRequest. The embedded TeDraw is applied exactly like a
 // framed TeDraw.
@@ -405,7 +417,7 @@ enum TeTtyTranscriptStream {
   TE_TTY_TRANSCRIPT_STREAM_INNER_OUT = 2;
 }
 
-// Framed payload, session agent -> client.
+// Framed payload, remote session runtime -> client.
 //
 // Raw inner PTY bytes captured for a client-requested tty transcript.
 message TeTtyTranscriptChunk {
