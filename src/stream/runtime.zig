@@ -3,6 +3,7 @@ const c = std.c;
 const posix = std.posix;
 
 const io = @import("../core/io.zig");
+const app_allocator = @import("../core/app_allocator.zig");
 const protocol = @import("../protocol/mod.zig");
 const client_log = @import("../core/client_log.zig");
 const proxy_control = @import("proxy_control.zig");
@@ -10,7 +11,6 @@ const reconnect_control = @import("../reconnect/control.zig");
 const reconnect = @import("../reconnect/mod.zig");
 const reconnect_title = @import("../reconnect/title.zig");
 const session_registry = @import("../runtime/session_registry.zig");
-const socket_transport = @import("../transport/socket.zig");
 const terminal = @import("../tty/terminal.zig");
 const pb = protocol.pb;
 
@@ -167,6 +167,58 @@ const StreamSink = struct {
     shutdown_on_eof: bool = false,
 };
 
+const ProxyRuntimeControl = struct {
+    allocator: std.mem.Allocator,
+    guid: []u8,
+    notify_read_fd: c.fd_t,
+    notify_write_fd: c.fd_t,
+    pending_mutex: std.Thread.Mutex = .{},
+    pending_clients: std.ArrayList(c.fd_t) = .empty,
+    closed: bool = false,
+
+    fn enqueue(self: *ProxyRuntimeControl, fd: c.fd_t) !void {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        if (self.closed) return error.StreamNotFound;
+        try self.pending_clients.append(self.allocator, fd);
+        var byte = [_]u8{1};
+        const n = c.write(self.notify_write_fd, &byte, byte.len);
+        if (n < 0 or @as(usize, @intCast(n)) != byte.len) {
+            _ = self.pending_clients.pop();
+            return error.RuntimeNotifyFailed;
+        }
+    }
+
+    fn takePending(self: *ProxyRuntimeControl) ?c.fd_t {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        if (self.pending_clients.items.len == 0) return null;
+        return self.pending_clients.orderedRemove(0);
+    }
+
+    fn close(self: *ProxyRuntimeControl) void {
+        self.pending_mutex.lock();
+        self.closed = true;
+        while (self.pending_clients.items.len > 0) {
+            const fd = self.pending_clients.pop().?;
+            _ = c.close(fd);
+        }
+        self.pending_mutex.unlock();
+    }
+
+    fn deinit(self: *ProxyRuntimeControl) void {
+        self.close();
+        self.pending_clients.deinit(self.allocator);
+        if (self.notify_read_fd >= 0) _ = c.close(self.notify_read_fd);
+        if (self.notify_write_fd >= 0) _ = c.close(self.notify_write_fd);
+        self.allocator.free(self.guid);
+        self.* = undefined;
+    }
+};
+
+var proxy_runtime_registry_mutex = std.Thread.Mutex{};
+var proxy_runtime_registry: std.ArrayList(*ProxyRuntimeControl) = .empty;
+
 fn sinkWithFd(stdin_fd: c.fd_t, close_fd_on_eof: ?*c.fd_t) StreamSink {
     return .{
         .fd = stdin_fd,
@@ -180,7 +232,7 @@ const StreamAttachedClientOptions = struct {
     reconnect_status: ?*StreamReconnectStatus = null,
     control_fd: c.fd_t = -1,
     control_input: ?*StreamInputControl = null,
-    replacement_listen_fd: ?c.fd_t = null,
+    replacement_control: ?*ProxyRuntimeControl = null,
     close_outbound_on_inbound_eof: bool = false,
 };
 
@@ -344,9 +396,9 @@ const StreamAttachedClient = struct {
         }
 
         var replacement_index: ?usize = null;
-        if (self.options.replacement_listen_fd) |listen_fd| {
+        if (self.options.replacement_control) |control| {
             replacement_index = count;
-            pollfds[count] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
+            pollfds[count] = .{ .fd = control.notify_read_fd, .events = posix.POLL.IN, .revents = 0 };
             count += 1;
         }
 
@@ -384,9 +436,10 @@ const StreamAttachedClient = struct {
 
         if (replacement_index) |index| {
             if ((pollfds[index].revents & posix.POLL.IN) != 0) {
-                const fd = c.accept(pollfds[index].fd, null, null);
-                if (fd < 0) return error.AcceptFailed;
-                return .{ .replacement = fd };
+                if (self.options.replacement_control) |control| {
+                    drainNotify(control.notify_read_fd);
+                    if (control.takePending()) |fd| return .{ .replacement = fd };
+                }
             }
         }
         if (interrupt_index) |index| {
@@ -532,6 +585,25 @@ fn setCloseOnExec(fd: c.fd_t) !void {
     const close_on_exec_flag = @as(c_int, @intCast(c.FD_CLOEXEC));
     if ((flags & close_on_exec_flag) != 0) return;
     if (c.fcntl(fd, c.F.SETFD, flags | close_on_exec_flag) < 0) return error.FcntlFailed;
+}
+
+fn createNotifyPipe() ![2]c.fd_t {
+    const notify_pipe = try createNotifyPipe();
+    return notify_pipe;
+}
+
+fn drainNotify(fd: c.fd_t) void {
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const n = c.read(fd, &buf, buf.len);
+        if (n > 0) continue;
+        if (n == 0) return;
+        switch (posix.errno(n)) {
+            .INTR => continue,
+            .AGAIN => return,
+            else => return,
+        }
+    }
 }
 
 const LocalStreamInterrupt = struct {
@@ -745,13 +817,13 @@ const StreamMode = enum {
     proxy,
 };
 
-const StreamAgentConfig = struct {
+const StreamRuntimeConfig = struct {
     guid: []const u8,
     mode: StreamMode,
     proxy_host: ?[]u8,
     proxy_port: u16 = 0,
 
-    fn deinit(self: *StreamAgentConfig, allocator: std.mem.Allocator) void {
+    fn deinit(self: *StreamRuntimeConfig, allocator: std.mem.Allocator) void {
         if (self.proxy_host) |host| allocator.free(host);
         self.* = undefined;
     }
@@ -769,14 +841,14 @@ const ProxyEndpoint = struct {
         };
     }
 
-    fn attachedClientOptions(self: *ProxyEndpoint, listen_fd: c.fd_t) StreamAttachedClientOptions {
+    fn attachedClientOptions(self: *ProxyEndpoint, control: *ProxyRuntimeControl) StreamAttachedClientOptions {
         return .{
             .source = .{ .fd = self.fd },
             .sink = .{
                 .fd = self.fd,
                 .shutdown_on_eof = true,
             },
-            .replacement_listen_fd = listen_fd,
+            .replacement_control = control,
         };
     }
 
@@ -793,7 +865,7 @@ pub fn clientOpenProxyStreamFromBrokerArgs(
     allocator: std.mem.Allocator,
     args: []const []const u8,
 ) !pb.ProxyStreamOpen {
-    var config = try parseStreamAgentConfig(allocator, args);
+    var config = try parseStreamRuntimeConfig(allocator, args);
     defer config.deinit(allocator);
     return .{
         .proxy_guid = config.guid,
@@ -811,43 +883,23 @@ pub fn serveProxyStreamOpen(
     if (!session_registry.isValidProxyGuid(request.proxy_guid)) return error.InvalidStreamGuid;
     if (request.proxy_port == 0 or request.proxy_port > std.math.maxInt(u16)) return error.InvalidStreamArgs;
 
-    var socket_paths = try session_registry.runtimeAgentSocketPathsForGuid(allocator, request.proxy_guid);
-    defer socket_paths.deinit(allocator);
-
-    const agent_fd = try connectOrStartProxyAgent(
+    const runtime = try connectOrStartProxyRuntime(
         allocator,
         exe,
         request.proxy_guid,
         request.proxy_host,
         @intCast(request.proxy_port),
-        socket_paths.socket,
     );
-    defer _ = c.close(agent_fd);
-    try forwardRawDuplex(fd, fd, agent_fd);
+    const runtime_fd = try connectProxyRuntime(runtime);
+    defer _ = c.close(runtime_fd);
+    try forwardRawDuplex(fd, fd, runtime_fd);
 }
 
-fn runProxyWorker(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
-    _ = exe;
-    if (args.len != 8) {
-        try io.writeAll(2, "sessh: proxy stream worker requires GUID SOCKET MODE ROWS COLS HOST PORT -\n");
-        return error.InvalidStreamArgs;
-    }
-    const socket_path = args[1];
-    var config = try parseStreamAgentConfig(allocator, &.{ args[0], args[2], args[3], args[4], args[5], args[6], args[7] });
-    defer config.deinit(allocator);
-
-    var socket_paths = try session_registry.runtimeAgentSocketPathsForGuid(allocator, config.guid);
-    defer {
-        socket_paths.removeRuntimeFiles();
-        socket_paths.deinit(allocator);
-    }
-    const listen_fd = try socket_transport.listenSocket(socket_path);
-    defer _ = c.close(listen_fd);
-
-    var endpoint = try startStreamEndpoint(allocator, config);
+fn runProxyRuntime(allocator: std.mem.Allocator, control: *ProxyRuntimeControl, proxy_host: []const u8, proxy_port: u16) !void {
+    var endpoint = try ProxyEndpoint.connect(allocator, proxy_host, proxy_port);
     defer endpoint.deinit();
 
-    var state = StreamState.init(allocator, config.guid);
+    var state = StreamState.init(allocator, control.guid);
     defer state.deinit();
 
     var attach_fd: c.fd_t = -1;
@@ -856,15 +908,15 @@ fn runProxyWorker(allocator: std.mem.Allocator, exe: []const u8, args: []const [
     }
     while (true) {
         if (attach_fd < 0) {
-            var detached_options = endpoint.attachedClientOptions(listen_fd);
-            attach_fd = try waitForReplacementWhileDetached(&state, listen_fd, &detached_options);
+            var detached_options = endpoint.attachedClientOptions(control);
+            attach_fd = try waitForReplacementWhileDetached(&state, control, &detached_options);
         }
 
         const outcome = try runAttachedStream(
             &state,
             attach_fd,
             attach_fd,
-            endpoint.attachedClientOptions(listen_fd),
+            endpoint.attachedClientOptions(control),
         );
         switch (outcome) {
             .complete => return,
@@ -882,7 +934,7 @@ fn runProxyWorker(allocator: std.mem.Allocator, exe: []const u8, args: []const [
 
 fn waitForReplacementWhileDetached(
     state: *StreamState,
-    listen_fd: c.fd_t,
+    control: *ProxyRuntimeControl,
     options: *const StreamAttachedClientOptions,
 ) !c.fd_t {
     while (true) {
@@ -892,8 +944,8 @@ fn waitForReplacementWhileDetached(
         // replacement transport attaches.
         var pollfds: [1 + 1]posix.pollfd = undefined;
         var count: usize = 0;
-        const listen_index = count;
-        pollfds[count] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
+        const replacement_index = count;
+        pollfds[count] = .{ .fd = control.notify_read_fd, .events = posix.POLL.IN, .revents = 0 };
         count += 1;
 
         var source_poll_index: ?usize = null;
@@ -905,10 +957,9 @@ fn waitForReplacementWhileDetached(
         }
 
         _ = try posix.poll(pollfds[0..count], -1);
-        if ((pollfds[listen_index].revents & posix.POLL.IN) != 0) {
-            const fd = c.accept(listen_fd, null, null);
-            if (fd < 0) return error.AcceptFailed;
-            return fd;
+        if ((pollfds[replacement_index].revents & posix.POLL.IN) != 0) {
+            drainNotify(control.notify_read_fd);
+            if (control.takePending()) |fd| return fd;
         }
 
         if (source_poll_index) |poll_index| {
@@ -1531,6 +1582,7 @@ pub fn forwardRawDuplex(left_read_fd: c.fd_t, left_write_fd: c.fd_t, right_fd: c
             if ((pollfds[poll_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
                 if (!copySomeOrClose(right_fd, left_write_fd)) {
                     right_open = false;
+                    _ = c.shutdown(left_write_fd, c.SHUT.WR);
                 }
             }
         }
@@ -1581,89 +1633,134 @@ fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) !ReadSomeResult {
     return readSome(fd, buf);
 }
 
-fn connectOrStartProxyAgent(
+fn connectOrStartProxyRuntime(
     allocator: std.mem.Allocator,
     exe: []const u8,
     guid: []const u8,
     proxy_host: []const u8,
     proxy_port: u16,
-    socket_path: []const u8,
-) !c.fd_t {
+) !*ProxyRuntimeControl {
     _ = exe;
-    if (socket_transport.connectSocket(socket_path)) |fd| return fd else |_| {}
+    const canonical = try session_registry.canonicalProxyGuid(allocator, guid);
+    defer allocator.free(canonical);
 
-    try startProxyAgentThread(allocator, guid, socket_path, proxy_host, proxy_port);
+    if (lookupProxyRuntime(canonical)) |control| return control;
 
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        if (socket_transport.connectSocket(socket_path)) |fd| return fd else |_| {}
-        io.sleepMillis(20);
-    }
-    return error.StreamAgentDidNotStart;
+    return startProxyRuntimeThread(allocator, canonical, proxy_host, proxy_port);
 }
 
-const ProxyAgentThreadContext = struct {
+fn connectProxyRuntime(control: *ProxyRuntimeControl) !c.fd_t {
+    var fds: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    errdefer {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+    }
+    try setCloseOnExec(fds[0]);
+    try setCloseOnExec(fds[1]);
+    try control.enqueue(fds[1]);
+    return fds[0];
+}
+
+const ProxyRuntimeThreadContext = struct {
     allocator: std.mem.Allocator,
-    guid: []u8,
-    socket_path: []u8,
+    control: *ProxyRuntimeControl,
     proxy_host: []u8,
     proxy_port: u16,
 };
 
-fn startProxyAgentThread(
+fn startProxyRuntimeThread(
     allocator: std.mem.Allocator,
     guid: []const u8,
-    socket_path: []const u8,
     proxy_host: []const u8,
     proxy_port: u16,
-) !void {
-    const context = try allocator.create(ProxyAgentThreadContext);
+) !*ProxyRuntimeControl {
+    const canonical = try session_registry.canonicalProxyGuid(allocator, guid);
+    errdefer allocator.free(canonical);
+
+    const notify_pipe = try posix.pipe();
+    errdefer {
+        posix.close(notify_pipe[0]);
+        posix.close(notify_pipe[1]);
+    }
+    try setNonBlockingFd(notify_pipe[0]);
+    try setNonBlockingFd(notify_pipe[1]);
+    try setCloseOnExec(notify_pipe[0]);
+    try setCloseOnExec(notify_pipe[1]);
+
+    const control = try allocator.create(ProxyRuntimeControl);
+    errdefer allocator.destroy(control);
+    control.* = .{
+        .allocator = allocator,
+        .guid = canonical,
+        .notify_read_fd = notify_pipe[0],
+        .notify_write_fd = notify_pipe[1],
+    };
+    errdefer control.deinit();
+
+    try registerProxyRuntime(control);
+    errdefer unregisterProxyRuntime(control);
+
+    const context = try allocator.create(ProxyRuntimeThreadContext);
     errdefer allocator.destroy(context);
     context.* = .{
         .allocator = allocator,
-        .guid = try allocator.dupe(u8, guid),
-        .socket_path = undefined,
+        .control = control,
         .proxy_host = undefined,
         .proxy_port = proxy_port,
     };
-    errdefer allocator.free(context.guid);
-    context.socket_path = try allocator.dupe(u8, socket_path);
-    errdefer allocator.free(context.socket_path);
     context.proxy_host = try allocator.dupe(u8, proxy_host);
     errdefer allocator.free(context.proxy_host);
 
-    const thread = try std.Thread.spawn(.{}, proxyAgentThreadMain, .{context});
+    const thread = try std.Thread.spawn(.{}, proxyRuntimeThreadMain, .{context});
     thread.detach();
+    return control;
 }
 
-fn proxyAgentThreadMain(context: *ProxyAgentThreadContext) void {
+fn proxyRuntimeThreadMain(context: *ProxyRuntimeThreadContext) void {
     const allocator = context.allocator;
+    const control = context.control;
     defer {
-        allocator.free(context.guid);
-        allocator.free(context.socket_path);
+        unregisterProxyRuntime(control);
+        control.deinit();
+        allocator.destroy(control);
         allocator.free(context.proxy_host);
         allocator.destroy(context);
     }
 
-    const encoded_proxy_host = encodeCommandArg(allocator, context.proxy_host) catch return;
-    defer allocator.free(encoded_proxy_host);
-    const proxy_port_arg = std.fmt.allocPrint(allocator, "{}", .{context.proxy_port}) catch return;
-    defer allocator.free(proxy_port_arg);
-
-    const args = [_][]const u8{
-        context.guid,
-        context.socket_path,
-        "proxy",
-        "1",
-        "1",
-        encoded_proxy_host,
-        proxy_port_arg,
-        "-",
-    };
-    runProxyWorker(allocator, "", args[0..]) catch {};
+    runProxyRuntime(allocator, control, context.proxy_host, context.proxy_port) catch {};
 }
 
-fn parseStreamAgentConfig(allocator: std.mem.Allocator, args: []const []const u8) !StreamAgentConfig {
+fn registerProxyRuntime(control: *ProxyRuntimeControl) !void {
+    proxy_runtime_registry_mutex.lock();
+    defer proxy_runtime_registry_mutex.unlock();
+    for (proxy_runtime_registry.items) |existing| {
+        if (std.mem.eql(u8, existing.guid, control.guid)) return error.StreamExists;
+    }
+    try proxy_runtime_registry.append(app_allocator.allocator(), control);
+}
+
+fn unregisterProxyRuntime(control: *ProxyRuntimeControl) void {
+    proxy_runtime_registry_mutex.lock();
+    defer proxy_runtime_registry_mutex.unlock();
+    for (proxy_runtime_registry.items, 0..) |existing, index| {
+        if (existing == control) {
+            _ = proxy_runtime_registry.orderedRemove(index);
+            return;
+        }
+    }
+}
+
+fn lookupProxyRuntime(guid: []const u8) ?*ProxyRuntimeControl {
+    proxy_runtime_registry_mutex.lock();
+    defer proxy_runtime_registry_mutex.unlock();
+    for (proxy_runtime_registry.items) |control| {
+        if (std.mem.eql(u8, control.guid, guid)) return control;
+    }
+    return null;
+}
+
+fn parseStreamRuntimeConfig(allocator: std.mem.Allocator, args: []const []const u8) !StreamRuntimeConfig {
     if (args.len != 7) {
         try io.writeAll(2, "sessh: :internal-stream-broker: requires GUID MODE ROWS COLS HOST PORT -\n");
         return error.InvalidStreamArgs;
@@ -1716,7 +1813,7 @@ fn encodeCommandArg(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out;
 }
 
-fn startStreamEndpoint(allocator: std.mem.Allocator, config: StreamAgentConfig) !ProxyEndpoint {
+fn startStreamEndpoint(allocator: std.mem.Allocator, config: StreamRuntimeConfig) !ProxyEndpoint {
     return switch (config.mode) {
         .proxy => try ProxyEndpoint.connect(allocator, config.proxy_host.?, config.proxy_port),
     };
@@ -2382,7 +2479,7 @@ fn expectAckFrame(fd: c.fd_t, expected_offset: u64) !void {
 }
 
 test "proxy stream config uses proxy guid and tcp target" {
-    var config = try parseStreamAgentConfig(std.testing.allocator, &.{
+    var config = try parseStreamRuntimeConfig(std.testing.allocator, &.{
         "p-550e8400-e29b-41d4-a716-446655440000",
         "proxy",
         "1",
@@ -2397,7 +2494,7 @@ test "proxy stream config uses proxy guid and tcp target" {
     try std.testing.expectEqualStrings("localhost", config.proxy_host.?);
     try std.testing.expectEqual(@as(u16, 22), config.proxy_port);
 
-    try std.testing.expectError(error.InvalidStreamGuid, parseStreamAgentConfig(std.testing.allocator, &.{
+    try std.testing.expectError(error.InvalidStreamGuid, parseStreamRuntimeConfig(std.testing.allocator, &.{
         "s-550e8400-e29b-41d4-a716-446655440000",
         "proxy",
         "1",
@@ -2406,7 +2503,7 @@ test "proxy stream config uses proxy guid and tcp target" {
         "22",
         "-",
     }));
-    try std.testing.expectError(error.InvalidStreamMode, parseStreamAgentConfig(std.testing.allocator, &.{
+    try std.testing.expectError(error.InvalidStreamMode, parseStreamRuntimeConfig(std.testing.allocator, &.{
         "p-550e8400-e29b-41d4-a716-446655440000",
         "tty",
         "1",
@@ -2415,6 +2512,49 @@ test "proxy stream config uses proxy guid and tcp target" {
         "-",
         "-",
     }));
+}
+
+test "raw duplex propagates right-side eof to the left peer" {
+    const DuplexThread = struct {
+        left_fd: c.fd_t,
+        right_fd: c.fd_t,
+
+        fn main(self: *@This()) void {
+            forwardRawDuplex(self.left_fd, self.left_fd, self.right_fd) catch {};
+            _ = c.close(self.left_fd);
+            _ = c.close(self.right_fd);
+        }
+    };
+
+    var left: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &left) != 0) return error.SocketPairFailed;
+    defer _ = c.close(left[1]);
+
+    var right: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &right) != 0) return error.SocketPairFailed;
+    defer _ = c.close(right[1]);
+
+    var context = DuplexThread{
+        .left_fd = left[0],
+        .right_fd = right[0],
+    };
+    const thread = try std.Thread.spawn(.{}, DuplexThread.main, .{&context});
+    defer thread.join();
+
+    _ = c.close(right[1]);
+    right[1] = -1;
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = left[1],
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 1_000));
+
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), c.read(left[1], &byte, byte.len));
+
+    _ = c.shutdown(left[1], c.SHUT.WR);
 }
 
 test "stream frames round trip through a pipe" {

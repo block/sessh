@@ -17,8 +17,6 @@ pub const default_ssh_port = "22";
 
 pub const SessionPaths = struct {
     dir: []u8,
-    socket: []u8,
-    agent_sock_link: []u8,
     meta: []u8,
     compat: []u8,
     route: []u8,
@@ -27,8 +25,6 @@ pub const SessionPaths = struct {
         allocator.free(self.route);
         allocator.free(self.compat);
         allocator.free(self.meta);
-        allocator.free(self.agent_sock_link);
-        allocator.free(self.socket);
         allocator.free(self.dir);
         self.* = undefined;
     }
@@ -42,28 +38,6 @@ pub const Allocation = struct {
         self.paths.deinit(allocator);
         allocator.free(self.id);
         self.* = undefined;
-    }
-};
-
-/// Runtime socket identity for anything addressed by a top-level typed GUID.
-/// The real Unix socket lives in `runtime/a` to keep paths short; the GUID
-/// directory contains the stable `agent.sock` symlink used by lookup code.
-pub const RuntimeAgentSocketPaths = struct {
-    dir: []u8,
-    socket: []u8,
-    agent_sock_link: []u8,
-
-    pub fn deinit(self: *RuntimeAgentSocketPaths, allocator: std.mem.Allocator) void {
-        allocator.free(self.agent_sock_link);
-        allocator.free(self.socket);
-        allocator.free(self.dir);
-        self.* = undefined;
-    }
-
-    pub fn removeRuntimeFiles(self: RuntimeAgentSocketPaths) void {
-        unlinkIfExists(self.socket) catch {};
-        unlinkIfExists(self.agent_sock_link) catch {};
-        removeDirIfEmpty(self.dir) catch {};
     }
 };
 
@@ -112,10 +86,6 @@ fn allocateSessionDirForGuidInRoots(allocator: std.mem.Allocator, runtime_root: 
     defer allocator.free(sessions_dir);
     try mkdirIgnoreExists(allocator, sessions_dir);
 
-    const socket_dir = try agentSocketsDirInRoot(allocator, runtime_root);
-    defer allocator.free(socket_dir);
-    try mkdirIgnoreExists(allocator, socket_dir);
-
     const canonical = try canonicalGuid(allocator, guid);
     errdefer allocator.free(canonical);
 
@@ -131,13 +101,7 @@ fn allocateSessionDirForGuidInRoots(allocator: std.mem.Allocator, runtime_root: 
         },
     }
 
-    var socket_allocation = try allocateSocketPathForGuidInRoot(allocator, runtime_root, canonical);
-    defer socket_allocation.deinit(allocator);
-    const link = try agentSocketLinkPath(allocator, dir);
-    defer allocator.free(link);
-    try installAgentSocketLink(allocator, link, socket_allocation.name);
-
-    var paths = try pathsForSessionDirWithSocketInStateRoot(allocator, dir, socket_allocation.path, state_root);
+    var paths = try pathsForSessionDirInStateRoot(allocator, dir, state_root);
     errdefer paths.deinit(allocator);
     return .{ .id = canonical, .paths = paths };
 }
@@ -162,10 +126,6 @@ fn stateSessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 
     return std.fmt.allocPrint(allocator, "{s}/guid", .{root});
 }
 
-pub fn agentSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/a", .{root});
-}
-
 pub fn clientSocketsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/c", .{root});
 }
@@ -175,12 +135,7 @@ pub fn ensureRuntimeLayout(allocator: std.mem.Allocator, paths: SessionPaths) !v
     const runtime_root = std.fs.path.dirname(sessions_dir) orelse return error.InvalidSessionDir;
     try ensureRegistryRoot(allocator, runtime_root);
     try mkdirIgnoreExists(allocator, sessions_dir);
-
-    const socket_dir = std.fs.path.dirname(paths.socket) orelse return error.InvalidSocketPath;
-    try mkdirIgnoreExists(allocator, socket_dir);
     try mkdirIgnoreExists(allocator, paths.dir);
-
-    try ensureAgentSocketLinkForSocketPath(allocator, paths.agent_sock_link, paths.socket);
 }
 
 pub fn pathsForSessionId(allocator: std.mem.Allocator, id: []const u8) !SessionPaths {
@@ -203,28 +158,8 @@ pub fn pathsForSessionDir(allocator: std.mem.Allocator, dir: []const u8) !Sessio
 }
 
 fn pathsForSessionDirInStateRoot(allocator: std.mem.Allocator, dir: []const u8, state_root: []const u8) !SessionPaths {
-    const agent_sock_link = try agentSocketLinkPath(allocator, dir);
-    errdefer allocator.free(agent_sock_link);
-    const socket = socketPathFromAgentSocketLink(allocator, dir, agent_sock_link) catch |err| switch (err) {
-        error.FileNotFound => try allocator.dupe(u8, agent_sock_link),
-        else => return err,
-    };
-    defer allocator.free(socket);
-    return pathsForSessionDirWithSocketAndLinkInStateRoot(allocator, dir, socket, agent_sock_link, state_root);
-}
-
-fn pathsForSessionDirWithSocketInStateRoot(allocator: std.mem.Allocator, dir: []const u8, socket: []const u8, state_root: []const u8) !SessionPaths {
-    const agent_sock_link = try agentSocketLinkPath(allocator, dir);
-    errdefer allocator.free(agent_sock_link);
-    return pathsForSessionDirWithSocketAndLinkInStateRoot(allocator, dir, socket, agent_sock_link, state_root);
-}
-
-fn pathsForSessionDirWithSocketAndLinkInStateRoot(allocator: std.mem.Allocator, dir: []const u8, socket: []const u8, agent_sock_link: []u8, state_root: []const u8) !SessionPaths {
     const dir_copy = try allocator.dupe(u8, dir);
     errdefer allocator.free(dir_copy);
-
-    const socket_copy = try allocator.dupe(u8, socket);
-    errdefer allocator.free(socket_copy);
 
     const meta = try std.fmt.allocPrint(allocator, "{s}/meta.json", .{dir});
     errdefer allocator.free(meta);
@@ -239,8 +174,6 @@ fn pathsForSessionDirWithSocketAndLinkInStateRoot(allocator: std.mem.Allocator, 
 
     return .{
         .dir = dir_copy,
-        .socket = socket_copy,
-        .agent_sock_link = agent_sock_link,
         .meta = meta,
         .compat = compat,
         .route = route,
@@ -324,12 +257,6 @@ pub fn canonicalProxyGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 
     return out;
 }
 
-fn canonicalRuntimeGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    if (isValidSessionGuid(guid) or isValidCompactGuid(guid)) return canonicalGuid(allocator, guid);
-    if (isValidProxyGuid(guid)) return canonicalProxyGuid(allocator, guid);
-    return error.InvalidSessionId;
-}
-
 pub fn compactGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
     if (isValidCompactGuid(guid)) {
         const out = try allocator.alloc(u8, compact_guid_len);
@@ -390,17 +317,17 @@ pub fn generateProxyGuid(allocator: std.mem.Allocator) ![]u8 {
     return out;
 }
 
-pub fn writeMeta(paths: SessionPaths, agent_pid: c.pid_t, version: []const u8) !void {
+pub fn writeMeta(paths: SessionPaths, runtime_pid: c.pid_t, version: []const u8) !void {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(app_allocator.allocator());
     const writer = text.writer(app_allocator.allocator());
     const created_at_unix_ms = sessionMetaCreatedAtUnixMs(app_allocator.allocator(), paths.meta);
     try writer.print(
-        "{{\"type\":{f},\"created_at_unix_ms\":{},\"agent_pid\":{},\"version\":{f}}}\n",
+        "{{\"type\":{f},\"created_at_unix_ms\":{},\"runtime_pid\":{},\"version\":{f}}}\n",
         .{
             std.json.fmt("local-session", .{}),
             created_at_unix_ms,
-            agent_pid,
+            runtime_pid,
             std.json.fmt(version, .{}),
         },
     );
@@ -428,14 +355,14 @@ pub const Route = struct {
     host: []u8,
     resolved_host: []u8,
     port: []u8,
-    agent_version: []u8,
+    runtime_version: []u8,
     ssh_options: []const []const u8,
     last_known_alive: bool,
 
     pub fn deinit(self: *Route, allocator: std.mem.Allocator) void {
         for (self.ssh_options) |option| allocator.free(option);
         allocator.free(self.ssh_options);
-        allocator.free(self.agent_version);
+        allocator.free(self.runtime_version);
         allocator.free(self.port);
         allocator.free(self.resolved_host);
         allocator.free(self.host);
@@ -453,12 +380,12 @@ pub fn writeSshRoute(
     resolved_host: []const u8,
     port: []const u8,
     ssh_options: []const []const u8,
-    agent_version: []const u8,
+    runtime_version: []const u8,
 ) !void {
     return writeRoute(allocator, guid, session_dir, host, ssh_options, .{
         .port = port,
         .resolved_host = resolved_host,
-        .agent_version = agent_version,
+        .runtime_version = runtime_version,
     });
 }
 
@@ -466,10 +393,10 @@ pub fn writeLocalRoute(
     allocator: std.mem.Allocator,
     guid: []const u8,
     session_dir: []const u8,
-    agent_version: []const u8,
+    runtime_version: []const u8,
 ) !void {
     return writeRoute(allocator, guid, session_dir, ".", &.{}, .{
-        .agent_version = agent_version,
+        .runtime_version = runtime_version,
     });
 }
 
@@ -477,7 +404,7 @@ const RouteStatus = struct {
     last_known_alive: bool = true,
     port: []const u8 = default_ssh_port,
     resolved_host: []const u8 = "",
-    agent_version: []const u8 = "",
+    runtime_version: []const u8 = "",
 };
 
 fn writeRoute(
@@ -499,14 +426,14 @@ fn writeRoute(
     const writer = text.writer(allocator);
     const resolved_host = if (status.resolved_host.len == 0) host else status.resolved_host;
     try writer.print(
-        "{{\"guid\":{f},\"session_dir\":{f},\"host\":{f},\"resolved_host\":{f},\"port\":{f},\"agent_version\":{f},\"alive\":{},\"ssh_options\":[",
+        "{{\"guid\":{f},\"session_dir\":{f},\"host\":{f},\"resolved_host\":{f},\"port\":{f},\"runtime_version\":{f},\"alive\":{},\"ssh_options\":[",
         .{
             std.json.fmt(canonical, .{}),
             std.json.fmt(session_dir, .{}),
             std.json.fmt(host, .{}),
             std.json.fmt(resolved_host, .{}),
             std.json.fmt(status.port, .{}),
-            std.json.fmt(status.agent_version, .{}),
+            std.json.fmt(status.runtime_version, .{}),
             status.last_known_alive,
         },
     );
@@ -521,56 +448,6 @@ fn writeRoute(
     try ensureRouteDirForGuid(allocator, canonical);
 
     try writeAtomicFile(route_path, text.items);
-}
-
-pub fn runtimeAgentSocketPathsForGuid(allocator: std.mem.Allocator, guid: []const u8) !RuntimeAgentSocketPaths {
-    const runtime_root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(runtime_root);
-    return runtimeAgentSocketPathsForGuidInRoot(allocator, runtime_root, guid);
-}
-
-pub fn runtimeAgentSocketPathsForGuidInRoot(
-    allocator: std.mem.Allocator,
-    runtime_root: []const u8,
-    guid: []const u8,
-) !RuntimeAgentSocketPaths {
-    try ensureRegistryRoot(allocator, runtime_root);
-
-    const guid_root = try sessionsDirInRoot(allocator, runtime_root);
-    defer allocator.free(guid_root);
-    try mkdirIgnoreExists(allocator, guid_root);
-
-    const canonical = try canonicalRuntimeGuid(allocator, guid);
-    defer allocator.free(canonical);
-
-    const socket_root = try agentSocketsDirInRoot(allocator, runtime_root);
-    defer allocator.free(socket_root);
-    try mkdirIgnoreExists(allocator, socket_root);
-
-    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ guid_root, canonical });
-    errdefer allocator.free(dir);
-    try mkdirIgnoreExists(allocator, dir);
-
-    const agent_sock_link = try agentSocketLinkPath(allocator, dir);
-    errdefer allocator.free(agent_sock_link);
-
-    const socket = socketPathFromAgentSocketLink(allocator, dir, agent_sock_link) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            var socket_allocation = try allocateRuntimeAgentSocketPathForGuidInRoot(allocator, runtime_root, canonical);
-            errdefer socket_allocation.deinit(allocator);
-            try installAgentSocketLink(allocator, agent_sock_link, socket_allocation.name);
-            allocator.free(socket_allocation.name);
-            break :blk socket_allocation.path;
-        },
-        else => return err,
-    };
-    errdefer allocator.free(socket);
-
-    return .{
-        .dir = dir,
-        .socket = socket,
-        .agent_sock_link = agent_sock_link,
-    };
 }
 
 fn routePathForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
@@ -630,8 +507,9 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
     const port = try allocator.dupe(u8, port_value);
     errdefer allocator.free(port);
 
-    const agent_version = try allocator.dupe(u8, jsonOptionalString(object, "agent_version") orelse "");
-    errdefer allocator.free(agent_version);
+    const runtime_version_value = jsonOptionalString(object, "runtime_version") orelse "";
+    const runtime_version = try allocator.dupe(u8, runtime_version_value);
+    errdefer allocator.free(runtime_version);
 
     const options = try jsonStringArrayField(allocator, object, "ssh_options");
     errdefer freeStringArray(allocator, options);
@@ -642,7 +520,7 @@ pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
         .host = host,
         .resolved_host = resolved_host,
         .port = port,
-        .agent_version = agent_version,
+        .runtime_version = runtime_version,
         .ssh_options = options,
         .last_known_alive = (try jsonOptionalBool(object, "alive")) orelse true,
     };
@@ -749,21 +627,6 @@ fn isAbsolutePath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "/");
 }
 
-fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8, max_len: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-    const buf = try allocator.alloc(u8, max_len);
-    defer allocator.free(buf);
-    const n = c.readlink(path_z.ptr, buf.ptr, buf.len);
-    if (n < 0) {
-        return switch (posix.errno(n)) {
-            .NOENT, .NOTDIR => error.FileNotFound,
-            else => error.ReadLinkFailed,
-        };
-    }
-    return allocator.dupe(u8, buf[0..@intCast(n)]);
-}
-
 pub const SocketPathAllocation = struct {
     name: []u8,
     path: []u8,
@@ -774,18 +637,6 @@ pub const SocketPathAllocation = struct {
         self.* = undefined;
     }
 };
-
-fn allocateSocketPathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !SocketPathAllocation {
-    const socket_dir = try agentSocketsDirInRoot(allocator, root);
-    defer allocator.free(socket_dir);
-    return allocateSocketPathForGuidInDir(allocator, socket_dir, guid);
-}
-
-fn allocateRuntimeAgentSocketPathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !SocketPathAllocation {
-    const socket_dir = try agentSocketsDirInRoot(allocator, root);
-    defer allocator.free(socket_dir);
-    return allocateSocketPathForGuidInDir(allocator, socket_dir, guid);
-}
 
 pub fn allocateClientSocketPathForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !SocketPathAllocation {
     const socket_dir = try clientSocketsDirInRoot(allocator, root);
@@ -857,75 +708,6 @@ fn pathExists(path: []const u8) !bool {
     return true;
 }
 
-fn agentSocketLinkPath(allocator: std.mem.Allocator, dir: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/agent.sock", .{dir});
-}
-
-fn installAgentSocketLink(allocator: std.mem.Allocator, link_path: []const u8, socket_name: []const u8) !void {
-    const target = try std.fmt.allocPrint(allocator, "../../a/{s}", .{socket_name});
-    defer allocator.free(target);
-    return installSymlinkReplacing(allocator, link_path, target);
-}
-
-fn installSymlinkReplacing(allocator: std.mem.Allocator, link_path: []const u8, target: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ link_path, c.getpid() });
-    defer allocator.free(tmp_path);
-
-    std.fs.cwd().deleteFile(tmp_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-
-    const target_z = try allocator.dupeZ(u8, target);
-    defer allocator.free(target_z);
-    const tmp_z = try allocator.dupeZ(u8, tmp_path);
-    defer allocator.free(tmp_z);
-    switch (posix.errno(c.symlink(target_z.ptr, tmp_z.ptr))) {
-        .SUCCESS => {},
-        .EXIST => return error.SymlinkFailed,
-        else => return error.SymlinkFailed,
-    }
-
-    const link_z = try allocator.dupeZ(u8, link_path);
-    defer allocator.free(link_z);
-    switch (posix.errno(c.rename(tmp_z.ptr, link_z.ptr))) {
-        .SUCCESS => return,
-        else => return error.RenameFailed,
-    }
-}
-
-fn ensureAgentSocketLinkForSocketPath(allocator: std.mem.Allocator, link_path: []const u8, socket_path: []const u8) !void {
-    const socket_name = std.fs.path.basename(socket_path);
-    const expected_target = try std.fmt.allocPrint(allocator, "../../a/{s}", .{socket_name});
-    defer allocator.free(expected_target);
-
-    const existing_target = readLinkAlloc(allocator, link_path, 4096) catch |err| switch (err) {
-        error.FileNotFound => {
-            try installAgentSocketLink(allocator, link_path, socket_name);
-            return;
-        },
-        else => return err,
-    };
-    defer allocator.free(existing_target);
-
-    if (std.mem.eql(u8, existing_target, expected_target)) return;
-    try unlinkIfExists(link_path);
-    try installAgentSocketLink(allocator, link_path, socket_name);
-}
-
-fn socketPathFromAgentSocketLink(allocator: std.mem.Allocator, dir: []const u8, link_path: []const u8) ![]u8 {
-    const target = try readLinkAlloc(allocator, link_path, 4096);
-    defer allocator.free(target);
-    if (isAbsolutePath(target)) return allocator.dupe(u8, target);
-    if (std.mem.startsWith(u8, target, "../../a/")) {
-        const guid_dir = std.fs.path.dirname(dir) orelse return error.InvalidSessionDir;
-        const root = std.fs.path.dirname(guid_dir) orelse return error.InvalidSessionDir;
-        const socket_name = target["../../a/".len..];
-        return std.fmt.allocPrint(allocator, "{s}/a/{s}", .{ root, socket_name });
-    }
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, target });
-}
-
 /// Clean shutdown removes both the live route and runtime files.
 pub fn removeEndedHints(paths: SessionPaths) !void {
     try unlinkIfExists(paths.route);
@@ -935,14 +717,12 @@ pub fn removeEndedHints(paths: SessionPaths) !void {
 }
 
 fn removeRuntimeSessionFiles(paths: SessionPaths) !void {
-    try unlinkIfExists(paths.socket);
-    try unlinkIfExists(paths.agent_sock_link);
     try unlinkIfExists(paths.compat);
     try unlinkIfExists(paths.meta);
 
-    const agent_log = try std.fmt.allocPrint(app_allocator.allocator(), "{s}/agent.log", .{paths.dir});
-    defer app_allocator.allocator().free(agent_log);
-    try unlinkIfExists(agent_log);
+    const runtime_log = try std.fmt.allocPrint(app_allocator.allocator(), "{s}/runtime.log", .{paths.dir});
+    defer app_allocator.allocator().free(runtime_log);
+    try unlinkIfExists(runtime_log);
 
     try removeDirIfEmpty(paths.dir);
 }
@@ -976,10 +756,6 @@ fn mkdirSessionDir(allocator: std.mem.Allocator, path: []const u8) !MkdirSession
 }
 
 fn runtimeHintsExist(paths: SessionPaths) bool {
-    if (std.fs.cwd().statFile(paths.socket)) |_| return true else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return true,
-    }
     _ = std.fs.cwd().statFile(paths.meta) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return true,
@@ -1031,7 +807,7 @@ test "refuses GUID session directories with runtime metadata" {
     try std.testing.expectError(error.SessionExists, allocateSessionDirForGuidInRoot(allocator, root, first.id));
 }
 
-test "session paths use guid session directories and separate socket directory" {
+test "session paths use guid session directories" {
     const allocator = std.testing.allocator;
     const root = "zig-cache/session-registry-path-test";
     std.fs.cwd().deleteTree(root) catch {};
@@ -1043,74 +819,9 @@ test "session paths use guid session directories and separate socket directory" 
 
     try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", allocation.id);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000", allocation.paths.dir);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/a/550e8400e29b41d4a716446655440000", allocation.paths.socket);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/agent.sock", allocation.paths.agent_sock_link);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/meta.json", allocation.paths.meta);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/compat", allocation.paths.compat);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/route.json", allocation.paths.route);
-
-    const link_target = try readLinkAlloc(allocator, allocation.paths.agent_sock_link, 4096);
-    defer allocator.free(link_target);
-    try std.testing.expectEqualStrings("../../a/550e8400e29b41d4a716446655440000", link_target);
-}
-
-test "long runtime roots use random socket names when compact guid does not fit" {
-    const allocator = std.testing.allocator;
-    const prefix = "zig-cache/session-registry-long-root-";
-    const root_len = maxUnixSocketPathLen() - "/a/".len - 16;
-    try std.testing.expect(root_len > prefix.len);
-
-    const root = try allocator.alloc(u8, root_len);
-    defer allocator.free(root);
-    @memcpy(root[0..prefix.len], prefix);
-    @memset(root[prefix.len..], 'x');
-
-    std.fs.cwd().deleteTree(root) catch {};
-    defer std.fs.cwd().deleteTree(root) catch {};
-
-    const guid = "s-550e8400-e29b-41d4-a716-446655440000";
-    var allocation = try allocateSessionDirForGuidInRoot(allocator, root, guid);
-    defer allocation.deinit(allocator);
-
-    try std.testing.expectEqualStrings(guid, allocation.id);
-    try std.testing.expectEqualStrings(root, allocation.paths.dir[0..root.len]);
-    try std.testing.expect(std.mem.endsWith(u8, allocation.paths.dir, "/guid/s-550e8400-e29b-41d4-a716-446655440000"));
-    try std.testing.expect(allocation.paths.socket.len <= maxUnixSocketPathLen());
-    const socket_name = std.fs.path.basename(allocation.paths.socket);
-    try std.testing.expectEqual(@as(usize, 16), socket_name.len);
-    try std.testing.expect(!std.mem.eql(u8, socket_name, "550e8400e29b41d4a716446655440000"));
-
-    const link_target = try readLinkAlloc(allocator, allocation.paths.agent_sock_link, 4096);
-    defer allocator.free(link_target);
-    const expected_target = try std.fmt.allocPrint(allocator, "../../a/{s}", .{socket_name});
-    defer allocator.free(expected_target);
-    try std.testing.expectEqualStrings(expected_target, link_target);
-}
-
-test "runtime agent socket paths use typed guid directories and socket directory" {
-    const allocator = std.testing.allocator;
-    const root = "zig-cache/runtime-agent-socket-path-test";
-    std.fs.cwd().deleteTree(root) catch {};
-    defer std.fs.cwd().deleteTree(root) catch {};
-
-    const guid = "p-550e8400-e29b-41d4-a716-446655440000";
-    var paths = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
-    defer paths.deinit(allocator);
-
-    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/p-550e8400-e29b-41d4-a716-446655440000", paths.dir);
-    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/a/550e8400e29b41d4a716446655440000", paths.socket);
-    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/p-550e8400-e29b-41d4-a716-446655440000/agent.sock", paths.agent_sock_link);
-
-    const link_target = try readLinkAlloc(allocator, paths.agent_sock_link, 4096);
-    defer allocator.free(link_target);
-    try std.testing.expectEqualStrings("../../a/550e8400e29b41d4a716446655440000", link_target);
-
-    var again = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
-    defer again.deinit(allocator);
-    try std.testing.expectEqualStrings(paths.socket, again.socket);
-
-    paths.removeRuntimeFiles();
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.dir));
 }
 
 test "client socket paths use client socket directory" {
@@ -1157,7 +868,7 @@ test "route json persists absolute session directories" {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     try text.writer(allocator).print(
-        "{{\"guid\":\"s-550e8400-e29b-41d4-a716-446655440000\",\"session_dir\":{f},\"host\":\"work.example\",\"agent_version\":\"0.5.0-test\",\"alive\":true,\"ssh_options\":[\"-F\"]}}\n",
+        "{{\"guid\":\"s-550e8400-e29b-41d4-a716-446655440000\",\"session_dir\":{f},\"host\":\"work.example\",\"runtime_version\":\"0.5.0-test\",\"alive\":true,\"ssh_options\":[\"-F\"]}}\n",
         .{std.json.fmt(session_dir, .{})},
     );
     const file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
@@ -1169,7 +880,7 @@ test "route json persists absolute session directories" {
     try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", route.guid);
     try std.testing.expectEqualStrings(session_dir, route.session_dir);
     try std.testing.expectEqualStrings("work.example", route.host);
-    try std.testing.expectEqualStrings("0.5.0-test", route.agent_version);
+    try std.testing.expectEqualStrings("0.5.0-test", route.runtime_version);
     try std.testing.expect(route.last_known_alive);
     try std.testing.expectEqual(@as(usize, 1), route.ssh_options.len);
     try std.testing.expectEqualStrings("-F", route.ssh_options[0]);

@@ -1,14 +1,14 @@
 # sesshd Coordinator Plan
 
 This is the proposed architecture after removing `sesshmux` and the
-session/stream agent split. It intentionally describes the destination shape
+session/proxy-stream runtime split. It intentionally describes the destination shape
 before field numbers or exact file layout.
 
 The important shift is that `sesshd` becomes the durable local process for
 sessh. There is one `sesshd` per machine, listening on a global Unix domain
 socket in the runtime directory. Public `sessh` invocations connect to that
 socket, starting `sesshd` if needed. The coordinator role inside `sesshd`
-replaces both the old session agent and the old stream agent.
+replaces both old per-session and per-stream runtime processes.
 
 `sesshd` should be a separate executable name, likely a symlink or hardlink to
 the same binary as `sessh`. Daemon mode is invoked through the shared binary as
@@ -40,7 +40,7 @@ On the server machine:
   client input
 - hang up remote sessions/streams when requested by the client coordinator
 
-There are no session agents or stream agents in this architecture.
+There are no per-session or per-stream daemon processes in this architecture.
 
 ## Local Startup
 
@@ -120,7 +120,7 @@ Candidate messages:
 
 Once a stream is open, payloads are ordered stream items. The current `Te*`
 messages can remain recognizable, but they should become terminal-emulator
-stream items, not agent messages.
+stream items, not runtime-private messages.
 
 ## Coordinator Tunnel Protocol
 
@@ -306,14 +306,14 @@ The coordinator needs a stable local socket. Candidate runtime layout:
 
 - `sesshd.sock`: global per-user coordinator socket
 
-All GUID-based socket names go away. The old `a/<compact-guid>` agent socket
-namespace disappears with agents, and the old `c/<compact-guid>` local
+All GUID-based socket names go away. The old `a/<compact-guid>` socket
+namespace disappears, and the old `c/<compact-guid>` local
 ProxyCommand rendezvous socket namespace is not part of the destination
 architecture. Individual sessions and proxy streams are logical objects inside
 coordinator connections, not filesystem sockets.
 
 Durable state should move toward cleanup records and coordinator logs rather
-than per-agent route directories.
+than per-runtime route directories.
 
 Resolved user/host/port is sufficient host identity for choosing a coordinator
 tunnel. The system must tolerate duplicate TCP connections between the same two
@@ -325,10 +325,10 @@ than necessary; they must not compromise stream correctness or cleanup safety.
 1. Add the local `sesshd` process and socket startup path while keeping the
    current session/stream implementation behind it.
 2. Move client-side cleanup records into the coordinator.
-3. Replace session/stream agents with remote coordinator-owned objects.
+3. Move session/proxy-stream runtimes into remote coordinator-owned objects.
 4. Introduce the multiplexed coordinator tunnel for proxy streams first.
 5. Move terminal-emulator sessions onto the same tunnel.
-6. Remove agent sockets, broker entrypoints, and agent-specific filesystem
+6. Remove legacy per-object sockets, broker entrypoints, and per-runtime filesystem
    layout.
 7. Collapse `sessh.proto` around two explicit protocol families:
    client/coordinator and coordinator/coordinator.

@@ -8,7 +8,6 @@ const client_renderer = @import("renderer.zig");
 const io = @import("../core/io.zig");
 const pty_process = @import("../tty/pty_process.zig");
 const protocol = @import("../protocol/mod.zig");
-const runtime_refresher = @import("../runtime/refresher.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 const socket_transport = @import("../transport/socket.zig");
 const terminal = @import("../tty/terminal.zig");
@@ -97,7 +96,7 @@ const AttachedClient = struct {
     }
 };
 
-const SessionAgent = struct {
+const SessionRuntime = struct {
     session: Session = .{},
     attached_client: AttachedClient = .{},
     running: bool = true,
@@ -108,6 +107,58 @@ const SessionAgent = struct {
     session_paths: ?session_registry.SessionPaths = null,
     started_session: bool = false,
 };
+
+const RuntimeControl = struct {
+    allocator: std.mem.Allocator,
+    guid: []u8,
+    notify_read_fd: c.fd_t,
+    notify_write_fd: c.fd_t,
+    pending_mutex: std.Thread.Mutex = .{},
+    pending_clients: std.ArrayList(c.fd_t) = .empty,
+    closed: bool = false,
+
+    fn enqueue(self: *RuntimeControl, fd: c.fd_t) !void {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        if (self.closed) return error.SessionNotFound;
+        try self.pending_clients.append(self.allocator, fd);
+        var byte = [_]u8{1};
+        const n = c.write(self.notify_write_fd, &byte, byte.len);
+        if (n < 0 or @as(usize, @intCast(n)) != byte.len) {
+            _ = self.pending_clients.pop();
+            return error.RuntimeNotifyFailed;
+        }
+    }
+
+    fn takePending(self: *RuntimeControl) ?c.fd_t {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        if (self.pending_clients.items.len == 0) return null;
+        return self.pending_clients.orderedRemove(0);
+    }
+
+    fn close(self: *RuntimeControl) void {
+        self.pending_mutex.lock();
+        self.closed = true;
+        while (self.pending_clients.items.len > 0) {
+            const fd = self.pending_clients.pop().?;
+            _ = c.close(fd);
+        }
+        self.pending_mutex.unlock();
+    }
+
+    fn deinit(self: *RuntimeControl) void {
+        self.close();
+        self.pending_clients.deinit(self.allocator);
+        if (self.notify_read_fd >= 0) _ = c.close(self.notify_read_fd);
+        if (self.notify_write_fd >= 0) _ = c.close(self.notify_write_fd);
+        self.allocator.free(self.guid);
+        self.* = undefined;
+    }
+};
+
+var runtime_registry_mutex = std.Thread.Mutex{};
+var runtime_registry: std.ArrayList(*RuntimeControl) = .empty;
 
 const PollKind = union(enum) {
     listen,
@@ -1097,27 +1148,60 @@ fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
     };
 }
 
-pub fn startSessionAgentThread(allocator: std.mem.Allocator, session_dir: []const u8) !void {
-    const context = try allocator.create(SessionAgentThreadContext);
+pub fn startSessionRuntimeThread(allocator: std.mem.Allocator, session_dir: []const u8) !*RuntimeControl {
+    const guid = try allocator.dupe(u8, std.fs.path.basename(session_dir));
+    errdefer allocator.free(guid);
+
+    const notify_pipe = try posix.pipe();
+    errdefer {
+        posix.close(notify_pipe[0]);
+        posix.close(notify_pipe[1]);
+    }
+    setNonBlockingFd(notify_pipe[0]) catch {};
+    setNonBlockingFd(notify_pipe[1]) catch {};
+    socket_transport.setCloseOnExec(notify_pipe[0]) catch {};
+    socket_transport.setCloseOnExec(notify_pipe[1]) catch {};
+
+    const control = try allocator.create(RuntimeControl);
+    errdefer allocator.destroy(control);
+    control.* = .{
+        .allocator = allocator,
+        .guid = guid,
+        .notify_read_fd = notify_pipe[0],
+        .notify_write_fd = notify_pipe[1],
+    };
+    errdefer control.deinit();
+
+    try registerRuntime(control);
+    errdefer unregisterRuntime(control);
+
+    const context = try allocator.create(SessionRuntimeThreadContext);
     errdefer allocator.destroy(context);
     context.* = .{
         .allocator = allocator,
         .session_dir = try allocator.dupe(u8, session_dir),
+        .control = control,
     };
     errdefer allocator.free(context.session_dir);
 
-    const thread = try std.Thread.spawn(.{}, sessionAgentThreadMain, .{context});
+    const thread = try std.Thread.spawn(.{}, sessionRuntimeThreadMain, .{context});
     thread.detach();
+    return control;
 }
 
-const SessionAgentThreadContext = struct {
+const SessionRuntimeThreadContext = struct {
     allocator: std.mem.Allocator,
     session_dir: []u8,
+    control: *RuntimeControl,
 };
 
-fn sessionAgentThreadMain(context: *SessionAgentThreadContext) void {
+fn sessionRuntimeThreadMain(context: *SessionRuntimeThreadContext) void {
     const allocator = context.allocator;
+    const control = context.control;
     defer {
+        unregisterRuntime(control);
+        control.deinit();
+        allocator.destroy(control);
         allocator.free(context.session_dir);
         allocator.destroy(context);
     }
@@ -1127,57 +1211,100 @@ fn sessionAgentThreadMain(context: *SessionAgentThreadContext) void {
         posix.close(shutdown_pipe[0]);
         posix.close(shutdown_pipe[1]);
     }
-    runSessionAgentLoop(context.session_dir, shutdown_pipe[0]) catch {};
+    runSessionRuntimeLoop(context.session_dir, shutdown_pipe[0], control) catch {};
 }
 
-fn runSessionAgentLoop(session_dir: []const u8, shutdown_signal_fd: c.fd_t) !void {
+fn runSessionRuntimeLoop(session_dir: []const u8, shutdown_signal_fd: c.fd_t, control: *RuntimeControl) !void {
     const paths = try session_registry.pathsForSessionDir(app_allocator.allocator(), session_dir);
     const fixed_session_id = std.fs.path.basename(paths.dir);
-    var session_agent = SessionAgent{
+    var session_runtime = SessionRuntime{
         .fixed_session_id = fixed_session_id,
         .session_paths = paths,
     };
-    defer if (session_agent.session_paths) |*session_paths| session_paths.deinit(app_allocator.allocator());
+    defer if (session_runtime.session_paths) |*session_paths| session_paths.deinit(app_allocator.allocator());
 
-    var listen_fd = try socket_transport.listenSocket(session_agent.session_paths.?.socket);
-    defer _ = c.close(listen_fd);
-    defer session_registry.removeEndedHints(session_agent.session_paths.?) catch {};
+    defer session_registry.removeEndedHints(session_runtime.session_paths.?) catch {};
 
-    const runtime_repair_pipe = try posix.pipe();
-    defer {
-        posix.close(runtime_repair_pipe[0]);
-        posix.close(runtime_repair_pipe[1]);
-    }
+    try writeRuntimeCompatBinary(session_runtime.session_paths.?);
+    try session_registry.writeMeta(session_runtime.session_paths.?, c.getpid(), config.version);
+    try openSessionRuntimeLog(&session_runtime, session_runtime.session_paths.?);
+    defer closeSessionRuntimeLog(&session_runtime);
+    logSessionRuntime(&session_runtime, "event=session_runtime_start id={s}", .{fixed_session_id});
+    defer logSessionRuntime(&session_runtime, "event=session_runtime_stop id={s}", .{fixed_session_id});
+    defer closeSessionRuntime(&session_runtime);
 
-    try writeAgentCompatBinary(session_agent.session_paths.?);
-    try session_registry.writeMeta(session_agent.session_paths.?, c.getpid(), config.version);
-    try openSessionAgentLog(&session_agent, session_agent.session_paths.?);
-    defer closeSessionAgentLog(&session_agent);
-    logSessionAgent(&session_agent, "event=session_agent_start id={s} socket={s}", .{ fixed_session_id, session_agent.session_paths.?.socket });
-    var refresher = runtime_refresher.RuntimeRefresher{};
-    refresher.startWithRepairSignal(app_allocator.allocator(), session_agent.session_paths.?, runtimeRefreshIntervalMs(), runtime_repair_pipe[1]) catch |err| {
-        logSessionAgent(&session_agent, "event=runtime_refresher_start_failed error={t}", .{err});
-    };
-    defer refresher.stopAndJoin(app_allocator.allocator());
-    defer logSessionAgent(&session_agent, "event=session_agent_stop id={s}", .{fixed_session_id});
-    defer closeSessionAgent(&session_agent);
-
-    while (session_agent.running) {
-        try sessionAgentPollOnce(&session_agent, &listen_fd, shutdown_signal_fd, runtime_repair_pipe[0]);
-        stopSessionAgentIfComplete(&session_agent);
+    while (session_runtime.running) {
+        try sessionRuntimePollOnce(&session_runtime, control, shutdown_signal_fd);
+        stopSessionRuntimeIfComplete(&session_runtime);
     }
 }
 
-fn runtimeRefreshIntervalMs() u64 {
-    const value_z = c.getenv("SESSH_TEST_RUNTIME_REFRESH_MS") orelse return runtime_refresher.default_refresh_interval_ms;
-    const value = std.mem.span(value_z);
-    if (value.len == 0) return runtime_refresher.default_refresh_interval_ms;
-    const parsed = std.fmt.parseInt(u64, value, 10) catch return runtime_refresher.default_refresh_interval_ms;
-    if (parsed == 0) return runtime_refresher.default_refresh_interval_ms;
-    return parsed;
+pub fn connectSessionRuntime(allocator: std.mem.Allocator, guid: []const u8) !c.fd_t {
+    const canonical = try session_registry.canonicalGuid(allocator, guid);
+    defer allocator.free(canonical);
+
+    const control = lookupRuntime(canonical) orelse return error.SessionNotFound;
+    var fds: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    errdefer {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+    }
+    try socket_transport.setCloseOnExec(fds[0]);
+    try socket_transport.setCloseOnExec(fds[1]);
+    try control.enqueue(fds[1]);
+    return fds[0];
 }
 
-fn writeAgentCompatBinary(paths: session_registry.SessionPaths) !void {
+pub fn connectSingleLiveSessionRuntime(allocator: std.mem.Allocator) !c.fd_t {
+    runtime_registry_mutex.lock();
+    var found_guid: ?[]u8 = null;
+    for (runtime_registry.items) |control| {
+        control.pending_mutex.lock();
+        const live = !control.closed;
+        control.pending_mutex.unlock();
+        if (!live) continue;
+        if (found_guid != null) {
+            runtime_registry_mutex.unlock();
+            return error.AmbiguousSession;
+        }
+        found_guid = try allocator.dupe(u8, control.guid);
+    }
+    runtime_registry_mutex.unlock();
+    defer if (found_guid) |guid| allocator.free(guid);
+    return connectSessionRuntime(allocator, found_guid orelse return error.SessionNotFound);
+}
+
+fn registerRuntime(control: *RuntimeControl) !void {
+    runtime_registry_mutex.lock();
+    defer runtime_registry_mutex.unlock();
+    for (runtime_registry.items) |existing| {
+        if (std.mem.eql(u8, existing.guid, control.guid)) return error.SessionExists;
+    }
+    try runtime_registry.append(app_allocator.allocator(), control);
+}
+
+fn unregisterRuntime(control: *RuntimeControl) void {
+    runtime_registry_mutex.lock();
+    defer runtime_registry_mutex.unlock();
+    for (runtime_registry.items, 0..) |existing, index| {
+        if (existing == control) {
+            _ = runtime_registry.orderedRemove(index);
+            return;
+        }
+    }
+}
+
+fn lookupRuntime(guid: []const u8) ?*RuntimeControl {
+    runtime_registry_mutex.lock();
+    defer runtime_registry_mutex.unlock();
+    for (runtime_registry.items) |control| {
+        if (std.mem.eql(u8, control.guid, guid)) return control;
+    }
+    return null;
+}
+
+fn writeRuntimeCompatBinary(paths: session_registry.SessionPaths) !void {
     try writeCompatBinaryTo(paths.compat);
 }
 
@@ -1259,11 +1386,11 @@ fn chmodPath(path: []const u8, mode: c.mode_t) !void {
     }
 }
 
-fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdown_signal_fd: c.fd_t, runtime_repair_fd: c.fd_t) !void {
-    const now_ms = sessionAgentMonotonicMs(session_agent);
+fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, control: *RuntimeControl, shutdown_signal_fd: c.fd_t) !void {
+    const now_ms = sessionRuntimeMonotonicMs(session_runtime);
     const now_unix_ms = nowUnixMs();
-    clearExpiredDebugUnresponsiveAttachedClients(session_agent, now_ms);
-    if (endReapedSessions(session_agent, now_unix_ms)) return;
+    clearExpiredDebugUnresponsiveAttachedClients(session_runtime, now_ms);
+    if (endReapedSessions(session_runtime, now_unix_ms)) return;
 
     var pollfds: [5]posix.pollfd = undefined;
     var kinds: [5]PollKind = undefined;
@@ -1273,25 +1400,21 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
     kinds[count] = .shutdown_signal;
     count += 1;
 
-    pollfds[count] = .{ .fd = runtime_repair_fd, .events = posix.POLL.IN, .revents = 0 };
-    kinds[count] = .runtime_repair;
-    count += 1;
-
-    if (!session_agent.shutting_down) {
-        pollfds[count] = .{ .fd = listen_fd.*, .events = posix.POLL.IN, .revents = 0 };
+    if (!session_runtime.shutting_down) {
+        pollfds[count] = .{ .fd = control.notify_read_fd, .events = posix.POLL.IN, .revents = 0 };
         kinds[count] = .listen;
         count += 1;
     }
 
-    if (session_agent.session.alive) {
-        const session = &session_agent.session;
+    if (session_runtime.session.alive) {
+        const session = &session_runtime.session;
         pollfds[count] = .{ .fd = session.pty_fd, .events = posix.POLL.IN, .revents = 0 };
         kinds[count] = .session;
         count += 1;
     }
 
-    if (session_agent.attached_client.active) {
-        const attached_client = &session_agent.attached_client;
+    if (session_runtime.attached_client.active) {
+        const attached_client = &session_runtime.attached_client;
         const debug_unresponsive = attached_client.debug_unresponsive_until_ms > now_ms;
         var events: i16 = if (attached_client.close_after_flush or debug_unresponsive) 0 else posix.POLL.IN;
         if (!debug_unresponsive and attached_client.queuedBytes() > 0) events |= posix.POLL.OUT;
@@ -1300,50 +1423,50 @@ fn sessionAgentPollOnce(session_agent: *SessionAgent, listen_fd: *c.fd_t, shutdo
         count += 1;
     }
 
-    _ = try posix.poll(pollfds[0..count], sessionAgentPollTimeoutMs(session_agent, now_ms, now_unix_ms));
-    const after_poll_ms = sessionAgentMonotonicMs(session_agent);
-    clearExpiredDebugUnresponsiveAttachedClients(session_agent, after_poll_ms);
-    flushExpiredSynchronizedOutputSessions(session_agent, after_poll_ms);
-    if (endReapedSessions(session_agent, nowUnixMs())) return;
+    _ = try posix.poll(pollfds[0..count], sessionRuntimePollTimeoutMs(session_runtime, now_ms, now_unix_ms));
+    const after_poll_ms = sessionRuntimeMonotonicMs(session_runtime);
+    clearExpiredDebugUnresponsiveAttachedClients(session_runtime, after_poll_ms);
+    flushExpiredSynchronizedOutputSessions(session_runtime, after_poll_ms);
+    if (endReapedSessions(session_runtime, nowUnixMs())) return;
 
     for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
         if (pollfd.revents == 0) continue;
         switch (kind) {
-            .listen => acceptSessionAgentClient(session_agent, listen_fd.*),
-            .shutdown_signal => handleShutdownSignalEvent(session_agent, shutdown_signal_fd),
-            .runtime_repair => handleRuntimeRepairEvent(session_agent, listen_fd, runtime_repair_fd),
-            .session => drainSessionOutput(session_agent),
-            .attached_client => handleAttachedClientEvents(session_agent, pollfd.revents),
+            .listen => handleRuntimeHandoffEvent(session_runtime, control),
+            .shutdown_signal => handleShutdownSignalEvent(session_runtime, shutdown_signal_fd),
+            .runtime_repair => {},
+            .session => drainSessionOutput(session_runtime),
+            .attached_client => handleAttachedClientEvents(session_runtime, pollfd.revents),
         }
     }
 }
 
-fn sessionAgentMonotonicMs(session_agent: *SessionAgent) i64 {
-    if (session_agent.monotonic_clock == null) {
-        session_agent.monotonic_clock = std.time.Timer.start() catch return std.time.milliTimestamp();
+fn sessionRuntimeMonotonicMs(session_runtime: *SessionRuntime) i64 {
+    if (session_runtime.monotonic_clock == null) {
+        session_runtime.monotonic_clock = std.time.Timer.start() catch return std.time.milliTimestamp();
     }
-    return if (session_agent.monotonic_clock) |*timer|
+    return if (session_runtime.monotonic_clock) |*timer|
         @intCast(timer.read() / std.time.ns_per_ms)
     else
         std.time.milliTimestamp();
 }
 
-fn clearExpiredDebugUnresponsiveAttachedClients(session_agent: *SessionAgent, now_ms: i64) void {
-    const attached_client = &session_agent.attached_client;
+fn clearExpiredDebugUnresponsiveAttachedClients(session_runtime: *SessionRuntime, now_ms: i64) void {
+    const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
     if (attached_client.debug_unresponsive_until_ms != 0 and attached_client.debug_unresponsive_until_ms <= now_ms) {
         attached_client.debug_unresponsive_until_ms = 0;
     }
 }
 
-fn sessionAgentPollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64, now_unix_ms: u64) i32 {
+fn sessionRuntimePollTimeoutMs(session_runtime: *const SessionRuntime, now_ms: i64, now_unix_ms: u64) i32 {
     var timeout_ms: ?i64 = null;
-    const attached_client = &session_agent.attached_client;
+    const attached_client = &session_runtime.attached_client;
     if (attached_client.active and attached_client.debug_unresponsive_until_ms > now_ms) {
         const remaining_ms = attached_client.debug_unresponsive_until_ms - now_ms;
         if (timeout_ms == null or remaining_ms < timeout_ms.?) timeout_ms = remaining_ms;
     }
-    const session = &session_agent.session;
+    const session = &session_runtime.session;
     if (session.alive and session.synchronized_output_since_ms != 0) {
         const elapsed_ms = now_ms - session.synchronized_output_since_ms;
         const remaining_ms = synchronized_output_max_hold_ms - elapsed_ms;
@@ -1362,17 +1485,17 @@ fn sessionAgentPollTimeoutMs(session_agent: *const SessionAgent, now_ms: i64, no
     return @intCast(@min(ms, std.math.maxInt(i32)));
 }
 
-fn endReapedSessions(session_agent: *SessionAgent, now_unix_ms: u64) bool {
-    const session = &session_agent.session;
+fn endReapedSessions(session_runtime: *SessionRuntime, now_unix_ms: u64) bool {
+    const session = &session_runtime.session;
     if (!sessionReapEnabled(session)) return false;
     const deadline_ms = session.detached_at_unix_ms +| session.reap_ms;
     if (now_unix_ms < deadline_ms) return false;
-    logSessionAgent(session_agent, "event=reaped id={s} detached_at_ms={} reap_ms={}", .{
+    logSessionRuntime(session_runtime, "event=reaped id={s} detached_at_ms={} reap_ms={}", .{
         session.idSlice(),
         session.detached_at_unix_ms,
         session.reap_ms,
     });
-    endSession(session_agent, 3, .{ .ended_at_unix_ms = now_unix_ms });
+    endSession(session_runtime, 3, .{ .ended_at_unix_ms = now_unix_ms });
     return true;
 }
 
@@ -1384,38 +1507,31 @@ fn sessionReapEnabled(session: *const Session) bool {
 }
 
 test "remote session runtime poll timeout includes reap deadline" {
-    var session_agent = SessionAgent{};
-    session_agent.session = .{
+    var session_runtime = SessionRuntime{};
+    session_runtime.session = .{
         .alive = true,
         .attached = false,
         .detached_at_unix_ms = 1_000,
         .reap_ms = 5_000,
     };
 
-    try std.testing.expectEqual(@as(i32, 5_000), sessionAgentPollTimeoutMs(&session_agent, 0, 1_000));
-    try std.testing.expectEqual(@as(i32, 1), sessionAgentPollTimeoutMs(&session_agent, 0, 5_999));
-    try std.testing.expectEqual(@as(i32, 0), sessionAgentPollTimeoutMs(&session_agent, 0, 6_000));
+    try std.testing.expectEqual(@as(i32, 5_000), sessionRuntimePollTimeoutMs(&session_runtime, 0, 1_000));
+    try std.testing.expectEqual(@as(i32, 1), sessionRuntimePollTimeoutMs(&session_runtime, 0, 5_999));
+    try std.testing.expectEqual(@as(i32, 0), sessionRuntimePollTimeoutMs(&session_runtime, 0, 6_000));
 
-    session_agent.session.attached = true;
-    try std.testing.expectEqual(@as(i32, -1), sessionAgentPollTimeoutMs(&session_agent, 0, 6_000));
+    session_runtime.session.attached = true;
+    try std.testing.expectEqual(@as(i32, -1), sessionRuntimePollTimeoutMs(&session_runtime, 0, 6_000));
 }
 
-fn flushExpiredSynchronizedOutputSessions(session_agent: *SessionAgent, now_ms: i64) void {
-    const session = &session_agent.session;
+fn flushExpiredSynchronizedOutputSessions(session_runtime: *SessionRuntime, now_ms: i64) void {
+    const session = &session_runtime.session;
     if (!session.alive or session.synchronized_output_since_ms == 0) return;
     if (now_ms - session.synchronized_output_since_ms < synchronized_output_max_hold_ms) return;
-    broadcastSessionPatch(session_agent);
+    broadcastSessionPatch(session_runtime);
     if (session.alive) {
         session.clearPendingPlainOutput();
         session.synchronized_output_since_ms = now_ms;
     }
-}
-
-fn handleRuntimeRepairEvent(session_agent: *SessionAgent, listen_fd: *c.fd_t, runtime_repair_fd: c.fd_t) void {
-    drainSignalPipe(runtime_repair_fd);
-    repairSessionAgentRuntime(session_agent, listen_fd) catch |err| {
-        logSessionAgent(session_agent, "event=runtime_repair_failed error={t}", .{err});
-    };
 }
 
 fn drainSignalPipe(fd: c.fd_t) void {
@@ -1423,73 +1539,50 @@ fn drainSignalPipe(fd: c.fd_t) void {
     _ = c.read(fd, &buf, buf.len);
 }
 
-fn repairSessionAgentRuntime(session_agent: *SessionAgent, listen_fd: *c.fd_t) !void {
-    const paths = session_agent.session_paths orelse return;
-    const socket_was_missing = !try socketPathIsSocket(paths.socket);
-
-    try session_registry.ensureRuntimeLayout(app_allocator.allocator(), paths);
-    try writeAgentCompatBinary(paths);
-    try session_registry.writeMeta(paths, c.getpid(), config.version);
-
-    if (socket_was_missing or !try socketPathIsSocket(paths.socket)) {
-        const new_listen_fd = try socket_transport.listenSocket(paths.socket);
-        const old_listen_fd = listen_fd.*;
-        listen_fd.* = new_listen_fd;
-        _ = c.close(old_listen_fd);
-        logSessionAgent(session_agent, "event=runtime_socket_rebound socket={s}", .{paths.socket});
-    }
+fn setNonBlockingFd(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
+    if ((flags & nonblocking_flag) != 0) return;
+    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
 }
 
-fn socketPathIsSocket(path: []const u8) !bool {
-    const path_z = try app_allocator.allocator().dupeZ(u8, path);
-    defer app_allocator.allocator().free(path_z);
-    var stat: c.Stat = undefined;
-    switch (posix.errno(c.fstatat(c.AT.FDCWD, path_z.ptr, &stat, c.AT.SYMLINK_NOFOLLOW))) {
-        .SUCCESS => return c.S.ISSOCK(stat.mode),
-        .NOENT, .NOTDIR => return false,
-        else => return error.SocketStatFailed,
-    }
-}
-
-fn handleShutdownSignalEvent(session_agent: *SessionAgent, shutdown_signal_fd: c.fd_t) void {
+fn handleShutdownSignalEvent(session_runtime: *SessionRuntime, shutdown_signal_fd: c.fd_t) void {
     var buf: [32]u8 = undefined;
     _ = c.read(shutdown_signal_fd, &buf, buf.len);
-    requestGracefulShutdown(session_agent);
+    requestGracefulShutdown(session_runtime);
 }
 
-fn handleAttachedClientEvents(session_agent: *SessionAgent, revents: i16) void {
+fn handleAttachedClientEvents(session_runtime: *SessionRuntime, revents: i16) void {
     if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     }
     if ((revents & posix.POLL.OUT) != 0) {
-        flushAttachedClientOutput(session_agent);
+        flushAttachedClientOutput(session_runtime);
     }
-    if (!session_agent.attached_client.active) return;
-    if (session_agent.attached_client.close_after_flush) return;
+    if (!session_runtime.attached_client.active) return;
+    if (session_runtime.attached_client.close_after_flush) return;
     if ((revents & posix.POLL.IN) != 0) {
-        drainAttachedClientInput(session_agent);
+        drainAttachedClientInput(session_runtime);
     }
 }
 
-fn acceptSessionAgentClient(session_agent: *SessionAgent, listen_fd: c.fd_t) void {
-    const client_fd = c.accept(listen_fd, null, null);
-    if (client_fd < 0) return;
-    socket_transport.setCloseOnExec(client_fd) catch {
-        _ = c.close(client_fd);
-        return;
-    };
+fn handleRuntimeHandoffEvent(session_runtime: *SessionRuntime, control: *RuntimeControl) void {
+    drainSignalPipe(control.notify_read_fd);
 
-    const keep_open = handleSessionAgentClient(session_agent, client_fd) catch |err| blk: {
-        logSessionAgent(session_agent, "event=client_error error={t}", .{err});
-        io.stderrPrint("sessh remote session runtime: client error: {t}\n", .{err}) catch {};
-        break :blk false;
-    };
-    if (!keep_open) _ = c.close(client_fd);
+    while (control.takePending()) |client_fd| {
+        const keep_open = handleSessionRuntimeClient(session_runtime, client_fd) catch |err| blk: {
+            logSessionRuntime(session_runtime, "event=client_error error={t}", .{err});
+            io.stderrPrint("sessh remote session runtime: client error: {t}\n", .{err}) catch {};
+            break :blk false;
+        };
+        if (!keep_open) _ = c.close(client_fd);
+    }
 }
 
-fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
-    const handshake_result = try acceptRemoteHandshake(session_agent, fd);
+fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !bool {
+    const handshake_result = try acceptRemoteHandshake(session_runtime, fd);
     if (handshake_result == .mismatch) return false;
 
     while (true) {
@@ -1511,23 +1604,23 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     var request = try attachRequestFromOpen(open);
                     defer request.deinit();
                     if (request.session_guid.len == 0) return error.MissingSessionGuid;
-                    const session = findSession(session_agent, request.session_guid);
+                    const session = findSession(session_runtime, request.session_guid);
                     const resolved_session = session orelse {
-                        try sendError(session_agent, fd, "SESSION_NOT_FOUND", "session not found", "");
+                        try sendError(session_runtime, fd, "SESSION_NOT_FOUND", "session not found", "");
                         return false;
                     };
                     updateSessionSize(resolved_session, request.resize.rows, request.resize.cols);
-                    try attachSession(session_agent, fd, request.resize, request.capture_tty_transcript);
+                    try attachSession(session_runtime, fd, request.resize, request.capture_tty_transcript);
                     return true;
                 }
 
                 var request = readSessionCreateRequest(frame.payload) catch {
-                    try sendError(session_agent, fd, "PROTOCOL_ERROR", "invalid terminal stream open payload", "");
+                    try sendError(session_runtime, fd, "PROTOCOL_ERROR", "invalid terminal stream open payload", "");
                     return false;
                 };
                 defer request.deinit();
                 const session = try createSession(
-                    session_agent,
+                    session_runtime,
                     request.resize.rows,
                     request.resize.cols,
                     request.scrollback_row_count,
@@ -1539,57 +1632,57 @@ fn handleSessionAgentClient(session_agent: *SessionAgent, fd: c.fd_t) !bool {
                     request.tty_settings,
                     request.reap_ms,
                 );
-                if (session_agent.session_paths) |paths| {
+                if (session_runtime.session_paths) |paths| {
                     try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), paths.dir, config.version);
                 }
-                try attachSession(session_agent, fd, request.resize, request.capture_tty_transcript);
+                try attachSession(session_runtime, fd, request.resize, request.capture_tty_transcript);
                 return true;
             },
             .te_session_client_debug_sever_connection_request => {
-                try handleSessionClientDebugSeverConnectionRequest(session_agent, fd, frame.payload);
+                try handleSessionClientDebugSeverConnectionRequest(session_runtime, fd, frame.payload);
                 return false;
             },
             .te_session_client_debug_unresponsive_connection_request => {
-                try handleSessionClientDebugUnresponsiveConnectionRequest(session_agent, fd, frame.payload);
+                try handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime, fd, frame.payload);
                 return false;
             },
             else => {
-                try sendError(session_agent, fd, "PROTOCOL_ERROR", "unexpected first action", "");
+                try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected first action", "");
                 return false;
             },
         }
     }
 }
 
-fn requestGracefulShutdown(session_agent: *SessionAgent) void {
-    if (session_agent.shutting_down) return;
-    session_agent.shutting_down = true;
-    logSessionAgent(session_agent, "event=session_agent_shutdown_requested", .{});
-    if (session_agent.session.alive) endSession(session_agent, 1, .{ .ended_at_unix_ms = nowUnixMs() });
+fn requestGracefulShutdown(session_runtime: *SessionRuntime) void {
+    if (session_runtime.shutting_down) return;
+    session_runtime.shutting_down = true;
+    logSessionRuntime(session_runtime, "event=session_runtime_shutdown_requested", .{});
+    if (session_runtime.session.alive) endSession(session_runtime, 1, .{ .ended_at_unix_ms = nowUnixMs() });
 }
 
-fn openSessionAgentLog(session_agent: *SessionAgent, paths: session_registry.SessionPaths) !void {
-    const log_path = try sessionAgentLogPath(app_allocator.allocator(), paths);
+fn openSessionRuntimeLog(session_runtime: *SessionRuntime, paths: session_registry.SessionPaths) !void {
+    const log_path = try sessionRuntimeLogPath(app_allocator.allocator(), paths);
     defer app_allocator.allocator().free(log_path);
     const log_dir = std.fs.path.dirname(log_path) orelse return error.InvalidLogPath;
     try std.fs.cwd().makePath(log_dir);
-    session_agent.log_file = try std.fs.createFileAbsolute(log_path, .{ .truncate = true, .mode = 0o600 });
+    session_runtime.log_file = try std.fs.createFileAbsolute(log_path, .{ .truncate = true, .mode = 0o600 });
 }
 
-fn sessionAgentLogPath(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) ![]u8 {
+fn sessionRuntimeLogPath(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) ![]u8 {
     const state_session_dir = std.fs.path.dirname(paths.route) orelse return error.InvalidRoutePath;
-    return std.fmt.allocPrint(allocator, "{s}/agent.log", .{state_session_dir});
+    return std.fmt.allocPrint(allocator, "{s}/runtime.log", .{state_session_dir});
 }
 
-fn closeSessionAgentLog(session_agent: *SessionAgent) void {
-    if (session_agent.log_file) |*file| {
+fn closeSessionRuntimeLog(session_runtime: *SessionRuntime) void {
+    if (session_runtime.log_file) |*file| {
         file.close();
-        session_agent.log_file = null;
+        session_runtime.log_file = null;
     }
 }
 
-fn logSessionAgent(session_agent: *SessionAgent, comptime fmt: []const u8, args: anytype) void {
-    if (session_agent.log_file) |*file| {
+fn logSessionRuntime(session_runtime: *SessionRuntime, comptime fmt: []const u8, args: anytype) void {
+    if (session_runtime.log_file) |*file| {
         var body_buf: [384]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf, fmt, args) catch return;
         var line_buf: [512]u8 = undefined;
@@ -1598,7 +1691,7 @@ fn logSessionAgent(session_agent: *SessionAgent, comptime fmt: []const u8, args:
     }
 }
 
-fn acceptRemoteHandshake(session_agent: *SessionAgent, fd: c.fd_t) !HandshakeResult {
+fn acceptRemoteHandshake(session_runtime: *SessionRuntime, fd: c.fd_t) !HandshakeResult {
     var peer_hello = try readHelloRequest(fd);
     defer peer_hello.deinit(app_allocator.allocator());
     if (!helloRequestIsCompatible(peer_hello)) {
@@ -1610,7 +1703,7 @@ fn acceptRemoteHandshake(session_agent: *SessionAgent, fd: c.fd_t) !HandshakeRes
     var hello_error = try readHelloReply(fd);
     defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
     if (hello_error) |err| {
-        logSessionAgent(session_agent, "event=handshake_rejected code={s} message={s}", .{
+        logSessionRuntime(session_runtime, "event=handshake_rejected code={s} message={s}", .{
             err.code,
             err.message,
         });
@@ -1682,8 +1775,8 @@ fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
     try protocol.sendFrame(fd, .hello_error, payload);
 }
 
-fn sendError(session_agent: *SessionAgent, fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    logSessionAgent(session_agent, "event=error code={s} message={s}", .{ code, message });
+fn sendError(session_runtime: *SessionRuntime, fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
+    logSessionRuntime(session_runtime, "event=error code={s} message={s}", .{ code, message });
     try sendErrorFrame(fd, code, message, hint);
 }
 
@@ -1697,8 +1790,8 @@ fn sendErrorFrame(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
     try protocol.sendFrame(fd, .error_message, payload);
 }
 
-fn queueAttachedClientError(session_agent: *SessionAgent, attached_client: *AttachedClient, code: []const u8, message: []const u8, hint: []const u8) !void {
-    logSessionAgent(session_agent, "event=error code={s} message={s}", .{ code, message });
+fn queueAttachedClientError(session_runtime: *SessionRuntime, attached_client: *AttachedClient, code: []const u8, message: []const u8, hint: []const u8) !void {
+    logSessionRuntime(session_runtime, "event=error code={s} message={s}", .{ code, message });
     const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
         .code = code,
         .message = message,
@@ -1740,18 +1833,18 @@ fn compactAttachedClientOutput(attached_client: *AttachedClient) void {
     attached_client.output_offset = 0;
 }
 
-fn flushAttachedClientOutput(session_agent: *SessionAgent) void {
-    const attached_client = &session_agent.attached_client;
+fn flushAttachedClientOutput(session_runtime: *SessionRuntime) void {
+    const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
     if (attached_client.debug_unresponsive_until_ms != 0) {
-        const now_ms = sessionAgentMonotonicMs(session_agent);
+        const now_ms = sessionRuntimeMonotonicMs(session_runtime);
         if (attached_client.debug_unresponsive_until_ms > now_ms) return;
         attached_client.debug_unresponsive_until_ms = 0;
     }
 
     while (attached_client.output_offset < attached_client.output.items.len) {
         const result = io.writeSomeNonBlocking(attached_client.fd, attached_client.output.items[attached_client.output_offset..]) catch {
-            detachAttachedClient(session_agent);
+            detachAttachedClient(session_runtime);
             return;
         };
         switch (result) {
@@ -1767,43 +1860,43 @@ fn flushAttachedClientOutput(session_agent: *SessionAgent) void {
         attached_client.output.clearRetainingCapacity();
         attached_client.output_offset = 0;
         if (attached_client.close_after_flush) {
-            detachAttachedClient(session_agent);
+            detachAttachedClient(session_runtime);
         }
     }
 }
 
-fn sendSessionAttachedForSession(session_agent: *const SessionAgent, attached_client: *AttachedClient, session: *const Session) !void {
+fn sendSessionAttachedForSession(session_runtime: *const SessionRuntime, attached_client: *AttachedClient, session: *const Session) !void {
     const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionAttached{
         .session_guid = session.idSlice(),
-        .session_dir = sessionDirSlice(session_agent),
+        .session_dir = sessionDirSlice(session_runtime),
     });
     defer app_allocator.allocator().free(payload);
     try queueAttachedClientFrame(attached_client, .te_session_attached, payload);
 }
 
-fn handleSessionClientDebugSeverConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
+fn handleSessionClientDebugSeverConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, payload: []const u8) !void {
     var request = try protocol.decodePayload(pb.TeSessionClientDebugSeverConnectionRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
-    const attached_client = &session_agent.attached_client;
+    const attached_client = &session_runtime.attached_client;
     if (!attached_client.active or attached_client.close_after_flush) {
-        try sendError(session_agent, fd, "NO_ATTACHED_CLIENTS", "no attached clients", "");
+        try sendError(session_runtime, fd, "NO_ATTACHED_CLIENTS", "no attached clients", "");
         return;
     }
-    detachAttachedClient(session_agent);
+    detachAttachedClient(session_runtime);
     try sendClientControlResponse(fd);
 }
 
-fn handleSessionClientDebugUnresponsiveConnectionRequest(session_agent: *SessionAgent, fd: c.fd_t, payload: []const u8) !void {
+fn handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, payload: []const u8) !void {
     var request = try protocol.decodePayload(pb.TeSessionClientDebugUnresponsiveConnectionRequest, app_allocator.allocator(), payload);
     defer request.deinit(app_allocator.allocator());
     const seconds = if (request.seconds == 0)
         config.default_debug_unresponsive_seconds
     else
         request.seconds;
-    const until_ms = sessionAgentMonotonicMs(session_agent) + @as(i64, seconds) * std.time.ms_per_s;
-    const attached_client = &session_agent.attached_client;
+    const until_ms = sessionRuntimeMonotonicMs(session_runtime) + @as(i64, seconds) * std.time.ms_per_s;
+    const attached_client = &session_runtime.attached_client;
     if (!attached_client.active or attached_client.close_after_flush) {
-        try sendError(session_agent, fd, "NO_ATTACHED_CLIENTS", "no attached clients", "");
+        try sendError(session_runtime, fd, "NO_ATTACHED_CLIENTS", "no attached clients", "");
         return;
     }
     attached_client.debug_unresponsive_until_ms = until_ms;
@@ -1816,8 +1909,8 @@ fn sendClientControlResponse(fd: c.fd_t) !void {
     try protocol.sendFrame(fd, .te_session_client_control_response, response_payload);
 }
 
-fn sessionDirSlice(session_agent: *const SessionAgent) []const u8 {
-    return if (session_agent.session_paths) |paths| paths.dir else "";
+fn sessionDirSlice(session_runtime: *const SessionRuntime) []const u8 {
+    return if (session_runtime.session_paths) |paths| paths.dir else "";
 }
 
 fn sendSessionEnded(attached_client: *AttachedClient, reason: u8, exit_info: ExitInfo) !void {
@@ -1855,16 +1948,16 @@ fn queueTtyTranscriptChunk(
 }
 
 fn queueTtyTranscriptChunkForSession(
-    session_agent: *SessionAgent,
+    session_runtime: *SessionRuntime,
     stream: pb.TeTtyTranscriptStream,
     bytes: []const u8,
 ) void {
     if (bytes.len == 0) return;
-    const attached_client = &session_agent.attached_client;
+    const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
     if (attached_client.close_after_flush or !attached_client.capture_tty_transcript) return;
     queueTtyTranscriptChunk(attached_client, stream, bytes) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
     };
 }
 
@@ -2562,7 +2655,7 @@ fn repaintRequestFromMessage(message: pb.TeRepaintRequest) !RepaintRequest {
 }
 
 fn createSession(
-    session_agent: *SessionAgent,
+    session_runtime: *SessionRuntime,
     rows: u16,
     cols: u16,
     scrollback_row_count: u32,
@@ -2574,7 +2667,7 @@ fn createSession(
     settings: ?tty_settings.Settings,
     reap_ms: u64,
 ) !*Session {
-    if (session_agent.started_session or session_agent.session.alive or session_agent.attached_client.active) return error.TooManySessions;
+    if (session_runtime.started_session or session_runtime.session.alive or session_runtime.attached_client.active) return error.TooManySessions;
 
     const terminal_model = try vt.SessionTerminal.createWithDefaultColors(
         app_allocator.allocator(),
@@ -2602,7 +2695,7 @@ fn createSession(
         .tty_settings = settings,
     });
 
-    const session = &session_agent.session;
+    const session = &session_runtime.session;
     session.* = Session{
         .pid = child.pid,
         .pty_fd = child.master_fd,
@@ -2615,8 +2708,8 @@ fn createSession(
     };
     @memcpy(session.id[0..session_guid.len], session_guid);
     session.id_len = session_guid.len;
-    session_agent.started_session = true;
-    logSessionAgent(session_agent, "event=session_create id={s} pid={} rows={} cols={} scrollback_rows={} shell={s} command_argc={} shell_command={}", .{
+    session_runtime.started_session = true;
+    logSessionRuntime(session_runtime, "event=session_create id={s} pid={} rows={} cols={} scrollback_rows={} shell={s} command_argc={} shell_command={}", .{
         session.idSlice(),
         child.pid,
         rows,
@@ -2741,15 +2834,15 @@ test "default shell prefers process environment then passwd then sh" {
 }
 
 fn attachSession(
-    session_agent: *SessionAgent,
+    session_runtime: *SessionRuntime,
     client_fd: c.fd_t,
     resize: ResizePayload,
     capture_tty_transcript: bool,
 ) !void {
-    const session = &session_agent.session;
-    detachAttachedClient(session_agent);
+    const session = &session_runtime.session;
+    detachAttachedClient(session_runtime);
 
-    const attached_client = &session_agent.attached_client;
+    const attached_client = &session_runtime.attached_client;
     attached_client.* = .{
         .fd = client_fd,
         .rows = resize.rows,
@@ -2763,23 +2856,23 @@ fn attachSession(
         attached_client.output.deinit(app_allocator.allocator());
         attached_client.* = AttachedClient{};
     }
-    try sendSessionAttachedForSession(session_agent, attached_client, session);
+    try sendSessionAttachedForSession(session_runtime, attached_client, session);
     if (resize.repaint_request) |request| {
         try sendSessionRepaintSnapshot(attached_client, session, request);
     } else {
         try sendSessionSnapshot(attached_client, session);
     }
-    refreshAttachedFlag(session_agent);
-    logSessionAgent(session_agent, "event=attach id={s} rows={} cols={} attached_client=1", .{
+    refreshAttachedFlag(session_runtime);
+    logSessionRuntime(session_runtime, "event=attach id={s} rows={} cols={} attached_client=1", .{
         session.idSlice(),
         resize.rows,
         resize.cols,
     });
-    flushAttachedClientOutput(session_agent);
+    flushAttachedClientOutput(session_runtime);
 }
 
-fn updateSynchronizedOutputState(session_agent: *SessionAgent, now_ms: i64) bool {
-    const session = &session_agent.session;
+fn updateSynchronizedOutputState(session_runtime: *SessionRuntime, now_ms: i64) bool {
+    const session = &session_runtime.session;
     const model = session.terminal_model orelse {
         session.synchronized_output_since_ms = 0;
         return false;
@@ -2794,18 +2887,18 @@ fn updateSynchronizedOutputState(session_agent: *SessionAgent, now_ms: i64) bool
     return true;
 }
 
-fn shouldDeferSynchronizedOutput(session_agent: *SessionAgent, now_ms: i64) bool {
-    const session = &session_agent.session;
-    if (!updateSynchronizedOutputState(session_agent, now_ms)) return false;
+fn shouldDeferSynchronizedOutput(session_runtime: *SessionRuntime, now_ms: i64) bool {
+    const session = &session_runtime.session;
+    if (!updateSynchronizedOutputState(session_runtime, now_ms)) return false;
     return now_ms - session.synchronized_output_since_ms < synchronized_output_max_hold_ms;
 }
 
-fn drainSessionOutput(session_agent: *SessionAgent) void {
-    const session = &session_agent.session;
+fn drainSessionOutput(session_runtime: *SessionRuntime) void {
+    const session = &session_runtime.session;
     if (!session.alive) return;
 
     var context = SessionPtyDrainContext{
-        .session_agent = session_agent,
+        .session_runtime = session_runtime,
     };
     const result = pty_process.drainMasterNonBlocking(
         session.pty_fd,
@@ -2816,19 +2909,19 @@ fn drainSessionOutput(session_agent: *SessionAgent) void {
             .max_bytes = preferred_live_output_batch_bytes,
         },
     ) catch {
-        endSessionFromPtyClose(session_agent);
+        endSessionFromPtyClose(session_runtime);
         return;
     };
     if (!session.alive) return;
     if (result.eof) {
-        endSessionFromPtyEof(session_agent);
+        endSessionFromPtyEof(session_runtime);
         return;
     }
     if (result.read_count == 0) return;
 
-    const now_ms = sessionAgentMonotonicMs(session_agent);
-    if (shouldDeferSynchronizedOutput(session_agent, now_ms)) return;
-    broadcastSessionPatch(session_agent);
+    const now_ms = sessionRuntimeMonotonicMs(session_runtime);
+    if (shouldDeferSynchronizedOutput(session_runtime, now_ms)) return;
+    broadcastSessionPatch(session_runtime);
     if (session.alive) {
         session.clearPendingPlainOutput();
         if (session.synchronized_output_since_ms != 0) {
@@ -2838,16 +2931,16 @@ fn drainSessionOutput(session_agent: *SessionAgent) void {
 }
 
 const SessionPtyDrainContext = struct {
-    session_agent: *SessionAgent,
+    session_runtime: *SessionRuntime,
 };
 
 fn feedSessionPtyBytes(context: *SessionPtyDrainContext, bytes: []const u8) !void {
-    const session_agent = context.session_agent;
-    if (!session_agent.session.alive) return error.SessionEndedDuringPtyDrain;
+    const session_runtime = context.session_runtime;
+    if (!session_runtime.session.alive) return error.SessionEndedDuringPtyDrain;
 
-    try feedSessionOutputBytes(session_agent, bytes);
+    try feedSessionOutputBytes(session_runtime, bytes);
 
-    const session = &session_agent.session;
+    const session = &session_runtime.session;
     const model = session.terminal_model orelse return;
     const input_responses = model.pendingInputResponses();
     if (input_responses.len == 0) return;
@@ -2856,17 +2949,17 @@ fn feedSessionPtyBytes(context: *SessionPtyDrainContext, bytes: []const u8) !voi
 }
 
 const RenderBarrierContext = struct {
-    session_agent: *SessionAgent,
+    session_runtime: *SessionRuntime,
 };
 
 fn handleSessionRenderBarrier(context: *anyopaque, model: *vt.SessionTerminal, barrier: vt.RenderBarrier) anyerror!void {
     _ = model;
     const barrier_context: *RenderBarrierContext = @ptrCast(@alignCast(context));
-    try flushSessionRenderBarrier(barrier_context.session_agent, barrier);
+    try flushSessionRenderBarrier(barrier_context.session_runtime, barrier);
 }
 
-fn flushSessionRenderBarrier(session_agent: *SessionAgent, barrier: vt.RenderBarrier) !void {
-    const session = &session_agent.session;
+fn flushSessionRenderBarrier(session_runtime: *SessionRuntime, barrier: vt.RenderBarrier) !void {
+    const session = &session_runtime.session;
     if (!session.alive) return;
     const model = session.terminal_model orelse return;
 
@@ -2875,79 +2968,79 @@ fn flushSessionRenderBarrier(session_agent: *SessionAgent, barrier: vt.RenderBar
     // cross this boundary because the bytes before the barrier are already
     // inside the VT model and may not match the bytes currently buffered here.
     session.clearPendingPlainOutput();
-    broadcastSessionPatch(session_agent);
+    broadcastSessionPatch(session_runtime);
     session.clearPendingPlainOutput();
 
     if (!session.alive) return;
     const scrollback_cursor = try model.scrollbackCursor();
-    const attached_client = &session_agent.attached_client;
+    const attached_client = &session_runtime.attached_client;
     if (!attached_client.active or attached_client.close_after_flush) return;
     queueRenderBarrierDraw(attached_client, session, barrier, scrollback_cursor) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     };
-    flushAttachedClientOutput(session_agent);
+    flushAttachedClientOutput(session_runtime);
 }
 
-fn feedSessionOutputBytes(session_agent: *SessionAgent, bytes: []const u8) !void {
-    const session = &session_agent.session;
-    queueTtyTranscriptChunkForSession(session_agent, .TE_TTY_TRANSCRIPT_STREAM_INNER_OUT, bytes);
+fn feedSessionOutputBytes(session_runtime: *SessionRuntime, bytes: []const u8) !void {
+    const session = &session_runtime.session;
+    queueTtyTranscriptChunkForSession(session_runtime, .TE_TTY_TRANSCRIPT_STREAM_INNER_OUT, bytes);
     if (session.terminal_model) |model| {
         const starts_at_boundary = model.isPlainTextParserBoundary();
         var barrier_context = RenderBarrierContext{
-            .session_agent = session_agent,
+            .session_runtime = session_runtime,
         };
         const saw_render_barrier = try model.feedWithRenderBarriers(
             bytes,
             &barrier_context,
             handleSessionRenderBarrier,
         );
-        if (!saw_render_barrier and hasActiveAttachedClient(session_agent)) {
+        if (!saw_render_barrier and hasActiveAttachedClient(session_runtime)) {
             try session.appendPendingPlainOutput(bytes, starts_at_boundary);
         }
     }
 }
 
-fn drainAttachedClientInput(session_agent: *SessionAgent) void {
-    const attached_client = &session_agent.attached_client;
+fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
+    const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
-    const session = &session_agent.session;
+    const session = &session_runtime.session;
     if (!session.alive) {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     }
 
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), attached_client.fd) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     };
     defer frame.deinit(app_allocator.allocator());
 
     switch (frame.message_type) {
-        .te_input => handleInputFrame(session_agent, frame.payload),
-        .te_resize => handleResizeFrame(session_agent, frame.payload),
-        .te_repaint_request => handleRepaintFrame(session_agent, frame.payload),
+        .te_input => handleInputFrame(session_runtime, frame.payload),
+        .te_resize => handleResizeFrame(session_runtime, frame.payload),
+        .te_repaint_request => handleRepaintFrame(session_runtime, frame.payload),
         .ping, .pong => {
             _ = protocol.handleTransportControlFrame(frame.message_type, frame.payload, attached_client.fd) catch {
-                detachAttachedClient(session_agent);
+                detachAttachedClient(session_runtime);
                 return;
             };
         },
         else => {
-            queueAttachedClientError(session_agent, attached_client, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
-                detachAttachedClient(session_agent);
+            queueAttachedClientError(session_runtime, attached_client, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
+                detachAttachedClient(session_runtime);
                 return;
             };
-            closeAttachedClientAfterFlush(session_agent);
+            closeAttachedClientAfterFlush(session_runtime);
         },
     }
 }
 
-fn handleInputFrame(session_agent: *SessionAgent, payload: []const u8) void {
-    const attached_client = &session_agent.attached_client;
-    const session = &session_agent.session;
+fn handleInputFrame(session_runtime: *SessionRuntime, payload: []const u8) void {
+    const attached_client = &session_runtime.attached_client;
+    const session = &session_runtime.session;
     var input = protocol.decodePayload(pb.TeInput, app_allocator.allocator(), payload) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     };
     defer input.deinit(app_allocator.allocator());
@@ -2957,15 +3050,15 @@ fn handleInputFrame(session_agent: *SessionAgent, payload: []const u8) void {
         const ack_payload = protocol.encodePayload(app_allocator.allocator(), pb.TeInputAck{
             .input_seq = input.input_seq,
         }) catch {
-            detachAttachedClient(session_agent);
+            detachAttachedClient(session_runtime);
             return;
         };
         defer app_allocator.allocator().free(ack_payload);
         queueAttachedClientFrame(attached_client, .te_input_ack, ack_payload) catch {
-            detachAttachedClient(session_agent);
+            detachAttachedClient(session_runtime);
             return;
         };
-        flushAttachedClientOutput(session_agent);
+        flushAttachedClientOutput(session_runtime);
     }
 
     if (session.rows != attached_client.rows or session.cols != attached_client.cols) {
@@ -2975,19 +3068,19 @@ fn handleInputFrame(session_agent: *SessionAgent, payload: []const u8) void {
     var translated = std.ArrayList(u8).empty;
     defer translated.deinit(app_allocator.allocator());
     translateAttachedClientInput(attached_client, session, input.data, &translated) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     };
     if (translated.items.len == 0) return;
 
     queueTtyTranscriptChunk(attached_client, .TE_TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     };
-    flushAttachedClientOutput(session_agent);
+    flushAttachedClientOutput(session_runtime);
 
     io.writeAll(session.pty_fd, translated.items) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     };
 }
@@ -3416,11 +3509,11 @@ test "bare escape is not held by kitty keyboard translation" {
     try std.testing.expectEqual(@as(usize, 0), attached_client.input_pending_len);
 }
 
-fn handleResizeFrame(session_agent: *SessionAgent, payload: []const u8) void {
-    const attached_client = &session_agent.attached_client;
-    const session = &session_agent.session;
+fn handleResizeFrame(session_runtime: *SessionRuntime, payload: []const u8) void {
+    const attached_client = &session_runtime.attached_client;
+    const session = &session_runtime.session;
     const resize = readResizePayload(payload) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     };
     const reset_for_screen_repaint = resize.repaint_request != null and
@@ -3431,47 +3524,47 @@ fn handleResizeFrame(session_agent: *SessionAgent, payload: []const u8) void {
     attached_client.presentation.setViewportOffset(resize.viewport_offset);
     updateSessionSize(session, resize.rows, resize.cols);
     if (resize.repaint_request) |request| {
-        handleRepaintRequest(session_agent, request);
+        handleRepaintRequest(session_runtime, request);
     }
 }
 
-fn handleRepaintFrame(session_agent: *SessionAgent, payload: []const u8) void {
+fn handleRepaintFrame(session_runtime: *SessionRuntime, payload: []const u8) void {
     const request = readRepaintRequest(payload) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     };
-    handleRepaintRequest(session_agent, request);
+    handleRepaintRequest(session_runtime, request);
 }
 
-fn handleRepaintRequest(session_agent: *SessionAgent, request: RepaintRequest) void {
-    const attached_client = &session_agent.attached_client;
-    const session = &session_agent.session;
+fn handleRepaintRequest(session_runtime: *SessionRuntime, request: RepaintRequest) void {
+    const attached_client = &session_runtime.attached_client;
+    const session = &session_runtime.session;
 
     const model = session.terminal_model orelse return;
     const clear_for_replace = request.scrollback_cursor != null and
         request.scrollback_cursor.?.per_epoch_cursor == 0 and
         request.initial_scrollback_rows == null;
     const screen_rows = queueRepaintSnapshot(attached_client, session, request, clear_for_replace) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     };
     model.markRendered(screen_rows);
-    flushAttachedClientOutput(session_agent);
+    flushAttachedClientOutput(session_runtime);
 }
 
-fn broadcastSessionPatch(session_agent: *SessionAgent) void {
-    if (!hasActiveAttachedClient(session_agent)) return;
+fn broadcastSessionPatch(session_runtime: *SessionRuntime) void {
+    if (!hasActiveAttachedClient(session_runtime)) return;
 
-    const session = &session_agent.session;
+    const session = &session_runtime.session;
     const model = session.terminal_model orelse return;
     var scrollback = model.scrollbackDelta(app_allocator.allocator()) catch {
-        endSessionFromPtyClose(session_agent);
+        endSessionFromPtyClose(session_runtime);
         return;
     };
     defer scrollback.deinit(app_allocator.allocator());
 
     var screen = model.renderedScreen(app_allocator.allocator()) catch {
-        endSessionFromPtyClose(session_agent);
+        endSessionFromPtyClose(session_runtime);
         return;
     };
     defer screen.deinit(app_allocator.allocator());
@@ -3499,17 +3592,17 @@ fn broadcastSessionPatch(session_agent: *SessionAgent) void {
     defer if (primary_screen) |*primary| primary.deinit(app_allocator.allocator());
     if ((should_send_screen_draw or scrollback.rows.len > 0) and screen.active_screen == 1) {
         primary_screen = model.renderedPrimaryScreen(app_allocator.allocator()) catch {
-            endSessionFromPtyClose(session_agent);
+            endSessionFromPtyClose(session_runtime);
             return;
         };
     }
     if (screen.retained_scrollback_clear_dirty) advanceScrollbackEpochForClear(session);
     var delivered = false;
-    const attached_client = &session_agent.attached_client;
+    const attached_client = &session_runtime.attached_client;
     if (attached_client.active and !attached_client.close_after_flush) {
         if (screen.retained_scrollback_clear_dirty) {
             queueRetainedScrollbackClearDraw(attached_client, session) catch {
-                detachAttachedClient(session_agent);
+                detachAttachedClient(session_runtime);
                 return;
             };
         }
@@ -3523,7 +3616,7 @@ fn broadcastSessionPatch(session_agent: *SessionAgent) void {
                 materialize_screen_after_scrollback,
                 scrollback.absolute_count,
             ) catch {
-                detachAttachedClient(session_agent);
+                detachAttachedClient(session_runtime);
                 return;
             };
         } else if (should_send_screen_draw) {
@@ -3536,11 +3629,11 @@ fn broadcastSessionPatch(session_agent: *SessionAgent) void {
                 materialize_screen_after_scrollback,
                 scrollback.absolute_count,
             ) catch {
-                detachAttachedClient(session_agent);
+                detachAttachedClient(session_runtime);
                 return;
             };
         }
-        flushAttachedClientOutput(session_agent);
+        flushAttachedClientOutput(session_runtime);
         if (attached_client.active) delivered = true;
     }
     if (delivered) {
@@ -3558,48 +3651,48 @@ fn broadcastSessionPatch(session_agent: *SessionAgent) void {
     }
 }
 
-fn hasActiveAttachedClient(session_agent: *const SessionAgent) bool {
-    const attached_client = &session_agent.attached_client;
+fn hasActiveAttachedClient(session_runtime: *const SessionRuntime) bool {
+    const attached_client = &session_runtime.attached_client;
     return attached_client.active and !attached_client.close_after_flush;
 }
 
-fn sendSessionEndedToAttachedClient(session_agent: *SessionAgent, reason: u8, exit_info: ExitInfo) void {
-    const attached_client = &session_agent.attached_client;
+fn sendSessionEndedToAttachedClient(session_runtime: *SessionRuntime, reason: u8, exit_info: ExitInfo) void {
+    const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
     sendSessionEnded(attached_client, reason, exit_info) catch {
-        detachAttachedClient(session_agent);
+        detachAttachedClient(session_runtime);
         return;
     };
-    closeAttachedClientAfterFlush(session_agent);
+    closeAttachedClientAfterFlush(session_runtime);
 }
 
-fn detachAttachedClient(session_agent: *SessionAgent) void {
-    const attached_client = &session_agent.attached_client;
+fn detachAttachedClient(session_runtime: *SessionRuntime) void {
+    const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
 
-    const session = &session_agent.session;
-    logSessionAgent(session_agent, "event=detach id={s} rows={} cols={}", .{ session.idSlice(), attached_client.rows, attached_client.cols });
+    const session = &session_runtime.session;
+    logSessionRuntime(session_runtime, "event=detach id={s} rows={} cols={}", .{ session.idSlice(), attached_client.rows, attached_client.cols });
     _ = c.close(attached_client.fd);
     attached_client.output.deinit(app_allocator.allocator());
     attached_client.* = AttachedClient{};
-    refreshAttachedFlag(session_agent);
+    refreshAttachedFlag(session_runtime);
 }
 
-fn closeAttachedClientAfterFlush(session_agent: *SessionAgent) void {
-    const attached_client = &session_agent.attached_client;
+fn closeAttachedClientAfterFlush(session_runtime: *SessionRuntime) void {
+    const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
     attached_client.close_after_flush = true;
-    flushAttachedClientOutput(session_agent);
+    flushAttachedClientOutput(session_runtime);
 }
 
-fn refreshAttachedFlag(session_agent: *SessionAgent) void {
-    const session = &session_agent.session;
+fn refreshAttachedFlag(session_runtime: *SessionRuntime) void {
+    const session = &session_runtime.session;
     if (!session.alive) {
         session.attached = false;
         return;
     }
 
-    const now_attached = hasActiveAttachedClient(session_agent);
+    const now_attached = hasActiveAttachedClient(session_runtime);
     const was_attached = session.attached;
     session.attached = now_attached;
     if (now_attached) {
@@ -3609,16 +3702,16 @@ fn refreshAttachedFlag(session_agent: *SessionAgent) void {
     }
 }
 
-fn endSession(session_agent: *SessionAgent, reason: u8, exit_info: ExitInfo) void {
-    const session = &session_agent.session;
+fn endSession(session_runtime: *SessionRuntime, reason: u8, exit_info: ExitInfo) void {
+    const session = &session_runtime.session;
     if (!session.alive) return;
 
-    broadcastSessionPatch(session_agent);
+    broadcastSessionPatch(session_runtime);
     session.clearPendingPlainOutput();
     session.synchronized_output_since_ms = 0;
 
     if (exit_info.kind != 0) {
-        logSessionAgent(session_agent, "event=session_end id={s} pid={} reason={} exit_kind={} status={} ended_at_ms={}", .{
+        logSessionRuntime(session_runtime, "event=session_end id={s} pid={} reason={} exit_kind={} status={} ended_at_ms={}", .{
             session.idSlice(),
             session.pid,
             reason,
@@ -3627,65 +3720,65 @@ fn endSession(session_agent: *SessionAgent, reason: u8, exit_info: ExitInfo) voi
             exit_info.ended_at_unix_ms,
         });
     } else {
-        logSessionAgent(session_agent, "event=session_end id={s} pid={} reason={} exit_kind=none status=none ended_at_ms={}", .{
+        logSessionRuntime(session_runtime, "event=session_end id={s} pid={} reason={} exit_kind=none status=none ended_at_ms={}", .{
             session.idSlice(),
             session.pid,
             reason,
             nowUnixMs(),
         });
     }
-    sendSessionEndedToAttachedClient(session_agent, reason, exit_info);
+    sendSessionEndedToAttachedClient(session_runtime, reason, exit_info);
     if (session.pty_fd >= 0) _ = c.close(session.pty_fd);
     if (session.terminal_model) |model| {
         model.destroy();
         session.terminal_model = null;
     }
-    removeEndedHints(session_agent);
+    removeEndedHints(session_runtime);
     session.deinit();
     session.alive = false;
     session.attached = false;
 }
 
-fn removeEndedHints(session_agent: *SessionAgent) void {
-    if (session_agent.session_paths) |paths| session_registry.removeEndedHints(paths) catch {};
+fn removeEndedHints(session_runtime: *SessionRuntime) void {
+    if (session_runtime.session_paths) |paths| session_registry.removeEndedHints(paths) catch {};
 }
 
-fn stopSessionAgentIfComplete(session_agent: *SessionAgent) void {
-    if (session_agent.shutting_down) {
-        if (session_agent.attached_client.active) return;
-        session_agent.running = false;
+fn stopSessionRuntimeIfComplete(session_runtime: *SessionRuntime) void {
+    if (session_runtime.shutting_down) {
+        if (session_runtime.attached_client.active) return;
+        session_runtime.running = false;
         return;
     }
-    if (session_agent.fixed_session_id == null or !session_agent.started_session) return;
-    if (session_agent.session.alive) return;
-    if (session_agent.attached_client.active) return;
-    session_agent.running = false;
+    if (session_runtime.fixed_session_id == null or !session_runtime.started_session) return;
+    if (session_runtime.session.alive) return;
+    if (session_runtime.attached_client.active) return;
+    session_runtime.running = false;
 }
 
-fn closeSessionAgent(session_agent: *SessionAgent) void {
-    detachAttachedClient(session_agent);
-    endSession(session_agent, 2, .{});
+fn closeSessionRuntime(session_runtime: *SessionRuntime) void {
+    detachAttachedClient(session_runtime);
+    endSession(session_runtime, 2, .{});
 }
 
-fn findSession(session_agent: *SessionAgent, id: []const u8) ?*Session {
-    const session = &session_agent.session;
+fn findSession(session_runtime: *SessionRuntime, id: []const u8) ?*Session {
+    const session = &session_runtime.session;
     if (session.alive and std.mem.eql(u8, session.idSlice(), id)) return session;
     return null;
 }
 
-fn endSessionFromPtyClose(session_agent: *SessionAgent) void {
-    endSession(session_agent, session_agent.session.end_reason, .{ .ended_at_unix_ms = nowUnixMs() });
+fn endSessionFromPtyClose(session_runtime: *SessionRuntime) void {
+    endSession(session_runtime, session_runtime.session.end_reason, .{ .ended_at_unix_ms = nowUnixMs() });
 }
 
-fn endSessionFromPtyEof(session_agent: *SessionAgent) void {
+fn endSessionFromPtyEof(session_runtime: *SessionRuntime) void {
     // Only ask for child status after PTY EOF. Exit status is useful metadata,
     // but checking it before PTY EOF can race with final terminal output that
     // still needs to be drained from the master fd.
-    if (waitForSessionExitInfo(session_agent.session.pid)) |exit_info| {
-        endSession(session_agent, session_agent.session.end_reason, exit_info);
+    if (waitForSessionExitInfo(session_runtime.session.pid)) |exit_info| {
+        endSession(session_runtime, session_runtime.session.end_reason, exit_info);
         return;
     }
-    endSessionFromPtyClose(session_agent);
+    endSessionFromPtyClose(session_runtime);
 }
 
 fn waitForSessionExitInfo(pid: c.pid_t) ?ExitInfo {

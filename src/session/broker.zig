@@ -6,9 +6,8 @@ const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const frame_forwarder = @import("../transport/frame_forwarder.zig");
-const session_agent = @import("agent.zig");
+const session_runtime = @import("runtime.zig");
 const session_registry = @import("../runtime/session_registry.zig");
-const socket_transport = @import("../transport/socket.zig");
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
@@ -26,25 +25,25 @@ pub fn serveFrameAfterHandshake(
             var request = try protocol.decodePayload(pb.TeStreamOpen, allocator, frame.payload);
             defer request.deinit(allocator);
             if (request.create == null) {
-                const agent_fd = connectAgentForOpen(allocator, request) catch |err| switch (err) {
-                    error.InvalidSessionGuid, error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {
+                const runtime_fd = connectRuntimeForOpen(allocator, request) catch |err| switch (err) {
+                    error.InvalidSessionGuid, error.SessionNotFound => {
                         try sendError(write_fd, "SESSION_NOT_FOUND", "session not found", "");
                         return;
                     },
                     else => return err,
                 };
-                defer _ = c.close(agent_fd);
-                try openAgentAndForwardFrames(allocator, agent_fd, frame.payload, read_fd, write_fd);
+                defer _ = c.close(runtime_fd);
+                try openRuntimeAndForwardFrames(allocator, runtime_fd, frame.payload, read_fd, write_fd);
                 return;
             }
 
             const open_payload = try sessionOpenPayloadWithCurrentEnvironment(allocator, frame.payload);
             defer allocator.free(open_payload);
-            const agent_fd = startSessionAgentAndConnect(allocator, exe, open_payload) catch |err| switch (err) {
+            const runtime_fd = startSessionRuntimeAndConnect(allocator, exe, open_payload) catch |err| switch (err) {
                 else => return err,
             };
-            defer _ = c.close(agent_fd);
-            try openAgentAndForwardFrames(allocator, agent_fd, open_payload, read_fd, write_fd);
+            defer _ = c.close(runtime_fd);
+            try openRuntimeAndForwardFrames(allocator, runtime_fd, open_payload, read_fd, write_fd);
             return;
         },
         else => {
@@ -69,73 +68,26 @@ pub fn serveDebugFrameAfterHandshake(
         },
     }
 
-    const agent_fd = connectSingleLiveSessionAgent(allocator) catch |err| switch (err) {
+    const runtime_fd = session_runtime.connectSingleLiveSessionRuntime(allocator) catch |err| switch (err) {
         error.SessionNotFound, error.AmbiguousSession => {
             try sendError(write_fd, "SESSION_NOT_FOUND", "session not found", "");
             return;
         },
         else => return err,
     };
-    defer _ = c.close(agent_fd);
+    defer _ = c.close(runtime_fd);
 
-    try initiateRuntimeHandshake(allocator, agent_fd);
-    try protocol.sendFrame(agent_fd, frame.message_type, frame.payload);
-    try forwardAgentFramesToClient(allocator, agent_fd, write_fd);
+    try initiateRuntimeHandshake(allocator, runtime_fd);
+    try protocol.sendFrame(runtime_fd, frame.message_type, frame.payload);
+    try forwardRuntimeFramesToClient(allocator, runtime_fd, write_fd);
 }
 
-fn connectSingleLiveSessionAgent(allocator: std.mem.Allocator) !c.fd_t {
-    const runtime_root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(runtime_root);
-    const guid_dir = try std.fmt.allocPrint(allocator, "{s}/guid", .{runtime_root});
-    defer allocator.free(guid_dir);
-
-    var dir = std.fs.openDirAbsolute(guid_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return error.SessionNotFound,
-        else => return err,
-    };
-    defer dir.close();
-
-    var found_fd: c.fd_t = -1;
-    errdefer {
-        if (found_fd >= 0) _ = c.close(found_fd);
-    }
-
-    var iterator = dir.iterate();
-    while (try iterator.next()) |entry| {
-        if (entry.kind != .directory) continue;
-        if (!session_registry.isValidSessionGuid(entry.name)) continue;
-
-        const session_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ guid_dir, entry.name });
-        defer allocator.free(session_dir);
-        var paths = session_registry.pathsForSessionDir(allocator, session_dir) catch continue;
-        defer paths.deinit(allocator);
-
-        const fd = socket_transport.connectSocket(paths.socket) catch continue;
-        if (found_fd >= 0) {
-            _ = c.close(fd);
-            return error.AmbiguousSession;
-        }
-        found_fd = fd;
-    }
-
-    if (found_fd < 0) return error.SessionNotFound;
-    return found_fd;
-}
-
-fn connectAgentForOpen(allocator: std.mem.Allocator, request: pb.TeStreamOpen) !c.fd_t {
+fn connectRuntimeForOpen(allocator: std.mem.Allocator, request: pb.TeStreamOpen) !c.fd_t {
     if (!session_registry.isValidSessionGuid(request.session_guid)) return error.InvalidSessionGuid;
-    const canonical = try session_registry.canonicalGuid(allocator, request.session_guid);
-    defer allocator.free(canonical);
-    const sessions_dir = try session_registry.sessionsDir(allocator);
-    defer allocator.free(sessions_dir);
-    const session_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, canonical });
-    defer allocator.free(session_dir);
-    var paths = try session_registry.pathsForSessionDir(allocator, session_dir);
-    defer paths.deinit(allocator);
-    return socket_transport.connectSocket(paths.socket);
+    return session_runtime.connectSessionRuntime(allocator, request.session_guid);
 }
 
-fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_open_payload: []const u8) !c.fd_t {
+fn startSessionRuntimeAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_open_payload: []const u8) !c.fd_t {
     var request = try protocol.decodePayload(pb.TeStreamOpen, allocator, session_open_payload);
     defer request.deinit(allocator);
     if (request.create == null) return error.MissingSessionCreate;
@@ -146,17 +98,8 @@ fn startSessionAgentAndConnect(allocator: std.mem.Allocator, exe: []const u8, se
     defer allocation.deinit(allocator);
 
     _ = exe;
-    try session_agent.startSessionAgentThread(allocator, allocation.paths.dir);
-
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        if (socket_transport.connectSocket(allocation.paths.socket)) |fd| return fd else |err| switch (err) {
-            error.ConnectFailed, error.SocketPathMissing, error.SocketDirMissing => {},
-            else => return err,
-        }
-        io.sleepMillis(20);
-    }
-    return error.SessionAgentDidNotStart;
+    _ = try session_runtime.startSessionRuntimeThread(allocator, allocation.paths.dir);
+    return session_runtime.connectSessionRuntime(allocator, allocation.id);
 }
 
 pub fn sessionOpenPayloadWithCurrentEnvironment(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
@@ -198,27 +141,27 @@ fn appendEnvironmentEntry(
     });
 }
 
-fn openAgentAndForwardFrames(
+fn openRuntimeAndForwardFrames(
     allocator: std.mem.Allocator,
-    agent_fd: c.fd_t,
+    runtime_fd: c.fd_t,
     session_open_payload: []const u8,
     read_fd: c.fd_t,
     write_fd: c.fd_t,
 ) !void {
-    initiateRuntimeHandshake(allocator, agent_fd) catch |err| switch (err) {
+    initiateRuntimeHandshake(allocator, runtime_fd) catch |err| switch (err) {
         error.VersionMismatch => {
             try sendError(write_fd, "VERSION_MISMATCH", "existing remote session runtime is incompatible with this client", "Start a fresh sessh connection with matching binaries");
             return;
         },
         else => return err,
     };
-    try protocol.sendFrame(agent_fd, .te_stream_open, session_open_payload);
-    try frame_forwarder.forwardFrames(read_fd, write_fd, agent_fd);
+    try protocol.sendFrame(runtime_fd, .te_stream_open, session_open_payload);
+    try frame_forwarder.forwardFrames(read_fd, write_fd, runtime_fd);
 }
 
-fn forwardAgentFramesToClient(allocator: std.mem.Allocator, agent_fd: c.fd_t, write_fd: c.fd_t) !void {
+fn forwardRuntimeFramesToClient(allocator: std.mem.Allocator, runtime_fd: c.fd_t, write_fd: c.fd_t) !void {
     while (true) {
-        var frame = protocol.readFrameAlloc(allocator, agent_fd) catch |err| switch (err) {
+        var frame = protocol.readFrameAlloc(allocator, runtime_fd) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
@@ -239,7 +182,7 @@ fn initiateRuntimeHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     defer if (hello_error) |*err| err.deinit(allocator);
     if (hello_error) |err| {
         if (std.mem.eql(u8, err.code, "VERSION_MISMATCH")) return error.VersionMismatch;
-        return error.AgentHandshakeFailed;
+        return error.RuntimeHandshakeFailed;
     }
     var peer_hello = try readHelloRequest(allocator, fd, fd);
     defer peer_hello.deinit(allocator);

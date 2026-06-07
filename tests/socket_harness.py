@@ -693,7 +693,7 @@ def guid_for_ref(ref):
     raise AssertionError(f"invalid guid ref: {ref}")
 
 
-def write_cached_remote_route(env, session_id, host, guid=None, alive=True, agent_version="cached-test"):
+def write_cached_remote_route(env, session_id, host, guid=None, alive=True, runtime_version="cached-test"):
     guid = guid_for_ref(guid) if guid is not None else guid_for_ref(session_id)
     route_dir = state_sessions_dir(env) / guid
     route_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -704,7 +704,7 @@ def write_cached_remote_route(env, session_id, host, guid=None, alive=True, agen
                 "guid": guid,
                 "session_dir": remote_session_dir,
                 "host": host,
-                "agent_version": agent_version,
+                "runtime_version": runtime_version,
                 "alive": alive,
                 "ssh_options": [],
             },
@@ -735,8 +735,8 @@ def route_file(env, session_id=None):
     return state_sessions_dir(env) / guid_for_ref(session_id) / "route.json"
 
 
-def agent_log_file(env, session_id=None):
-    return route_file(env, session_id).parent / "agent.log"
+def runtime_log_file(env, session_id=None):
+    return route_file(env, session_id).parent / "runtime.log"
 
 
 def socket_path(env, session_id=None):
@@ -744,7 +744,7 @@ def socket_path(env, session_id=None):
     return runtime_root(env) / "d" / "sesshd.sock"
 
 
-def start_session_agent(env, session_id=None):
+def start_daemon(env, session_id=None):
     _ = session_id
     path = socket_path(env, session_id)
     proc = subprocess.Popen(
@@ -759,7 +759,7 @@ def start_session_agent(env, session_id=None):
     return proc
 
 
-def session_agent_pids(env):
+def session_runtime_pids(env):
     pids = []
     root = sessions_dir(env)
     if root.exists():
@@ -768,7 +768,7 @@ def session_agent_pids(env):
                 meta = json.loads(meta_file.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
-            pid = meta.get("agent_pid")
+            pid = meta.get("runtime_pid")
             if isinstance(pid, int):
                 pids.append(pid)
     return pids
@@ -782,7 +782,7 @@ def run_login_shell_profile_test(_base_env):
         profile.write_text("printf 'LOGIN_PROFILE_READY\\n'\n")
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
             try:
@@ -819,7 +819,7 @@ def run_session_create_command_argv_test(_base_env):
         command.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
             try:
@@ -862,7 +862,7 @@ def run_session_create_shell_command_test(_base_env):
         )
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
             try:
@@ -892,7 +892,7 @@ def run_session_create_tty_settings_test(_base_env):
         env = isolated_env(tmp)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
             try:
@@ -1040,7 +1040,7 @@ def run_minor_version_compatibility_test(base_env):
         env["SHELL"] = "/bin/sh"
         cleanup_runtime(env)
         try:
-            proc = start_session_agent(env)
+            proc = start_daemon(env)
 
             newer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             newer.settimeout(5.0)
@@ -1102,7 +1102,7 @@ def run_live_draw_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1155,7 +1155,7 @@ def run_synchronized_output_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1198,7 +1198,7 @@ def run_input_ack_protocol_test(base_env):
         env["SHELL"] = str(shell)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1241,7 +1241,7 @@ def run_session_ended_payload_protocol_test(base_env):
         conn = None
         proc = None
         try:
-            proc = start_session_agent(env)
+            proc = start_daemon(env)
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
             conn.connect(str(socket_path(env)))
@@ -1295,7 +1295,7 @@ def run_plain_scroll_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1346,7 +1346,7 @@ def run_plain_screen_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1393,7 +1393,7 @@ def run_split_escape_tail_is_not_replayed_as_text_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1438,7 +1438,7 @@ def run_active_screen_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1485,7 +1485,7 @@ def run_active_screen_barrier_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1532,7 +1532,7 @@ def run_terminal_modes_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1592,7 +1592,7 @@ def run_cursor_shape_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1720,7 +1720,7 @@ def run_complete_display_clear_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1762,7 +1762,7 @@ def run_title_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1807,7 +1807,7 @@ def run_default_colors_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1863,7 +1863,7 @@ def run_seeded_default_color_query_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1930,7 +1930,7 @@ def run_complex_ui_query_protocol_test(base_env):
         env["SHELL"] = str(shell)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -1976,7 +1976,7 @@ def run_scrollback_attach_draw_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -2076,7 +2076,7 @@ def run_scrollback_clear_protocol_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -2152,7 +2152,7 @@ def write_reconnect_gap_shell(path, before_count, during_count):
 
 
 def start_gap_session(env, shell, scrollback_limit):
-    start_session_agent(env)
+    start_daemon(env)
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     conn.settimeout(5.0)
     conn.connect(str(socket_path(env)))
@@ -2295,7 +2295,7 @@ def run_resize_epoch_does_not_clear_reconnect_scrollback_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -2375,7 +2375,7 @@ def run_screen_repaint_after_presentation_reset_clears_rows_test(base_env):
         shell.chmod(0o700)
         cleanup_runtime(env)
         try:
-            start_session_agent(env)
+            start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)
@@ -2425,7 +2425,7 @@ def run_session_runtime_crash_client_error_test(base_env):
             output = read_until(fd, b"READY$ ")
             os.write(fd, b"go\n")
             output += read_until(fd, b"CRASH_UI_READY")
-            pids = session_agent_pids(env)
+            pids = session_runtime_pids(env)
             if len(pids) != 1:
                 raise AssertionError(f"expected one session runtime, found {pids}")
 

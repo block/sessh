@@ -23,7 +23,7 @@ from socket_harness import (
     send_hello,
     send_resize,
     socket_path,
-    start_session_agent,
+    start_daemon,
 )
 from test_env import isolated_env
 
@@ -134,7 +134,7 @@ def main():
         cleanup_runtime(env)
         proc = None
         try:
-            proc = start_session_agent(env)
+            proc = start_daemon(env)
 
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             conn.settimeout(5.0)

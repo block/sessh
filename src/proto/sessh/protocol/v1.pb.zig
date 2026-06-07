@@ -3062,7 +3062,7 @@ pub const TeSessionEnded = struct {
 
 /// Embedded in TeStreamItem.
 ///
-/// Session-agent-generated terminal bytes for the attached session.
+/// Session-runtime-generated terminal bytes for the attached session.
 pub const TeDraw = struct {
     scrollback_cursor: []const u8 = &.{},
     viewport_offset: ?i32 = null,

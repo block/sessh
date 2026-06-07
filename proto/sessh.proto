@@ -299,14 +299,14 @@ message TeSessionCreate {
     string command = 1;
   }
 
-  // Maximum session-agent-retained scrollback rows for this session.
+  // Maximum runtime-retained scrollback rows for this session.
   uint32 scrollback_row_limit = 2;
   // Environment entries to apply to the PTY child. Entries already present in
   // the request take precedence over environment inherited by the broker.
   repeated EnvironmentEntry environment = 3;
   // Colors the remote session runtime may use to answer early OSC 10/11 queries.
   DefaultColors query_default_colors = 4;
-  // At most one command form may be present. When command is unset, the agent
+  // At most one command form may be present. When command is unset, the runtime
   // starts the user's interactive login shell. The shell_command variant
   // mirrors ssh's `ssh HOST cmd args...` behavior after the local argv has
   // been joined into a command string for the remote shell.
@@ -316,7 +316,7 @@ message TeSessionCreate {
   }
   // Portable local tty settings to apply to the newly created remote PTY.
   TtySettings tty_settings = 10;
-  // Maximum time the session may remain detached before the agent ends it.
+  // Maximum time the session may remain detached before the runtime ends it.
   // Zero means disabled.
   uint64 reap_ms = 11;
 }
@@ -440,7 +440,7 @@ message TeSessionEnded {
 
 // Embedded in TeStreamItem.
 //
-// Session-agent-generated terminal bytes for the attached session.
+// Session-runtime-generated terminal bytes for the attached session.
 message TeDraw {
   // Opaque cursor representing the client scrollback state after applying this
   // draw. Clients must store and pass this back without interpreting it.

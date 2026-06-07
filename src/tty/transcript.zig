@@ -101,8 +101,8 @@ pub const Recorder = struct {
         try out.appendSlice(self.allocator, "  \"streams\": {\n");
         try appendStreamManifest(&out, self.allocator, "outer.in.bin", "outer-to-client", self.outer_in.items.len, true);
         try appendStreamManifest(&out, self.allocator, "outer.out.bin", "client-to-outer", self.outer_out.items.len, true);
-        try appendStreamManifest(&out, self.allocator, "inner.in.bin", "agent-to-pty", self.inner_in.items.len, true);
-        try appendStreamManifest(&out, self.allocator, "inner.out.bin", "pty-to-agent", self.inner_out.items.len, false);
+        try appendStreamManifest(&out, self.allocator, "inner.in.bin", "runtime-to-pty", self.inner_in.items.len, true);
+        try appendStreamManifest(&out, self.allocator, "inner.out.bin", "pty-to-runtime", self.inner_out.items.len, false);
         try out.appendSlice(self.allocator, "  }\n");
         try out.appendSlice(self.allocator, "}\n");
         return out.toOwnedSlice(self.allocator);

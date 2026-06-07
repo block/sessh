@@ -1,7 +1,7 @@
 # Cleanup
 
 Sessh no longer has a public session manager. The visible client may disconnect
-from its remote agent, and reconnect may recover the same session while the
+from its remote runtime, and reconnect may recover the same session while the
 original client is still alive. Detached remote sessions are not meant to be
 resumed later by another command.
 

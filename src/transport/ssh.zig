@@ -19,7 +19,7 @@ const remote_shell = @import("remote_shell.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 const socket_transport = @import("socket.zig");
 const ssh_opts = @import("ssh_options.zig");
-const stream_agent = @import("../stream/agent.zig");
+const stream_runtime = @import("../stream/runtime.zig");
 const tty_transcript = @import("../tty/transcript.zig");
 const pb = protocol.pb;
 
@@ -403,11 +403,11 @@ fn runRemoteNewSession(
             child.closeStdin();
             _ = child.wait() catch {};
             if (runtime_config.common.capture_tty_transcript != null) {
-                try io.writeAll(2, "sessh: --capture-tty-transcript requires a compatible sessh agent\n");
+                try io.writeAll(2, "sessh: --capture-tty-transcript requires a compatible sessh runtime\n");
                 return process_exit.request(1);
             }
             if (new.command_argv.len > 0 or shell_command != null) {
-                try io.writeAll(2, "sessh: persistent command sessions require a compatible sessh agent\n");
+                try io.writeAll(2, "sessh: persistent command sessions require a compatible sessh runtime\n");
                 return process_exit.request(1);
             }
             try runPlainSshFallbackAfterVersionMismatch(allocator, target);
@@ -1593,7 +1593,7 @@ const StreamClientStarter = struct {
     }
 };
 
-fn proxyStreamReconnectStatusMode(level: config.FilterLevel, has_client_socket: bool) stream_agent.StreamReconnectStatusMode {
+fn proxyStreamReconnectStatusMode(level: config.FilterLevel, has_client_socket: bool) stream_runtime.StreamReconnectStatusMode {
     return switch (level) {
         .raw => .disabled,
         .hygienic, .emulated => if (has_client_socket) .client_control else .stderr_plain,
@@ -1994,7 +1994,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
         client_control_fd >= 0 and proxy_control_output_mode != .none,
     );
 
-    const exit_status = stream_agent.runLocalStream(allocator, &starter, .{
+    const exit_status = stream_runtime.runLocalStream(allocator, &starter, .{
         .guid = proxy_guid,
         .source_fd = 0,
         .sink_fd = 1,
@@ -2318,14 +2318,14 @@ test "parseSshArgs routes OpenSSH-owned options to proxy stream mode" {
     try std.testing.expect(x11.invocation.proxy_required);
     try std.testing.expect(shouldUseProxyStreamForTest(x11, true));
 
-    var agent = try parseSshArgsForTest(std.testing.allocator, &.{
+    var forward_agent = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "-A",
         "example.com",
     }, .{});
-    defer agent.deinit(std.testing.allocator);
-    try std.testing.expect(agent.invocation.proxy_required);
-    try std.testing.expect(shouldUseProxyStreamForTest(agent, true));
+    defer forward_agent.deinit(std.testing.allocator);
+    try std.testing.expect(forward_agent.invocation.proxy_required);
+    try std.testing.expect(shouldUseProxyStreamForTest(forward_agent, true));
 
     var stdin_null = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
@@ -2567,10 +2567,10 @@ test "default ssh options append resolved interactive IPQoS value" {
 }
 
 test "proxy stream reconnect status follows filter level" {
-    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.disabled, proxyStreamReconnectStatusMode(.raw, false));
-    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.stderr_plain, proxyStreamReconnectStatusMode(.hygienic, false));
-    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.hygienic, true));
-    try std.testing.expectEqual(stream_agent.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.emulated, true));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.disabled, proxyStreamReconnectStatusMode(.raw, false));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, proxyStreamReconnectStatusMode(.hygienic, false));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.hygienic, true));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.emulated, true));
 }
 
 test "terminal reconnect presentation follows filter level" {

@@ -8,7 +8,7 @@ extern "c" fn socket(domain: c_int, socket_type: c_int, protocol: c_int) c_int;
 
 var runtime_root_symlink_published = false;
 
-/// Runtime root for live sockets and agent-owned files. Keep this path short:
+/// Runtime root for live sockets and daemon-owned files. Keep this path short:
 /// Unix-domain socket paths have tight platform limits.
 pub fn runtimeRoot(allocator: std.mem.Allocator) ![]u8 {
     if (envVar("XDG_RUNTIME_DIR")) |root| return runtimeRootForXdg(allocator, root);

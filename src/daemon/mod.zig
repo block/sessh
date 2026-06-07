@@ -9,7 +9,7 @@ const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const session_broker = @import("../session/broker.zig");
 const socket_transport = @import("../transport/socket.zig");
-const stream_agent = @import("../stream/agent.zig");
+const stream_runtime = @import("../stream/runtime.zig");
 
 const hpb = protocol.hpb;
 const pb = protocol.pb;
@@ -47,7 +47,7 @@ pub fn forwardStreamBrokerToDaemon(
     exe: []const u8,
     args: []const []const u8,
 ) !void {
-    const request = try stream_agent.clientOpenProxyStreamFromBrokerArgs(allocator, args);
+    const request = try stream_runtime.clientOpenProxyStreamFromBrokerArgs(allocator, args);
     defer allocator.free(request.proxy_host);
 
     try ensureStarted(allocator, exe);
@@ -57,7 +57,7 @@ pub fn forwardStreamBrokerToDaemon(
     const payload = try protocol.encodePayload(allocator, pb.ProxyStreamItem{ .payload = .{ .open = request } });
     defer allocator.free(payload);
     try protocol.sendFrame(fd, .proxy_stream_item, payload);
-    try stream_agent.forwardRawDuplex(0, 1, fd);
+    try stream_runtime.forwardRawDuplex(0, 1, fd);
 }
 
 fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
@@ -270,7 +270,7 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                     return;
                 };
                 switch (payload) {
-                    .open => |request| try stream_agent.serveProxyStreamOpen(allocator, exe, request, fd),
+                    .open => |request| try stream_runtime.serveProxyStreamOpen(allocator, exe, request, fd),
                     else => try sendError(fd, "PROTOCOL_ERROR", "expected proxy stream open", ""),
                 }
                 return;

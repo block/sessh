@@ -5,26 +5,26 @@ const posix = std.posix;
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 
-pub fn forwardFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, agent_fd: c.fd_t) !void {
+pub fn forwardFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, runtime_fd: c.fd_t) !void {
     defer {
         _ = c.shutdown(stdin_fd, c.SHUT.WR);
         if (stdout_fd != stdin_fd) _ = c.shutdown(stdout_fd, c.SHUT.WR);
-        _ = c.shutdown(agent_fd, c.SHUT.WR);
+        _ = c.shutdown(runtime_fd, c.SHUT.WR);
     }
 
     var pollfds = [_]posix.pollfd{
         .{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = agent_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = runtime_fd, .events = posix.POLL.IN, .revents = 0 },
     };
 
     while (true) {
         _ = try posix.poll(&pollfds, -1);
 
         if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (!try copyOneFrame(stdin_fd, agent_fd)) return;
+            if (!try copyOneFrame(stdin_fd, runtime_fd)) return;
         }
         if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (!try copyOneFrame(agent_fd, stdout_fd)) return;
+            if (!try copyOneFrame(runtime_fd, stdout_fd)) return;
         }
     }
 }

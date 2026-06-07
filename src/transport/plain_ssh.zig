@@ -8,7 +8,7 @@ const proxy_control = @import("../stream/proxy_control.zig");
 const pty_process = @import("../tty/pty_process.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect_title = @import("../reconnect/title.zig");
-const stream_agent = @import("../stream/agent.zig");
+const stream_runtime = @import("../stream/runtime.zig");
 const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
 
@@ -18,7 +18,7 @@ const ProxyClientControl = struct {
     const max_cleanup_title_bytes = 512;
 
     control_fd: c.fd_t = -1,
-    title_tracker: stream_agent.TerminalTitleTracker = .{},
+    title_tracker: stream_runtime.TerminalTitleTracker = .{},
     pending_title: [max_title_bytes]u8 = undefined,
     pending_title_len: usize = 0,
     status_line: [max_status_bytes]u8 = undefined,
