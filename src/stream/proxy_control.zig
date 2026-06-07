@@ -75,14 +75,14 @@ pub fn serverHandshake(allocator: std.mem.Allocator, fd: c.fd_t, capabilities: C
 }
 
 fn writeCapabilities(fd: c.fd_t, capabilities: Capabilities) !void {
-    try sendMessage(fd, .proxy_control_capabilities, pb.ProxyControlCapabilities{
+    try sendMessage(fd, .proxy_control_capabilities, pb.ProxyStreamItem.ControlCapabilities{
         .output_mode = toPbOutputMode(capabilities.output_mode),
         .ctrl_r_available = capabilities.ctrl_r_available,
     });
 }
 
 pub fn writeDiagnostic(fd: c.fd_t, diagnostic: Diagnostic) !void {
-    try sendMessage(fd, .proxy_control_diagnostic, pb.ProxyControlDiagnostic{
+    try sendMessage(fd, .proxy_control_diagnostic, pb.ProxyStreamItem.ControlDiagnostic{
         .update = diagnostic.update,
         .diagnostic_line = diagnostic.diagnostic_line,
         .intercept_ctrl_r = diagnostic.intercept_ctrl_r,
@@ -90,7 +90,7 @@ pub fn writeDiagnostic(fd: c.fd_t, diagnostic: Diagnostic) !void {
 }
 
 pub fn writeCtrlR(fd: c.fd_t) !void {
-    try sendMessage(fd, .proxy_control_ctrl_r, pb.ProxyControlCtrlR{});
+    try sendMessage(fd, .proxy_control_ctrl_r, pb.ProxyStreamItem.ControlCtrlR{});
 }
 
 fn readCapabilities(allocator: std.mem.Allocator, fd: c.fd_t) !Capabilities {
@@ -100,7 +100,7 @@ fn readCapabilities(allocator: std.mem.Allocator, fd: c.fd_t) !Capabilities {
 
         switch (frame.message_type) {
             .proxy_control_capabilities => {
-                var message = try protocol.decodePayload(pb.ProxyControlCapabilities, allocator, frame.payload);
+                var message = try protocol.decodePayload(pb.ProxyStreamItem.ControlCapabilities, allocator, frame.payload);
                 defer message.deinit(allocator);
                 return .{
                     .output_mode = fromPbOutputMode(message.output_mode),
@@ -121,7 +121,7 @@ pub fn readMessage(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
 
     return switch (frame.message_type) {
         .proxy_control_diagnostic => blk: {
-            var message = try protocol.decodePayload(pb.ProxyControlDiagnostic, allocator, frame.payload);
+            var message = try protocol.decodePayload(pb.ProxyStreamItem.ControlDiagnostic, allocator, frame.payload);
             defer message.deinit(allocator);
 
             const update = if (message.update) |line| try allocator.dupe(u8, line) else null;
@@ -140,7 +140,7 @@ pub fn readMessage(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
             };
         },
         .proxy_control_ctrl_r => blk: {
-            var message = try protocol.decodePayload(pb.ProxyControlCtrlR, allocator, frame.payload);
+            var message = try protocol.decodePayload(pb.ProxyStreamItem.ControlCtrlR, allocator, frame.payload);
             defer message.deinit(allocator);
             break :blk OwnedMessage{ .message = .ctrl_r };
         },
@@ -221,7 +221,7 @@ fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
 }
 
-fn toPbOutputMode(mode: OutputMode) pb.ProxyControlCapabilities.OutputMode {
+fn toPbOutputMode(mode: OutputMode) pb.ProxyStreamItem.ControlCapabilities.OutputMode {
     return switch (mode) {
         .none => .OUTPUT_MODE_NONE,
         .update => .OUTPUT_MODE_UPDATE,
@@ -229,7 +229,7 @@ fn toPbOutputMode(mode: OutputMode) pb.ProxyControlCapabilities.OutputMode {
     };
 }
 
-fn fromPbOutputMode(mode: pb.ProxyControlCapabilities.OutputMode) OutputMode {
+fn fromPbOutputMode(mode: pb.ProxyStreamItem.ControlCapabilities.OutputMode) OutputMode {
     return switch (mode) {
         .OUTPUT_MODE_UPDATE => .update,
         .OUTPUT_MODE_DIAGNOSTIC_LINE => .diagnostic_line,

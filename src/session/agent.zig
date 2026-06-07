@@ -2446,7 +2446,7 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
     };
 }
 
-fn readTtySettings(message: pb.TeTtySettings) !tty_settings.Settings {
+fn readTtySettings(message: pb.TeSessionCreate.TtySettings) !tty_settings.Settings {
     var modes = try app_allocator.allocator().alloc(tty_settings.Mode, message.tty_mode.items.len);
     errdefer app_allocator.allocator().free(modes);
     for (message.tty_mode.items, 0..) |mode, i| {
@@ -2466,7 +2466,7 @@ fn readTtySettings(message: pb.TeTtySettings) !tty_settings.Settings {
     };
 }
 
-fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.TeEnvironmentEntry) !void {
+fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.TeSessionCreate.EnvironmentEntry) !void {
     if (!isValidEnvironmentEntry(entry)) return error.InvalidEnvironmentEntry;
     if (sessionEnvironmentHasEntry(environment, entry.name)) return;
 
@@ -2492,7 +2492,7 @@ fn sessionEnvironmentHasEntry(environment: *const SessionEnvironment, name: []co
     return false;
 }
 
-fn isValidEnvironmentEntry(entry: pb.TeEnvironmentEntry) bool {
+fn isValidEnvironmentEntry(entry: pb.TeSessionCreate.EnvironmentEntry) bool {
     return isValidEnvironmentName(entry.name) and
         std.mem.indexOfScalar(u8, entry.value, 0) == null;
 }
@@ -2503,7 +2503,7 @@ fn isValidEnvironmentName(name: []const u8) bool {
         std.mem.indexOfScalar(u8, name, 0) == null;
 }
 
-fn readDefaultColors(colors: pb.TeDefaultColors) !vt.DefaultColors {
+fn readDefaultColors(colors: pb.TeSessionCreate.DefaultColors) !vt.DefaultColors {
     return .{
         .foreground_color = try readDefaultColorValue(colors.foreground_color),
         .background_color = try readDefaultColorValue(colors.background_color),

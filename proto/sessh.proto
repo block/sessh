@@ -41,67 +41,67 @@ message Frame {
 message MuxStreamFrame {
   uint64 stream_id = 1;
 
+  // Opens or resumes a mux stream. The detail oneof identifies the stream type;
+  // there is no separate stream-kind field to keep in sync.
+  message Open {
+    // First byte this side still needs from the peer's outbound stream.
+    uint64 recv_next_offset = 1;
+    // Backpressure credit this side grants the peer. The peer may send bytes in
+    // [recv_next_offset, recv_next_offset + receive_window_bytes) for this mux
+    // stream and must stop when that window is exhausted.
+    uint32 receive_window_bytes = 2;
+
+    oneof detail {
+      TeStreamOpen te = 10;
+      ProxyStreamOpen proxy = 11;
+    }
+  }
+
+  // Accepts a mux stream open and reports the acceptor's receive state. This is
+  // not a required round-trip barrier; peers may pipeline payload after open when
+  // they already have credit.
+  message OpenOk {
+    uint64 recv_next_offset = 1;
+    // Initial backpressure credit granted by the stream acceptor. This has the
+    // same meaning as Open.receive_window_bytes.
+    uint32 receive_window_bytes = 2;
+  }
+
+  // Ordered durable stream payload carried over a mux stream.
+  message Payload {
+    uint64 offset = 1;
+
+    oneof item {
+      TeStreamItem te = 2;
+      ProxyStreamItem proxy = 3;
+    }
+  }
+
+  message Ack {
+    // First byte offset not yet received from the peer.
+    uint64 recv_next_offset = 1;
+    // Updated backpressure credit. Receivers increase this as they drain their
+    // bounded per-stream buffer; senders stop sending on this mux stream when
+    // the advertised window is exhausted. Other mux streams have independent
+    // windows and may continue making progress.
+    uint32 receive_window_bytes = 2;
+  }
+
+  // Abrupt mux-stream termination, analogous to TCP RST or HTTP/2 RST_STREAM.
+  // Graceful proxy EOF and terminal session exit are stream payload items instead.
+  message Reset {
+    string code = 1;
+    string message = 2;
+    optional string hint = 3;
+  }
+
   oneof message {
-    MuxStreamOpen open = 2;
-    MuxStreamOpenOk open_ok = 3;
-    MuxStreamPayload payload = 4;
-    MuxStreamAck ack = 5;
-    MuxStreamReset reset = 6;
+    Open open = 2;
+    OpenOk open_ok = 3;
+    Payload payload = 4;
+    Ack ack = 5;
+    Reset reset = 6;
   }
-}
-
-// Opens or resumes a mux stream. The detail oneof identifies the stream type;
-// there is no separate stream-kind field to keep in sync.
-message MuxStreamOpen {
-  // First byte this side still needs from the peer's outbound stream.
-  uint64 recv_next_offset = 1;
-  // Backpressure credit this side grants the peer. The peer may send bytes in
-  // [recv_next_offset, recv_next_offset + receive_window_bytes) for this mux
-  // stream and must stop when that window is exhausted.
-  uint32 receive_window_bytes = 2;
-
-  oneof detail {
-    TeStreamOpen te = 10;
-    ProxyStreamOpen proxy = 11;
-  }
-}
-
-// Accepts a mux stream open and reports the acceptor's receive state. This is
-// not a required round-trip barrier; peers may pipeline payload after open when
-// they already have credit.
-message MuxStreamOpenOk {
-  uint64 recv_next_offset = 1;
-  // Initial backpressure credit granted by the stream acceptor. This has the
-  // same meaning as MuxStreamOpen.receive_window_bytes.
-  uint32 receive_window_bytes = 2;
-}
-
-// Ordered durable stream payload carried over a mux stream.
-message MuxStreamPayload {
-  uint64 offset = 1;
-
-  oneof item {
-    TeStreamItem te = 2;
-    ProxyStreamItem proxy = 3;
-  }
-}
-
-message MuxStreamAck {
-  // First byte offset not yet received from the peer.
-  uint64 recv_next_offset = 1;
-  // Updated backpressure credit. Receivers increase this as they drain their
-  // bounded per-stream buffer; senders stop sending on this mux stream when
-  // the advertised window is exhausted. Other mux streams have independent
-  // windows and may continue making progress.
-  uint32 receive_window_bytes = 2;
-}
-
-// Abrupt mux-stream termination, analogous to TCP RST or HTTP/2 RST_STREAM.
-// Graceful proxy EOF and terminal session exit are stream payload items instead.
-message MuxStreamReset {
-  string code = 1;
-  string message = 2;
-  optional string hint = 3;
 }
 
 // Terminal-emulator stream open details.
@@ -119,7 +119,7 @@ message TeStreamOpen {
 }
 
 // Ordered terminal-emulator stream item. Direct local IPC can carry this as a
-// top-level Frame payload; mux tunnels carry it inside MuxStreamPayload.
+// top-level Frame payload; mux tunnels carry it inside MuxStreamFrame.Payload.
 message TeStreamItem {
   oneof payload {
     TeStreamOpen open = 1;
@@ -142,39 +142,39 @@ message TeStreamItem {
 // Coordinator-injected terminal-emulator diagnostic. This is not remote process
 // output; the visible client renders it according to its filter level.
 message TeDiagnostic {
-  oneof payload {
-    TeDiagnosticDisconnected disconnected = 1;
-    TeDiagnosticConnecting connecting = 2;
-    TeDiagnosticReconnected reconnected = 3;
-    TeDiagnosticUnresponsive unresponsive = 4;
-    TeDiagnosticReconnectFailed reconnect_failed = 5;
-    TeDiagnosticCleanupPending cleanup_pending = 6;
+  message Disconnected {
+    optional uint64 next_retry_unix_ms = 1;
   }
-}
 
-message TeDiagnosticDisconnected {
-  optional uint64 next_retry_unix_ms = 1;
-}
+  message Connecting {
+    uint64 attempt = 1;
+  }
 
-message TeDiagnosticConnecting {
-  uint64 attempt = 1;
-}
+  message Reconnected {
+  }
 
-message TeDiagnosticReconnected {
-}
+  message Unresponsive {
+    uint64 attempt = 1;
+  }
 
-message TeDiagnosticUnresponsive {
-  uint64 attempt = 1;
-}
+  message ReconnectFailed {
+    uint64 attempt = 1;
+    string message = 2;
+    optional uint64 next_retry_unix_ms = 3;
+  }
 
-message TeDiagnosticReconnectFailed {
-  uint64 attempt = 1;
-  string message = 2;
-  optional uint64 next_retry_unix_ms = 3;
-}
+  message CleanupPending {
+    string message = 1;
+  }
 
-message TeDiagnosticCleanupPending {
-  string message = 1;
+  oneof payload {
+    Disconnected disconnected = 1;
+    Connecting connecting = 2;
+    Reconnected reconnected = 3;
+    Unresponsive unresponsive = 4;
+    ReconnectFailed reconnect_failed = 5;
+    CleanupPending cleanup_pending = 6;
+  }
 }
 
 // Proxy stream open details. This carries the durable p-guid because direct
@@ -186,64 +186,58 @@ message ProxyStreamOpen {
 }
 
 // Ordered proxy stream item. Data is offset-free here; mux offsets live in
-// MuxStreamPayload, and direct local IPC relies on socket ordering.
+// MuxStreamFrame.Payload, and direct local IPC relies on socket ordering.
 message ProxyStreamItem {
   message Eof {
+  }
+
+  // Sent immediately after the local IPC socket's normal HelloFrame handshake
+  // so the ProxyCommand process can choose the right diagnostic stream shape.
+  message ControlCapabilities {
+    enum OutputMode {
+      OUTPUT_MODE_NONE = 0;
+      // Client can render replaceable connection-state updates. The client owns
+      // presentation and may show this in a title, an on-screen status line, or
+      // both.
+      OUTPUT_MODE_UPDATE = 1;
+      // Client can only emit infrequent diagnostic lines. These cannot erase
+      // prior output, so countdown-style status must be collapsed into one line
+      // with an absolute retry time.
+      OUTPUT_MODE_DIAGNOSTIC_LINE = 2;
+    }
+
+    OutputMode output_mode = 1;
+    bool ctrl_r_available = 2;
+  }
+
+  // One diagnostic item in the proxy-control stream. `update` is replaceable
+  // connection state. `diagnostic_line` is append-only and should be emitted
+  // infrequently. When both text fields are absent, the client clears any
+  // previous update.
+  message ControlDiagnostic {
+    optional string update = 1;
+    optional string diagnostic_line = 2;
+    bool intercept_ctrl_r = 3;
+  }
+
+  // Requests an immediate reconnect attempt after the visible client
+  // intercepted CTRL-R.
+  message ControlCtrlR {
   }
 
   oneof payload {
     ProxyStreamOpen open = 1;
     bytes data = 2;
     Eof eof = 3;
-    ProxyControlCapabilities control_capabilities = 10;
-    ProxyControlDiagnostic control_diagnostic = 11;
-    ProxyControlCtrlR control_ctrl_r = 12;
+    ControlCapabilities control_capabilities = 10;
+    ControlDiagnostic control_diagnostic = 11;
+    ControlCtrlR control_ctrl_r = 12;
   }
 }
 
-// Embedded in ProxyStreamItem.
-//
-// Sent immediately after the local IPC socket's normal HelloFrame handshake so
-// the ProxyCommand process can choose the right diagnostic stream shape.
-message ProxyControlCapabilities {
-  enum OutputMode {
-    OUTPUT_MODE_NONE = 0;
-    // Client can render replaceable connection-state updates. The client owns
-    // presentation and may show this in a title, an on-screen status line, or
-    // both.
-    OUTPUT_MODE_UPDATE = 1;
-    // Client can only emit infrequent diagnostic lines. These cannot erase
-    // prior output, so countdown-style status must be collapsed into one line
-    // with an absolute retry time.
-    OUTPUT_MODE_DIAGNOSTIC_LINE = 2;
-  }
-
-  OutputMode output_mode = 1;
-  bool ctrl_r_available = 2;
-}
-
-// Embedded in ProxyStreamItem.
-//
-// One diagnostic item in the proxy-control stream. `update` is replaceable
-// connection state. `diagnostic_line` is append-only and should be emitted
-// infrequently. When both text fields are absent, the client clears any
-// previous update.
-message ProxyControlDiagnostic {
-  optional string update = 1;
-  optional string diagnostic_line = 2;
-  bool intercept_ctrl_r = 3;
-}
-
-// Embedded in ProxyStreamItem.
-//
-// Requests an immediate reconnect attempt after the visible client intercepted
-// CTRL-R.
-message ProxyControlCtrlR {
-}
-
-// A transport liveness probe. This is not application input and must not change
-// stream offsets or terminal state. It currently matters most for proxy streams,
-// where stdin can be EOF and no user input may arrive to force a write failure.
+// Transport control frame used to check whether the peer is still responsive.
+// Ping/Pong live outside all logical streams, so handling them must not advance
+// stream offsets or mutate terminal contents.
 message Ping {
 }
 
@@ -251,88 +245,77 @@ message Ping {
 message Pong {
 }
 
-// Embedded in TeSessionCreate.
-//
-// Portable PTY settings captured from the client-side tty before sessh puts it
-// into raw mode. This follows SSH's pty-req model: do not send a native
-// termios struct, because those layouts and flag values are OS-specific.
-message TeTtySettings {
-  // TERM value from the client environment. This is only present when the
-  // remote PTY exposes the client's real terminal, such as no-terminal-emulator
-  // mode.
-  // Normal sessh sessions leave this absent so the remote advertises sessh's
-  // terminal-emulator TERM instead. Empty is meaningful when the client had
-  // TERM set to an empty string.
-  optional string term = 1;
-  // SSH/RFC 4254 terminal-mode opcode/value pairs. Unknown opcodes are ignored
-  // by the receiver, matching SSH server behavior.
-  repeated TeTtyMode tty_mode = 2;
-}
-
-// Embedded in TeTtySettings.
-message TeTtyMode {
-  // SSH terminal-mode opcode. Opcodes 1-159 have uint32 values; 128/129 are
-  // input/output baud rates.
-  uint32 opcode = 1;
-  uint32 value = 2;
-}
-
-// Embedded in TeSessionCreate.
-//
-// Environment value used when creating a new session.
-message TeEnvironmentEntry {
-  string name = 1;
-  string value = 2;
-}
-
-// Embedded in TeSessionCreate.
-//
-// Outer terminal default colors reported by the client.
-message TeDefaultColors {
-  // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
-  uint32 foreground_color = 1;
-  // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
-  uint32 background_color = 2;
-}
-
-// Embedded in TeSessionCreate.
-//
-// Execs a program directly, preserving argv boundaries. Empty argv is treated
-// the same as no command.
-message TeExecCommand {
-  repeated string argv = 1;
-}
-
-// Embedded in TeSessionCreate.
-//
-// Evaluates a command string with the remote account's shell. An empty command
-// is still a command; clients that want an interactive login shell must leave
-// TeSessionCreate.command unset.
-message TeShellCommand {
-  string command = 1;
-}
-
 // Embedded in TeStreamOpen.
 //
 // Creates a new interactive PTY session for this terminal-emulator stream.
 message TeSessionCreate {
+  // Portable PTY settings captured from the client-side tty before sessh puts it
+  // into raw mode. This follows SSH's pty-req model: do not send a native
+  // termios struct, because those layouts and flag values are OS-specific.
+  message TtySettings {
+    message Mode {
+      // SSH terminal-mode opcode. Opcodes 1-159 have uint32 values; 128/129 are
+      // input/output baud rates.
+      uint32 opcode = 1;
+      uint32 value = 2;
+    }
+
+    // TERM value from the client environment. This is only present when the
+    // remote PTY exposes the client's real terminal, such as
+    // no-terminal-emulator mode.
+    // Normal sessh sessions leave this absent so the remote advertises sessh's
+    // terminal-emulator TERM instead. Empty is meaningful when the client had
+    // TERM set to an empty string.
+    optional string term = 1;
+    // SSH/RFC 4254 terminal-mode opcode/value pairs. Unknown opcodes are
+    // ignored by the receiver, matching SSH server behavior.
+    repeated Mode tty_mode = 2;
+  }
+
+  // Environment value used when creating a new session.
+  message EnvironmentEntry {
+    string name = 1;
+    string value = 2;
+  }
+
+  // Outer terminal default colors reported by the client.
+  message DefaultColors {
+    // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
+    uint32 foreground_color = 1;
+    // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
+    uint32 background_color = 2;
+  }
+
+  // Execs a program directly, preserving argv boundaries. Empty argv is treated
+  // the same as no command.
+  message ExecCommand {
+    repeated string argv = 1;
+  }
+
+  // Evaluates a command string with the remote account's shell. An empty command
+  // is still a command; clients that want an interactive login shell must leave
+  // TeSessionCreate.command unset.
+  message ShellCommand {
+    string command = 1;
+  }
+
   // Maximum session-agent-retained scrollback rows for this session.
   uint32 scrollback_row_limit = 2;
   // Environment entries to apply to the PTY child. Entries already present in
   // the request take precedence over environment inherited by the broker.
-  repeated TeEnvironmentEntry environment = 3;
+  repeated EnvironmentEntry environment = 3;
   // Colors the remote session runtime may use to answer early OSC 10/11 queries.
-  TeDefaultColors query_default_colors = 4;
+  DefaultColors query_default_colors = 4;
   // At most one command form may be present. When command is unset, the agent
   // starts the user's interactive login shell. The shell_command variant
   // mirrors ssh's `ssh HOST cmd args...` behavior after the local argv has
   // been joined into a command string for the remote shell.
   oneof command {
-    TeExecCommand exec_command = 8;
-    TeShellCommand shell_command = 9;
+    ExecCommand exec_command = 8;
+    ShellCommand shell_command = 9;
   }
   // Portable local tty settings to apply to the newly created remote PTY.
-  TeTtySettings tty_settings = 10;
+  TtySettings tty_settings = 10;
   // Maximum time the session may remain detached before the agent ends it.
   // Zero means disabled.
   uint64 reap_ms = 11;

@@ -311,17 +311,17 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_item = message } });
         },
         .proxy_control_capabilities => blk: {
-            var message = try decodePayload(pb.ProxyControlCapabilities, allocator, payload);
+            var message = try decodePayload(pb.ProxyStreamItem.ControlCapabilities, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_item = .{ .payload = .{ .control_capabilities = message } } } });
         },
         .proxy_control_diagnostic => blk: {
-            var message = try decodePayload(pb.ProxyControlDiagnostic, allocator, payload);
+            var message = try decodePayload(pb.ProxyStreamItem.ControlDiagnostic, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_item = .{ .payload = .{ .control_diagnostic = message } } } });
         },
         .proxy_control_ctrl_r => blk: {
-            var message = try decodePayload(pb.ProxyControlCtrlR, allocator, payload);
+            var message = try decodePayload(pb.ProxyStreamItem.ControlCtrlR, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_item = .{ .payload = .{ .control_ctrl_r = message } } } });
         },

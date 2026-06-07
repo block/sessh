@@ -1485,7 +1485,7 @@ fn sendSessionCreate(
         break :blk null;
     };
     defer if (captured_tty_settings) |*settings| settings.deinit(app_allocator.allocator());
-    var protocol_tty_settings = pb.TeTtySettings{};
+    var protocol_tty_settings = pb.TeSessionCreate.TtySettings{};
     defer protocol_tty_settings.tty_mode.deinit(app_allocator.allocator());
     if (captured_tty_settings) |settings| {
         for (settings.modes) |mode| {
@@ -1496,7 +1496,7 @@ fn sendSessionCreate(
         }
         create.tty_settings = protocol_tty_settings;
     }
-    var exec_command = pb.TeExecCommand{};
+    var exec_command = pb.TeSessionCreate.ExecCommand{};
     defer exec_command.argv.deinit(app_allocator.allocator());
     if (shell_command) |command| {
         create.command = .{ .shell_command = .{ .command = command } };
