@@ -1925,12 +1925,6 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
 
     const proxy_guid = try session_registry.generateProxyGuid(allocator);
     defer allocator.free(proxy_guid);
-    session_registry.writeOutgoingProxyHint(allocator, proxy_guid) catch |err| {
-        client_log.debug("event=outgoing_proxy_hint_write_failed proxy={s} error={t}", .{ proxy_guid, err });
-    };
-    defer session_registry.removeOutgoingProxyHint(allocator, proxy_guid) catch |err| {
-        client_log.debug("event=outgoing_proxy_hint_remove_failed proxy={s} error={t}", .{ proxy_guid, err });
-    };
 
     if (invocation.port.len == 0) return error.InvalidProxyStreamArgs;
     _ = try std.fmt.parseInt(u16, invocation.port, 10);
@@ -2017,14 +2011,8 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
         .proxy_control_output_mode = proxy_control_output_mode,
         .title_fallback = invocation.host,
     }) catch |err| {
-        session_registry.removeOutgoingProxyHint(allocator, proxy_guid) catch |remove_err| {
-            client_log.debug("event=outgoing_proxy_hint_remove_failed proxy={s} error={t}", .{ proxy_guid, remove_err });
-        };
         try starter.exitAfterInitialFailure(err);
         return;
-    };
-    session_registry.removeOutgoingProxyHint(allocator, proxy_guid) catch |err| {
-        client_log.debug("event=outgoing_proxy_hint_remove_failed proxy={s} error={t}", .{ proxy_guid, err });
     };
     return process_exit.request(exit_status);
 }

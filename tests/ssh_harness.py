@@ -1092,22 +1092,12 @@ def state_sessions_dir(env):
 
 
 def write_live_proxy_runtime(runtime_root_path, guid, agent_pid):
+    _ = agent_pid
     compact = guid[2:].replace("-", "").lower()
     guid_dir = runtime_root_path / "guid" / guid
     socket_dir = runtime_root_path / "a"
     guid_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     socket_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (guid_dir / "incoming-meta.json").write_text(
-        json.dumps(
-            {
-                "type": "incoming-proxy",
-                "created_at_unix_ms": int(time.time() * 1000),
-                "agent_pid": agent_pid,
-            },
-            separators=(",", ":"),
-        )
-        + "\n"
-    )
     os.symlink(f"../../a/{compact}", guid_dir / "agent.sock")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(socket_dir / compact))

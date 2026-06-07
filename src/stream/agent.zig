@@ -46,20 +46,6 @@ pub const LocalStreamOptions = struct {
     title_fallback: []const u8 = "",
 };
 
-// Stream channels are internal fd-shaped identities. The proxy stream protocol
-// carries one active outbound channel and one active inbound channel at a time.
-const StreamChannel = i32;
-const stream_channel_undefined: StreamChannel = -1;
-const stream_channel_stdin: StreamChannel = 0;
-const stream_channel_stdout: StreamChannel = 1;
-const stream_channel_stderr: StreamChannel = 2;
-const channel_count = 3;
-const max_stream_sources = 2;
-const stream_channels = [_]StreamChannel{
-    stream_channel_stdin,
-    stream_channel_stdout,
-    stream_channel_stderr,
-};
 // Source EOF is reported as fd readiness on some platforms and as HUP/ERR on
 // others. Either way, a ready source gets a read attempt before we consider the
 // child reaped or the stream complete.
@@ -74,22 +60,7 @@ fn handleLocalStreamInterrupt(_: c_int) callconv(.c) void {
     _ = c.write(fd, &byte, byte.len);
 }
 
-const ChannelMask = struct {
-    stdin: bool = false,
-    stdout: bool = false,
-    stderr: bool = false,
-
-    fn contains(self: ChannelMask, channel: StreamChannel) bool {
-        return switch (channel) {
-            stream_channel_stdin => self.stdin,
-            stream_channel_stdout => self.stdout,
-            stream_channel_stderr => self.stderr,
-            else => false,
-        };
-    }
-};
-
-const StreamChannelState = struct {
+const StreamByteState = struct {
     outbound: std.ArrayList(u8) = .empty,
     outbound_base: u64 = 0,
     recv_next_offset: u64 = 0,
@@ -104,136 +75,70 @@ const StreamChannelState = struct {
     outbound_eof_acked: bool = false,
     inbound_eof: bool = false,
 
-    fn outboundNext(self: *const StreamChannelState) u64 {
+    fn outboundNext(self: *const StreamByteState) u64 {
         return self.outbound_base + self.outbound.items.len;
     }
 
-    fn bufferedBytes(self: *const StreamChannelState) usize {
+    fn bufferedBytes(self: *const StreamByteState) usize {
         return self.outbound.items.len;
     }
 
-    fn deinit(self: *StreamChannelState, allocator: std.mem.Allocator) void {
+    fn deinit(self: *StreamByteState, allocator: std.mem.Allocator) void {
         self.outbound.deinit(allocator);
         self.* = undefined;
     }
 };
 
-// Tracks byte offsets independently for the internal stdin/stdout/stderr
-// identities. The active channel masks decide which single channel is carried
-// in each direction for a proxy stream.
+// Tracks one byte stream in each direction. The local side appends source bytes
+// to `outbound`; peer data advances `inbound.recv_next_offset`.
 const StreamState = struct {
     allocator: std.mem.Allocator,
-    channels: [channel_count]StreamChannelState = .{ .{}, .{}, .{} },
-    active_outbound: ChannelMask,
-    active_inbound: ChannelMask,
+    outbound: StreamByteState = .{},
+    inbound: StreamByteState = .{},
     peer_ready: bool = false,
 
-    fn init(allocator: std.mem.Allocator, active_outbound: ChannelMask, active_inbound: ChannelMask) StreamState {
-        var state = StreamState{
-            .allocator = allocator,
-            .active_outbound = active_outbound,
-            .active_inbound = active_inbound,
-        };
-        for (stream_channels) |stream_channel| {
-            if (!active_inbound.contains(stream_channel)) state.channel(stream_channel).inbound_eof = true;
-            if (!active_outbound.contains(stream_channel)) {
-                state.channel(stream_channel).outbound_eof = true;
-                state.channel(stream_channel).outbound_eof_acked = true;
-            }
-        }
-        return state;
+    fn init(allocator: std.mem.Allocator) StreamState {
+        return .{ .allocator = allocator };
     }
 
     fn deinit(self: *StreamState) void {
-        for (&self.channels) |*channel_state| channel_state.deinit(self.allocator);
+        self.outbound.deinit(self.allocator);
+        self.inbound.deinit(self.allocator);
         self.* = undefined;
     }
 
-    fn channel(self: *StreamState, stream_channel: StreamChannel) *StreamChannelState {
-        return &self.channels[channelIndex(stream_channel)];
+    fn appendOutbound(self: *StreamState, bytes: []const u8) !void {
+        try self.outbound.outbound.appendSlice(self.allocator, bytes);
     }
 
-    fn constChannel(self: *const StreamState, stream_channel: StreamChannel) *const StreamChannelState {
-        return &self.channels[channelIndex(stream_channel)];
-    }
-
-    fn appendOutbound(self: *StreamState, stream_channel: StreamChannel, bytes: []const u8) !void {
-        try self.channel(stream_channel).outbound.appendSlice(self.allocator, bytes);
-    }
-
-    fn dropOutboundThrough(self: *StreamState, stream_channel: StreamChannel, offset: u64) !void {
-        const channel_state = self.channel(stream_channel);
-        if (offset < channel_state.outbound_base) return;
-        if (offset > channel_state.outboundNext()) return error.StreamAckOutOfRange;
-        const drop: usize = @intCast(offset - channel_state.outbound_base);
+    fn dropOutboundThrough(self: *StreamState, offset: u64) !void {
+        if (offset < self.outbound.outbound_base) return;
+        if (offset > self.outbound.outboundNext()) return error.StreamAckOutOfRange;
+        const drop: usize = @intCast(offset - self.outbound.outbound_base);
         if (drop == 0) return;
-        const remaining = channel_state.outbound.items.len - drop;
-        std.mem.copyForwards(u8, channel_state.outbound.items[0..remaining], channel_state.outbound.items[drop..]);
-        channel_state.outbound.shrinkRetainingCapacity(remaining);
-        channel_state.outbound_base = offset;
+        const remaining = self.outbound.outbound.items.len - drop;
+        std.mem.copyForwards(u8, self.outbound.outbound.items[0..remaining], self.outbound.outbound.items[drop..]);
+        self.outbound.outbound.shrinkRetainingCapacity(remaining);
+        self.outbound.outbound_base = offset;
     }
 
-    fn bufferedBytes(self: *const StreamState, stream_channel: StreamChannel) usize {
-        return self.constChannel(stream_channel).bufferedBytes();
-    }
-
-    fn allActiveInboundEof(self: *const StreamState) bool {
-        for (stream_channels) |stream_channel| {
-            if (self.active_inbound.contains(stream_channel) and !self.constChannel(stream_channel).inbound_eof) return false;
-        }
-        return true;
+    fn bufferedBytes(self: *const StreamState) usize {
+        return self.outbound.bufferedBytes();
     }
 
     fn complete(self: *const StreamState) bool {
-        for (stream_channels) |stream_channel| {
-            const channel_state = self.constChannel(stream_channel);
-            if (self.active_outbound.contains(stream_channel)) {
-                if (!channel_state.outbound_eof or
-                    !channel_state.outbound_eof_acked or
-                    channel_state.outbound.items.len != 0)
-                {
-                    return false;
-                }
-            }
-            if (self.active_inbound.contains(stream_channel) and !channel_state.inbound_eof) return false;
-        }
-        return true;
+        return self.outbound.outbound_eof and
+            self.outbound.outbound_eof_acked and
+            self.outbound.outbound.items.len == 0 and
+            self.inbound.inbound_eof;
     }
 
     fn hasProgress(self: *const StreamState) bool {
-        for (stream_channels) |stream_channel| {
-            const channel_state = self.constChannel(stream_channel);
-            if (channel_state.recv_next_offset != 0 or
-                channel_state.outbound_base != 0 or
-                channel_state.outbound.items.len != 0)
-            {
-                return true;
-            }
-        }
-        return false;
+        return self.inbound.recv_next_offset != 0 or
+            self.outbound.outbound_base != 0 or
+            self.outbound.outbound.items.len != 0;
     }
 };
-
-fn channelIndex(channel: StreamChannel) usize {
-    return switch (channel) {
-        stream_channel_stdin => 0,
-        stream_channel_stdout => 1,
-        stream_channel_stderr => 2,
-        else => unreachable,
-    };
-}
-
-fn singleActiveChannel(mask: ChannelMask) !StreamChannel {
-    var channel: StreamChannel = stream_channel_undefined;
-    var count: usize = 0;
-    for (stream_channels) |candidate| {
-        if (!mask.contains(candidate)) continue;
-        channel = candidate;
-        count += 1;
-    }
-    if (count != 1) return error.StreamInvalidChannel;
-    return channel;
-}
 
 const StreamStepOutcome = union(enum) {
     idle,
@@ -245,51 +150,32 @@ const StreamStepOutcome = union(enum) {
     replacement: c.fd_t,
 };
 
-const StreamSourceKind = enum {
-    byte_stream,
-};
-
 const StreamSource = struct {
     fd: c.fd_t = -1,
-    channel: StreamChannel = stream_channel_undefined,
-    kind: StreamSourceKind = .byte_stream,
     input_control: ?*StreamInputControl = null,
 };
 
-const ChannelSink = struct {
+const StreamSink = struct {
     fd: c.fd_t = -1,
     close_fd_on_eof: ?*c.fd_t = null,
     shutdown_on_eof: bool = false,
 };
 
-fn sinksWithStdin(stdin_fd: c.fd_t, close_fd_on_eof: ?*c.fd_t) [channel_count]ChannelSink {
-    var sinks: [channel_count]ChannelSink = .{ .{}, .{}, .{} };
-    sinks[channelIndex(stream_channel_stdin)] = .{
+fn sinkWithFd(stdin_fd: c.fd_t, close_fd_on_eof: ?*c.fd_t) StreamSink {
+    return .{
         .fd = stdin_fd,
         .close_fd_on_eof = close_fd_on_eof,
     };
-    return sinks;
-}
-
-fn localStreamSinks(stdout_fd: c.fd_t) [channel_count]ChannelSink {
-    var sinks: [channel_count]ChannelSink = .{ .{}, .{}, .{} };
-    sinks[channelIndex(stream_channel_stdout)] = .{ .fd = stdout_fd };
-    return sinks;
 }
 
 const StreamAttachedClientOptions = struct {
-    source_count: usize = 0,
-    sources: [max_stream_sources]StreamSource = .{ .{}, .{} },
-    sinks: [channel_count]ChannelSink = .{ .{}, .{}, .{} },
+    source: StreamSource = .{},
+    sink: StreamSink = .{},
     reconnect_status: ?*StreamReconnectStatus = null,
     control_fd: c.fd_t = -1,
     control_input: ?*StreamInputControl = null,
     replacement_listen_fd: ?c.fd_t = null,
     close_outbound_on_inbound_eof: bool = false,
-
-    fn sink(self: *const StreamAttachedClientOptions, channel: StreamChannel) ChannelSink {
-        return self.sinks[channelIndex(channel)];
-    }
 };
 
 const StreamInputControl = struct {
@@ -420,11 +306,7 @@ const StreamAttachedClient = struct {
         options: StreamAttachedClientOptions,
     ) !StreamAttachedClient {
         state.peer_ready = false;
-        for (stream_channels) |channel| {
-            if (state.active_outbound.contains(channel)) {
-                state.channel(channel).outbound_eof_sent = false;
-            }
-        }
+        state.outbound.outbound_eof_sent = false;
         sendResumeMessage(state, transport_write_fd) catch return error.StreamTransportClosed;
         const now_ms = nowMillis();
         return .{
@@ -441,20 +323,16 @@ const StreamAttachedClient = struct {
         if (state.complete()) return .complete;
 
         const now_before_poll_ms = nowMillis();
-        var pollfds: [1 + max_stream_sources + 1 + 3]posix.pollfd = undefined;
+        var pollfds: [1 + 1 + 1 + 3]posix.pollfd = undefined;
         var count: usize = 0;
         const transport_index = count;
         pollfds[count] = .{ .fd = self.transport_read_fd, .events = posix.POLL.IN, .revents = 0 };
         count += 1;
 
-        var source_poll_indices: [max_stream_sources]?usize = .{ null, null };
-        if (self.options.source_count > max_stream_sources) return error.StreamTooManySources;
-        for (self.options.sources[0..self.options.source_count], 0..) |source, source_index| {
-            if (source.fd < 0) continue;
-            if (!state.active_outbound.contains(source.channel)) return error.StreamInactiveChannel;
-            const channel_state = state.channel(source.channel);
-            if (channel_state.outbound_eof or channel_state.bufferedBytes() >= max_buffered_bytes) continue;
-            source_poll_indices[source_index] = count;
+        var source_poll_index: ?usize = null;
+        const source = self.options.source;
+        if (source.fd >= 0 and !state.outbound.outbound_eof and state.bufferedBytes() < max_buffered_bytes) {
+            source_poll_index = count;
             pollfds[count] = .{ .fd = source.fd, .events = source_poll_events, .revents = 0 };
             count += 1;
         }
@@ -547,14 +425,14 @@ const StreamAttachedClient = struct {
             return .progress;
         }
 
-        var source_ready = false;
-        for (self.options.sources[0..self.options.source_count], 0..) |source, source_index| {
-            const poll_index = source_poll_indices[source_index] orelse continue;
+        const source_ready = blk: {
+            const poll_index = source_poll_index orelse break :blk false;
             if (pollfds[poll_index].revents != 0) {
-                source_ready = true;
                 try readStreamSource(state, source);
+                break :blk true;
             }
-        }
+            break :blk false;
+        };
         if (!source_ready) {
             // A wake-only event means the local loop has a replacement result
             // to inspect. Do not flush buffered bytes to the old transport just
@@ -576,15 +454,14 @@ const StreamAttachedClient = struct {
 };
 
 fn readStreamSource(state: *StreamState, source: StreamSource) !void {
-    const channel_state = state.channel(source.channel);
-    if (channel_state.outbound_eof) return;
+    if (state.outbound.outbound_eof) return;
     // HUP/ERR can arrive while bytes are still readable, so source readiness
     // always gets a read attempt.
     var buf: [max_chunk_bytes]u8 = undefined;
     switch (try readStreamSourceFd(source, &buf)) {
         .bytes => |bytes| try appendStreamSourceBytes(state, source, bytes),
         .would_block => {},
-        .eof => channel_state.outbound_eof = true,
+        .eof => state.outbound.outbound_eof = true,
     }
 }
 
@@ -592,9 +469,9 @@ fn appendStreamSourceBytes(state: *StreamState, source: StreamSource, bytes: []c
     if (source.input_control) |control| {
         var filtered: [max_chunk_bytes]u8 = undefined;
         const filtered_bytes = control.filter(bytes, &filtered);
-        try state.appendOutbound(source.channel, filtered_bytes);
+        try state.appendOutbound(filtered_bytes);
     } else {
-        try state.appendOutbound(source.channel, bytes);
+        try state.appendOutbound(bytes);
     }
 }
 
@@ -602,40 +479,36 @@ fn drainStreamSourcesNonBlocking(
     state: *StreamState,
     options: *const StreamAttachedClientOptions,
 ) !void {
-    for (options.sources[0..options.source_count]) |source| {
-        if (source.fd < 0) continue;
-        const channel_state = state.channel(source.channel);
-        while (!channel_state.outbound_eof and channel_state.bufferedBytes() < max_buffered_bytes) {
-            var buf: [max_chunk_bytes]u8 = undefined;
-            switch (try readStreamSourceFdNonBlocking(source, &buf)) {
-                .bytes => |bytes| if (bytes.len == 0) {
-                    channel_state.outbound_eof = true;
-                    break;
-                } else {
-                    try appendStreamSourceBytes(state, source, bytes);
-                },
-                .would_block => {
-                    // Would-block only means there is no source data ready
-                    // right now. EOF must come from the source fd itself, not
-                    // from a child-status guess.
-                    break;
-                },
-                .eof => {
-                    channel_state.outbound_eof = true;
-                    break;
-                },
-            }
+    const source = options.source;
+    if (source.fd < 0) return;
+    while (!state.outbound.outbound_eof and state.bufferedBytes() < max_buffered_bytes) {
+        var buf: [max_chunk_bytes]u8 = undefined;
+        switch (try readStreamSourceFdNonBlocking(source, &buf)) {
+            .bytes => |bytes| if (bytes.len == 0) {
+                state.outbound.outbound_eof = true;
+                break;
+            } else {
+                try appendStreamSourceBytes(state, source, bytes);
+            },
+            .would_block => {
+                // Would-block only means there is no source data ready
+                // right now. EOF must come from the source fd itself, not
+                // from a child-status guess.
+                break;
+            },
+            .eof => {
+                state.outbound.outbound_eof = true;
+                break;
+            },
         }
     }
 }
 
 fn readStreamSourceFd(source: StreamSource, buf: []u8) !ReadSomeResult {
-    _ = source.kind;
     return readSome(source.fd, buf);
 }
 
 fn readStreamSourceFdNonBlocking(source: StreamSource, buf: []u8) !ReadSomeResult {
-    _ = source.kind;
     return readSomeNonBlocking(source.fd, buf);
 }
 
@@ -892,18 +765,10 @@ const ProxyEndpoint = struct {
 
     fn attachedClientOptions(self: *ProxyEndpoint, listen_fd: c.fd_t) StreamAttachedClientOptions {
         return .{
-            .source_count = 1,
-            .sources = .{
-                .{ .fd = self.fd, .channel = stream_channel_stdout },
-                .{},
-            },
-            .sinks = blk: {
-                var sinks: [channel_count]ChannelSink = .{ .{}, .{}, .{} };
-                sinks[channelIndex(stream_channel_stdin)] = .{
-                    .fd = self.fd,
-                    .shutdown_on_eof = true,
-                };
-                break :blk sinks;
+            .source = .{ .fd = self.fd },
+            .sink = .{
+                .fd = self.fd,
+                .shutdown_on_eof = true,
             },
             .replacement_listen_fd = listen_fd,
         };
@@ -922,7 +787,7 @@ const ProxyEndpoint = struct {
 /// to the durable stream agent socket for the stream GUID, starting the agent
 /// when needed, then forwards bytes between ssh stdio and the agent socket.
 /// Stream brokers use `p-` GUIDs, but their durable sockets are still agent
-/// sockets under `a/`; the GUID directory carries proxy-specific metadata.
+/// sockets under `a/`.
 pub fn runBroker(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     var config = try parseStreamAgentConfig(allocator, args);
     defer config.deinit(allocator);
@@ -950,15 +815,13 @@ pub fn runAgent(allocator: std.mem.Allocator, exe: []const u8, args: []const []c
         socket_paths.removeRuntimeFiles();
         socket_paths.deinit(allocator);
     }
-    try session_registry.writeRuntimeAgentPidForGuid(allocator, config.guid, c.getpid());
-
     const listen_fd = try socket_transport.listenSocket(socket_path);
     defer _ = c.close(listen_fd);
 
     var endpoint = try startStreamEndpoint(allocator, config);
     defer endpoint.deinit();
 
-    var state = StreamState.init(allocator, .{ .stdout = true }, .{ .stdin = true });
+    var state = StreamState.init(allocator);
     defer state.deinit();
 
     var attach_fd: c.fd_t = -1;
@@ -1001,20 +864,16 @@ fn waitForReplacementWhileDetached(
         // attached. It must keep draining remote fds into the offset-tracked
         // buffers; otherwise the remote TCP peer can block before a
         // replacement transport attaches.
-        var pollfds: [1 + max_stream_sources]posix.pollfd = undefined;
+        var pollfds: [1 + 1]posix.pollfd = undefined;
         var count: usize = 0;
         const listen_index = count;
         pollfds[count] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
         count += 1;
 
-        var source_poll_indices: [max_stream_sources]?usize = .{ null, null };
-        if (options.source_count > max_stream_sources) return error.StreamTooManySources;
-        for (options.sources[0..options.source_count], 0..) |source, source_index| {
-            if (source.fd < 0) continue;
-            if (!state.active_outbound.contains(source.channel)) return error.StreamInactiveChannel;
-            const channel_state = state.channel(source.channel);
-            if (channel_state.outbound_eof or channel_state.bufferedBytes() >= max_buffered_bytes) continue;
-            source_poll_indices[source_index] = count;
+        var source_poll_index: ?usize = null;
+        const source = options.source;
+        if (source.fd >= 0 and !state.outbound.outbound_eof and state.bufferedBytes() < max_buffered_bytes) {
+            source_poll_index = count;
             pollfds[count] = .{ .fd = source.fd, .events = source_poll_events, .revents = 0 };
             count += 1;
         }
@@ -1026,8 +885,7 @@ fn waitForReplacementWhileDetached(
             return fd;
         }
 
-        for (options.sources[0..options.source_count], 0..) |source, source_index| {
-            const poll_index = source_poll_indices[source_index] orelse continue;
+        if (source_poll_index) |poll_index| {
             if (pollfds[poll_index].revents != 0) {
                 try readStreamSource(state, source);
             }
@@ -1050,11 +908,7 @@ pub fn runLocalStream(
     var control_fd = options.control_fd;
     if (control_fd >= 0) setNonBlockingFd(control_fd) catch {};
 
-    var state = StreamState.init(
-        allocator,
-        .{ .stdin = true },
-        .{ .stdout = true },
-    );
+    var state = StreamState.init(allocator);
     defer state.deinit();
     var input_control = StreamInputControl{
         .enabled = options.intercept_ctrl_r,
@@ -1116,16 +970,11 @@ pub fn runLocalStream(
                 transport.readFd(),
                 transport.writeFd(),
                 .{
-                    .source_count = 1,
-                    .sources = .{
-                        .{
-                            .fd = options.source_fd,
-                            .channel = stream_channel_stdin,
-                            .input_control = &input_control,
-                        },
-                        .{},
+                    .source = .{
+                        .fd = options.source_fd,
+                        .input_control = &input_control,
                     },
-                    .sinks = localStreamSinks(options.sink_fd),
+                    .sink = .{ .fd = options.sink_fd },
                     .reconnect_status = &reconnect_status,
                     .control_fd = control_fd,
                     .control_input = &input_control,
@@ -1358,7 +1207,7 @@ fn handleFrame(
             var message = try protocol.decodePayload(pb.ProxyStreamResume, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
             state.peer_ready = true;
-            try handleResumeOffset(state, try singleActiveChannel(state.active_outbound), message.recv_next_offset);
+            try handleResumeOffset(state, message.recv_next_offset);
             sendPending(state, transport_write_fd) catch |err| switch (err) {
                 error.WriteFailed => return error.StreamTransportWriteFailed,
                 else => return err,
@@ -1367,12 +1216,12 @@ fn handleFrame(
         .proxy_stream_ack => {
             var message = try protocol.decodePayload(pb.ProxyStreamAck, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
-            try handleAck(state, try singleActiveChannel(state.active_outbound), message.offset);
+            try handleAck(state, message.offset);
         },
         .proxy_stream_eof_ack => {
             var message = try protocol.decodePayload(pb.ProxyStreamEofAck, state.allocator, mutable.payload);
             defer message.deinit(state.allocator);
-            try handleEofAck(state, try singleActiveChannel(state.active_outbound), message.offset);
+            try handleEofAck(state, message.offset);
         },
         .proxy_stream_data => {
             var message = try protocol.decodePayload(pb.ProxyStreamData, state.allocator, mutable.payload);
@@ -1381,7 +1230,6 @@ fn handleFrame(
                 state,
                 transport_write_fd,
                 options,
-                try singleActiveChannel(state.active_inbound),
                 message.offset,
                 message.data,
             );
@@ -1393,7 +1241,6 @@ fn handleFrame(
                 state,
                 transport_write_fd,
                 options,
-                try singleActiveChannel(state.active_inbound),
                 message.offset,
             );
         },
@@ -1407,60 +1254,52 @@ fn handleFrame(
     }
 }
 
-fn handleResumeOffset(state: *StreamState, channel: StreamChannel, offset: u64) !void {
-    if (!state.active_outbound.contains(channel)) return error.StreamInactiveChannel;
-    const channel_state = state.channel(channel);
-    channel_state.peer_recv = offset;
-    try state.dropOutboundThrough(channel, offset);
-    channel_state.outbound_sent_next = offset;
+fn handleResumeOffset(state: *StreamState, offset: u64) !void {
+    state.outbound.peer_recv = offset;
+    try state.dropOutboundThrough(offset);
+    state.outbound.outbound_sent_next = offset;
 }
 
-fn handleAck(state: *StreamState, channel: StreamChannel, offset: u64) !void {
-    if (!state.active_outbound.contains(channel)) return error.StreamInactiveChannel;
-    const channel_state = state.channel(channel);
-    channel_state.peer_recv = offset;
-    try state.dropOutboundThrough(channel, offset);
-    if (channel_state.outbound_sent_next < offset) channel_state.outbound_sent_next = offset;
+fn handleAck(state: *StreamState, offset: u64) !void {
+    state.outbound.peer_recv = offset;
+    try state.dropOutboundThrough(offset);
+    if (state.outbound.outbound_sent_next < offset) state.outbound.outbound_sent_next = offset;
 }
 
-fn handleEofAck(state: *StreamState, channel: StreamChannel, offset: u64) !void {
-    try handleAck(state, channel, offset);
-    const channel_state = state.channel(channel);
-    if (offset == channel_state.outboundNext()) channel_state.outbound_eof_acked = true;
+fn handleEofAck(state: *StreamState, offset: u64) !void {
+    try handleAck(state, offset);
+    if (offset == state.outbound.outboundNext()) state.outbound.outbound_eof_acked = true;
 }
 
 fn handleInboundData(
     state: *StreamState,
     transport_write_fd: c.fd_t,
     options: *const StreamAttachedClientOptions,
-    channel: StreamChannel,
     offset: u64,
     data: []const u8,
 ) !void {
-    if (!state.active_inbound.contains(channel)) return error.StreamInactiveChannel;
-    const channel_state = state.channel(channel);
-    const sink = options.sink(channel);
-    if (offset < channel_state.recv_next_offset) {
+    const sink = options.sink;
+    if (offset < state.inbound.recv_next_offset) {
         // Reconnect retransmits from the peer's last confirmed offset. If a
         // frame overlaps bytes already delivered, keep only the new suffix.
-        const already_received: usize = @intCast(channel_state.recv_next_offset - offset);
+        const already_received: usize = @intCast(state.inbound.recv_next_offset - offset);
         if (already_received < data.len) {
             const new_data = data[already_received..];
             if (sink.fd < 0) return error.StreamSinkClosed;
-            try deliverInboundData(options, channel, sink.fd, new_data);
-            channel_state.recv_next_offset += new_data.len;
+            try deliverInboundData(options, sink.fd, new_data);
+            state.inbound.recv_next_offset += new_data.len;
         }
-        sendAckForChannel(state, transport_write_fd, channel, channel_state.recv_next_offset) catch |err| switch (err) {
+        sendAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
             error.WriteFailed => return error.StreamTransportWriteFailed,
             else => return err,
         };
         return;
     }
-    if (offset != channel_state.recv_next_offset) return error.StreamOffsetGap;
+    if (offset != state.inbound.recv_next_offset) return error.StreamOffsetGap;
     if (data.len != 0 and sink.fd < 0) return error.StreamSinkClosed;
-    if (data.len != 0) try deliverInboundData(options, channel, sink.fd, data);
-    channel_state.recv_next_offset += data.len;
-    sendAckForChannel(state, transport_write_fd, channel, channel_state.recv_next_offset) catch |err| switch (err) {
+    if (data.len != 0) try deliverInboundData(options, sink.fd, data);
+    state.inbound.recv_next_offset += data.len;
+    sendAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
         error.WriteFailed => return error.StreamTransportWriteFailed,
         else => return err,
     };
@@ -1470,14 +1309,11 @@ fn handleInboundEof(
     state: *StreamState,
     transport_write_fd: c.fd_t,
     options: *const StreamAttachedClientOptions,
-    channel: StreamChannel,
     offset: u64,
 ) !void {
-    if (!state.active_inbound.contains(channel)) return error.StreamInactiveChannel;
-    const channel_state = state.channel(channel);
-    if (offset > channel_state.recv_next_offset) return error.StreamOffsetGap;
-    channel_state.inbound_eof = true;
-    const sink = options.sink(channel);
+    if (offset > state.inbound.recv_next_offset) return error.StreamOffsetGap;
+    state.inbound.inbound_eof = true;
+    const sink = options.sink;
     if (sink.shutdown_on_eof and sink.fd >= 0) _ = c.shutdown(sink.fd, c.SHUT.WR);
     if (sink.close_fd_on_eof) |sink_fd_ptr| {
         if (sink_fd_ptr.* >= 0) {
@@ -1485,61 +1321,51 @@ fn handleInboundEof(
             sink_fd_ptr.* = -1;
         }
     }
-    if (options.close_outbound_on_inbound_eof and state.allActiveInboundEof()) {
-        for (stream_channels) |outbound_channel| {
-            if (state.active_outbound.contains(outbound_channel)) {
-                state.channel(outbound_channel).outbound_eof = true;
-            }
-        }
+    if (options.close_outbound_on_inbound_eof and state.inbound.inbound_eof) {
+        state.outbound.outbound_eof = true;
     }
-    sendEofAckForChannel(state, transport_write_fd, channel, channel_state.recv_next_offset) catch |err| switch (err) {
+    sendEofAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
         error.WriteFailed => return error.StreamTransportWriteFailed,
         else => return err,
     };
 }
 
-fn deliverInboundData(options: *const StreamAttachedClientOptions, channel: StreamChannel, sink_fd: c.fd_t, bytes: []const u8) !void {
-    if (options.reconnect_status) |status| status.observeInbound(channel, bytes);
+fn deliverInboundData(options: *const StreamAttachedClientOptions, sink_fd: c.fd_t, bytes: []const u8) !void {
+    if (options.reconnect_status) |status| status.observeInbound(bytes);
     try io.writeAll(sink_fd, bytes);
 }
 
 fn sendResumeMessage(state: *StreamState, fd: c.fd_t) !void {
-    const channel = try singleActiveChannel(state.active_inbound);
     try sendStreamMessage(state.allocator, fd, .proxy_stream_resume, pb.ProxyStreamResume{
-        .recv_next_offset = state.constChannel(channel).recv_next_offset,
+        .recv_next_offset = state.inbound.recv_next_offset,
     });
 }
 
-fn sendAckForChannel(state: *StreamState, fd: c.fd_t, channel: StreamChannel, offset: u64) !void {
-    if (channel != try singleActiveChannel(state.active_inbound)) return error.StreamInvalidChannel;
+fn sendAck(state: *StreamState, fd: c.fd_t, offset: u64) !void {
     try sendStreamMessage(state.allocator, fd, .proxy_stream_ack, pb.ProxyStreamAck{
         .offset = offset,
     });
 }
 
-fn sendEofAckForChannel(state: *StreamState, fd: c.fd_t, channel: StreamChannel, offset: u64) !void {
-    if (channel != try singleActiveChannel(state.active_inbound)) return error.StreamInvalidChannel;
+fn sendEofAck(state: *StreamState, fd: c.fd_t, offset: u64) !void {
     try sendStreamMessage(state.allocator, fd, .proxy_stream_eof_ack, pb.ProxyStreamEofAck{
         .offset = offset,
     });
 }
 
-fn sendDataForChannel(
+fn sendData(
     state: *StreamState,
     fd: c.fd_t,
-    channel: StreamChannel,
     offset: u64,
     data: []const u8,
 ) !void {
-    if (channel != try singleActiveChannel(state.active_outbound)) return error.StreamInvalidChannel;
     try sendStreamMessage(state.allocator, fd, .proxy_stream_data, pb.ProxyStreamData{
         .offset = offset,
         .data = data,
     });
 }
 
-fn sendEofForChannel(state: *StreamState, fd: c.fd_t, channel: StreamChannel, offset: u64) !void {
-    if (channel != try singleActiveChannel(state.active_outbound)) return error.StreamInvalidChannel;
+fn sendEof(state: *StreamState, fd: c.fd_t, offset: u64) !void {
     try sendStreamMessage(state.allocator, fd, .proxy_stream_eof, pb.ProxyStreamEof{
         .offset = offset,
     });
@@ -1547,37 +1373,34 @@ fn sendEofForChannel(state: *StreamState, fd: c.fd_t, channel: StreamChannel, of
 
 fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
     if (!state.peer_ready) return;
-    for (stream_channels) |channel| {
-        if (!state.active_outbound.contains(channel)) continue;
-        const channel_state = state.channel(channel);
-        if (channel_state.peer_recv < channel_state.outbound_base or
-            channel_state.peer_recv > channel_state.outboundNext())
-        {
-            return error.StreamAckOutOfRange;
-        }
-        if (channel_state.outbound_sent_next < channel_state.outbound_base or
-            channel_state.outbound_sent_next > channel_state.outboundNext())
-        {
-            return error.StreamAckOutOfRange;
-        }
-        // ACKs tell us what the peer has durably received. Separately remember
-        // how far this transport has already been sent so appending new source
-        // bytes does not cause an overlapping resend on the same still-live
-        // transport. On a replacement transport, the resume frame resets
-        // outbound_sent_next to the peer's reported receive offset, which is
-        // when retransmission is needed.
-        var index: usize = @intCast(channel_state.outbound_sent_next - channel_state.outbound_base);
-        while (index < channel_state.outbound.items.len) {
-            const len = @min(max_chunk_bytes, channel_state.outbound.items.len - index);
-            const offset = channel_state.outbound_base + index;
-            try sendDataForChannel(state, transport_write_fd, channel, offset, channel_state.outbound.items[index .. index + len]);
-            index += len;
-            channel_state.outbound_sent_next = offset + len;
-        }
-        if (channel_state.outbound_eof and !channel_state.outbound_eof_acked and !channel_state.outbound_eof_sent) {
-            try sendEofForChannel(state, transport_write_fd, channel, channel_state.outboundNext());
-            channel_state.outbound_eof_sent = true;
-        }
+    const outbound = &state.outbound;
+    if (outbound.peer_recv < outbound.outbound_base or
+        outbound.peer_recv > outbound.outboundNext())
+    {
+        return error.StreamAckOutOfRange;
+    }
+    if (outbound.outbound_sent_next < outbound.outbound_base or
+        outbound.outbound_sent_next > outbound.outboundNext())
+    {
+        return error.StreamAckOutOfRange;
+    }
+    // ACKs tell us what the peer has durably received. Separately remember
+    // how far this transport has already been sent so appending new source
+    // bytes does not cause an overlapping resend on the same still-live
+    // transport. On a replacement transport, the resume frame resets
+    // outbound_sent_next to the peer's reported receive offset, which is
+    // when retransmission is needed.
+    var index: usize = @intCast(outbound.outbound_sent_next - outbound.outbound_base);
+    while (index < outbound.outbound.items.len) {
+        const len = @min(max_chunk_bytes, outbound.outbound.items.len - index);
+        const offset = outbound.outbound_base + index;
+        try sendData(state, transport_write_fd, offset, outbound.outbound.items[index .. index + len]);
+        index += len;
+        outbound.outbound_sent_next = offset + len;
+    }
+    if (outbound.outbound_eof and !outbound.outbound_eof_acked and !outbound.outbound_eof_sent) {
+        try sendEof(state, transport_write_fd, outbound.outboundNext());
+        outbound.outbound_eof_sent = true;
     }
 }
 
@@ -1886,11 +1709,11 @@ fn readReconnectInput(
     var buf: [max_chunk_bytes]u8 = undefined;
     const n = c.read(source_fd, &buf, buf.len);
     if (n <= 0) {
-        state.channel(stream_channel_stdin).outbound_eof = true;
+        state.outbound.outbound_eof = true;
     } else {
         var filtered: [max_chunk_bytes]u8 = undefined;
         const filtered_bytes = input_control.filter(buf[0..@intCast(n)], &filtered);
-        state.appendOutbound(stream_channel_stdin, filtered_bytes) catch {};
+        state.appendOutbound(filtered_bytes) catch {};
     }
     return input_control.consumeAction();
 }
@@ -2260,8 +2083,8 @@ const StreamReconnectStatus = struct {
         self.title_visible = false;
     }
 
-    fn observeInbound(self: *StreamReconnectStatus, channel: StreamChannel, bytes: []const u8) void {
-        if (channel != stream_channel_stdout or self.mode != .title) return;
+    fn observeInbound(self: *StreamReconnectStatus, bytes: []const u8) void {
+        if (self.mode != .title) return;
         self.title_tracker.observe(bytes);
         if (self.escape_help_pending and self.canWriteTitle()) self.writeEscapeHelpText();
     }
@@ -2396,7 +2219,7 @@ test "stream ping receives pong without changing offsets" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{ .stdout = true });
+    var state = StreamState.init(std.testing.allocator);
     defer state.deinit();
     const payload = try protocol.encodePayload(std.testing.allocator, pb.Ping{});
     const options = StreamAttachedClientOptions{};
@@ -2408,8 +2231,8 @@ test "stream ping receives pong without changing offsets" {
     var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.pong, frame.message_type);
-    try std.testing.expectEqual(@as(u64, 0), state.constChannel(stream_channel_stdout).recv_next_offset);
-    try std.testing.expectEqual(@as(u64, 0), state.constChannel(stream_channel_stdin).outboundNext());
+    try std.testing.expectEqual(@as(u64, 0), state.inbound.recv_next_offset);
+    try std.testing.expectEqual(@as(u64, 0), state.outbound.outboundNext());
 }
 
 test "stream sender sends only newly appended bytes on a live transport" {
@@ -2417,11 +2240,11 @@ test "stream sender sends only newly appended bytes on a live transport" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{});
+    var state = StreamState.init(std.testing.allocator);
     defer state.deinit();
     state.peer_ready = true;
 
-    try state.appendOutbound(stream_channel_stdin, "first");
+    try state.appendOutbound("first");
     try sendPending(&state, fds[1]);
     var first_frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer first_frame.deinit(std.testing.allocator);
@@ -2431,7 +2254,7 @@ test "stream sender sends only newly appended bytes on a live transport" {
     try std.testing.expectEqual(@as(u64, 0), first.offset);
     try std.testing.expectEqualStrings("first", first.data);
 
-    try state.appendOutbound(stream_channel_stdin, "second");
+    try state.appendOutbound("second");
     try sendPending(&state, fds[1]);
     var second_frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer second_frame.deinit(std.testing.allocator);
@@ -2450,16 +2273,16 @@ test "stream receiver keeps suffix from overlapping data frame" {
     defer posix.close(ack[0]);
     defer posix.close(ack[1]);
 
-    var state = StreamState.init(std.testing.allocator, .{}, .{ .stdout = true });
+    var state = StreamState.init(std.testing.allocator);
     defer state.deinit();
-    state.channel(stream_channel_stdout).recv_next_offset = 5;
+    state.inbound.recv_next_offset = 5;
 
     const payload = try protocol.encodePayload(std.testing.allocator, pb.ProxyStreamData{
         .offset = 0,
         .data = "firstsecond",
     });
     var options = StreamAttachedClientOptions{};
-    options.sinks[channelIndex(stream_channel_stdout)] = .{ .fd = sink[1] };
+    options.sink = .{ .fd = sink[1] };
     try handleFrame(&state, ack[1], &options, .{
         .message_type = .proxy_stream_data,
         .payload = payload,
@@ -2485,7 +2308,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
     defer posix.close(transport_out[0]);
     defer posix.close(transport_out[1]);
 
-    var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{ .stdout = true });
+    var state = StreamState.init(std.testing.allocator);
     defer state.deinit();
     state.peer_ready = true;
 
@@ -2656,9 +2479,10 @@ test "pending stream replacement notifies failed preparation" {
 }
 
 test "stream completion waits for eof acknowledgement" {
-    var state = StreamState.init(std.testing.allocator, .{ .stdin = true }, .{});
+    var state = StreamState.init(std.testing.allocator);
     defer state.deinit();
-    state.channel(stream_channel_stdin).outbound_eof = true;
+    state.outbound.outbound_eof = true;
+    state.inbound.inbound_eof = true;
 
     try std.testing.expect(!state.complete());
 
@@ -2811,8 +2635,8 @@ test "stream reconnect status restores tracked application title" {
     defer posix.close(fds[0]);
 
     var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
-    status.observeInbound(stream_channel_stdout, "\x1b]2;remote");
-    status.observeInbound(stream_channel_stdout, "-title\x1b\\");
+    status.observeInbound("\x1b]2;remote");
+    status.observeInbound("-title\x1b\\");
     status.showRetry(10_000);
     status.clear();
     posix.close(fds[1]);
@@ -2863,7 +2687,7 @@ test "stream reconnect status skips title while terminal parser is unsafe" {
     defer posix.close(fds[0]);
 
     var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
-    status.observeInbound(stream_channel_stdout, "\x1b]2;partial-title");
+    status.observeInbound("\x1b]2;partial-title");
     status.showRetry(10_000);
     status.clear();
     posix.close(fds[1]);
@@ -2879,13 +2703,13 @@ test "stream escape help waits for terminal parser safe point" {
     try setNonBlockingFd(fds[0]);
 
     var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
-    status.observeInbound(stream_channel_stdout, "\x1b]2;partial-title");
+    status.observeInbound("\x1b]2;partial-title");
     status.showEscapeHelp();
 
     var empty_buf: [16]u8 = undefined;
     try std.testing.expectError(error.WouldBlock, posix.read(fds[0], &empty_buf));
 
-    status.observeInbound(stream_channel_stdout, "\x1b\\");
+    status.observeInbound("\x1b\\");
     posix.close(fds[1]);
 
     var output: std.ArrayList(u8) = .empty;
@@ -2906,10 +2730,10 @@ test "stream reconnect status treats synchronized update as unsafe for title" {
     defer posix.close(fds[0]);
 
     var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
-    status.observeInbound(stream_channel_stdout, "\x1b[?2026h");
+    status.observeInbound("\x1b[?2026h");
     status.showRetry(10_000);
     status.clear();
-    status.observeInbound(stream_channel_stdout, "\x1b[?2026l");
+    status.observeInbound("\x1b[?2026l");
     status.showRetry(10_000);
     status.clear();
     posix.close(fds[1]);

@@ -208,9 +208,6 @@ message TeSessionCreate {
   // Canonical session GUID in s-prefixed hyphenated UUID form, e.g.
   // s-550e8400-e29b-41d4-a716-446655440000.
   string session_guid = 5;
-  // Deprecated wire-compatible field for older clients. It is illegal to set
-  // both legacy_command_argv and command. New clients must use command instead.
-  repeated string legacy_command_argv = 7;
   // At most one command form may be present. When command is unset, the agent
   // starts the user's interactive login shell. The shell_command variant
   // mirrors ssh's `ssh HOST cmd args...` behavior after the local argv has

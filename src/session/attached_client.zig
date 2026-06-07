@@ -924,9 +924,7 @@ pub fn startNewSessionOnRuntime(
 ) !RuntimeSession {
     const size = terminal.currentWindowSize();
     const viewport_offset = queryInitialViewportOffset();
-    const handshake = try runtimeHandshakeWithPeerProtocol(read_fd, write_fd);
-    const peer_supports_command_oneof = peerSupportsSessionCreateCommandOneof(handshake.peer_protocol);
-    if (shell_command != null and !peer_supports_command_oneof) return error.VersionMismatch;
+    try runtimeHandshake(read_fd, write_fd);
     const repaint_request_seq = try sendSessionCreate(
         write_fd,
         size,
@@ -935,7 +933,6 @@ pub fn startNewSessionOnRuntime(
         session_guid,
         command_argv,
         shell_command,
-        peer_supports_command_oneof,
         reap_ms,
     );
     var session = try readRuntimeSession(read_fd);
@@ -1380,32 +1377,15 @@ fn readFrameAllocMaybeCancelled(
     }
 }
 
-const PeerProtocol = struct {
-    major: u32,
-    minor: u32,
-};
-
-const RuntimeHandshakeResult = struct {
-    peer_protocol: PeerProtocol,
-};
-
 pub fn runtimeHandshake(read_fd: c.fd_t, write_fd: c.fd_t) !void {
-    _ = try runtimeHandshakeResult(read_fd, write_fd);
-}
-
-fn runtimeHandshakeResult(read_fd: c.fd_t, write_fd: c.fd_t) !RuntimeHandshakeResult {
-    return runtimeHandshakeInner(read_fd, write_fd, null);
-}
-
-fn runtimeHandshakeWithPeerProtocol(read_fd: c.fd_t, write_fd: c.fd_t) !RuntimeHandshakeResult {
-    return runtimeHandshakeInner(read_fd, write_fd, null);
+    try runtimeHandshakeInner(read_fd, write_fd, null);
 }
 
 fn runtimeHandshakeInner(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     cancelled: ?*const std.atomic.Value(bool),
-) !RuntimeHandshakeResult {
+) !void {
     try sendHelloRequest(write_fd);
     var hello_error = try readHelloReply(read_fd, cancelled);
     defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
@@ -1418,27 +1398,12 @@ fn runtimeHandshakeInner(
 
     var peer_hello = try readHelloRequest(read_fd, write_fd, cancelled);
     defer peer_hello.deinit(app_allocator.allocator());
-    const result = RuntimeHandshakeResult{
-        .peer_protocol = .{
-            .major = peer_hello.protocol_major,
-            .minor = peer_hello.protocol_minor,
-        },
-    };
     if (helloRequestIsCompatible(peer_hello)) {
         try sendHelloOk(write_fd);
     } else {
         try sendHelloError(write_fd, "VERSION_MISMATCH", "existing remote sessh is incompatible with this client", "");
         return error.VersionMismatch;
     }
-    return result;
-}
-
-fn peerSupportsSessionCreateCommandOneof(peer: PeerProtocol) bool {
-    // Older peers understand field 7, but they do not know the newer command
-    // fields. Use the legacy field for argv-preserving commands and reject
-    // shell-eval commands before SessionCreate so `sessh -t HOST cmd...` never
-    // turns into an accidental interactive shell on an older broker.
-    return peer.major > 2 or (peer.major == 2 and peer.minor >= 1);
 }
 
 fn sendHelloRequest(fd: c.fd_t) !void {
@@ -1530,7 +1495,6 @@ fn sendSessionCreate(
     session_guid: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
-    peer_supports_command_oneof: bool,
     reap_ms: u64,
 ) !u64 {
     if (command_argv.len > 0 and shell_command != null) return error.InvalidSessionCommand;
@@ -1551,7 +1515,6 @@ fn sendSessionCreate(
         .capture_tty_transcript = tty_transcript.enabled(),
     };
     defer message.environment.deinit(app_allocator.allocator());
-    defer message.legacy_command_argv.deinit(app_allocator.allocator());
     // The normal sessh path runs a terminal emulator on the remote side. Copy
     // portable line-discipline modes, but keep TERM tied to that emulator
     // contract instead of leaking the outer terminal's TERM.
@@ -1575,11 +1538,9 @@ fn sendSessionCreate(
     defer exec_command.argv.deinit(app_allocator.allocator());
     if (shell_command) |command| {
         message.command = .{ .shell_command = .{ .command = command } };
-    } else if (command_argv.len > 0 and peer_supports_command_oneof) {
+    } else if (command_argv.len > 0) {
         try exec_command.argv.appendSlice(app_allocator.allocator(), command_argv);
         message.command = .{ .exec_command = exec_command };
-    } else {
-        try message.legacy_command_argv.appendSlice(app_allocator.allocator(), command_argv);
     }
     const default_colors = queryDefaultColorsForSession();
     message.query_default_colors = .{

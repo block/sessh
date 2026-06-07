@@ -352,7 +352,6 @@ def pack_session_create(
     bg=0xFFFFFFFF,
     session_id=None,
     command_argv=None,
-    legacy_command_argv=None,
     shell_command=None,
     tty_settings=None,
     initial_scrollback=None,
@@ -378,8 +377,6 @@ def pack_session_create(
     entry.value = str(shell)
     if command_argv:
         message.exec_command.argv.extend(str(arg) for arg in command_argv)
-    if legacy_command_argv:
-        message.legacy_command_argv.extend(str(arg) for arg in legacy_command_argv)
     if shell_command is not None:
         message.shell_command.command = str(shell_command)
     if tty_settings is not None:
@@ -477,7 +474,6 @@ def create_and_attach_session(
     session_id=None,
     initial_scrollback=None,
     command_argv=None,
-    legacy_command_argv=None,
     shell_command=None,
     tty_settings=None,
 ):
@@ -491,7 +487,6 @@ def create_and_attach_session(
             bg=bg,
             session_id=session_id,
             command_argv=command_argv,
-            legacy_command_argv=legacy_command_argv,
             shell_command=shell_command,
             tty_settings=tty_settings,
             initial_scrollback=initial_scrollback,
@@ -848,46 +843,6 @@ def run_session_create_command_argv_test(_base_env):
                 if message_type != SESSION_ATTACHED:
                     raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
                 _matched, draws = recv_draw_until(conn, b"COMMAND_ARGV_READY:arg-one")
-                draw_bytes = b"".join(draw["draw_bytes"] for draw in draws)
-                if b"UNEXPECTED_SHELL" in draw_bytes:
-                    raise AssertionError(draws)
-                send_frame(conn, INPUT, pack_bytes(b"exit\n"))
-                recv_until_message(conn, SESSION_ENDED)
-            finally:
-                conn.close()
-        finally:
-            cleanup_runtime(env)
-
-
-def run_session_create_legacy_command_argv_test(_base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-legacy-command-argv-", dir="/tmp") as tmp:
-        env = isolated_env(tmp)
-        shell = Path(tmp) / "shell-should-not-run"
-        command = Path(tmp) / "legacy-command-child"
-        shell.write_text("#!/bin/sh\nprintf 'UNEXPECTED_SHELL\\n'\nexit 1\n")
-        shell.chmod(0o700)
-        command.write_text(
-            "#!/bin/sh\n"
-            "printf 'LEGACY_COMMAND_ARGV_READY:%s\\n' \"$1\"\n"
-            "while IFS= read -r line; do\n"
-            "  [ \"$line\" = exit ] && exit 0\n"
-            "done\n"
-        )
-        command.chmod(0o700)
-        cleanup_runtime(env)
-        try:
-            start_session_agent(env)
-            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            conn.settimeout(5.0)
-            try:
-                conn.connect(str(socket_path(env)))
-                send_hello(conn)
-                send_resize(conn)
-                create_and_attach_session(conn, shell, legacy_command_argv=[command, "arg-one"])
-                message_type, _payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                _matched, draws = recv_draw_until(conn, b"LEGACY_COMMAND_ARGV_READY:arg-one")
                 draw_bytes = b"".join(draw["draw_bytes"] for draw in draws)
                 if b"UNEXPECTED_SHELL" in draw_bytes:
                     raise AssertionError(draws)
@@ -2791,7 +2746,6 @@ def main():
 
             run_login_shell_profile_test(env)
             run_session_create_command_argv_test(env)
-            run_session_create_legacy_command_argv_test(env)
             run_session_create_shell_command_test(env)
             run_session_create_tty_settings_test(env)
             run_session_agent_registry_test(env)

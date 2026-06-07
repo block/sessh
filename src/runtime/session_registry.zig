@@ -52,10 +52,8 @@ pub const RuntimeAgentSocketPaths = struct {
     dir: []u8,
     socket: []u8,
     agent_sock_link: []u8,
-    meta: []u8,
 
     pub fn deinit(self: *RuntimeAgentSocketPaths, allocator: std.mem.Allocator) void {
-        allocator.free(self.meta);
         allocator.free(self.agent_sock_link);
         allocator.free(self.socket);
         allocator.free(self.dir);
@@ -65,7 +63,6 @@ pub const RuntimeAgentSocketPaths = struct {
     pub fn removeRuntimeFiles(self: RuntimeAgentSocketPaths) void {
         unlinkIfExists(self.socket) catch {};
         unlinkIfExists(self.agent_sock_link) catch {};
-        unlinkIfExists(self.meta) catch {};
         removeDirIfEmpty(self.dir) catch {};
     }
 };
@@ -455,66 +452,15 @@ pub const Meta = struct {
     }
 };
 
-pub const RuntimeGuidType = enum {
-    local_session,
-    incoming_proxy,
-    outgoing_proxy,
-};
-
-pub fn runtimeGuidTypeName(guid_type: RuntimeGuidType) []const u8 {
-    return switch (guid_type) {
-        .local_session => "local-session",
-        .incoming_proxy => "incoming-proxy",
-        .outgoing_proxy => "outgoing-proxy",
-    };
-}
-
-const runtime_guid_session_meta_filenames = [_][]const u8{"meta.json"};
-const runtime_guid_directional_meta_filenames = [_][]const u8{
-    "incoming-meta.json",
-    "outgoing-meta.json",
-};
-const runtime_guid_empty_meta_filenames = [_][]const u8{};
-
-pub fn runtimeGuidMetaFilenamesForGuid(guid: []const u8) []const []const u8 {
-    if (isValidSessionGuid(guid)) return runtime_guid_session_meta_filenames[0..];
-    if (isValidProxyGuid(guid)) return runtime_guid_directional_meta_filenames[0..];
-    return runtime_guid_empty_meta_filenames[0..];
-}
-
-// Reconnectable-stream GUID directories can exist on both sides of a connection
-// at once. Each side owns one directional metadata file so teardown can remove
-// its own record without clobbering the other side's record.
-fn runtimeGuidMetaFilenameForType(guid_type: RuntimeGuidType) []const u8 {
-    return switch (guid_type) {
-        .local_session => "meta.json",
-        .incoming_proxy => "incoming-meta.json",
-        .outgoing_proxy => "outgoing-meta.json",
-    };
-}
-
-fn runtimeGuidTypeFromName(value: []const u8) !RuntimeGuidType {
-    if (std.mem.eql(u8, value, "local-session")) return .local_session;
-    if (std.mem.eql(u8, value, "incoming-proxy")) return .incoming_proxy;
-    if (std.mem.eql(u8, value, "outgoing-proxy")) return .outgoing_proxy;
-    return error.InvalidRuntimeGuidMeta;
-}
-
-pub const RuntimeGuidMeta = struct {
-    guid_type: RuntimeGuidType,
-    created_at_unix_ms: ?u64,
-    agent_pid: ?c.pid_t = null,
-};
-
 pub fn writeMeta(paths: SessionPaths, agent_pid: c.pid_t, version: []const u8) !void {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(app_allocator.allocator());
     const writer = text.writer(app_allocator.allocator());
-    const created_at_unix_ms = runtimeGuidMetaCreatedAtUnixMs(app_allocator.allocator(), paths.meta);
+    const created_at_unix_ms = sessionMetaCreatedAtUnixMs(app_allocator.allocator(), paths.meta);
     try writer.print(
         "{{\"type\":{f},\"created_at_unix_ms\":{},\"agent_pid\":{},\"version\":{f}}}\n",
         .{
-            std.json.fmt(runtimeGuidTypeName(.local_session), .{}),
+            std.json.fmt("local-session", .{}),
             created_at_unix_ms,
             agent_pid,
             std.json.fmt(version, .{}),
@@ -523,69 +469,19 @@ pub fn writeMeta(paths: SessionPaths, agent_pid: c.pid_t, version: []const u8) !
     try writeAtomicFile(paths.meta, text.items);
 }
 
-fn writeRuntimeGuidMetaInDir(allocator: std.mem.Allocator, dir: []const u8, guid_type: RuntimeGuidType) !void {
-    const path = try runtimeGuidMetaPathForTypeInDir(allocator, dir, guid_type);
-    defer allocator.free(path);
-    try writeRuntimeGuidMetaPath(allocator, path, guid_type);
-}
-
-fn writeRuntimeGuidMetaPath(allocator: std.mem.Allocator, path: []const u8, guid_type: RuntimeGuidType) !void {
-    return writeRuntimeGuidMetaPathWithPid(allocator, path, guid_type, null);
-}
-
-fn writeRuntimeGuidMetaPathWithPid(allocator: std.mem.Allocator, path: []const u8, guid_type: RuntimeGuidType, agent_pid: ?c.pid_t) !void {
-    const created_at_unix_ms = runtimeGuidMetaCreatedAtUnixMs(allocator, path);
-    const existing_agent_pid = if (agent_pid == null) blk: {
-        const meta = readRuntimeGuidMeta(allocator, path) catch break :blk null;
-        break :blk meta.agent_pid;
-    } else null;
-    const output_agent_pid = agent_pid orelse existing_agent_pid;
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
-    const writer = text.writer(allocator);
-    try writer.print("{{\"type\":{f},\"created_at_unix_ms\":{}", .{
-        std.json.fmt(runtimeGuidTypeName(guid_type), .{}),
-        created_at_unix_ms,
-    });
-    if (output_agent_pid) |pid| try writer.print(",\"agent_pid\":{}", .{pid});
-    try writer.writeAll("}\n");
-    try writeAtomicFile(path, text.items);
-}
-
-fn runtimeGuidMetaCreatedAtUnixMs(allocator: std.mem.Allocator, path: []const u8) u64 {
-    const meta = readRuntimeGuidMeta(allocator, path) catch return currentUnixMs();
-    return meta.created_at_unix_ms orelse currentUnixMs();
-}
-
-fn removeRuntimeGuidMetaInDir(allocator: std.mem.Allocator, dir: []const u8, guid_type: RuntimeGuidType) !void {
-    const meta_path = try runtimeGuidMetaPathForTypeInDir(allocator, dir, guid_type);
-    defer allocator.free(meta_path);
-    try unlinkIfExists(meta_path);
-    removeDirIfEmpty(dir) catch |err| switch (err) {
-        error.DirNotEmpty => {},
-        else => return err,
-    };
+fn sessionMetaCreatedAtUnixMs(allocator: std.mem.Allocator, path: []const u8) u64 {
+    const bytes = std.fs.cwd().readFileAlloc(allocator, path, 4096) catch return currentUnixMs();
+    defer allocator.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return currentUnixMs();
+    defer parsed.deinit();
+    const object = jsonObject(parsed.value) catch return currentUnixMs();
+    return (jsonOptionalU64(object, "created_at_unix_ms") catch return currentUnixMs()) orelse currentUnixMs();
 }
 
 fn currentUnixMs() u64 {
     const ms = std.time.milliTimestamp();
     if (ms <= 0) return 0;
     return @intCast(ms);
-}
-
-pub fn readRuntimeGuidMeta(allocator: std.mem.Allocator, path: []const u8) !RuntimeGuidMeta {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 4096);
-    defer allocator.free(bytes);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
-    defer parsed.deinit();
-    const object = try jsonObject(parsed.value);
-    const guid_type = try runtimeGuidTypeFromName(try jsonRequiredString(object, "type"));
-    return .{
-        .guid_type = guid_type,
-        .created_at_unix_ms = try jsonOptionalU64(object, "created_at_unix_ms"),
-        .agent_pid = if (object.get("agent_pid")) |value| try jsonPid(value) else null,
-    };
 }
 
 pub fn readMeta(allocator: std.mem.Allocator, paths: SessionPaths) !Meta {
@@ -718,74 +614,6 @@ pub fn runtimeAgentSocketPathsForGuid(allocator: std.mem.Allocator, guid: []cons
     return runtimeAgentSocketPathsForGuidInRoot(allocator, runtime_root, guid);
 }
 
-pub fn writeRuntimeAgentPidForGuid(allocator: std.mem.Allocator, guid: []const u8, agent_pid: c.pid_t) !void {
-    const runtime_root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(runtime_root);
-    const canonical = try canonicalRuntimeGuid(allocator, guid);
-    defer allocator.free(canonical);
-    const guid_root = try sessionsDirInRoot(allocator, runtime_root);
-    defer allocator.free(guid_root);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ guid_root, canonical });
-    defer allocator.free(dir);
-    try mkdirIgnoreExists(allocator, dir);
-    const incoming_meta_type = runtimeIncomingMetaTypeForGuid(canonical);
-    const meta = try runtimeGuidMetaPathForTypeInDir(allocator, dir, incoming_meta_type);
-    defer allocator.free(meta);
-    try writeRuntimeGuidMetaPathWithPid(allocator, meta, incoming_meta_type, agent_pid);
-}
-
-pub fn writeOutgoingProxyHint(allocator: std.mem.Allocator, guid: []const u8) !void {
-    const runtime_root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(runtime_root);
-    return writeOutgoingProxyHintInRoot(allocator, runtime_root, guid);
-}
-
-fn writeOutgoingProxyHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, guid: []const u8) !void {
-    return writeDirectionalRuntimeGuidHintInRoot(allocator, runtime_root, guid, .outgoing_proxy);
-}
-
-fn writeDirectionalRuntimeGuidHintInRoot(
-    allocator: std.mem.Allocator,
-    runtime_root: []const u8,
-    guid: []const u8,
-    guid_type: RuntimeGuidType,
-) !void {
-    try ensureRegistryRoot(allocator, runtime_root);
-    const guid_root = try sessionsDirInRoot(allocator, runtime_root);
-    defer allocator.free(guid_root);
-    try mkdirIgnoreExists(allocator, guid_root);
-
-    const canonical = try canonicalRuntimeGuid(allocator, guid);
-    defer allocator.free(canonical);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ guid_root, canonical });
-    defer allocator.free(dir);
-    try mkdirIgnoreExists(allocator, dir);
-    try writeRuntimeGuidMetaInDir(allocator, dir, guid_type);
-}
-
-pub fn removeOutgoingProxyHint(allocator: std.mem.Allocator, guid: []const u8) !void {
-    const runtime_root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(runtime_root);
-    return removeOutgoingProxyHintInRoot(allocator, runtime_root, guid);
-}
-
-fn removeOutgoingProxyHintInRoot(allocator: std.mem.Allocator, runtime_root: []const u8, guid: []const u8) !void {
-    return removeDirectionalRuntimeGuidHintInRoot(allocator, runtime_root, guid, .outgoing_proxy);
-}
-
-fn removeDirectionalRuntimeGuidHintInRoot(
-    allocator: std.mem.Allocator,
-    runtime_root: []const u8,
-    guid: []const u8,
-    guid_type: RuntimeGuidType,
-) !void {
-    const canonical = try canonicalRuntimeGuid(allocator, guid);
-    defer allocator.free(canonical);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/guid/{s}", .{ runtime_root, canonical });
-    defer allocator.free(dir);
-    try removeRuntimeGuidMetaInDir(allocator, dir, guid_type);
-}
-
 pub fn runtimeAgentSocketPathsForGuidInRoot(
     allocator: std.mem.Allocator,
     runtime_root: []const u8,
@@ -811,10 +639,6 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
     const agent_sock_link = try agentSocketLinkPath(allocator, dir);
     errdefer allocator.free(agent_sock_link);
 
-    const incoming_meta_type = runtimeIncomingMetaTypeForGuid(canonical);
-    const meta = try runtimeGuidMetaPathForTypeInDir(allocator, dir, incoming_meta_type);
-    errdefer allocator.free(meta);
-
     const socket = socketPathFromAgentSocketLink(allocator, dir, agent_sock_link) catch |err| switch (err) {
         error.FileNotFound => blk: {
             var socket_allocation = try allocateRuntimeAgentSocketPathForGuidInRoot(allocator, runtime_root, canonical);
@@ -826,31 +650,12 @@ pub fn runtimeAgentSocketPathsForGuidInRoot(
         else => return err,
     };
     errdefer allocator.free(socket);
-    try writeRuntimeGuidMetaPath(allocator, meta, incoming_meta_type);
 
     return .{
         .dir = dir,
         .socket = socket,
         .agent_sock_link = agent_sock_link,
-        .meta = meta,
     };
-}
-
-fn runtimeIncomingMetaTypeForGuid(guid: []const u8) RuntimeGuidType {
-    if (isValidProxyGuid(guid)) return .incoming_proxy;
-    return .local_session;
-}
-
-pub fn runtimeGuidMetaPathInDir(allocator: std.mem.Allocator, dir: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/meta.json", .{dir});
-}
-
-pub fn runtimeGuidMetaPathForTypeInDir(allocator: std.mem.Allocator, dir: []const u8, guid_type: RuntimeGuidType) ![]u8 {
-    return runtimeGuidMetaPathForFilenameInDir(allocator, dir, runtimeGuidMetaFilenameForType(guid_type));
-}
-
-pub fn runtimeGuidMetaPathForFilenameInDir(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, filename });
 }
 
 fn routePathForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
@@ -1376,14 +1181,6 @@ fn removeDirIfEmpty(path: []const u8) !void {
     }
 }
 
-fn expectRuntimeGuidMetaType(allocator: std.mem.Allocator, path: []const u8, expected: RuntimeGuidType) !u64 {
-    const meta = try readRuntimeGuidMeta(allocator, path);
-    try std.testing.expectEqual(expected, meta.guid_type);
-    const created_at_unix_ms = meta.created_at_unix_ms orelse return error.MissingCreatedAt;
-    try std.testing.expect(created_at_unix_ms > 0);
-    return created_at_unix_ms;
-}
-
 test "refuses GUID session directories with runtime metadata" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(
@@ -1478,8 +1275,6 @@ test "runtime agent socket paths use typed guid directories and socket directory
     try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/p-550e8400-e29b-41d4-a716-446655440000", paths.dir);
     try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/a/550e8400e29b41d4a716446655440000", paths.socket);
     try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/p-550e8400-e29b-41d4-a716-446655440000/agent.sock", paths.agent_sock_link);
-    try std.testing.expectEqualStrings("zig-cache/runtime-agent-socket-path-test/guid/p-550e8400-e29b-41d4-a716-446655440000/incoming-meta.json", paths.meta);
-    const created_at_unix_ms = try expectRuntimeGuidMetaType(allocator, paths.meta, .incoming_proxy);
 
     const link_target = try readLinkAlloc(allocator, paths.agent_sock_link, 4096);
     defer allocator.free(link_target);
@@ -1488,10 +1283,8 @@ test "runtime agent socket paths use typed guid directories and socket directory
     var again = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
     defer again.deinit(allocator);
     try std.testing.expectEqualStrings(paths.socket, again.socket);
-    try std.testing.expectEqual(created_at_unix_ms, try expectRuntimeGuidMetaType(allocator, again.meta, .incoming_proxy));
 
     paths.removeRuntimeFiles();
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.meta));
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.dir));
 }
 
@@ -1507,36 +1300,6 @@ test "client socket paths use client socket directory" {
 
     try std.testing.expectEqualStrings("550e8400e29b41d4a716446655440000", allocation.name);
     try std.testing.expectEqualStrings("zig-cache/client-socket-path-test/c/550e8400e29b41d4a716446655440000", allocation.path);
-}
-
-test "outgoing proxy hints use proxy runtime metadata without stealing incoming proxy cleanup" {
-    const allocator = std.testing.allocator;
-    const root = "zig-cache/outgoing-proxy-hint-test";
-    std.fs.cwd().deleteTree(root) catch {};
-    defer std.fs.cwd().deleteTree(root) catch {};
-
-    const guid = "p-550e8400-e29b-41d4-a716-446655440000";
-    const dir = "zig-cache/outgoing-proxy-hint-test/guid/p-550e8400-e29b-41d4-a716-446655440000";
-    const incoming_meta_path = "zig-cache/outgoing-proxy-hint-test/guid/p-550e8400-e29b-41d4-a716-446655440000/incoming-meta.json";
-    const outgoing_meta_path = "zig-cache/outgoing-proxy-hint-test/guid/p-550e8400-e29b-41d4-a716-446655440000/outgoing-meta.json";
-
-    try writeOutgoingProxyHintInRoot(allocator, root, guid);
-    _ = try expectRuntimeGuidMetaType(allocator, outgoing_meta_path, .outgoing_proxy);
-    try removeOutgoingProxyHintInRoot(allocator, root, guid);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(outgoing_meta_path));
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(dir));
-
-    try writeOutgoingProxyHintInRoot(allocator, root, guid);
-    var incoming = try runtimeAgentSocketPathsForGuidInRoot(allocator, root, guid);
-    defer incoming.deinit(allocator);
-    _ = try expectRuntimeGuidMetaType(allocator, incoming_meta_path, .incoming_proxy);
-    _ = try expectRuntimeGuidMetaType(allocator, outgoing_meta_path, .outgoing_proxy);
-
-    try removeOutgoingProxyHintInRoot(allocator, root, guid);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(outgoing_meta_path));
-    _ = try expectRuntimeGuidMetaType(allocator, incoming_meta_path, .incoming_proxy);
-    incoming.removeRuntimeFiles();
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(dir));
 }
 
 test "validates session ids and short typed prefixes" {
