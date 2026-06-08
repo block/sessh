@@ -122,13 +122,13 @@ pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
             _ = setenv("TERM", "xterm-256color", 1);
         }
         _ = setenv("SHELL", shell_z.ptr, 1);
-        if (ttyname(0)) |path| {
+        if (ttyname(posix.STDIN_FILENO)) |path| {
             _ = setenv("SSH_TTY", path, 1);
         }
         if (session_guid_z) |guid| _ = setenv("SESSH_GUID", guid.ptr, 1);
         if (sessh_path_z) |path| _ = setenv("SESSH_PATH", path.ptr, 1);
         if (path_z) |path| _ = setenv("PATH", path.ptr, 1);
-        if (options.tty_settings) |settings| tty_settings.applyToFd(settings, 0) catch {};
+        if (options.tty_settings) |settings| tty_settings.applyToFd(settings, posix.STDIN_FILENO) catch {};
         if (prepared_command) |command| {
             posix.execvpeZ(command.argv[0].?, command.argv.ptr, @ptrCast(c.environ)) catch {};
         } else {

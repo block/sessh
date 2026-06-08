@@ -4,6 +4,7 @@ const c = std.c;
 const posix = std.posix;
 
 const io = @import("../core/io.zig");
+const terminal = @import("../tty/terminal.zig");
 
 pub const CursorStyle = enum(u8) {
     default = 0,
@@ -545,31 +546,22 @@ pub const PresentationGuard = struct {
     active: bool = true,
 
     pub fn init(fd: c.fd_t) PresentationGuard {
-        return .{ .renderer = Renderer.init(fd) };
-    }
-
-    pub fn initWithInitialKittyKeyboardFlags(fd: c.fd_t, initial_kitty_keyboard_flags: u5) PresentationGuard {
-        return .{ .renderer = Renderer.init(fd), .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags };
+        return .{ .renderer = Renderer.init(fd), .initial_kitty_keyboard_flags = initialKittyKeyboardFlags(fd) };
     }
 
     pub fn initWithCleanupTitle(fd: c.fd_t, cleanup_title: []const u8) PresentationGuard {
-        return .{ .renderer = Renderer.init(fd), .cleanup_title = cleanup_title };
-    }
-
-    pub fn initWithCleanupTitleAndInitialKittyKeyboardFlags(
-        fd: c.fd_t,
-        cleanup_title: []const u8,
-        initial_kitty_keyboard_flags: u5,
-    ) PresentationGuard {
         return .{
             .renderer = Renderer.init(fd),
             .cleanup_title = cleanup_title,
-            .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags,
+            .initial_kitty_keyboard_flags = initialKittyKeyboardFlags(fd),
         };
     }
 
     pub fn withCapabilities(fd: c.fd_t, caps: Capabilities) PresentationGuard {
-        return .{ .renderer = Renderer.withCapabilities(fd, caps) };
+        return .{
+            .renderer = Renderer.withCapabilities(fd, caps),
+            .initial_kitty_keyboard_flags = initialKittyKeyboardFlags(fd),
+        };
     }
 
     pub fn withCapabilitiesAndInitialKittyKeyboardFlags(
@@ -587,6 +579,7 @@ pub const PresentationGuard = struct {
         return .{
             .renderer = Renderer.withCapabilities(fd, caps),
             .cleanup_title = cleanup_title,
+            .initial_kitty_keyboard_flags = initialKittyKeyboardFlags(fd),
         };
     }
 
@@ -610,6 +603,11 @@ pub const PresentationGuard = struct {
         self.active = false;
     }
 };
+
+fn initialKittyKeyboardFlags(output_fd: c.fd_t) u5 {
+    if (c.isatty(output_fd) == 0) return 0;
+    return terminal.queryInitialKittyKeyboardFlags(posix.STDIN_FILENO, output_fd);
+}
 
 fn attrsEqual(a: CellAttrs, b: CellAttrs) bool {
     return a.bold == b.bold and

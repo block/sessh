@@ -237,6 +237,31 @@ pub fn queryKittyKeyboardFlags(input_fd: c.fd_t, output_fd: c.fd_t) !?u5 {
     return probe.kitty_keyboard_flags;
 }
 
+const InitialKittyKeyboardFlags = struct {
+    input_fd: c.fd_t,
+    output_fd: c.fd_t,
+    flags: u5,
+};
+
+var cached_initial_kitty_keyboard_flags: ?InitialKittyKeyboardFlags = null;
+
+pub fn queryInitialKittyKeyboardFlags(input_fd: c.fd_t, output_fd: c.fd_t) u5 {
+    if (cached_initial_kitty_keyboard_flags) |cached| {
+        if (cached.input_fd == input_fd and cached.output_fd == output_fd) return cached.flags;
+    }
+
+    // Reconnects keep using the same outer terminal. Querying it again after
+    // the reconnect overlay clears can race with typed-ahead input and consume
+    // those bytes as probe responses.
+    const flags = (queryKittyKeyboardFlags(input_fd, output_fd) catch null) orelse 0;
+    cached_initial_kitty_keyboard_flags = .{
+        .input_fd = input_fd,
+        .output_fd = output_fd,
+        .flags = flags,
+    };
+    return flags;
+}
+
 pub fn queryTerminalProbe(input_fd: c.fd_t, output_fd: c.fd_t) !TerminalProbe {
     if (cached_probe != null and cached_probe_input_fd == input_fd and cached_probe_output_fd == output_fd) return cached_probe.?;
     var probe = TerminalProbe{};

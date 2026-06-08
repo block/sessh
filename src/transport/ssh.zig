@@ -356,8 +356,8 @@ fn runRemoteNewSession(
     defer resolved_target.deinit(allocator);
     const target = resolved_target.target;
 
-    const stdin_is_tty = c.isatty(0) != 0;
-    const stdout_is_tty = c.isatty(1) != 0;
+    const stdin_is_tty = c.isatty(posix.STDIN_FILENO) != 0;
+    const stdout_is_tty = c.isatty(posix.STDOUT_FILENO) != 0;
     if (shouldUseProxyStream(new, runtime_config.common, stdin_is_tty, stdout_is_tty)) {
         if (runtime_config.common.capture_tty_transcript != null) {
             try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with proxy stream mode\n");
@@ -1310,8 +1310,8 @@ fn runProxyStreamSsh(
         common.filter_level,
         new.tty_request,
         new.shell_command_args,
-        c.isatty(0) != 0,
-        c.isatty(1) != 0,
+        c.isatty(posix.STDIN_FILENO) != 0,
+        c.isatty(posix.STDOUT_FILENO) != 0,
     );
     var client_socket_guid: ?[]u8 = null;
     defer if (client_socket_guid) |guid| allocator.free(guid);

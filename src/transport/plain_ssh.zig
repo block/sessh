@@ -257,7 +257,7 @@ pub fn runArgvUnderLocalPty(
     @memcpy(ssh_argv[1..], ssh_args);
 
     var size = terminal.currentWindowSize();
-    var captured_tty_settings: ?tty_settings.Settings = try tty_settings.capture(allocator, 0, .{});
+    var captured_tty_settings: ?tty_settings.Settings = try tty_settings.capture(allocator, posix.STDIN_FILENO, .{});
     defer if (captured_tty_settings) |*settings| settings.deinit(allocator);
 
     var child = try pty_process.spawn(allocator, .{
@@ -268,10 +268,10 @@ pub fn runArgvUnderLocalPty(
     });
     defer child.terminate();
 
-    var mode_guard = try terminal.TerminalModeGuard.enable(0);
+    var mode_guard = try terminal.TerminalModeGuard.enable(posix.STDIN_FILENO);
     defer mode_guard.restore();
 
-    var stdin_flags_guard = try FdStatusFlagsGuard.setNonBlocking(0);
+    var stdin_flags_guard = try FdStatusFlagsGuard.setNonBlocking(posix.STDIN_FILENO);
     defer stdin_flags_guard.restore();
     setNonBlockingFd(child.master_fd) catch {};
 
@@ -290,7 +290,7 @@ pub fn runArgvUnderLocalPty(
         pollfds[count] = .{ .fd = child.master_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
         count += 1;
         const stdin_index = count;
-        pollfds[count] = .{ .fd = 0, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+        pollfds[count] = .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
         count += 1;
         var control_index: ?usize = null;
         const control_fd = if (diagnostics.control_fd >= 0) diagnostics.control_fd else client_socket_listen_fd;
@@ -306,7 +306,7 @@ pub fn runArgvUnderLocalPty(
             switch (try pty_process.readMaster(child.master_fd, &buf)) {
                 .bytes => |bytes| {
                     diagnostics.observeOutput(bytes);
-                    try io.writeAll(1, bytes);
+                    try io.writeAll(posix.STDOUT_FILENO, bytes);
                 },
                 .would_block => {},
                 .eof => {
@@ -328,7 +328,7 @@ pub fn runArgvUnderLocalPty(
 
         if ((pollfds[stdin_index].revents & posix.POLL.IN) != 0) {
             var input: [4096]u8 = undefined;
-            const n = c.read(0, &input, input.len);
+            const n = c.read(posix.STDIN_FILENO, &input, input.len);
             if (n > 0) {
                 const bytes = input[0..@intCast(n)];
                 try writePtyInput(child.master_fd, bytes, &diagnostics);

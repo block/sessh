@@ -61,7 +61,7 @@ pub const ReconnectUi = struct {
     escape_filter: terminal.EscapeFilter = .{},
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     title_enabled: bool = false,
-    title_fd: c.fd_t = 1,
+    title_fd: c.fd_t = posix.STDOUT_FILENO,
     title_visible: bool = false,
     presentation: ReconnectPresentation = .overlay,
     cleanup_title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
@@ -76,8 +76,8 @@ pub const ReconnectUi = struct {
 
     pub fn beginWithPresentation(viewport_offset: i32, presentation: ReconnectPresentation) !ReconnectUi {
         var ui = ReconnectUi{
-            .mode_guard = try terminal.TerminalModeGuard.enable(0),
-            .title_enabled = (presentation == .overlay or presentation == .title) and c.isatty(1) != 0,
+            .mode_guard = try terminal.TerminalModeGuard.enable(posix.STDIN_FILENO),
+            .title_enabled = (presentation == .overlay or presentation == .title) and c.isatty(posix.STDOUT_FILENO) != 0,
             .presentation = presentation,
             .last_size = terminal.currentWindowSize(),
         };
@@ -284,10 +284,10 @@ pub const ReconnectUi = struct {
         self.last_size = size;
         self.resize_generation +%= 1;
         if (self.resize_generation == 0) self.resize_generation = 1;
-        if (self.presentation != .overlay or c.isatty(1) == 0) return;
+        if (self.presentation != .overlay or c.isatty(posix.STDOUT_FILENO) == 0) return;
 
-        const renderer = client_renderer.Renderer.init(1);
-        try renderer.restorePresentation(queryInitialKittyKeyboardFlags());
+        const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
+        try renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(posix.STDIN_FILENO, posix.STDOUT_FILENO));
         try renderer.clearVisible();
         self.overlay_state = null;
         self.viewport_offset = 0;
@@ -297,7 +297,7 @@ pub const ReconnectUi = struct {
     fn pollInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
         var pollfds = [_]posix.pollfd{
             .{
-                .fd = 0,
+                .fd = posix.STDIN_FILENO,
                 .events = posix.POLL.IN,
                 .revents = 0,
             },
@@ -318,9 +318,9 @@ pub const ReconnectUi = struct {
 
         var input: [256]u8 = undefined;
         var filtered: [512]u8 = undefined;
-        const n = c.read(0, &input, input.len);
+        const n = c.read(posix.STDIN_FILENO, &input, input.len);
         if (n <= 0) return .client_hangup;
-        io_helpers.noteRead(0, input[0..@intCast(n)]);
+        io_helpers.noteRead(posix.STDIN_FILENO, input[0..@intCast(n)]);
 
         const bytes = input[0..@intCast(n)];
         switch (reconnect_control.scanInput(bytes, .{})) {
@@ -345,18 +345,18 @@ pub const ReconnectUi = struct {
 
     fn alertDisconnectedInput(self: *ReconnectUi) !void {
         _ = self;
-        try io_helpers.writeAll(1, "\x07");
-        if (c.isatty(1) == 0) return;
-        try io_helpers.writeAll(1, "\x1b[?5h");
-        defer io_helpers.writeAll(1, "\x1b[?5l") catch {};
+        try io_helpers.writeAll(posix.STDOUT_FILENO, "\x07");
+        if (c.isatty(posix.STDOUT_FILENO) == 0) return;
+        try io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?5h");
+        defer io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?5l") catch {};
         std.Thread.sleep(35 * std.time.ns_per_ms);
     }
 
     pub fn clearOverlay(self: *ReconnectUi) !i32 {
         if (self.presentation != .overlay) return @intCast(self.viewport_offset);
-        if (c.isatty(1) == 0) return @intCast(self.viewport_offset);
+        if (c.isatty(posix.STDOUT_FILENO) == 0) return @intCast(self.viewport_offset);
         const state = self.overlay_state orelse return @intCast(self.viewport_offset);
-        const renderer = client_renderer.Renderer.init(1);
+        const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
         const size = terminal.currentWindowSize();
         try eraseOverlayRows(renderer, state, size.rows, size.cols);
         try restoreOverlayExpansion(renderer, state, size.rows);
@@ -422,21 +422,21 @@ pub const ReconnectUi = struct {
         switch (self.presentation) {
             .none, .title => return,
             .stderr_plain => {
-                try io_helpers.writeAll(2, message);
-                try io_helpers.writeAll(2, "\r\n");
+                try io_helpers.writeAll(posix.STDERR_FILENO, message);
+                try io_helpers.writeAll(posix.STDERR_FILENO, "\r\n");
                 return;
             },
             .overlay => {},
         }
 
-        if (c.isatty(1) == 0) {
-            try io_helpers.writeAll(1, "\r\n");
-            try io_helpers.writeAll(1, message);
-            try io_helpers.writeAll(1, "\r\n");
+        if (c.isatty(posix.STDOUT_FILENO) == 0) {
+            try io_helpers.writeAll(posix.STDOUT_FILENO, "\r\n");
+            try io_helpers.writeAll(posix.STDOUT_FILENO, message);
+            try io_helpers.writeAll(posix.STDOUT_FILENO, "\r\n");
             for (self.diagnostic_lines[0..self.diagnostic_line_count]) |*line| {
                 if (line.len == 0) continue;
-                try io_helpers.writeAll(1, line.slice());
-                try io_helpers.writeAll(1, "\r\n");
+                try io_helpers.writeAll(posix.STDOUT_FILENO, line.slice());
+                try io_helpers.writeAll(posix.STDOUT_FILENO, "\r\n");
             }
             return;
         }
@@ -459,7 +459,7 @@ pub const ReconnectUi = struct {
             overlay_lines[overlay_line_count] = .{ .text = line.slice(), .alignment = .left };
             overlay_line_count += 1;
         }
-        const renderer = client_renderer.Renderer.init(1);
+        const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
         const state = try drawOverlayLines(renderer, size, self.viewport_offset, self.overlay_state, overlay_lines[0..overlay_line_count]);
         self.viewport_offset = state.viewport_offset;
         self.overlay_state = state;
@@ -497,8 +497,8 @@ pub const ReconnectUi = struct {
         const delayed = diagnostic.seq <= self.live_diagnostic_start_seq;
         var line_buf: [client_log.max_user_diagnostic_display_bytes]u8 = undefined;
         const len = formatOverlayDiagnostic(line_buf[0..], diagnostic, delayed);
-        io_helpers.writeAll(2, line_buf[0..len]) catch return;
-        io_helpers.writeAll(2, "\r\n") catch {};
+        io_helpers.writeAll(posix.STDERR_FILENO, line_buf[0..len]) catch return;
+        io_helpers.writeAll(posix.STDERR_FILENO, "\r\n") catch {};
     }
 
     fn appendDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
@@ -529,15 +529,15 @@ pub const ReconnectUi = struct {
     }
 
     fn hideCursor(self: *ReconnectUi) !void {
-        if (c.isatty(1) == 0) return;
-        try io_helpers.writeAll(1, "\x1b[?25l");
+        if (c.isatty(posix.STDOUT_FILENO) == 0) return;
+        try io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?25l");
         self.cursor_hidden = true;
     }
 
     fn showCursor(self: *ReconnectUi) !void {
         if (!self.cursor_hidden) return;
         self.cursor_hidden = false;
-        try io_helpers.writeAll(1, "\x1b[?25h");
+        try io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?25h");
     }
 
     pub fn restoreTitleAfterReconnect(self: *ReconnectUi, app_title_present: ?bool, fallback_title: []const u8) void {
@@ -957,19 +957,6 @@ fn setNonBlocking(fd: c.fd_t) !void {
     const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
     if ((flags & nonblocking_flag) != 0) return;
     if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-}
-
-var cached_initial_kitty_keyboard_flags: ?u5 = null;
-
-pub fn queryInitialKittyKeyboardFlags() u5 {
-    if (cached_initial_kitty_keyboard_flags) |flags| return flags;
-
-    // Reconnects keep using the same outer terminal. Querying it again after
-    // the reconnect overlay clears can race with typed-ahead input and consume
-    // those bytes as probe responses.
-    const flags = (terminal.queryKittyKeyboardFlags(0, 1) catch null) orelse 0;
-    cached_initial_kitty_keyboard_flags = flags;
-    return flags;
 }
 
 fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {

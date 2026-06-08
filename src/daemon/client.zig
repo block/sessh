@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = std.c;
+const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
 const config = @import("../core/config.zig");
@@ -72,9 +73,9 @@ pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
 
     const fd = try connectOrStartForDirName(allocator, exe, dir_name);
     defer _ = c.close(fd);
-    try io.writeAll(1, "daemon socket ");
-    try io.writeAll(1, path);
-    try io.writeAll(1, "\n");
+    try io.writeAll(posix.STDOUT_FILENO, "daemon socket ");
+    try io.writeAll(posix.STDOUT_FILENO, path);
+    try io.writeAll(posix.STDOUT_FILENO, "\n");
 
     const request_payload = try protocol.encodePayload(allocator, pb.DaemonLogRequest{});
     defer allocator.free(request_payload);
@@ -92,7 +93,7 @@ pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
                 defer entry.deinit(allocator);
                 const line = try daemonLogLine(allocator, entry.unix_ms, entry.message);
                 defer allocator.free(line);
-                try io.writeAll(1, line);
+                try io.writeAll(posix.STDOUT_FILENO, line);
             },
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);

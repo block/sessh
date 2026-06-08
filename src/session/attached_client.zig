@@ -1210,7 +1210,7 @@ pub fn pollAndForwardReconnectInput(
     try reconnect_ui.refreshOverlayIfDiagnosticsChanged();
 
     var pollfds = [_]posix.pollfd{.{
-        .fd = 0,
+        .fd = posix.STDIN_FILENO,
         .events = posix.POLL.IN,
         .revents = 0,
     }};
@@ -1221,10 +1221,10 @@ pub fn pollAndForwardReconnectInput(
 
     var input: [4096]u8 = undefined;
     var filtered: [8192]u8 = undefined;
-    const n = c.read(0, &input, input.len);
+    const n = c.read(posix.STDIN_FILENO, &input, input.len);
     if (n <= 0) return .client_hangup;
     const bytes = input[0..@intCast(n)];
-    io_helpers.noteRead(0, bytes);
+    io_helpers.noteRead(posix.STDIN_FILENO, bytes);
 
     for (bytes) |byte| {
         if (byte == 0x12) {
@@ -1286,8 +1286,8 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
 }
 
 fn queryInitialViewportOffset() ?i32 {
-    if (c.isatty(0) == 0 or c.isatty(1) == 0) return null;
-    const position = terminal.queryCursorPosition(0, 1) catch return unknown_viewport_offset;
+    if (c.isatty(posix.STDIN_FILENO) == 0 or c.isatty(posix.STDOUT_FILENO) == 0) return null;
+    const position = terminal.queryCursorPosition(posix.STDIN_FILENO, posix.STDOUT_FILENO) catch return unknown_viewport_offset;
     return initialViewportOffsetFromCursorPosition(position);
 }
 
@@ -1502,7 +1502,7 @@ fn sendSessionCreate(
     // The normal sessh path runs a terminal emulator on the remote side. Copy
     // portable line-discipline modes, but keep TERM tied to that emulator
     // contract instead of leaking the outer terminal's TERM.
-    var captured_tty_settings = tty_settings.capture(app_allocator.allocator(), 0, .{ .include_term = false }) catch |err| blk: {
+    var captured_tty_settings = tty_settings.capture(app_allocator.allocator(), posix.STDIN_FILENO, .{ .include_term = false }) catch |err| blk: {
         client_log.debug("event=tty_settings_capture_failed error={t}", .{err});
         break :blk null;
     };
@@ -1557,7 +1557,7 @@ const ProtocolDefaultColors = struct {
 };
 
 fn queryDefaultColorsForSession() ProtocolDefaultColors {
-    const queried = terminal.queryDefaultColors(0, 1) catch return .{};
+    const queried = terminal.queryDefaultColors(posix.STDIN_FILENO, posix.STDOUT_FILENO) catch return .{};
     return .{
         .foreground_color = protocolColorFromRgb(queried.foreground),
         .background_color = protocolColorFromRgb(queried.background),
@@ -1677,30 +1677,25 @@ fn runAttachedClientLoop(
     app_title_present: *?bool,
     options: AttachedClientOptions,
 ) !AttachedClientEnd {
-    const output_is_tty = c.isatty(1) != 0;
-    const initial_kitty_keyboard_flags = if (output_is_tty) client_ui.queryInitialKittyKeyboardFlags() else 0;
-    var mode_guard = try terminal.TerminalModeGuard.enable(0);
+    const output_is_tty = c.isatty(posix.STDOUT_FILENO) != 0;
+    var mode_guard = try terminal.TerminalModeGuard.enable(posix.STDIN_FILENO);
     defer mode_guard.restore();
     const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
     defer if (cleanup_title) |title| app_allocator.allocator().free(title);
     var presentation_guard = if (output_is_tty) guard: {
         break :guard if (cleanup_title) |title|
-            client_renderer.PresentationGuard.initWithCleanupTitleAndInitialKittyKeyboardFlags(
-                1,
-                title,
-                initial_kitty_keyboard_flags,
-            )
+            client_renderer.PresentationGuard.initWithCleanupTitle(posix.STDOUT_FILENO, title)
         else
-            client_renderer.PresentationGuard.initWithInitialKittyKeyboardFlags(1, initial_kitty_keyboard_flags);
+            client_renderer.PresentationGuard.init(posix.STDOUT_FILENO);
     } else guard: {
-        var inactive = client_renderer.PresentationGuard.init(1);
+        var inactive = client_renderer.PresentationGuard.init(posix.STDOUT_FILENO);
         inactive.active = false;
         break :guard inactive;
     };
     defer presentation_guard.restore();
 
     const end = try runAttachedTerminal(
-        0,
+        posix.STDIN_FILENO,
         read_fd,
         write_fd,
         input_escape_filter,
@@ -1855,7 +1850,7 @@ fn showEscapeHelpModal(
     // it is visible, remote draw frames are discarded and a repaint is requested
     // after dismissal so the client resumes from the remote session runtime's latest
     // screen state.
-    const renderer = client_renderer.Renderer.init(1);
+    const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
     var overlay_state: ?client_ui.OverlayDrawState = null;
     var last_size = terminal.currentWindowSize();
     try drawEscapeHelpOverlay(renderer, last_size, viewport_offset, &overlay_state);
@@ -2171,9 +2166,9 @@ fn restoreAttachedClientEndPresentationBytesToFd(fd: c.fd_t, attached_client_end
 }
 
 fn restoreLocalTerminalPresentation() void {
-    if (c.isatty(1) == 0) return;
-    const renderer = client_renderer.Renderer.init(1);
-    renderer.restorePresentation(client_ui.queryInitialKittyKeyboardFlags()) catch {};
+    if (c.isatty(posix.STDOUT_FILENO) == 0) return;
+    const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
+    renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(posix.STDIN_FILENO, posix.STDOUT_FILENO)) catch {};
     const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
     if (cleanup_title) |title| {
         defer app_allocator.allocator().free(title);
@@ -2183,9 +2178,9 @@ fn restoreLocalTerminalPresentation() void {
 
 fn clearVisibleAfterResizeTimeout(viewport_offset: *i32) void {
     viewport_offset.* = 0;
-    if (c.isatty(1) == 0) return;
-    const renderer = client_renderer.Renderer.init(1);
-    renderer.restorePresentation(client_ui.queryInitialKittyKeyboardFlags()) catch {};
+    if (c.isatty(posix.STDOUT_FILENO) == 0) return;
+    const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
+    renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(posix.STDIN_FILENO, posix.STDOUT_FILENO)) catch {};
     renderer.clearVisible() catch {};
 }
 
@@ -2200,8 +2195,8 @@ fn clientHangup() AttachedClientEnd {
 }
 
 fn writeClientCloseBoundary() void {
-    if (c.isatty(1) == 0) return;
-    io_helpers.writeAll(1, "\r\n") catch {};
+    if (c.isatty(posix.STDOUT_FILENO) == 0) return;
+    io_helpers.writeAll(posix.STDOUT_FILENO, "\r\n") catch {};
 }
 
 fn handleDrawFrame(
@@ -2273,7 +2268,7 @@ fn handleDrawPayload(
     viewport_offset: *i32,
     app_title_present: ?*?bool,
 ) !void {
-    try io_helpers.writeAll(1, draw.draw_bytes);
+    try io_helpers.writeAll(posix.STDOUT_FILENO, draw.draw_bytes);
     if (attached_client_end_restore) |target| {
         if (draw.attached_client_end_restore_bytes) |restore| {
             target.clearRetainingCapacity();

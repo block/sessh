@@ -52,7 +52,7 @@ fn runMain() !void {
 
     if (topLevelArgIs(args, &.{ "--help", "-h" })) return usage(0);
     if (topLevelArgIs(args, &.{"--version"}) or sesshShortVersionRequested(args)) {
-        try io.writeAll(1, "sessh " ++ config.version ++ "\n");
+        try io.writeAll(posix.STDOUT_FILENO, "sessh " ++ config.version ++ "\n");
         return;
     }
     if (topLevelArgIs(args, &.{"--daemon-log"})) return daemon_client.printDaemonLog(allocator, args[0]);
@@ -85,7 +85,7 @@ fn usage(code: u8) !void {
         \\  https://github.com/block/sessh/blob/main/docs/USER_MANUAL.md
         \\
     ;
-    try io.writeAll(if (code == 0) 1 else 2, text);
+    try io.writeAll(if (code == 0) posix.STDOUT_FILENO else posix.STDERR_FILENO, text);
     return process_exit.request(code);
 }
 
