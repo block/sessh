@@ -646,7 +646,7 @@ test "attached client keeps attached-client-end restore bytes while reconnecting
     try std.testing.expectEqualStrings("restore-primary", attached_client_end_restore.items);
 }
 
-test "final attached-client-end restore writes and clears saved cleanup bytes" {
+test "final attached-client-end restore skips non-tty output and clears saved cleanup bytes" {
     const output = try posix.pipe();
     defer posix.close(output[0]);
     defer posix.close(output[1]);
@@ -662,12 +662,7 @@ test "final attached-client-end restore writes and clears saved cleanup bytes" {
         .events = posix.POLL.IN,
         .revents = 0,
     }};
-    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 1000));
-
-    var buf: [64]u8 = undefined;
-    const n = c.read(output[0], &buf, buf.len);
-    if (n < 0) return error.ReadFailed;
-    try std.testing.expectEqualStrings("restore-primary", buf[0..@intCast(n)]);
+    try std.testing.expectEqual(@as(usize, 0), try posix.poll(&pollfds, 0));
     try std.testing.expectEqual(@as(usize, 0), attached_client_end_restore.items.len);
 }
 
@@ -1682,19 +1677,26 @@ fn runAttachedClientLoop(
     app_title_present: *?bool,
     options: AttachedClientOptions,
 ) !AttachedClientEnd {
-    const initial_kitty_keyboard_flags = client_ui.queryInitialKittyKeyboardFlags();
+    const output_is_tty = c.isatty(1) != 0;
+    const initial_kitty_keyboard_flags = if (output_is_tty) client_ui.queryInitialKittyKeyboardFlags() else 0;
     var mode_guard = try terminal.TerminalModeGuard.enable(0);
     defer mode_guard.restore();
     const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
     defer if (cleanup_title) |title| app_allocator.allocator().free(title);
-    var presentation_guard = if (cleanup_title) |title|
-        client_renderer.PresentationGuard.initWithCleanupTitleAndInitialKittyKeyboardFlags(
-            1,
-            title,
-            initial_kitty_keyboard_flags,
-        )
-    else
-        client_renderer.PresentationGuard.initWithInitialKittyKeyboardFlags(1, initial_kitty_keyboard_flags);
+    var presentation_guard = if (output_is_tty) guard: {
+        break :guard if (cleanup_title) |title|
+            client_renderer.PresentationGuard.initWithCleanupTitleAndInitialKittyKeyboardFlags(
+                1,
+                title,
+                initial_kitty_keyboard_flags,
+            )
+        else
+            client_renderer.PresentationGuard.initWithInitialKittyKeyboardFlags(1, initial_kitty_keyboard_flags);
+    } else guard: {
+        var inactive = client_renderer.PresentationGuard.init(1);
+        inactive.active = false;
+        break :guard inactive;
+    };
     defer presentation_guard.restore();
 
     const end = try runAttachedTerminal(
@@ -2160,11 +2162,16 @@ fn restoreAttachedClientEndPresentationBytes(attached_client_end_restore: ?*std.
 fn restoreAttachedClientEndPresentationBytesToFd(fd: c.fd_t, attached_client_end_restore: ?*std.ArrayList(u8)) void {
     const restore = attached_client_end_restore orelse return;
     if (restore.items.len == 0) return;
+    if (c.isatty(fd) == 0) {
+        restore.clearRetainingCapacity();
+        return;
+    }
     io_helpers.writeAll(fd, restore.items) catch {};
     restore.clearRetainingCapacity();
 }
 
 fn restoreLocalTerminalPresentation() void {
+    if (c.isatty(1) == 0) return;
     const renderer = client_renderer.Renderer.init(1);
     renderer.restorePresentation(client_ui.queryInitialKittyKeyboardFlags()) catch {};
     const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;

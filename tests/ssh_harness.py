@@ -530,6 +530,30 @@ def run_sessh(args, env, timeout=5.0):
     )
 
 
+def run_sessh_with_tty_stdin_and_piped_stdout(args, env, timeout=10.0):
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            sessh_argv(args),
+            cwd=ROOT,
+            env=env,
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    finally:
+        os.close(slave)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    finally:
+        os.close(master)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+    return subprocess.CompletedProcess(sessh_argv(args), proc.returncode, stdout, stderr)
+
+
 def write_sessh_config(env, text):
     config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -1082,6 +1106,72 @@ def remote_path_artifact():
     return local_artifact()
 
 
+def local_daemon_executable():
+    path = BIN if BIN.is_absolute() else ROOT / BIN
+    path = path.resolve(strict=False)
+    if path.name == "sessh-dev":
+        return path
+    if path.name == "sessh":
+        os_name, arch = canonical_local_platform()
+        wrapper_daemon = path.parent / ".." / "libexec" / "sessh" / f"{os_name}-{arch}" / "sesshd"
+        if wrapper_daemon.exists():
+            return wrapper_daemon.resolve(strict=False)
+        sibling = path.parent / "sesshd"
+        if sibling.exists():
+            return sibling.resolve(strict=False)
+    return path
+
+
+def command_executable(command):
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    if not parts:
+        return None
+    exe = Path(parts[0])
+    if not exe.is_absolute():
+        exe = ROOT / exe
+    return exe.resolve(strict=False)
+
+
+def local_daemon_pids():
+    target = local_daemon_executable()
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,command="],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result)
+    pids = []
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or ":internal-daemon:" not in stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if command_executable(command) == target:
+            pids.append(pid)
+    return pids
+
+
+def wait_local_daemon_pids(timeout=5.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        pids = local_daemon_pids()
+        if pids:
+            return pids
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for local daemon process {local_daemon_executable()}")
+
+
 def artifact_cache_path(env, artifact):
     return Path(env["XDG_CACHE_HOME"]) / "sessh" / "bin" / sessh_version() / sha256(artifact) / "sessh"
 
@@ -1289,7 +1379,12 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         if b"daemon started socket=" in daemon_log_output:
             raise AssertionError(f"daemon log replayed old entries: {daemon_log_output!r}")
 
-        result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
+        result = run_sessh_in_pty(
+            ["-F", str(fake_config), "test-host"],
+            env,
+            ((marker.encode("utf-8"), None),),
+            timeout=30.0,
+        )
         daemon_log_output += read_until_any_pipe(
             log_proc.stdout,
             (
@@ -1327,13 +1422,14 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(
             ssh_failure_diagnostics("bootstrap protocol leaked to client output", result, fake_log, fake_trace)
         )
-    status_start = result.stderr.find("sessh: bootstrapping...")
-    status_clear = result.stderr.find("\x1b[K", status_start + 1)
+    combined_output = result.stdout + result.stderr
+    status_start = combined_output.find("sessh: bootstrapping...")
+    status_clear = combined_output.find("\x1b[K", status_start + 1)
     if status_start < 0 or status_clear < 0 or status_clear < status_start:
         raise AssertionError(
             ssh_failure_diagnostics("bootstrap status was not displayed and cleared", result, fake_log, fake_trace)
         )
-    if "ssh ts_ms=" in result.stderr:
+    if "ssh ts_ms=" in combined_output:
         raise AssertionError(ssh_failure_diagnostics("bootstrap status was captured as ssh stderr", result, fake_log, fake_trace))
 
     artifact = remote_path_artifact()
@@ -1436,6 +1532,136 @@ def test_ssh_daemon_log_records_client_hangup_cleanup(tmp):
             raise AssertionError(
                 ssh_failure_diagnostics(f"daemon log missing {expected!r}", result, fake_log, fake_trace)
             )
+
+
+def test_ssh_local_daemon_death_exits_with_error(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_DAEMON_DEATH_READY"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    argv = sessh_argv(["test-host"])
+    proc = subprocess.Popen(
+        argv,
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = b""
+    stderr = b""
+    returncode = None
+    daemon_pids = []
+    try:
+        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+        daemon_pids = wait_local_daemon_pids(timeout=5.0)
+        for pid in daemon_pids:
+            os.kill(pid, signal.SIGTERM)
+        returncode = proc.wait(timeout=10.0)
+        stdout += proc.stdout.read()
+        stderr = proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        for pid in daemon_pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    result = subprocess.CompletedProcess(
+        argv,
+        returncode,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
+    if result.returncode != 255:
+        raise AssertionError(result)
+    if "sessh: daemon connection lost" not in result.stderr:
+        raise AssertionError(result)
+    if "Retry connecting" in result.stdout or "Reconnecting" in result.stdout:
+        raise AssertionError(result)
+    if "Retry connecting" in result.stderr or "Reconnecting" in result.stderr:
+        raise AssertionError(result)
+
+
+def test_ssh_local_daemon_death_tty_error_starts_on_new_line(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_DAEMON_DEATH_TTY_READY"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    argv = sessh_argv(["test-host"])
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(argv[0], argv, env)
+
+    output = b""
+    waited = False
+    daemon_pids = []
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        output = read_pty_until(fd, output, marker.encode("utf-8"), timeout=30.0)
+        daemon_pids = wait_local_daemon_pids(timeout=5.0)
+        for daemon_pid in daemon_pids:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+        deadline = time.monotonic() + 10.0
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                waited = True
+                returncode = wait_status_to_returncode(status)
+                output += read_available_pty(fd)
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"timed out waiting for client close; got {output!r}")
+            output += read_available_pty(fd)
+            time.sleep(0.05)
+    finally:
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        for daemon_pid in daemon_pids:
+            try:
+                os.kill(daemon_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        os.close(fd)
+
+    if returncode != 255:
+        raise AssertionError(output.decode("utf-8", "replace"))
+    if b"\r\nsessh: daemon connection lost\r\n" not in output:
+        raise AssertionError(output)
+    if b"Retry connecting" in output or b"Reconnecting" in output:
+        raise AssertionError(output)
 
 
 def test_ssh_transport_cache_hit_suppresses_bootstrap_status(tmp):
@@ -2582,6 +2808,35 @@ def test_ssh_terminal_emulator_release_artifact_restores_local_tty_on_exit(tmp):
             f"after:  {tty_attr_summary(result.tty_attrs_after)}\n"
             f"output: {result.stdout!r}"
         )
+
+
+def test_ssh_requested_tty_with_piped_stdout_does_not_emit_local_cleanup(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = "/bin/sh"
+
+    result = run_sessh_with_tty_stdin_and_piped_stdout(
+        ["-t", "test-host", "printf 'remote-sessh\\n'"],
+        env,
+        timeout=30.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "remote-sessh" not in result.stdout:
+        raise AssertionError(result)
+    for leaked in ("\x1b]2;", str(ROOT)):
+        if leaked in result.stdout:
+            raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+    if "--filter-level" not in log_text or "raw" not in log_text:
+        raise AssertionError(log_text)
 
 
 def test_ssh_no_terminal_emulator_tty_uses_proxy_with_hygienic_diagnostics(tmp):
@@ -3817,6 +4072,14 @@ def main(argv=None):
             test_ssh_daemon_log_records_client_hangup_cleanup,
         ),
         (
+            "ssh local daemon death exits with error",
+            test_ssh_local_daemon_death_exits_with_error,
+        ),
+        (
+            "ssh local daemon death tty error starts on new line",
+            test_ssh_local_daemon_death_tty_error_starts_on_new_line,
+        ),
+        (
             "ssh transport cache hit suppresses bootstrap status",
             test_ssh_transport_cache_hit_suppresses_bootstrap_status,
         ),
@@ -3995,6 +4258,10 @@ def main(argv=None):
         (
             "ssh terminal-emulator release artifact restores local tty on exit",
             test_ssh_terminal_emulator_release_artifact_restores_local_tty_on_exit,
+        ),
+        (
+            "ssh requested tty with piped stdout does not emit local cleanup",
+            test_ssh_requested_tty_with_piped_stdout_does_not_emit_local_cleanup,
         ),
         (
             "ssh forced tty remote command allocates pty with stdin null",

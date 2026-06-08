@@ -18,7 +18,6 @@ const frame_forwarder = @import("frame_forwarder.zig");
 const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
 const protocol = @import("../protocol/mod.zig");
-const reconnect = @import("../reconnect/mod.zig");
 const plain_ssh = @import("plain_ssh.zig");
 const remote_shell = @import("remote_shell.zig");
 const session_registry = @import("../runtime/session_registry.zig");
@@ -197,42 +196,6 @@ const SshStderrMode = enum(u8) {
     discard,
 };
 
-const ParallelReconnectResult = reconnect.AsyncResult(TerminalTransport);
-
-const ParallelReconnectState = struct {
-    task: reconnect.AsyncTask(TerminalTransport) = .{},
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    target: SshTarget,
-    common: CommonSessionOptions,
-    reconnect_ui: *client_ui.ReconnectUi,
-    session: attached_client.RuntimeSession,
-    failure_policy: BootstrapFailurePolicy,
-
-    fn store(self: *ParallelReconnectState, result: ParallelReconnectResult) void {
-        self.task.store(result);
-    }
-
-    fn isDone(self: *const ParallelReconnectState) bool {
-        return self.task.isDone();
-    }
-
-    fn take(self: *ParallelReconnectState) ?ParallelReconnectResult {
-        return self.task.take();
-    }
-};
-
-const ReconnectRaceOutcome = union(enum) {
-    recovered,
-    reconnected: TerminalTransport,
-    session_ended,
-    failed: anyerror,
-    disconnected: anyerror,
-    client_hangup,
-};
-
-const reconnect_ready_switch_delay_ms: u64 = 10_000;
-
 const SshStderrPump = struct {
     allocator: std.mem.Allocator,
     state: *State,
@@ -394,7 +357,8 @@ fn runRemoteNewSession(
     const target = resolved_target.target;
 
     const stdin_is_tty = c.isatty(0) != 0;
-    if (shouldUseProxyStream(new, runtime_config.common, stdin_is_tty)) {
+    const stdout_is_tty = c.isatty(1) != 0;
+    if (shouldUseProxyStream(new, runtime_config.common, stdin_is_tty, stdout_is_tty)) {
         if (runtime_config.common.capture_tty_transcript != null) {
             try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with proxy stream mode\n");
             return process_exit.request(64);
@@ -459,11 +423,7 @@ fn runRemoteNewSession(
         target.options,
     );
     try runAttachedRemoteClient(
-        allocator,
-        exe,
         target,
-        runtime_config,
-        failure_policy,
         &transport,
         &session,
     );
@@ -771,273 +731,45 @@ fn teardownTranscriptRecorder(transcript_recorder: *?tty_transcript.Recorder) vo
 }
 
 fn runAttachedRemoteClient(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
     target: SshTarget,
-    runtime_config: SessionRuntimeConfig,
-    failure_policy: BootstrapFailurePolicy,
     transport: *TerminalTransport,
     session: *attached_client.RuntimeSession,
 ) !void {
-    while (true) {
-        const end = attached_client.runAttachedClient(
-            transport.readFd(),
-            transport.writeFd(),
-            session,
-            .{ .monitor_connection = true },
-        ) catch |err| {
-            waitAfterRuntimeAttachFailure(transport, "attached client");
-            if (process_exit.is(err)) return err;
-            try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
-            return process_exit.request(1);
-        };
+    const end = attached_client.runAttachedClient(
+        transport.readFd(),
+        transport.writeFd(),
+        session,
+        .{ .monitor_connection = false },
+    ) catch |err| {
+        waitAfterRuntimeAttachFailure(transport, "attached client");
+        if (process_exit.is(err)) return err;
+        try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
+        return process_exit.request(1);
+    };
 
-        var race_existing_connection = false;
-        switch (end) {
-            .session_ended => {
-                client_log.debug("event=session_ended host={s} session={s}", .{ target.host, session.idSlice() });
-                const exit_status = try finishEndedRemoteSession(transport, session);
-                return process_exit.request(exit_status);
-            },
-            .client_hangup => {
-                client_log.debug("event=client_hangup host={s} session={s}", .{ target.host, session.idSlice() });
-                attached_client.drainLocalTransportDiagnostics(transport.readFd(), 100);
-                transport.terminate();
-                try finishHungUpSshSession(session);
-                return;
-            },
-            .unresponsive => {
-                client_log.debug("event=disconnect reason=unresponsive host={s} session={s}", .{ target.host, session.idSlice() });
-                race_existing_connection = true;
-            },
-            .transport_closed => {
-                client_log.debug("event=disconnect reason=transport_closed host={s} session={s}", .{ target.host, session.idSlice() });
-                transport.closeStdin();
-                transport.close();
-            },
-        }
-
-        const pending_input_at_disconnect = session.hasPendingInputAck();
-        const pending_paste_like_input_at_disconnect = session.hasPendingPasteLikeInputAck();
-        var reconnect_ui = try client_ui.ReconnectUi.beginWithPresentation(
-            session.viewport_offset,
-            reconnectPresentationForFilterLevel(runtime_config.common.filter_level),
-        );
-        var reconnect_ui_active = true;
-        defer if (reconnect_ui_active) reconnect_ui.deinit();
-
-        if (race_existing_connection) {
-            switch (try raceExistingConnectionWithReconnect(
-                target,
-                failure_policy,
-                exe,
-                runtime_config.common,
-                transport,
-                session,
-                &reconnect_ui,
-                pending_input_at_disconnect,
-                pending_paste_like_input_at_disconnect,
-            )) {
-                .recovered => {
-                    session.noteUnresponsiveRecovery();
-                    session.discardPendingInputAcks();
-                    session.viewport_offset = try reconnect_ui.clearOverlay();
-                    attached_client.repaintRuntimeSession(
-                        transport.readFd(),
-                        transport.writeFd(),
-                        session,
-                    ) catch |err| switch (err) {
-                        error.SessionEnded => {
-                            const exit_status = try finishEndedRemoteSession(transport, session);
-                            return process_exit.request(exit_status);
-                        },
-                        else => return err,
-                    };
-                    reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
-                    reconnect_ui.deinit();
-                    reconnect_ui_active = false;
-                    continue;
-                },
-                .reconnected => |new_transport| {
-                    transport.terminate();
-                    transport.* = new_transport;
-                    session.discardPendingInputAcks();
-                    session.viewport_offset = try reconnect_ui.clearOverlay();
-                    attached_client.finishReconnectRepaint(transport.readFd(), transport.writeFd(), session) catch |err| switch (err) {
-                        error.SessionEnded => {
-                            const exit_status = try finishEndedRemoteSession(transport, session);
-                            return process_exit.request(exit_status);
-                        },
-                        else => return err,
-                    };
-                    reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
-                    client_log.debug("event=reconnect_success host={s} session={s} attempt=0", .{
-                        target.host,
-                        session.idSlice(),
-                    });
-                    reconnect_ui.deinit();
-                    reconnect_ui_active = false;
-                    continue;
-                },
-                .session_ended => {
-                    const exit_status = try finishEndedRemoteSession(transport, session);
-                    return process_exit.request(exit_status);
-                },
-                .client_hangup => {
-                    transport.terminate();
-                    finishReconnectUiForEnd(&reconnect_ui, &reconnect_ui_active);
-                    try finishHungUpSshSession(session);
-                    return;
-                },
-                .failed => |err| {
-                    client_log.debug("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
-                        target.host,
-                        session.idSlice(),
-                        err,
-                    });
-                    client_log.userDiagnosticInfo("reconnect failed: parallel: {t}", .{err});
-                    transport.terminate();
-                },
-                .disconnected => |err| {
-                    client_log.debug("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
-                        target.host,
-                        session.idSlice(),
-                        err,
-                    });
-                    client_log.userDiagnosticInfo("reconnect failed: parallel: {t}", .{err});
-                },
-            }
-        }
-
-        var reconnect_attempt: usize = 0;
-        while (true) {
-            const delay_ms = reconnect.delayMs(reconnect_attempt);
-            client_log.debug("event=reconnect_wait host={s} session={s} attempt={} delay_ms={}", .{
-                target.host,
-                session.idSlice(),
-                reconnect_attempt,
-                delay_ms,
-            });
-            const wait_decision = try reconnect_ui.waitForReconnect(delay_ms);
-            switch (wait_decision) {
-                .client_hangup => {
-                    client_log.debug("event=reconnect_client_hangup host={s} session={s} attempt={}", .{
-                        target.host,
-                        session.idSlice(),
-                        reconnect_attempt,
-                    });
-                    finishReconnectUiForEnd(&reconnect_ui, &reconnect_ui_active);
-                    try finishHungUpSshSession(session);
-                    return;
-                },
-                .reconnect_now, .wait_elapsed => {
-                    client_log.debug("event=reconnect_attempt host={s} session={s} attempt={}", .{
-                        target.host,
-                        session.idSlice(),
-                        reconnect_attempt,
-                    });
-                },
-            }
-
-            transport.* = openTerminalDaemonTransport(
-                allocator,
-                exe,
-                target,
-                runtime_config.common,
-                true,
-                false,
-                &reconnect_ui,
-            ) catch |err| switch (err) {
-                error.ExitRequested => return err,
-                error.OutOfMemory => return err,
-                else => {
-                    client_log.debug("event=reconnect_failed stage=transport host={s} session={s} attempt={} error={t}", .{
-                        target.host,
-                        session.idSlice(),
-                        reconnect_attempt,
-                        err,
-                    });
-                    client_log.userDiagnosticInfo("reconnect failed: transport: {t}", .{err});
-                    reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
-                    continue;
-                },
-            };
-
-            session.viewport_offset = reconnect_ui.currentViewportOffset();
-            attached_client.reconnectSessionOnRuntimeCancellable(
-                transport.readFd(),
-                transport.writeFd(),
-                session,
-                reconnect_ui.cancellationFlag(),
-            ) catch |err| {
-                transport.closeStdin();
-                transport.close();
-                switch (err) {
-                    error.OutOfMemory => return err,
-                    else => {
-                        client_log.debug("event=reconnect_failed stage=attach host={s} session={s} attempt={} error={t}", .{
-                            target.host,
-                            session.idSlice(),
-                            reconnect_attempt,
-                            err,
-                        });
-                        client_log.userDiagnosticInfo("reconnect failed: attach: {t}", .{err});
-                        reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
-                        continue;
-                    },
-                }
-            };
-
-            switch (try waitForReconnectSwitchIfNeeded(
-                &reconnect_ui,
-                pending_input_at_disconnect,
-                pending_paste_like_input_at_disconnect,
-                false,
-            )) {
-                .client_hangup => {
-                    transport.terminate();
-                    finishReconnectUiForEnd(&reconnect_ui, &reconnect_ui_active);
-                    try finishHungUpSshSession(session);
-                    return;
-                },
-                .reconnect_now, .wait_elapsed => {},
-            }
-
-            session.discardPendingInputAcks();
-            session.viewport_offset = try reconnect_ui.clearOverlay();
-            attached_client.finishReconnectRepaint(
-                transport.readFd(),
-                transport.writeFd(),
-                session,
-            ) catch |err| {
-                transport.closeStdin();
-                transport.close();
-                switch (err) {
-                    error.OutOfMemory => return err,
-                    else => {
-                        client_log.debug("event=reconnect_failed stage=repaint host={s} session={s} attempt={} error={t}", .{
-                            target.host,
-                            session.idSlice(),
-                            reconnect_attempt,
-                            err,
-                        });
-                        client_log.userDiagnosticInfo("reconnect failed: repaint: {t}", .{err});
-                        reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
-                        continue;
-                    },
-                }
-            };
-
-            client_log.debug("event=reconnect_success host={s} session={s} attempt={}", .{
-                target.host,
-                session.idSlice(),
-                reconnect_attempt,
-            });
-            reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
-            reconnect_ui.deinit();
-            reconnect_ui_active = false;
-            break;
-        }
+    switch (end) {
+        .session_ended => {
+            client_log.debug("event=session_ended host={s} session={s}", .{ target.host, session.idSlice() });
+            const exit_status = try finishEndedRemoteSession(transport, session);
+            return process_exit.request(exit_status);
+        },
+        .client_hangup => {
+            client_log.debug("event=client_hangup host={s} session={s}", .{ target.host, session.idSlice() });
+            attached_client.drainLocalTransportDiagnostics(transport.readFd(), 100);
+            transport.terminate();
+            try finishHungUpSshSession(session);
+            return;
+        },
+        .unresponsive => {
+            client_log.debug("event=local_daemon_unresponsive host={s} session={s}", .{ target.host, session.idSlice() });
+            try finishLocalDaemonClosedSshSession(transport, session);
+            return process_exit.request(255);
+        },
+        .transport_closed => {
+            client_log.debug("event=local_daemon_closed host={s} session={s}", .{ target.host, session.idSlice() });
+            try finishLocalDaemonClosedSshSession(transport, session);
+            return process_exit.request(255);
+        },
     }
 }
 
@@ -1052,6 +784,22 @@ fn finishHungUpSshSession(session: *attached_client.RuntimeSession) !void {
     session.restoreAttachedClientEndPresentationForExit();
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
+}
+
+fn finishLocalDaemonClosedSshSession(transport: *TerminalTransport, session: *attached_client.RuntimeSession) !void {
+    transport.close();
+    session.restoreAttachedClientEndPresentationForExit();
+    client_log.flush(2);
+    try printDaemonConnectionLost();
+    try tty_transcript.finishActiveOrReport();
+}
+
+fn printDaemonConnectionLost() !void {
+    if (c.isatty(2) != 0) {
+        try io.writeAll(2, "\nsessh: daemon connection lost\n");
+    } else {
+        try io.stderrPrint("sessh: daemon connection lost\n", .{});
+    }
 }
 
 fn finishEndedRemoteSession(transport: *TerminalTransport, session: *attached_client.RuntimeSession) !u8 {
@@ -1074,22 +822,6 @@ fn finishEndedRemoteSession(transport: *TerminalTransport, session: *attached_cl
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
     return exit_status;
-}
-
-fn finishReconnectUiForEnd(reconnect_ui: *client_ui.ReconnectUi, active: *bool) void {
-    if (!active.*) return;
-    _ = reconnect_ui.clearOverlay() catch {};
-    reconnect_ui.restoreTitleForEnd();
-    reconnect_ui.deinit();
-    active.* = false;
-}
-
-fn reconnectPresentationForFilterLevel(level: config.FilterLevel) client_ui.ReconnectPresentation {
-    return switch (level) {
-        .raw => .none,
-        .hygienic => .title,
-        .emulated => .overlay,
-    };
 }
 
 fn writeBootstrapStatusBytes(client_diagnostic_fd: c.fd_t, bytes: []const u8) !void {
@@ -1168,396 +900,6 @@ fn sshVerbosity(ssh_options: []const []const u8) usize {
         }
     }
     return total;
-}
-
-fn raceExistingConnectionWithReconnect(
-    target: SshTarget,
-    failure_policy: BootstrapFailurePolicy,
-    exe: []const u8,
-    common: CommonSessionOptions,
-    old_transport: *TerminalTransport,
-    session: *attached_client.RuntimeSession,
-    reconnect_ui: *client_ui.ReconnectUi,
-    pending_input_at_disconnect: bool,
-    pending_paste_like_input_at_disconnect: bool,
-) !ReconnectRaceOutcome {
-    reconnect_ui.showUnresponsiveReconnectInProgressTitle();
-    var reconnect_attempt: usize = 0;
-    while (true) {
-        const outcome = try raceExistingConnectionWithReconnectAttempt(
-            target,
-            failure_policy,
-            exe,
-            common,
-            old_transport,
-            session,
-            reconnect_ui,
-            pending_input_at_disconnect,
-            pending_paste_like_input_at_disconnect,
-        );
-        switch (outcome) {
-            .failed => |err| {
-                client_log.debug("event=reconnect_failed stage=parallel host={s} session={s} attempt={} error={t}", .{
-                    target.host,
-                    session.idSlice(),
-                    reconnect_attempt,
-                    err,
-                });
-                client_log.userDiagnosticInfo("reconnect failed: parallel: {t}", .{err});
-                const delay_ms = reconnect.delayMs(reconnect_attempt);
-                reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, reconnect_ui);
-                client_log.debug("event=reconnect_wait_unresponsive host={s} session={s} attempt={} delay_ms={}", .{
-                    target.host,
-                    session.idSlice(),
-                    reconnect_attempt,
-                    delay_ms,
-                });
-                if (try waitForUnresponsiveReconnectRetry(
-                    old_transport,
-                    session,
-                    reconnect_ui,
-                    delay_ms,
-                )) |retry_outcome| return retry_outcome;
-            },
-            .disconnected => return outcome,
-            else => return outcome,
-        }
-    }
-}
-
-fn waitForUnresponsiveReconnectRetry(
-    old_transport: *TerminalTransport,
-    session: *attached_client.RuntimeSession,
-    reconnect_ui: *client_ui.ReconnectUi,
-    delay_ms: u64,
-) !?ReconnectRaceOutcome {
-    var timer = try std.time.Timer.start();
-    while (true) {
-        const elapsed_ms = @divTrunc(timer.read(), std.time.ns_per_ms);
-        if (elapsed_ms >= delay_ms) return null;
-
-        if (try attached_client.pollRuntimeRecovery(old_transport.readFd(), session, 0)) |recovery| {
-            switch (recovery) {
-                .recovered => return .recovered,
-                .session_ended => return .session_ended,
-                .transport_closed => {
-                    old_transport.closeStdin();
-                    old_transport.close();
-                    return .{ .disconnected = error.TransportClosed };
-                },
-            }
-        }
-
-        const remaining_ms = delay_ms - elapsed_ms;
-        const poll_ms: i32 = @intCast(@min(remaining_ms, @as(u64, 50)));
-        switch (try attached_client.pollAndForwardReconnectInput(
-            old_transport.readFd(),
-            old_transport.writeFd(),
-            session,
-            reconnect_ui,
-            poll_ms,
-        )) {
-            .wait_elapsed => {},
-            .client_hangup => return .client_hangup,
-            .reconnect_now => return null,
-            .transport_closed => {
-                old_transport.closeStdin();
-                old_transport.close();
-                return .{ .disconnected = error.TransportClosed };
-            },
-        }
-    }
-}
-
-fn raceExistingConnectionWithReconnectAttempt(
-    target: SshTarget,
-    failure_policy: BootstrapFailurePolicy,
-    exe: []const u8,
-    common: CommonSessionOptions,
-    old_transport: *TerminalTransport,
-    session: *attached_client.RuntimeSession,
-    reconnect_ui: *client_ui.ReconnectUi,
-    pending_input_at_disconnect: bool,
-    pending_paste_like_input_at_disconnect: bool,
-) !ReconnectRaceOutcome {
-    session.viewport_offset = reconnect_ui.currentViewportOffset();
-    var state = ParallelReconnectState{
-        .allocator = std.heap.smp_allocator,
-        .exe = exe,
-        .target = target,
-        .common = common,
-        .reconnect_ui = reconnect_ui,
-        .session = session.*,
-        .failure_policy = failure_policy,
-    };
-    const thread_allocator = std.heap.smp_allocator;
-    var thread = try std.Thread.spawn(.{}, parallelReconnectMain, .{ &state, thread_allocator });
-    var joined = false;
-    defer if (!joined) {
-        reconnect_ui.cancel();
-        thread.join();
-        cleanupParallelReconnectResult(&state);
-    };
-    var ready_connection: ?TerminalTransport = null;
-    defer if (ready_connection) |*connection| connection.terminate();
-    var ready_session = attached_client.RuntimeSession{};
-
-    var old_available = true;
-    while (true) {
-        if (ready_connection == null and state.isDone()) {
-            joined = true;
-            thread.join();
-            switch (state.take().?) {
-                .ready => |connection| {
-                    ready_connection = connection;
-                    ready_session = session.*;
-                    if (!old_available) {
-                        return try attachReadyReconnectConnectionAfterTransportClosed(
-                            &ready_connection,
-                            &ready_session,
-                            session,
-                            reconnect_ui,
-                            pending_input_at_disconnect,
-                            pending_paste_like_input_at_disconnect,
-                        );
-                    }
-                    const disposition = reconnect_ui.reconnectSwitchDisposition(
-                        pending_input_at_disconnect,
-                        pending_paste_like_input_at_disconnect,
-                        true,
-                    );
-                    if (reconnect_ui.hasReconnectAcknowledgement() or disposition == .automatic) {
-                        return try attachReadyReconnectConnection(
-                            &ready_connection,
-                            &ready_session,
-                            session,
-                            reconnect_ui,
-                        );
-                    }
-                    try reconnect_ui.showReconnectReady(disposition);
-                },
-                .failed => |err| {
-                    if (!old_available) return .{ .disconnected = err };
-                    return .{ .failed = err };
-                },
-            }
-        }
-
-        if (old_available) {
-            if (try attached_client.pollRuntimeRecovery(old_transport.readFd(), session, 0)) |recovery| {
-                switch (recovery) {
-                    .recovered => {
-                        reconnect_ui.cancel();
-                        if (!joined) {
-                            joined = true;
-                            thread.join();
-                            cleanupParallelReconnectResult(&state);
-                        }
-                        return .recovered;
-                    },
-                    .session_ended => {
-                        reconnect_ui.cancel();
-                        if (!joined) {
-                            joined = true;
-                            thread.join();
-                            cleanupParallelReconnectResult(&state);
-                        }
-                        return .session_ended;
-                    },
-                    .transport_closed => {
-                        old_transport.closeStdin();
-                        old_transport.close();
-                        old_available = false;
-                        if (ready_connection != null) {
-                            return try attachReadyReconnectConnectionAfterTransportClosed(
-                                &ready_connection,
-                                &ready_session,
-                                session,
-                                reconnect_ui,
-                                pending_input_at_disconnect,
-                                pending_paste_like_input_at_disconnect,
-                            );
-                        }
-                        try reconnect_ui.showDisconnectedReconnectInProgress();
-                    },
-                }
-            }
-            if (old_available) {
-                switch (try attached_client.pollAndForwardReconnectInput(
-                    old_transport.readFd(),
-                    old_transport.writeFd(),
-                    session,
-                    reconnect_ui,
-                    50,
-                )) {
-                    .wait_elapsed => {},
-                    .client_hangup => {
-                        reconnect_ui.cancel();
-                        if (!joined) {
-                            joined = true;
-                            thread.join();
-                            cleanupParallelReconnectResult(&state);
-                        }
-                        return .client_hangup;
-                    },
-                    .reconnect_now => {
-                        if (ready_connection != null) {
-                            return try attachReadyReconnectConnection(
-                                &ready_connection,
-                                &ready_session,
-                                session,
-                                reconnect_ui,
-                            );
-                        }
-                    },
-                    .transport_closed => {
-                        old_transport.closeStdin();
-                        old_transport.close();
-                        old_available = false;
-                        if (ready_connection != null) {
-                            return try attachReadyReconnectConnectionAfterTransportClosed(
-                                &ready_connection,
-                                &ready_session,
-                                session,
-                                reconnect_ui,
-                                pending_input_at_disconnect,
-                                pending_paste_like_input_at_disconnect,
-                            );
-                        }
-                        try reconnect_ui.showDisconnectedReconnectInProgress();
-                    },
-                }
-            }
-        } else {
-            switch (try reconnect_ui.pollDecision(50)) {
-                .client_hangup => {
-                    reconnect_ui.cancel();
-                    if (!joined) {
-                        joined = true;
-                        thread.join();
-                        cleanupParallelReconnectResult(&state);
-                    }
-                    return .client_hangup;
-                },
-                .reconnect_now => {
-                    if (ready_connection) |connection| {
-                        session.adoptReconnectState(&ready_session);
-                        ready_connection = null;
-                        return .{ .reconnected = connection };
-                    }
-                },
-                .wait_elapsed => {},
-            }
-        }
-    }
-}
-
-fn attachReadyReconnectConnectionAfterTransportClosed(
-    ready_connection: *?TerminalTransport,
-    ready_session: *attached_client.RuntimeSession,
-    session: *attached_client.RuntimeSession,
-    reconnect_ui: *client_ui.ReconnectUi,
-    pending_input_at_disconnect: bool,
-    pending_paste_like_input_at_disconnect: bool,
-) !ReconnectRaceOutcome {
-    switch (try waitForReconnectSwitchIfNeeded(
-        reconnect_ui,
-        pending_input_at_disconnect,
-        pending_paste_like_input_at_disconnect,
-        false,
-    )) {
-        .client_hangup => return .client_hangup,
-        .reconnect_now, .wait_elapsed => {},
-    }
-    return attachReadyReconnectConnection(ready_connection, ready_session, session, reconnect_ui);
-}
-
-fn attachReadyReconnectConnection(
-    ready_connection: *?TerminalTransport,
-    ready_session: *attached_client.RuntimeSession,
-    session: *attached_client.RuntimeSession,
-    reconnect_ui: *client_ui.ReconnectUi,
-) !ReconnectRaceOutcome {
-    var connection = ready_connection.* orelse return .{ .failed = error.ReconnectNotReady };
-    ready_connection.* = null;
-
-    attached_client.attachPreparedReconnectRuntimeCancellable(
-        connection.readFd(),
-        connection.writeFd(),
-        ready_session,
-        reconnect_ui.cancellationFlag(),
-    ) catch |err| {
-        connection.terminate();
-        return .{ .failed = err };
-    };
-    session.adoptReconnectState(ready_session);
-    return .{ .reconnected = connection };
-}
-
-fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allocator) void {
-    var connection = openTerminalDaemonTransport(
-        allocator,
-        state.exe,
-        state.target,
-        state.common,
-        true,
-        false,
-        state.reconnect_ui,
-    ) catch |err| {
-        state.store(.{ .failed = err });
-        return;
-    };
-
-    // Stop after Hello while racing an unresponsive transport. SessionAttach
-    // would replace the still-visible old attached client before the user presses
-    // Ctrl-R to switch.
-    attached_client.prepareReconnectRuntimeCancellable(
-        connection.readFd(),
-        connection.writeFd(),
-        state.reconnect_ui.cancellationFlag(),
-    ) catch |err| {
-        if (err == error.ReconnectCancelled) {
-            connection.terminate();
-        } else {
-            connection.closeStdin();
-            connection.close();
-        }
-        state.store(.{ .failed = err });
-        return;
-    };
-
-    state.store(.{ .ready = connection });
-}
-
-fn cleanupParallelReconnectResult(state: *ParallelReconnectState) void {
-    var result = state.take() orelse return;
-    switch (result) {
-        .ready => |*connection| connection.terminate(),
-        .failed => {},
-    }
-}
-
-fn waitForReconnectSwitchIfNeeded(
-    reconnect_ui: *client_ui.ReconnectUi,
-    pending_input_at_disconnect: bool,
-    pending_paste_like_input_at_disconnect: bool,
-    unresponsive: bool,
-) !client_ui.ReconnectDecision {
-    if (reconnect_ui.hasReconnectAcknowledgement()) return .reconnect_now;
-    const disposition = reconnect_ui.reconnectSwitchDisposition(
-        pending_input_at_disconnect,
-        pending_paste_like_input_at_disconnect,
-        unresponsive,
-    );
-    return switch (disposition) {
-        .automatic => .wait_elapsed,
-        .delayed => reconnect_ui.waitForReconnectSwitchOrTimeout(reconnect_ready_switch_delay_ms),
-        .manual_disconnected, .manual_unresponsive => reconnect_ui.waitForReconnectSwitch(disposition),
-    };
-}
-
-fn nextReconnectAttemptAfterFailure(attempt: usize, reconnect_ui: *client_ui.ReconnectUi) usize {
-    return reconnect.nextAttempt(attempt, reconnect_ui.consumeReconnectAcknowledgement());
 }
 
 fn defaultSshOptionsLen(target: SshTarget) usize {
@@ -1936,9 +1278,10 @@ fn filterLevelForcesProxy(level: config.FilterLevel) bool {
     };
 }
 
-fn shouldUseProxyStream(new: RemoteNewSession, common: CommonSessionOptions, stdin_is_tty: bool) bool {
+fn shouldUseProxyStream(new: RemoteNewSession, common: CommonSessionOptions, stdin_is_tty: bool, stdout_is_tty: bool) bool {
     if (new.command_argv.len != 0) return false;
     if (filterLevelForcesProxy(common.filter_level) or new.proxy_required) return true;
+    if ((!stdin_is_tty or !stdout_is_tty) and common.filter_level == .emulated) return true;
     if (!hasRemoteShellCommand(new.shell_command_args)) return !common.terminal_emulator;
     return shouldUseStreamPath(new, common, stdin_is_tty);
 }
@@ -2048,7 +1391,7 @@ fn proxyDiagnosticsPlan(
             .client_ctrl_r = false,
         },
         .hygienic, .emulated => blk: {
-            if (!stdout_is_tty) break :blk .{
+            if (!stdin_is_tty or !stdout_is_tty) break :blk .{
                 .command_level = .raw,
                 .use_client_socket = false,
                 .wrap_visible_ssh = false,
@@ -2640,7 +1983,11 @@ fn shouldUseStreamPathForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool) bo
 }
 
 fn shouldUseProxyStreamForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool) bool {
-    return shouldUseProxyStream(remoteNewFromParsedSessh(parsed), parsed.invocation.common, stdin_is_tty);
+    return shouldUseProxyStreamForTestWithStdout(parsed, stdin_is_tty, true);
+}
+
+fn shouldUseProxyStreamForTestWithStdout(parsed: ParsedSesshForTest, stdin_is_tty: bool, stdout_is_tty: bool) bool {
+    return shouldUseProxyStream(remoteNewFromParsedSessh(parsed), parsed.invocation.common, stdin_is_tty, stdout_is_tty);
 }
 
 fn proxyDiagnosticsPlanForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool, stdout_is_tty: bool) ProxyDiagnosticsPlan {
@@ -2840,6 +2187,28 @@ test "stream routing preserves ssh remote command tty semantics" {
     try std.testing.expect(!shouldUseProxyStreamForTest(forced, true));
 }
 
+test "emulated mode falls back to proxy stream when stdin or stdout is not a tty" {
+    var requested_tty_command = try parseSshArgsForTest(std.testing.allocator, &.{
+        "sessh",
+        "-t",
+        "example.com",
+        "tty",
+    }, .{});
+    defer requested_tty_command.deinit(std.testing.allocator);
+    try std.testing.expect(!shouldUseProxyStreamForTestWithStdout(requested_tty_command, true, true));
+    try std.testing.expect(shouldUseProxyStreamForTestWithStdout(requested_tty_command, false, true));
+    try std.testing.expect(shouldUseProxyStreamForTestWithStdout(requested_tty_command, true, false));
+
+    var interactive = try parseSshArgsForTest(std.testing.allocator, &.{
+        "sessh",
+        "example.com",
+    }, .{});
+    defer interactive.deinit(std.testing.allocator);
+    try std.testing.expect(!shouldUseProxyStreamForTestWithStdout(interactive, true, true));
+    try std.testing.expect(shouldUseProxyStreamForTestWithStdout(interactive, false, true));
+    try std.testing.expect(shouldUseProxyStreamForTestWithStdout(interactive, true, false));
+}
+
 test "no terminal emulator forces stream path and preserves ssh tty semantics" {
     var terminal_emulator = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
@@ -2938,12 +2307,6 @@ test "proxy stream reconnect status follows filter level" {
     try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.emulated, true));
 }
 
-test "terminal reconnect presentation follows filter level" {
-    try std.testing.expectEqual(client_ui.ReconnectPresentation.none, reconnectPresentationForFilterLevel(.raw));
-    try std.testing.expectEqual(client_ui.ReconnectPresentation.title, reconnectPresentationForFilterLevel(.hygienic));
-    try std.testing.expectEqual(client_ui.ReconnectPresentation.overlay, reconnectPresentationForFilterLevel(.emulated));
-}
-
 test "proxy diagnostics plan maps emulated to hygienic client socket" {
     var parsed = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
@@ -2963,6 +2326,12 @@ test "proxy diagnostics plan maps emulated to hygienic client socket" {
     try std.testing.expect(!no_stdout.use_client_socket);
     try std.testing.expect(!no_stdout.wrap_visible_ssh);
     try std.testing.expect(!no_stdout.client_ctrl_r);
+
+    const no_stdin = proxyDiagnosticsPlanForTest(parsed, false, true);
+    try std.testing.expectEqual(config.FilterLevel.raw, no_stdin.command_level);
+    try std.testing.expect(!no_stdin.use_client_socket);
+    try std.testing.expect(!no_stdin.wrap_visible_ssh);
+    try std.testing.expect(!no_stdin.client_ctrl_r);
 }
 
 test "proxy diagnostics plan honors raw level" {
