@@ -1091,12 +1091,13 @@ def run_daemon_log_test(_base_env):
                 if message_type != PONG:
                     raise AssertionError(f"expected PONG from sesshd, got {message_type}")
 
-            output += read_until_pipe(log_proc.stdout, b"client hello completed")
+            output += read_until_pipe(log_proc.stdout, b"client disconnected from daemon")
             output = output.decode("utf-8", "replace")
             for expected in (
                 "daemon log subscribed",
                 "client connected",
                 "client hello completed",
+                "client disconnected from daemon",
             ):
                 if expected not in output:
                     raise AssertionError(f"daemon log missing {expected!r}: {output!r}")

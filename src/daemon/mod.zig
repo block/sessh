@@ -256,7 +256,10 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
 
     while (true) {
         var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
-            error.EndOfStream => return,
+            error.EndOfStream => {
+                daemon_log.infof(allocator, "client disconnected from daemon", .{});
+                return;
+            },
             else => return err,
         };
         defer frame.deinit(allocator);
@@ -308,7 +311,10 @@ fn serveDaemonLogRequest(allocator: std.mem.Allocator, fd: c.fd_t, payload: []co
 
     while (true) {
         var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
-            error.EndOfStream => return,
+            error.EndOfStream => {
+                daemon_log.infof(allocator, "daemon log subscriber disconnected", .{});
+                return;
+            },
             else => return err,
         };
         defer frame.deinit(allocator);

@@ -1263,7 +1263,7 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
             raise AssertionError(f"daemon log replayed old entries: {daemon_log_output!r}")
 
         result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
-        daemon_log_output += read_until_pipe(log_proc.stdout, b"terminal transport ready host=test-host", timeout=5.0)
+        daemon_log_output += read_until_pipe(log_proc.stdout, b"ssh transport disconnected from daemon host=test-host", timeout=5.0)
     finally:
         terminate_process(log_proc)
 
@@ -1323,6 +1323,74 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         "bootstrap upload required host=test-host",
         "bootstrap completed host=test-host uploaded=true",
         "terminal transport ready host=test-host",
+        "ssh transport disconnected from daemon host=test-host",
+    ):
+        if expected not in daemon_log_stdout:
+            raise AssertionError(
+                ssh_failure_diagnostics(f"daemon log missing {expected!r}", result, fake_log, fake_trace)
+            )
+
+
+def test_ssh_daemon_log_records_client_hangup_cleanup(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_HANGUP_CLEANUP_READY"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SHELL"] = str(remote_shell)
+
+    log_proc = subprocess.Popen(
+        sessh_argv(["--daemon-log"]),
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    proc = None
+    try:
+        daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
+        argv = sessh_argv(["test-host"])
+        proc = subprocess.Popen(
+            argv,
+            cwd=ROOT,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout = read_until_pipe(proc.stdout, marker.encode("utf-8"), timeout=30.0)
+        proc.stdin.close()
+        returncode = proc.wait(timeout=30.0)
+        stdout += proc.stdout.read()
+        stderr = proc.stderr.read()
+        result = subprocess.CompletedProcess(
+            argv,
+            returncode,
+            stdout.decode("utf-8", "replace"),
+            stderr.decode("utf-8", "replace"),
+        )
+        daemon_log_output += read_until_pipe(log_proc.stdout, b"remote terminal hangup requested host=test-host", timeout=5.0)
+    finally:
+        if proc is not None and proc.poll() is None:
+            terminate_process(proc)
+        terminate_process(log_proc)
+
+    if result.returncode != 0:
+        raise AssertionError(ssh_failure_diagnostics("sessh returned non-zero", result, fake_log, fake_trace))
+    daemon_log_stdout = daemon_log_output.decode("utf-8", "replace")
+    for expected in (
+        "terminal client disconnected; requesting remote hangup host=test-host",
+        "remote terminal hangup requested host=test-host",
     ):
         if expected not in daemon_log_stdout:
             raise AssertionError(
@@ -1621,7 +1689,20 @@ def test_ssh_failure_uses_ssh_exit_status_and_visible_args(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_EXIT_BEFORE_COMMAND"] = "255"
 
-    result = run_sessh(["-vvv", "test-host"], env, timeout=5.0)
+    log_proc = subprocess.Popen(
+        sessh_argv(["--daemon-log"]),
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
+        result = run_sessh(["-vvv", "test-host"], env, timeout=5.0)
+        daemon_log_output += read_until_pipe(log_proc.stdout, b"terminal transport failed host=test-host", timeout=5.0)
+    finally:
+        terminate_process(log_proc)
 
     if result.returncode != 255:
         raise AssertionError(result)
@@ -1631,6 +1712,13 @@ def test_ssh_failure_uses_ssh_exit_status_and_visible_args(tmp):
         raise AssertionError(result)
     if "EndOfStream" in result.stderr or "ssh bootstrap failed before response" in result.stderr:
         raise AssertionError(result.stderr)
+    daemon_log_stdout = daemon_log_output.decode("utf-8", "replace")
+    for expected in (
+        "bootstrap failed before response host=test-host error=EndOfStream",
+        "terminal transport failed host=test-host error=SshBootstrapFailed",
+    ):
+        if expected not in daemon_log_stdout:
+            raise AssertionError(f"daemon log missing {expected!r}: {daemon_log_stdout!r}")
 
 
 def test_ssh_stdin_null_option_uses_proxy_stream(tmp):
@@ -3683,6 +3771,10 @@ def main(argv=None):
         (
             "ssh transport uploads artifact and reaches broker",
             test_ssh_transport_uploads_artifact_and_reaches_broker,
+        ),
+        (
+            "ssh daemon log records client hangup cleanup",
+            test_ssh_daemon_log_records_client_hangup_cleanup,
         ),
         (
             "ssh transport cache hit suppresses bootstrap status",

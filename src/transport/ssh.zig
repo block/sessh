@@ -101,6 +101,7 @@ const BootstrapFailurePolicy = struct {
     unsupported_action: []const u8,
     allow_plain_ssh_fallback: bool = false,
     return_unsupported_error: bool = false,
+    return_bootstrap_error: bool = false,
 };
 
 const RuntimeConnection = struct {
@@ -532,9 +533,11 @@ pub fn serveTerminalTransportFromDaemon(
         .{
             .unsupported_action = "start a persistent sessh session",
             .return_unsupported_error = true,
+            .return_bootstrap_error = true,
         },
     ) catch |err| switch (err) {
         error.UnsupportedRemotePlatform => {
+            daemon_log.infof(allocator, "terminal transport failed host={s} error={t}", .{ target.host, err });
             try sendDaemonTransportError(
                 client_fd,
                 "UNSUPPORTED_REMOTE_PLATFORM",
@@ -544,6 +547,7 @@ pub fn serveTerminalTransportFromDaemon(
             return;
         },
         else => {
+            daemon_log.infof(allocator, "terminal transport failed host={s} error={t}", .{ target.host, err });
             try frame_forwarder.forwardRawTransportDiagnostics(client_fd, diagnostic_pipe[0]);
             if (try sendDaemonSshFailure(client_fd, allocator, target, bootstrap_failure_term)) return;
             try sendDaemonTransportError(client_fd, "SSH_TRANSPORT_FAILED", "ssh transport failed", "");
@@ -561,7 +565,10 @@ pub fn serveTerminalTransportFromDaemon(
         child.child.stdout.?.handle,
         child.child.stdin.?.handle,
         .te_session_hangup,
-        .{ .notify_read_fd = diagnostic_pipe[0] },
+        .{
+            .notify_read_fd = diagnostic_pipe[0],
+            .log_context = .{ .host = target.host },
+        },
     );
 }
 
@@ -1661,6 +1668,10 @@ fn startRuntimeConnection(
         if (batch_mode) {
             return err;
         }
+        if (failure_policy.return_bootstrap_error) {
+            daemon_log.infof(allocator, "bootstrap failed before response host={s} error={t}", .{ target.host, err });
+            return error.SshBootstrapFailed;
+        }
         try exitAfterSshBootstrapFailure(allocator, target, term, err);
     };
     defer allocator.free(line);
@@ -1670,6 +1681,10 @@ fn startRuntimeConnection(
         const remote_platform = parseMissingPlatform(line) catch {
             connection.closeStdin();
             _ = connection.wait() catch {};
+            if (failure_policy.return_bootstrap_error) {
+                daemon_log.infof(allocator, "bootstrap invalid response host={s} line={s}", .{ target.host, line });
+                return error.SshBootstrapInvalidResponse;
+            }
             try io.stderrPrint("sessh: invalid bootstrap response: {s}\n", .{line});
             return process_exit.request(1);
         };
@@ -1689,6 +1704,14 @@ fn startRuntimeConnection(
                 "sessh: no packaged artifact is available for {s} {s}\n",
                 .{ remote_platform.os, remote_platform.arch },
             );
+            if (failure_policy.return_bootstrap_error) {
+                daemon_log.infof(
+                    allocator,
+                    "bootstrap artifact unavailable host={s} platform={s}/{s}",
+                    .{ target.host, remote_platform.os, remote_platform.arch },
+                );
+                return error.SshBootstrapFailed;
+            }
             return process_exit.request(1);
         };
         daemon_log.infof(
@@ -1724,6 +1747,10 @@ fn startRuntimeConnection(
             if (batch_mode) {
                 return err;
             }
+            if (failure_policy.return_bootstrap_error) {
+                daemon_log.infof(allocator, "bootstrap failed after upload host={s} error={t}", .{ target.host, err });
+                return error.SshBootstrapFailed;
+            }
             try exitAfterSshBootstrapFailure(allocator, target, term, err);
         };
     }
@@ -1750,12 +1777,20 @@ fn startRuntimeConnection(
         if (isUnsupportedPlatformBootstrapError(line)) {
             try exitUnsupportedPlatform(failure_policy.unsupported_action, null);
         }
+        if (failure_policy.return_bootstrap_error) {
+            daemon_log.infof(allocator, "remote bootstrap failed host={s} line={s}", .{ target.host, line });
+            return error.SshBootstrapFailed;
+        }
         try io.stderrPrint("sessh: remote bootstrap failed: {s}\n", .{line});
         return process_exit.request(1);
     }
 
     connection.closeStdin();
     _ = connection.wait() catch {};
+    if (failure_policy.return_bootstrap_error) {
+        daemon_log.infof(allocator, "unexpected bootstrap response host={s} line={s}", .{ target.host, line });
+        return error.SshBootstrapInvalidResponse;
+    }
     try io.stderrPrint("sessh: unexpected bootstrap response: {s}\n", .{line});
     return process_exit.request(1);
 }

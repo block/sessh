@@ -3,6 +3,7 @@ const c = std.c;
 const posix = std.posix;
 
 const io = @import("../core/io.zig");
+const daemon_log = @import("../daemon/log.zig");
 const protocol = @import("../protocol/mod.zig");
 
 pub const ClientCloseAction = enum {
@@ -12,6 +13,11 @@ pub const ClientCloseAction = enum {
 
 pub const ClientDiagnosticForwarding = struct {
     notify_read_fd: c.fd_t = -1,
+    log_context: LogContext = .{},
+};
+
+pub const LogContext = struct {
+    host: []const u8 = "",
 };
 
 pub fn forwardFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, runtime_fd: c.fd_t) !void {
@@ -89,12 +95,15 @@ pub fn forwardFramesBetweenWithClientCloseActionAndDiagnostics(
         }
         if ((pollfds[client_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             if (!try copyOneFrame(client_read_fd, runtime_write_fd)) {
-                try handleClientClose(runtime_write_fd, client_close_action);
+                try handleClientClose(runtime_write_fd, client_close_action, diagnostics.log_context);
                 return;
             }
         }
         if ((pollfds[runtime_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (!try copyOneFrame(runtime_read_fd, client_write_fd)) return;
+            if (!try copyOneFrame(runtime_read_fd, client_write_fd)) {
+                logDaemonEvent(diagnostics.log_context, "ssh transport disconnected from daemon");
+                return;
+            }
         }
     }
 }
@@ -118,14 +127,37 @@ fn copyOneFrame(read_fd: c.fd_t, write_fd: c.fd_t) !bool {
     return true;
 }
 
-fn handleClientClose(runtime_write_fd: c.fd_t, action: ClientCloseAction) !void {
+fn handleClientClose(runtime_write_fd: c.fd_t, action: ClientCloseAction, log_context: LogContext) !void {
     switch (action) {
         .none => {},
         .te_session_hangup => {
+            logDaemonEvent(log_context, "terminal client disconnected; requesting remote hangup");
             const payload = try protocol.encodePayload(std.heap.page_allocator, protocol.pb.TeSessionHangupRequest{});
             defer std.heap.page_allocator.free(payload);
-            try protocol.sendFrame(runtime_write_fd, .te_session_hangup_request, payload);
+            protocol.sendFrame(runtime_write_fd, .te_session_hangup_request, payload) catch |err| {
+                logDaemonEventFmt(log_context, "remote terminal hangup request failed error={t}", .{err});
+                return err;
+            };
+            logDaemonEvent(log_context, "remote terminal hangup requested");
         },
+    }
+}
+
+fn logDaemonEvent(log_context: LogContext, message: []const u8) void {
+    if (log_context.host.len == 0) {
+        daemon_log.infof(std.heap.page_allocator, "{s}", .{message});
+    } else {
+        daemon_log.infof(std.heap.page_allocator, "{s} host={s}", .{ message, log_context.host });
+    }
+}
+
+fn logDaemonEventFmt(log_context: LogContext, comptime fmt: []const u8, args: anytype) void {
+    if (log_context.host.len == 0) {
+        daemon_log.infof(std.heap.page_allocator, fmt, args);
+    } else {
+        const message = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
+        defer std.heap.page_allocator.free(message);
+        daemon_log.infof(std.heap.page_allocator, "{s} host={s}", .{ message, log_context.host });
     }
 }
 
