@@ -32,6 +32,7 @@ const terminal_query_timeout_ms: i64 = 150;
 const terminal_query_poll_ms: i64 = 25;
 const kitty_keyboard_query = "\x1b[?u";
 const terminal_probe_request =
+    kitty_keyboard_query ++
     "\x1b]60;?\x1b\\" ++
     "\x1b[6n" ++
     "\x1b]10;?\x1b\\" ++

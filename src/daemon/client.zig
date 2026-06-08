@@ -14,7 +14,7 @@ const hpb = protocol.hpb;
 const pb = protocol.pb;
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
-    const dir_name = try socket_namespace.defaultDirName(allocator);
+    const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
     return socketPathForDirName(allocator, dir_name);
 }
@@ -39,7 +39,7 @@ pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
 }
 
 pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
-    const dir_name = try socket_namespace.defaultDirName(allocator);
+    const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
     return connectOrStartForDirName(allocator, exe, dir_name);
 }
@@ -71,7 +71,7 @@ fn spawnDaemonIfNamespaceUnlocked(allocator: std.mem.Allocator, exe: []const u8,
 }
 
 pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
-    const dir_name = try socket_namespace.defaultDirName(allocator);
+    const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
     const path = try socketPathForDirName(allocator, dir_name);
     defer allocator.free(path);
@@ -169,7 +169,7 @@ test "daemon log timestamp uses readable milliseconds" {
 }
 
 pub fn connectAndHandshake(allocator: std.mem.Allocator) !c.fd_t {
-    const dir_name = try socket_namespace.defaultDirName(allocator);
+    const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
     return connectAndHandshakeForDirName(allocator, dir_name);
 }

@@ -1526,9 +1526,11 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     for expected in (
         "terminal transport opening host=test-host",
         "ssh transport starting host=test-host bootstrap=true",
+        "remote daemon namespace host=test-host namespace=",
+        "env=SESSH_DAEMON_NAMESPACE",
         "bootstrap upload required host=test-host",
         "bootstrap completed host=test-host uploaded=true",
-        "terminal transport ready host=test-host",
+        "terminal transport ready host=test-host remote_namespace=",
     ):
         if expected not in daemon_log_stdout:
             raise AssertionError(
@@ -1678,6 +1680,18 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
             f"\nlog:\n{optional_text(fake_log)}"
             f"\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
         )
+    daemon_log_text = daemon_log_output.decode("utf-8", "replace")
+    for expected in (
+        "terminal pooled client startup host=test-host",
+        "kind=te",
+        "request_to_ready_ms=",
+        "ready_to_open_ms=",
+        "open_to_open_ok_ms=",
+        "open_ok_to_first_payload_ms=",
+        "request_to_first_payload_ms=",
+    ):
+        if expected not in daemon_log_text:
+            raise AssertionError(f"daemon log missing {expected!r}: {daemon_log_text}")
 
 
 def test_ssh_proxy_streams_pool_tcp_connection(tmp):
@@ -1842,6 +1856,18 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
             f"\nlog:\n{optional_text(fake_log)}"
             f"\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
         )
+    daemon_log_text = daemon_log_output.decode("utf-8", "replace")
+    for expected in (
+        "terminal pooled client startup host=test-host",
+        "kind=proxy",
+        "request_to_ready_ms=",
+        "ready_to_open_ms=",
+        "open_to_open_ok_ms=",
+        "open_ok_to_first_payload_ms=",
+        "request_to_first_payload_ms=",
+    ):
+        if expected not in daemon_log_text:
+            raise AssertionError(f"daemon log missing {expected!r}: {daemon_log_text}")
 
 
 def test_ssh_local_daemon_death_tty_error_starts_on_new_line(tmp):

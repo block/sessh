@@ -67,6 +67,65 @@ const paste_like_single_read_bytes = 32;
 const paste_like_window_bytes = 64;
 const paste_like_window_ms: i64 = 250;
 
+pub const LocalTerminalState = struct {
+    size: WindowSize = .{},
+    cursor_position: ?terminal.CursorPosition = null,
+    viewport_offset: ?i32 = null,
+    default_colors: ProtocolDefaultColors = .{},
+    tty_settings: ?tty_settings.Settings = null,
+    initial_kitty_keyboard_flags: u5 = 0,
+
+    pub fn deinit(self: *LocalTerminalState) void {
+        if (self.tty_settings) |*settings| settings.deinit(app_allocator.allocator());
+        self.* = .{};
+    }
+};
+
+const LocalTerminalProbeContext = struct {
+    state: LocalTerminalState = .{},
+};
+
+pub const LocalTerminalProbe = struct {
+    allocator: std.mem.Allocator,
+    context: ?*LocalTerminalProbeContext = null,
+    thread: ?std.Thread = null,
+
+    pub fn start(allocator: std.mem.Allocator) LocalTerminalProbe {
+        const context = allocator.create(LocalTerminalProbeContext) catch return .{ .allocator = allocator };
+        context.* = .{};
+        const thread = std.Thread.spawn(.{}, captureLocalTerminalStateThread, .{context}) catch {
+            allocator.destroy(context);
+            return .{ .allocator = allocator };
+        };
+        return .{
+            .allocator = allocator,
+            .context = context,
+            .thread = thread,
+        };
+    }
+
+    pub fn finish(self: *LocalTerminalProbe) LocalTerminalState {
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        const context = self.context orelse return captureLocalTerminalState();
+        defer {
+            self.allocator.destroy(context);
+            self.context = null;
+        }
+        const state = context.state;
+        context.state = .{};
+        return state;
+    }
+
+    pub fn deinit(self: *LocalTerminalProbe) void {
+        if (self.context == null) return;
+        var state = self.finish();
+        state.deinit();
+    }
+};
+
 const ConnectionMonitor = struct {
     enabled: bool = false,
     any_response_wait_started_ms: ?i64 = null,
@@ -287,6 +346,9 @@ pub const RuntimeSession = struct {
     /// Most recent app-title presence bit from Draw/RepaintResponse. True means
     /// the app owns the title, even if it set it to an empty string.
     app_title_present: ?bool = null,
+    initial_cursor_position: ?terminal.CursorPosition = null,
+    initial_draw_alignment_pending: bool = false,
+    initial_kitty_keyboard_flags: u5 = 0,
 
     pub fn adoptReconnectState(self: *RuntimeSession, reconnected: *const RuntimeSession) void {
         self.pending_repaint = reconnected.pending_repaint;
@@ -317,7 +379,7 @@ pub const RuntimeSession = struct {
 
     pub fn restoreAttachedClientEndPresentationForExit(self: *RuntimeSession) void {
         self.restoreAttachedClientEndPresentation();
-        restoreLocalTerminalPresentation();
+        restoreLocalTerminalPresentation(self.initial_kitty_keyboard_flags);
     }
 
     pub fn deinit(self: *RuntimeSession) void {
@@ -573,6 +635,8 @@ test "attached client drains pending session end before monitor timeout" {
     var app_title_present: ?bool = null;
     var input_escape_filter = terminal.EscapeFilter{};
     var paste_like_input_classifier = PasteLikeInputClassifier{};
+    var initial_cursor_position: ?terminal.CursorPosition = null;
+    var initial_draw_alignment_pending = false;
 
     try std.testing.expectEqual(
         AttachedClientEnd.session_ended,
@@ -590,6 +654,8 @@ test "attached client drains pending session end before monitor timeout" {
             &paste_like_input_classifier,
             null,
             &app_title_present,
+            &initial_cursor_position,
+            &initial_draw_alignment_pending,
             .{ .monitor_connection = true },
         ),
     );
@@ -613,6 +679,8 @@ test "attached client treats input write failure as transport closed" {
     var input_escape_filter = terminal.EscapeFilter{};
     var paste_like_input_classifier = PasteLikeInputClassifier{};
     var app_title_present: ?bool = null;
+    var initial_cursor_position: ?terminal.CursorPosition = null;
+    var initial_draw_alignment_pending = false;
 
     try io_helpers.writeAll(input[1], "typed");
 
@@ -632,6 +700,8 @@ test "attached client treats input write failure as transport closed" {
             &paste_like_input_classifier,
             null,
             &app_title_present,
+            &initial_cursor_position,
+            &initial_draw_alignment_pending,
             .{ .monitor_connection = true },
         ),
     );
@@ -918,14 +988,12 @@ pub fn startNewSessionOnRuntime(
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
     reap_ms: u64,
+    local_terminal: *LocalTerminalState,
 ) !RuntimeSession {
-    const size = terminal.currentWindowSize();
-    const viewport_offset = queryInitialViewportOffset();
     try runtimeHandshake(read_fd, write_fd);
     const repaint_request_seq = try sendSessionCreate(
         write_fd,
-        size,
-        viewport_offset,
+        local_terminal,
         scrollback_row_count,
         session_guid,
         command_argv,
@@ -933,8 +1001,11 @@ pub fn startNewSessionOnRuntime(
         reap_ms,
     );
     var session = try readRuntimeSession(read_fd);
-    session.viewport_offset = viewport_offset orelse 0;
+    session.viewport_offset = local_terminal.viewport_offset orelse 0;
     session.pending_repaint.repaint_request_seq = repaint_request_seq;
+    session.initial_cursor_position = local_terminal.cursor_position;
+    session.initial_draw_alignment_pending = local_terminal.cursor_position != null;
+    session.initial_kitty_keyboard_flags = local_terminal.initial_kitty_keyboard_flags;
     return session;
 }
 
@@ -1096,6 +1167,9 @@ pub fn runAttachedClient(
         &session.paste_like_input_classifier,
         &session.ended_process_exit_code,
         &session.app_title_present,
+        &session.initial_cursor_position,
+        &session.initial_draw_alignment_pending,
+        session.initial_kitty_keyboard_flags,
         .{
             .monitor_connection = options.monitor_connection,
             .responsiveness_timeout_floor_ms = @max(options.responsiveness_timeout_floor_ms, session.unresponsive_timeout_floor_ms),
@@ -1294,12 +1368,6 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
             else => return error.UnexpectedFrame,
         }
     }
-}
-
-fn queryInitialViewportOffset() ?i32 {
-    if (c.isatty(posix.STDIN_FILENO) == 0 or c.isatty(posix.STDOUT_FILENO) == 0) return null;
-    const position = terminal.queryCursorPosition(posix.STDIN_FILENO, posix.STDOUT_FILENO) catch return unknown_viewport_offset;
-    return initialViewportOffsetFromCursorPosition(position);
 }
 
 fn initialViewportOffsetFromCursorPosition(position: ?terminal.CursorPosition) ?i32 {
@@ -1502,8 +1570,7 @@ fn errorPayloadFromHelloError(response_error: hpb.HelloError) ErrorPayload {
 
 fn sendSessionCreate(
     conn: c.fd_t,
-    size: WindowSize,
-    viewport_offset: ?i32,
+    local_terminal: *const LocalTerminalState,
     scrollback_row_count: u32,
     session_guid: []const u8,
     command_argv: []const []const u8,
@@ -1517,17 +1584,9 @@ fn sendSessionCreate(
         .reap_ms = reap_ms,
     };
     defer create.environment.deinit(app_allocator.allocator());
-    // The normal sessh path runs a terminal emulator on the remote side. Copy
-    // portable line-discipline modes, but keep TERM tied to that emulator
-    // contract instead of leaking the outer terminal's TERM.
-    var captured_tty_settings = tty_settings.capture(app_allocator.allocator(), posix.STDIN_FILENO, .{ .include_term = false }) catch |err| blk: {
-        client_log.debug("event=tty_settings_capture_failed error={t}", .{err});
-        break :blk null;
-    };
-    defer if (captured_tty_settings) |*settings| settings.deinit(app_allocator.allocator());
     var protocol_tty_settings = pb.TeSessionCreate.TtySettings{};
     defer protocol_tty_settings.tty_mode.deinit(app_allocator.allocator());
-    if (captured_tty_settings) |settings| {
+    if (local_terminal.tty_settings) |settings| {
         for (settings.modes) |mode| {
             try protocol_tty_settings.tty_mode.append(app_allocator.allocator(), .{
                 .opcode = mode.opcode,
@@ -1544,17 +1603,16 @@ fn sendSessionCreate(
         try exec_command.argv.appendSlice(app_allocator.allocator(), command_argv);
         create.command = .{ .exec_command = exec_command };
     }
-    const default_colors = queryDefaultColorsForSession();
     create.query_default_colors = .{
-        .foreground_color = default_colors.foreground_color,
-        .background_color = default_colors.background_color,
+        .foreground_color = local_terminal.default_colors.foreground_color,
+        .background_color = local_terminal.default_colors.background_color,
     };
     const message = pb.TeStreamOpen{
         .session_guid = session_guid,
         .resize = .{
-            .terminal_rows = size.rows,
-            .terminal_cols = size.cols,
-            .viewport_offset = viewport_offset,
+            .terminal_rows = local_terminal.size.rows,
+            .terminal_cols = local_terminal.size.cols,
+            .viewport_offset = local_terminal.viewport_offset,
             .repaint_request = .{
                 .repaint_request_seq = repaint_request_seq,
                 .scrollback_cursor = "",
@@ -1574,8 +1632,36 @@ const ProtocolDefaultColors = struct {
     background_color: u32 = 0xffffffff,
 };
 
-fn queryDefaultColorsForSession() ProtocolDefaultColors {
-    const queried = terminal.queryDefaultColors(posix.STDIN_FILENO, posix.STDOUT_FILENO) catch return .{};
+fn captureLocalTerminalStateThread(context: *LocalTerminalProbeContext) void {
+    context.state = captureLocalTerminalState();
+}
+
+pub fn captureLocalTerminalState() LocalTerminalState {
+    var state = LocalTerminalState{
+        .size = terminal.currentWindowSize(),
+    };
+    // The normal sessh path runs a terminal emulator on the remote side. Copy
+    // portable line-discipline modes, but keep TERM tied to that emulator
+    // contract instead of leaking the outer terminal's TERM.
+    state.tty_settings = tty_settings.capture(app_allocator.allocator(), posix.STDIN_FILENO, .{ .include_term = false }) catch |err| blk: {
+        client_log.debug("event=tty_settings_capture_failed error={t}", .{err});
+        break :blk null;
+    };
+
+    if (c.isatty(posix.STDIN_FILENO) == 0 or c.isatty(posix.STDOUT_FILENO) == 0) return state;
+
+    const probe = terminal.queryTerminalProbe(posix.STDIN_FILENO, posix.STDOUT_FILENO) catch {
+        state.viewport_offset = unknown_viewport_offset;
+        return state;
+    };
+    state.cursor_position = probe.cursor_position;
+    state.viewport_offset = initialViewportOffsetFromCursorPosition(probe.cursor_position);
+    state.default_colors = protocolDefaultColorsFromQuery(probe.default_colors);
+    state.initial_kitty_keyboard_flags = probe.kitty_keyboard_flags orelse 0;
+    return state;
+}
+
+fn protocolDefaultColorsFromQuery(queried: terminal.DefaultColorQuery) ProtocolDefaultColors {
     return .{
         .foreground_color = protocolColorFromRgb(queried.foreground),
         .background_color = protocolColorFromRgb(queried.background),
@@ -1694,6 +1780,9 @@ fn runAttachedClientLoop(
     paste_like_input_classifier: *PasteLikeInputClassifier,
     ended_process_exit_code: ?*?u8,
     app_title_present: *?bool,
+    initial_cursor_position: *?terminal.CursorPosition,
+    initial_draw_alignment_pending: *bool,
+    initial_kitty_keyboard_flags: u5,
     options: AttachedClientOptions,
 ) !AttachedClientEnd {
     const output_is_tty = c.isatty(posix.STDOUT_FILENO) != 0;
@@ -1703,11 +1792,15 @@ fn runAttachedClientLoop(
     defer if (cleanup_title) |title| app_allocator.allocator().free(title);
     var presentation_guard = if (output_is_tty) guard: {
         break :guard if (cleanup_title) |title|
-            client_renderer.PresentationGuard.initWithCleanupTitle(posix.STDOUT_FILENO, title)
+            client_renderer.PresentationGuard.initWithCleanupTitleAndInitialKittyKeyboardFlags(
+                posix.STDOUT_FILENO,
+                title,
+                initial_kitty_keyboard_flags,
+            )
         else
-            client_renderer.PresentationGuard.init(posix.STDOUT_FILENO);
+            client_renderer.PresentationGuard.initWithInitialKittyKeyboardFlags(posix.STDOUT_FILENO, initial_kitty_keyboard_flags);
     } else guard: {
-        var inactive = client_renderer.PresentationGuard.init(posix.STDOUT_FILENO);
+        var inactive = client_renderer.PresentationGuard.initWithInitialKittyKeyboardFlags(posix.STDOUT_FILENO, initial_kitty_keyboard_flags);
         inactive.active = false;
         break :guard inactive;
     };
@@ -1727,6 +1820,8 @@ fn runAttachedClientLoop(
         paste_like_input_classifier,
         ended_process_exit_code,
         app_title_present,
+        initial_cursor_position,
+        initial_draw_alignment_pending,
         options,
     );
     if (end == .client_hangup) writeClientCloseBoundary();
@@ -1747,6 +1842,8 @@ fn runAttachedTerminal(
     paste_like_input_classifier: *PasteLikeInputClassifier,
     ended_process_exit_code: ?*?u8,
     app_title_present: *?bool,
+    initial_cursor_position: *?terminal.CursorPosition,
+    initial_draw_alignment_pending: *bool,
     options: AttachedClientOptions,
 ) !AttachedClientEnd {
     var pollfds = [_]posix.pollfd{
@@ -1777,6 +1874,8 @@ fn runAttachedTerminal(
                 input_ack_tracker,
                 ended_process_exit_code,
                 app_title_present,
+                initial_cursor_position,
+                initial_draw_alignment_pending,
             )) |end| return finishAttachedClient(end, attached_client_end_restore);
         }
 
@@ -1798,6 +1897,8 @@ fn runAttachedTerminal(
                         input_ack_tracker,
                         ended_process_exit_code,
                         app_title_present,
+                        initial_cursor_position,
+                        initial_draw_alignment_pending,
                     ),
                     else => return err,
                 };
@@ -1827,6 +1928,8 @@ fn runAttachedTerminal(
                         input_ack_tracker,
                         ended_process_exit_code,
                         app_title_present,
+                        initial_cursor_position,
+                        initial_draw_alignment_pending,
                     ),
                     else => return err,
                 },
@@ -1844,6 +1947,8 @@ fn runAttachedTerminal(
                 input_ack_tracker,
                 ended_process_exit_code,
                 app_title_present,
+                initial_cursor_position,
+                initial_draw_alignment_pending,
             ),
             else => return err,
         };
@@ -2041,6 +2146,8 @@ fn drainAttachedClientRuntimeFrames(
     input_ack_tracker: *InputAckTracker,
     ended_process_exit_code: ?*?u8,
     app_title_present: *?bool,
+    initial_cursor_position: *?terminal.CursorPosition,
+    initial_draw_alignment_pending: *bool,
 ) !?AttachedClientEnd {
     while (true) {
         var runtime_poll = [_]posix.pollfd{.{
@@ -2068,6 +2175,8 @@ fn drainAttachedClientRuntimeFrames(
             input_ack_tracker,
             ended_process_exit_code,
             app_title_present,
+            initial_cursor_position,
+            initial_draw_alignment_pending,
         )) |end| return end;
     }
 }
@@ -2082,6 +2191,8 @@ fn finishAttachedClientAfterRuntimeWriteFailed(
     input_ack_tracker: *InputAckTracker,
     ended_process_exit_code: ?*?u8,
     app_title_present: *?bool,
+    initial_cursor_position: *?terminal.CursorPosition,
+    initial_draw_alignment_pending: *bool,
 ) !AttachedClientEnd {
     if (try drainAttachedClientRuntimeFrames(
         read_fd,
@@ -2094,6 +2205,8 @@ fn finishAttachedClientAfterRuntimeWriteFailed(
         input_ack_tracker,
         ended_process_exit_code,
         app_title_present,
+        initial_cursor_position,
+        initial_draw_alignment_pending,
     )) |end| return finishAttachedClient(end, attached_client_end_restore);
     return .transport_closed;
 }
@@ -2109,24 +2222,36 @@ fn handleAttachedClientRuntimeFrame(
     input_ack_tracker: *InputAckTracker,
     ended_process_exit_code: ?*?u8,
     app_title_present: *?bool,
+    initial_cursor_position: *?terminal.CursorPosition,
+    initial_draw_alignment_pending: *bool,
 ) !?AttachedClientEnd {
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
         .te_draw => {
             if (!pending_repaint.active()) {
-                try handleDrawFrame(frame.payload, attached_client_end_restore, scrollback_cursor, viewport_offset, app_title_present);
+                try handleDrawFrameWithInitialAlignment(
+                    frame.payload,
+                    attached_client_end_restore,
+                    scrollback_cursor,
+                    viewport_offset,
+                    app_title_present,
+                    initial_cursor_position,
+                    initial_draw_alignment_pending,
+                );
             }
             return null;
         },
         .te_repaint_response => {
-            _ = try handleRepaintResponseFrame(
+            _ = try handleRepaintResponseFrameWithInitialAlignment(
                 frame.payload,
                 attached_client_end_restore,
                 scrollback_cursor,
                 viewport_offset,
                 pending_repaint,
                 app_title_present,
+                initial_cursor_position,
+                initial_draw_alignment_pending,
             );
             return null;
         },
@@ -2186,10 +2311,10 @@ fn restoreAttachedClientEndPresentationBytesToFd(fd: c.fd_t, attached_client_end
     restore.clearRetainingCapacity();
 }
 
-fn restoreLocalTerminalPresentation() void {
+fn restoreLocalTerminalPresentation(initial_kitty_keyboard_flags: u5) void {
     if (c.isatty(posix.STDOUT_FILENO) == 0) return;
     const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
-    renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(posix.STDIN_FILENO, posix.STDOUT_FILENO)) catch {};
+    renderer.restorePresentation(initial_kitty_keyboard_flags) catch {};
     const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
     if (cleanup_title) |title| {
         defer app_allocator.allocator().free(title);
@@ -2227,9 +2352,37 @@ fn handleDrawFrame(
     viewport_offset: *i32,
     app_title_present: ?*?bool,
 ) !void {
+    try handleDrawFrameWithInitialAlignment(
+        payload,
+        attached_client_end_restore,
+        scrollback_cursor,
+        viewport_offset,
+        app_title_present,
+        null,
+        null,
+    );
+}
+
+fn handleDrawFrameWithInitialAlignment(
+    payload: []const u8,
+    attached_client_end_restore: ?*std.ArrayList(u8),
+    scrollback_cursor: *ScrollbackCursor,
+    viewport_offset: *i32,
+    app_title_present: ?*?bool,
+    initial_cursor_position: ?*?terminal.CursorPosition,
+    initial_draw_alignment_pending: ?*bool,
+) !void {
     const draw = try parseDrawPayload(payload);
     defer freeDrawPayload(draw);
-    try handleDrawPayload(draw, attached_client_end_restore, scrollback_cursor, viewport_offset, app_title_present);
+    try handleDrawPayloadWithInitialAlignment(
+        draw,
+        attached_client_end_restore,
+        scrollback_cursor,
+        viewport_offset,
+        app_title_present,
+        initial_cursor_position,
+        initial_draw_alignment_pending,
+    );
 }
 
 fn handleRepaintResponseFrame(
@@ -2240,13 +2393,43 @@ fn handleRepaintResponseFrame(
     pending_repaint: *PendingRepaint,
     app_title_present: ?*?bool,
 ) !bool {
+    return handleRepaintResponseFrameWithInitialAlignment(
+        payload,
+        attached_client_end_restore,
+        scrollback_cursor,
+        viewport_offset,
+        pending_repaint,
+        app_title_present,
+        null,
+        null,
+    );
+}
+
+fn handleRepaintResponseFrameWithInitialAlignment(
+    payload: []const u8,
+    attached_client_end_restore: ?*std.ArrayList(u8),
+    scrollback_cursor: *ScrollbackCursor,
+    viewport_offset: *i32,
+    pending_repaint: *PendingRepaint,
+    app_title_present: ?*?bool,
+    initial_cursor_position: ?*?terminal.CursorPosition,
+    initial_draw_alignment_pending: ?*bool,
+) !bool {
     var response = try protocol.decodePayload(pb.TeRepaintResponse, app_allocator.allocator(), payload);
     defer response.deinit(app_allocator.allocator());
     if (!pending_repaint.active() or !pending_repaint.matches(response.repaint_request_seq)) return false;
     const response_draw = response.draw orelse return error.MissingDraw;
     const draw = try drawPayloadFromMessage(response_draw);
     defer freeDrawPayload(draw);
-    try handleDrawPayload(draw, attached_client_end_restore, scrollback_cursor, viewport_offset, app_title_present);
+    try handleDrawPayloadWithInitialAlignment(
+        draw,
+        attached_client_end_restore,
+        scrollback_cursor,
+        viewport_offset,
+        app_title_present,
+        initial_cursor_position,
+        initial_draw_alignment_pending,
+    );
     pending_repaint.clear();
     return true;
 }
@@ -2289,6 +2472,27 @@ fn handleDrawPayload(
     viewport_offset: *i32,
     app_title_present: ?*?bool,
 ) !void {
+    try handleDrawPayloadWithInitialAlignment(
+        draw,
+        attached_client_end_restore,
+        scrollback_cursor,
+        viewport_offset,
+        app_title_present,
+        null,
+        null,
+    );
+}
+
+fn handleDrawPayloadWithInitialAlignment(
+    draw: DrawPayload,
+    attached_client_end_restore: ?*std.ArrayList(u8),
+    scrollback_cursor: *ScrollbackCursor,
+    viewport_offset: *i32,
+    app_title_present: ?*?bool,
+    initial_cursor_position: ?*?terminal.CursorPosition,
+    initial_draw_alignment_pending: ?*bool,
+) !void {
+    try restoreInitialCursorAndClearBelow(initial_cursor_position, initial_draw_alignment_pending);
     try io_helpers.writeAll(posix.STDOUT_FILENO, draw.draw_bytes);
     if (attached_client_end_restore) |target| {
         if (draw.attached_client_end_restore_bytes) |restore| {
@@ -2301,6 +2505,22 @@ fn handleDrawPayload(
     if (app_title_present) |target| {
         if (draw.app_title_present) |present| target.* = present;
     }
+}
+
+fn restoreInitialCursorAndClearBelow(
+    initial_cursor_position: ?*?terminal.CursorPosition,
+    initial_draw_alignment_pending: ?*bool,
+) !void {
+    const pending = initial_draw_alignment_pending orelse return;
+    if (!pending.*) return;
+    pending.* = false;
+    const cursor = initial_cursor_position orelse return;
+    defer cursor.* = null;
+    const position = cursor.* orelse return;
+    if (c.isatty(posix.STDOUT_FILENO) == 0) return;
+    const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
+    renderer.moveCursor(position.row, position.col) catch return;
+    renderer.clearBelowCursor() catch {};
 }
 
 fn parseDrawPayload(payload: []const u8) !DrawPayload {

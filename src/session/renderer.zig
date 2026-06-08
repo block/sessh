@@ -286,6 +286,11 @@ pub const Renderer = struct {
         try self.write("\x1b[2K");
     }
 
+    pub fn clearBelowCursor(self: Renderer) !void {
+        if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
+        try self.write("\x1b[J");
+    }
+
     pub fn setScrollRegion(self: Renderer, top: u16, bottom: u16) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
         var buf: [32]u8 = undefined;
@@ -554,6 +559,25 @@ pub const PresentationGuard = struct {
             .renderer = Renderer.init(fd),
             .cleanup_title = cleanup_title,
             .initial_kitty_keyboard_flags = initialKittyKeyboardFlags(fd),
+        };
+    }
+
+    pub fn initWithInitialKittyKeyboardFlags(fd: c.fd_t, initial_kitty_keyboard_flags: u5) PresentationGuard {
+        return .{
+            .renderer = Renderer.init(fd),
+            .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags,
+        };
+    }
+
+    pub fn initWithCleanupTitleAndInitialKittyKeyboardFlags(
+        fd: c.fd_t,
+        cleanup_title: []const u8,
+        initial_kitty_keyboard_flags: u5,
+    ) PresentationGuard {
+        return .{
+            .renderer = Renderer.init(fd),
+            .cleanup_title = cleanup_title,
+            .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags,
         };
     }
 

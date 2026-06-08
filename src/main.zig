@@ -88,6 +88,7 @@ fn usage(code: u8) !void {
         \\usage:
         \\  sessh [ssh-option ...] destination [command argument ...]
         \\  sessh --daemon-log
+        \\  SESSH_DAEMON_NAMESPACE=<namespace> sessh --daemon-log
         \\
         \\sessh wraps ssh, making sessions persistent and automatically
         \\reconnecting when ssh drops.

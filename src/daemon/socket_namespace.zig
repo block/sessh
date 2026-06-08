@@ -8,6 +8,12 @@ pub const broker_executable_name = "sessh-broker";
 pub const proxy_executable_name = "sessh-proxy";
 pub const socket_filename = "sesshd.sock";
 pub const lock_filename = "sesshd.lock";
+pub const namespace_env = "SESSH_DAEMON_NAMESPACE";
+
+pub fn selectedDirName(allocator: std.mem.Allocator) ![]u8 {
+    if (try envDirName(allocator)) |dir_name| return dir_name;
+    return defaultDirName(allocator);
+}
 
 pub fn defaultDirName(allocator: std.mem.Allocator) ![]u8 {
     const base = try std.fmt.allocPrint(allocator, "{d}", .{config.protocol_major});
@@ -22,6 +28,16 @@ pub fn defaultDirName(allocator: std.mem.Allocator) ![]u8 {
 
     const value = try std.fmt.allocPrint(allocator, "{s}.dev.{s}", .{ base, hash.hex[0..8] });
     allocator.free(base);
+    return value;
+}
+
+fn envDirName(allocator: std.mem.Allocator) !?[]u8 {
+    const value = std.process.getEnvVarOwned(allocator, namespace_env) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+    errdefer allocator.free(value);
+    try validateDirName(value);
     return value;
 }
 

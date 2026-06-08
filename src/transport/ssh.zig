@@ -175,6 +175,15 @@ const TerminalTransportStart = struct {
     connection: RuntimeConnection,
     diagnostic_fd: c.fd_t,
     diagnostic_write_fd: c.fd_t,
+
+    remote_daemon_namespace: ?[]u8 = null,
+
+    fn deinitNamespace(self: *TerminalTransportStart, allocator: std.mem.Allocator) void {
+        if (self.remote_daemon_namespace) |namespace| {
+            allocator.free(namespace);
+            self.remote_daemon_namespace = null;
+        }
+    }
 };
 
 const PooledTerminalClientState = enum {
@@ -198,6 +207,12 @@ const PooledTerminalClient = struct {
     state: PooledTerminalClientState = .pending_ready,
     outbound_next_offset: u64 = 0,
     inbound_next_offset: u64 = 0,
+    request_started_ms: u64 = 0,
+    ready_sent_ms: u64 = 0,
+    mux_open_sent_ms: u64 = 0,
+    mux_open_ok_ms: u64 = 0,
+    first_payload_ms: u64 = 0,
+    startup_timing_logged: bool = false,
     session_ended: bool = false,
     done: bool = false,
 
@@ -225,10 +240,12 @@ const TerminalTunnel = struct {
     connection: ?RuntimeConnection = null,
     diagnostic_fd: c.fd_t = -1,
     diagnostic_write_fd: c.fd_t = -1,
+    remote_daemon_namespace: ?[]u8 = null,
     next_stream_id: u64 = 1,
 
     fn deinit(self: *TerminalTunnel) void {
         if (self.connection) |*connection| connection.terminate();
+        if (self.remote_daemon_namespace) |namespace| self.allocator.free(namespace);
         if (self.diagnostic_fd >= 0) posix.close(self.diagnostic_fd);
         if (self.diagnostic_write_fd >= 0) posix.close(self.diagnostic_write_fd);
         posix.close(self.wake_pipe[0]);
@@ -462,6 +479,9 @@ fn runRemoteNewSession(
     const shell_command = try shellCommandFromRemoteArgs(allocator, new.shell_command_args);
     defer if (shell_command) |command| allocator.free(command);
 
+    var local_terminal_probe = attached_client.LocalTerminalProbe.start(allocator);
+    defer local_terminal_probe.deinit();
+
     var transcript_recorder: ?tty_transcript.Recorder = null;
     try setupTranscriptRecorder(allocator, runtime_config.common.capture_tty_transcript, &transcript_recorder);
     defer teardownTranscriptRecorder(&transcript_recorder);
@@ -479,6 +499,9 @@ fn runRemoteNewSession(
         null,
     );
 
+    var local_terminal = local_terminal_probe.finish();
+    defer local_terminal.deinit();
+
     var session = attached_client.startNewSessionOnRuntime(
         transport.readFd(),
         transport.writeFd(),
@@ -487,6 +510,7 @@ fn runRemoteNewSession(
         new.command_argv,
         shell_command,
         runtime_config.disconnected_reap_ms,
+        &local_terminal,
     ) catch |err| {
         if (err == error.VersionMismatch) {
             transport.close();
@@ -554,13 +578,18 @@ fn startTerminalTransportForDaemon(
     const artifacts = if (artifacts_storage) |*value| value else null;
 
     var broker_socket_dir: ?[]u8 = null;
-    defer if (broker_socket_dir) |dir| allocator.free(dir);
+    errdefer if (broker_socket_dir) |dir| allocator.free(dir);
     var broker_arg_storage: [1][]const u8 = undefined;
     var broker_args: []const []const u8 = broker_arg_storage[0..0];
     if (request.bootstrap) {
         broker_socket_dir = try daemon_socket_namespace.defaultDirName(allocator);
         broker_arg_storage[0] = broker_socket_dir.?;
         broker_args = broker_arg_storage[0..1];
+        daemon_log.infof(
+            allocator,
+            "remote daemon namespace host={s} namespace={s} env={s}",
+            .{ target.host, broker_socket_dir.?, daemon_socket_namespace.namespace_env },
+        );
     }
 
     const remote_command = if (request.bootstrap)
@@ -622,10 +651,13 @@ fn startTerminalTransportForDaemon(
     };
 
     try frame_forwarder.forwardRawTransportDiagnostics(client_fd, diagnostic_pipe[0]);
+    const remote_daemon_namespace = broker_socket_dir;
+    broker_socket_dir = null;
     return .{
         .connection = child,
         .diagnostic_fd = diagnostic_pipe[0],
         .diagnostic_write_fd = diagnostic_pipe[1],
+        .remote_daemon_namespace = remote_daemon_namespace,
     };
 }
 
@@ -639,6 +671,7 @@ fn servePooledTerminalTransportFromDaemon(
     errdefer allocator.destroy(client);
     client.* = .{
         .fd = client_fd,
+        .request_started_ms = nowUnixMs(),
     };
     errdefer client.deinit();
 
@@ -672,8 +705,8 @@ fn acquireTerminalTunnel(
         try tunnel.clients.append(allocator, client);
         daemon_log.infof(
             allocator,
-            "terminal transport reusing pooled ssh transport host={s} pool={s}",
-            .{ target.host, tunnel.key },
+            "terminal transport reusing pooled ssh transport host={s} pool={s} remote_namespace={s}",
+            .{ target.host, tunnel.key, tunnel.remote_daemon_namespace orelse "remote-default" },
         );
         wakeTerminalTunnel(tunnel);
         return .{ .tunnel = tunnel, .created = false };
@@ -732,6 +765,7 @@ fn startNewTerminalTunnel(
         started.connection.terminate();
         posix.close(started.diagnostic_fd);
         posix.close(started.diagnostic_write_fd);
+        started.deinitNamespace(allocator);
     }
 
     try initiatePooledRemoteDaemonHandshake(
@@ -744,11 +778,17 @@ fn startNewTerminalTunnel(
     tunnel.connection = started.connection;
     tunnel.diagnostic_fd = started.diagnostic_fd;
     tunnel.diagnostic_write_fd = started.diagnostic_write_fd;
+    tunnel.remote_daemon_namespace = started.remote_daemon_namespace;
+    started.remote_daemon_namespace = null;
     tunnel.state = .ready;
     terminal_pool_condition.broadcast();
     terminal_pool_mutex.unlock();
 
-    daemon_log.infof(allocator, "terminal transport ready host={s}", .{target.host});
+    daemon_log.infof(
+        allocator,
+        "terminal transport ready host={s} remote_namespace={s}",
+        .{ target.host, tunnel.remote_daemon_namespace orelse "remote-default" },
+    );
     const thread = try std.Thread.spawn(.{}, terminalTunnelThreadMain, .{tunnel});
     thread.detach();
     wakeTerminalTunnel(tunnel);
@@ -883,6 +923,7 @@ fn activatePendingTerminalClients(tunnel: *TerminalTunnel) !void {
             markPooledTerminalClientDoneLocked(tunnel, client);
             continue;
         };
+        client.ready_sent_ms = nowUnixMs();
     }
     terminal_pool_condition.broadcast();
 }
@@ -985,6 +1026,7 @@ fn sendPooledTeMuxOpen(
             .detail = .{ .te = request },
         } },
     });
+    client.mux_open_sent_ms = nowUnixMs();
 }
 
 fn sendPooledProxyMuxOpen(
@@ -1008,6 +1050,7 @@ fn sendPooledProxyMuxOpen(
     client.local_stream_id = mux_frame.stream_id;
     mux_frame.stream_id = client.stream_id;
     try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, mux_frame);
+    client.mux_open_sent_ms = nowUnixMs();
 }
 
 fn sendPooledProxyMuxFrame(
@@ -1060,14 +1103,35 @@ fn readPooledRemoteMuxFrame(tunnel: *TerminalTunnel) !bool {
     const client = findPooledTerminalClient(tunnel, mux_frame.stream_id) orelse return true;
     const message = mux_frame.message orelse return error.UnexpectedDaemonFrame;
     if (client.kind == .proxy) {
+        switch (message) {
+            .open_ok => {
+                if (client.mux_open_ok_ms == 0) client.mux_open_ok_ms = nowUnixMs();
+            },
+            .payload => {
+                if (client.first_payload_ms == 0) {
+                    client.first_payload_ms = nowUnixMs();
+                    logPooledTerminalClientStartupTiming(tunnel, client);
+                }
+            },
+            .reset => {
+                if (client.first_payload_ms == 0) client.first_payload_ms = nowUnixMs();
+            },
+            .open, .ack => {},
+        }
         mux_frame.stream_id = client.local_stream_id;
         try sendPooledMuxFrame(tunnel.allocator, client.fd, mux_frame);
         return true;
     }
     switch (message) {
-        .open_ok => {},
+        .open_ok => {
+            if (client.mux_open_ok_ms == 0) client.mux_open_ok_ms = nowUnixMs();
+        },
         .ack => {},
         .payload => |payload| {
+            if (client.first_payload_ms == 0) {
+                client.first_payload_ms = nowUnixMs();
+                logPooledTerminalClientStartupTiming(tunnel, client);
+            }
             const item = payload.item orelse return error.UnexpectedDaemonFrame;
             const te_item = switch (item) {
                 .te => |te| te,
@@ -1205,6 +1269,7 @@ fn finishTerminalTunnel(tunnel: *TerminalTunnel) void {
 
 fn markPooledTerminalClientDoneLocked(tunnel: *TerminalTunnel, client: *PooledTerminalClient) void {
     if (client.done) return;
+    logPooledTerminalClientStartupTiming(tunnel, client);
     daemon_log.infof(
         tunnel.allocator,
         "terminal pooled client finished host={s} pool={s} stream_id={}",
@@ -1218,6 +1283,39 @@ fn markPooledTerminalClientDoneLocked(tunnel: *TerminalTunnel, client: *PooledTe
         _ = tunnel.clients.swapRemove(index);
         break;
     }
+}
+
+fn logPooledTerminalClientStartupTiming(tunnel: *TerminalTunnel, client: *PooledTerminalClient) void {
+    if (client.startup_timing_logged) return;
+    client.startup_timing_logged = true;
+    daemon_log.infof(
+        tunnel.allocator,
+        "terminal pooled client startup host={s} pool={s} stream_id={} kind={s} request_to_ready_ms={} ready_to_open_ms={} open_to_open_ok_ms={} open_ok_to_first_payload_ms={} request_to_first_payload_ms={}",
+        .{
+            tunnel.display_host,
+            tunnel.key,
+            client.stream_id,
+            pooledTerminalClientKindName(client.kind),
+            elapsedMs(client.request_started_ms, client.ready_sent_ms),
+            elapsedMs(client.ready_sent_ms, client.mux_open_sent_ms),
+            elapsedMs(client.mux_open_sent_ms, client.mux_open_ok_ms),
+            elapsedMs(client.mux_open_ok_ms, client.first_payload_ms),
+            elapsedMs(client.request_started_ms, client.first_payload_ms),
+        },
+    );
+}
+
+fn pooledTerminalClientKindName(kind: PooledTerminalClientKind) []const u8 {
+    return switch (kind) {
+        .unknown => "unknown",
+        .te => "te",
+        .proxy => "proxy",
+    };
+}
+
+fn elapsedMs(start_ms: u64, end_ms: u64) u64 {
+    if (start_ms == 0 or end_ms == 0 or end_ms < start_ms) return 0;
+    return end_ms - start_ms;
 }
 
 fn removeTerminalTunnelLocked(tunnel: *TerminalTunnel) void {

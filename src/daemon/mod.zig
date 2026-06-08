@@ -30,7 +30,7 @@ const daemon_lock_sleep_ms: u64 = 20;
 var active_client_threads: std.atomic.Value(usize) = .init(0);
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
-    const dir_name = try socket_namespace.defaultDirName(allocator);
+    const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
     return socketPathForDirName(allocator, dir_name);
 }
@@ -46,7 +46,7 @@ pub fn connect(allocator: std.mem.Allocator) !c.fd_t {
 }
 
 pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
-    const dir_name = try socket_namespace.defaultDirName(allocator);
+    const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
     return ensureStartedForDirName(allocator, exe, dir_name);
 }
@@ -65,7 +65,7 @@ pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args
         try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-broker: accepts at most one daemon socket namespace\n");
         return error.InvalidBrokerArgs;
     }
-    const dir_name = if (args.len == 1) args[0] else try socket_namespace.defaultDirName(allocator);
+    const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
     defer if (args.len == 0) allocator.free(dir_name);
 
     try ensureStartedForDirName(allocator, exe, dir_name);
@@ -79,7 +79,7 @@ pub fn reexecBrokerOrForward(allocator: std.mem.Allocator, exe: []const u8, args
         try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-broker: accepts at most one daemon socket namespace\n");
         return error.InvalidBrokerArgs;
     }
-    const dir_name = if (args.len == 1) args[0] else try socket_namespace.defaultDirName(allocator);
+    const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
     defer if (args.len == 0) allocator.free(dir_name);
 
     var runtime_executables = try daemon_executable.installRuntimeExecutablesOrUseNamespaceOwner(allocator, exe, dir_name);
@@ -92,7 +92,7 @@ pub fn reexecDaemonOrRun(allocator: std.mem.Allocator, exe: []const u8, args: []
         try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-daemon: accepts at most one daemon socket namespace\n");
         return error.InvalidDaemonArgs;
     }
-    const dir_name = if (args.len == 1) args[0] else try socket_namespace.defaultDirName(allocator);
+    const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
     defer if (args.len == 0) allocator.free(dir_name);
 
     var runtime_executables = try daemon_executable.installRuntimeExecutablesOrUseNamespaceOwner(allocator, exe, dir_name);
@@ -202,7 +202,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
         try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-daemon: accepts at most one daemon socket namespace\n");
         return error.InvalidDaemonArgs;
     }
-    const dir_name = if (args.len == 1) args[0] else try socket_namespace.defaultDirName(allocator);
+    const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
     defer if (args.len == 0) allocator.free(dir_name);
 
     const daemon_exe = try socket_namespace.executablePath(allocator, dir_name, daemon_executable.daemon_name);

@@ -26,6 +26,12 @@ pub fn serveFrameAfterHandshake(
         .te_stream_open => {
             var request = try protocol.decodePayload(pb.TeStreamOpen, allocator, frame.payload);
             defer request.deinit(allocator);
+            const action = teStreamActionName(request);
+            daemon_log.infof(
+                allocator,
+                "terminal stream opening session={s} action={s}",
+                .{ request.session_guid, action },
+            );
             if (request.create == null) {
                 const runtime_fd = connectRuntimeForOpen(allocator, request) catch |err| switch (err) {
                     error.InvalidSessionGuid, error.SessionNotFound => {
@@ -35,6 +41,11 @@ pub fn serveFrameAfterHandshake(
                     else => return err,
                 };
                 defer _ = c.close(runtime_fd);
+                daemon_log.infof(
+                    allocator,
+                    "terminal stream runtime connected session={s} action={s}",
+                    .{ request.session_guid, action },
+                );
                 try openRuntimeAndForwardFrames(allocator, runtime_fd, frame.payload, read_fd, write_fd);
                 return;
             }
@@ -45,6 +56,11 @@ pub fn serveFrameAfterHandshake(
                 else => return err,
             };
             defer _ = c.close(runtime_fd);
+            daemon_log.infof(
+                allocator,
+                "terminal stream runtime connected session={s} action={s}",
+                .{ request.session_guid, action },
+            );
             try openRuntimeAndForwardFrames(allocator, runtime_fd, open_payload, read_fd, write_fd);
             return;
         },
@@ -139,9 +155,14 @@ pub fn serveMuxStreamFrameAfterHandshake(
             } else {
                 const runtime = sessions.swapRemove(runtime_index);
                 if (!runtime.ended) {
+                    daemon_log.infof(
+                        allocator,
+                        "terminal session runtime closed stream_id={} session={s}",
+                        .{ runtime.stream_id, runtime.session_guid },
+                    );
                     sendTeMuxReset(allocator, fd, runtime.stream_id, "RUNTIME_CLOSED", "terminal runtime closed") catch {};
                 }
-                _ = c.close(runtime.runtime_fd);
+                closeTeMuxRuntime(allocator, runtime, false);
             }
         }
 
@@ -159,8 +180,10 @@ pub fn serveMuxStreamFrameAfterHandshake(
 const TeMuxRuntime = struct {
     stream_id: u64,
     runtime_fd: c.fd_t,
+    session_guid: []u8,
     inbound_next_offset: u64 = 0,
     outbound_next_offset: u64 = 0,
+    attached_logged: bool = false,
     ended: bool = false,
 };
 
@@ -171,10 +194,15 @@ const TeMuxPollTarget = struct {
 
 fn closeTeMuxRuntimes(allocator: std.mem.Allocator, sessions: *std.ArrayList(TeMuxRuntime)) void {
     for (sessions.items) |runtime| {
-        sendTeHangupToRuntime(runtime.runtime_fd) catch {};
-        _ = c.close(runtime.runtime_fd);
+        closeTeMuxRuntime(allocator, runtime, true);
     }
     sessions.deinit(allocator);
+}
+
+fn closeTeMuxRuntime(allocator: std.mem.Allocator, runtime: TeMuxRuntime, send_hangup: bool) void {
+    if (send_hangup) sendTeHangupToRuntime(runtime.runtime_fd) catch {};
+    _ = c.close(runtime.runtime_fd);
+    allocator.free(runtime.session_guid);
 }
 
 fn handleTeMuxFrame(
@@ -194,10 +222,10 @@ fn handleTeMuxFrame(
         },
         .payload => |payload| handleTeMuxPayload(allocator, sessions, mux_fd, mux_frame.stream_id, payload) catch |err| {
             try sendTeMuxResetForError(allocator, mux_fd, mux_frame.stream_id, "STREAM_FAILED", err);
-            try removeTeMuxRuntime(sessions, mux_frame.stream_id);
+            try removeTeMuxRuntime(allocator, sessions, mux_frame.stream_id);
         },
         .ack, .open_ok => {},
-        .reset => try removeTeMuxRuntime(sessions, mux_frame.stream_id),
+        .reset => try removeTeMuxRuntime(allocator, sessions, mux_frame.stream_id),
     }
 }
 
@@ -214,24 +242,50 @@ fn handleTeMuxOpen(
         .te => |te| te,
         else => return error.UnexpectedFrame,
     };
+    const action = teStreamActionName(te_open);
+    const open_started_ms = std.time.milliTimestamp();
+    daemon_log.infof(
+        allocator,
+        "terminal mux stream opening stream_id={} session={s} action={s}",
+        .{ stream_id, te_open.session_guid, action },
+    );
     if (findTeMuxRuntimeIndex(sessions, stream_id) != null) {
         try sendTeMuxReset(allocator, mux_fd, stream_id, "STREAM_EXISTS", "mux stream already exists");
         return;
     }
 
+    const session_guid = try allocator.dupe(u8, te_open.session_guid);
+    var session_guid_owned = true;
+    errdefer if (session_guid_owned) allocator.free(session_guid);
+
     const open_payload = try protocol.encodePayload(allocator, te_open);
     defer allocator.free(open_payload);
 
-    const runtime_fd = openTeMuxRuntime(allocator, exe, te_open, open_payload) catch |err| switch (err) {
+    const runtime_fd = openTeMuxRuntime(allocator, exe, stream_id, te_open, action, open_payload, open_started_ms) catch |err| switch (err) {
         error.InvalidSessionGuid, error.SessionNotFound => {
+            daemon_log.infof(
+                allocator,
+                "terminal mux stream open failed stream_id={} session={s} action={s} error={t}",
+                .{ stream_id, te_open.session_guid, action, err },
+            );
             try sendTeMuxReset(allocator, mux_fd, stream_id, "SESSION_NOT_FOUND", "session not found");
             return;
         },
         error.VersionMismatch => {
+            daemon_log.infof(
+                allocator,
+                "terminal mux stream open failed stream_id={} session={s} action={s} error={t}",
+                .{ stream_id, te_open.session_guid, action, err },
+            );
             try sendTeMuxReset(allocator, mux_fd, stream_id, "VERSION_MISMATCH", "existing remote session runtime is incompatible with this client");
             return;
         },
         else => {
+            daemon_log.infof(
+                allocator,
+                "terminal mux stream open failed stream_id={} session={s} action={s} error={t}",
+                .{ stream_id, te_open.session_guid, action, err },
+            );
             try sendTeMuxReset(allocator, mux_fd, stream_id, "OPEN_FAILED", "terminal stream open failed");
             return;
         },
@@ -242,28 +296,56 @@ fn handleTeMuxOpen(
     try sessions.append(allocator, .{
         .stream_id = stream_id,
         .runtime_fd = runtime_fd,
+        .session_guid = session_guid,
     });
+    session_guid_owned = false;
+    daemon_log.infof(
+        allocator,
+        "terminal mux stream open ok stream_id={} session={s} action={s} elapsed_ms={}",
+        .{ stream_id, te_open.session_guid, action, elapsedMsSince(open_started_ms) },
+    );
 }
 
 fn openTeMuxRuntime(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    stream_id: u64,
     request: pb.TeStreamOpen,
+    action: []const u8,
     open_payload: []const u8,
+    open_started_ms: i64,
 ) !c.fd_t {
+    const prepare_started_ms = std.time.milliTimestamp();
     const runtime_payload = if (request.create == null)
         open_payload
     else
         try sessionOpenPayloadWithCurrentEnvironment(allocator, open_payload);
     defer if (request.create != null) allocator.free(runtime_payload);
+    daemon_log.infof(
+        allocator,
+        "terminal mux runtime payload prepared stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
+        .{ stream_id, request.session_guid, action, elapsedMsSince(prepare_started_ms), elapsedMsSince(open_started_ms) },
+    );
 
     const runtime_fd = if (request.create == null)
         try connectRuntimeForOpen(allocator, request)
     else
         try startSessionRuntimeAndConnect(allocator, exe, runtime_payload);
     errdefer _ = c.close(runtime_fd);
+    const handshake_started_ms = std.time.milliTimestamp();
     try initiateRuntimeHandshake(allocator, runtime_fd);
+    daemon_log.infof(
+        allocator,
+        "terminal mux runtime handshake complete stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
+        .{ stream_id, request.session_guid, action, elapsedMsSince(handshake_started_ms), elapsedMsSince(open_started_ms) },
+    );
+    const send_started_ms = std.time.milliTimestamp();
     try protocol.sendFrame(runtime_fd, .te_stream_open, runtime_payload);
+    daemon_log.infof(
+        allocator,
+        "terminal mux runtime open sent stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
+        .{ stream_id, request.session_guid, action, elapsedMsSince(send_started_ms), elapsedMsSince(open_started_ms) },
+    );
     return runtime_fd;
 }
 
@@ -287,7 +369,11 @@ fn handleTeMuxPayload(
     runtime.inbound_next_offset = @max(runtime.inbound_next_offset, payload.offset +| 1);
     if (te_item.payload) |te_payload| {
         if (te_payload == .session_hangup_request) {
-            daemon_log.infof(allocator, "remote terminal hangup requested", .{});
+            daemon_log.infof(
+                allocator,
+                "remote terminal hangup requested stream_id={} session={s}",
+                .{ stream_id, runtime.session_guid },
+            );
         }
     }
     try protocol.sendTeStreamItemFrame(allocator, runtime.runtime_fd, te_item);
@@ -311,7 +397,22 @@ fn forwardTeRuntimeFrameToMux(
     defer item.deinit(allocator);
     try sendTeMuxPayload(allocator, mux_fd, runtime.stream_id, runtime.outbound_next_offset, item);
     runtime.outbound_next_offset +|= 1;
-    if (frame.message_type == .te_session_ended) runtime.ended = true;
+    if (frame.message_type == .te_session_attached and !runtime.attached_logged) {
+        runtime.attached_logged = true;
+        daemon_log.infof(
+            allocator,
+            "terminal session attached stream_id={} session={s}",
+            .{ runtime.stream_id, runtime.session_guid },
+        );
+    }
+    if (frame.message_type == .te_session_ended) {
+        runtime.ended = true;
+        daemon_log.infof(
+            allocator,
+            "terminal session ended stream_id={} session={s}",
+            .{ runtime.stream_id, runtime.session_guid },
+        );
+    }
     return true;
 }
 
@@ -322,11 +423,15 @@ fn findTeMuxRuntimeIndex(sessions: *const std.ArrayList(TeMuxRuntime), stream_id
     return null;
 }
 
-fn removeTeMuxRuntime(sessions: *std.ArrayList(TeMuxRuntime), stream_id: u64) !void {
+fn removeTeMuxRuntime(allocator: std.mem.Allocator, sessions: *std.ArrayList(TeMuxRuntime), stream_id: u64) !void {
     const index = findTeMuxRuntimeIndex(sessions, stream_id) orelse return;
     const runtime = sessions.swapRemove(index);
-    sendTeHangupToRuntime(runtime.runtime_fd) catch {};
-    _ = c.close(runtime.runtime_fd);
+    daemon_log.infof(
+        allocator,
+        "terminal mux stream closing stream_id={} session={s}",
+        .{ runtime.stream_id, runtime.session_guid },
+    );
+    closeTeMuxRuntime(allocator, runtime, true);
 }
 
 fn sendTeMuxOpenOk(allocator: std.mem.Allocator, fd: c.fd_t, stream_id: u64) !void {
@@ -401,6 +506,7 @@ fn connectRuntimeForOpen(allocator: std.mem.Allocator, request: pb.TeStreamOpen)
 }
 
 fn startSessionRuntimeAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_open_payload: []const u8) !c.fd_t {
+    const started_ms = std.time.milliTimestamp();
     var request = try protocol.decodePayload(pb.TeStreamOpen, allocator, session_open_payload);
     defer request.deinit(allocator);
     if (request.create == null) return error.MissingSessionCreate;
@@ -410,9 +516,26 @@ fn startSessionRuntimeAndConnect(allocator: std.mem.Allocator, exe: []const u8, 
         try session_registry.allocateSessionDir(allocator);
     defer allocation.deinit(allocator);
 
+    daemon_log.infof(allocator, "terminal session creating session={s}", .{allocation.id});
     _ = exe;
     _ = try session_runtime.startSessionRuntimeThread(allocator, allocation.paths.dir);
-    return session_runtime.connectSessionRuntime(allocator, allocation.id);
+    const runtime_fd = try session_runtime.connectSessionRuntime(allocator, allocation.id);
+    daemon_log.infof(
+        allocator,
+        "terminal session runtime connected session={s} elapsed_ms={}",
+        .{ allocation.id, elapsedMsSince(started_ms) },
+    );
+    return runtime_fd;
+}
+
+fn teStreamActionName(request: pb.TeStreamOpen) []const u8 {
+    return if (request.create == null) "resume" else "create";
+}
+
+fn elapsedMsSince(start_ms: i64) u64 {
+    const end_ms = std.time.milliTimestamp();
+    if (end_ms <= start_ms) return 0;
+    return @intCast(end_ms - start_ms);
 }
 
 pub fn sessionOpenPayloadWithCurrentEnvironment(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {

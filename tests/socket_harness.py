@@ -52,6 +52,7 @@ SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST = "te_session_client_debug_sever_c
 SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST = "te_session_client_debug_unresponsive_connection_request"
 PING = "ping"
 PONG = "pong"
+MUX_STREAM_FRAME = "mux_stream_frame"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -62,6 +63,7 @@ _FRAME_FIELDS = {
     ERROR: ERROR,
     PING: PING,
     PONG: PONG,
+    MUX_STREAM_FRAME: MUX_STREAM_FRAME,
 }
 _TE_STREAM_ITEM_FIELDS = {
     TERMINAL_STREAM_OPEN: "open",
@@ -690,6 +692,44 @@ def recv_until_message(conn, expected_kind, timeout=5.0):
     raise AssertionError(f"did not receive message kind {expected_kind}")
 
 
+def recv_mux_frame(conn, timeout=5.0):
+    old_timeout = conn.gettimeout()
+    conn.settimeout(timeout)
+    try:
+        while True:
+            message_kind, payload = recv_frame(conn)
+            if message_kind != MUX_STREAM_FRAME:
+                continue
+            mux = sessh_pb().MuxStreamFrame()
+            mux.ParseFromString(payload)
+            return mux
+    finally:
+        conn.settimeout(old_timeout)
+
+
+def send_mux_te_open(conn, shell, stream_id=1, session_id=None):
+    te_open = sessh_pb().TeStreamOpen()
+    te_open.ParseFromString(pack_session_create(shell, session_id=session_id))
+    mux = sessh_pb().MuxStreamFrame(stream_id=stream_id)
+    mux.open.recv_next_offset = 0
+    mux.open.receive_window_bytes = 0
+    mux.open.te.CopyFrom(te_open)
+    send_frame(conn, MUX_STREAM_FRAME, mux.SerializeToString())
+
+
+def recv_mux_te_payload(conn, expected_payload, timeout=5.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        mux = recv_mux_frame(conn, timeout=max(0.1, end - time.monotonic()))
+        if mux.WhichOneof("message") != "payload":
+            continue
+        if mux.payload.WhichOneof("item") != "te":
+            continue
+        if mux.payload.te.WhichOneof("payload") == expected_payload:
+            return mux.payload.te
+    raise AssertionError(f"did not receive mux terminal payload {expected_payload}")
+
+
 def send_frame(conn, message_kind, payload=b""):
     body = encode_frame_body(message_kind, payload)
     conn.sendall(struct.pack(">I", len(body)) + body)
@@ -863,6 +903,10 @@ def runtime_log_file(env, session_id=None):
 def socket_path(env, session_id=None):
     _ = session_id
     return runtime_root(env) / daemon_socket_dir_name() / "sesshd.sock"
+
+
+def socket_path_for_dir(env, dir_name):
+    return runtime_root(env) / dir_name / "sesshd.sock"
 
 
 def start_daemon(env, session_id=None):
@@ -1265,6 +1309,166 @@ def run_daemon_log_test(_base_env):
                 if expected not in output:
                     raise AssertionError(f"daemon log missing {expected!r}: {output!r}")
         finally:
+            if log_proc is not None and log_proc.poll() is None:
+                log_proc.terminate()
+                try:
+                    log_proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    log_proc.kill()
+                    log_proc.wait(timeout=2.0)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
+            cleanup_runtime(env)
+
+
+def run_daemon_log_namespace_env_test(_base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-daemon-log-namespace-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        cleanup_runtime(env)
+        namespace = "debug.remote.ns"
+        expected_socket = socket_path_for_dir(env, namespace)
+        log_env = env.copy()
+        log_env["SESSH_DAEMON_NAMESPACE"] = namespace
+        log_proc = subprocess.Popen(
+            [str(BIN), "--daemon-log"],
+            cwd=ROOT,
+            env=log_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            output = read_until_pipe(log_proc.stdout, b"daemon log subscribed")
+            lines = output.decode("utf-8", "replace").splitlines()
+            if not lines or lines[0] != f"daemon socket {expected_socket}":
+                raise AssertionError(f"daemon log namespace override used wrong socket: {output!r}")
+            wait_file(expected_socket)
+        finally:
+            if log_proc.poll() is None:
+                log_proc.terminate()
+                try:
+                    log_proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    log_proc.kill()
+                    log_proc.wait(timeout=2.0)
+            cleanup_runtime(env)
+
+
+def run_daemon_log_session_lifecycle_test(_base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-daemon-log-session-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "log-session-shell"
+        shell.write_text("#!/bin/sh\nprintf 'DAEMON_LOG_SESSION_READY\\n'\n")
+        shell.chmod(0o700)
+        env["SHELL"] = str(shell)
+        cleanup_runtime(env)
+        proc = start_daemon(env)
+        log_proc = None
+        conn = None
+        try:
+            log_proc = subprocess.Popen(
+                [str(BIN), "--daemon-log"],
+                cwd=ROOT,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            output = read_until_pipe(log_proc.stdout, b"daemon log subscribed")
+
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            conn.connect(str(socket_path(env)))
+            send_hello(conn)
+            send_frame(conn, SESSION_CREATE, pack_session_create(shell))
+            recv_until_message(conn, SESSION_ATTACHED)
+            recv_until_message(conn, SESSION_ENDED)
+
+            output += read_until_pipe(log_proc.stdout, b"terminal stream runtime connected", timeout=5.0)
+            text = output.decode("utf-8", "replace")
+            for expected in (
+                "terminal stream opening session=",
+                "action=create",
+                "terminal session creating session=",
+                "terminal session runtime connected session=",
+                "terminal stream runtime connected session=",
+            ):
+                if expected not in text:
+                    raise AssertionError(f"daemon log missing {expected!r}: {text!r}")
+        finally:
+            if conn is not None:
+                conn.close()
+            if log_proc is not None and log_proc.poll() is None:
+                log_proc.terminate()
+                try:
+                    log_proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    log_proc.kill()
+                    log_proc.wait(timeout=2.0)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
+            cleanup_runtime(env)
+
+
+def run_daemon_log_mux_session_lifecycle_test(_base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-daemon-log-mux-session-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        shell = Path(tmp) / "log-mux-session-shell"
+        shell.write_text("#!/bin/sh\nprintf 'DAEMON_LOG_MUX_SESSION_READY\\n'\n")
+        shell.chmod(0o700)
+        env["SHELL"] = str(shell)
+        session_id = test_session_guid(77)
+        cleanup_runtime(env)
+        proc = start_daemon(env)
+        log_proc = None
+        conn = None
+        try:
+            log_proc = subprocess.Popen(
+                [str(BIN), "--daemon-log"],
+                cwd=ROOT,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            output = read_until_pipe(log_proc.stdout, b"daemon log subscribed")
+
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+            conn.connect(str(socket_path(env)))
+            send_hello(conn)
+            send_mux_te_open(conn, shell, stream_id=1, session_id=session_id)
+            while recv_mux_frame(conn).WhichOneof("message") != "open_ok":
+                pass
+            recv_mux_te_payload(conn, "session_attached")
+            recv_mux_te_payload(conn, "session_ended")
+
+            output += read_until_pipe(log_proc.stdout, b"terminal session ended stream_id=1", timeout=5.0)
+            text = output.decode("utf-8", "replace")
+            for expected in (
+                f"terminal mux stream opening stream_id=1 session={session_id} action=create",
+                f"terminal mux runtime payload prepared stream_id=1 session={session_id} action=create",
+                f"terminal session creating session={session_id}",
+                f"terminal session runtime connected session={session_id}",
+                f"terminal mux runtime handshake complete stream_id=1 session={session_id} action=create",
+                f"terminal mux runtime open sent stream_id=1 session={session_id} action=create",
+                f"terminal mux stream open ok stream_id=1 session={session_id} action=create",
+                f"terminal session attached stream_id=1 session={session_id}",
+                f"terminal session ended stream_id=1 session={session_id}",
+            ):
+                if expected not in text:
+                    raise AssertionError(f"daemon log missing {expected!r}: {text!r}")
+        finally:
+            if conn is not None:
+                conn.close()
             if log_proc is not None and log_proc.poll() is None:
                 log_proc.terminate()
                 try:
@@ -2944,6 +3148,9 @@ def main():
             run_daemon_ping_test(env)
             run_daemon_concurrent_start_test(env)
             run_daemon_log_test(env)
+            run_daemon_log_namespace_env_test(env)
+            run_daemon_log_session_lifecycle_test(env)
+            run_daemon_log_mux_session_lifecycle_test(env)
             run_session_create_command_argv_test(env)
             run_session_create_shell_command_test(env)
             run_session_create_tty_settings_test(env)
