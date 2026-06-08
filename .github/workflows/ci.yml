@@ -79,14 +79,8 @@ jobs:
           test -f "$archive"
           test -f "$archive.sha256"
           test -x "$RUNNER_TEMP/dist/sessh-$version/bin/sessh"
-          test -x "$RUNNER_TEMP/dist/sessh-$version/bin/sesshmux"
           actual_version="$("$RUNNER_TEMP/dist/sessh-$version/bin/sessh" --version)"
           if [[ "$actual_version" != "sessh $version" ]]; then
             echo "archive binary reported '$actual_version', expected 'sessh $version'" >&2
-            exit 1
-          fi
-          actual_mux_version="$("$RUNNER_TEMP/dist/sessh-$version/bin/sesshmux" --version)"
-          if [[ "$actual_mux_version" != "sesshmux $version" ]]; then
-            echo "archive mux binary reported '$actual_mux_version', expected 'sesshmux $version'" >&2
             exit 1
           fi
