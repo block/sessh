@@ -485,6 +485,7 @@ fn startRemoteSessionBroker(
         false,
         null,
         -1,
+        -1,
         null,
         null,
         failure_policy,
@@ -534,6 +535,7 @@ pub fn serveTerminalTransportFromDaemon(
         false,
         .pipe,
         diagnostic_pipe[1],
+        client_fd,
         &client_environment,
         &bootstrap_failure_term,
         .{
@@ -599,7 +601,6 @@ fn openTerminalDaemonTransport(
 
     var bootstrap_status_visible = false;
     defer clearClientBootstrapStatus(&bootstrap_status_visible);
-    try showClientBootstrapStatus(&bootstrap_status_visible, reconnect_ui);
 
     while (true) {
         var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
@@ -1092,16 +1093,32 @@ fn reconnectPresentationForFilterLevel(level: config.FilterLevel) client_ui.Reco
     };
 }
 
-fn showClientBootstrapStatus(visible: *bool, reconnect_ui: ?*client_ui.ReconnectUi) !void {
+fn writeBootstrapStatusBytes(client_diagnostic_fd: c.fd_t, bytes: []const u8) !void {
+    if (client_diagnostic_fd >= 0) {
+        const payload = try protocol.encodePayload(app_allocator.allocator(), pb.ClientTeTransportDiagnostic{
+            .chunk = bytes,
+        });
+        defer app_allocator.allocator().free(payload);
+        try protocol.sendFrame(client_diagnostic_fd, .client_te_transport_diagnostic, payload);
+    } else {
+        try io.writeAll(2, bytes);
+    }
+}
+
+fn showClientBootstrapStatus(visible: *bool, reconnect_ui: ?*client_ui.ReconnectUi, client_diagnostic_fd: c.fd_t) !void {
     if (reconnect_ui != null or visible.*) return;
-    try io.writeAll(2, "\rsessh: bootstrapping...");
+    try writeBootstrapStatusBytes(client_diagnostic_fd, "\rsessh: bootstrapping...");
     visible.* = true;
 }
 
-fn clearClientBootstrapStatus(visible: *bool) void {
+fn clearClientBootstrapStatusOn(visible: *bool, client_diagnostic_fd: c.fd_t) void {
     if (!visible.*) return;
-    io.writeAll(2, "\r\x1b[K") catch {};
+    writeBootstrapStatusBytes(client_diagnostic_fd, "\r\x1b[K") catch {};
     visible.* = false;
+}
+
+fn clearClientBootstrapStatus(visible: *bool) void {
+    clearClientBootstrapStatusOn(visible, -1);
 }
 
 fn nowUnixMs() u64 {
@@ -1567,6 +1584,7 @@ fn startRuntimeConnection(
     poll_reconnect_input: bool,
     stderr_mode_override: ?SshStderrMode,
     stderr_diagnostic_fd: c.fd_t,
+    bootstrap_status_client_fd: c.fd_t,
     env_map: ?*const std.process.EnvMap,
     bootstrap_failure_term: ?*?std.process.Child.Term,
     failure_policy: BootstrapFailurePolicy,
@@ -1677,8 +1695,8 @@ fn startRuntimeConnection(
         };
 
         var bootstrap_status_visible = false;
-        defer clearClientBootstrapStatus(&bootstrap_status_visible);
-        try showClientBootstrapStatus(&bootstrap_status_visible, reconnect_ui);
+        defer clearClientBootstrapStatusOn(&bootstrap_status_visible, bootstrap_status_client_fd);
+        try showClientBootstrapStatus(&bootstrap_status_visible, reconnect_ui, bootstrap_status_client_fd);
 
         sendUpload(allocator, connection.child.stdin.?.handle, artifact, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
@@ -1809,6 +1827,7 @@ const StreamClientStarter = struct {
             null,
             false,
             self.stderr_mode,
+            -1,
             -1,
             null,
             &failure_term,

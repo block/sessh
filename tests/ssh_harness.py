@@ -1275,6 +1275,48 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(f"completed uploaded session left route files: {routes}")
 
 
+def test_ssh_transport_cache_hit_suppresses_bootstrap_status(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    fake_config = tmp / "ssh_config"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_ATTACH_READY"
+    fake_config.write_text("Host test-host\n")
+    remote_shell.write_text(
+        f"#!/bin/sh\n"
+        f"printf '{marker}\\n'\n"
+        "printf 'SESSH_PATH=%s\\n' \"$SESSH_PATH\"\n"
+        "printf 'SESSH_BIN=%s\\n' \"$(command -v sessh || true)\"\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SHELL"] = str(remote_shell)
+
+    installed = seed_remote_artifact_cache(env)
+    result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
+    if result.returncode != 0:
+        raise AssertionError(ssh_failure_diagnostics("sessh returned non-zero on cache hit", result, fake_log, fake_trace))
+    if marker not in result.stdout:
+        raise AssertionError(
+            ssh_failure_diagnostics("ssh cache-hit attach did not render remote output", result, fake_log, fake_trace)
+        )
+    if "sessh: bootstrapping..." in result.stderr:
+        raise AssertionError(ssh_failure_diagnostics("cache-hit bootstrap displayed upload status", result, fake_log, fake_trace))
+    if any(token in result.stdout or token in result.stderr for token in ("MISSING ", "UPLOAD ", "OK\n")):
+        raise AssertionError(
+            ssh_failure_diagnostics("cache-hit bootstrap protocol leaked to client output", result, fake_log, fake_trace)
+        )
+    if f"SESSH_PATH={installed.parent.resolve()}" not in result.stdout:
+        raise AssertionError(result)
+    if f"SESSH_BIN={installed.resolve()}" not in result.stdout:
+        raise AssertionError(result)
+
+
 def test_ssh_clean_remote_exit_removes_routes(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -3553,6 +3595,10 @@ def main(argv=None):
         (
             "ssh transport uploads artifact and reaches broker",
             test_ssh_transport_uploads_artifact_and_reaches_broker,
+        ),
+        (
+            "ssh transport cache hit suppresses bootstrap status",
+            test_ssh_transport_cache_hit_suppresses_bootstrap_status,
         ),
         (
             "ssh clean remote exit removes routes",
