@@ -1073,7 +1073,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         if "ssh runtime attach is not implemented yet" in result.stderr:
             raise AssertionError(result.stderr)
 
-        artifact_path = prefix / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+        artifact_path = prefix / "libexec" / "sessh" / f"{os_name}-{arch}" / "sessh"
         if not artifact_path.exists():
             raise AssertionError(f"missing packaged artifact: {artifact_path}")
         remote_artifact = f"/root/.cache/sessh/bin/{sessh_version()}/{sha256(artifact_path)}/sessh"

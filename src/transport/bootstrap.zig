@@ -125,16 +125,17 @@ const PackagedArtifactTarget = struct {
     os: []const u8,
     arch: []const u8,
     filename: []const u8,
+    path: []const u8,
 };
 
 const packaged_artifact_targets = [_]PackagedArtifactTarget{
-    .{ .os = "macos", .arch = "aarch64", .filename = "sessh-macos-aarch64" },
-    .{ .os = "macos", .arch = "x86_64", .filename = "sessh-macos-x86_64" },
-    .{ .os = "linux", .arch = "arm32", .filename = "sessh-linux-arm32" },
-    .{ .os = "linux", .arch = "aarch64", .filename = "sessh-linux-aarch64" },
-    .{ .os = "linux", .arch = "x86_64", .filename = "sessh-linux-x86_64" },
-    .{ .os = "linux", .arch = "x86", .filename = "sessh-linux-x86" },
-    .{ .os = "linux", .arch = "riscv64", .filename = "sessh-linux-riscv64" },
+    .{ .os = "macos", .arch = "aarch64", .filename = "sessh-macos-aarch64", .path = "macos-aarch64/sessh" },
+    .{ .os = "macos", .arch = "x86_64", .filename = "sessh-macos-x86_64", .path = "macos-x86_64/sessh" },
+    .{ .os = "linux", .arch = "arm32", .filename = "sessh-linux-arm32", .path = "linux-arm32/sessh" },
+    .{ .os = "linux", .arch = "aarch64", .filename = "sessh-linux-aarch64", .path = "linux-aarch64/sessh" },
+    .{ .os = "linux", .arch = "x86_64", .filename = "sessh-linux-x86_64", .path = "linux-x86_64/sessh" },
+    .{ .os = "linux", .arch = "x86", .filename = "sessh-linux-x86", .path = "linux-x86/sessh" },
+    .{ .os = "linux", .arch = "riscv64", .filename = "sessh-linux-riscv64", .path = "linux-riscv64/sessh" },
 };
 
 pub fn loadArtifactSet(allocator: std.mem.Allocator) !ArtifactSet {
@@ -161,8 +162,12 @@ fn loadPackagedArtifactSet(allocator: std.mem.Allocator, exe_path: []const u8) !
         return artifact_set;
     }
 
-    const prefix_dir = std.fs.path.dirname(exe_dir) orelse return error.NoPackagedArtifacts;
-    const libexec_dir = try std.fs.path.join(allocator, &.{ prefix_dir, "libexec", "sessh" });
+    const artifact_root = std.fs.path.dirname(exe_dir) orelse return error.NoPackagedArtifacts;
+    if (try loadPackagedArtifactSetFromDir(allocator, artifact_root)) |artifact_set| {
+        return artifact_set;
+    }
+
+    const libexec_dir = try std.fs.path.join(allocator, &.{ artifact_root, "libexec", "sessh" });
     defer allocator.free(libexec_dir);
     if (try loadPackagedArtifactSetFromDir(allocator, libexec_dir)) |artifact_set| {
         return artifact_set;
@@ -178,7 +183,7 @@ fn loadPackagedArtifactSetFromDir(allocator: std.mem.Allocator, artifact_dir: []
 
     var found_any = false;
     for (packaged_artifact_targets) |target| {
-        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.filename });
+        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.path });
         defer allocator.free(path);
 
         const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
@@ -199,7 +204,7 @@ fn loadPackagedArtifactSetFromDir(allocator: std.mem.Allocator, artifact_dir: []
     }
 
     for (packaged_artifact_targets, 0..) |target, i| {
-        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.filename });
+        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.path });
         errdefer allocator.free(path);
 
         entries[i] = try loadArtifactEntryForPlatform(allocator, path, .{
@@ -262,7 +267,7 @@ fn parsePackagedArtifactManifest(
         const target = packaged_artifact_targets[target_index];
         if (!isLowerSha256Hex(hash_hex)) return error.InvalidArtifactManifest;
 
-        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.filename });
+        const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.path });
         entries[target_index] = try artifactEntryFromManifest(allocator, path, target, hash_hex);
         seen[target_index] = true;
     }
@@ -568,7 +573,8 @@ test "packaged artifact manifest supplies hashes without hashing artifact conten
     var manifest: std.ArrayList(u8) = .empty;
     defer manifest.deinit(std.testing.allocator);
     for (packaged_artifact_targets) |target| {
-        try tmp.dir.writeFile(.{ .sub_path = target.filename, .data = "x" });
+        if (std.fs.path.dirname(target.path)) |dir| try tmp.dir.makePath(dir);
+        try tmp.dir.writeFile(.{ .sub_path = target.path, .data = "x" });
         try manifest.writer(std.testing.allocator).print(
             "{s} {s}\n",
             .{ target.filename, zero_hash },
@@ -589,9 +595,40 @@ test "packaged artifact manifest supplies hashes without hashing artifact conten
     try std.testing.expectEqualStrings(zero_hash, entry.hash_hex[0..]);
 }
 
+test "packaged artifact set loads from platform executable directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const zero_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    var manifest: std.ArrayList(u8) = .empty;
+    defer manifest.deinit(std.testing.allocator);
+    for (packaged_artifact_targets) |target| {
+        if (std.fs.path.dirname(target.path)) |dir| try tmp.dir.makePath(dir);
+        try tmp.dir.writeFile(.{ .sub_path = target.path, .data = "x" });
+        try manifest.writer(std.testing.allocator).print(
+            "{s} {s}\n",
+            .{ target.filename, zero_hash },
+        );
+    }
+    try tmp.dir.writeFile(.{ .sub_path = artifact_manifest_filename, .data = manifest.items });
+
+    const artifact_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(artifact_dir);
+    const exe_path = try std.fs.path.join(std.testing.allocator, &.{ artifact_dir, "macos-aarch64", "sessh" });
+    defer std.testing.allocator.free(exe_path);
+
+    var artifact_set = try loadPackagedArtifactSet(std.testing.allocator, exe_path);
+    defer artifact_set.deinit();
+
+    const entry = artifact_set.find(.{ .os = "linux", .arch = "x86_64" }) orelse {
+        return error.MissingArtifactEntry;
+    };
+    try std.testing.expectEqualStrings(zero_hash, entry.hash_hex[0..]);
+}
+
 test "sessh-dev uses development artifact upload" {
     try std.testing.expect(isDevelopmentExecutable("/tmp/sessh-dev"));
     try std.testing.expect(isDevelopmentExecutable("/tmp/build/bin/sessh-dev"));
     try std.testing.expect(!isDevelopmentExecutable("/tmp/build/bin/sessh"));
-    try std.testing.expect(!isDevelopmentExecutable("/tmp/libexec/sessh/sessh-macos-aarch64"));
+    try std.testing.expect(!isDevelopmentExecutable("/tmp/libexec/sessh/macos-aarch64/sessh"));
 }

@@ -599,6 +599,23 @@ def read_until_pipe(pipe, needle, timeout=10.0):
     return data
 
 
+def read_until_any_pipe(pipe, needles, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    data = b""
+    while not any(needle in data for needle in needles):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"timed out waiting for any of {needles!r}; got {data!r}")
+        ready, _, _ = select.select([pipe], [], [], remaining)
+        if not ready:
+            raise AssertionError(f"timed out waiting for any of {needles!r}; got {data!r}")
+        chunk = os.read(pipe.fileno(), 4096)
+        if not chunk:
+            raise AssertionError(f"process exited before any of {needles!r}; got {data!r}")
+        data += chunk
+    return data
+
+
 def read_available_pipe(pipe, timeout=0.25):
     deadline = time.monotonic() + timeout
     data = b""
@@ -1051,7 +1068,7 @@ def canonical_local_platform():
 
 def local_artifact():
     os_name, arch = canonical_local_platform()
-    return ROOT / "zig-out" / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+    return ROOT / "zig-out" / "libexec" / "sessh" / f"{os_name}-{arch}" / "sessh"
 
 
 def remote_path_artifact():
@@ -1059,7 +1076,7 @@ def remote_path_artifact():
         return BIN if BIN.is_absolute() else ROOT / BIN
     path = BIN if BIN.is_absolute() else ROOT / BIN
     os_name, arch = canonical_local_platform()
-    wrapper_artifact = path.parent / ".." / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+    wrapper_artifact = path.parent / ".." / "libexec" / "sessh" / f"{os_name}-{arch}" / "sessh"
     if wrapper_artifact.exists():
         return wrapper_artifact
     return local_artifact()
@@ -1273,7 +1290,14 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
             raise AssertionError(f"daemon log replayed old entries: {daemon_log_output!r}")
 
         result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
-        daemon_log_output += read_until_pipe(log_proc.stdout, b"ssh transport disconnected from daemon host=test-host", timeout=5.0)
+        daemon_log_output += read_until_any_pipe(
+            log_proc.stdout,
+            (
+                b"ssh transport disconnected from daemon host=test-host",
+                b"terminal client disconnected; requesting remote hangup host=test-host",
+            ),
+            timeout=5.0,
+        )
     finally:
         terminate_process(log_proc)
 
@@ -1333,12 +1357,18 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         "bootstrap upload required host=test-host",
         "bootstrap completed host=test-host uploaded=true",
         "terminal transport ready host=test-host",
-        "ssh transport disconnected from daemon host=test-host",
     ):
         if expected not in daemon_log_stdout:
             raise AssertionError(
                 ssh_failure_diagnostics(f"daemon log missing {expected!r}", result, fake_log, fake_trace)
             )
+    if (
+        "ssh transport disconnected from daemon host=test-host" not in daemon_log_stdout
+        and "terminal client disconnected; requesting remote hangup host=test-host" not in daemon_log_stdout
+    ):
+        raise AssertionError(
+            ssh_failure_diagnostics("daemon log missing terminal transport cleanup", result, fake_log, fake_trace)
+        )
 
 
 def test_ssh_daemon_log_records_client_hangup_cleanup(tmp):

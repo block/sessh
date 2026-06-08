@@ -154,6 +154,7 @@ test {
     _ = @import("core/process_exit.zig");
     _ = @import("core/shell.zig");
     _ = @import("daemon/client.zig");
+    _ = @import("daemon/executable.zig");
     _ = @import("daemon/log.zig");
     _ = @import("daemon/mod.zig");
     _ = @import("protocol/mod.zig");

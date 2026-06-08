@@ -50,14 +50,22 @@ case "$(uname -m)" in
     ;;
 esac
 
-real="$bindir/../libexec/sessh/sessh-$os-$arch"
+platform=$os-$arch
+real="$bindir/../libexec/sessh/$platform/sessh"
 if [ ! -x "$real" ]; then
   printf 'sessh: missing platform binary: %s\n' "$real" >&2
   exit 127
 fi
 
 case "$(basename "$0")" in
-  sesshd) exec "$real" :internal-daemon: "$@" ;;
+  sesshd)
+    daemon="$bindir/../libexec/sessh/$platform/sesshd"
+    if [ ! -x "$daemon" ]; then
+      printf 'sessh: missing platform binary: %s\n' "$daemon" >&2
+      exit 127
+    fi
+    exec "$daemon" :internal-daemon: "$@"
+    ;;
 esac
 
 exec "$real" "$@"

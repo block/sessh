@@ -9,6 +9,7 @@ const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const session_daemon_handler = @import("../session/daemon_handler.zig");
 const session_runtime = @import("../session/runtime.zig");
+const daemon_executable = @import("executable.zig");
 const daemon_log = @import("log.zig");
 const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
@@ -88,7 +89,9 @@ fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_n
 }
 
 fn spawnDaemon(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !void {
-    const argv = [_][]const u8{ exe, ":internal-daemon:", dir_name };
+    const daemon_exe = try daemon_executable.daemonPathFor(allocator, exe);
+    defer allocator.free(daemon_exe);
+    const argv = [_][]const u8{ daemon_exe, ":internal-daemon:", dir_name };
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;

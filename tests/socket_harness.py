@@ -177,13 +177,18 @@ def daemon_namespace_executable():
     if path.name == "sessh-dev":
         return path
     os_name, arch = canonical_local_platform()
-    wrapper_artifact = path.parent / ".." / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+    wrapper_artifact = platform_wrapper_executable(path, "sessh")
     if wrapper_artifact.exists():
         return wrapper_artifact
-    artifact = ROOT / "zig-out" / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+    artifact = ROOT / "zig-out" / "libexec" / "sessh" / f"{os_name}-{arch}" / "sessh"
     if artifact.exists():
         return artifact
     return path
+
+
+def platform_wrapper_executable(wrapper, name):
+    os_name, arch = canonical_local_platform()
+    return wrapper.parent / ".." / "libexec" / "sessh" / f"{os_name}-{arch}" / name
 
 
 def sessh_protocol_major():
@@ -195,11 +200,15 @@ def sessh_protocol_major():
 
 
 def daemon_socket_dir_name():
+    return daemon_socket_dir_name_for_executable(daemon_namespace_executable())
+
+
+def daemon_socket_dir_name_for_executable(executable):
     version = sessh_version()
     base = str(sessh_protocol_major())
     if not version.endswith("-dev"):
         return base
-    return f"{base}.dev.{hashlib.sha256(daemon_namespace_executable().read_bytes()).hexdigest()[:8]}"
+    return f"{base}.dev.{hashlib.sha256(executable.read_bytes()).hexdigest()[:8]}"
 
 
 KITTY_KEYBOARD_QUERY = b"\x1b[?u"
@@ -351,6 +360,45 @@ def wait_log_contains(path, needle, timeout=5.0):
                 return last
         time.sleep(0.05)
     raise AssertionError(f"did not see {needle!r} in {path}; saw {last!r}")
+
+
+def process_command_basename(pid):
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result)
+    command = result.stdout.strip()
+    if not command:
+        raise AssertionError(f"missing command for pid {pid}")
+    return Path(command.split()[0]).name
+
+
+def wait_process_command_containing(needle, timeout=5.0):
+    end = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < end:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        last = result.stdout
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            _pid_text, _sep, command = stripped.partition(" ")
+            if needle in command:
+                return command
+        time.sleep(0.05)
+    raise AssertionError(f"did not find process command containing {needle!r}; saw {last!r}")
 
 
 def sessh_pb():
@@ -2790,8 +2838,9 @@ def main():
             if short_help_text.returncode != 0 or short_help_text.stdout != help_text.stdout:
                 raise AssertionError(short_help_text)
             sessh_wrapper = ROOT / "zig-out" / "bin" / "sessh"
+            sesshd_wrapper = ROOT / "zig-out" / "bin" / "sesshd"
             release_artifact_dir = ROOT / "zig-out" / "libexec" / "sessh"
-            if sessh_wrapper.exists() and release_artifact_dir.exists() and any(release_artifact_dir.glob("sessh-*")):
+            if sessh_wrapper.exists() and release_artifact_dir.exists() and any(release_artifact_dir.glob("*/sessh")):
                 sessh_help = subprocess.run(
                     [str(sessh_wrapper), "--help"],
                     cwd=ROOT,
@@ -2831,6 +2880,64 @@ def main():
                 )
                 if sessh_short_version_text.returncode != 0 or sessh_short_version_text.stdout != f"sessh {sessh_version()}\n":
                     raise AssertionError(sessh_short_version_text)
+                sesshd_artifact = platform_wrapper_executable(sesshd_wrapper, "sesshd")
+                if not sesshd_artifact.is_symlink() or os.readlink(sesshd_artifact) != "sessh":
+                    raise AssertionError(f"{sesshd_artifact} is not a relative sesshd -> sessh symlink")
+                for wrapper, expected_name in ((sessh_wrapper, "sessh"), (sesshd_wrapper, "sesshd")):
+                    if not wrapper.exists():
+                        continue
+                    expected_socket = runtime_root(env) / daemon_socket_dir_name_for_executable(
+                        platform_wrapper_executable(wrapper, expected_name)
+                    ) / "sesshd.sock"
+                    cleanup_runtime(env)
+                    proc = subprocess.Popen(
+                        [str(wrapper), ":internal-daemon:"] if expected_name == "sessh" else [str(wrapper)],
+                        cwd=ROOT,
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    try:
+                        wait_file(expected_socket)
+                        actual_name = process_command_basename(proc.pid)
+                        if actual_name != expected_name:
+                            raise AssertionError(f"{wrapper} exec name was {actual_name!r}, expected {expected_name!r}")
+                        proc.wait(timeout=5.0)
+                        if proc.returncode != 0:
+                            raise AssertionError(proc.stderr.read().decode("utf-8", "replace"))
+                    finally:
+                        if proc.poll() is None:
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=2.0)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                                proc.wait(timeout=2.0)
+                        cleanup_runtime(env)
+                cleanup_runtime(env)
+                log_proc = subprocess.Popen(
+                    [str(sessh_wrapper), "--daemon-log"],
+                    cwd=ROOT,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                try:
+                    read_until_pipe(log_proc.stdout, b"daemon log subscribed")
+                    daemon_command = wait_process_command_containing(str(sesshd_artifact))
+                    if Path(daemon_command.split()[0]).name != "sesshd":
+                        raise AssertionError(f"auto-started daemon command was {daemon_command!r}")
+                finally:
+                    if log_proc.poll() is None:
+                        log_proc.terminate()
+                        try:
+                            log_proc.wait(timeout=2.0)
+                        except subprocess.TimeoutExpired:
+                            log_proc.kill()
+                            log_proc.wait(timeout=2.0)
+                    cleanup_runtime(env)
 
             run_login_shell_profile_test(env)
             run_daemon_ping_test(env)

@@ -5,6 +5,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
+const daemon_executable = @import("executable.zig");
 const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
 
@@ -45,7 +46,9 @@ pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
 pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
     if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
 
-    const argv = [_][]const u8{ exe, ":internal-daemon:", dir_name };
+    const daemon_exe = try daemon_executable.daemonPathFor(allocator, exe);
+    defer allocator.free(daemon_exe);
+    const argv = [_][]const u8{ daemon_exe, ":internal-daemon:", dir_name };
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;

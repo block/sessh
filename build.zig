@@ -87,6 +87,7 @@ fn installWrapper(b: *std.Build, dest_sub_path: []const u8) *std.Build.Step {
 
 const ArtifactTarget = struct {
     filename: []const u8,
+    platform_dir: []const u8,
     query: std.Target.Query,
 };
 
@@ -99,30 +100,37 @@ fn addArtifactsStep(b: *std.Build, protoc_step: *std.Build.Step) *std.Build.Step
     const artifact_targets = [_]ArtifactTarget{
         .{
             .filename = "sessh-macos-aarch64",
+            .platform_dir = "macos-aarch64",
             .query = .{ .cpu_arch = .aarch64, .os_tag = .macos },
         },
         .{
             .filename = "sessh-macos-x86_64",
+            .platform_dir = "macos-x86_64",
             .query = .{ .cpu_arch = .x86_64, .os_tag = .macos },
         },
         .{
             .filename = "sessh-linux-arm32",
+            .platform_dir = "linux-arm32",
             .query = .{ .cpu_arch = .arm, .os_tag = .linux, .abi = .musleabihf },
         },
         .{
             .filename = "sessh-linux-aarch64",
+            .platform_dir = "linux-aarch64",
             .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
         },
         .{
             .filename = "sessh-linux-x86_64",
+            .platform_dir = "linux-x86_64",
             .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
         },
         .{
             .filename = "sessh-linux-x86",
+            .platform_dir = "linux-x86",
             .query = .{ .cpu_arch = .x86, .os_tag = .linux, .abi = .musl },
         },
         .{
             .filename = "sessh-linux-riscv64",
+            .platform_dir = "linux-riscv64",
             .query = .{
                 .cpu_arch = .riscv64,
                 .os_tag = .linux,
@@ -159,9 +167,13 @@ fn addArtifactsStep(b: *std.Build, protoc_step: *std.Build.Step) *std.Build.Step
         artifact.step.dependOn(protoc_step);
         const install = b.addInstallArtifact(artifact, .{
             .dest_dir = .{ .override = .prefix },
-            .dest_sub_path = b.fmt("libexec/sessh/{s}", .{artifact_target.filename}),
+            .dest_sub_path = b.fmt("libexec/sessh/{s}/sessh", .{artifact_target.platform_dir}),
         });
         artifacts_step.dependOn(&install.step);
+        const sesshd_path = b.getInstallPath(.prefix, b.fmt("libexec/sessh/{s}/sesshd", .{artifact_target.platform_dir}));
+        const link_daemon_name = b.addSystemCommand(&.{ "ln", "-sf", "sessh", sesshd_path });
+        link_daemon_name.step.dependOn(&install.step);
+        artifacts_step.dependOn(&link_daemon_name.step);
 
         manifest_run.addArg(artifact_target.filename);
         manifest_run.addFileArg(artifact.getEmittedBin());

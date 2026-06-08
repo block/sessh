@@ -303,8 +303,8 @@ fn stderrPumpMain(state: *SshStderrPump.State) void {
 ///
 /// The bootstrapper installs or finds the remote sessh binary, then execs
 /// the internal `:internal-broker:` entrypoint we send in the EXEC line.
-/// Installed packages keep one binary per supported platform in libexec/sessh,
-/// named `sessh-<os>-<arch>`. If that layout is unavailable, upload the
+/// Installed packages keep one executable per supported platform under
+/// `libexec/sessh/<os>-<arch>/sessh`. If that layout is unavailable, upload the
 /// current binary for same-platform development tests.
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     return runWithParseOptions(allocator, args);
