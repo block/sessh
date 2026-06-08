@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 from pathlib import Path
 
@@ -92,6 +93,12 @@ trace_fake_ssh_parsed() {
 }
 
 apply_remote_env() {
+  # OpenSSH does not hand arbitrary client shell internals to the remote command
+  # unless configured to do so with SendEnv/AcceptEnv. Keep the fake boundary
+  # honest so tests catch sessh forwarding those variables itself.
+  unset FPATH
+  unset fpath
+  unset ZDOTDIR
   if [ -z "${SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}.remote
   fi
@@ -1673,6 +1680,170 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
         )
 
 
+def test_ssh_proxy_streams_pool_tcp_connection(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    marker1 = b"SSH_PROXY_POOL_1\n"
+    marker2 = b"SSH_PROXY_POOL_2\n"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SESSH_FAKE_SSH_G_USER"] = "pool-user"
+    env["SESSH_FAKE_SSH_G_HOSTNAME"] = "pool-host"
+    env["SESSH_FAKE_SSH_G_PORT"] = "2222"
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    server_port = server.getsockname()[1]
+    server_stop = threading.Event()
+
+    def echo_server():
+        while not server_stop.is_set():
+            try:
+                server.settimeout(0.1)
+                conn, _ = server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=echo_connection, args=(conn,), daemon=True).start()
+
+    def echo_connection(conn):
+        with conn:
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    return
+                conn.sendall(data)
+
+    server_thread = threading.Thread(target=echo_server, daemon=True)
+    server_thread.start()
+
+    def send_client_te_transport_open(conn):
+        request = sessh_pb().ClientTeTransportOpen(host="test-host", bootstrap=True, batch_mode=True)
+        for name, value in env.items():
+            entry = request.environment.add()
+            entry.name = str(name)
+            entry.value = str(value)
+        frame = sessh_pb().Frame()
+        frame.client_te_transport_open.CopyFrom(request)
+        body = frame.SerializeToString()
+        conn.sendall(struct.pack(">I", len(body)) + body)
+
+    def send_mux_frame(conn, mux):
+        frame = sessh_pb().Frame()
+        frame.mux_stream_frame.CopyFrom(mux)
+        body = frame.SerializeToString()
+        conn.sendall(struct.pack(">I", len(body)) + body)
+
+    def recv_mux_frame(conn, timeout=30.0):
+        old_timeout = conn.gettimeout()
+        conn.settimeout(timeout)
+        try:
+            while True:
+                message_type, payload = recv_frame(conn)
+                if message_type != "mux_stream_frame":
+                    continue
+                mux = sessh_pb().MuxStreamFrame()
+                mux.ParseFromString(payload)
+                return mux
+        finally:
+            conn.settimeout(old_timeout)
+
+    def send_proxy_open(conn, session_index):
+        mux = sessh_pb().MuxStreamFrame(stream_id=1)
+        mux.open.recv_next_offset = 0
+        mux.open.receive_window_bytes = 65536
+        mux.open.proxy.proxy_guid = f"p-{session_index:08x}-0000-4000-8000-{session_index:012x}"
+        mux.open.proxy.proxy_host = "localhost"
+        mux.open.proxy.proxy_port = server_port
+        send_mux_frame(conn, mux)
+
+    def send_proxy_data(conn, data):
+        mux = sessh_pb().MuxStreamFrame(stream_id=1)
+        mux.payload.offset = 0
+        mux.payload.proxy.data = data
+        send_mux_frame(conn, mux)
+
+    def recv_proxy_data_until(conn, needle):
+        end = time.monotonic() + 30.0
+        chunks = []
+        while time.monotonic() < end:
+            mux = recv_mux_frame(conn, timeout=max(0.1, end - time.monotonic()))
+            if mux.WhichOneof("message") != "payload":
+                continue
+            if mux.payload.WhichOneof("item") != "proxy":
+                continue
+            if mux.payload.proxy.WhichOneof("payload") != "data":
+                continue
+            chunks.append(mux.payload.proxy.data)
+            if needle in b"".join(chunks):
+                return
+        raise AssertionError(f"did not receive proxy data {needle!r}: {chunks!r}")
+
+    def open_proxy_stream(marker, session_index):
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(30.0)
+        conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
+        send_hello(conn)
+        send_client_te_transport_open(conn)
+        while True:
+            message_type, _ = recv_frame(conn)
+            if message_type == "client_te_transport_ready":
+                break
+            if message_type == "client_te_transport_diagnostic":
+                continue
+            raise AssertionError(f"unexpected transport-open frame: {message_type}")
+        send_hello(conn)
+        send_proxy_open(conn, session_index)
+        while recv_mux_frame(conn).WhichOneof("message") != "open_ok":
+            pass
+        send_proxy_data(conn, marker)
+        recv_proxy_data_until(conn, marker)
+        return conn
+
+    log_proc = subprocess.Popen(
+        sessh_argv(["--daemon-log"]),
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    conn1 = conn2 = None
+    daemon_log_output = b""
+    try:
+        daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
+        try:
+            conn1 = open_proxy_stream(marker1, 1)
+            conn2 = open_proxy_stream(marker2, 2)
+            daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
+        except Exception as exc:
+            daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
+            raise AssertionError(
+                f"{exc}\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
+            ) from exc
+    finally:
+        if conn2 is not None:
+            conn2.close()
+        if conn1 is not None:
+            conn1.close()
+        terminate_process(log_proc)
+        server_stop.set()
+        server.close()
+
+    if ssh_invocation_count(fake_log) != 1:
+        raise AssertionError(
+            "expected pooled proxy streams to use one ssh invocation"
+            f"\nlog:\n{optional_text(fake_log)}"
+            f"\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
+        )
+
+
 def test_ssh_local_daemon_death_tty_error_starts_on_new_line(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1997,6 +2168,43 @@ def test_ssh_session_uses_remote_shell_not_local_client_shell(tmp):
     if remote_marker not in result.stdout:
         raise AssertionError(result)
     if local_marker in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_session_does_not_forward_local_zsh_function_path(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    leaked_marker = "LOCAL_FPATH_LEAKED"
+    remote_marker = "REMOTE_LOGIN_ENV_OK"
+    remote_shell.write_text(
+        "#!/bin/sh\n"
+        f"if [ \"${{FPATH-unset}}\" = {shlex.quote(str(tmp / 'local-zsh-functions'))} ]; then\n"
+        f"  printf '{leaked_marker}\\n'\n"
+        "  exit 42\n"
+        "fi\n"
+        f"printf '{remote_marker}\\n'\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_SHELL"] = str(remote_shell)
+    env["FPATH"] = str(tmp / "local-zsh-functions")
+
+    result = run_sessh_in_pty(
+        ["test-host"],
+        env,
+        ((remote_marker.encode("utf-8"), None),),
+        timeout=30.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if remote_marker not in result.stdout:
+        raise AssertionError(result)
+    if leaked_marker in result.stdout:
         raise AssertionError(result)
 
 
@@ -4259,6 +4467,10 @@ def main(argv=None):
             test_ssh_terminal_transports_pool_tcp_connection,
         ),
         (
+            "ssh proxy streams pool tcp connection",
+            test_ssh_proxy_streams_pool_tcp_connection,
+        ),
+        (
             "ssh local daemon death tty error starts on new line",
             test_ssh_local_daemon_death_tty_error_starts_on_new_line,
         ),
@@ -4293,6 +4505,10 @@ def main(argv=None):
         (
             "ssh session uses remote shell, not local client shell",
             test_ssh_session_uses_remote_shell_not_local_client_shell,
+        ),
+        (
+            "ssh session does not forward local zsh function path",
+            test_ssh_session_does_not_forward_local_zsh_function_path,
         ),
         (
             "ssh verbose flags are passed to ssh",

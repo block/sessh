@@ -50,6 +50,8 @@ message ClientTeTransportOpen {
   string host = 2;
   bool bootstrap = 3;
   bool batch_mode = 4;
+  // Environment for the local daemon when it launches the local ssh transport.
+  // These entries are not part of the remote PTY child environment.
   repeated TeSessionCreate.EnvironmentEntry environment = 5;
 }
 
@@ -348,7 +350,8 @@ message TeSessionCreate {
   // Maximum runtime-retained scrollback rows for this session.
   uint32 scrollback_row_limit = 2;
   // Environment entries to apply to the PTY child. Entries already present in
-  // the request take precedence over environment inherited by the broker.
+  // the request take precedence over environment inherited by the remote
+  // broker/daemon.
   repeated EnvironmentEntry environment = 3;
   // Colors the remote session runtime may use to answer early OSC 10/11 queries.
   DefaultColors query_default_colors = 4;

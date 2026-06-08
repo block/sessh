@@ -251,13 +251,19 @@ fn openTeMuxRuntime(
     request: pb.TeStreamOpen,
     open_payload: []const u8,
 ) !c.fd_t {
+    const runtime_payload = if (request.create == null)
+        open_payload
+    else
+        try sessionOpenPayloadWithCurrentEnvironment(allocator, open_payload);
+    defer if (request.create != null) allocator.free(runtime_payload);
+
     const runtime_fd = if (request.create == null)
         try connectRuntimeForOpen(allocator, request)
     else
-        try startSessionRuntimeAndConnect(allocator, exe, open_payload);
+        try startSessionRuntimeAndConnect(allocator, exe, runtime_payload);
     errdefer _ = c.close(runtime_fd);
     try initiateRuntimeHandshake(allocator, runtime_fd);
-    try protocol.sendFrame(runtime_fd, .te_stream_open, open_payload);
+    try protocol.sendFrame(runtime_fd, .te_stream_open, runtime_payload);
     return runtime_fd;
 }
 

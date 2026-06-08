@@ -184,22 +184,24 @@ const PooledTerminalClientState = enum {
     done,
 };
 
+const PooledTerminalClientKind = enum {
+    unknown,
+    te,
+    proxy,
+};
+
 const PooledTerminalClient = struct {
     fd: c.fd_t,
     stream_id: u64 = 0,
+    local_stream_id: u64 = 0,
+    kind: PooledTerminalClientKind = .unknown,
     state: PooledTerminalClientState = .pending_ready,
-    environment: []pb.TeSessionCreate.EnvironmentEntry,
     outbound_next_offset: u64 = 0,
     inbound_next_offset: u64 = 0,
     session_ended: bool = false,
     done: bool = false,
 
-    fn deinit(self: *PooledTerminalClient, allocator: std.mem.Allocator) void {
-        for (self.environment) |entry| {
-            allocator.free(entry.name);
-            allocator.free(entry.value);
-        }
-        allocator.free(self.environment);
+    fn deinit(self: *PooledTerminalClient) void {
         self.* = undefined;
     }
 };
@@ -637,9 +639,8 @@ fn servePooledTerminalTransportFromDaemon(
     errdefer allocator.destroy(client);
     client.* = .{
         .fd = client_fd,
-        .environment = try cloneTransportEnvironment(allocator, request.environment.items),
     };
-    errdefer client.deinit(allocator);
+    errdefer client.deinit();
 
     const acquire = try acquireTerminalTunnel(allocator, target, client);
     if (acquire.created) {
@@ -649,32 +650,8 @@ fn servePooledTerminalTransportFromDaemon(
     }
 
     waitForPooledTerminalClientDone(client);
-    client.deinit(allocator);
+    client.deinit();
     allocator.destroy(client);
-}
-
-fn cloneTransportEnvironment(
-    allocator: std.mem.Allocator,
-    entries: []const pb.TeSessionCreate.EnvironmentEntry,
-) ![]pb.TeSessionCreate.EnvironmentEntry {
-    const cloned = try allocator.alloc(pb.TeSessionCreate.EnvironmentEntry, entries.len);
-    errdefer allocator.free(cloned);
-    var filled: usize = 0;
-    errdefer {
-        for (cloned[0..filled]) |entry| {
-            allocator.free(entry.name);
-            allocator.free(entry.value);
-        }
-    }
-    for (entries, 0..) |entry, index| {
-        const name = try allocator.dupe(u8, entry.name);
-        errdefer allocator.free(name);
-        const value = try allocator.dupe(u8, entry.value);
-        errdefer allocator.free(value);
-        cloned[index] = .{ .name = name, .value = value };
-        filled += 1;
-    }
-    return cloned;
 }
 
 fn acquireTerminalTunnel(
@@ -936,11 +913,17 @@ fn openPooledTerminalClientStream(tunnel: *TerminalTunnel, client: *PooledTermin
     };
     defer frame.deinit(tunnel.allocator);
     if (frame.message_type != .te_stream_open) {
-        try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal stream open", "");
+        if (frame.message_type == .mux_stream_frame) {
+            try sendPooledProxyMuxOpen(tunnel, client, frame.payload);
+            client.state = .active;
+            return;
+        }
+        try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal or proxy stream open", "");
         finishPooledTerminalClient(tunnel, client, false);
         return;
     }
     try sendPooledTeMuxOpen(tunnel, client, frame.payload);
+    client.kind = .te;
     client.state = .active;
 }
 
@@ -957,6 +940,14 @@ fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerm
         .ping, .pong => {
             _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, client.fd);
         },
+        .mux_stream_frame => {
+            if (client.kind != .proxy) {
+                try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected proxy stream frame", "");
+                finishPooledTerminalClient(tunnel, client, true);
+                return;
+            }
+            try sendPooledProxyMuxFrame(tunnel, client, frame.payload);
+        },
         .te_input,
         .te_resize,
         .te_repaint_request,
@@ -964,7 +955,14 @@ fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerm
         .te_session_client_debug_unresponsive_connection_request,
         .te_session_hangup_request,
         .te_stream_item,
-        => try sendPooledTeMuxPayloadFromFrame(tunnel, client, frame.message_type, frame.payload),
+        => {
+            if (client.kind != .te) {
+                try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected terminal stream frame", "");
+                finishPooledTerminalClient(tunnel, client, true);
+                return;
+            }
+            try sendPooledTeMuxPayloadFromFrame(tunnel, client, frame.message_type, frame.payload);
+        },
         else => {
             try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected terminal client frame", "");
             finishPooledTerminalClient(tunnel, client, true);
@@ -979,9 +977,6 @@ fn sendPooledTeMuxOpen(
 ) !void {
     var request = try protocol.decodePayload(pb.TeStreamOpen, tunnel.allocator, payload);
     defer request.deinit(tunnel.allocator);
-    if (request.create) |*create| {
-        try appendPooledClientEnvironment(tunnel.allocator, create, client.environment);
-    }
     try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, .{
         .stream_id = client.stream_id,
         .message = .{ .open = .{
@@ -992,18 +987,39 @@ fn sendPooledTeMuxOpen(
     });
 }
 
-fn appendPooledClientEnvironment(
-    allocator: std.mem.Allocator,
-    create: *pb.TeSessionCreate,
-    entries: []const pb.TeSessionCreate.EnvironmentEntry,
+fn sendPooledProxyMuxOpen(
+    tunnel: *TerminalTunnel,
+    client: *PooledTerminalClient,
+    payload: []const u8,
 ) !void {
-    for (entries) |entry| {
-        const name = try allocator.dupe(u8, entry.name);
-        errdefer allocator.free(name);
-        const value = try allocator.dupe(u8, entry.value);
-        errdefer allocator.free(value);
-        try create.environment.append(allocator, .{ .name = name, .value = value });
+    var mux_frame = try protocol.decodePayload(pb.MuxStreamFrame, tunnel.allocator, payload);
+    defer mux_frame.deinit(tunnel.allocator);
+    const message = mux_frame.message orelse return error.UnexpectedDaemonFrame;
+    const open = switch (message) {
+        .open => |open| open,
+        else => return error.UnexpectedDaemonFrame,
+    };
+    const detail = open.detail orelse return error.UnexpectedDaemonFrame;
+    switch (detail) {
+        .proxy => {},
+        else => return error.UnexpectedDaemonFrame,
     }
+    client.kind = .proxy;
+    client.local_stream_id = mux_frame.stream_id;
+    mux_frame.stream_id = client.stream_id;
+    try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, mux_frame);
+}
+
+fn sendPooledProxyMuxFrame(
+    tunnel: *TerminalTunnel,
+    client: *PooledTerminalClient,
+    payload: []const u8,
+) !void {
+    var mux_frame = try protocol.decodePayload(pb.MuxStreamFrame, tunnel.allocator, payload);
+    defer mux_frame.deinit(tunnel.allocator);
+    if (mux_frame.stream_id != client.local_stream_id) return error.UnexpectedDaemonFrame;
+    mux_frame.stream_id = client.stream_id;
+    try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, mux_frame);
 }
 
 fn sendPooledTeMuxPayloadFromFrame(
@@ -1043,6 +1059,11 @@ fn readPooledRemoteMuxFrame(tunnel: *TerminalTunnel) !bool {
     defer mux_frame.deinit(tunnel.allocator);
     const client = findPooledTerminalClient(tunnel, mux_frame.stream_id) orelse return true;
     const message = mux_frame.message orelse return error.UnexpectedDaemonFrame;
+    if (client.kind == .proxy) {
+        mux_frame.stream_id = client.local_stream_id;
+        try sendPooledMuxFrame(tunnel.allocator, client.fd, mux_frame);
+        return true;
+    }
     switch (message) {
         .open_ok => {},
         .ack => {},
@@ -1082,9 +1103,18 @@ fn finishPooledTerminalClient(
     client: *PooledTerminalClient,
     send_hangup: bool,
 ) void {
-    if (send_hangup and client.state == .active and !client.session_ended) {
-        daemon_log.infof(tunnel.allocator, "terminal client disconnected; requesting remote hangup host={s}", .{tunnel.display_host});
-        sendPooledTeHangup(tunnel, client) catch {};
+    if (send_hangup and client.state == .active) {
+        switch (client.kind) {
+            .te => if (!client.session_ended) {
+                daemon_log.infof(tunnel.allocator, "terminal client disconnected; requesting remote hangup host={s}", .{tunnel.display_host});
+                sendPooledTeHangup(tunnel, client) catch {};
+            },
+            .proxy => {
+                daemon_log.infof(tunnel.allocator, "proxy client disconnected; resetting remote stream host={s}", .{tunnel.display_host});
+                sendPooledProxyReset(tunnel, client) catch {};
+            },
+            .unknown => {},
+        }
     }
     terminal_pool_mutex.lock();
     markPooledTerminalClientDoneLocked(tunnel, client);
@@ -1095,6 +1125,16 @@ fn finishPooledTerminalClient(
 fn sendPooledTeHangup(tunnel: *TerminalTunnel, client: *PooledTerminalClient) !void {
     try sendPooledTeMuxPayload(tunnel, client, .{
         .payload = .{ .session_hangup_request = .{} },
+    });
+}
+
+fn sendPooledProxyReset(tunnel: *TerminalTunnel, client: *PooledTerminalClient) !void {
+    try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, .{
+        .stream_id = client.stream_id,
+        .message = .{ .reset = .{
+            .code = "CLIENT_DISCONNECT",
+            .message = "local proxy stream disconnected",
+        } },
     });
 }
 
@@ -2163,98 +2203,91 @@ fn shouldUseStreamPath(new: RemoteNewSession, common: CommonSessionOptions, stdi
     };
 }
 
-const StreamClientTransport = struct {
-    connection: RuntimeConnection,
+const DaemonStreamClientTransport = struct {
+    fd: c.fd_t,
 
-    pub fn readFd(self: *const StreamClientTransport) c.fd_t {
-        return self.connection.child.stdout.?.handle;
+    pub fn readFd(self: *const DaemonStreamClientTransport) c.fd_t {
+        return self.fd;
     }
 
-    pub fn writeFd(self: *const StreamClientTransport) c.fd_t {
-        return self.connection.child.stdin.?.handle;
+    pub fn writeFd(self: *const DaemonStreamClientTransport) c.fd_t {
+        return self.fd;
     }
 
-    pub fn close(self: *StreamClientTransport) void {
-        self.connection.closeStdin();
-        _ = self.connection.wait() catch {};
+    pub fn close(self: *DaemonStreamClientTransport) void {
+        if (self.fd >= 0) {
+            _ = c.close(self.fd);
+            self.fd = -1;
+        }
     }
 
-    pub fn terminate(self: *StreamClientTransport) void {
-        self.connection.terminate();
+    pub fn terminate(self: *DaemonStreamClientTransport) void {
+        self.close();
     }
 };
 
-const StreamClientStarter = struct {
+const DaemonStreamClientStarter = struct {
     allocator: std.mem.Allocator,
+    exe: []const u8,
     target: SshTarget,
-    artifacts: ?*const ArtifactSet,
-    remote_command: []const u8,
-    stderr_mode: SshStderrMode,
-    last_failure_mutex: std.Thread.Mutex = .{},
-    last_failure_term: ?std.process.Child.Term = null,
+    bootstrap: bool,
 
-    pub fn start(self: *StreamClientStarter) !StreamClientTransport {
-        self.recordFailureTerm(null);
-        var failure_term: ?std.process.Child.Term = null;
-        var broker_socket_dir: ?[]u8 = null;
-        defer if (broker_socket_dir) |dir| self.allocator.free(dir);
-        var broker_arg_storage: [1][]const u8 = undefined;
-        var broker_args: []const []const u8 = broker_arg_storage[0..0];
-        if (self.artifacts != null) {
-            broker_socket_dir = try daemon_socket_namespace.defaultDirName(self.allocator);
-            broker_arg_storage[0] = broker_socket_dir.?;
-            broker_args = broker_arg_storage[0..1];
-        }
-        const connection = startRuntimeConnection(
-            self.allocator,
-            self.target,
-            self.artifacts,
-            self.remote_command,
-            .broker,
-            broker_args,
-            true,
-            null,
-            false,
-            self.stderr_mode,
-            -1,
-            -1,
-            null,
-            &failure_term,
-            .{ .unsupported_action = "start a proxy stream" },
-        ) catch |err| {
-            self.recordFailureTerm(failure_term);
-            return err;
+    pub fn start(self: *DaemonStreamClientStarter) !DaemonStreamClientTransport {
+        const fd = try daemon_client.connectOrStart(self.allocator, self.exe);
+        errdefer _ = c.close(fd);
+
+        var request = pb.ClientTeTransportOpen{
+            .host = self.target.host,
+            .bootstrap = self.bootstrap,
+            .batch_mode = true,
         };
-        return .{ .connection = connection };
-    }
+        defer request.ssh_option.deinit(self.allocator);
+        defer deinitTransportOpenEnvironment(self.allocator, &request);
+        try request.ssh_option.appendSlice(self.allocator, self.target.options);
+        try appendCurrentEnvironmentToTransportOpen(self.allocator, &request);
 
-    pub fn exitAfterInitialFailure(self: *StreamClientStarter, err: anyerror) !void {
-        const term = self.takeFailureTerm();
-        if (term) |value| {
-            switch (value) {
-                .Exited => |code| {
-                    if (code != 0) return process_exit.request(code);
-                    return err;
+        const payload = try protocol.encodePayload(self.allocator, request);
+        defer self.allocator.free(payload);
+        try protocol.sendFrame(fd, .client_te_transport_open, payload);
+
+        var bootstrap_status_visible = false;
+        defer clearClientBootstrapStatus(&bootstrap_status_visible);
+        while (true) {
+            var frame = protocol.readFrameAlloc(self.allocator, fd) catch |err| switch (err) {
+                error.EndOfStream => return error.DaemonTransportClosed,
+                else => return err,
+            };
+            defer frame.deinit(self.allocator);
+            switch (frame.message_type) {
+                .client_te_transport_ready => {
+                    var ready = try protocol.decodePayload(pb.ClientTeTransportReady, self.allocator, frame.payload);
+                    defer ready.deinit(self.allocator);
+                    return .{ .fd = fd };
                 },
-                .Signal => return process_exit.request(255),
-                else => return process_exit.request(255),
+                .client_te_transport_diagnostic => {
+                    try handleClientTeTransportDiagnostic(self.allocator, frame.payload, null, &bootstrap_status_visible);
+                },
+                .error_message => {
+                    var message = try protocol.decodePayload(protocol.hpb.Error, self.allocator, frame.payload);
+                    defer message.deinit(self.allocator);
+                    if (daemonTransportExitCode(message.code)) |exit_code| {
+                        try printDaemonTransportError(message);
+                        return process_exit.request(exit_code);
+                    }
+                    try printDaemonTransportError(message);
+                    return error.DaemonTransportFailed;
+                },
+                .ping, .pong => {
+                    _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
+                },
+                else => return error.UnexpectedDaemonFrame,
             }
         }
+    }
+
+    pub fn exitAfterInitialFailure(self: *DaemonStreamClientStarter, err: anyerror) !void {
+        _ = self;
         return err;
-    }
-
-    fn recordFailureTerm(self: *StreamClientStarter, term: ?std.process.Child.Term) void {
-        self.last_failure_mutex.lock();
-        self.last_failure_term = term;
-        self.last_failure_mutex.unlock();
-    }
-
-    fn takeFailureTerm(self: *StreamClientStarter) ?std.process.Child.Term {
-        self.last_failure_mutex.lock();
-        defer self.last_failure_mutex.unlock();
-        const term = self.last_failure_term;
-        self.last_failure_term = null;
-        return term;
     }
 };
 
@@ -2581,7 +2614,7 @@ const ProxyStreamInvocation = struct {
     }
 };
 
-pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const []const u8) !void {
+pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     var invocation = parseProxyStreamInvocation(allocator, args) catch |err| {
         try printProxyStreamArgError(err);
         return process_exit.request(64);
@@ -2605,29 +2638,19 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
     const default_ipqos_option = try resolved_ssh_config.defaultIpQosOption(allocator);
     defer if (default_ipqos_option) |option| allocator.free(option);
 
-    var artifacts_storage: ?ArtifactSet = if (invocation.bootstrap) try loadArtifactSet(allocator) else null;
-    defer if (artifacts_storage) |*artifacts| artifacts.deinit();
-    const artifacts = if (artifacts_storage) |*value| value else null;
-
-    const remote_command = if (invocation.bootstrap)
-        try bootstrapCommand(allocator)
-    else
-        try directBrokerCommand(allocator, &.{});
-    defer allocator.free(remote_command);
-
     const stream_target = SshTarget{
         .options = invocation.ssh_options.items,
         .host = invocation.host,
         .default_ipqos_option = default_ipqos_option,
+        .resolved_user = resolved_ssh_config.user,
         .resolved_host = resolved_ssh_config.hostname,
         .resolved_port = resolved_ssh_config.port,
     };
-    var starter = StreamClientStarter{
+    var starter = DaemonStreamClientStarter{
         .allocator = allocator,
+        .exe = exe,
         .target = stream_target,
-        .artifacts = artifacts,
-        .remote_command = remote_command,
-        .stderr_mode = .forward,
+        .bootstrap = invocation.bootstrap,
     };
 
     var client_control_fd: c.fd_t = -1;
