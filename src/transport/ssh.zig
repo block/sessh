@@ -2,6 +2,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const app_allocator = @import("../core/app_allocator.zig");
 const attached_client = @import("../session/attached_client.zig");
 const transport_bootstrap = @import("bootstrap.zig");
 const client_config = @import("../session/client_config.zig");
@@ -10,6 +11,8 @@ const client_ui = @import("../session/client_ui.zig");
 const proxy_control = @import("../stream/proxy_control.zig");
 const sessh_cli = @import("../sessh/cli.zig");
 const config = @import("../core/config.zig");
+const daemon_client = @import("../daemon/client.zig");
+const frame_forwarder = @import("frame_forwarder.zig");
 const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
 const protocol = @import("../protocol/mod.zig");
@@ -95,6 +98,7 @@ const RemoteNewSession = struct {
 const BootstrapFailurePolicy = struct {
     unsupported_action: []const u8,
     allow_plain_ssh_fallback: bool = false,
+    return_unsupported_error: bool = false,
 };
 
 const RuntimeConnection = struct {
@@ -134,6 +138,33 @@ const RuntimeConnection = struct {
     }
 };
 
+const TerminalTransport = struct {
+    fd: c.fd_t = -1,
+
+    fn readFd(self: *const TerminalTransport) c.fd_t {
+        return self.fd;
+    }
+
+    fn writeFd(self: *const TerminalTransport) c.fd_t {
+        return self.fd;
+    }
+
+    fn closeStdin(self: *TerminalTransport) void {
+        if (self.fd >= 0) _ = c.shutdown(self.fd, c.SHUT.WR);
+    }
+
+    fn close(self: *TerminalTransport) void {
+        if (self.fd >= 0) {
+            _ = c.close(self.fd);
+            self.fd = -1;
+        }
+    }
+
+    fn terminate(self: *TerminalTransport) void {
+        self.close();
+    }
+};
+
 fn resolveSshTarget(
     allocator: std.mem.Allocator,
     options: []const []const u8,
@@ -159,16 +190,18 @@ fn resolveSshTarget(
 const SshStderrMode = enum(u8) {
     forward,
     diagnostics,
+    pipe,
     discard,
 };
 
-const ParallelReconnectResult = reconnect.AsyncResult(RuntimeConnection);
+const ParallelReconnectResult = reconnect.AsyncResult(TerminalTransport);
 
 const ParallelReconnectState = struct {
-    task: reconnect.AsyncTask(RuntimeConnection) = .{},
+    task: reconnect.AsyncTask(TerminalTransport) = .{},
+    allocator: std.mem.Allocator,
+    exe: []const u8,
     target: SshTarget,
-    artifacts: ?*const ArtifactSet,
-    remote_command: []const u8,
+    common: CommonSessionOptions,
     reconnect_ui: *client_ui.ReconnectUi,
     session: attached_client.RuntimeSession,
     failure_policy: BootstrapFailurePolicy,
@@ -188,11 +221,11 @@ const ParallelReconnectState = struct {
 
 const ReconnectRaceOutcome = union(enum) {
     recovered,
-    reconnected: RuntimeConnection,
+    reconnected: TerminalTransport,
     session_ended,
     failed: anyerror,
     disconnected: anyerror,
-    detach,
+    client_hangup,
 };
 
 const reconnect_ready_switch_delay_ms: u64 = 10_000;
@@ -204,16 +237,18 @@ const SshStderrPump = struct {
 
     const State = struct {
         fd: c.fd_t,
+        diagnostic_fd: c.fd_t,
         mode: std.atomic.Value(u8),
         stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
 
-    fn start(allocator: std.mem.Allocator, file: std.fs.File, mode: SshStderrMode) !SshStderrPump {
+    fn start(allocator: std.mem.Allocator, file: std.fs.File, mode: SshStderrMode, diagnostic_fd: c.fd_t) !SshStderrPump {
         errdefer file.close();
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
         state.* = .{
             .fd = file.handle,
+            .diagnostic_fd = diagnostic_fd,
             .mode = std.atomic.Value(u8).init(@intFromEnum(mode)),
         };
 
@@ -222,6 +257,8 @@ const SshStderrPump = struct {
     }
 
     fn suppress(self: *SshStderrPump) void {
+        const current: SshStderrMode = @enumFromInt(self.state.mode.load(.acquire));
+        if (current == .pipe) return;
         self.state.mode.store(@intFromEnum(SshStderrMode.diagnostics), .release);
     }
 
@@ -253,6 +290,7 @@ fn stderrPumpMain(state: *SshStderrPump.State) void {
         switch (mode) {
             .forward => io.writeAll(2, bytes) catch {},
             .diagnostics => client_log.appendSshStderr(bytes),
+            .pipe => if (state.diagnostic_fd >= 0) io.writeAll(state.diagnostic_fd, bytes) catch {},
             .discard => {},
         }
     }
@@ -364,16 +402,6 @@ fn runRemoteNewSession(
     const shell_command = try shellCommandFromRemoteArgs(allocator, new.shell_command_args);
     defer if (shell_command) |command| allocator.free(command);
 
-    var artifacts_storage: ?ArtifactSet = if (runtime_config.common.bootstrap) try loadArtifactSet(allocator) else null;
-    defer if (artifacts_storage) |*artifacts| artifacts.deinit();
-    const artifacts = if (artifacts_storage) |*value| value else null;
-
-    const remote_command = if (runtime_config.common.bootstrap)
-        try bootstrapCommand(allocator)
-    else
-        try directBrokerCommand(allocator);
-    defer allocator.free(remote_command);
-
     var transcript_recorder: ?tty_transcript.Recorder = null;
     try setupTranscriptRecorder(allocator, runtime_config.common.capture_tty_transcript, &transcript_recorder);
     defer teardownTranscriptRecorder(&transcript_recorder);
@@ -381,17 +409,19 @@ fn runRemoteNewSession(
     const new_guid = try session_registry.generateGuid(allocator);
     defer allocator.free(new_guid);
 
-    var child = try startRemoteSessionBroker(
+    var transport = try openTerminalDaemonTransport(
         allocator,
+        exe,
         target,
-        artifacts,
-        remote_command,
-        failure_policy,
+        runtime_config.common,
+        false,
+        failure_policy.allow_plain_ssh_fallback,
+        null,
     );
 
     var session = attached_client.startNewSessionOnRuntime(
-        child.child.stdout.?.handle,
-        child.child.stdin.?.handle,
+        transport.readFd(),
+        transport.writeFd(),
         runtime_config.common.scrollback_row_count,
         new_guid,
         new.command_argv,
@@ -399,8 +429,7 @@ fn runRemoteNewSession(
         runtime_config.disconnected_reap_ms,
     ) catch |err| {
         if (err == error.VersionMismatch) {
-            child.closeStdin();
-            _ = child.wait() catch {};
+            transport.close();
             if (runtime_config.common.capture_tty_transcript != null) {
                 try io.writeAll(2, "sessh: --capture-tty-transcript requires a compatible sessh runtime\n");
                 return process_exit.request(1);
@@ -411,14 +440,13 @@ fn runRemoteNewSession(
             }
             try runPlainSshFallbackAfterVersionMismatch(allocator, target);
         }
-        waitAfterRuntimeAttachFailure(&child, "start");
+        waitAfterRuntimeAttachFailure(&transport, "start");
         if (process_exit.is(err)) return err;
         try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
         return process_exit.request(1);
     };
     defer session.deinit();
     session.setTitleFallback(target.host);
-    child.suppressSshStderr();
     try attached_client.ensureLocalRouteForRemoteSession(
         allocator,
         &session,
@@ -429,12 +457,11 @@ fn runRemoteNewSession(
     );
     try runAttachedRemoteClient(
         allocator,
+        exe,
         target,
         runtime_config,
-        artifacts,
-        remote_command,
         failure_policy,
-        &child,
+        &transport,
         &session,
     );
 }
@@ -457,9 +484,268 @@ fn startRemoteSessionBroker(
         null,
         false,
         null,
+        -1,
+        null,
         null,
         failure_policy,
     );
+}
+
+pub fn serveTerminalTransportFromDaemon(
+    allocator: std.mem.Allocator,
+    client_fd: c.fd_t,
+    request: pb.ClientTeTransportOpen,
+) !void {
+    var resolved_target = try resolveSshTarget(allocator, request.ssh_option.items, request.host);
+    defer resolved_target.deinit(allocator);
+    const target = resolved_target.target;
+
+    var artifacts_storage: ?ArtifactSet = if (request.bootstrap) try loadArtifactSet(allocator) else null;
+    defer if (artifacts_storage) |*artifacts| artifacts.deinit();
+    const artifacts = if (artifacts_storage) |*value| value else null;
+
+    const remote_command = if (request.bootstrap)
+        try bootstrapCommand(allocator)
+    else
+        try directBrokerCommand(allocator);
+    defer allocator.free(remote_command);
+
+    const diagnostic_pipe = try posix.pipe();
+    defer posix.close(diagnostic_pipe[0]);
+    defer posix.close(diagnostic_pipe[1]);
+    setNonBlockingFd(diagnostic_pipe[0]) catch {};
+    setNonBlockingFd(diagnostic_pipe[1]) catch {};
+    socket_transport.setCloseOnExec(diagnostic_pipe[0]) catch {};
+    socket_transport.setCloseOnExec(diagnostic_pipe[1]) catch {};
+
+    var client_environment = try envMapFromTransportOpen(allocator, request);
+    defer client_environment.deinit();
+
+    var bootstrap_failure_term: ?std.process.Child.Term = null;
+    var child = startRuntimeConnection(
+        allocator,
+        target,
+        artifacts,
+        remote_command,
+        .broker,
+        &.{},
+        request.batch_mode,
+        null,
+        false,
+        .pipe,
+        diagnostic_pipe[1],
+        &client_environment,
+        &bootstrap_failure_term,
+        .{
+            .unsupported_action = "start a persistent sessh session",
+            .return_unsupported_error = true,
+        },
+    ) catch |err| switch (err) {
+        error.UnsupportedRemotePlatform => {
+            try sendDaemonTransportError(
+                client_fd,
+                "UNSUPPORTED_REMOTE_PLATFORM",
+                "remote platform is unsupported and no matching sessh binary is available",
+                "",
+            );
+            return;
+        },
+        else => {
+            try frame_forwarder.forwardRawTransportDiagnostics(client_fd, diagnostic_pipe[0]);
+            if (try sendDaemonSshFailure(client_fd, allocator, target, bootstrap_failure_term)) return;
+            try sendDaemonTransportError(client_fd, "SSH_TRANSPORT_FAILED", "ssh transport failed", "");
+            return;
+        },
+    };
+    defer child.terminate();
+
+    try frame_forwarder.forwardRawTransportDiagnostics(client_fd, diagnostic_pipe[0]);
+    try sendTerminalTransportReady(client_fd);
+    try frame_forwarder.forwardFramesBetweenWithClientCloseActionAndDiagnostics(
+        client_fd,
+        client_fd,
+        child.child.stdout.?.handle,
+        child.child.stdin.?.handle,
+        .te_session_hangup,
+        .{ .notify_read_fd = diagnostic_pipe[0] },
+    );
+}
+
+fn openTerminalDaemonTransport(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    target: SshTarget,
+    common: CommonSessionOptions,
+    batch_mode: bool,
+    allow_plain_ssh_fallback: bool,
+    reconnect_ui: ?*client_ui.ReconnectUi,
+) !TerminalTransport {
+    const fd = try daemon_client.connectOrStart(allocator, exe);
+    errdefer _ = c.close(fd);
+
+    var request = pb.ClientTeTransportOpen{
+        .host = target.host,
+        .bootstrap = common.bootstrap,
+        .batch_mode = batch_mode,
+    };
+    defer request.ssh_option.deinit(allocator);
+    defer deinitTransportOpenEnvironment(allocator, &request);
+    try request.ssh_option.appendSlice(allocator, target.options);
+    try appendCurrentEnvironmentToTransportOpen(allocator, &request);
+
+    const payload = try protocol.encodePayload(allocator, request);
+    defer allocator.free(payload);
+    try protocol.sendFrame(fd, .client_te_transport_open, payload);
+
+    var bootstrap_status_visible = false;
+    defer clearClientBootstrapStatus(&bootstrap_status_visible);
+    try showClientBootstrapStatus(&bootstrap_status_visible, reconnect_ui);
+
+    while (true) {
+        var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
+            error.EndOfStream => return error.DaemonTransportClosed,
+            else => return err,
+        };
+        defer frame.deinit(allocator);
+        switch (frame.message_type) {
+            .client_te_transport_ready => {
+                var ready = try protocol.decodePayload(pb.ClientTeTransportReady, allocator, frame.payload);
+                defer ready.deinit(allocator);
+                return .{ .fd = fd };
+            },
+            .error_message => {
+                var message = try protocol.decodePayload(protocol.hpb.Error, allocator, frame.payload);
+                defer message.deinit(allocator);
+                if (std.mem.eql(u8, message.code, "UNSUPPORTED_REMOTE_PLATFORM") and allow_plain_ssh_fallback) {
+                    _ = c.close(fd);
+                    try runPlainSshFallback(allocator, target, null);
+                }
+                if (reconnect_ui != null) {
+                    return error.DaemonTransportFailed;
+                }
+                if (daemonTransportExitCode(message.code)) |exit_code| {
+                    try printDaemonTransportError(message);
+                    return process_exit.request(exit_code);
+                }
+                try printDaemonTransportError(message);
+                return process_exit.request(1);
+            },
+            .client_te_transport_diagnostic => {
+                try handleClientTeTransportDiagnostic(allocator, frame.payload, reconnect_ui, &bootstrap_status_visible);
+            },
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
+            },
+            else => return error.UnexpectedDaemonFrame,
+        }
+    }
+}
+
+fn printDaemonTransportError(message: protocol.hpb.Error) !void {
+    try io.stderrPrint("sessh: {s}\n", .{message.message});
+    if (message.hint) |hint| {
+        if (hint.len > 0) try io.stderrPrint("{s}\n", .{hint});
+    }
+}
+
+fn sendTerminalTransportReady(fd: c.fd_t) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.ClientTeTransportReady{});
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .client_te_transport_ready, payload);
+}
+
+fn sendDaemonTransportError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
+    const payload = try protocol.encodePayload(app_allocator.allocator(), protocol.hpb.Error{
+        .code = code,
+        .message = message,
+        .hint = hint,
+    });
+    defer app_allocator.allocator().free(payload);
+    try protocol.sendFrame(fd, .error_message, payload);
+}
+
+fn sendDaemonSshFailure(
+    fd: c.fd_t,
+    allocator: std.mem.Allocator,
+    target: SshTarget,
+    term: ?std.process.Child.Term,
+) !bool {
+    const value = term orelse return false;
+    switch (value) {
+        .Exited => |code| {
+            if (code == 0) return false;
+            const message = try visibleSshFailureMessage(allocator, target, "exitcode", code);
+            defer allocator.free(message);
+            var code_buf: [64]u8 = undefined;
+            const error_code = try std.fmt.bufPrint(&code_buf, "SSH_TRANSPORT_EXITED_{}", .{@min(code, 255)});
+            try sendDaemonTransportError(fd, error_code, message, "");
+            return true;
+        },
+        .Signal => |signal| {
+            const message = try visibleSshFailureMessage(allocator, target, "signal", signal);
+            defer allocator.free(message);
+            try sendDaemonTransportError(fd, "SSH_TRANSPORT_EXITED_255", message, "");
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn daemonTransportExitCode(code: []const u8) ?u8 {
+    const prefix = "SSH_TRANSPORT_EXITED_";
+    if (!std.mem.startsWith(u8, code, prefix)) return null;
+    const parsed = std.fmt.parseUnsigned(u16, code[prefix.len..], 10) catch return null;
+    return @intCast(@min(parsed, 255));
+}
+
+fn handleClientTeTransportDiagnostic(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    reconnect_ui: ?*client_ui.ReconnectUi,
+    bootstrap_status_visible: *bool,
+) !void {
+    var message = try protocol.decodePayload(pb.ClientTeTransportDiagnostic, allocator, payload);
+    defer message.deinit(allocator);
+    if (message.chunk.len == 0) return;
+    if (reconnect_ui) |ui| {
+        client_log.appendSshStderr(message.chunk);
+        try ui.refreshOverlayIfDiagnosticsChanged();
+        return;
+    }
+    clearClientBootstrapStatus(bootstrap_status_visible);
+    try io.writeAll(2, message.chunk);
+}
+
+fn appendCurrentEnvironmentToTransportOpen(allocator: std.mem.Allocator, request: *pb.ClientTeTransportOpen) !void {
+    var index: usize = 0;
+    while (c.environ[index]) |entry_z| : (index += 1) {
+        const entry = std.mem.span(entry_z);
+        const equals = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        if (equals == 0) continue;
+        const name = try allocator.dupe(u8, entry[0..equals]);
+        errdefer allocator.free(name);
+        const value = try allocator.dupe(u8, entry[equals + 1 ..]);
+        errdefer allocator.free(value);
+        try request.environment.append(allocator, .{ .name = name, .value = value });
+    }
+}
+
+fn deinitTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.ClientTeTransportOpen) void {
+    for (request.environment.items) |entry| {
+        allocator.free(entry.name);
+        allocator.free(entry.value);
+    }
+    request.environment.deinit(allocator);
+}
+
+fn envMapFromTransportOpen(allocator: std.mem.Allocator, request: pb.ClientTeTransportOpen) !std.process.EnvMap {
+    var env = std.process.EnvMap.init(allocator);
+    errdefer env.deinit();
+    for (request.environment.items) |entry| {
+        if (entry.name.len == 0) continue;
+        try env.put(entry.name, entry.value);
+    }
+    return env;
 }
 
 fn setupTranscriptRecorder(
@@ -486,22 +772,21 @@ fn teardownTranscriptRecorder(transcript_recorder: *?tty_transcript.Recorder) vo
 
 fn runAttachedRemoteClient(
     allocator: std.mem.Allocator,
+    exe: []const u8,
     target: SshTarget,
     runtime_config: SessionRuntimeConfig,
-    artifacts: ?*const ArtifactSet,
-    remote_command: []const u8,
     failure_policy: BootstrapFailurePolicy,
-    child: *RuntimeConnection,
+    transport: *TerminalTransport,
     session: *attached_client.RuntimeSession,
 ) !void {
     while (true) {
         const end = attached_client.runAttachedClient(
-            child.child.stdout.?.handle,
-            child.child.stdin.?.handle,
+            transport.readFd(),
+            transport.writeFd(),
             session,
             .{ .monitor_connection = true },
         ) catch |err| {
-            waitAfterRuntimeAttachFailure(child, "attached client");
+            waitAfterRuntimeAttachFailure(transport, "attached client");
             if (process_exit.is(err)) return err;
             try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
             return process_exit.request(1);
@@ -509,16 +794,17 @@ fn runAttachedRemoteClient(
 
         var race_existing_connection = false;
         switch (end) {
-            .detach => {
-                client_log.debug("event=detach host={s} session={s}", .{ target.host, session.idSlice() });
-                child.terminate();
-                try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
-                return;
-            },
             .session_ended => {
                 client_log.debug("event=session_ended host={s} session={s}", .{ target.host, session.idSlice() });
-                const exit_status = try finishEndedRemoteSession(child, session);
+                const exit_status = try finishEndedRemoteSession(transport, session);
                 return process_exit.request(exit_status);
+            },
+            .client_hangup => {
+                client_log.debug("event=client_hangup host={s} session={s}", .{ target.host, session.idSlice() });
+                attached_client.drainLocalTransportDiagnostics(transport.readFd(), 100);
+                transport.terminate();
+                try finishHungUpSshSession(session);
+                return;
             },
             .unresponsive => {
                 client_log.debug("event=disconnect reason=unresponsive host={s} session={s}", .{ target.host, session.idSlice() });
@@ -526,14 +812,8 @@ fn runAttachedRemoteClient(
             },
             .transport_closed => {
                 client_log.debug("event=disconnect reason=transport_closed host={s} session={s}", .{ target.host, session.idSlice() });
-                child.closeStdin();
-                const term: ?std.process.Child.Term = child.wait() catch |err| blk: {
-                    client_log.debug("event=transport_closed_wait_failed host={s} session={s} error={t}", .{ target.host, session.idSlice(), err });
-                    break :blk null;
-                };
-                if (term) |value| {
-                    client_log.debug("event=transport_closed_ssh_exit host={s} session={s} term={t}", .{ target.host, session.idSlice(), value });
-                }
+                transport.closeStdin();
+                transport.close();
             },
         }
 
@@ -550,9 +830,9 @@ fn runAttachedRemoteClient(
             switch (try raceExistingConnectionWithReconnect(
                 target,
                 failure_policy,
-                artifacts,
-                remote_command,
-                child,
+                exe,
+                runtime_config.common,
+                transport,
                 session,
                 &reconnect_ui,
                 pending_input_at_disconnect,
@@ -563,12 +843,12 @@ fn runAttachedRemoteClient(
                     session.discardPendingInputAcks();
                     session.viewport_offset = try reconnect_ui.clearOverlay();
                     attached_client.repaintRuntimeSession(
-                        child.child.stdout.?.handle,
-                        child.child.stdin.?.handle,
+                        transport.readFd(),
+                        transport.writeFd(),
                         session,
                     ) catch |err| switch (err) {
                         error.SessionEnded => {
-                            const exit_status = try finishEndedRemoteSession(child, session);
+                            const exit_status = try finishEndedRemoteSession(transport, session);
                             return process_exit.request(exit_status);
                         },
                         else => return err,
@@ -578,14 +858,14 @@ fn runAttachedRemoteClient(
                     reconnect_ui_active = false;
                     continue;
                 },
-                .reconnected => |new_child| {
-                    child.terminate();
-                    child.* = new_child;
+                .reconnected => |new_transport| {
+                    transport.terminate();
+                    transport.* = new_transport;
                     session.discardPendingInputAcks();
                     session.viewport_offset = try reconnect_ui.clearOverlay();
-                    attached_client.finishReconnectRepaint(child.child.stdout.?.handle, child.child.stdin.?.handle, session) catch |err| switch (err) {
+                    attached_client.finishReconnectRepaint(transport.readFd(), transport.writeFd(), session) catch |err| switch (err) {
                         error.SessionEnded => {
-                            const exit_status = try finishEndedRemoteSession(child, session);
+                            const exit_status = try finishEndedRemoteSession(transport, session);
                             return process_exit.request(exit_status);
                         },
                         else => return err,
@@ -600,13 +880,13 @@ fn runAttachedRemoteClient(
                     continue;
                 },
                 .session_ended => {
-                    const exit_status = try finishEndedRemoteSession(child, session);
+                    const exit_status = try finishEndedRemoteSession(transport, session);
                     return process_exit.request(exit_status);
                 },
-                .detach => {
-                    child.terminate();
-                    finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
+                .client_hangup => {
+                    transport.terminate();
+                    finishReconnectUiForEnd(&reconnect_ui, &reconnect_ui_active);
+                    try finishHungUpSshSession(session);
                     return;
                 },
                 .failed => |err| {
@@ -616,7 +896,7 @@ fn runAttachedRemoteClient(
                         err,
                     });
                     client_log.userDiagnosticInfo("reconnect failed: parallel: {t}", .{err});
-                    child.terminate();
+                    transport.terminate();
                 },
                 .disconnected => |err| {
                     client_log.debug("event=reconnect_failed stage=parallel host={s} session={s} attempt=0 error={t}", .{
@@ -640,14 +920,14 @@ fn runAttachedRemoteClient(
             });
             const wait_decision = try reconnect_ui.waitForReconnect(delay_ms);
             switch (wait_decision) {
-                .detach => {
-                    client_log.debug("event=reconnect_detach host={s} session={s} attempt={}", .{
+                .client_hangup => {
+                    client_log.debug("event=reconnect_client_hangup host={s} session={s} attempt={}", .{
                         target.host,
                         session.idSlice(),
                         reconnect_attempt,
                     });
-                    finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
+                    finishReconnectUiForEnd(&reconnect_ui, &reconnect_ui_active);
+                    try finishHungUpSshSession(session);
                     return;
                 },
                 .reconnect_now, .wait_elapsed => {
@@ -659,26 +939,16 @@ fn runAttachedRemoteClient(
                 },
             }
 
-            child.* = startRuntimeConnection(
+            transport.* = openTerminalDaemonTransport(
                 allocator,
+                exe,
                 target,
-                artifacts,
-                remote_command,
-                .broker,
-                &.{},
+                runtime_config.common,
                 true,
+                false,
                 &reconnect_ui,
-                true,
-                null,
-                null,
-                failure_policy,
             ) catch |err| switch (err) {
                 error.ExitRequested => return err,
-                error.ReconnectDetached => {
-                    finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
-                    return;
-                },
                 error.OutOfMemory => return err,
                 else => {
                     client_log.debug("event=reconnect_failed stage=transport host={s} session={s} attempt={} error={t}", .{
@@ -695,13 +965,13 @@ fn runAttachedRemoteClient(
 
             session.viewport_offset = reconnect_ui.currentViewportOffset();
             attached_client.reconnectSessionOnRuntimeCancellable(
-                child.child.stdout.?.handle,
-                child.child.stdin.?.handle,
+                transport.readFd(),
+                transport.writeFd(),
                 session,
                 reconnect_ui.cancellationFlag(),
             ) catch |err| {
-                child.closeStdin();
-                _ = child.wait() catch {};
+                transport.closeStdin();
+                transport.close();
                 switch (err) {
                     error.OutOfMemory => return err,
                     else => {
@@ -724,10 +994,10 @@ fn runAttachedRemoteClient(
                 pending_paste_like_input_at_disconnect,
                 false,
             )) {
-                .detach => {
-                    child.terminate();
-                    finishReconnectUiForDetach(&reconnect_ui, &reconnect_ui_active);
-                    try finishDetachedSshSession(allocator, runtime_config.common.overlay_args.slice(), session);
+                .client_hangup => {
+                    transport.terminate();
+                    finishReconnectUiForEnd(&reconnect_ui, &reconnect_ui_active);
+                    try finishHungUpSshSession(session);
                     return;
                 },
                 .reconnect_now, .wait_elapsed => {},
@@ -736,12 +1006,12 @@ fn runAttachedRemoteClient(
             session.discardPendingInputAcks();
             session.viewport_offset = try reconnect_ui.clearOverlay();
             attached_client.finishReconnectRepaint(
-                child.child.stdout.?.handle,
-                child.child.stdin.?.handle,
+                transport.readFd(),
+                transport.writeFd(),
                 session,
             ) catch |err| {
-                child.closeStdin();
-                _ = child.wait() catch {};
+                transport.closeStdin();
+                transport.close();
                 switch (err) {
                     error.OutOfMemory => return err,
                     else => {
@@ -771,34 +1041,20 @@ fn runAttachedRemoteClient(
     }
 }
 
-fn waitAfterRuntimeAttachFailure(child: *RuntimeConnection, stage: []const u8) void {
-    child.closeStdin();
-    const term = child.wait() catch |err| {
-        client_log.flush(2);
-        io.stderrPrint("sessh: ssh runtime wait failed after attach {s} failure: {t}\n", .{ stage, err }) catch {};
-        return;
-    };
+fn waitAfterRuntimeAttachFailure(transport: *TerminalTransport, stage: []const u8) void {
+    transport.closeStdin();
+    transport.close();
     client_log.flush(2);
-    io.stderrPrint("sessh: ssh runtime ended after attach {s} failure: {t}\n", .{ stage, term }) catch {};
+    io.stderrPrint("sessh: ssh runtime transport closed after attach {s} failure\n", .{stage}) catch {};
 }
 
-fn finishDetachedSshSession(
-    allocator: std.mem.Allocator,
-    overlay_args: []const []const u8,
-    session: *attached_client.RuntimeSession,
-) !void {
+fn finishHungUpSshSession(session: *attached_client.RuntimeSession) !void {
     session.restoreAttachedClientEndPresentationForExit();
-    _ = allocator;
-    _ = overlay_args;
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
-    attached_client.writeDetachOverlayForDisconnect();
 }
 
-fn finishEndedRemoteSession(
-    child: *RuntimeConnection,
-    session: *attached_client.RuntimeSession,
-) !u8 {
+fn finishEndedRemoteSession(transport: *TerminalTransport, session: *attached_client.RuntimeSession) !u8 {
     const exit_status = session.endedProcessExitCode();
     if (session.guidSlice().len > 0) {
         var maybe_paths: ?session_registry.SessionPaths = session_registry.pathsForSessionId(std.heap.page_allocator, session.guidSlice()) catch |err| blk: {
@@ -813,17 +1069,17 @@ fn finishEndedRemoteSession(
         }
     }
     session.restoreAttachedClientEndPresentationForExit();
-    child.closeStdin();
-    _ = child.wait() catch {};
+    transport.closeStdin();
+    transport.close();
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
     return exit_status;
 }
 
-fn finishReconnectUiForDetach(reconnect_ui: *client_ui.ReconnectUi, active: *bool) void {
+fn finishReconnectUiForEnd(reconnect_ui: *client_ui.ReconnectUi, active: *bool) void {
     if (!active.*) return;
     _ = reconnect_ui.clearOverlay() catch {};
-    reconnect_ui.restoreTitleForDetach();
+    reconnect_ui.restoreTitleForEnd();
     reconnect_ui.deinit();
     active.* = false;
 }
@@ -852,6 +1108,13 @@ fn nowUnixMs() u64 {
     const ms = std.time.milliTimestamp();
     if (ms <= 0) return 0;
     return @intCast(ms);
+}
+
+fn setNonBlockingFd(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const nonblocking_flag = if (@hasDecl(c.O, "NONBLOCK")) c.O.NONBLOCK else c.SOCK.NONBLOCK;
+    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
 }
 
 fn inferredClientLogLevel(ssh_options: []const []const u8) client_log.Level {
@@ -894,9 +1157,9 @@ fn sshVerbosity(ssh_options: []const []const u8) usize {
 fn raceExistingConnectionWithReconnect(
     target: SshTarget,
     failure_policy: BootstrapFailurePolicy,
-    artifacts: ?*const ArtifactSet,
-    remote_command: []const u8,
-    old_child: *RuntimeConnection,
+    exe: []const u8,
+    common: CommonSessionOptions,
+    old_transport: *TerminalTransport,
     session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
     pending_input_at_disconnect: bool,
@@ -908,9 +1171,9 @@ fn raceExistingConnectionWithReconnect(
         const outcome = try raceExistingConnectionWithReconnectAttempt(
             target,
             failure_policy,
-            artifacts,
-            remote_command,
-            old_child,
+            exe,
+            common,
+            old_transport,
             session,
             reconnect_ui,
             pending_input_at_disconnect,
@@ -934,7 +1197,7 @@ fn raceExistingConnectionWithReconnect(
                     delay_ms,
                 });
                 if (try waitForUnresponsiveReconnectRetry(
-                    old_child,
+                    old_transport,
                     session,
                     reconnect_ui,
                     delay_ms,
@@ -947,7 +1210,7 @@ fn raceExistingConnectionWithReconnect(
 }
 
 fn waitForUnresponsiveReconnectRetry(
-    old_child: *RuntimeConnection,
+    old_transport: *TerminalTransport,
     session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
     delay_ms: u64,
@@ -957,14 +1220,13 @@ fn waitForUnresponsiveReconnectRetry(
         const elapsed_ms = @divTrunc(timer.read(), std.time.ns_per_ms);
         if (elapsed_ms >= delay_ms) return null;
 
-        if (try attached_client.pollRuntimeRecovery(old_child.child.stdout.?.handle, session, 0)) |recovery| {
+        if (try attached_client.pollRuntimeRecovery(old_transport.readFd(), session, 0)) |recovery| {
             switch (recovery) {
                 .recovered => return .recovered,
                 .session_ended => return .session_ended,
-                .detach => return .detach,
                 .transport_closed => {
-                    old_child.closeStdin();
-                    _ = old_child.wait() catch {};
+                    old_transport.closeStdin();
+                    old_transport.close();
                     return .{ .disconnected = error.TransportClosed };
                 },
             }
@@ -973,18 +1235,18 @@ fn waitForUnresponsiveReconnectRetry(
         const remaining_ms = delay_ms - elapsed_ms;
         const poll_ms: i32 = @intCast(@min(remaining_ms, @as(u64, 50)));
         switch (try attached_client.pollAndForwardReconnectInput(
-            old_child.child.stdout.?.handle,
-            old_child.child.stdin.?.handle,
+            old_transport.readFd(),
+            old_transport.writeFd(),
             session,
             reconnect_ui,
             poll_ms,
         )) {
             .wait_elapsed => {},
-            .detach => return .detach,
+            .client_hangup => return .client_hangup,
             .reconnect_now => return null,
             .transport_closed => {
-                old_child.closeStdin();
-                _ = old_child.wait() catch {};
+                old_transport.closeStdin();
+                old_transport.close();
                 return .{ .disconnected = error.TransportClosed };
             },
         }
@@ -994,9 +1256,9 @@ fn waitForUnresponsiveReconnectRetry(
 fn raceExistingConnectionWithReconnectAttempt(
     target: SshTarget,
     failure_policy: BootstrapFailurePolicy,
-    artifacts: ?*const ArtifactSet,
-    remote_command: []const u8,
-    old_child: *RuntimeConnection,
+    exe: []const u8,
+    common: CommonSessionOptions,
+    old_transport: *TerminalTransport,
     session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
     pending_input_at_disconnect: bool,
@@ -1004,9 +1266,10 @@ fn raceExistingConnectionWithReconnectAttempt(
 ) !ReconnectRaceOutcome {
     session.viewport_offset = reconnect_ui.currentViewportOffset();
     var state = ParallelReconnectState{
+        .allocator = std.heap.smp_allocator,
+        .exe = exe,
         .target = target,
-        .artifacts = artifacts,
-        .remote_command = remote_command,
+        .common = common,
         .reconnect_ui = reconnect_ui,
         .session = session.*,
         .failure_policy = failure_policy,
@@ -1019,7 +1282,7 @@ fn raceExistingConnectionWithReconnectAttempt(
         thread.join();
         cleanupParallelReconnectResult(&state);
     };
-    var ready_connection: ?RuntimeConnection = null;
+    var ready_connection: ?TerminalTransport = null;
     defer if (ready_connection) |*connection| connection.terminate();
     var ready_session = attached_client.RuntimeSession{};
 
@@ -1065,7 +1328,7 @@ fn raceExistingConnectionWithReconnectAttempt(
         }
 
         if (old_available) {
-            if (try attached_client.pollRuntimeRecovery(old_child.child.stdout.?.handle, session, 0)) |recovery| {
+            if (try attached_client.pollRuntimeRecovery(old_transport.readFd(), session, 0)) |recovery| {
                 switch (recovery) {
                     .recovered => {
                         reconnect_ui.cancel();
@@ -1085,18 +1348,9 @@ fn raceExistingConnectionWithReconnectAttempt(
                         }
                         return .session_ended;
                     },
-                    .detach => {
-                        reconnect_ui.cancel();
-                        if (!joined) {
-                            joined = true;
-                            thread.join();
-                            cleanupParallelReconnectResult(&state);
-                        }
-                        return .detach;
-                    },
                     .transport_closed => {
-                        old_child.closeStdin();
-                        _ = old_child.wait() catch {};
+                        old_transport.closeStdin();
+                        old_transport.close();
                         old_available = false;
                         if (ready_connection != null) {
                             return try attachReadyReconnectConnectionAfterTransportClosed(
@@ -1114,21 +1368,21 @@ fn raceExistingConnectionWithReconnectAttempt(
             }
             if (old_available) {
                 switch (try attached_client.pollAndForwardReconnectInput(
-                    old_child.child.stdout.?.handle,
-                    old_child.child.stdin.?.handle,
+                    old_transport.readFd(),
+                    old_transport.writeFd(),
                     session,
                     reconnect_ui,
                     50,
                 )) {
                     .wait_elapsed => {},
-                    .detach => {
+                    .client_hangup => {
                         reconnect_ui.cancel();
                         if (!joined) {
                             joined = true;
                             thread.join();
                             cleanupParallelReconnectResult(&state);
                         }
-                        return .detach;
+                        return .client_hangup;
                     },
                     .reconnect_now => {
                         if (ready_connection != null) {
@@ -1141,8 +1395,8 @@ fn raceExistingConnectionWithReconnectAttempt(
                         }
                     },
                     .transport_closed => {
-                        old_child.closeStdin();
-                        _ = old_child.wait() catch {};
+                        old_transport.closeStdin();
+                        old_transport.close();
                         old_available = false;
                         if (ready_connection != null) {
                             return try attachReadyReconnectConnectionAfterTransportClosed(
@@ -1160,14 +1414,14 @@ fn raceExistingConnectionWithReconnectAttempt(
             }
         } else {
             switch (try reconnect_ui.pollDecision(50)) {
-                .detach => {
+                .client_hangup => {
                     reconnect_ui.cancel();
                     if (!joined) {
                         joined = true;
                         thread.join();
                         cleanupParallelReconnectResult(&state);
                     }
-                    return .detach;
+                    return .client_hangup;
                 },
                 .reconnect_now => {
                     if (ready_connection) |connection| {
@@ -1183,7 +1437,7 @@ fn raceExistingConnectionWithReconnectAttempt(
 }
 
 fn attachReadyReconnectConnectionAfterTransportClosed(
-    ready_connection: *?RuntimeConnection,
+    ready_connection: *?TerminalTransport,
     ready_session: *attached_client.RuntimeSession,
     session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
@@ -1196,14 +1450,14 @@ fn attachReadyReconnectConnectionAfterTransportClosed(
         pending_paste_like_input_at_disconnect,
         false,
     )) {
-        .detach => return .detach,
+        .client_hangup => return .client_hangup,
         .reconnect_now, .wait_elapsed => {},
     }
     return attachReadyReconnectConnection(ready_connection, ready_session, session, reconnect_ui);
 }
 
 fn attachReadyReconnectConnection(
-    ready_connection: *?RuntimeConnection,
+    ready_connection: *?TerminalTransport,
     ready_session: *attached_client.RuntimeSession,
     session: *attached_client.RuntimeSession,
     reconnect_ui: *client_ui.ReconnectUi,
@@ -1212,8 +1466,8 @@ fn attachReadyReconnectConnection(
     ready_connection.* = null;
 
     attached_client.attachPreparedReconnectRuntimeCancellable(
-        connection.child.stdout.?.handle,
-        connection.child.stdin.?.handle,
+        connection.readFd(),
+        connection.writeFd(),
         ready_session,
         reconnect_ui.cancellationFlag(),
     ) catch |err| {
@@ -1225,19 +1479,14 @@ fn attachReadyReconnectConnection(
 }
 
 fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allocator) void {
-    var connection = startRuntimeConnection(
+    var connection = openTerminalDaemonTransport(
         allocator,
+        state.exe,
         state.target,
-        state.artifacts,
-        state.remote_command,
-        .broker,
-        &.{},
+        state.common,
         true,
-        state.reconnect_ui,
         false,
-        null,
-        null,
-        state.failure_policy,
+        state.reconnect_ui,
     ) catch |err| {
         state.store(.{ .failed = err });
         return;
@@ -1247,15 +1496,15 @@ fn parallelReconnectMain(state: *ParallelReconnectState, allocator: std.mem.Allo
     // would replace the still-visible old attached client before the user presses
     // Ctrl-R to switch.
     attached_client.prepareReconnectRuntimeCancellable(
-        connection.child.stdout.?.handle,
-        connection.child.stdin.?.handle,
+        connection.readFd(),
+        connection.writeFd(),
         state.reconnect_ui.cancellationFlag(),
     ) catch |err| {
-        if (err == error.ReconnectDetached) {
+        if (err == error.ReconnectCancelled) {
             connection.terminate();
         } else {
             connection.closeStdin();
-            _ = connection.wait() catch {};
+            connection.close();
         }
         state.store(.{ .failed = err });
         return;
@@ -1317,6 +1566,8 @@ fn startRuntimeConnection(
     reconnect_ui: ?*client_ui.ReconnectUi,
     poll_reconnect_input: bool,
     stderr_mode_override: ?SshStderrMode,
+    stderr_diagnostic_fd: c.fd_t,
+    env_map: ?*const std.process.EnvMap,
     bootstrap_failure_term: ?*?std.process.Child.Term,
     failure_policy: BootstrapFailurePolicy,
 ) !RuntimeConnection {
@@ -1346,12 +1597,13 @@ fn startRuntimeConnection(
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    child.env_map = env_map;
     try child.spawn();
     var connection = RuntimeConnection{ .child = child };
     const stderr_file = connection.child.stderr.?;
     connection.child.stderr = null;
     const stderr_mode = stderr_mode_override orelse if (reconnect_ui == null) SshStderrMode.forward else SshStderrMode.diagnostics;
-    connection.stderr_pump = SshStderrPump.start(allocator, stderr_file, stderr_mode) catch |err| {
+    connection.stderr_pump = SshStderrPump.start(allocator, stderr_file, stderr_mode, stderr_diagnostic_fd) catch |err| {
         connection.terminate();
         return err;
     };
@@ -1362,7 +1614,7 @@ fn startRuntimeConnection(
     if (bootstrap_entrypoint) |entrypoint| {
         artifact_set.sendExec(stdin_fd, entrypoint, exec_args, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
-            if (err == error.ReconnectDetached) {
+            if (err == error.ReconnectCancelled) {
                 connection.terminate();
                 return err;
             }
@@ -1373,7 +1625,7 @@ fn startRuntimeConnection(
     } else {
         artifact_set.sendExecArgs(stdin_fd, exec_args, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
-            if (err == error.ReconnectDetached) {
+            if (err == error.ReconnectCancelled) {
                 connection.terminate();
                 return err;
             }
@@ -1385,7 +1637,7 @@ fn startRuntimeConnection(
 
     var line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
         connection.closeStdin();
-        if (err == error.ReconnectDetached) {
+        if (err == error.ReconnectCancelled) {
             connection.terminate();
             return err;
         }
@@ -1408,6 +1660,9 @@ fn startRuntimeConnection(
         const artifact = artifact_set.find(remote_platform) orelse {
             connection.closeStdin();
             _ = connection.wait() catch {};
+            if (failure_policy.return_unsupported_error and artifactFilenameForPlatform(remote_platform) == null) {
+                return error.UnsupportedRemotePlatform;
+            }
             if (artifactFilenameForPlatform(remote_platform) == null and canUsePlainSshFallback(failure_policy, batch_mode, reconnect_ui)) {
                 try runPlainSshFallback(allocator, target, remote_platform);
             }
@@ -1427,7 +1682,7 @@ fn startRuntimeConnection(
 
         sendUpload(allocator, connection.child.stdin.?.handle, artifact, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
-            if (err == error.ReconnectDetached) {
+            if (err == error.ReconnectCancelled) {
                 connection.terminate();
                 return err;
             }
@@ -1438,7 +1693,7 @@ fn startRuntimeConnection(
         allocator.free(line);
         line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
-            if (err == error.ReconnectDetached) {
+            if (err == error.ReconnectCancelled) {
                 connection.terminate();
                 return err;
             }
@@ -1459,6 +1714,9 @@ fn startRuntimeConnection(
     if (std.mem.startsWith(u8, line, "ERR ")) {
         connection.closeStdin();
         _ = connection.wait() catch {};
+        if (isUnsupportedPlatformBootstrapError(line) and failure_policy.return_unsupported_error) {
+            return error.UnsupportedRemotePlatform;
+        }
         if (isUnsupportedPlatformBootstrapError(line) and canUsePlainSshFallback(failure_policy, batch_mode, reconnect_ui)) {
             try runPlainSshFallback(allocator, target, null);
         }
@@ -1551,6 +1809,8 @@ const StreamClientStarter = struct {
             null,
             false,
             self.stderr_mode,
+            -1,
+            null,
             &failure_term,
             .{ .unsupported_action = "start a proxy stream" },
         ) catch |err| {
@@ -1989,6 +2249,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
         .ctrl_r_status_enabled = proxy_control_ctrl_r_available and client_control_fd >= 0,
         .proxy_control_output_mode = proxy_control_output_mode,
         .title_fallback = invocation.host,
+        .reset_on_source_eof = true,
     }) catch |err| {
         try starter.exitAfterInitialFailure(err);
         return;
@@ -2169,6 +2430,39 @@ fn writeVisibleSshCommand(allocator: std.mem.Allocator, target: SshTarget) !void
     try io.writeAll(2, " ");
     try writeDiagnosticShellArg(allocator, target.host);
     try io.writeAll(2, "`");
+}
+
+fn visibleSshFailureMessage(
+    allocator: std.mem.Allocator,
+    target: SshTarget,
+    label: []const u8,
+    value: anytype,
+) ![]u8 {
+    var message = std.ArrayList(u8).empty;
+    errdefer message.deinit(allocator);
+    try message.appendSlice(allocator, "`ssh");
+    for (target.options) |arg| {
+        try message.append(allocator, ' ');
+        try appendDiagnosticShellArg(allocator, &message, arg);
+    }
+    try message.append(allocator, ' ');
+    try appendDiagnosticShellArg(allocator, &message, target.host);
+    try message.appendSlice(allocator, "` failed (");
+    try message.appendSlice(allocator, label);
+    try message.append(allocator, '=');
+    try message.writer(allocator).print("{}", .{value});
+    try message.append(allocator, ')');
+    return message.toOwnedSlice(allocator);
+}
+
+fn appendDiagnosticShellArg(allocator: std.mem.Allocator, out: *std.ArrayList(u8), arg: []const u8) !void {
+    if (isPlainShellArg(arg)) {
+        try out.appendSlice(allocator, arg);
+        return;
+    }
+    const quoted = try shellQuote(allocator, arg);
+    defer allocator.free(quoted);
+    try out.appendSlice(allocator, quoted);
 }
 
 fn writeDiagnosticShellArg(allocator: std.mem.Allocator, arg: []const u8) !void {

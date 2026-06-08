@@ -58,7 +58,7 @@ remove those blank lines, but we'd still be left with our content at the top of
 the viewport. So, we only align our viewports when necessary. Otherwise we wait
 for content to come in normally, aligning the viewports naturally without any
 side-effects. Once the viewports are aligned they stay aligned until the
-session is detached.
+session is disconnected.
 
 ## Window resize
 
@@ -80,7 +80,7 @@ We still keep our own model of both screens. Remote `sesshd` saves the
 outer-primary cursor/grid state before switching buffers, draws the modeled
 alternate screen in the outer alternate buffer, and sends the client a cleanup
 payload that leaves the outer alternate screen and restores the modeled primary
-screen on detach or session exit. A reconnecting client keeps that cleanup
+screen on client close or session exit. A reconnecting client keeps that cleanup
 payload in memory but does not apply it while it is still trying to recover the
 session.
 

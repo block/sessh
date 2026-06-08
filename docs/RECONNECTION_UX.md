@@ -6,13 +6,13 @@ exponential backoff. While disconnected we bell on input.
 When actively reconnecting we show this overlay:
 
 ```
---- sessh: disconnected: Reconnecting... Ctrl-C detach ---
+--- sessh: disconnected: Reconnecting... ---
 ```
 
 When exponentially backing off, we show this overlay, counting down:
 
 ```
---- sessh: disconnected: Retry connecting 10sec. CTRL-R now. CTRL-C detach ---
+--- sessh: disconnected: Retry connecting 10sec. CTRL-R now ---
 ```
 
 For an unresponsive connection, reconnecting and switching are separate. We may
@@ -36,7 +36,7 @@ keystrokes may be lost. To avoid confusion, we delay switching connections for
 connection died, and show this overlay, counting down:
 
 ```
---- sessh: disconnected: Connection ready. Switch 10sec. CTRL-R now. CTRL-C detach ---
+--- sessh: disconnected: Connection ready. Switch 10sec. CTRL-R now ---
 ```
 
 ## Avoiding reconnection confusion #2: copy/pasting
@@ -61,7 +61,7 @@ automatic switching, because none of it can be partially delivered.
 When automatic switching is disabled, we show this overlay:
 
 ```
---- sessh: disconnected: Connection ready. CTRL-R switch. CTRL-C detach ---
+--- sessh: disconnected: Connection ready. CTRL-R switch ---
 ```
 
 ## Avoiding reconnection confusion #3: unresponsive connection
@@ -74,5 +74,5 @@ to the replacement connection (`CTRL-R` acknowledges that prior input may have
 been lost):
 
 ```
---- sessh: unresponsive: Connection ready. CTRL-R switch. CTRL-C detach ---
+--- sessh: unresponsive: Connection ready. CTRL-R switch ---
 ```

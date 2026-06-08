@@ -229,10 +229,10 @@ def main():
         raise SystemExit(f"missing binary: {BIN}")
 
     session = f"sessh-ssh-reconnect-{os.getpid()}"
-    detach_session = f"{session}-detach"
-    reconnect_detach_session = f"{session}-reconnect-detach"
-    alt_detach_session = f"{session}-alt-detach"
-    alt_reconnect_detach_session = f"{session}-alt-reconnect-detach"
+    close_session = f"{session}-close"
+    reconnect_close_session = f"{session}-reconnect-close"
+    alt_close_session = f"{session}-alt-close"
+    alt_reconnect_close_session = f"{session}-alt-reconnect-close"
     bottom_session = f"{session}-bottom"
     bottom_failure_session = f"{session}-bottom-failure"
     with tempfile.TemporaryDirectory(prefix="sessh-ssh-reconnect-tmux-", dir="/tmp") as tmp_text:
@@ -322,8 +322,8 @@ def main():
                 )
 
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "C-r"])
-            wait_capture(env, session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=2.0)
-            wait_visible_absent(env, session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=10.0)
+            wait_capture(env, session, "sessh: disconnected: Reconnecting...", timeout=2.0)
+            wait_visible_absent(env, session, "sessh: disconnected: Reconnecting...", timeout=10.0)
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "after-reconnect", "Enter"])
             final = wait_capture(env, session, "REMOTE:after-reconnect")
             after_repaint = capture_visible(env, session)
@@ -348,18 +348,17 @@ def main():
                 raise AssertionError(f"reconnect damaged outer scrollback:\n{final}")
 
             cleanup_runtime(env)
-            new_tmux_session(env, reconnect_detach_session, 100, 24)
-            run(env, [*TMUX_ARGS, "set-window-option", "-t", reconnect_detach_session, "remain-on-exit", "on"])
-            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
-            wait_capture(env, reconnect_detach_session, PROMPT)
-            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, sessh_cmd, "Enter"])
-            wait_capture(env, reconnect_detach_session, "REMOTE_PROMPT$")
+            new_tmux_session(env, reconnect_close_session, 100, 24)
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", reconnect_close_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_close_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, reconnect_close_session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_close_session, sessh_cmd, "Enter"])
+            wait_capture(env, reconnect_close_session, "REMOTE_PROMPT$")
             sever_attached_clients(child_env)
-            wait_capture(env, reconnect_detach_session, "sessh: disconnected: Retry connecting 10sec")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, "C-c"])
-            wait_capture(env, reconnect_detach_session, "sessh: disconnected", timeout=5.0)
-            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_detach_session, "printf 'OUTER_RECONNECT_DETACHED\\n'", "Enter"])
-            wait_capture(env, reconnect_detach_session, "OUTER_RECONNECT_DETACHED")
+            wait_capture(env, reconnect_close_session, "sessh: disconnected: Retry connecting 10sec")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_close_session, "Enter", "~."])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_close_session, "printf 'OUTER_RECONNECT_CLOSED\\n'", "Enter"])
+            wait_capture(env, reconnect_close_session, "OUTER_RECONNECT_CLOSED")
 
             cleanup_runtime(env)
             new_tmux_session(env, bottom_session, 100, 8)
@@ -391,8 +390,8 @@ def main():
             sever_attached_clients(child_env)
             wait_capture(env, bottom_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_session, "C-r"])
-            wait_capture(env, bottom_session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=2.0)
-            wait_visible_absent(env, bottom_session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=10.0)
+            wait_capture(env, bottom_session, "sessh: disconnected: Reconnecting...", timeout=2.0)
+            wait_visible_absent(env, bottom_session, "sessh: disconnected: Reconnecting...", timeout=10.0)
             bottom_after = capture_visible(env, bottom_session)
             bottom_after_lines = bottom_after.splitlines()
             if "REMOTE_TOP" not in bottom_after_lines:
@@ -433,8 +432,8 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, "C-r"])
             wait_capture(env, bottom_failure_session, "planned batch reconnect failure", timeout=6.0)
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, "C-r"])
-            wait_capture(env, bottom_failure_session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=2.0)
-            wait_visible_absent(env, bottom_failure_session, "sessh: disconnected: Reconnecting... CTRL-C detach", timeout=10.0)
+            wait_capture(env, bottom_failure_session, "sessh: disconnected: Reconnecting...", timeout=2.0)
+            wait_visible_absent(env, bottom_failure_session, "sessh: disconnected: Reconnecting...", timeout=10.0)
             bottom_failure_after = capture_visible(env, bottom_failure_session)
             if bottom_failure_after.count("REMOTE_TOP") != 1:
                 raise AssertionError(f"bottom reconnect after failed attempt duplicated session screen content:\n{bottom_failure_after}")
@@ -442,88 +441,85 @@ def main():
                 raise AssertionError(f"bottom reconnect after failed attempt leaked banner:\n{bottom_failure_after}")
 
             cleanup_runtime(env)
-            idle_detach_session = f"{detach_session}-idle"
-            new_tmux_session(env, idle_detach_session, 140, 24)
-            run(env, [*TMUX_ARGS, "set-window-option", "-t", idle_detach_session, "remain-on-exit", "on"])
-            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
-            wait_capture(env, idle_detach_session, PROMPT)
-            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, sessh_cmd, "Enter"])
-            wait_capture(env, idle_detach_session, "REMOTE_PROMPT$")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "Enter", "~."])
+            idle_close_session = f"{close_session}-idle"
+            new_tmux_session(env, idle_close_session, 140, 24)
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", idle_close_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_close_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, idle_close_session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_close_session, sessh_cmd, "Enter"])
+            wait_capture(env, idle_close_session, "REMOTE_PROMPT$")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_close_session, "Enter", "~."])
             time.sleep(0.5)
-            idle_after = capture(env, idle_detach_session)
-            if "sessh: disconnected" not in idle_after:
-                raise AssertionError(f"detach did not print a disconnect notice:\n{idle_after}")
+            idle_after = capture(env, idle_close_session)
             if f"REMOTE_PROMPT$ {PROMPT}" in idle_after or f"REMOTE_PROMPT${PROMPT}" in idle_after:
-                raise AssertionError(f"detach drew the outer prompt at the inner cursor:\n{idle_after}")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_detach_session, "printf 'OUTER_IDLE_DETACHED\\n'", "Enter"])
-            wait_capture(env, idle_detach_session, "OUTER_IDLE_DETACHED")
+                raise AssertionError(f"close drew the outer prompt at the inner cursor:\n{idle_after}")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", idle_close_session, "printf 'OUTER_IDLE_CLOSED\\n'", "Enter"])
+            wait_capture(env, idle_close_session, "OUTER_IDLE_CLOSED")
 
             cleanup_runtime(env)
-            new_tmux_session(env, detach_session, 80, 24)
-            run(env, [*TMUX_ARGS, "set-window-option", "-t", detach_session, "remain-on-exit", "on"])
-            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
-            wait_capture(env, detach_session, PROMPT)
-            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, sessh_cmd, "Enter"])
-            wait_capture(env, detach_session, "REMOTE_PROMPT$")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, "spam", "Enter"])
-            wait_capture(env, detach_session, "REMOTE_SPAM_")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, "Enter", "~."])
+            new_tmux_session(env, close_session, 80, 24)
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", close_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", close_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, close_session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", close_session, sessh_cmd, "Enter"])
+            wait_capture(env, close_session, "REMOTE_PROMPT$")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", close_session, "spam", "Enter"])
+            wait_capture(env, close_session, "REMOTE_SPAM_")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", close_session, "Enter", "~."])
             time.sleep(0.5)
-            immediate_after_detach = capture_visible(env, detach_session)
-            if "REMOTE_SPAM_" not in immediate_after_detach:
-                raise AssertionError(f"detach did not leave flowing output visible:\n{immediate_after_detach}")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", detach_session, "printf 'OUTER_SPAM_DETACHED\\n'", "Enter"])
-            detached = wait_capture(env, detach_session, "OUTER_SPAM_DETACHED", timeout=10.0)
-            visible_after_detach = capture_visible(env, detach_session)
-            if not visible_after_detach.strip():
-                raise AssertionError(f"detach left a blank visible pane:\n{detached}")
-            if "REMOTE_SPAM_" not in detached:
-                raise AssertionError(f"detach lost flowing output from scrollback:\n{detached}")
+            immediate_after_close = capture_visible(env, close_session)
+            if "REMOTE_SPAM_" not in immediate_after_close:
+                raise AssertionError(f"close did not leave flowing output visible:\n{immediate_after_close}")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", close_session, "printf 'OUTER_SPAM_CLOSED\\n'", "Enter"])
+            closed = wait_capture(env, close_session, "OUTER_SPAM_CLOSED", timeout=10.0)
+            visible_after_close = capture_visible(env, close_session)
+            if not visible_after_close.strip():
+                raise AssertionError(f"close left a blank visible pane:\n{closed}")
+            if "REMOTE_SPAM_" not in closed:
+                raise AssertionError(f"close lost flowing output from scrollback:\n{closed}")
 
             cleanup_runtime(env)
-            new_tmux_session(env, alt_detach_session, 80, 24)
-            run(env, [*TMUX_ARGS, "set-window-option", "-t", alt_detach_session, "remain-on-exit", "on"])
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
-            wait_capture(env, alt_detach_session, PROMPT)
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, sessh_cmd, "Enter"])
-            wait_capture(env, alt_detach_session, "REMOTE_PROMPT$")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "enter-alt", "Enter"])
-            wait_capture(env, alt_detach_session, "ALT_SCREEN_READY")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "Enter", "~."])
+            new_tmux_session(env, alt_close_session, 80, 24)
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", alt_close_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_close_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, alt_close_session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_close_session, sessh_cmd, "Enter"])
+            wait_capture(env, alt_close_session, "REMOTE_PROMPT$")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_close_session, "enter-alt", "Enter"])
+            wait_capture(env, alt_close_session, "ALT_SCREEN_READY")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_close_session, "Enter", "~."])
             time.sleep(0.5)
-            alt_after = capture_visible(env, alt_detach_session)
+            alt_after = capture_visible(env, alt_close_session)
             if "ALT_SCREEN_READY" in alt_after:
-                raise AssertionError(f"detach left alternate-screen contents visible:\n{alt_after}")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_detach_session, "printf 'OUTER_ALT_DETACHED\\n'", "Enter"])
-            wait_capture(env, alt_detach_session, "OUTER_ALT_DETACHED")
+                raise AssertionError(f"close left alternate-screen contents visible:\n{alt_after}")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_close_session, "printf 'OUTER_ALT_CLOSED\\n'", "Enter"])
+            wait_capture(env, alt_close_session, "OUTER_ALT_CLOSED")
 
             cleanup_runtime(env)
-            new_tmux_session(env, alt_reconnect_detach_session, 140, 24)
-            run(env, [*TMUX_ARGS, "set-window-option", "-t", alt_reconnect_detach_session, "remain-on-exit", "on"])
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
-            wait_capture(env, alt_reconnect_detach_session, PROMPT)
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, sessh_cmd, "Enter"])
-            wait_capture(env, alt_reconnect_detach_session, "REMOTE_PROMPT$")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, "enter-alt", "Enter"])
-            wait_capture(env, alt_reconnect_detach_session, "ALT_SCREEN_READY")
+            new_tmux_session(env, alt_reconnect_close_session, 140, 24)
+            run(env, [*TMUX_ARGS, "set-window-option", "-t", alt_reconnect_close_session, "remain-on-exit", "on"])
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_close_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
+            wait_capture(env, alt_reconnect_close_session, PROMPT)
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_close_session, sessh_cmd, "Enter"])
+            wait_capture(env, alt_reconnect_close_session, "REMOTE_PROMPT$")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_close_session, "enter-alt", "Enter"])
+            wait_capture(env, alt_reconnect_close_session, "ALT_SCREEN_READY")
             sever_attached_clients(child_env)
-            wait_capture(env, alt_reconnect_detach_session, "sessh: disconnected: Retry connecting 10sec")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, "C-c"])
-            wait_capture(env, alt_reconnect_detach_session, "sessh: disconnected", timeout=5.0)
-            alt_reconnect_after = capture_visible(env, alt_reconnect_detach_session)
+            wait_capture(env, alt_reconnect_close_session, "sessh: disconnected: Retry connecting 10sec")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_close_session, "Enter", "~."])
+            alt_reconnect_after = capture_visible(env, alt_reconnect_close_session)
             if "ALT_SCREEN_READY" in alt_reconnect_after:
-                raise AssertionError(f"reconnect detach left alternate-screen contents visible:\n{alt_reconnect_after}")
-            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_detach_session, "printf 'OUTER_ALT_RECONNECT_DETACHED\\n'", "Enter"])
-            wait_capture(env, alt_reconnect_detach_session, "OUTER_ALT_RECONNECT_DETACHED")
+                raise AssertionError(f"reconnect close left alternate-screen contents visible:\n{alt_reconnect_after}")
+            run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_close_session, "printf 'OUTER_ALT_RECONNECT_CLOSED\\n'", "Enter"])
+            wait_capture(env, alt_reconnect_close_session, "OUTER_ALT_RECONNECT_CLOSED")
         finally:
             for tmux_session in (
                 session,
-                detach_session,
-                reconnect_detach_session,
-                f"{detach_session}-idle",
-                alt_detach_session,
-                alt_reconnect_detach_session,
+                close_session,
+                reconnect_close_session,
+                f"{close_session}-idle",
+                alt_close_session,
+                alt_reconnect_close_session,
                 bottom_session,
                 bottom_failure_session,
             ):
@@ -537,7 +533,7 @@ def main():
                 )
             cleanup_runtime(env)
 
-    print("ok ssh reconnect banner is temporary and detach returns to the outer prompt")
+    print("ok ssh reconnect banner is temporary and close returns to the outer prompt")
 
 
 if __name__ == "__main__":

@@ -12,21 +12,6 @@ const terminal = @import("../tty/terminal.zig");
 
 const WindowSize = terminal.WindowSize;
 
-pub const DetachOverlayArgs = struct {
-    buf: [16][]const u8 = undefined,
-    len: usize = 0,
-
-    pub fn append(self: *DetachOverlayArgs, arg: []const u8) !void {
-        if (self.len >= self.buf.len) return error.TooManyDetachOverlayArgs;
-        self.buf[self.len] = arg;
-        self.len += 1;
-    }
-
-    pub fn slice(self: *const DetachOverlayArgs) []const []const u8 {
-        return self.buf[0..self.len];
-    }
-};
-
 fn copyTitleFallback(dest: []u8, title: []const u8) usize {
     const len = @min(dest.len, title.len);
     @memcpy(dest[0..len], title[0..len]);
@@ -43,7 +28,7 @@ pub const ReconnectPresentation = enum {
 pub const ReconnectDecision = enum {
     wait_elapsed,
     reconnect_now,
-    detach,
+    client_hangup,
 };
 
 pub const ReconnectSwitchDisposition = enum {
@@ -125,7 +110,7 @@ pub const ReconnectUi = struct {
     }
 
     pub fn deinit(self: *ReconnectUi) void {
-        self.restoreTitleForDetach();
+        self.restoreTitleForEnd();
         if (self.diagnostic_notify_write_fd >= 0) {
             client_log.unregisterUserDiagnosticNotifier(self.diagnostic_notify_write_fd);
             posix.close(self.diagnostic_notify_write_fd);
@@ -148,7 +133,7 @@ pub const ReconnectUi = struct {
             const elapsed_ms = elapsedTimerMs(&timer);
             if (elapsed_ms >= delay_ms) {
                 self.showReconnectingTitle();
-                try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
+                try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{}));
                 return .wait_elapsed;
             }
 
@@ -158,10 +143,10 @@ pub const ReconnectUi = struct {
             try self.refreshForResize();
             try self.refreshOverlayIfDiagnosticsChanged();
             switch (decision) {
-                .detach => return decision,
+                .client_hangup => return decision,
                 .reconnect_now => {
                     self.showReconnectingTitle();
-                    try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
+                    try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{}));
                     return .reconnect_now;
                 },
                 .wait_elapsed => {},
@@ -178,7 +163,7 @@ pub const ReconnectUi = struct {
 
     pub fn showDisconnectedReconnectInProgress(self: *ReconnectUi) !void {
         self.showReconnectingTitle();
-        try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{ .ctrl_c_detach = true }));
+        try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{}));
     }
 
     pub fn showUnresponsiveReconnectInProgressTitle(self: *ReconnectUi) void {
@@ -217,7 +202,7 @@ pub const ReconnectUi = struct {
         try self.showReconnectReady(disposition);
         while (true) {
             switch (try self.pollDecision(-1)) {
-                .detach => |decision| return decision,
+                .client_hangup => |decision| return decision,
                 .reconnect_now => return .reconnect_now,
                 .wait_elapsed => {},
             }
@@ -237,7 +222,7 @@ pub const ReconnectUi = struct {
             const next_wake_ms = @min(delay_ms, next_overlay_update_ms);
             const wait_ms: i32 = @intCast(@min(next_wake_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
             switch (try self.pollDecision(wait_ms)) {
-                .detach => |decision| return decision,
+                .client_hangup => |decision| return decision,
                 .reconnect_now => return .reconnect_now,
                 .wait_elapsed => {},
             }
@@ -251,16 +236,16 @@ pub const ReconnectUi = struct {
         }
     }
 
-    pub fn pollDetach(self: *ReconnectUi, timeout_ms: i32) !bool {
+    pub fn pollClientHangup(self: *ReconnectUi, timeout_ms: i32) !bool {
         const decision = try self.pollDecision(timeout_ms);
         return switch (decision) {
-            .detach => true,
+            .client_hangup => true,
             .reconnect_now, .wait_elapsed => false,
         };
     }
 
     pub fn pollDecision(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        if (self.isCancelled()) return .detach;
+        if (self.isCancelled()) return .client_hangup;
         try self.refreshForResize();
         try self.refreshOverlayIfDiagnosticsChanged();
         const decision = try self.pollInput(timeout_ms);
@@ -325,7 +310,7 @@ pub const ReconnectUi = struct {
         const poll_count: usize = if (self.diagnostic_notify_read_fd >= 0) 2 else 1;
         const ready = try posix.poll(pollfds[0..poll_count], self.effectivePollTimeout(timeout_ms));
         if (ready == 0) return .wait_elapsed;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .detach;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .client_hangup;
         if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
             self.drainDiagnosticNotifier();
         }
@@ -334,12 +319,11 @@ pub const ReconnectUi = struct {
         var input: [256]u8 = undefined;
         var filtered: [512]u8 = undefined;
         const n = c.read(0, &input, input.len);
-        if (n <= 0) return .detach;
+        if (n <= 0) return .client_hangup;
         io_helpers.noteRead(0, input[0..@intCast(n)]);
 
         const bytes = input[0..@intCast(n)];
-        switch (reconnect_control.scanInput(bytes, .{ .ctrl_c_detaches = true })) {
-            .detach => return .detach,
+        switch (reconnect_control.scanInput(bytes, .{})) {
             .reconnect_now => {
                 self.reconnect_acknowledged = true;
                 return .reconnect_now;
@@ -348,7 +332,7 @@ pub const ReconnectUi = struct {
         }
         const result = self.escape_filter.filter(bytes, &filtered);
         if (result.end) |end| switch (end) {
-            .detach => return .detach,
+            .disconnect => return .client_hangup,
             .help => {},
             .repaint => {},
         };
@@ -392,7 +376,7 @@ pub const ReconnectUi = struct {
         const status = try reconnect_title.retryStatus(
             &status_buf,
             delay_ms,
-            .{ .ctrl_r = true, .ctrl_c_detach = true },
+            .{ .ctrl_r = true },
         );
         var message_buf: [128]u8 = undefined;
         const message = try std.fmt.bufPrint(&message_buf, "--- {s} ---", .{status});
@@ -408,13 +392,13 @@ pub const ReconnectUi = struct {
                 const delay = try formatSwitchDelay(delay_ms, &delay_buf);
                 break :blk try std.fmt.bufPrint(
                     &message_buf,
-                    "--- sessh: disconnected: Connection ready. Switch {s}. CTRL-R now. CTRL-C detach ---",
+                    "--- sessh: disconnected: Connection ready. Switch {s}. CTRL-R now ---",
                     .{delay},
                 );
             },
-            .manual_disconnected => "--- sessh: disconnected: Connection ready. CTRL-R switch. CTRL-C detach ---",
-            .manual_unresponsive => "--- sessh: unresponsive: Connection ready. CTRL-R switch. CTRL-C detach ---",
-            .automatic => "--- sessh: disconnected: Connection ready. CTRL-R switch. CTRL-C detach ---",
+            .manual_disconnected => "--- sessh: disconnected: Connection ready. CTRL-R switch ---",
+            .manual_unresponsive => "--- sessh: unresponsive: Connection ready. CTRL-R switch ---",
+            .automatic => "--- sessh: disconnected: Connection ready. CTRL-R switch ---",
         };
         try self.drawStaticOverlay(message);
     }
@@ -564,7 +548,7 @@ pub const ReconnectUi = struct {
         self.title_visible = false;
     }
 
-    pub fn restoreTitleForDetach(self: *ReconnectUi) void {
+    pub fn restoreTitleForEnd(self: *ReconnectUi) void {
         if (!self.title_visible) return;
         self.restoreTitleTo(self.cleanupTitleFallback());
         self.title_visible = false;
@@ -1057,7 +1041,7 @@ test "ReconnectUi leaves restored app title alone after reconnect repaint" {
     try std.testing.expect(!ui.title_visible);
 }
 
-test "ReconnectUi restores local cleanup title on detach" {
+test "ReconnectUi restores local cleanup title on end" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
@@ -1068,7 +1052,7 @@ test "ReconnectUi restores local cleanup title on detach" {
     };
     ui.cleanup_title_fallback_len = copyTitleFallback(&ui.cleanup_title_fallback, "/tmp/local");
     ui.showRetryTitle(5_000);
-    ui.restoreTitleForDetach();
+    ui.restoreTitleForEnd();
     posix.close(fds[1]);
 
     var buf: [128]u8 = undefined;

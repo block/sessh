@@ -2,7 +2,6 @@ const std = @import("std");
 
 const client_config = @import("../session/client_config.zig");
 const client_log = @import("../core/client_log.zig");
-const client_ui = @import("../session/client_ui.zig");
 const config = @import("../core/config.zig");
 const ssh_opts = @import("../transport/ssh_options.zig");
 
@@ -18,7 +17,6 @@ pub const Invocation = struct {
 };
 
 pub const CommonSessionOptions = struct {
-    overlay_args: client_ui.DetachOverlayArgs = .{},
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     scrollback_row_count_set: bool = false,
     initial_scrollback_row_count: ?u32 = null,
@@ -119,8 +117,6 @@ fn parseSesshOptionBeforeHost(args: []const []const u8, index: *usize, common: *
         if (index.* >= args.len) return error.MissingClientLogLevel;
         common.client_log_level = try client_log.parseLevel(args[index.*]);
         common.client_log_level_set = true;
-        try common.overlay_args.append(arg);
-        try common.overlay_args.append(args[index.*]);
         index.* += 1;
     } else if (std.mem.eql(u8, arg, "--terminal-emulator")) {
         common.terminal_emulator = true;

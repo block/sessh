@@ -32,16 +32,16 @@ const ErrorPayload = struct {
 };
 
 pub const AttachedClientEnd = enum {
-    detach,
     unresponsive,
     transport_closed,
     session_ended,
+    client_hangup,
 };
 
 pub const ReconnectInputPumpResult = enum {
     wait_elapsed,
     reconnect_now,
-    detach,
+    client_hangup,
     transport_closed,
 };
 
@@ -49,7 +49,6 @@ pub const RuntimeRecovery = enum {
     recovered,
     transport_closed,
     session_ended,
-    detach,
 };
 
 pub const AttachedClientOptions = struct {
@@ -678,7 +677,7 @@ test "cancelled reconnect frame read returns without input" {
     defer posix.close(fds[1]);
 
     var cancelled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.ReconnectDetached, readFrameAllocMaybeCancelled(fds[0], &cancelled));
+    try std.testing.expectError(error.ReconnectCancelled, readFrameAllocMaybeCancelled(fds[0], &cancelled));
 }
 
 test "draw payload preserves app title presence bit" {
@@ -1060,6 +1059,9 @@ fn finishReconnectRepaintInner(
             .te_input_ack => {
                 _ = try handleInputAckFrame(frame.payload, &session.input_ack_tracker);
             },
+            .client_te_transport_diagnostic => {
+                try handleClientTeTransportDiagnosticFrame(frame.payload);
+            },
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
@@ -1100,6 +1102,31 @@ pub fn runAttachedClient(
             .responsiveness_timeout_floor_ms = @max(options.responsiveness_timeout_floor_ms, session.unresponsive_timeout_floor_ms),
         },
     );
+}
+
+pub fn drainLocalTransportDiagnostics(read_fd: c.fd_t, timeout_ms: u64) void {
+    var timer = std.time.Timer.start() catch return;
+    while (true) {
+        const elapsed_ms = @divTrunc(timer.read(), std.time.ns_per_ms);
+        if (elapsed_ms >= timeout_ms) return;
+        const remaining_ms: i32 = @intCast(@min(timeout_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
+        var pollfds = [_]posix.pollfd{.{
+            .fd = read_fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&pollfds, remaining_ms) catch return;
+        if (ready == 0) return;
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) return;
+
+        var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return;
+        defer frame.deinit(app_allocator.allocator());
+        switch (frame.message_type) {
+            .client_te_transport_diagnostic => handleClientTeTransportDiagnosticFrame(frame.payload) catch return,
+            .ping, .pong => {},
+            else => return,
+        }
+    }
 }
 
 pub fn pollRuntimeRecovery(
@@ -1170,6 +1197,7 @@ pub fn pollAndForwardReconnectInput(
     reconnect_ui: *client_ui.ReconnectUi,
     timeout_ms: i32,
 ) !ReconnectInputPumpResult {
+    _ = read_fd;
     try reconnect_ui.refreshForResize();
     if (reconnect_ui.consumeResizeForRuntime()) {
         session.viewport_offset = reconnect_ui.currentViewportOffset();
@@ -1193,18 +1221,17 @@ pub fn pollAndForwardReconnectInput(
     }};
     const ready = try posix.poll(&pollfds, timeout_ms);
     if (ready == 0) return .wait_elapsed;
-    if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .detach;
+    if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .client_hangup;
     if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
 
     var input: [4096]u8 = undefined;
     var filtered: [8192]u8 = undefined;
     const n = c.read(0, &input, input.len);
-    if (n <= 0) return .detach;
+    if (n <= 0) return .client_hangup;
     const bytes = input[0..@intCast(n)];
     io_helpers.noteRead(0, bytes);
 
     for (bytes) |byte| {
-        if (byte == 0x03) return .detach;
         if (byte == 0x12) {
             reconnect_ui.reconnect_acknowledged = true;
             return .reconnect_now;
@@ -1221,10 +1248,7 @@ pub fn pollAndForwardReconnectInput(
     }
 
     if (result.end) |end| switch (end) {
-        .detach => return switch (requestSessionDetach(read_fd, write_fd)) {
-            .detach => .detach,
-            else => .transport_closed,
-        },
+        .disconnect => return .client_hangup,
         .help => {},
         .repaint => sendRepaint(write_fd, "", &session.pending_repaint) catch |err| switch (err) {
             error.WriteFailed => return .transport_closed,
@@ -1234,15 +1258,6 @@ pub fn pollAndForwardReconnectInput(
 
     try reconnect_ui.refreshOverlayIfDiagnosticsChanged();
     return .wait_elapsed;
-}
-
-pub fn writeDetachOverlayForDisconnect() void {
-    if (c.isatty(1) == 0) return;
-    writeDetachOverlay() catch {};
-}
-
-fn writeDetachOverlay() !void {
-    try io_helpers.writeAll(1, "--- sessh: disconnected ---\r\n");
 }
 
 fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
@@ -1266,6 +1281,9 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                 try session.setIdentity(attached.session_guid);
                 try session.setSessionDir(attached.session_dir);
                 return session;
+            },
+            .client_te_transport_diagnostic => {
+                try handleClientTeTransportDiagnosticFrame(frame.payload);
             },
             else => return error.UnexpectedFrame,
         }
@@ -1318,6 +1336,9 @@ fn readSessionAttachedInner(
                 defer attached.deinit(app_allocator.allocator());
                 return;
             },
+            .client_te_transport_diagnostic => {
+                try handleClientTeTransportDiagnosticFrame(frame.payload);
+            },
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
@@ -1332,14 +1353,14 @@ fn readFrameAllocMaybeCancelled(
 ) !protocol.OwnedFrame {
     const flag = cancelled orelse return protocol.readFrameAlloc(app_allocator.allocator(), fd);
     while (true) {
-        if (flag.load(.acquire)) return error.ReconnectDetached;
+        if (flag.load(.acquire)) return error.ReconnectCancelled;
         var pollfds = [_]posix.pollfd{.{
             .fd = fd,
             .events = posix.POLL.IN,
             .revents = 0,
         }};
         const ready = try posix.poll(&pollfds, 50);
-        if (flag.load(.acquire)) return error.ReconnectDetached;
+        if (flag.load(.acquire)) return error.ReconnectCancelled;
         if (ready == 0) continue;
         if ((pollfds[0].revents & posix.POLL.IN) != 0) {
             return protocol.readFrameAlloc(app_allocator.allocator(), fd);
@@ -1422,6 +1443,9 @@ fn readHelloReply(
                 const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
                 return err;
             },
+            .client_te_transport_diagnostic => {
+                try handleClientTeTransportDiagnosticFrame(frame.payload);
+            },
             else => return error.UnexpectedFrame,
         }
     }
@@ -1437,6 +1461,9 @@ fn readHelloRequest(
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
+            .client_te_transport_diagnostic => {
+                try handleClientTeTransportDiagnosticFrame(frame.payload);
+            },
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
@@ -1595,6 +1622,9 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
                 return true;
             },
             .te_session_ended => return false,
+            .client_te_transport_diagnostic => {
+                try handleClientTeTransportDiagnosticFrame(frame.payload);
+            },
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, conn);
             },
@@ -1683,7 +1713,7 @@ fn runAttachedClientLoop(
         app_title_present,
         options,
     );
-    if (end == .detach) writeDetachBoundary();
+    if (end == .client_hangup) writeClientCloseBoundary();
     return end;
 }
 
@@ -1736,7 +1766,7 @@ fn runAttachedTerminal(
 
         if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             const n = c.read(input_fd, &buf, buf.len);
-            if (n <= 0) return finishAttachedClient(requestSessionDetach(read_fd, write_fd), attached_client_end_restore);
+            if (n <= 0) return finishAttachedClient(clientHangup(), attached_client_end_restore);
             io_helpers.noteRead(input_fd, buf[0..@intCast(n)]);
             const result = input_escape_filter.filter(buf[0..@intCast(n)], &filtered);
             if (result.bytes.len > 0) {
@@ -1758,7 +1788,7 @@ fn runAttachedTerminal(
                 connection_monitor.afterInput();
             }
             if (result.end) |end| switch (end) {
-                .detach => return finishAttachedClient(requestSessionDetach(read_fd, write_fd), attached_client_end_restore),
+                .disconnect => return finishAttachedClient(clientHangup(), attached_client_end_restore),
                 .help => {
                     if (try showEscapeHelpModal(
                         input_fd,
@@ -1852,7 +1882,7 @@ fn showEscapeHelpModal(
             const n = c.read(input_fd, &input, input.len);
             if (n <= 0) {
                 try clearEscapeHelpOverlay(renderer, viewport_offset, &overlay_state);
-                return requestSessionDetach(read_fd, write_fd);
+                return clientHangup();
             }
             const bytes = input[0..@intCast(n)];
             io_helpers.noteRead(input_fd, bytes);
@@ -1957,6 +1987,10 @@ fn handleEscapeHelpRuntimeFrame(
         },
         .te_input_ack => {
             _ = try handleInputAckFrame(frame.payload, input_ack_tracker);
+            return null;
+        },
+        .client_te_transport_diagnostic => {
+            try handleClientTeTransportDiagnosticFrame(frame.payload);
             return null;
         },
         .ping, .pong => {
@@ -2088,6 +2122,10 @@ fn handleAttachedClientRuntimeFrame(
             if (ack.progressed) connection_monitor.noteInputAckProgress(ack.still_pending);
             return null;
         },
+        .client_te_transport_diagnostic => {
+            try handleClientTeTransportDiagnosticFrame(frame.payload);
+            return null;
+        },
         .ping, .pong => {
             _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             return null;
@@ -2109,7 +2147,7 @@ fn handleAttachedClientRuntimeFrame(
 }
 
 fn finishAttachedClient(end: AttachedClientEnd, attached_client_end_restore: ?*std.ArrayList(u8)) AttachedClientEnd {
-    if (end == .detach or end == .session_ended) {
+    if (end == .client_hangup or end == .session_ended) {
         restoreAttachedClientEndPresentationBytes(attached_client_end_restore);
     }
     return end;
@@ -2150,13 +2188,11 @@ fn checkResizeRepaintTimeout(pending_repaint: *const PendingRepaint, viewport_of
     return .unresponsive;
 }
 
-fn requestSessionDetach(read_fd: c.fd_t, write_fd: c.fd_t) AttachedClientEnd {
-    _ = read_fd;
-    _ = write_fd;
-    return .detach;
+fn clientHangup() AttachedClientEnd {
+    return .client_hangup;
 }
 
-fn writeDetachBoundary() void {
+fn writeClientCloseBoundary() void {
     if (c.isatty(1) == 0) return;
     io_helpers.writeAll(1, "\r\n") catch {};
 }
@@ -2201,6 +2237,12 @@ fn handleTtyTranscriptChunkFrame(payload: []const u8) !void {
         .TE_TTY_TRANSCRIPT_STREAM_UNSPECIFIED => {},
         _ => {},
     }
+}
+
+fn handleClientTeTransportDiagnosticFrame(payload: []const u8) !void {
+    var diagnostic = try protocol.decodePayload(pb.ClientTeTransportDiagnostic, app_allocator.allocator(), payload);
+    defer diagnostic.deinit(app_allocator.allocator());
+    client_log.appendSshStderr(diagnostic.chunk);
 }
 
 const InputAckResult = struct {

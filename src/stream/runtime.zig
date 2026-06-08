@@ -49,6 +49,7 @@ pub const LocalStreamOptions = struct {
     ctrl_r_status_enabled: ?bool = null,
     proxy_control_output_mode: proxy_control.OutputMode = .update,
     title_fallback: []const u8 = "",
+    reset_on_source_eof: bool = false,
 };
 
 // Source EOF is reported as fd readiness on some platforms and as HUP/ERR on
@@ -104,6 +105,7 @@ const StreamState = struct {
     outbound: StreamByteState = .{},
     inbound: StreamByteState = .{},
     peer_ready: bool = false,
+    source_eof: bool = false,
 
     fn init(allocator: std.mem.Allocator, guid: []const u8, proxy_host: []const u8, proxy_port: u16) StreamState {
         return .{
@@ -241,6 +243,7 @@ const StreamAttachedClientOptions = struct {
     control_input: ?*StreamInputControl = null,
     replacement_control: ?*ProxyRuntimeControl = null,
     close_outbound_on_inbound_eof: bool = false,
+    reset_on_source_eof: bool = false,
     perform_handshake: bool = false,
 };
 
@@ -259,7 +262,7 @@ const StreamInputControl = struct {
         if (self.escape_enabled) {
             const result = self.escape_filter.filter(bytes, &scratch);
             if (result.end) |end| switch (end) {
-                .detach => self.disconnect_requested = true,
+                .disconnect => self.disconnect_requested = true,
                 .help => self.help_requested = true,
                 .repaint => {},
             };
@@ -478,6 +481,7 @@ const StreamAttachedClient = struct {
                 &self.options,
                 frame,
             ) catch |err| switch (err) {
+                error.StreamReset => return .complete,
                 error.StreamTransportWriteFailed => return .transport_closed,
                 else => return err,
             };
@@ -486,6 +490,7 @@ const StreamAttachedClient = struct {
             // tells us the peer is ready for retransmission, and inbound EOF can mark
             // our outbound side closed.
             try drainStreamSourcesNonBlocking(state, &self.options);
+            if (try self.completeAfterSourceReset()) return .complete;
             if (state.peer_ready) {
                 sendPending(state, self.transport_write_fd) catch |err| switch (err) {
                     error.WriteFailed => return .transport_closed,
@@ -512,6 +517,7 @@ const StreamAttachedClient = struct {
             }
         }
         try drainStreamSourcesNonBlocking(state, &self.options);
+        if (try self.completeAfterSourceReset()) return .complete;
 
         if (state.peer_ready) {
             sendPending(state, self.transport_write_fd) catch |err| switch (err) {
@@ -520,6 +526,12 @@ const StreamAttachedClient = struct {
             };
         }
         return .idle;
+    }
+
+    fn completeAfterSourceReset(self: *StreamAttachedClient) !bool {
+        if (!self.options.reset_on_source_eof or !self.state.source_eof) return false;
+        try sendReset(self.state, self.transport_write_fd, "SOURCE_CLOSED", "local proxy stream closed");
+        return true;
     }
 };
 
@@ -531,7 +543,10 @@ fn readStreamSource(state: *StreamState, source: StreamSource) !void {
     switch (try readStreamSourceFd(source, &buf)) {
         .bytes => |bytes| try appendStreamSourceBytes(state, source, bytes),
         .would_block => {},
-        .eof => state.outbound.outbound_eof = true,
+        .eof => {
+            state.source_eof = true;
+            state.outbound.outbound_eof = true;
+        },
     }
 }
 
@@ -555,6 +570,7 @@ fn drainStreamSourcesNonBlocking(
         var buf: [max_chunk_bytes]u8 = undefined;
         switch (try readStreamSourceFdNonBlocking(source, &buf)) {
             .bytes => |bytes| if (bytes.len == 0) {
+                state.source_eof = true;
                 state.outbound.outbound_eof = true;
                 break;
             } else {
@@ -567,6 +583,7 @@ fn drainStreamSourcesNonBlocking(
                 break;
             },
             .eof => {
+                state.source_eof = true;
                 state.outbound.outbound_eof = true;
                 break;
             },
@@ -904,8 +921,8 @@ fn runProxyRuntime(allocator: std.mem.Allocator, control: *ProxyRuntimeControl, 
     }
     while (true) {
         if (attach_fd < 0) {
-            var detached_options = endpoint.attachedClientOptions(control);
-            attach_fd = try waitForReplacementWhileDetached(&state, control, &detached_options);
+            var disconnected_options = endpoint.attachedClientOptions(control);
+            attach_fd = try waitForReplacementWhileDisconnected(&state, control, &disconnected_options);
         }
 
         const outcome = try runAttachedStream(
@@ -928,7 +945,7 @@ fn runProxyRuntime(allocator: std.mem.Allocator, control: *ProxyRuntimeControl, 
     }
 }
 
-fn waitForReplacementWhileDetached(
+fn waitForReplacementWhileDisconnected(
     state: *StreamState,
     control: *ProxyRuntimeControl,
     options: *const StreamAttachedClientOptions,
@@ -1056,6 +1073,7 @@ pub fn runLocalStream(
                     // no peer left to consume local input, so close the local
                     // outbound side too.
                     .close_outbound_on_inbound_eof = true,
+                    .reset_on_source_eof = options.reset_on_source_eof,
                 },
             ) catch {
                 transport.close();
@@ -1116,6 +1134,7 @@ pub fn runLocalStream(
                 }
                 switch (input_control.consumeAction()) {
                     .disconnect => {
+                        sendReset(&state, transport.writeFd(), "CLIENT_DISCONNECT", "local proxy stream disconnected") catch {};
                         abortTransport(&transport);
                         return 0;
                     },
@@ -1329,7 +1348,7 @@ fn handleMuxStreamFrame(
                 .te => return error.StreamUnexpectedFrame,
             }
         },
-        .reset => return error.StreamTransportClosed,
+        .reset => return error.StreamReset,
     }
 }
 
@@ -1494,6 +1513,16 @@ fn sendEof(state: *StreamState, fd: c.fd_t, offset: u64) !void {
         .message = .{ .payload = .{
             .offset = offset,
             .item = .{ .proxy = .{ .payload = .{ .eof = .{} } } },
+        } },
+    });
+}
+
+fn sendReset(state: *StreamState, fd: c.fd_t, code: []const u8, message: []const u8) !void {
+    try sendMuxStreamFrame(state.allocator, fd, .{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .reset = .{
+            .code = code,
+            .message = message,
         } },
     });
 }
@@ -2106,7 +2135,6 @@ const StreamReconnectStatus = struct {
     fn showRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
         const message = reconnect_title.retryStatus(&self.line, delay_ms, .{
             .ctrl_r = self.ctrl_r_enabled,
-            .ctrl_c_detach = false,
         }) catch return;
         self.line_len = message.len;
         self.refreshDiagnostics();
@@ -2118,7 +2146,6 @@ const StreamReconnectStatus = struct {
     fn showReconnecting(self: *StreamReconnectStatus) void {
         const message = reconnect_title.reconnectingStatus(.{
             .ctrl_r = self.ctrl_r_enabled,
-            .ctrl_c_detach = false,
         });
         @memcpy(self.line[0..message.len], message);
         self.line_len = message.len;
@@ -2418,6 +2445,16 @@ fn expectAckFrame(fd: c.fd_t, expected_offset: u64) !void {
     }
 }
 
+fn expectResetFrame(fd: c.fd_t, expected_code: []const u8) !void {
+    var mux = try expectMuxStreamFrame(fd);
+    defer mux.deinit(std.testing.allocator);
+    const message = mux.message orelse return error.UnexpectedMuxFrame;
+    switch (message) {
+        .reset => |reset| try std.testing.expectEqualStrings(expected_code, reset.code),
+        else => return error.UnexpectedMuxFrame,
+    }
+}
+
 test "raw duplex propagates right-side eof to the left peer" {
     const DuplexThread = struct {
         left_fd: c.fd_t,
@@ -2576,6 +2613,62 @@ test "stream inbound eof promptly flushes generated outbound eof" {
     try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 0));
 
     try expectProxyEofFrame(transport_out[0], 0);
+}
+
+test "stream source eof can reset proxy stream" {
+    const source = try posix.pipe();
+    defer posix.close(source[0]);
+    posix.close(source[1]);
+
+    const transport_in = try posix.pipe();
+    defer posix.close(transport_in[0]);
+    defer posix.close(transport_in[1]);
+    const transport_out = try posix.pipe();
+    defer posix.close(transport_out[0]);
+    defer posix.close(transport_out[1]);
+
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    defer state.deinit();
+    state.peer_ready = true;
+
+    var attached_client = StreamAttachedClient{
+        .state = &state,
+        .transport_read_fd = transport_in[0],
+        .transport_write_fd = transport_out[1],
+        .options = .{
+            .source = .{ .fd = source[0] },
+            .reset_on_source_eof = true,
+        },
+        .liveness = StreamLiveness.init(1_000),
+    };
+
+    try std.testing.expectEqual(StreamStepOutcome.complete, try attached_client.step(1_000));
+    try expectResetFrame(transport_out[0], "SOURCE_CLOSED");
+}
+
+test "stream reset completes proxy stream" {
+    const transport_in = try posix.pipe();
+    defer posix.close(transport_in[0]);
+    defer posix.close(transport_in[1]);
+    const transport_out = try posix.pipe();
+    defer posix.close(transport_out[0]);
+    defer posix.close(transport_out[1]);
+
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    defer state.deinit();
+    state.peer_ready = true;
+
+    try sendReset(&state, transport_in[1], "CLIENT_DISCONNECT", "test reset");
+
+    var attached_client = StreamAttachedClient{
+        .state = &state,
+        .transport_read_fd = transport_in[0],
+        .transport_write_fd = transport_out[1],
+        .options = .{},
+        .liveness = StreamLiveness.init(1_000),
+    };
+
+    try std.testing.expectEqual(StreamStepOutcome.complete, try attached_client.step(1_000));
 }
 
 test "stream liveness schedules probes before declaring unresponsive" {

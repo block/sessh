@@ -31,7 +31,34 @@ message Frame {
     // a mux stream id because the socket itself identifies the stream.
     TeStreamItem te_stream_item = 61;
     ProxyStreamItem proxy_stream_item = 62;
+    ClientTeTransportOpen client_te_transport_open = 63;
+    ClientTeTransportReady client_te_transport_ready = 64;
+    ClientTeTransportDiagnostic client_te_transport_diagnostic = 65;
   }
+}
+
+// Local visible-client -> local daemon request to open a terminal-emulator
+// transport to a remote sesshd. After ClientTeTransportReady, this local socket
+// becomes a transparent framed transport: the visible client sends the normal
+// Hello/TeStreamOpen sequence and the daemon forwards it over ssh to the remote
+// daemon endpoint.
+message ClientTeTransportOpen {
+  repeated string ssh_option = 1;
+  string host = 2;
+  bool bootstrap = 3;
+  bool batch_mode = 4;
+  repeated TeSessionCreate.EnvironmentEntry environment = 5;
+}
+
+// Acknowledges ClientTeTransportOpen. This is only a local-daemon readiness
+// marker; it is not part of the remote runtime handshake.
+message ClientTeTransportReady {
+}
+
+// Local daemon -> visible-client ssh stderr diagnostic for the transport the
+// daemon owns. This is not remote process output.
+message ClientTeTransportDiagnostic {
+  bytes chunk = 1;
 }
 
 // Framed payload, client coordinator <-> server coordinator.
@@ -136,6 +163,7 @@ message TeStreamItem {
     TeSessionClientControlResponse session_client_control_response = 12;
     TeSessionClientDebugSeverConnectionRequest debug_sever_connection_request = 13;
     TeSessionClientDebugUnresponsiveConnectionRequest debug_unresponsive_connection_request = 14;
+    TeSessionHangupRequest session_hangup_request = 15;
   }
 }
 
@@ -314,7 +342,7 @@ message TeSessionCreate {
   }
   // Portable local tty settings to apply to the newly created remote PTY.
   TtySettings tty_settings = 10;
-  // Maximum time the session may remain detached before the runtime ends it.
+  // Maximum time the session may remain disconnected before the runtime ends it.
   // Zero means disabled.
   uint64 reap_ms = 11;
 }
@@ -404,6 +432,12 @@ message TeSessionClientDebugUnresponsiveConnectionRequest {
 // Confirms that a debug client-control request was accepted.
 message TeSessionClientControlResponse {}
 
+// Embedded in TeStreamItem.
+//
+// Requests ssh-shaped hangup for the remote PTY session. This is sent by a
+// daemon when its local visible-client socket closes.
+message TeSessionHangupRequest {}
+
 enum TeSessionEndReason {
   TE_SESSION_END_REASON_UNSPECIFIED = 0;
   TE_SESSION_END_REASON_PROCESS_EXITED = 1;
@@ -451,7 +485,7 @@ message TeDraw {
   bytes draw_bytes = 3;
   // Terminal bytes the client keeps in memory until it really leaves the
   // session view. Transport loss starts reconnect, so the client keeps this
-  // payload active; detach or session-end writes it. Present empty clears a
+  // payload active; client close or session-end writes it. Present empty clears a
   // previous restore.
   optional bytes attached_client_end_restore_bytes = 4;
   // Present when this draw includes the current screen title state. True means

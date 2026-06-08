@@ -15,11 +15,11 @@ If an interactive connection drops, sessh retries in the background and shows a
 temporary overlay such as:
 
 ```text
---- sessh: disconnected: Retry connecting 10sec. CTRL-R now. CTRL-C detach ---
+--- sessh: disconnected: Retry connecting 10sec. CTRL-R now ---
 ```
 
 `CTRL-R` asks sessh to switch to a prepared reconnect when one is available.
-`CTRL-C` or the ssh-style escape `Enter ~ .` disconnects the visible client.
+The ssh-style escape `Enter ~ .` closes the visible client.
 There is intentionally no public resume/list/kill command surface.
 
 # Options

@@ -2,7 +2,7 @@
 
 Sessh no longer has a public session manager. The visible client may disconnect
 from its remote runtime, and reconnect may recover the same session while the
-original client is still alive. Detached remote sessions are not meant to be
+original client is still alive. Disconnected remote sessions are not meant to be
 resumed later by another command.
 
 Remote work is cleaned up with two mechanisms:

@@ -10,6 +10,7 @@ const protocol = @import("../protocol/mod.zig");
 const session_daemon_handler = @import("../session/daemon_handler.zig");
 const socket_transport = @import("../transport/socket.zig");
 const stream_runtime = @import("../stream/runtime.zig");
+const transport_ssh = @import("../transport/ssh.zig");
 
 const hpb = protocol.hpb;
 const pb = protocol.pb;
@@ -246,6 +247,12 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
             },
             .mux_stream_frame => {
                 try stream_runtime.serveMuxStreamFrameAfterHandshake(allocator, exe, frame, fd);
+                return;
+            },
+            .client_te_transport_open => {
+                var request = try protocol.decodePayload(pb.ClientTeTransportOpen, allocator, frame.payload);
+                defer request.deinit(allocator);
+                try transport_ssh.serveTerminalTransportFromDaemon(allocator, fd, request);
                 return;
             },
             else => {

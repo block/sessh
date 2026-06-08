@@ -5,26 +5,96 @@ const posix = std.posix;
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 
+pub const ClientCloseAction = enum {
+    none,
+    te_session_hangup,
+};
+
+pub const ClientDiagnosticForwarding = struct {
+    notify_read_fd: c.fd_t = -1,
+};
+
 pub fn forwardFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, runtime_fd: c.fd_t) !void {
+    return forwardFramesBetween(stdin_fd, stdout_fd, runtime_fd, runtime_fd);
+}
+
+pub fn forwardFramesBetween(
+    client_read_fd: c.fd_t,
+    client_write_fd: c.fd_t,
+    runtime_read_fd: c.fd_t,
+    runtime_write_fd: c.fd_t,
+) !void {
+    return forwardFramesBetweenWithClientCloseAction(
+        client_read_fd,
+        client_write_fd,
+        runtime_read_fd,
+        runtime_write_fd,
+        .none,
+    );
+}
+
+pub fn forwardFramesBetweenWithClientCloseAction(
+    client_read_fd: c.fd_t,
+    client_write_fd: c.fd_t,
+    runtime_read_fd: c.fd_t,
+    runtime_write_fd: c.fd_t,
+    client_close_action: ClientCloseAction,
+) !void {
+    return forwardFramesBetweenWithClientCloseActionAndDiagnostics(
+        client_read_fd,
+        client_write_fd,
+        runtime_read_fd,
+        runtime_write_fd,
+        client_close_action,
+        .{},
+    );
+}
+
+pub fn forwardFramesBetweenWithClientCloseActionAndDiagnostics(
+    client_read_fd: c.fd_t,
+    client_write_fd: c.fd_t,
+    runtime_read_fd: c.fd_t,
+    runtime_write_fd: c.fd_t,
+    client_close_action: ClientCloseAction,
+    diagnostics: ClientDiagnosticForwarding,
+) !void {
     defer {
-        _ = c.shutdown(stdin_fd, c.SHUT.WR);
-        if (stdout_fd != stdin_fd) _ = c.shutdown(stdout_fd, c.SHUT.WR);
-        _ = c.shutdown(runtime_fd, c.SHUT.WR);
+        _ = c.shutdown(client_read_fd, c.SHUT.WR);
+        if (client_write_fd != client_read_fd) _ = c.shutdown(client_write_fd, c.SHUT.WR);
+        _ = c.shutdown(runtime_write_fd, c.SHUT.WR);
     }
 
-    var pollfds = [_]posix.pollfd{
-        .{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = runtime_fd, .events = posix.POLL.IN, .revents = 0 },
-    };
-
     while (true) {
-        _ = try posix.poll(&pollfds, -1);
-
-        if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (!try copyOneFrame(stdin_fd, runtime_fd)) return;
+        var pollfds: [3]posix.pollfd = undefined;
+        var count: usize = 0;
+        const client_index = count;
+        pollfds[count] = .{ .fd = client_read_fd, .events = posix.POLL.IN, .revents = 0 };
+        count += 1;
+        const runtime_index = count;
+        pollfds[count] = .{ .fd = runtime_read_fd, .events = posix.POLL.IN, .revents = 0 };
+        count += 1;
+        var diagnostic_index: ?usize = null;
+        if (diagnostics.notify_read_fd >= 0) {
+            diagnostic_index = count;
+            pollfds[count] = .{ .fd = diagnostics.notify_read_fd, .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
         }
-        if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (!try copyOneFrame(runtime_fd, stdout_fd)) return;
+
+        _ = try posix.poll(pollfds[0..count], -1);
+
+        if (diagnostic_index) |index| {
+            if ((pollfds[index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+                try forwardRawTransportDiagnostics(client_write_fd, diagnostics.notify_read_fd);
+            }
+        }
+        if ((pollfds[client_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+            if (!try copyOneFrame(client_read_fd, runtime_write_fd)) {
+                try handleClientClose(runtime_write_fd, client_close_action);
+                return;
+            }
+        }
+        if ((pollfds[runtime_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+            if (!try copyOneFrame(runtime_read_fd, client_write_fd)) return;
         }
     }
 }
@@ -46,4 +116,38 @@ fn copyOneFrame(read_fd: c.fd_t, write_fd: c.fd_t) !bool {
         remaining -= chunk_len;
     }
     return true;
+}
+
+fn handleClientClose(runtime_write_fd: c.fd_t, action: ClientCloseAction) !void {
+    switch (action) {
+        .none => {},
+        .te_session_hangup => {
+            const payload = try protocol.encodePayload(std.heap.page_allocator, protocol.pb.TeSessionHangupRequest{});
+            defer std.heap.page_allocator.free(payload);
+            try protocol.sendFrame(runtime_write_fd, .te_session_hangup_request, payload);
+        },
+    }
+}
+
+pub fn forwardRawTransportDiagnostics(fd: c.fd_t, diagnostic_read_fd: c.fd_t) !void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        var pollfds = [_]posix.pollfd{.{
+            .fd = diagnostic_read_fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, 0);
+        if (ready == 0 or (pollfds[0].revents & posix.POLL.IN) == 0) return;
+
+        const n = c.read(diagnostic_read_fd, &buf, buf.len);
+        if (n <= 0) return;
+        const chunk = buf[0..@intCast(n)];
+        const payload = try protocol.encodePayload(std.heap.page_allocator, protocol.pb.ClientTeTransportDiagnostic{
+            .chunk = chunk,
+        });
+        try protocol.sendFrame(fd, .client_te_transport_diagnostic, payload);
+        std.heap.page_allocator.free(payload);
+        if (chunk.len < buf.len) return;
+    }
 }

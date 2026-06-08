@@ -198,7 +198,7 @@ def read_until_count(fd, needle, count, timeout=5.0):
     raise AssertionError(f"did not see {count} copies of {needle!r}; saw {data!r}")
 
 
-def send_escape_detach(fd):
+def send_escape_close(fd):
     os.write(fd, b"\n")
     time.sleep(0.05)
     os.write(fd, b"~.\n")
@@ -2557,8 +2557,8 @@ def run_initial_kitty_keyboard_restore_test(tmp_root):
         pid, fd = spawn_client(env, [])
         try:
             read_until(fd, b"$ ")
-            send_escape_detach(fd)
-            output = read_until(fd, b"sessh: detached")
+            send_escape_close(fd)
+            output = read_until(fd, b"\x1b[=7u")
             output += read_available(fd, timeout=0.5)
             if b"\x1b[=7u" not in output:
                 raise AssertionError(f"missing kitty keyboard restore sequence: {output!r}")

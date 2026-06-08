@@ -18,6 +18,7 @@ const max_attached_client_output_queue_bytes = 64 * 1024 * 1024;
 const preferred_live_output_batch_bytes = 1024;
 const max_live_output_reads_per_batch = 64;
 const synchronized_output_max_hold_ms: i64 = 1000;
+const pty_hangup_reap_poll_ms: i64 = 50;
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
@@ -27,6 +28,7 @@ const Session = struct {
     id_len: usize = 0,
     pid: c.pid_t = 0,
     pty_fd: c.fd_t = -1,
+    pty_closed_for_hangup: bool = false,
     terminal_model: ?*vt.SessionTerminal = null,
     rows: u16 = 24,
     cols: u16 = 80,
@@ -35,7 +37,7 @@ const Session = struct {
     last_scrollback_clear_epoch: u64 = 1,
     end_reason: u8 = 0,
     attached: bool = false,
-    detached_at_unix_ms: u64 = 0,
+    disconnected_at_unix_ms: u64 = 0,
     reap_ms: u64 = 0,
     alive: bool = false,
     pending_plain_output: std.ArrayList(u8) = .empty,
@@ -1390,6 +1392,7 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, control: *RuntimeCon
     const now_ms = sessionRuntimeMonotonicMs(session_runtime);
     const now_unix_ms = nowUnixMs();
     clearExpiredDebugUnresponsiveAttachedClients(session_runtime, now_ms);
+    if (reapPtyHangupSessionIfExited(session_runtime)) return;
     if (endReapedSessions(session_runtime, now_unix_ms)) return;
 
     var pollfds: [5]posix.pollfd = undefined;
@@ -1406,7 +1409,7 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, control: *RuntimeCon
         count += 1;
     }
 
-    if (session_runtime.session.alive) {
+    if (session_runtime.session.alive and session_runtime.session.pty_fd >= 0) {
         const session = &session_runtime.session;
         pollfds[count] = .{ .fd = session.pty_fd, .events = posix.POLL.IN, .revents = 0 };
         kinds[count] = .session;
@@ -1427,6 +1430,7 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, control: *RuntimeCon
     const after_poll_ms = sessionRuntimeMonotonicMs(session_runtime);
     clearExpiredDebugUnresponsiveAttachedClients(session_runtime, after_poll_ms);
     flushExpiredSynchronizedOutputSessions(session_runtime, after_poll_ms);
+    if (reapPtyHangupSessionIfExited(session_runtime)) return;
     if (endReapedSessions(session_runtime, nowUnixMs())) return;
 
     for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
@@ -1473,8 +1477,11 @@ fn sessionRuntimePollTimeoutMs(session_runtime: *const SessionRuntime, now_ms: i
         const clamped_remaining_ms = @max(remaining_ms, 0);
         if (timeout_ms == null or clamped_remaining_ms < timeout_ms.?) timeout_ms = clamped_remaining_ms;
     }
+    if (session.alive and session.pty_closed_for_hangup) {
+        if (timeout_ms == null or pty_hangup_reap_poll_ms < timeout_ms.?) timeout_ms = pty_hangup_reap_poll_ms;
+    }
     if (sessionReapEnabled(session)) {
-        const deadline_ms = session.detached_at_unix_ms +| session.reap_ms;
+        const deadline_ms = session.disconnected_at_unix_ms +| session.reap_ms;
         const remaining_ms: i64 = if (deadline_ms <= now_unix_ms)
             0
         else
@@ -1488,11 +1495,11 @@ fn sessionRuntimePollTimeoutMs(session_runtime: *const SessionRuntime, now_ms: i
 fn endReapedSessions(session_runtime: *SessionRuntime, now_unix_ms: u64) bool {
     const session = &session_runtime.session;
     if (!sessionReapEnabled(session)) return false;
-    const deadline_ms = session.detached_at_unix_ms +| session.reap_ms;
+    const deadline_ms = session.disconnected_at_unix_ms +| session.reap_ms;
     if (now_unix_ms < deadline_ms) return false;
-    logSessionRuntime(session_runtime, "event=reaped id={s} detached_at_ms={} reap_ms={}", .{
+    logSessionRuntime(session_runtime, "event=reaped id={s} disconnected_at_ms={} reap_ms={}", .{
         session.idSlice(),
-        session.detached_at_unix_ms,
+        session.disconnected_at_unix_ms,
         session.reap_ms,
     });
     endSession(session_runtime, 3, .{ .ended_at_unix_ms = now_unix_ms });
@@ -1502,7 +1509,7 @@ fn endReapedSessions(session_runtime: *SessionRuntime, now_unix_ms: u64) bool {
 fn sessionReapEnabled(session: *const Session) bool {
     return session.alive and
         !session.attached and
-        session.detached_at_unix_ms != 0 and
+        session.disconnected_at_unix_ms != 0 and
         session.reap_ms != 0;
 }
 
@@ -1511,7 +1518,7 @@ test "remote session runtime poll timeout includes reap deadline" {
     session_runtime.session = .{
         .alive = true,
         .attached = false,
-        .detached_at_unix_ms = 1_000,
+        .disconnected_at_unix_ms = 1_000,
         .reap_ms = 5_000,
     };
 
@@ -1521,6 +1528,16 @@ test "remote session runtime poll timeout includes reap deadline" {
 
     session_runtime.session.attached = true;
     try std.testing.expectEqual(@as(i32, -1), sessionRuntimePollTimeoutMs(&session_runtime, 0, 6_000));
+}
+
+test "remote session runtime poll timeout wakes to reap pty hangup" {
+    var session_runtime = SessionRuntime{};
+    session_runtime.session = .{
+        .alive = true,
+        .pty_closed_for_hangup = true,
+    };
+
+    try std.testing.expectEqual(@as(i32, pty_hangup_reap_poll_ms), sessionRuntimePollTimeoutMs(&session_runtime, 0, 0));
 }
 
 fn flushExpiredSynchronizedOutputSessions(session_runtime: *SessionRuntime, now_ms: i64) void {
@@ -1555,7 +1572,7 @@ fn handleShutdownSignalEvent(session_runtime: *SessionRuntime, shutdown_signal_f
 
 fn handleAttachedClientEvents(session_runtime: *SessionRuntime, revents: i16) void {
     if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     }
     if ((revents & posix.POLL.OUT) != 0) {
@@ -1844,7 +1861,7 @@ fn flushAttachedClientOutput(session_runtime: *SessionRuntime) void {
 
     while (attached_client.output_offset < attached_client.output.items.len) {
         const result = io.writeSomeNonBlocking(attached_client.fd, attached_client.output.items[attached_client.output_offset..]) catch {
-            detachAttachedClient(session_runtime);
+            disconnectAttachedClient(session_runtime);
             return;
         };
         switch (result) {
@@ -1860,7 +1877,7 @@ fn flushAttachedClientOutput(session_runtime: *SessionRuntime) void {
         attached_client.output.clearRetainingCapacity();
         attached_client.output_offset = 0;
         if (attached_client.close_after_flush) {
-            detachAttachedClient(session_runtime);
+            disconnectAttachedClient(session_runtime);
         }
     }
 }
@@ -1882,7 +1899,7 @@ fn handleSessionClientDebugSeverConnectionRequest(session_runtime: *SessionRunti
         try sendError(session_runtime, fd, "NO_ATTACHED_CLIENTS", "no attached clients", "");
         return;
     }
-    detachAttachedClient(session_runtime);
+    disconnectAttachedClient(session_runtime);
     try sendClientControlResponse(fd);
 }
 
@@ -1957,7 +1974,7 @@ fn queueTtyTranscriptChunkForSession(
     if (!attached_client.active) return;
     if (attached_client.close_after_flush or !attached_client.capture_tty_transcript) return;
     queueTtyTranscriptChunk(attached_client, stream, bytes) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
     };
 }
 
@@ -2840,7 +2857,7 @@ fn attachSession(
     capture_tty_transcript: bool,
 ) !void {
     const session = &session_runtime.session;
-    detachAttachedClient(session_runtime);
+    disconnectAttachedClient(session_runtime);
 
     const attached_client = &session_runtime.attached_client;
     attached_client.* = .{
@@ -2976,7 +2993,7 @@ fn flushSessionRenderBarrier(session_runtime: *SessionRuntime, barrier: vt.Rende
     const attached_client = &session_runtime.attached_client;
     if (!attached_client.active or attached_client.close_after_flush) return;
     queueRenderBarrierDraw(attached_client, session, barrier, scrollback_cursor) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     };
     flushAttachedClientOutput(session_runtime);
@@ -3006,12 +3023,12 @@ fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
     if (!attached_client.active) return;
     const session = &session_runtime.session;
     if (!session.alive) {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     }
 
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), attached_client.fd) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     };
     defer frame.deinit(app_allocator.allocator());
@@ -3020,15 +3037,16 @@ fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
         .te_input => handleInputFrame(session_runtime, frame.payload),
         .te_resize => handleResizeFrame(session_runtime, frame.payload),
         .te_repaint_request => handleRepaintFrame(session_runtime, frame.payload),
+        .te_session_hangup_request => handleSessionHangupRequest(session_runtime, frame.payload),
         .ping, .pong => {
             _ = protocol.handleTransportControlFrame(frame.message_type, frame.payload, attached_client.fd) catch {
-                detachAttachedClient(session_runtime);
+                disconnectAttachedClient(session_runtime);
                 return;
             };
         },
         else => {
             queueAttachedClientError(session_runtime, attached_client, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
-                detachAttachedClient(session_runtime);
+                disconnectAttachedClient(session_runtime);
                 return;
             };
             closeAttachedClientAfterFlush(session_runtime);
@@ -3036,11 +3054,68 @@ fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
     }
 }
 
+fn handleSessionHangupRequest(session_runtime: *SessionRuntime, payload: []const u8) void {
+    var request = protocol.decodePayload(pb.TeSessionHangupRequest, app_allocator.allocator(), payload) catch {
+        disconnectAttachedClient(session_runtime);
+        return;
+    };
+    defer request.deinit(app_allocator.allocator());
+    requestSessionPtyHangup(session_runtime);
+}
+
+fn requestSessionPtyHangup(session_runtime: *SessionRuntime) void {
+    const session = &session_runtime.session;
+    if (!session.alive) {
+        disconnectAttachedClient(session_runtime);
+        return;
+    }
+
+    logSessionRuntime(session_runtime, "event=session_pty_hangup_request id={s} pid={} pty_fd={}", .{
+        session.idSlice(),
+        session.pid,
+        session.pty_fd,
+    });
+    disconnectAttachedClient(session_runtime);
+    if (session.pty_fd >= 0) {
+        _ = c.close(session.pty_fd);
+        session.pty_fd = -1;
+        session.pty_closed_for_hangup = true;
+        session.synchronized_output_since_ms = 0;
+    }
+    _ = reapPtyHangupSessionIfExited(session_runtime);
+}
+
+fn reapPtyHangupSessionIfExited(session_runtime: *SessionRuntime) bool {
+    const session = &session_runtime.session;
+    if (!session.alive or !session.pty_closed_for_hangup) return false;
+    if (session.pid <= 0) {
+        endSessionFromPtyClose(session_runtime);
+        return true;
+    }
+
+    var status: c_int = 0;
+    const result = c.waitpid(session.pid, &status, 1);
+    if (result == session.pid) {
+        endSession(session_runtime, session.end_reason, exitInfoFromWaitStatus(status));
+        return true;
+    }
+    if (result < 0) {
+        switch (posix.errno(result)) {
+            .INTR => return false,
+            else => {
+                endSessionFromPtyClose(session_runtime);
+                return true;
+            },
+        }
+    }
+    return false;
+}
+
 fn handleInputFrame(session_runtime: *SessionRuntime, payload: []const u8) void {
     const attached_client = &session_runtime.attached_client;
     const session = &session_runtime.session;
     var input = protocol.decodePayload(pb.TeInput, app_allocator.allocator(), payload) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     };
     defer input.deinit(app_allocator.allocator());
@@ -3050,12 +3125,12 @@ fn handleInputFrame(session_runtime: *SessionRuntime, payload: []const u8) void 
         const ack_payload = protocol.encodePayload(app_allocator.allocator(), pb.TeInputAck{
             .input_seq = input.input_seq,
         }) catch {
-            detachAttachedClient(session_runtime);
+            disconnectAttachedClient(session_runtime);
             return;
         };
         defer app_allocator.allocator().free(ack_payload);
         queueAttachedClientFrame(attached_client, .te_input_ack, ack_payload) catch {
-            detachAttachedClient(session_runtime);
+            disconnectAttachedClient(session_runtime);
             return;
         };
         flushAttachedClientOutput(session_runtime);
@@ -3068,19 +3143,19 @@ fn handleInputFrame(session_runtime: *SessionRuntime, payload: []const u8) void 
     var translated = std.ArrayList(u8).empty;
     defer translated.deinit(app_allocator.allocator());
     translateAttachedClientInput(attached_client, session, input.data, &translated) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     };
     if (translated.items.len == 0) return;
 
     queueTtyTranscriptChunk(attached_client, .TE_TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     };
     flushAttachedClientOutput(session_runtime);
 
     io.writeAll(session.pty_fd, translated.items) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     };
 }
@@ -3513,7 +3588,7 @@ fn handleResizeFrame(session_runtime: *SessionRuntime, payload: []const u8) void
     const attached_client = &session_runtime.attached_client;
     const session = &session_runtime.session;
     const resize = readResizePayload(payload) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     };
     const reset_for_screen_repaint = resize.repaint_request != null and
@@ -3530,7 +3605,7 @@ fn handleResizeFrame(session_runtime: *SessionRuntime, payload: []const u8) void
 
 fn handleRepaintFrame(session_runtime: *SessionRuntime, payload: []const u8) void {
     const request = readRepaintRequest(payload) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     };
     handleRepaintRequest(session_runtime, request);
@@ -3545,7 +3620,7 @@ fn handleRepaintRequest(session_runtime: *SessionRuntime, request: RepaintReques
         request.scrollback_cursor.?.per_epoch_cursor == 0 and
         request.initial_scrollback_rows == null;
     const screen_rows = queueRepaintSnapshot(attached_client, session, request, clear_for_replace) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     };
     model.markRendered(screen_rows);
@@ -3602,7 +3677,7 @@ fn broadcastSessionPatch(session_runtime: *SessionRuntime) void {
     if (attached_client.active and !attached_client.close_after_flush) {
         if (screen.retained_scrollback_clear_dirty) {
             queueRetainedScrollbackClearDraw(attached_client, session) catch {
-                detachAttachedClient(session_runtime);
+                disconnectAttachedClient(session_runtime);
                 return;
             };
         }
@@ -3616,7 +3691,7 @@ fn broadcastSessionPatch(session_runtime: *SessionRuntime) void {
                 materialize_screen_after_scrollback,
                 scrollback.absolute_count,
             ) catch {
-                detachAttachedClient(session_runtime);
+                disconnectAttachedClient(session_runtime);
                 return;
             };
         } else if (should_send_screen_draw) {
@@ -3629,7 +3704,7 @@ fn broadcastSessionPatch(session_runtime: *SessionRuntime) void {
                 materialize_screen_after_scrollback,
                 scrollback.absolute_count,
             ) catch {
-                detachAttachedClient(session_runtime);
+                disconnectAttachedClient(session_runtime);
                 return;
             };
         }
@@ -3660,18 +3735,18 @@ fn sendSessionEndedToAttachedClient(session_runtime: *SessionRuntime, reason: u8
     const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
     sendSessionEnded(attached_client, reason, exit_info) catch {
-        detachAttachedClient(session_runtime);
+        disconnectAttachedClient(session_runtime);
         return;
     };
     closeAttachedClientAfterFlush(session_runtime);
 }
 
-fn detachAttachedClient(session_runtime: *SessionRuntime) void {
+fn disconnectAttachedClient(session_runtime: *SessionRuntime) void {
     const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
 
     const session = &session_runtime.session;
-    logSessionRuntime(session_runtime, "event=detach id={s} rows={} cols={}", .{ session.idSlice(), attached_client.rows, attached_client.cols });
+    logSessionRuntime(session_runtime, "event=attached_client_disconnected id={s} rows={} cols={}", .{ session.idSlice(), attached_client.rows, attached_client.cols });
     _ = c.close(attached_client.fd);
     attached_client.output.deinit(app_allocator.allocator());
     attached_client.* = AttachedClient{};
@@ -3696,9 +3771,9 @@ fn refreshAttachedFlag(session_runtime: *SessionRuntime) void {
     const was_attached = session.attached;
     session.attached = now_attached;
     if (now_attached) {
-        session.detached_at_unix_ms = 0;
-    } else if (was_attached or session.detached_at_unix_ms == 0) {
-        session.detached_at_unix_ms = nowUnixMs();
+        session.disconnected_at_unix_ms = 0;
+    } else if (was_attached or session.disconnected_at_unix_ms == 0) {
+        session.disconnected_at_unix_ms = nowUnixMs();
     }
 }
 
@@ -3756,13 +3831,13 @@ fn stopSessionRuntimeIfComplete(session_runtime: *SessionRuntime) void {
 }
 
 fn closeSessionRuntime(session_runtime: *SessionRuntime) void {
-    detachAttachedClient(session_runtime);
+    disconnectAttachedClient(session_runtime);
     endSession(session_runtime, 2, .{});
 }
 
 fn findSession(session_runtime: *SessionRuntime, id: []const u8) ?*Session {
     const session = &session_runtime.session;
-    if (session.alive and std.mem.eql(u8, session.idSlice(), id)) return session;
+    if (session.alive and !session.pty_closed_for_hangup and std.mem.eql(u8, session.idSlice(), id)) return session;
     return null;
 }
 

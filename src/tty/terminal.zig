@@ -58,7 +58,7 @@ var cached_probe_input_fd: c.fd_t = -1;
 var cached_probe_output_fd: c.fd_t = -1;
 
 pub const FilterEnd = enum {
-    detach,
+    disconnect,
     help,
     repaint,
 };
@@ -96,7 +96,7 @@ pub const EscapeFilter = struct {
         for (input, 0..) |byte, index| {
             if (self.pending_tilde) {
                 self.pending_tilde = false;
-                if (byte == '.') return .{ .bytes = out[0..written], .end = .detach };
+                if (byte == '.') return .{ .bytes = out[0..written], .end = .disconnect };
                 if (byte == 'p') return .{ .bytes = out[0..written], .end = .repaint };
                 if (byte == '?') return .{ .bytes = out[0..written], .end = .help };
                 if (byte == '~') {
@@ -130,7 +130,7 @@ test "EscapeFilter handles ssh line-start escapes" {
 
     var result = filter.filter("~.", &out);
     try std.testing.expectEqualStrings("", result.bytes);
-    try std.testing.expectEqual(FilterEnd.detach, result.end.?);
+    try std.testing.expectEqual(FilterEnd.disconnect, result.end.?);
 
     filter = .{};
     result = filter.filter("~p", &out);
@@ -165,7 +165,7 @@ test "EscapeFilter handles ssh line-start escapes" {
     filter = .{ .at_line_start = false };
     result = filter.filter("~.\n", &out);
     try std.testing.expectEqualStrings("", result.bytes);
-    try std.testing.expectEqual(FilterEnd.detach, result.end.?);
+    try std.testing.expectEqual(FilterEnd.disconnect, result.end.?);
 }
 
 /// Restores local tty mode even when the remote PTY leaves itself in raw/no-echo

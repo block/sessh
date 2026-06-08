@@ -467,7 +467,7 @@ fn writeAllMaybeCancellable(
             .revents = 0,
         }};
         const ready = try posix.poll(&pollfds, 50);
-        if (try reconnectShouldDetach(reconnect_ui.?, poll_reconnect_input)) return error.ReconnectDetached;
+        if (try reconnectShouldCancel(reconnect_ui.?, poll_reconnect_input)) return error.ReconnectCancelled;
         if (ready == 0) continue;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
         if ((pollfds[0].revents & posix.POLL.OUT) == 0) continue;
@@ -496,7 +496,7 @@ pub fn readBootstrapLine(
         }};
         const ready = try posix.poll(&pollfds, if (reconnect_ui == null) -1 else 50);
         if (reconnect_ui) |ui| {
-            if (try reconnectShouldDetach(ui, poll_reconnect_input)) return error.ReconnectDetached;
+            if (try reconnectShouldCancel(ui, poll_reconnect_input)) return error.ReconnectCancelled;
         }
         if (ready == 0) continue;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
@@ -520,9 +520,9 @@ pub fn readBootstrapLine(
     return error.BootstrapLineTooLong;
 }
 
-fn reconnectShouldDetach(reconnect_ui: *client_ui.ReconnectUi, poll_reconnect_input: bool) !bool {
+fn reconnectShouldCancel(reconnect_ui: *client_ui.ReconnectUi, poll_reconnect_input: bool) !bool {
     if (!poll_reconnect_input) return reconnect_ui.isCancelled();
-    return reconnect_ui.pollDetach(0);
+    return reconnect_ui.pollClientHangup(0);
 }
 
 test "readBootstrapLine returns the first line without the newline" {

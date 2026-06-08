@@ -4,6 +4,7 @@ const posix = std.posix;
 const app_allocator = @import("core/app_allocator.zig");
 const config = @import("core/config.zig");
 const daemon = @import("daemon/mod.zig");
+const daemon_client = @import("daemon/client.zig");
 const io = @import("core/io.zig");
 const process_exit = @import("core/process_exit.zig");
 const terminal = @import("tty/terminal.zig");
@@ -59,7 +60,7 @@ fn runMain() !void {
         return;
     }
 
-    try daemon.ensureStarted(allocator, args[0]);
+    try daemon_client.ensureStarted(allocator, args[0]);
     return transport_ssh.run(allocator, args);
 }
 
@@ -153,6 +154,7 @@ test {
     _ = @import("core/io.zig");
     _ = @import("core/process_exit.zig");
     _ = @import("core/shell.zig");
+    _ = @import("daemon/client.zig");
     _ = @import("daemon/mod.zig");
     _ = @import("protocol/mod.zig");
     _ = @import("reconnect/control.zig");

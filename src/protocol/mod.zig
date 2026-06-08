@@ -26,6 +26,7 @@ pub const MessageType = enum {
     te_session_client_control_response,
     te_session_client_debug_sever_connection_request,
     te_session_client_debug_unresponsive_connection_request,
+    te_session_hangup_request,
     ping,
     pong,
     mux_stream_frame,
@@ -34,6 +35,9 @@ pub const MessageType = enum {
     proxy_control_diagnostic,
     proxy_control_ctrl_r,
     te_stream_item,
+    client_te_transport_open,
+    client_te_transport_ready,
+    client_te_transport_diagnostic,
 };
 
 pub const frame_header_len = 4;
@@ -147,6 +151,9 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .mux_stream_frame => |message| ownedFrameFromMessage(allocator, .mux_stream_frame, message),
             .te_stream_item => |message| ownedFrameFromTeStreamItem(allocator, message),
             .proxy_stream_item => |message| ownedFrameFromProxyStreamItem(allocator, message),
+            .client_te_transport_open => |message| ownedFrameFromMessage(allocator, .client_te_transport_open, message),
+            .client_te_transport_ready => |message| ownedFrameFromMessage(allocator, .client_te_transport_ready, message),
+            .client_te_transport_diagnostic => |message| ownedFrameFromMessage(allocator, .client_te_transport_diagnostic, message),
         };
     }
 
@@ -190,6 +197,7 @@ fn ownedFrameFromTeStreamItem(allocator: std.mem.Allocator, item: pb.TeStreamIte
         .session_client_control_response => |message| ownedFrameFromMessage(allocator, .te_session_client_control_response, message),
         .debug_sever_connection_request => |message| ownedFrameFromMessage(allocator, .te_session_client_debug_sever_connection_request, message),
         .debug_unresponsive_connection_request => |message| ownedFrameFromMessage(allocator, .te_session_client_debug_unresponsive_connection_request, message),
+        .session_hangup_request => |message| ownedFrameFromMessage(allocator, .te_session_hangup_request, message),
     };
 }
 
@@ -290,6 +298,11 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .debug_unresponsive_connection_request = message } } } });
         },
+        .te_session_hangup_request => blk: {
+            var message = try decodePayload(pb.TeSessionHangupRequest, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .session_hangup_request = message } } } });
+        },
         .ping => blk: {
             var message = try decodePayload(pb.Ping, allocator, payload);
             defer message.deinit(allocator);
@@ -329,6 +342,21 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.TeStreamItem, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = message } });
+        },
+        .client_te_transport_open => blk: {
+            var message = try decodePayload(pb.ClientTeTransportOpen, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_te_transport_open = message } });
+        },
+        .client_te_transport_ready => blk: {
+            var message = try decodePayload(pb.ClientTeTransportReady, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_te_transport_ready = message } });
+        },
+        .client_te_transport_diagnostic => blk: {
+            var message = try decodePayload(pb.ClientTeTransportDiagnostic, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_te_transport_diagnostic = message } });
         },
     };
 }
