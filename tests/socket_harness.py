@@ -147,15 +147,59 @@ def sessh_version():
     raise AssertionError("could not find sessh version")
 
 
+def canonical_local_platform():
+    sysname = os.uname().sysname
+    machine = os.uname().machine
+    if sysname == "Darwin":
+        os_name = "macos"
+    elif sysname == "Linux":
+        os_name = "linux"
+    else:
+        raise AssertionError(f"unsupported test OS: {sysname}")
+
+    if machine in ("x86_64", "amd64"):
+        arch = "x86_64"
+    elif machine in ("i386", "i486", "i586", "i686"):
+        arch = "x86"
+    elif machine in ("arm", "armv6l", "armv7l", "armv8l"):
+        arch = "arm32"
+    elif machine in ("aarch64", "arm64"):
+        arch = "aarch64"
+    elif machine == "riscv64":
+        arch = "riscv64"
+    else:
+        raise AssertionError(f"unsupported test arch: {machine}")
+    return os_name, arch
+
+
+def daemon_namespace_executable():
+    path = BIN if BIN.is_absolute() else ROOT / BIN
+    if path.name == "sessh-dev":
+        return path
+    os_name, arch = canonical_local_platform()
+    wrapper_artifact = path.parent / ".." / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+    if wrapper_artifact.exists():
+        return wrapper_artifact
+    artifact = ROOT / "zig-out" / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+    if artifact.exists():
+        return artifact
+    return path
+
+
+def sessh_protocol_major():
+    for line in (ROOT / "src" / "core" / "config.zig").read_text().splitlines():
+        match = re.match(r"pub const protocol_major = ([0-9]+);", line)
+        if match:
+            return int(match.group(1))
+    raise AssertionError("could not find sessh protocol_major")
+
+
 def daemon_socket_dir_name():
     version = sessh_version()
-    parts = version.removesuffix("-dev").split(".")
-    if len(parts) < 1:
-        raise AssertionError(f"unexpected sessh version: {version}")
-    base = parts[0]
+    base = str(sessh_protocol_major())
     if not version.endswith("-dev"):
         return base
-    return f"{base}.dev.{hashlib.sha256(BIN.read_bytes()).hexdigest()[:8]}"
+    return f"{base}.dev.{hashlib.sha256(daemon_namespace_executable().read_bytes()).hexdigest()[:8]}"
 
 
 KITTY_KEYBOARD_QUERY = b"\x1b[?u"

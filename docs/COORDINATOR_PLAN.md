@@ -305,8 +305,8 @@ user has not typed recently.
 The coordinator needs a stable local socket for each compatible build
 namespace. Candidate runtime layout:
 
-- `<major>/sesshd.sock`: release namespace
-- `<major.dev.hash>/sesshd.sock`: dev namespace, with `hash` derived
+- `<protocol-major>/sesshd.sock`: release namespace
+- `<protocol-major.dev.hash>/sesshd.sock`: dev namespace, with `hash` derived
   from the executable
 
 All GUID-based socket names go away. The old `a/<compact-guid>` socket

@@ -4,7 +4,7 @@ const config = @import("../core/config.zig");
 const socket_transport = @import("../transport/socket.zig");
 
 pub fn defaultDirName(allocator: std.mem.Allocator) ![]u8 {
-    const base = try versionMajor(allocator, config.version);
+    const base = try std.fmt.allocPrint(allocator, "{d}", .{config.protocol_major});
     errdefer allocator.free(base);
 
     if (!std.mem.endsWith(u8, config.version, "-dev")) return base;
@@ -59,35 +59,28 @@ fn hashFile(path: []const u8) !Hash {
     return .{ .hex = std.fmt.bytesToHex(digest, .lower) };
 }
 
-fn versionMajor(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
-    const core = if (std.mem.endsWith(u8, version, "-dev")) version[0 .. version.len - "-dev".len] else version;
-    var parts = std.mem.splitScalar(u8, core, '.');
-    const major = parts.next() orelse return error.InvalidVersion;
-    if (major.len == 0) return error.InvalidVersion;
-    try validateNumeric(major);
-    return allocator.dupe(u8, major);
-}
+test "daemon socket namespace uses protocol major" {
+    const allocator = std.testing.allocator;
+    const dir_name = try defaultDirName(allocator);
+    defer allocator.free(dir_name);
 
-fn validateNumeric(value: []const u8) !void {
-    for (value) |byte| {
-        if (byte < '0' or byte > '9') return error.InvalidVersion;
+    const expected_prefix = try std.fmt.allocPrint(allocator, "{d}", .{config.protocol_major});
+    defer allocator.free(expected_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, dir_name, expected_prefix));
+    if (std.mem.endsWith(u8, config.version, "-dev")) {
+        try std.testing.expect(std.mem.startsWith(u8, dir_name[expected_prefix.len..], ".dev."));
+    } else {
+        try std.testing.expectEqualStrings(expected_prefix, dir_name);
     }
 }
 
-test "version namespace uses major only" {
+test "daemon socket path is protocol scoped" {
     const allocator = std.testing.allocator;
-    const release = try versionMajor(allocator, "1.2.3");
-    defer allocator.free(release);
-    try std.testing.expectEqualStrings("1", release);
-
-    const dev = try versionMajor(allocator, "1.2.3-dev");
-    defer allocator.free(dev);
-    try std.testing.expectEqualStrings("1", dev);
-}
-
-test "daemon socket path is version scoped" {
-    const allocator = std.testing.allocator;
-    const path = try socketPath(allocator, "1.dev.abcdef12");
+    const dir_name = try std.fmt.allocPrint(allocator, "{d}.dev.abcdef12", .{config.protocol_major});
+    defer allocator.free(dir_name);
+    const path = try socketPath(allocator, dir_name);
     defer allocator.free(path);
-    try std.testing.expect(std.mem.endsWith(u8, path, "/1.dev.abcdef12/sesshd.sock"));
+    const suffix = try std.fmt.allocPrint(allocator, "/{s}/sesshd.sock", .{dir_name});
+    defer allocator.free(suffix);
+    try std.testing.expect(std.mem.endsWith(u8, path, suffix));
 }

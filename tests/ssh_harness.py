@@ -1057,6 +1057,11 @@ def local_artifact():
 def remote_path_artifact():
     if BIN.name == "sessh-dev":
         return BIN if BIN.is_absolute() else ROOT / BIN
+    path = BIN if BIN.is_absolute() else ROOT / BIN
+    os_name, arch = canonical_local_platform()
+    wrapper_artifact = path.parent / ".." / "libexec" / "sessh" / f"sessh-{os_name}-{arch}"
+    if wrapper_artifact.exists():
+        return wrapper_artifact
     return local_artifact()
 
 
@@ -1081,12 +1086,17 @@ def sessh_version():
     raise AssertionError("could not find sessh version")
 
 
+def sessh_protocol_major():
+    for line in (ROOT / "src" / "core" / "config.zig").read_text().splitlines():
+        match = re.match(r"pub const protocol_major = ([0-9]+);", line)
+        if match:
+            return int(match.group(1))
+    raise AssertionError("could not find sessh protocol_major")
+
+
 def daemon_socket_dir_name():
     version = sessh_version()
-    parts = version.removesuffix("-dev").split(".")
-    if len(parts) < 1:
-        raise AssertionError(f"unexpected sessh version: {version}")
-    base = parts[0]
+    base = str(sessh_protocol_major())
     if not version.endswith("-dev"):
         return base
     return f"{base}.dev.{hashlib.sha256(remote_path_artifact().read_bytes()).hexdigest()[:8]}"

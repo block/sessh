@@ -14,8 +14,8 @@ If `XDG_RUNTIME_DIR` is missing, sessh falls back to `/tmp/sessh-<uid>`.
 The local daemon socket is scoped by compatibility namespace:
 
 ```text
-<major>/sesshd.sock
-<major.dev.hash>/sesshd.sock
+<protocol-major>/sesshd.sock
+<protocol-major.dev.hash>/sesshd.sock
 ```
 
 Runtime GUID directories live under `guid/<s-guid>/` for terminal-emulator

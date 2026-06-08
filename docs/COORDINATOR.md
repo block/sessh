@@ -8,8 +8,8 @@ cleanup owner.
 There is one local Unix-domain socket per compatible build namespace:
 
 ```text
-<major>/sesshd.sock
-<major.dev.hash>/sesshd.sock
+<protocol-major>/sesshd.sock
+<protocol-major.dev.hash>/sesshd.sock
 ```
 
 Public `sessh` invocations connect to that socket, starting the daemon when it
