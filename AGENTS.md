@@ -13,6 +13,7 @@ scripts/check --fast
 Also run the specific tests that cover the code paths you changed. Do not run
 `scripts/check` with `--ci` or `--full` unless the user asks for it. If
 `--ci`/`--full` seems warranted, tell the user why and ask before running it.
+If you just changed comments, don't re-run tests.
 
 ## Docs
 

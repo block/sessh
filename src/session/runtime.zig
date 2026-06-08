@@ -1297,6 +1297,12 @@ fn unregisterRuntime(control: *RuntimeControl) void {
     }
 }
 
+pub fn activeRuntimeCount() usize {
+    runtime_registry_mutex.lock();
+    defer runtime_registry_mutex.unlock();
+    return runtime_registry.items.len;
+}
+
 fn lookupRuntime(guid: []const u8) ?*RuntimeControl {
     runtime_registry_mutex.lock();
     defer runtime_registry_mutex.unlock();

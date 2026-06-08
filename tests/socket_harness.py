@@ -1085,6 +1085,7 @@ def run_daemon_ping_test(env):
         stderr=subprocess.PIPE,
     )
     daemon_socket_path = socket_path(env)
+    daemon_exited = False
     try:
         wait_file(daemon_socket_path)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -1097,14 +1098,76 @@ def run_daemon_ping_test(env):
                 raise AssertionError(f"expected PONG from sesshd, got {message_type}")
             pong = sessh_pb().Pong()
             pong.ParseFromString(payload)
-    finally:
-        proc.terminate()
+
         try:
-            proc.wait(timeout=5.0)
+            returncode = proc.wait(timeout=5.0)
+            daemon_exited = True
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5.0)
+            raise AssertionError("sesshd did not exit after becoming idle")
+        if returncode != 0:
+            stderr = proc.stderr.read().decode("utf-8", "replace")
+            raise AssertionError(f"sesshd exited with {returncode}: {stderr}")
+        wait_missing(daemon_socket_path)
+    finally:
+        if not daemon_exited and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
         cleanup_runtime(env)
+
+
+def run_daemon_concurrent_start_test(_base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-daemon-race-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        cleanup_runtime(env)
+        procs = []
+        daemon_socket_path = socket_path(env)
+        try:
+            for _ in range(6):
+                procs.append(
+                    subprocess.Popen(
+                        [str(BIN), ":internal-daemon:"],
+                        cwd=ROOT,
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                )
+
+            wait_file(daemon_socket_path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5.0)
+                sock.connect(str(daemon_socket_path))
+                send_hello(sock)
+                send_frame(sock, PING, sessh_pb().Ping().SerializeToString())
+                message_type, _payload = recv_frame(sock)
+                if message_type != PONG:
+                    raise AssertionError(f"expected PONG from sesshd, got {message_type}")
+
+            for proc in procs:
+                try:
+                    proc.wait(timeout=6.0)
+                except subprocess.TimeoutExpired:
+                    raise AssertionError("concurrent sesshd contender did not exit")
+
+            if not any(proc.returncode == 0 for proc in procs):
+                diagnostics = [proc.stderr.read().decode("utf-8", "replace") for proc in procs]
+                raise AssertionError(f"no daemon contender exited cleanly: {diagnostics!r}")
+            wait_missing(daemon_socket_path)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2.0)
+            cleanup_runtime(env)
 
 
 def run_daemon_log_test(_base_env):
@@ -2771,6 +2834,7 @@ def main():
 
             run_login_shell_profile_test(env)
             run_daemon_ping_test(env)
+            run_daemon_concurrent_start_test(env)
             run_daemon_log_test(env)
             run_session_create_command_argv_test(env)
             run_session_create_shell_command_test(env)

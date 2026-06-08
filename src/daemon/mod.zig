@@ -8,6 +8,7 @@ const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const session_daemon_handler = @import("../session/daemon_handler.zig");
+const session_runtime = @import("../session/runtime.zig");
 const daemon_log = @import("log.zig");
 const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
@@ -16,6 +17,16 @@ const transport_ssh = @import("../transport/ssh.zig");
 
 const hpb = protocol.hpb;
 const pb = protocol.pb;
+
+const daemon_idle_check_ms: u64 = 250;
+const daemon_idle_shutdown_ms: u64 = 1_000;
+const daemon_start_attempts: usize = 100;
+const daemon_start_sleep_ms: u64 = 20;
+const daemon_spawn_every_attempts: usize = 10;
+const daemon_lock_attempts: usize = 100;
+const daemon_lock_sleep_ms: u64 = 20;
+
+var active_client_threads: std.atomic.Value(usize) = .init(0);
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
     const dir_name = try socket_namespace.defaultDirName(allocator);
@@ -65,6 +76,18 @@ pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args
 fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
     if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
 
+    var attempts: usize = 0;
+    while (attempts < daemon_start_attempts) : (attempts += 1) {
+        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
+        if (attempts % daemon_spawn_every_attempts == 0) {
+            try spawnDaemon(allocator, exe, dir_name);
+        }
+        io.sleepMillis(daemon_start_sleep_ms);
+    }
+    return error.DaemonDidNotStart;
+}
+
+fn spawnDaemon(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !void {
     const argv = [_][]const u8{ exe, ":internal-daemon:", dir_name };
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
@@ -72,13 +95,6 @@ fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_n
     child.stderr_behavior = .Ignore;
     child.pgid = 0;
     try child.spawn();
-
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
-        io.sleepMillis(20);
-    }
-    return error.DaemonDidNotStart;
 }
 
 fn connectForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
@@ -168,13 +184,12 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     const path = try socketPathForDirName(allocator, dir_name);
     defer allocator.free(path);
 
-    if (socket_transport.connectSocket(path)) |fd| {
-        _ = c.close(fd);
-        return error.DaemonAlreadyRunning;
-    } else |_| {}
+    var daemon_lock = try acquireDaemonSocketLock(allocator, dir_name, path);
+    defer daemon_lock.deinit();
 
     const listen_fd = try socket_transport.listenSocket(path);
     defer _ = c.close(listen_fd);
+    defer std.fs.deleteFileAbsolute(path) catch {};
     daemon_log.infof(allocator, "daemon started socket={s}", .{path});
 
     var daemon_dispatcher = try dispatcher.Dispatcher.init(allocator);
@@ -185,9 +200,17 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
         .exe = daemon_exe,
         .listen_fd = listen_fd,
     };
+    var idle_context = DaemonIdleContext{
+        .allocator = allocator,
+        .last_live_work_ms = daemon_dispatcher.nowMs(),
+    };
     _ = try daemon_dispatcher.watchFd(listen_fd, .{ .readable = true }, .{
         .ctx = &accept_context,
         .callback = acceptDaemonClient,
+    });
+    _ = try daemon_dispatcher.watchTimerAfter(daemon_idle_check_ms, .{
+        .ctx = &idle_context,
+        .callback = checkDaemonIdle,
     });
     try daemon_dispatcher.run();
 }
@@ -226,7 +249,9 @@ fn acceptDaemonClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher
         .exe = accept_context.exe,
         .fd = client_fd,
     };
+    _ = active_client_threads.fetchAdd(1, .acq_rel);
     const thread = std.Thread.spawn(.{}, clientThread, .{context}) catch {
+        _ = active_client_threads.fetchSub(1, .acq_rel);
         accept_context.allocator.destroy(context);
         _ = c.close(client_fd);
         return;
@@ -246,7 +271,98 @@ fn clientThread(context: *ClientContext) void {
     const fd = context.fd;
     defer allocator.destroy(context);
     defer _ = c.close(fd);
+    defer _ = active_client_threads.fetchSub(1, .acq_rel);
     handleClient(allocator, exe, fd) catch {};
+}
+
+const DaemonIdleContext = struct {
+    allocator: std.mem.Allocator,
+    last_live_work_ms: u64,
+};
+
+fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+    _ = id;
+    const idle_context: *DaemonIdleContext = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .timer => {},
+        .fd => return error.UnexpectedDaemonFdEvent,
+    }
+
+    const now_ms = daemon_dispatcher.nowMs();
+    if (daemonHasLiveWork()) {
+        idle_context.last_live_work_ms = now_ms;
+    } else if (now_ms -| idle_context.last_live_work_ms >= daemon_idle_shutdown_ms) {
+        daemon_log.infof(idle_context.allocator, "daemon idle; shutting down", .{});
+        daemon_dispatcher.stop();
+        return;
+    }
+
+    _ = try daemon_dispatcher.watchTimerAfter(daemon_idle_check_ms, .{
+        .ctx = idle_context,
+        .callback = checkDaemonIdle,
+    });
+}
+
+fn daemonHasLiveWork() bool {
+    return active_client_threads.load(.acquire) != 0 or
+        session_runtime.activeRuntimeCount() != 0 or
+        stream_runtime.activeProxyRuntimeCount() != 0;
+}
+
+const DaemonSocketLock = struct {
+    file: std.fs.File,
+
+    fn deinit(self: *DaemonSocketLock) void {
+        std.posix.flock(self.file.handle, std.posix.LOCK.UN) catch {};
+        self.file.close();
+        self.* = undefined;
+    }
+};
+
+// The lock file, not the socket path, serializes daemon ownership. A Unix
+// socket pathname can briefly be stale, absent, or connected to a daemon that is
+// already exiting; the lock gives startup and shutdown one shared ordering point.
+fn acquireDaemonSocketLock(allocator: std.mem.Allocator, dir_name: []const u8, socket_path: []const u8) !DaemonSocketLock {
+    try socket_transport.ensureSocketDir(allocator, socket_path);
+
+    var attempts: usize = 0;
+    while (attempts < daemon_lock_attempts) : (attempts += 1) {
+        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| {
+            _ = c.close(fd);
+            return error.DaemonAlreadyRunning;
+        } else |_| {}
+
+        if (tryAcquireDaemonSocketLock(allocator, socket_path)) |lock| return lock else |err| switch (err) {
+            error.DaemonLockBusy => {},
+            else => return err,
+        }
+        io.sleepMillis(daemon_lock_sleep_ms);
+    }
+    return error.DaemonLockBusy;
+}
+
+fn tryAcquireDaemonSocketLock(allocator: std.mem.Allocator, socket_path: []const u8) !DaemonSocketLock {
+    const lock_path = try daemonSocketLockPath(allocator, socket_path);
+    defer allocator.free(lock_path);
+
+    var file = try std.fs.createFileAbsolute(lock_path, .{
+        .read = true,
+        .truncate = false,
+        .mode = 0o600,
+    });
+    errdefer file.close();
+    try socket_transport.setCloseOnExec(file.handle);
+
+    std.posix.flock(file.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) catch |err| switch (err) {
+        error.WouldBlock => return error.DaemonLockBusy,
+        else => return err,
+    };
+    return .{ .file = file };
+}
+
+fn daemonSocketLockPath(allocator: std.mem.Allocator, socket_path: []const u8) ![]u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, socket_path, '/') orelse return error.InvalidDaemonSocketPath;
+    return std.fmt.allocPrint(allocator, "{s}/sesshd.lock", .{socket_path[0..slash]});
 }
 
 fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void {

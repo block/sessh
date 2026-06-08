@@ -141,7 +141,7 @@ pub fn setCloseOnExec(fd: c.fd_t) !void {
     if (c.fcntl(fd, c.F.SETFD, flags | close_on_exec_flag) < 0) return error.FcntlFailed;
 }
 
-fn ensureSocketDir(allocator: std.mem.Allocator, socket_path: []const u8) !void {
+pub fn ensureSocketDir(allocator: std.mem.Allocator, socket_path: []const u8) !void {
     const slash = std.mem.lastIndexOfScalar(u8, socket_path, '/') orelse return;
     const dir = socket_path[0..slash];
     if (std.mem.lastIndexOfScalar(u8, dir, '/')) |parent_slash| {

@@ -1782,6 +1782,12 @@ fn unregisterProxyRuntime(control: *ProxyRuntimeControl) void {
     }
 }
 
+pub fn activeProxyRuntimeCount() usize {
+    proxy_runtime_registry_mutex.lock();
+    defer proxy_runtime_registry_mutex.unlock();
+    return proxy_runtime_registry.items.len;
+}
+
 fn lookupProxyRuntime(guid: []const u8) ?*ProxyRuntimeControl {
     proxy_runtime_registry_mutex.lock();
     defer proxy_runtime_registry_mutex.unlock();
