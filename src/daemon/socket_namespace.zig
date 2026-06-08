@@ -3,6 +3,12 @@ const std = @import("std");
 const config = @import("../core/config.zig");
 const socket_transport = @import("../transport/socket.zig");
 
+pub const daemon_executable_name = "sesshd";
+pub const broker_executable_name = "sessh-broker";
+pub const proxy_executable_name = "sessh-proxy";
+pub const socket_filename = "sesshd.sock";
+pub const lock_filename = "sesshd.lock";
+
 pub fn defaultDirName(allocator: std.mem.Allocator) ![]u8 {
     const base = try std.fmt.allocPrint(allocator, "{d}", .{config.protocol_major});
     errdefer allocator.free(base);
@@ -20,10 +26,29 @@ pub fn defaultDirName(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn socketPath(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
+    const dir = try dirPath(allocator, dir_name);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, socket_filename });
+}
+
+pub fn dirPath(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
     try validateDirName(dir_name);
     const root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(root);
-    return std.fmt.allocPrint(allocator, "{s}/{s}/sesshd.sock", .{ root, dir_name });
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, dir_name });
+}
+
+pub fn executablePath(allocator: std.mem.Allocator, dir_name: []const u8, name: []const u8) ![]u8 {
+    try validateExecutableName(name);
+    const dir = try dirPath(allocator, dir_name);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
+}
+
+pub fn lockPath(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
+    const dir = try dirPath(allocator, dir_name);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, lock_filename });
 }
 
 pub fn validateDirName(dir_name: []const u8) !void {
@@ -34,6 +59,16 @@ pub fn validateDirName(dir_name: []const u8) !void {
             else => return error.InvalidDaemonSocketDir,
         }
     }
+}
+
+fn validateExecutableName(name: []const u8) !void {
+    if (std.mem.eql(u8, name, daemon_executable_name) or
+        std.mem.eql(u8, name, broker_executable_name) or
+        std.mem.eql(u8, name, proxy_executable_name))
+    {
+        return;
+    }
+    return error.InvalidDaemonExecutableName;
 }
 
 const Hash = struct {

@@ -2838,7 +2838,6 @@ def main():
             if short_help_text.returncode != 0 or short_help_text.stdout != help_text.stdout:
                 raise AssertionError(short_help_text)
             sessh_wrapper = ROOT / "zig-out" / "bin" / "sessh"
-            sesshd_wrapper = ROOT / "zig-out" / "bin" / "sesshd"
             release_artifact_dir = ROOT / "zig-out" / "libexec" / "sessh"
             if sessh_wrapper.exists() and release_artifact_dir.exists() and any(release_artifact_dir.glob("*/sessh")):
                 sessh_help = subprocess.run(
@@ -2880,41 +2879,38 @@ def main():
                 )
                 if sessh_short_version_text.returncode != 0 or sessh_short_version_text.stdout != f"sessh {sessh_version()}\n":
                     raise AssertionError(sessh_short_version_text)
-                sesshd_artifact = platform_wrapper_executable(sesshd_wrapper, "sesshd")
-                if not sesshd_artifact.is_symlink() or os.readlink(sesshd_artifact) != "sessh":
-                    raise AssertionError(f"{sesshd_artifact} is not a relative sesshd -> sessh symlink")
-                for wrapper, expected_name in ((sessh_wrapper, "sessh"), (sesshd_wrapper, "sesshd")):
-                    if not wrapper.exists():
-                        continue
-                    expected_socket = runtime_root(env) / daemon_socket_dir_name_for_executable(
-                        platform_wrapper_executable(wrapper, expected_name)
-                    ) / "sesshd.sock"
+                sessh_artifact = platform_wrapper_executable(sessh_wrapper, "sessh").resolve(strict=False)
+                expected_socket = runtime_root(env) / daemon_socket_dir_name_for_executable(sessh_artifact) / "sesshd.sock"
+                cleanup_runtime(env)
+                proc = subprocess.Popen(
+                    [str(sessh_wrapper), ":internal-daemon:"],
+                    cwd=ROOT,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                try:
+                    wait_file(expected_socket)
+                    for role_name in ("sesshd", "sessh-broker", "sessh-proxy"):
+                        role_path = runtime_root(env) / daemon_socket_dir_name_for_executable(sessh_artifact) / role_name
+                        if not role_path.is_symlink() or Path(os.readlink(role_path)) != sessh_artifact:
+                            raise AssertionError(f"{role_path} is not a symlink to {sessh_artifact}")
+                    actual_name = process_command_basename(proc.pid)
+                    if actual_name != "sesshd":
+                        raise AssertionError(f"{sessh_wrapper} daemon exec name was {actual_name!r}, expected 'sesshd'")
+                    proc.wait(timeout=5.0)
+                    if proc.returncode != 0:
+                        raise AssertionError(proc.stderr.read().decode("utf-8", "replace"))
+                finally:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=2.0)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=2.0)
                     cleanup_runtime(env)
-                    proc = subprocess.Popen(
-                        [str(wrapper), ":internal-daemon:"] if expected_name == "sessh" else [str(wrapper)],
-                        cwd=ROOT,
-                        env=env,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                    try:
-                        wait_file(expected_socket)
-                        actual_name = process_command_basename(proc.pid)
-                        if actual_name != expected_name:
-                            raise AssertionError(f"{wrapper} exec name was {actual_name!r}, expected {expected_name!r}")
-                        proc.wait(timeout=5.0)
-                        if proc.returncode != 0:
-                            raise AssertionError(proc.stderr.read().decode("utf-8", "replace"))
-                    finally:
-                        if proc.poll() is None:
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=2.0)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                                proc.wait(timeout=2.0)
-                        cleanup_runtime(env)
                 cleanup_runtime(env)
                 log_proc = subprocess.Popen(
                     [str(sessh_wrapper), "--daemon-log"],
@@ -2926,9 +2922,14 @@ def main():
                 )
                 try:
                     read_until_pipe(log_proc.stdout, b"daemon log subscribed")
-                    daemon_command = wait_process_command_containing(str(sesshd_artifact))
+                    daemon_path = runtime_root(env) / daemon_socket_dir_name_for_executable(sessh_artifact) / "sesshd"
+                    daemon_command = wait_process_command_containing(str(daemon_path))
                     if Path(daemon_command.split()[0]).name != "sesshd":
                         raise AssertionError(f"auto-started daemon command was {daemon_command!r}")
+                    for role_name in ("sessh-broker", "sessh-proxy"):
+                        role_path = runtime_root(env) / daemon_socket_dir_name_for_executable(sessh_artifact) / role_name
+                        if not role_path.is_symlink() or Path(os.readlink(role_path)) != sessh_artifact:
+                            raise AssertionError(f"{role_path} is not a symlink to {sessh_artifact}")
                 finally:
                     if log_proc.poll() is None:
                         log_proc.terminate()

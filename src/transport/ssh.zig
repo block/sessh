@@ -12,6 +12,7 @@ const proxy_control = @import("../stream/proxy_control.zig");
 const sessh_cli = @import("../sessh/cli.zig");
 const config = @import("../core/config.zig");
 const daemon_client = @import("../daemon/client.zig");
+const daemon_executable = @import("../daemon/executable.zig");
 const daemon_log = @import("../daemon/log.zig");
 const daemon_socket_namespace = @import("../daemon/socket_namespace.zig");
 const frame_forwarder = @import("frame_forwarder.zig");
@@ -363,7 +364,7 @@ fn runRemoteNewSession(
             try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with proxy stream mode\n");
             return process_exit.request(64);
         }
-        try runProxyStreamSsh(allocator, exe, target, runtime_config.common, new);
+        try runProxyStreamSsh(allocator, target, runtime_config.common, new);
     }
 
     const shell_command = try shellCommandFromRemoteArgs(allocator, new.shell_command_args);
@@ -1300,7 +1301,6 @@ fn hasRemoteShellCommand(args: []const []const u8) bool {
 // opens a TCP connection to sshd on the remote machine.
 fn runProxyStreamSsh(
     allocator: std.mem.Allocator,
-    exe: []const u8,
     target: SshTarget,
     common: CommonSessionOptions,
     new: RemoteNewSession,
@@ -1329,10 +1329,14 @@ fn runProxyStreamSsh(
     defer if (client_socket_allocation) |allocation| {
         std.fs.deleteFileAbsolute(allocation.path) catch {};
     };
+    const daemon_dir_name = try daemon_socket_namespace.defaultDirName(allocator);
+    defer allocator.free(daemon_dir_name);
+    var runtime_executables = try daemon_executable.runtimeExecutablePaths(allocator, daemon_dir_name);
+    defer runtime_executables.deinit();
 
     const proxy_command_option = try proxyCommandOption(
         allocator,
-        exe,
+        runtime_executables.proxy,
         target.options,
         if (client_socket_allocation) |allocation| allocation.path else null,
         diagnostics_plan.command_level,
@@ -1493,7 +1497,6 @@ fn proxyCommandOption(
     defer command.deinit(allocator);
 
     try appendShellToken(allocator, &command, exe);
-    try appendShellToken(allocator, &command, ":internal-proxy-stream:");
     try appendShellToken(allocator, &command, "--host");
     // Use the original host token so the inner ssh sees the same Host block.
     // `%h` is already resolved to HostName and can lose alias-scoped options.
@@ -2122,10 +2125,11 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(shouldUseProxyStreamForTest(parsed, true));
 
-    const option = try proxyCommandOption(std.testing.allocator, "sessh-dev", parsed.invocation.ssh_options, "/tmp/sessh-test/c/abc", .hygienic, true, true);
+    const option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "/tmp/sessh-test/c/abc", .hygienic, true, true);
     defer std.testing.allocator.free(option);
 
-    try std.testing.expect(std.mem.indexOf(u8, option, ":internal-proxy-stream:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "sessh-proxy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, ":internal-proxy-stream:") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%n") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%p") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%r") != null);
@@ -2142,7 +2146,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "'-X'") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "'-tt'") == null);
 
-    const no_bootstrap_option = try proxyCommandOption(std.testing.allocator, "sessh-dev", parsed.invocation.ssh_options, null, .raw, false, false);
+    const no_bootstrap_option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .raw, false, false);
     defer std.testing.allocator.free(no_bootstrap_option);
     try std.testing.expect(std.mem.indexOf(u8, no_bootstrap_option, "--no-bootstrap") != null);
 }

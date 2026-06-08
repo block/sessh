@@ -57,15 +57,4 @@ if [ ! -x "$real" ]; then
   exit 127
 fi
 
-case "$(basename "$0")" in
-  sesshd)
-    daemon="$bindir/../libexec/sessh/$platform/sesshd"
-    if [ ! -x "$daemon" ]; then
-      printf 'sessh: missing platform binary: %s\n' "$daemon" >&2
-      exit 127
-    fi
-    exec "$daemon" :internal-daemon: "$@"
-    ;;
-esac
-
 exec "$real" "$@"

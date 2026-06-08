@@ -45,24 +45,29 @@ pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
 }
 
 pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
-    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
+    var spawned = false;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        if (!spawned) {
+            spawned = try spawnDaemonIfNamespaceUnlocked(allocator, exe, dir_name);
+        }
+        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
+        io.sleepMillis(20);
+    }
+    return error.DaemonDidNotStart;
+}
 
-    const daemon_exe = try daemon_executable.daemonPathFor(allocator, exe);
-    defer allocator.free(daemon_exe);
-    const argv = [_][]const u8{ daemon_exe, ":internal-daemon:", dir_name };
+fn spawnDaemonIfNamespaceUnlocked(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !bool {
+    var runtime_executables = (try daemon_executable.installRuntimeExecutablesForDaemonStart(allocator, exe, dir_name)) orelse return false;
+    defer runtime_executables.deinit();
+    const argv = [_][]const u8{ runtime_executables.daemon, dir_name };
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     child.pgid = 0;
     try child.spawn();
-
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
-        io.sleepMillis(20);
-    }
-    return error.DaemonDidNotStart;
+    return true;
 }
 
 pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {

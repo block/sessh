@@ -1,9 +1,9 @@
 # Coordinator
 
 `sesshd` is the durable per-user process behind `sessh`. It is the same binary
-as `sessh`, entered internally as `sessh :internal-daemon:`, but installed under
-a separate name so users can kill visible `sessh` clients without killing the
-cleanup owner.
+as `sessh`, but the daemon namespace contains a `sesshd` symlink beside the
+socket so users can kill visible `sessh` clients without killing the cleanup
+owner.
 
 There is one local Unix-domain socket per compatible build namespace:
 

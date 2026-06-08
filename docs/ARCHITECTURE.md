@@ -1,8 +1,8 @@
 # Architecture
 
 `sessh` is an ssh-shaped client with a per-user daemon named `sesshd`.
-The same installed binary can be invoked as either name; daemon mode itself is
-entered as `sessh :internal-daemon:`.
+The packaged artifact is still just `sessh`; runtime namespaces contain
+role-shaped symlinks such as `sesshd`, `sessh-broker`, and `sessh-proxy`.
 
 The visible `sessh` process parses ssh-compatible arguments, starts or connects
 to local `sesshd`, then chooses either the terminal-emulator path or the
@@ -24,7 +24,9 @@ and `sesshd` owns the durable byte-stream endpoint.
 
 ## Internal Modalities
 
-Special first arguments are internal entrypoints, not public commands:
+Special first arguments are compatibility entrypoints, not public commands.
+Steady-state internal processes usually enter by executable name through the
+runtime symlinks:
 
 - `:internal-daemon:`
 - `:internal-broker:`

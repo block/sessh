@@ -1106,22 +1106,6 @@ def remote_path_artifact():
     return local_artifact()
 
 
-def local_daemon_executable():
-    path = BIN if BIN.is_absolute() else ROOT / BIN
-    path = path.resolve(strict=False)
-    if path.name == "sessh-dev":
-        return path
-    if path.name == "sessh":
-        os_name, arch = canonical_local_platform()
-        wrapper_daemon = path.parent / ".." / "libexec" / "sessh" / f"{os_name}-{arch}" / "sesshd"
-        if wrapper_daemon.exists():
-            return wrapper_daemon.resolve(strict=False)
-        sibling = path.parent / "sesshd"
-        if sibling.exists():
-            return sibling.resolve(strict=False)
-    return path
-
-
 def command_executable(command):
     try:
         parts = shlex.split(command)
@@ -1135,8 +1119,12 @@ def command_executable(command):
     return exe.resolve(strict=False)
 
 
-def local_daemon_pids():
-    target = local_daemon_executable()
+def local_daemon_executable(env):
+    return daemon_socket_path(Path(env["XDG_RUNTIME_DIR"])).parent / "sesshd"
+
+
+def local_daemon_pids(env):
+    target = local_daemon_executable(env)
     result = subprocess.run(
         ["ps", "-axo", "pid=,command="],
         cwd=ROOT,
@@ -1150,7 +1138,7 @@ def local_daemon_pids():
     pids = []
     for line in result.stdout.splitlines():
         stripped = line.strip()
-        if not stripped or ":internal-daemon:" not in stripped:
+        if not stripped:
             continue
         pid_text, _, command = stripped.partition(" ")
         try:
@@ -1162,14 +1150,14 @@ def local_daemon_pids():
     return pids
 
 
-def wait_local_daemon_pids(timeout=5.0):
+def wait_local_daemon_pids(env, timeout=5.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        pids = local_daemon_pids()
+        pids = local_daemon_pids(env)
         if pids:
             return pids
         time.sleep(0.05)
-    raise AssertionError(f"timed out waiting for local daemon process {local_daemon_executable()}")
+    raise AssertionError(f"timed out waiting for local daemon process {local_daemon_executable(env)}")
 
 
 def artifact_cache_path(env, artifact):
@@ -1564,7 +1552,7 @@ def test_ssh_local_daemon_death_exits_with_error(tmp):
     daemon_pids = []
     try:
         stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
-        daemon_pids = wait_local_daemon_pids(timeout=5.0)
+        daemon_pids = wait_local_daemon_pids(env, timeout=5.0)
         for pid in daemon_pids:
             os.kill(pid, signal.SIGTERM)
         returncode = proc.wait(timeout=10.0)
@@ -1623,7 +1611,7 @@ def test_ssh_local_daemon_death_tty_error_starts_on_new_line(tmp):
     try:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         output = read_pty_until(fd, output, marker.encode("utf-8"), timeout=30.0)
-        daemon_pids = wait_local_daemon_pids(timeout=5.0)
+        daemon_pids = wait_local_daemon_pids(env, timeout=5.0)
         for daemon_pid in daemon_pids:
             os.kill(daemon_pid, signal.SIGTERM)
 
@@ -2032,7 +2020,7 @@ def test_ssh_x11_uses_proxy_stream(tmp):
         raise AssertionError(log_text)
     if "proxy_x11_option=-X" not in log_text:
         raise AssertionError(log_text)
-    if ":internal-proxy-stream:" not in log_text:
+    if "sessh-proxy" not in log_text:
         raise AssertionError(log_text)
     if "proxy_remote_command=echo hello" not in log_text:
         raise AssertionError(log_text)
@@ -2061,7 +2049,7 @@ def test_ssh_forwarding_uses_proxy_stream(tmp):
         raise AssertionError(log_text)
     if "proxy_forward_value=8080:localhost:80" not in log_text:
         raise AssertionError(log_text)
-    if ":internal-proxy-stream:" not in log_text:
+    if "sessh-proxy" not in log_text:
         raise AssertionError(log_text)
 
 
@@ -2082,7 +2070,7 @@ def test_ssh_filter_level_raw_uses_proxy_stream(tmp):
     log_text = fake_log.read_text()
     if "proxy_ssh=1" not in log_text:
         raise AssertionError(log_text)
-    if ":internal-proxy-stream:" not in log_text:
+    if "sessh-proxy" not in log_text:
         raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
@@ -2104,7 +2092,7 @@ def test_ssh_filter_level_config_uses_proxy_stream(tmp):
     log_text = fake_log.read_text()
     if "proxy_ssh=1" not in log_text:
         raise AssertionError(log_text)
-    if ":internal-proxy-stream:" not in log_text:
+    if "sessh-proxy" not in log_text:
         raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
@@ -2124,7 +2112,7 @@ def test_ssh_filter_level_cli_overrides_config(tmp):
     if result.returncode != 0:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "proxy_ssh=1" not in log_text or ":internal-proxy-stream:" not in log_text:
+    if "proxy_ssh=1" not in log_text or "sessh-proxy" not in log_text:
         raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
@@ -2150,7 +2138,7 @@ def test_ssh_remote_command_uses_proxy_stream(tmp):
     log_text = fake_log.read_text()
     if "proxy_ssh=1" not in log_text:
         raise AssertionError(log_text)
-    if ":internal-proxy-stream:" not in log_text:
+    if "sessh-proxy" not in log_text:
         raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)

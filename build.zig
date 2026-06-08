@@ -34,7 +34,6 @@ pub fn build(b: *std.Build) void {
     exe.step.dependOn(&protoc_step.step);
 
     const sessh_wrapper_step = installWrapper(b, "bin/sessh");
-    const sesshd_wrapper_step = installWrapper(b, "bin/sesshd");
 
     const run_step = b.step("run", "Run sessh");
     const run_cmd = b.addRunArtifact(exe);
@@ -48,7 +47,6 @@ pub fn build(b: *std.Build) void {
     });
     install_dev_step.dependOn(&install_dev.step);
     install_dev_step.dependOn(sessh_wrapper_step);
-    install_dev_step.dependOn(sesshd_wrapper_step);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -170,10 +168,6 @@ fn addArtifactsStep(b: *std.Build, protoc_step: *std.Build.Step) *std.Build.Step
             .dest_sub_path = b.fmt("libexec/sessh/{s}/sessh", .{artifact_target.platform_dir}),
         });
         artifacts_step.dependOn(&install.step);
-        const sesshd_path = b.getInstallPath(.prefix, b.fmt("libexec/sessh/{s}/sesshd", .{artifact_target.platform_dir}));
-        const link_daemon_name = b.addSystemCommand(&.{ "ln", "-sf", "sessh", sesshd_path });
-        link_daemon_name.step.dependOn(&install.step);
-        artifacts_step.dependOn(&link_daemon_name.step);
 
         manifest_run.addArg(artifact_target.filename);
         manifest_run.addFileArg(artifact.getEmittedBin());

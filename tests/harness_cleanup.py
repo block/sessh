@@ -103,9 +103,11 @@ def is_build_sessh_executable(resolved, expected_wrapper):
 
 
 def is_test_cached_sessh_command(resolved, command):
-    if (
+    command_name = command_basename(command)
+    if command_name not in ("sesshd", "sessh-broker", "sessh-proxy") and (
         ":internal-broker:" not in command
         and ":internal-daemon:" not in command
+        and ":internal-proxy-stream:" not in command
     ):
         return False
     parts = resolved.parts
@@ -119,6 +121,13 @@ def is_test_cached_sessh_command(resolved, command):
         if parts[index : index + 3] == ("cache", "sessh", "bin"):
             return True
     return False
+
+
+def command_basename(command):
+    exe = command_executable(command)
+    if exe is None:
+        return ""
+    return exe.name
 
 
 def command_executable(command):

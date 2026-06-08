@@ -36,14 +36,25 @@ fn runMain() !void {
     defer allocator.free(args);
     for (argv, 0..) |arg, i| args[i] = arg;
 
+    const exe_name = std.fs.path.basename(args[0]);
+    if (std.mem.eql(u8, exe_name, "sesshd")) {
+        return daemon.run(allocator, args[0], args[1..]);
+    }
+    if (std.mem.eql(u8, exe_name, "sessh-broker")) {
+        return daemon.forwardBrokerToDaemon(allocator, args[0], args[1..]);
+    }
+    if (std.mem.eql(u8, exe_name, "sessh-proxy")) {
+        return transport_ssh.runProxyStream(allocator, args[0], args[1..]);
+    }
+
     if (args.len == 1) return usage(0);
 
     if (std.mem.eql(u8, args[1], ":internal-daemon:")) {
-        return daemon.run(allocator, args[0], args[2..]);
+        return daemon.reexecDaemonOrRun(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-broker:")) {
-        return daemon.forwardBrokerToDaemon(allocator, args[0], args[2..]);
+        return daemon.reexecBrokerOrForward(allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-proxy-stream:")) {

@@ -62,7 +62,7 @@ fn ensureStartedForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_na
 
 pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     if (args.len > 1) {
-        try io.writeAll(2, "sessh: :internal-broker: accepts at most one daemon socket namespace\n");
+        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-broker: accepts at most one daemon socket namespace\n");
         return error.InvalidBrokerArgs;
     }
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.defaultDirName(allocator);
@@ -71,33 +71,58 @@ pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args
     try ensureStartedForDirName(allocator, exe, dir_name);
     const fd = try connectForDirName(allocator, dir_name);
     defer _ = c.close(fd);
-    try forwardBrokerFramesToDaemon(allocator, 0, 1, fd);
+    try forwardBrokerFramesToDaemon(allocator, std.posix.STDIN_FILENO, std.posix.STDOUT_FILENO, fd);
+}
+
+pub fn reexecBrokerOrForward(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+    if (args.len > 1) {
+        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-broker: accepts at most one daemon socket namespace\n");
+        return error.InvalidBrokerArgs;
+    }
+    const dir_name = if (args.len == 1) args[0] else try socket_namespace.defaultDirName(allocator);
+    defer if (args.len == 0) allocator.free(dir_name);
+
+    var runtime_executables = try daemon_executable.installRuntimeExecutablesOrUseNamespaceOwner(allocator, exe, dir_name);
+    defer runtime_executables.deinit();
+    return daemon_executable.reexec(allocator, runtime_executables.broker, args);
+}
+
+pub fn reexecDaemonOrRun(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+    if (args.len > 1) {
+        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-daemon: accepts at most one daemon socket namespace\n");
+        return error.InvalidDaemonArgs;
+    }
+    const dir_name = if (args.len == 1) args[0] else try socket_namespace.defaultDirName(allocator);
+    defer if (args.len == 0) allocator.free(dir_name);
+
+    var runtime_executables = try daemon_executable.installRuntimeExecutablesOrUseNamespaceOwner(allocator, exe, dir_name);
+    defer runtime_executables.deinit();
+    return daemon_executable.reexec(allocator, runtime_executables.daemon, args);
 }
 
 fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
-    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
-
     var attempts: usize = 0;
     while (attempts < daemon_start_attempts) : (attempts += 1) {
-        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
         if (attempts % daemon_spawn_every_attempts == 0) {
-            try spawnDaemon(allocator, exe, dir_name);
+            _ = try spawnDaemon(allocator, exe, dir_name);
         }
+        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
         io.sleepMillis(daemon_start_sleep_ms);
     }
     return error.DaemonDidNotStart;
 }
 
-fn spawnDaemon(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !void {
-    const daemon_exe = try daemon_executable.daemonPathFor(allocator, exe);
-    defer allocator.free(daemon_exe);
-    const argv = [_][]const u8{ daemon_exe, ":internal-daemon:", dir_name };
+fn spawnDaemon(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !bool {
+    var runtime_executables = (try daemon_executable.installRuntimeExecutablesForDaemonStart(allocator, exe, dir_name)) orelse return false;
+    defer runtime_executables.deinit();
+    const argv = [_][]const u8{ runtime_executables.daemon, dir_name };
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     child.pgid = 0;
     try child.spawn();
+    return true;
 }
 
 fn connectForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
@@ -174,13 +199,13 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     core_fds.closeInheritedNonStdioFileDescriptors();
 
     if (args.len > 1) {
-        try io.writeAll(2, "sessh: :internal-daemon: accepts at most one daemon socket namespace\n");
+        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-daemon: accepts at most one daemon socket namespace\n");
         return error.InvalidDaemonArgs;
     }
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.defaultDirName(allocator);
     defer if (args.len == 0) allocator.free(dir_name);
 
-    const daemon_exe = try allocator.dupe(u8, exe);
+    const daemon_exe = try socket_namespace.executablePath(allocator, dir_name, daemon_executable.daemon_name);
     defer allocator.free(daemon_exe);
 
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
@@ -189,6 +214,8 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 
     var daemon_lock = try acquireDaemonSocketLock(allocator, dir_name, path);
     defer daemon_lock.deinit();
+    var locked_runtime_executables = try daemon_executable.installRuntimeExecutablesWhileHoldingLock(allocator, exe, dir_name);
+    defer locked_runtime_executables.deinit();
 
     const listen_fd = try socket_transport.listenSocket(path);
     defer _ = c.close(listen_fd);
@@ -330,15 +357,16 @@ fn acquireDaemonSocketLock(allocator: std.mem.Allocator, dir_name: []const u8, s
 
     var attempts: usize = 0;
     while (attempts < daemon_lock_attempts) : (attempts += 1) {
+        if (tryAcquireDaemonSocketLock(allocator, socket_path)) |lock| return lock else |err| switch (err) {
+            error.DaemonLockBusy => {},
+            else => return err,
+        }
+
         if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| {
             _ = c.close(fd);
             return error.DaemonAlreadyRunning;
         } else |_| {}
 
-        if (tryAcquireDaemonSocketLock(allocator, socket_path)) |lock| return lock else |err| switch (err) {
-            error.DaemonLockBusy => {},
-            else => return err,
-        }
         io.sleepMillis(daemon_lock_sleep_ms);
     }
     return error.DaemonLockBusy;
