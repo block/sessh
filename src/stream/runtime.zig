@@ -12,7 +12,6 @@ const reconnect_control = @import("../reconnect/control.zig");
 const reconnect = @import("../reconnect/mod.zig");
 const reconnect_title = @import("../reconnect/title.zig");
 const session_registry = @import("../runtime/session_registry.zig");
-const session_attached_client = @import("../session/attached_client.zig");
 const terminal = @import("../tty/terminal.zig");
 const pb = protocol.pb;
 
@@ -245,7 +244,6 @@ const StreamAttachedClientOptions = struct {
     replacement_control: ?*ProxyRuntimeControl = null,
     close_outbound_on_inbound_eof: bool = false,
     reset_on_source_eof: bool = false,
-    perform_handshake: bool = false,
 };
 
 const StreamInputControl = struct {
@@ -377,9 +375,6 @@ const StreamAttachedClient = struct {
     ) !StreamAttachedClient {
         state.peer_ready = false;
         state.outbound.outbound_eof_sent = false;
-        if (options.perform_handshake) {
-            session_attached_client.runtimeHandshake(transport_read_fd, transport_write_fd) catch return error.StreamTransportClosed;
-        }
         sendResumeMessage(state, transport_write_fd) catch return error.StreamTransportClosed;
         const now_ms = nowMillis();
         return .{
@@ -1230,7 +1225,6 @@ pub fn runLocalStream(
                     .reconnect_status = &reconnect_status,
                     .control_fd = control_fd,
                     .control_input = &input_control,
-                    .perform_handshake = true,
                     // Once the remote side closes its output stream there is
                     // no peer left to consume local input, so close the local
                     // outbound side too.
@@ -1468,6 +1462,15 @@ fn handleFrame(
                 error.WriteFailed => return error.StreamTransportWriteFailed,
                 else => return err,
             };
+        },
+        .error_message => {
+            var message = try protocol.decodePayload(protocol.hpb.Error, state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            try io.stderrPrint("sessh: {s}\n", .{message.message});
+            if (message.hint) |hint| {
+                if (hint.len > 0) try io.stderrPrint("{s}\n", .{hint});
+            }
+            return error.StreamReset;
         },
         else => return error.StreamUnexpectedFrame,
     }

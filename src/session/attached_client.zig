@@ -898,18 +898,6 @@ test "reconnect waits for repaint response before returning" {
 
     next_repaint_request_seq = 77;
 
-    const hello_ok = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
-    defer app_allocator.allocator().free(hello_ok);
-    try protocol.sendFrame(remote_to_client[1], .hello_ok, hello_ok);
-
-    const hello_request = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloRequest{
-        .protocol_major = config.protocol_major,
-        .protocol_minor = config.protocol_minor,
-        .version = config.version,
-    });
-    defer app_allocator.allocator().free(hello_request);
-    try protocol.sendFrame(remote_to_client[1], .hello_request, hello_request);
-
     const session_attached = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionAttached{});
     defer app_allocator.allocator().free(session_attached);
     try protocol.sendFrame(remote_to_client[1], .te_session_attached, session_attached);
@@ -990,7 +978,6 @@ pub fn startNewSessionOnRuntime(
     reap_ms: u64,
     local_terminal: *LocalTerminalState,
 ) !RuntimeSession {
-    try runtimeHandshake(read_fd, write_fd);
     const repaint_request_seq = try sendSessionCreate(
         write_fd,
         local_terminal,
@@ -1026,23 +1013,6 @@ pub fn reconnectSessionOnRuntimeCancellable(
     try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, cancelled, false);
 }
 
-pub fn prepareReconnectRuntimeCancellable(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    cancelled: *const std.atomic.Value(bool),
-) !void {
-    _ = try runtimeHandshakeInner(read_fd, write_fd, cancelled);
-}
-
-pub fn attachPreparedReconnectRuntimeCancellable(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    session: *RuntimeSession,
-    cancelled: *const std.atomic.Value(bool),
-) !void {
-    try attachReconnectRuntimeInner(read_fd, write_fd, session, cancelled, false);
-}
-
 fn reconnectSessionOnRuntimeInner(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
@@ -1050,7 +1020,6 @@ fn reconnectSessionOnRuntimeInner(
     cancelled: ?*const std.atomic.Value(bool),
     wait_for_repaint: bool,
 ) !void {
-    _ = try runtimeHandshakeInner(read_fd, write_fd, cancelled);
     try attachReconnectRuntimeInner(read_fd, write_fd, session, cancelled, wait_for_repaint);
 }
 
@@ -1109,6 +1078,9 @@ fn finishReconnectRepaintInner(
             },
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
+            },
+            .client_te_transport_status => {
+                try handleClientTeTransportStatusFrame(frame.payload);
             },
             .client_te_transport_closed => return error.RemoteTransportClosed,
             .ping, .pong => {
@@ -1175,6 +1147,7 @@ pub fn drainLocalTransportDiagnostics(read_fd: c.fd_t, timeout_ms: u64) void {
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .client_te_transport_diagnostic => handleClientTeTransportDiagnosticFrame(frame.payload) catch return,
+            .client_te_transport_status => handleClientTeTransportStatusFrame(frame.payload) catch return,
             .client_te_transport_closed => return,
             .ping, .pong => {},
             else => return,
@@ -1329,6 +1302,14 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                     freeErrorPayload(parsed);
                     return error.RemoteDaemonDied;
                 }
+                if (std.mem.eql(u8, parsed.code, "UNSUPPORTED_REMOTE_PLATFORM")) {
+                    freeErrorPayload(parsed);
+                    return error.UnsupportedRemotePlatform;
+                }
+                if (transportExitCode(parsed.code)) |exit_code| {
+                    try printParsedError(parsed);
+                    return process_exit.request(exit_code);
+                }
                 try printParsedError(parsed);
                 return process_exit.request(1);
             },
@@ -1342,6 +1323,9 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
             },
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
+            },
+            .client_te_transport_status => {
+                try handleClientTeTransportStatusFrame(frame.payload);
             },
             .client_te_transport_closed => return error.RemoteTransportClosed,
             else => return error.UnexpectedFrame,
@@ -1385,6 +1369,14 @@ fn readSessionAttachedInner(
                     freeErrorPayload(parsed);
                     return error.RemoteDaemonDied;
                 }
+                if (std.mem.eql(u8, parsed.code, "UNSUPPORTED_REMOTE_PLATFORM")) {
+                    freeErrorPayload(parsed);
+                    return error.UnsupportedRemotePlatform;
+                }
+                if (transportExitCode(parsed.code)) |exit_code| {
+                    try printParsedError(parsed);
+                    return process_exit.request(exit_code);
+                }
                 try printParsedError(parsed);
                 return process_exit.request(1);
             },
@@ -1395,6 +1387,9 @@ fn readSessionAttachedInner(
             },
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
+            },
+            .client_te_transport_status => {
+                try handleClientTeTransportStatusFrame(frame.payload);
             },
             .client_te_transport_closed => return error.RemoteTransportClosed,
             .ping, .pong => {
@@ -1427,124 +1422,6 @@ fn readFrameAllocMaybeCancelled(
             return error.EndOfStream;
         }
     }
-}
-
-pub fn runtimeHandshake(read_fd: c.fd_t, write_fd: c.fd_t) !void {
-    try runtimeHandshakeInner(read_fd, write_fd, null);
-}
-
-fn runtimeHandshakeInner(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    cancelled: ?*const std.atomic.Value(bool),
-) !void {
-    try sendHelloRequest(write_fd);
-    var hello_error = try readHelloReply(read_fd, cancelled);
-    defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
-    if (hello_error) |err| {
-        const parsed = errorPayloadFromHelloError(err);
-        if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) return error.VersionMismatch;
-        try printBorrowedError(parsed);
-        return process_exit.request(1);
-    }
-
-    var peer_hello = try readHelloRequest(read_fd, write_fd, cancelled);
-    defer peer_hello.deinit(app_allocator.allocator());
-    if (helloRequestIsCompatible(peer_hello)) {
-        try sendHelloOk(write_fd);
-    } else {
-        try sendHelloError(write_fd, "VERSION_MISMATCH", "existing remote sessh is incompatible with this client", "");
-        return error.VersionMismatch;
-    }
-}
-
-fn sendHelloRequest(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloRequest{
-        .protocol_major = config.protocol_major,
-        .protocol_minor = config.protocol_minor,
-        .version = config.version,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_request, payload);
-}
-
-fn sendHelloOk(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_ok, payload);
-}
-
-fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloError{
-        .code = code,
-        .message = message,
-        .hint = hint,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_error, payload);
-}
-
-fn readHelloReply(
-    read_fd: c.fd_t,
-    cancelled: ?*const std.atomic.Value(bool),
-) !?hpb.HelloError {
-    while (true) {
-        var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
-        defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .hello_ok => {
-                var ok = try protocol.decodePayload(hpb.HelloOk, app_allocator.allocator(), frame.payload);
-                defer ok.deinit(app_allocator.allocator());
-                return null;
-            },
-            .hello_error => {
-                const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
-                return err;
-            },
-            .client_te_transport_diagnostic => {
-                try handleClientTeTransportDiagnosticFrame(frame.payload);
-            },
-            .client_te_transport_closed => return error.RemoteTransportClosed,
-            else => return error.UnexpectedFrame,
-        }
-    }
-}
-
-fn readHelloRequest(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    cancelled: ?*const std.atomic.Value(bool),
-) !hpb.HelloRequest {
-    while (true) {
-        var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
-        defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .hello_request => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
-            .client_te_transport_diagnostic => {
-                try handleClientTeTransportDiagnosticFrame(frame.payload);
-            },
-            .client_te_transport_closed => return error.RemoteTransportClosed,
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
-            },
-            else => {
-                try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
-                return error.UnexpectedFrame;
-            },
-        }
-    }
-}
-
-fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
-    return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
-}
-
-fn errorPayloadFromHelloError(response_error: hpb.HelloError) ErrorPayload {
-    return .{
-        .code = response_error.code,
-        .message = response_error.message,
-        .hint = response_error.hint orelse "",
-    };
 }
 
 fn sendSessionCreate(
@@ -1703,6 +1580,9 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
             },
+            .client_te_transport_status => {
+                try handleClientTeTransportStatusFrame(frame.payload);
+            },
             .client_te_transport_closed => return error.RemoteTransportClosed,
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, conn);
@@ -1724,6 +1604,13 @@ fn parseErrorPayload(payload: []const u8) !ErrorPayload {
         .message = try app_allocator.allocator().dupe(u8, decoded.message),
         .hint = try app_allocator.allocator().dupe(u8, decoded.hint orelse ""),
     };
+}
+
+fn transportExitCode(code: []const u8) ?u8 {
+    const prefix = "SSH_TRANSPORT_EXITED_";
+    if (!std.mem.startsWith(u8, code, prefix)) return null;
+    const parsed = std.fmt.parseUnsigned(u16, code[prefix.len..], 10) catch return null;
+    return @intCast(@min(parsed, 255));
 }
 
 fn printParsedError(parsed: ErrorPayload) !void {
@@ -2093,6 +1980,10 @@ fn handleEscapeHelpRuntimeFrame(
             try handleClientTeTransportDiagnosticFrame(frame.payload);
             return null;
         },
+        .client_te_transport_status => {
+            try handleClientTeTransportStatusFrame(frame.payload);
+            return null;
+        },
         .client_te_transport_closed => return .remote_transport_closed,
         .ping, .pong => {
             _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
@@ -2245,6 +2136,10 @@ fn handleAttachedClientRuntimeFrame(
         },
         .client_te_transport_diagnostic => {
             try handleClientTeTransportDiagnosticFrame(frame.payload);
+            return null;
+        },
+        .client_te_transport_status => {
+            try handleClientTeTransportStatusFrame(frame.payload);
             return null;
         },
         .client_te_transport_closed => return .remote_transport_closed,
@@ -2428,6 +2323,16 @@ fn handleClientTeTransportDiagnosticFrame(payload: []const u8) !void {
     var diagnostic = try protocol.decodePayload(pb.ClientTeTransportDiagnostic, app_allocator.allocator(), payload);
     defer diagnostic.deinit(app_allocator.allocator());
     client_log.appendSshStderr(diagnostic.chunk);
+}
+
+fn handleClientTeTransportStatusFrame(payload: []const u8) !void {
+    var status = try protocol.decodePayload(pb.ClientTeTransportStatus, app_allocator.allocator(), payload);
+    defer status.deinit(app_allocator.allocator());
+    const state = status.status orelse return;
+    switch (state) {
+        .bootstrap_started => try io_helpers.writeAll(2, "\rsessh: bootstrapping..."),
+        .bootstrap_finished => try io_helpers.writeAll(2, "\r\x1b[K"),
+    }
 }
 
 const InputAckResult = struct {

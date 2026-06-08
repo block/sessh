@@ -187,8 +187,8 @@ const TerminalTransportStart = struct {
 };
 
 const PooledTerminalClientState = enum {
-    pending_ready,
-    handshaking,
+    pending_tunnel,
+    opening_stream,
     active,
     done,
 };
@@ -204,11 +204,10 @@ const PooledTerminalClient = struct {
     stream_id: u64 = 0,
     local_stream_id: u64 = 0,
     kind: PooledTerminalClientKind = .unknown,
-    state: PooledTerminalClientState = .pending_ready,
+    state: PooledTerminalClientState = .pending_tunnel,
     outbound_next_offset: u64 = 0,
     inbound_next_offset: u64 = 0,
     request_started_ms: u64 = 0,
-    ready_sent_ms: u64 = 0,
     mux_open_sent_ms: u64 = 0,
     mux_open_ok_ms: u64 = 0,
     first_payload_ms: u64 = 0,
@@ -462,10 +461,7 @@ fn runRemoteNewSession(
     };
     client_log.setLevel(runtime_config.common.client_log_level);
 
-    var resolved_target = try resolveSshTarget(allocator, ssh_options, host);
-    defer resolved_target.deinit(allocator);
-    const target = resolved_target.target;
-
+    const target = SshTarget{ .options = ssh_options, .host = host };
     const stdin_is_tty = c.isatty(posix.STDIN_FILENO) != 0;
     const stdout_is_tty = c.isatty(posix.STDOUT_FILENO) != 0;
     if (shouldUseProxyStream(new, runtime_config.common, stdin_is_tty, stdout_is_tty)) {
@@ -495,8 +491,6 @@ fn runRemoteNewSession(
         target,
         runtime_config.common,
         false,
-        failure_policy.allow_plain_ssh_fallback,
-        null,
     );
 
     var local_terminal = local_terminal_probe.finish();
@@ -524,6 +518,10 @@ fn runRemoteNewSession(
             }
             try runPlainSshFallbackAfterVersionMismatch(allocator, target);
         }
+        if (err == error.UnsupportedRemotePlatform and failure_policy.allow_plain_ssh_fallback) {
+            transport.close();
+            try runPlainSshFallback(allocator, target, null);
+        }
         waitAfterRuntimeAttachFailure(&transport, "start");
         if (process_exit.is(err)) return err;
         try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
@@ -536,7 +534,6 @@ fn runRemoteNewSession(
         exe,
         target,
         runtime_config,
-        failure_policy,
         &transport,
         &session,
     );
@@ -838,7 +835,7 @@ fn runTerminalTunnel(tunnel: *TerminalTunnel) !void {
             terminal_pool_mutex.lock();
             defer terminal_pool_mutex.unlock();
             for (tunnel.clients.items) |client| {
-                if (client.state != .done and client.state != .pending_ready) {
+                if (client.state != .done and client.state != .pending_tunnel) {
                     try poll_clients.append(tunnel.allocator, client);
                 }
             }
@@ -907,36 +904,23 @@ fn activatePendingTerminalClients(tunnel: *TerminalTunnel) !void {
     terminal_pool_mutex.lock();
     defer terminal_pool_mutex.unlock();
     for (tunnel.clients.items) |client| {
-        if (client.state != .pending_ready) continue;
+        if (client.state != .pending_tunnel) continue;
         client.stream_id = tunnel.next_stream_id;
         tunnel.next_stream_id += 1;
-        client.state = .handshaking;
-        sendTerminalTransportReady(client.fd) catch {
-            markPooledTerminalClientDoneLocked(tunnel, client);
-            continue;
-        };
-        client.ready_sent_ms = nowUnixMs();
+        client.state = .opening_stream;
     }
     terminal_pool_condition.broadcast();
 }
 
 fn handlePooledTerminalClientReadable(tunnel: *TerminalTunnel, client: *PooledTerminalClient) !void {
     switch (client.state) {
-        .handshaking => try openPooledTerminalClientStream(tunnel, client),
+        .opening_stream => try openPooledTerminalClientStream(tunnel, client),
         .active => try forwardPooledTerminalClientFrame(tunnel, client),
-        .pending_ready, .done => {},
+        .pending_tunnel, .done => {},
     }
 }
 
 fn openPooledTerminalClientStream(tunnel: *TerminalTunnel, client: *PooledTerminalClient) !void {
-    acceptPooledClientHandshake(tunnel.allocator, client.fd) catch |err| switch (err) {
-        error.EndOfStream => {
-            finishPooledTerminalClient(tunnel, client, true);
-            return;
-        },
-        else => return err,
-    };
-
     var frame = protocol.readFrameAlloc(tunnel.allocator, client.fd) catch |err| switch (err) {
         error.EndOfStream => {
             finishPooledTerminalClient(tunnel, client, true);
@@ -1282,14 +1266,13 @@ fn logPooledTerminalClientStartupTiming(tunnel: *TerminalTunnel, client: *Pooled
     client.startup_timing_logged = true;
     daemon_log.infof(
         tunnel.allocator,
-        "terminal pooled client startup host={s} pool={s} stream_id={} kind={s} request_to_ready_ms={} ready_to_open_ms={} open_to_open_ok_ms={} open_ok_to_first_payload_ms={} request_to_first_payload_ms={}",
+        "terminal pooled client startup host={s} pool={s} stream_id={} kind={s} request_to_open_ms={} open_to_open_ok_ms={} open_ok_to_first_payload_ms={} request_to_first_payload_ms={}",
         .{
             tunnel.display_host,
             tunnel.key,
             client.stream_id,
             pooledTerminalClientKindName(client.kind),
-            elapsedMs(client.request_started_ms, client.ready_sent_ms),
-            elapsedMs(client.ready_sent_ms, client.mux_open_sent_ms),
+            elapsedMs(client.request_started_ms, client.mux_open_sent_ms),
             elapsedMs(client.mux_open_sent_ms, client.mux_open_ok_ms),
             elapsedMs(client.mux_open_ok_ms, client.first_payload_ms),
             elapsedMs(client.request_started_ms, client.first_payload_ms),
@@ -1337,20 +1320,6 @@ fn sendPooledMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.MuxS
     const payload = try protocol.encodePayload(allocator, message);
     defer allocator.free(payload);
     try protocol.sendFrame(fd, .mux_stream_frame, payload);
-}
-
-fn acceptPooledClientHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    var peer_hello = try readPooledHelloRequest(allocator, fd);
-    defer peer_hello.deinit(allocator);
-    if (!protocol.helloRequestIsCompatible(peer_hello, config.min_protocol_major, config.min_protocol_minor)) {
-        try sendPooledHelloError(fd, "VERSION_MISMATCH", "sesshd is incompatible with this client", "");
-        return error.VersionMismatch;
-    }
-    try sendPooledHelloOk(fd);
-    try sendPooledHelloRequest(fd);
-    var hello_error = try readPooledHelloReply(allocator, fd);
-    defer if (hello_error) |*err| err.deinit(allocator);
-    if (hello_error) |_| return error.VersionMismatch;
 }
 
 fn initiatePooledRemoteDaemonHandshake(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !void {
@@ -1432,8 +1401,6 @@ fn openTerminalDaemonTransport(
     target: SshTarget,
     common: CommonSessionOptions,
     batch_mode: bool,
-    allow_plain_ssh_fallback: bool,
-    reconnect_ui: ?*client_ui.ReconnectUi,
 ) !TerminalTransport {
     const fd = try daemon_client.connectOrStart(allocator, exe);
     errdefer _ = c.close(fd);
@@ -1451,61 +1418,7 @@ fn openTerminalDaemonTransport(
     const payload = try protocol.encodePayload(allocator, request);
     defer allocator.free(payload);
     try protocol.sendFrame(fd, .client_te_transport_open, payload);
-
-    var bootstrap_status_visible = false;
-    defer clearClientBootstrapStatus(&bootstrap_status_visible);
-
-    while (true) {
-        var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
-            error.EndOfStream => return error.DaemonTransportClosed,
-            else => return err,
-        };
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .client_te_transport_ready => {
-                var ready = try protocol.decodePayload(pb.ClientTeTransportReady, allocator, frame.payload);
-                defer ready.deinit(allocator);
-                return .{ .fd = fd };
-            },
-            .error_message => {
-                var message = try protocol.decodePayload(protocol.hpb.Error, allocator, frame.payload);
-                defer message.deinit(allocator);
-                if (std.mem.eql(u8, message.code, "UNSUPPORTED_REMOTE_PLATFORM") and allow_plain_ssh_fallback) {
-                    _ = c.close(fd);
-                    try runPlainSshFallback(allocator, target, null);
-                }
-                if (reconnect_ui != null) {
-                    return error.DaemonTransportFailed;
-                }
-                if (daemonTransportExitCode(message.code)) |exit_code| {
-                    try printDaemonTransportError(message);
-                    return process_exit.request(exit_code);
-                }
-                try printDaemonTransportError(message);
-                return process_exit.request(1);
-            },
-            .client_te_transport_diagnostic => {
-                try handleClientTeTransportDiagnostic(allocator, frame.payload, reconnect_ui, &bootstrap_status_visible);
-            },
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
-            },
-            else => return error.UnexpectedDaemonFrame,
-        }
-    }
-}
-
-fn printDaemonTransportError(message: protocol.hpb.Error) !void {
-    try io.stderrPrint("sessh: {s}\n", .{message.message});
-    if (message.hint) |hint| {
-        if (hint.len > 0) try io.stderrPrint("{s}\n", .{hint});
-    }
-}
-
-fn sendTerminalTransportReady(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.ClientTeTransportReady{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .client_te_transport_ready, payload);
+    return .{ .fd = fd };
 }
 
 fn sendDaemonTransportError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
@@ -1543,31 +1456,6 @@ fn sendDaemonSshFailure(
         },
         else => return false,
     }
-}
-
-fn daemonTransportExitCode(code: []const u8) ?u8 {
-    const prefix = "SSH_TRANSPORT_EXITED_";
-    if (!std.mem.startsWith(u8, code, prefix)) return null;
-    const parsed = std.fmt.parseUnsigned(u16, code[prefix.len..], 10) catch return null;
-    return @intCast(@min(parsed, 255));
-}
-
-fn handleClientTeTransportDiagnostic(
-    allocator: std.mem.Allocator,
-    payload: []const u8,
-    reconnect_ui: ?*client_ui.ReconnectUi,
-    bootstrap_status_visible: *bool,
-) !void {
-    var message = try protocol.decodePayload(pb.ClientTeTransportDiagnostic, allocator, payload);
-    defer message.deinit(allocator);
-    if (message.chunk.len == 0) return;
-    if (reconnect_ui) |ui| {
-        client_log.appendSshStderr(message.chunk);
-        try ui.refreshOverlayIfDiagnosticsChanged();
-        return;
-    }
-    clearClientBootstrapStatus(bootstrap_status_visible);
-    try io.writeAll(2, message.chunk);
 }
 
 fn appendCurrentEnvironmentToTransportOpen(allocator: std.mem.Allocator, request: *pb.ClientTeTransportOpen) !void {
@@ -1629,7 +1517,6 @@ fn runAttachedRemoteClient(
     exe: []const u8,
     target: SshTarget,
     runtime_config: SessionRuntimeConfig,
-    failure_policy: BootstrapFailurePolicy,
     transport: *TerminalTransport,
     session: *attached_client.RuntimeSession,
 ) !void {
@@ -1677,7 +1564,6 @@ fn runAttachedRemoteClient(
                     exe,
                     target,
                     runtime_config,
-                    failure_policy,
                     transport,
                     session,
                 );
@@ -1691,7 +1577,6 @@ fn reconnectRemoteSessionClient(
     exe: []const u8,
     target: SshTarget,
     runtime_config: SessionRuntimeConfig,
-    failure_policy: BootstrapFailurePolicy,
     transport: *TerminalTransport,
     session: *attached_client.RuntimeSession,
 ) !void {
@@ -1734,14 +1619,7 @@ fn reconnectRemoteSessionClient(
             target,
             runtime_config.common,
             true,
-            failure_policy.allow_plain_ssh_fallback,
-            &reconnect_ui,
         ) catch |err| switch (err) {
-            error.DaemonTransportClosed => {
-                finishReconnectUi(&reconnect_ui, &reconnect_ui_active);
-                try finishLocalDaemonClosedSshSession(transport, session);
-                return process_exit.request(255);
-            },
             error.OutOfMemory => return err,
             else => {
                 noteReconnectFailure("transport", target, session, reconnect_attempt, err);
@@ -1936,27 +1814,41 @@ fn finishEndedRemoteSession(transport: *TerminalTransport, session: *attached_cl
     return exit_status;
 }
 
-fn writeBootstrapStatusBytes(client_diagnostic_fd: c.fd_t, bytes: []const u8) !void {
-    if (client_diagnostic_fd >= 0) {
-        const payload = try protocol.encodePayload(app_allocator.allocator(), pb.ClientTeTransportDiagnostic{
-            .chunk = bytes,
-        });
+const BootstrapStatus = enum {
+    started,
+    finished,
+};
+
+fn bootstrapStatusBytes(status: BootstrapStatus) []const u8 {
+    return switch (status) {
+        .started => "\rsessh: bootstrapping...",
+        .finished => "\r\x1b[K",
+    };
+}
+
+fn sendBootstrapStatus(client_status_fd: c.fd_t, status: BootstrapStatus) !void {
+    if (client_status_fd >= 0) {
+        const message = switch (status) {
+            .started => pb.ClientTeTransportStatus{ .status = .{ .bootstrap_started = .{} } },
+            .finished => pb.ClientTeTransportStatus{ .status = .{ .bootstrap_finished = .{} } },
+        };
+        const payload = try protocol.encodePayload(app_allocator.allocator(), message);
         defer app_allocator.allocator().free(payload);
-        try protocol.sendFrame(client_diagnostic_fd, .client_te_transport_diagnostic, payload);
+        try protocol.sendFrame(client_status_fd, .client_te_transport_status, payload);
     } else {
-        try io.writeAll(2, bytes);
+        try io.writeAll(2, bootstrapStatusBytes(status));
     }
 }
 
-fn showClientBootstrapStatus(visible: *bool, reconnect_ui: ?*client_ui.ReconnectUi, client_diagnostic_fd: c.fd_t) !void {
+fn showClientBootstrapStatus(visible: *bool, reconnect_ui: ?*client_ui.ReconnectUi, client_status_fd: c.fd_t) !void {
     if (reconnect_ui != null or visible.*) return;
-    try writeBootstrapStatusBytes(client_diagnostic_fd, "\rsessh: bootstrapping...");
+    try sendBootstrapStatus(client_status_fd, .started);
     visible.* = true;
 }
 
-fn clearClientBootstrapStatusOn(visible: *bool, client_diagnostic_fd: c.fd_t) void {
+fn clearClientBootstrapStatusOn(visible: *bool, client_status_fd: c.fd_t) void {
     if (!visible.*) return;
-    writeBootstrapStatusBytes(client_diagnostic_fd, "\r\x1b[K") catch {};
+    sendBootstrapStatus(client_status_fd, .finished) catch {};
     visible.* = false;
 }
 
@@ -2327,40 +2219,7 @@ const DaemonStreamClientStarter = struct {
         const payload = try protocol.encodePayload(self.allocator, request);
         defer self.allocator.free(payload);
         try protocol.sendFrame(fd, .client_te_transport_open, payload);
-
-        var bootstrap_status_visible = false;
-        defer clearClientBootstrapStatus(&bootstrap_status_visible);
-        while (true) {
-            var frame = protocol.readFrameAlloc(self.allocator, fd) catch |err| switch (err) {
-                error.EndOfStream => return error.DaemonTransportClosed,
-                else => return err,
-            };
-            defer frame.deinit(self.allocator);
-            switch (frame.message_type) {
-                .client_te_transport_ready => {
-                    var ready = try protocol.decodePayload(pb.ClientTeTransportReady, self.allocator, frame.payload);
-                    defer ready.deinit(self.allocator);
-                    return .{ .fd = fd };
-                },
-                .client_te_transport_diagnostic => {
-                    try handleClientTeTransportDiagnostic(self.allocator, frame.payload, null, &bootstrap_status_visible);
-                },
-                .error_message => {
-                    var message = try protocol.decodePayload(protocol.hpb.Error, self.allocator, frame.payload);
-                    defer message.deinit(self.allocator);
-                    if (daemonTransportExitCode(message.code)) |exit_code| {
-                        try printDaemonTransportError(message);
-                        return process_exit.request(exit_code);
-                    }
-                    try printDaemonTransportError(message);
-                    return error.DaemonTransportFailed;
-                },
-                .ping, .pong => {
-                    _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
-                },
-                else => return error.UnexpectedDaemonFrame,
-            }
-        }
+        return .{ .fd = fd };
     }
 
     pub fn exitAfterInitialFailure(self: *DaemonStreamClientStarter, err: anyerror) !void {
@@ -2711,18 +2570,9 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         try invocation.ssh_options.append(allocator, "-l");
         try invocation.ssh_options.append(allocator, invocation.user);
     }
-    var resolved_ssh_config = try resolveSshConfig(allocator, invocation.ssh_options.items, invocation.host);
-    defer resolved_ssh_config.deinit(allocator);
-    const default_ipqos_option = try resolved_ssh_config.defaultIpQosOption(allocator);
-    defer if (default_ipqos_option) |option| allocator.free(option);
-
     const stream_target = SshTarget{
         .options = invocation.ssh_options.items,
         .host = invocation.host,
-        .default_ipqos_option = default_ipqos_option,
-        .resolved_user = resolved_ssh_config.user,
-        .resolved_host = resolved_ssh_config.hostname,
-        .resolved_port = resolved_ssh_config.port,
     };
     var starter = DaemonStreamClientStarter{
         .allocator = allocator,

@@ -32,19 +32,18 @@ message Frame {
     TeStreamItem te_stream_item = 61;
     ProxyStreamItem proxy_stream_item = 62;
     ClientTeTransportOpen client_te_transport_open = 63;
-    ClientTeTransportReady client_te_transport_ready = 64;
     ClientTeTransportDiagnostic client_te_transport_diagnostic = 65;
     DaemonLogRequest daemon_log_request = 66;
     DaemonLogEntry daemon_log_entry = 67;
     ClientTeTransportClosed client_te_transport_closed = 68;
+    ClientTeTransportStatus client_te_transport_status = 69;
   }
 }
 
 // Local visible-client -> local daemon request to open a terminal-emulator
-// transport to a remote sesshd. After ClientTeTransportReady, this local socket
-// becomes a transparent framed transport: the visible client sends the normal
-// Hello/TeStreamOpen sequence and the daemon forwards it over ssh to the remote
-// daemon endpoint.
+// transport to a remote sesshd. The client may immediately pipeline stream
+// frames after this request; the local daemon queues them behind tunnel setup
+// and forwards them over ssh when the remote daemon endpoint is ready.
 message ClientTeTransportOpen {
   repeated string ssh_option = 1;
   string host = 2;
@@ -55,15 +54,26 @@ message ClientTeTransportOpen {
   repeated TeSessionCreate.EnvironmentEntry environment = 5;
 }
 
-// Acknowledges ClientTeTransportOpen. This is only a local-daemon readiness
-// marker; it is not part of the remote runtime handshake.
-message ClientTeTransportReady {
-}
-
 // Local daemon -> visible-client ssh stderr diagnostic for the transport the
 // daemon owns. This is not remote process output.
 message ClientTeTransportDiagnostic {
   bytes chunk = 1;
+}
+
+// Local daemon -> visible-client status for the transport the daemon owns.
+// Unlike ClientTeTransportDiagnostic, this is local sessh UI state and should
+// be rendered immediately rather than buffered as delayed ssh stderr.
+message ClientTeTransportStatus {
+  message BootstrapStarted {
+  }
+
+  message BootstrapFinished {
+  }
+
+  oneof status {
+    BootstrapStarted bootstrap_started = 1;
+    BootstrapFinished bootstrap_finished = 2;
+  }
 }
 
 // Local daemon -> visible-client notification that the local daemon is still

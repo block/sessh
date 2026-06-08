@@ -1589,15 +1589,6 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
         conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
         send_hello(conn)
         send_client_te_transport_open(conn)
-        while True:
-            message_type, payload = recv_frame(conn)
-            if message_type == "client_te_transport_ready":
-                break
-            if message_type == "client_te_transport_diagnostic":
-                continue
-            raise AssertionError(f"unexpected transport-open frame: {message_type}")
-
-        send_hello(conn)
         command = f"printf '{marker}\\n'; sleep 2"
         send_frame(
             conn,
@@ -1650,8 +1641,7 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
     for expected in (
         "terminal pooled client startup host=test-host",
         "kind=te",
-        "request_to_ready_ms=",
-        "ready_to_open_ms=",
+        "request_to_open_ms=",
         "open_to_open_ok_ms=",
         "open_ok_to_first_payload_ms=",
         "request_to_first_payload_ms=",
@@ -1771,14 +1761,6 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
         conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
         send_hello(conn)
         send_client_te_transport_open(conn)
-        while True:
-            message_type, _ = recv_frame(conn)
-            if message_type == "client_te_transport_ready":
-                break
-            if message_type == "client_te_transport_diagnostic":
-                continue
-            raise AssertionError(f"unexpected transport-open frame: {message_type}")
-        send_hello(conn)
         send_proxy_open(conn, session_index)
         while recv_mux_frame(conn).WhichOneof("message") != "open_ok":
             pass
@@ -1826,8 +1808,7 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
     for expected in (
         "terminal pooled client startup host=test-host",
         "kind=proxy",
-        "request_to_ready_ms=",
-        "ready_to_open_ms=",
+        "request_to_open_ms=",
         "open_to_open_ok_ms=",
         "open_ok_to_first_payload_ms=",
         "request_to_first_payload_ms=",
@@ -1940,7 +1921,12 @@ def test_ssh_transport_cache_hit_suppresses_bootstrap_status(tmp):
         if b"daemon started socket=" in daemon_log_output:
             raise AssertionError(f"daemon log replayed old entries: {daemon_log_output!r}")
 
-        result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
+        result = run_sessh_in_pty(
+            ["-F", str(fake_config), "test-host"],
+            env,
+            ((marker.encode("utf-8"), None),),
+            timeout=30.0,
+        )
         daemon_log_output += read_until_pipe(
             log_proc.stdout,
             b"bootstrap skipped host=test-host reason=remote_artifact_present",
@@ -1955,7 +1941,7 @@ def test_ssh_transport_cache_hit_suppresses_bootstrap_status(tmp):
         raise AssertionError(
             ssh_failure_diagnostics("ssh cache-hit attach did not render remote output", result, fake_log, fake_trace)
         )
-    if "sessh: bootstrapping..." in result.stderr:
+    if "sessh: bootstrapping..." in result.stdout or "sessh: bootstrapping..." in result.stderr:
         raise AssertionError(ssh_failure_diagnostics("cache-hit bootstrap displayed upload status", result, fake_log, fake_trace))
     if any(token in result.stdout or token in result.stderr for token in ("MISSING ", "UPLOAD ", "OK\n")):
         raise AssertionError(
