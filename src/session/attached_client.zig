@@ -1009,27 +1009,6 @@ pub fn startNewSessionOnRuntime(
     return session;
 }
 
-pub fn ensureLocalRouteForRemoteSession(
-    allocator: std.mem.Allocator,
-    session: *const RuntimeSession,
-    host: []const u8,
-    resolved_host: []const u8,
-    port: []const u8,
-    ssh_options: []const []const u8,
-) !void {
-    if (session.guidSlice().len == 0) return;
-    try session_registry.writeSshRoute(
-        allocator,
-        session.guidSlice(),
-        session.sessionDirSlice(),
-        host,
-        resolved_host,
-        port,
-        ssh_options,
-        config.version,
-    );
-}
-
 pub fn reconnectSessionOnRuntime(
     read_fd: c.fd_t,
     write_fd: c.fd_t,

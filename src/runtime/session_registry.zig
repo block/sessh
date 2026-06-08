@@ -3,7 +3,6 @@ const app_allocator = @import("../core/app_allocator.zig");
 const c = std.c;
 const posix = std.posix;
 
-const config = @import("../core/config.zig");
 const socket_transport = @import("../transport/socket.zig");
 
 pub const guid_body_len = 36;
@@ -17,14 +16,8 @@ pub const default_ssh_port = "22";
 
 pub const SessionPaths = struct {
     dir: []u8,
-    meta: []u8,
-    compat: []u8,
-    route: []u8,
 
     pub fn deinit(self: *SessionPaths, allocator: std.mem.Allocator) void {
-        allocator.free(self.route);
-        allocator.free(self.compat);
-        allocator.free(self.meta);
         allocator.free(self.dir);
         self.* = undefined;
     }
@@ -44,24 +37,13 @@ pub const Allocation = struct {
 pub fn allocateSessionDir(allocator: std.mem.Allocator) !Allocation {
     const runtime_root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(runtime_root);
-    const state_root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(state_root);
-    return allocateSessionDirInRoots(allocator, runtime_root, state_root);
+    return allocateSessionDirInRoot(allocator, runtime_root);
 }
 
 pub fn allocateSessionDirInRoot(allocator: std.mem.Allocator, root: []const u8) !Allocation {
     const id = try generateGuid(allocator);
     errdefer allocator.free(id);
-    var allocation = try allocateSessionDirForGuidInRoots(allocator, root, root, id);
-    allocator.free(allocation.id);
-    allocation.id = id;
-    return allocation;
-}
-
-fn allocateSessionDirInRoots(allocator: std.mem.Allocator, runtime_root: []const u8, state_root: []const u8) !Allocation {
-    const id = try generateGuid(allocator);
-    errdefer allocator.free(id);
-    var allocation = try allocateSessionDirForGuidInRoots(allocator, runtime_root, state_root, id);
+    var allocation = try allocateSessionDirForGuidInRoot(allocator, root, id);
     allocator.free(allocation.id);
     allocation.id = id;
     return allocation;
@@ -70,19 +52,13 @@ fn allocateSessionDirInRoots(allocator: std.mem.Allocator, runtime_root: []const
 pub fn allocateSessionDirForGuid(allocator: std.mem.Allocator, guid: []const u8) !Allocation {
     const runtime_root = try socket_transport.runtimeRoot(allocator);
     defer allocator.free(runtime_root);
-    const state_root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(state_root);
-    return allocateSessionDirForGuidInRoots(allocator, runtime_root, state_root, guid);
+    return allocateSessionDirForGuidInRoot(allocator, runtime_root, guid);
 }
 
 pub fn allocateSessionDirForGuidInRoot(allocator: std.mem.Allocator, root: []const u8, guid: []const u8) !Allocation {
-    return allocateSessionDirForGuidInRoots(allocator, root, root, guid);
-}
+    try ensureRegistryRoot(allocator, root);
 
-fn allocateSessionDirForGuidInRoots(allocator: std.mem.Allocator, runtime_root: []const u8, state_root: []const u8, guid: []const u8) !Allocation {
-    try ensureRegistryRoot(allocator, runtime_root);
-
-    const sessions_dir = try sessionsDirInRoot(allocator, runtime_root);
+    const sessions_dir = try sessionsDirInRoot(allocator, root);
     defer allocator.free(sessions_dir);
     try mkdirIgnoreExists(allocator, sessions_dir);
 
@@ -93,15 +69,10 @@ fn allocateSessionDirForGuidInRoots(allocator: std.mem.Allocator, runtime_root: 
     defer allocator.free(dir);
     switch (try mkdirSessionDir(allocator, dir)) {
         .created => {},
-        .exists => {
-            var existing_paths = try pathsForSessionDirInStateRoot(allocator, dir, state_root);
-            errdefer existing_paths.deinit(allocator);
-            if (runtimeHintsExist(existing_paths)) return error.SessionExists;
-            existing_paths.deinit(allocator);
-        },
+        .exists => return error.SessionExists,
     }
 
-    var paths = try pathsForSessionDirInStateRoot(allocator, dir, state_root);
+    var paths = try pathsForSessionDir(allocator, dir);
     errdefer paths.deinit(allocator);
     return .{ .id = canonical, .paths = paths };
 }
@@ -112,17 +83,7 @@ pub fn sessionsDir(allocator: std.mem.Allocator) ![]u8 {
     return sessionsDirInRoot(allocator, root);
 }
 
-pub fn stateSessionsDir(allocator: std.mem.Allocator) ![]u8 {
-    const root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(root);
-    return stateSessionsDirInRoot(allocator, root);
-}
-
 pub fn sessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/guid", .{root});
-}
-
-fn stateSessionsDirInRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/guid", .{root});
 }
 
@@ -142,41 +103,19 @@ pub fn pathsForSessionId(allocator: std.mem.Allocator, id: []const u8) !SessionP
     if (!isValidSessionId(id)) return error.InvalidSessionId;
     const sessions_dir = try sessionsDir(allocator);
     defer allocator.free(sessions_dir);
-    const state_root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(state_root);
     const canonical = try canonicalGuid(allocator, id);
     defer allocator.free(canonical);
     const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_dir, canonical });
     defer allocator.free(dir);
-    return pathsForSessionDirInStateRoot(allocator, dir, state_root);
+    return pathsForSessionDir(allocator, dir);
 }
 
 pub fn pathsForSessionDir(allocator: std.mem.Allocator, dir: []const u8) !SessionPaths {
-    const state_root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(state_root);
-    return pathsForSessionDirInStateRoot(allocator, dir, state_root);
-}
-
-fn pathsForSessionDirInStateRoot(allocator: std.mem.Allocator, dir: []const u8, state_root: []const u8) !SessionPaths {
     const dir_copy = try allocator.dupe(u8, dir);
     errdefer allocator.free(dir_copy);
 
-    const meta = try std.fmt.allocPrint(allocator, "{s}/meta.json", .{dir});
-    errdefer allocator.free(meta);
-
-    const compat = try std.fmt.allocPrint(allocator, "{s}/compat", .{dir});
-    errdefer allocator.free(compat);
-
-    const canonical = try canonicalGuid(allocator, std.fs.path.basename(dir));
-    defer allocator.free(canonical);
-    const route = try routePathForGuidInStateRoot(allocator, state_root, canonical);
-    errdefer allocator.free(route);
-
     return .{
         .dir = dir_copy,
-        .meta = meta,
-        .compat = compat,
-        .route = route,
     };
 }
 
@@ -317,316 +256,6 @@ pub fn generateProxyGuid(allocator: std.mem.Allocator) ![]u8 {
     return out;
 }
 
-pub fn writeMeta(paths: SessionPaths, runtime_pid: c.pid_t, version: []const u8) !void {
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(app_allocator.allocator());
-    const writer = text.writer(app_allocator.allocator());
-    const created_at_unix_ms = sessionMetaCreatedAtUnixMs(app_allocator.allocator(), paths.meta);
-    try writer.print(
-        "{{\"type\":{f},\"created_at_unix_ms\":{},\"runtime_pid\":{},\"version\":{f}}}\n",
-        .{
-            std.json.fmt("local-session", .{}),
-            created_at_unix_ms,
-            runtime_pid,
-            std.json.fmt(version, .{}),
-        },
-    );
-    try writeAtomicFile(paths.meta, text.items);
-}
-
-fn sessionMetaCreatedAtUnixMs(allocator: std.mem.Allocator, path: []const u8) u64 {
-    const bytes = std.fs.cwd().readFileAlloc(allocator, path, 4096) catch return currentUnixMs();
-    defer allocator.free(bytes);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return currentUnixMs();
-    defer parsed.deinit();
-    const object = jsonObject(parsed.value) catch return currentUnixMs();
-    return (jsonOptionalU64(object, "created_at_unix_ms") catch return currentUnixMs()) orelse currentUnixMs();
-}
-
-fn currentUnixMs() u64 {
-    const ms = std.time.milliTimestamp();
-    if (ms <= 0) return 0;
-    return @intCast(ms);
-}
-
-pub const Route = struct {
-    guid: []u8,
-    session_dir: []u8,
-    host: []u8,
-    resolved_host: []u8,
-    port: []u8,
-    runtime_version: []u8,
-    ssh_options: []const []const u8,
-    last_known_alive: bool,
-
-    pub fn deinit(self: *Route, allocator: std.mem.Allocator) void {
-        for (self.ssh_options) |option| allocator.free(option);
-        allocator.free(self.ssh_options);
-        allocator.free(self.runtime_version);
-        allocator.free(self.port);
-        allocator.free(self.resolved_host);
-        allocator.free(self.host);
-        allocator.free(self.session_dir);
-        allocator.free(self.guid);
-        self.* = undefined;
-    }
-};
-
-pub fn writeSshRoute(
-    allocator: std.mem.Allocator,
-    guid: []const u8,
-    session_dir: []const u8,
-    host: []const u8,
-    resolved_host: []const u8,
-    port: []const u8,
-    ssh_options: []const []const u8,
-    runtime_version: []const u8,
-) !void {
-    return writeRoute(allocator, guid, session_dir, host, ssh_options, .{
-        .port = port,
-        .resolved_host = resolved_host,
-        .runtime_version = runtime_version,
-    });
-}
-
-pub fn writeLocalRoute(
-    allocator: std.mem.Allocator,
-    guid: []const u8,
-    session_dir: []const u8,
-    runtime_version: []const u8,
-) !void {
-    return writeRoute(allocator, guid, session_dir, ".", &.{}, .{
-        .runtime_version = runtime_version,
-    });
-}
-
-const RouteStatus = struct {
-    last_known_alive: bool = true,
-    port: []const u8 = default_ssh_port,
-    resolved_host: []const u8 = "",
-    runtime_version: []const u8 = "",
-};
-
-fn writeRoute(
-    allocator: std.mem.Allocator,
-    guid: []const u8,
-    session_dir: []const u8,
-    host: []const u8,
-    ssh_options: []const []const u8,
-    status: RouteStatus,
-) !void {
-    if (!isAbsolutePath(session_dir)) return error.InvalidSessionDir;
-    const canonical = try canonicalGuid(allocator, guid);
-    defer allocator.free(canonical);
-    const state_root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(state_root);
-
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
-    const writer = text.writer(allocator);
-    const resolved_host = if (status.resolved_host.len == 0) host else status.resolved_host;
-    try writer.print(
-        "{{\"guid\":{f},\"session_dir\":{f},\"host\":{f},\"resolved_host\":{f},\"port\":{f},\"runtime_version\":{f},\"alive\":{},\"ssh_options\":[",
-        .{
-            std.json.fmt(canonical, .{}),
-            std.json.fmt(session_dir, .{}),
-            std.json.fmt(host, .{}),
-            std.json.fmt(resolved_host, .{}),
-            std.json.fmt(status.port, .{}),
-            std.json.fmt(status.runtime_version, .{}),
-            status.last_known_alive,
-        },
-    );
-    for (ssh_options, 0..) |arg, i| {
-        if (i > 0) try writer.writeAll(",");
-        try writer.print("{f}", .{std.json.fmt(arg, .{})});
-    }
-    try writer.writeAll("]}\n");
-
-    const route_path = try routePathForGuidInStateRoot(allocator, state_root, canonical);
-    defer allocator.free(route_path);
-    try ensureRouteDirForGuid(allocator, canonical);
-
-    try writeAtomicFile(route_path, text.items);
-}
-
-fn routePathForGuid(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
-    const state_root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(state_root);
-    const canonical = try canonicalGuid(allocator, guid);
-    defer allocator.free(canonical);
-    return routePathForGuidInStateRoot(allocator, state_root, canonical);
-}
-
-fn routePathForGuidInStateRoot(allocator: std.mem.Allocator, state_root: []const u8, guid: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/guid/{s}/route.json", .{ state_root, guid });
-}
-
-fn ensureRouteDirForGuid(allocator: std.mem.Allocator, guid: []const u8) !void {
-    const state_root = try socket_transport.stateRoot(allocator);
-    defer allocator.free(state_root);
-    try ensureRegistryRoot(allocator, state_root);
-
-    const state_sessions_dir = try stateSessionsDirInRoot(allocator, state_root);
-    defer allocator.free(state_sessions_dir);
-    try mkdirIgnoreExists(allocator, state_sessions_dir);
-
-    const canonical = try canonicalGuid(allocator, guid);
-    defer allocator.free(canonical);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ state_sessions_dir, canonical });
-    defer allocator.free(dir);
-    try mkdirIgnoreExists(allocator, dir);
-}
-
-pub fn readRoute(allocator: std.mem.Allocator, path: []const u8) !Route {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024);
-    defer allocator.free(bytes);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
-    defer parsed.deinit();
-    const object = try jsonObject(parsed.value);
-
-    const guid_value = try jsonRequiredString(object, "guid");
-    if (!isValidSessionGuid(guid_value)) return error.InvalidRoute;
-    const guid = try allocator.dupe(u8, guid_value);
-    errdefer allocator.free(guid);
-
-    const session_dir_value = jsonOptionalString(object, "session_dir") orelse "";
-    if (session_dir_value.len > 0 and !isAbsolutePath(session_dir_value)) return error.InvalidRoute;
-    const session_dir = try allocator.dupe(u8, session_dir_value);
-    errdefer allocator.free(session_dir);
-
-    const host = try allocator.dupe(u8, jsonOptionalString(object, "host") orelse "");
-    errdefer allocator.free(host);
-
-    const resolved_host = try allocator.dupe(u8, jsonOptionalString(object, "resolved_host") orelse host);
-    errdefer allocator.free(resolved_host);
-
-    const port_value = jsonOptionalString(object, "port") orelse default_ssh_port;
-    if (!isValidSshPort(port_value)) return error.InvalidRoute;
-    const port = try allocator.dupe(u8, port_value);
-    errdefer allocator.free(port);
-
-    const runtime_version_value = jsonOptionalString(object, "runtime_version") orelse "";
-    const runtime_version = try allocator.dupe(u8, runtime_version_value);
-    errdefer allocator.free(runtime_version);
-
-    const options = try jsonStringArrayField(allocator, object, "ssh_options");
-    errdefer freeStringArray(allocator, options);
-
-    return .{
-        .guid = guid,
-        .session_dir = session_dir,
-        .host = host,
-        .resolved_host = resolved_host,
-        .port = port,
-        .runtime_version = runtime_version,
-        .ssh_options = options,
-        .last_known_alive = (try jsonOptionalBool(object, "alive")) orelse true,
-    };
-}
-
-fn jsonObject(value: std.json.Value) !std.json.ObjectMap {
-    return switch (value) {
-        .object => |object| object,
-        else => error.InvalidJson,
-    };
-}
-
-fn jsonRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
-    return jsonOptionalString(object, key) orelse error.InvalidJson;
-}
-
-fn jsonOptionalString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .string => |string| string,
-        else => null,
-    };
-}
-
-fn jsonOptionalBool(object: std.json.ObjectMap, key: []const u8) !?bool {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .bool => |boolean| boolean,
-        else => error.InvalidJson,
-    };
-}
-
-fn jsonOptionalU64(object: std.json.ObjectMap, key: []const u8) !?u64 {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .null => null,
-        .integer => |integer| blk: {
-            if (integer < 0) return error.InvalidJson;
-            break :blk @intCast(integer);
-        },
-        else => error.InvalidJson,
-    };
-}
-
-fn jsonStringArrayField(allocator: std.mem.Allocator, object: std.json.ObjectMap, key: []const u8) ![]const []const u8 {
-    const value = object.get(key) orelse return try allocator.alloc([]const u8, 0);
-    const array = switch (value) {
-        .array => |array| array,
-        else => return error.InvalidJson,
-    };
-    var out = try allocator.alloc([]const u8, array.items.len);
-    errdefer allocator.free(out);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |item| allocator.free(item);
-    }
-    for (array.items, 0..) |item, i| {
-        const string = switch (item) {
-            .string => |string| string,
-            else => return error.InvalidJson,
-        };
-        out[i] = try allocator.dupe(u8, string);
-        initialized += 1;
-    }
-    return out;
-}
-
-fn isValidSshPort(port: []const u8) bool {
-    if (port.len == 0) return false;
-    const value = std.fmt.parseInt(u16, port, 10) catch return false;
-    return value != 0;
-}
-
-fn freeStringArray(allocator: std.mem.Allocator, strings: []const []const u8) void {
-    for (strings) |string| allocator.free(string);
-    allocator.free(strings);
-}
-
-fn writeAtomicFile(path: []const u8, contents: []const u8) !void {
-    const allocator = app_allocator.allocator();
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ path, c.getpid() });
-    defer allocator.free(tmp_path);
-    try unlinkIfExists(tmp_path);
-    errdefer unlinkIfExists(tmp_path) catch {};
-
-    {
-        var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .mode = 0o600 });
-        errdefer file.close();
-        try file.writeAll(contents);
-        file.close();
-    }
-
-    const tmp_path_z = try allocator.dupeZ(u8, tmp_path);
-    defer allocator.free(tmp_path_z);
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-    switch (posix.errno(c.rename(tmp_path_z.ptr, path_z.ptr))) {
-        .SUCCESS => return,
-        else => return error.RenameFailed,
-    }
-}
-
-fn isAbsolutePath(path: []const u8) bool {
-    return std.mem.startsWith(u8, path, "/");
-}
-
 pub const SocketPathAllocation = struct {
     name: []u8,
     path: []u8,
@@ -708,22 +337,7 @@ fn pathExists(path: []const u8) !bool {
     return true;
 }
 
-/// Clean shutdown removes both the live route and runtime files.
-pub fn removeEndedHints(paths: SessionPaths) !void {
-    try unlinkIfExists(paths.route);
-    try removeRuntimeSessionFiles(paths);
-    const route_dir = std.fs.path.dirname(paths.route) orelse return;
-    try removeDirIfEmpty(route_dir);
-}
-
-fn removeRuntimeSessionFiles(paths: SessionPaths) !void {
-    try unlinkIfExists(paths.compat);
-    try unlinkIfExists(paths.meta);
-
-    const runtime_log = try std.fmt.allocPrint(app_allocator.allocator(), "{s}/runtime.log", .{paths.dir});
-    defer app_allocator.allocator().free(runtime_log);
-    try unlinkIfExists(runtime_log);
-
+pub fn removeSessionDir(paths: SessionPaths) !void {
     try removeDirIfEmpty(paths.dir);
 }
 
@@ -755,23 +369,6 @@ fn mkdirSessionDir(allocator: std.mem.Allocator, path: []const u8) !MkdirSession
     };
 }
 
-fn runtimeHintsExist(paths: SessionPaths) bool {
-    _ = std.fs.cwd().statFile(paths.meta) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return true,
-    };
-    return true;
-}
-
-fn unlinkIfExists(path: []const u8) !void {
-    const path_z = try app_allocator.allocator().dupeZ(u8, path);
-    defer app_allocator.allocator().free(path_z);
-    switch (posix.errno(c.unlink(path_z.ptr))) {
-        .SUCCESS, .NOENT => return,
-        else => return error.UnlinkFailed,
-    }
-}
-
 fn removeDirIfEmpty(path: []const u8) !void {
     const path_z = try app_allocator.allocator().dupeZ(u8, path);
     defer app_allocator.allocator().free(path_z);
@@ -782,11 +379,11 @@ fn removeDirIfEmpty(path: []const u8) !void {
     }
 }
 
-test "refuses GUID session directories with runtime metadata" {
+test "refuses existing GUID session directories" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(
         allocator,
-        "zig-cache/session-registry-test-{}",
+        "/tmp/sessh-session-registry-test-{}",
         .{c.getpid()},
     );
     defer allocator.free(root);
@@ -803,7 +400,6 @@ test "refuses GUID session directories with runtime metadata" {
     try std.testing.expect(isValidGuid(second.id));
     try std.testing.expect(!std.mem.eql(u8, first.id, second.id));
 
-    try writeMeta(first.paths, 12345, "0.5.0-dev");
     try std.testing.expectError(error.SessionExists, allocateSessionDirForGuidInRoot(allocator, root, first.id));
 }
 
@@ -819,9 +415,6 @@ test "session paths use guid session directories" {
 
     try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", allocation.id);
     try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000", allocation.paths.dir);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/meta.json", allocation.paths.meta);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/compat", allocation.paths.compat);
-    try std.testing.expectEqualStrings("zig-cache/session-registry-path-test/guid/s-550e8400-e29b-41d4-a716-446655440000/route.json", allocation.paths.route);
 }
 
 test "client socket paths use client socket directory" {
@@ -851,37 +444,4 @@ test "validates session and proxy ids" {
     try std.testing.expect(!isValidSessionId(""));
     try std.testing.expect(!isValidSessionId("s1"));
     try std.testing.expect(!isValidSessionId("550e8400-e29b-41d4-a716-44665544000z"));
-}
-
-test "route json persists absolute session directories" {
-    const allocator = std.testing.allocator;
-    const root = try std.fmt.allocPrint(allocator, "/tmp/sessh-route-test-{}", .{c.getpid()});
-    defer allocator.free(root);
-    std.fs.cwd().deleteTree(root) catch {};
-    defer std.fs.cwd().deleteTree(root) catch {};
-    try std.fs.cwd().makePath(root);
-
-    const route_path = try std.fmt.allocPrint(allocator, "{s}/route.json", .{root});
-    defer allocator.free(route_path);
-    const session_dir = "/tmp/sessh-runtime-test/guid/s-550e8400-e29b-41d4-a716-446655440000";
-
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
-    try text.writer(allocator).print(
-        "{{\"guid\":\"s-550e8400-e29b-41d4-a716-446655440000\",\"session_dir\":{f},\"host\":\"work.example\",\"runtime_version\":\"0.5.0-test\",\"alive\":true,\"ssh_options\":[\"-F\"]}}\n",
-        .{std.json.fmt(session_dir, .{})},
-    );
-    const file = try std.fs.cwd().createFile(route_path, .{ .truncate = true, .mode = 0o600 });
-    try file.writeAll(text.items);
-    file.close();
-
-    var route = try readRoute(allocator, route_path);
-    defer route.deinit(allocator);
-    try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", route.guid);
-    try std.testing.expectEqualStrings(session_dir, route.session_dir);
-    try std.testing.expectEqualStrings("work.example", route.host);
-    try std.testing.expectEqualStrings("0.5.0-test", route.runtime_version);
-    try std.testing.expect(route.last_known_alive);
-    try std.testing.expectEqual(@as(usize, 1), route.ssh_options.len);
-    try std.testing.expectEqualStrings("-F", route.ssh_options[0]);
 }

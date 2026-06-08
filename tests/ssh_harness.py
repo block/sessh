@@ -1355,26 +1355,6 @@ def session_path(env, session_id=None):
     return sessions_dir(env) / canonical_guid(session_id)
 
 
-def route_file(env, session_id=None):
-    if session_id is None:
-        session_id = test_session_guid(1)
-    return fake_remote_state_sessions_dir(env) / canonical_guid(session_id) / "route.json"
-
-
-def session_compat_path(env, session_id=None):
-    return session_path(env, session_id) / "compat"
-
-
-def assert_session_compat_points_to_cached_artifact(env, artifact, session_id, context):
-    cached = artifact_cache_path(env, artifact)
-    compat = session_compat_path(env, session_id)
-    assert_cached_artifact(env, artifact, context)
-    if not compat.is_symlink():
-        raise AssertionError(f"{context}: session compat path is not a symlink")
-    if not compat.exists() or not os.path.samefile(cached, compat):
-        raise AssertionError(f"{context}: session compat path does not resolve to cached artifact")
-
-
 def assert_cached_artifact(env, artifact, context):
     cached = artifact_cache_path(env, artifact)
     if not cached.exists():
@@ -1383,20 +1363,6 @@ def assert_cached_artifact(env, artifact, context):
         raise AssertionError(f"{context}: cached artifact does not match source binary")
     if not os.access(cached, os.X_OK):
         raise AssertionError(f"{context}: cached artifact is not executable")
-
-
-def write_compat_marker(path, marker):
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.write_text(
-        "#!/bin/sh\n"
-        "printf 'compat_invoked=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
-        "printf 'compat_args=%s\\n' \"$*\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
-        "printf 'compat_env_guid=%s\\n' \"${SESSH_GUID-unset}\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
-        "printf 'compat_env_client_version=%s\\n' \"${SESSH_CLIENT_VERSION-unset}\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
-        "printf 'compat_env_compat=%s\\n' \"${SESSH_COMPAT-unset}\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
-        f"printf '{marker}\\n'\n"
-    )
-    path.chmod(0o700)
 
 
 def test_fake_ssh_exports_host_to_remote_command(tmp):

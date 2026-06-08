@@ -531,14 +531,6 @@ fn runRemoteNewSession(
     };
     defer session.deinit();
     session.setTitleFallback(target.host);
-    try attached_client.ensureLocalRouteForRemoteSession(
-        allocator,
-        &session,
-        target.host,
-        target.resolved_host,
-        target.resolved_port,
-        target.options,
-    );
     try runAttachedRemoteClient(
         allocator,
         exe,
@@ -1936,18 +1928,6 @@ fn nextReconnectAttemptAfterFailure(attempt: usize, reconnect_ui: *client_ui.Rec
 
 fn finishEndedRemoteSession(transport: *TerminalTransport, session: *attached_client.RuntimeSession) !u8 {
     const exit_status = session.endedProcessExitCode();
-    if (session.guidSlice().len > 0) {
-        var maybe_paths: ?session_registry.SessionPaths = session_registry.pathsForSessionId(std.heap.page_allocator, session.guidSlice()) catch |err| blk: {
-            client_log.debug("event=remote_session_route_cleanup_resolve_failed session={s} error={t}", .{ session.idSlice(), err });
-            break :blk null;
-        };
-        if (maybe_paths) |*paths| {
-            defer paths.deinit(std.heap.page_allocator);
-            session_registry.removeEndedHints(paths.*) catch |err| {
-                client_log.debug("event=remote_session_route_cleanup_failed session={s} error={t}", .{ session.idSlice(), err });
-            };
-        }
-    }
     session.restoreAttachedClientEndPresentationForExit();
     transport.closeStdin();
     transport.close();

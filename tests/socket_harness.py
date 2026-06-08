@@ -854,27 +854,6 @@ def guid_for_ref(ref):
     raise AssertionError(f"invalid guid ref: {ref}")
 
 
-def write_cached_remote_route(env, session_id, host, guid=None, alive=True, runtime_version="cached-test"):
-    guid = guid_for_ref(guid) if guid is not None else guid_for_ref(session_id)
-    route_dir = state_sessions_dir(env) / guid
-    route_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    remote_session_dir = f"/tmp/sessh-remote/guid/{guid}"
-    (route_dir / "route.json").write_text(
-        json.dumps(
-            {
-                "guid": guid,
-                "session_dir": remote_session_dir,
-                "host": host,
-                "runtime_version": runtime_version,
-                "alive": alive,
-                "ssh_options": [],
-            },
-            separators=(",", ":"),
-        )
-        + "\n"
-    )
-
-
 def assert_runtime_dir_symlink(env, expected_runtime_root):
     link = Path(env["XDG_CACHE_HOME"]) / "sessh" / "runtime_dir"
     if not link.is_symlink():
@@ -888,16 +867,6 @@ def session_dir(env, session_id=None):
     if session_id is None:
         session_id = test_session_guid(1)
     return sessions_dir(env) / guid_for_ref(session_id)
-
-
-def route_file(env, session_id=None):
-    if session_id is None:
-        session_id = test_session_guid(1)
-    return state_sessions_dir(env) / guid_for_ref(session_id) / "route.json"
-
-
-def runtime_log_file(env, session_id=None):
-    return route_file(env, session_id).parent / "runtime.log"
 
 
 def socket_path(env, session_id=None):
@@ -926,16 +895,23 @@ def start_daemon(env, session_id=None):
 
 def session_runtime_pids(env):
     pids = []
-    root = sessions_dir(env)
-    if root.exists():
-        for meta_file in sorted(root.glob("*/meta.json")):
-            try:
-                meta = json.loads(meta_file.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            pid = meta.get("runtime_pid")
-            if isinstance(pid, int):
-                pids.append(pid)
+    daemon_exe = socket_path(env).parent / "sesshd"
+    try:
+        output = subprocess.check_output(["ps", "-eo", "pid=,command="], text=True)
+    except subprocess.CalledProcessError:
+        return pids
+    needle = str(daemon_exe)
+    for line in output.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_text, command = parts
+        if needle not in command:
+            continue
+        try:
+            pids.append(int(pid_text))
+        except ValueError:
+            pass
     return pids
 
 
@@ -2938,13 +2914,10 @@ def run_broker_starts_daemon_session_test(base_env):
 
             session_1_guid = test_session_guid(1)
             session_path = session_dir(env, session_1_guid)
-            meta_file = session_path / "meta.json"
-            wait_file(meta_file)
-            meta = json.loads(meta_file.read_text())
-            if meta.get("type") != "local-session" or meta.get("version") != sessh_version():
-                raise AssertionError(meta)
-            if not os.path.islink(session_path / "compat"):
-                raise AssertionError("broker session did not write compat symlink")
+            for legacy_name in ("meta.json", "compat"):
+                legacy_path = session_path / legacy_name
+                if legacy_path.exists() or legacy_path.is_symlink():
+                    raise AssertionError(f"broker session wrote legacy file {legacy_path}")
             assert_runtime_dir_symlink(env, Path(env["XDG_RUNTIME_DIR"]))
 
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
@@ -2953,7 +2926,6 @@ def run_broker_starts_daemon_session_test(base_env):
             proc.wait(timeout=5.0)
             if proc.returncode != 0:
                 raise AssertionError(proc.stderr.read().decode("utf-8", "replace"))
-            wait_missing(session_path / "compat")
             wait_missing(session_path)
         finally:
             if proc.poll() is None:

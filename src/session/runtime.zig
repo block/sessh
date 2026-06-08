@@ -103,7 +103,6 @@ const SessionRuntime = struct {
     attached_client: AttachedClient = .{},
     running: bool = true,
     shutting_down: bool = false,
-    log_file: ?std.fs.File = null,
     monotonic_clock: ?std.time.Timer = null,
     fixed_session_id: ?[]const u8 = null,
     session_paths: ?session_registry.SessionPaths = null,
@@ -1225,14 +1224,8 @@ fn runSessionRuntimeLoop(session_dir: []const u8, shutdown_signal_fd: c.fd_t, co
     };
     defer if (session_runtime.session_paths) |*session_paths| session_paths.deinit(app_allocator.allocator());
 
-    defer session_registry.removeEndedHints(session_runtime.session_paths.?) catch {};
+    defer session_registry.removeSessionDir(session_runtime.session_paths.?) catch {};
 
-    try writeRuntimeCompatBinary(session_runtime.session_paths.?);
-    try session_registry.writeMeta(session_runtime.session_paths.?, c.getpid(), config.version);
-    try openSessionRuntimeLog(&session_runtime, session_runtime.session_paths.?);
-    defer closeSessionRuntimeLog(&session_runtime);
-    logSessionRuntime(&session_runtime, "event=session_runtime_start id={s}", .{fixed_session_id});
-    defer logSessionRuntime(&session_runtime, "event=session_runtime_stop id={s}", .{fixed_session_id});
     defer closeSessionRuntime(&session_runtime);
 
     while (session_runtime.running) {
@@ -1310,88 +1303,6 @@ fn lookupRuntime(guid: []const u8) ?*RuntimeControl {
         if (std.mem.eql(u8, control.guid, guid)) return control;
     }
     return null;
-}
-
-fn writeRuntimeCompatBinary(paths: session_registry.SessionPaths) !void {
-    try writeCompatBinaryTo(paths.compat);
-}
-
-fn writeCompatBinaryTo(compat_path: []const u8) !void {
-    const allocator = app_allocator.allocator();
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
-    defer allocator.free(exe_path);
-
-    const hash_hex = try sha256FileHex(exe_path);
-    const artifact_path = try socket_transport.cachedArtifactPath(allocator, config.version, &hash_hex);
-    defer allocator.free(artifact_path);
-    try ensureContentArtifact(exe_path, artifact_path, &hash_hex);
-
-    const compat_dir = std.fs.path.dirname(compat_path) orelse return error.InvalidCompatPath;
-    try std.fs.cwd().makePath(compat_dir);
-
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ compat_path, c.getpid() });
-    defer allocator.free(tmp_path);
-    std.fs.deleteFileAbsolute(tmp_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-
-    try posix.symlink(artifact_path, tmp_path);
-    try std.fs.renameAbsolute(tmp_path, compat_path);
-}
-
-fn ensureContentArtifact(exe_path: []const u8, artifact_path: []const u8, expected_hash_hex: []const u8) !void {
-    if (sha256FileHex(artifact_path)) |actual_hash| {
-        if (std.mem.eql(u8, &actual_hash, expected_hash_hex)) {
-            try chmodPath(artifact_path, 0o700);
-            return;
-        }
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
-
-    const artifact_dir = std.fs.path.dirname(artifact_path) orelse return error.InvalidArtifactPath;
-    try std.fs.cwd().makePath(artifact_dir);
-
-    const allocator = app_allocator.allocator();
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ artifact_path, c.getpid() });
-    defer allocator.free(tmp_path);
-    std.fs.deleteFileAbsolute(tmp_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-
-    try std.fs.copyFileAbsolute(exe_path, tmp_path, .{ .override_mode = 0o700 });
-    const copied_hash = try sha256FileHex(tmp_path);
-    if (!std.mem.eql(u8, &copied_hash, expected_hash_hex)) return error.ArtifactHashMismatch;
-    try std.fs.renameAbsolute(tmp_path, artifact_path);
-}
-
-fn sha256FileHex(path: []const u8) ![64]u8 {
-    var file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var buf: [16 * 1024]u8 = undefined;
-    while (true) {
-        const n = try file.read(&buf);
-        if (n == 0) break;
-        hasher.update(buf[0..n]);
-    }
-
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    return std.fmt.bytesToHex(digest, .lower);
-}
-
-fn chmodPath(path: []const u8, mode: c.mode_t) !void {
-    const path_z = try app_allocator.allocator().dupeZ(u8, path);
-    defer app_allocator.allocator().free(path_z);
-    switch (posix.errno(c.chmod(path_z.ptr, mode))) {
-        .SUCCESS => return,
-        else => return error.ChmodFailed,
-    }
 }
 
 fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, control: *RuntimeControl, shutdown_signal_fd: c.fd_t) !void {
@@ -1503,11 +1414,6 @@ fn endReapedSessions(session_runtime: *SessionRuntime, now_unix_ms: u64) bool {
     if (!sessionReapEnabled(session)) return false;
     const deadline_ms = session.disconnected_at_unix_ms +| session.reap_ms;
     if (now_unix_ms < deadline_ms) return false;
-    logSessionRuntime(session_runtime, "event=reaped id={s} disconnected_at_ms={} reap_ms={}", .{
-        session.idSlice(),
-        session.disconnected_at_unix_ms,
-        session.reap_ms,
-    });
     endSession(session_runtime, 3, .{ .ended_at_unix_ms = now_unix_ms });
     return true;
 }
@@ -1596,7 +1502,6 @@ fn handleRuntimeHandoffEvent(session_runtime: *SessionRuntime, control: *Runtime
 
     while (control.takePending()) |client_fd| {
         const keep_open = handleSessionRuntimeClient(session_runtime, client_fd) catch |err| blk: {
-            logSessionRuntime(session_runtime, "event=client_error error={t}", .{err});
             io.stderrPrint("sessh remote session runtime: client error: {t}\n", .{err}) catch {};
             break :blk false;
         };
@@ -1642,7 +1547,7 @@ fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !boo
                     return false;
                 };
                 defer request.deinit();
-                const session = try createSession(
+                _ = try createSession(
                     session_runtime,
                     request.resize.rows,
                     request.resize.cols,
@@ -1655,9 +1560,6 @@ fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !boo
                     request.tty_settings,
                     request.reap_ms,
                 );
-                if (session_runtime.session_paths) |paths| {
-                    try session_registry.writeLocalRoute(app_allocator.allocator(), session.idSlice(), paths.dir, config.version);
-                }
                 try attachSession(session_runtime, fd, request.resize, request.capture_tty_transcript);
                 return true;
             },
@@ -1680,41 +1582,11 @@ fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !boo
 fn requestGracefulShutdown(session_runtime: *SessionRuntime) void {
     if (session_runtime.shutting_down) return;
     session_runtime.shutting_down = true;
-    logSessionRuntime(session_runtime, "event=session_runtime_shutdown_requested", .{});
     if (session_runtime.session.alive) endSession(session_runtime, 1, .{ .ended_at_unix_ms = nowUnixMs() });
 }
 
-fn openSessionRuntimeLog(session_runtime: *SessionRuntime, paths: session_registry.SessionPaths) !void {
-    const log_path = try sessionRuntimeLogPath(app_allocator.allocator(), paths);
-    defer app_allocator.allocator().free(log_path);
-    const log_dir = std.fs.path.dirname(log_path) orelse return error.InvalidLogPath;
-    try std.fs.cwd().makePath(log_dir);
-    session_runtime.log_file = try std.fs.createFileAbsolute(log_path, .{ .truncate = true, .mode = 0o600 });
-}
-
-fn sessionRuntimeLogPath(allocator: std.mem.Allocator, paths: session_registry.SessionPaths) ![]u8 {
-    const state_session_dir = std.fs.path.dirname(paths.route) orelse return error.InvalidRoutePath;
-    return std.fmt.allocPrint(allocator, "{s}/runtime.log", .{state_session_dir});
-}
-
-fn closeSessionRuntimeLog(session_runtime: *SessionRuntime) void {
-    if (session_runtime.log_file) |*file| {
-        file.close();
-        session_runtime.log_file = null;
-    }
-}
-
-fn logSessionRuntime(session_runtime: *SessionRuntime, comptime fmt: []const u8, args: anytype) void {
-    if (session_runtime.log_file) |*file| {
-        var body_buf: [384]u8 = undefined;
-        const body = std.fmt.bufPrint(&body_buf, fmt, args) catch return;
-        var line_buf: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(&line_buf, "ts_ms={} {s}\n", .{ nowUnixMs(), body }) catch return;
-        file.writeAll(line) catch {};
-    }
-}
-
 fn acceptRemoteHandshake(session_runtime: *SessionRuntime, fd: c.fd_t) !HandshakeResult {
+    _ = session_runtime;
     var peer_hello = try readHelloRequest(fd);
     defer peer_hello.deinit(app_allocator.allocator());
     if (!helloRequestIsCompatible(peer_hello)) {
@@ -1725,11 +1597,7 @@ fn acceptRemoteHandshake(session_runtime: *SessionRuntime, fd: c.fd_t) !Handshak
     try sendHelloRequest(fd);
     var hello_error = try readHelloReply(fd);
     defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
-    if (hello_error) |err| {
-        logSessionRuntime(session_runtime, "event=handshake_rejected code={s} message={s}", .{
-            err.code,
-            err.message,
-        });
+    if (hello_error) |_| {
         return .mismatch;
     }
     return .accepted;
@@ -1799,7 +1667,7 @@ fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
 }
 
 fn sendError(session_runtime: *SessionRuntime, fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    logSessionRuntime(session_runtime, "event=error code={s} message={s}", .{ code, message });
+    _ = session_runtime;
     try sendErrorFrame(fd, code, message, hint);
 }
 
@@ -1814,7 +1682,7 @@ fn sendErrorFrame(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
 }
 
 fn queueAttachedClientError(session_runtime: *SessionRuntime, attached_client: *AttachedClient, code: []const u8, message: []const u8, hint: []const u8) !void {
-    logSessionRuntime(session_runtime, "event=error code={s} message={s}", .{ code, message });
+    _ = session_runtime;
     const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
         .code = code,
         .message = message,
@@ -2732,16 +2600,6 @@ fn createSession(
     @memcpy(session.id[0..session_guid.len], session_guid);
     session.id_len = session_guid.len;
     session_runtime.started_session = true;
-    logSessionRuntime(session_runtime, "event=session_create id={s} pid={} rows={} cols={} scrollback_rows={} shell={s} command_argc={} shell_command={}", .{
-        session.idSlice(),
-        child.pid,
-        rows,
-        cols,
-        scrollback_row_count,
-        shell_path,
-        command_argv.len,
-        shell_command != null,
-    });
     return session;
 }
 
@@ -2886,11 +2744,6 @@ fn attachSession(
         try sendSessionSnapshot(attached_client, session);
     }
     refreshAttachedFlag(session_runtime);
-    logSessionRuntime(session_runtime, "event=attach id={s} rows={} cols={} attached_client=1", .{
-        session.idSlice(),
-        resize.rows,
-        resize.cols,
-    });
     flushAttachedClientOutput(session_runtime);
 }
 
@@ -3076,11 +2929,6 @@ fn requestSessionPtyHangup(session_runtime: *SessionRuntime) void {
         return;
     }
 
-    logSessionRuntime(session_runtime, "event=session_pty_hangup_request id={s} pid={} pty_fd={}", .{
-        session.idSlice(),
-        session.pid,
-        session.pty_fd,
-    });
     disconnectAttachedClient(session_runtime);
     if (session.pty_fd >= 0) {
         _ = c.close(session.pty_fd);
@@ -3751,8 +3599,6 @@ fn disconnectAttachedClient(session_runtime: *SessionRuntime) void {
     const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
 
-    const session = &session_runtime.session;
-    logSessionRuntime(session_runtime, "event=attached_client_disconnected id={s} rows={} cols={}", .{ session.idSlice(), attached_client.rows, attached_client.cols });
     _ = c.close(attached_client.fd);
     attached_client.output.deinit(app_allocator.allocator());
     attached_client.* = AttachedClient{};
@@ -3791,37 +3637,20 @@ fn endSession(session_runtime: *SessionRuntime, reason: u8, exit_info: ExitInfo)
     session.clearPendingPlainOutput();
     session.synchronized_output_since_ms = 0;
 
-    if (exit_info.kind != 0) {
-        logSessionRuntime(session_runtime, "event=session_end id={s} pid={} reason={} exit_kind={} status={} ended_at_ms={}", .{
-            session.idSlice(),
-            session.pid,
-            reason,
-            exit_info.kind,
-            exit_info.status,
-            exit_info.ended_at_unix_ms,
-        });
-    } else {
-        logSessionRuntime(session_runtime, "event=session_end id={s} pid={} reason={} exit_kind=none status=none ended_at_ms={}", .{
-            session.idSlice(),
-            session.pid,
-            reason,
-            nowUnixMs(),
-        });
-    }
     sendSessionEndedToAttachedClient(session_runtime, reason, exit_info);
     if (session.pty_fd >= 0) _ = c.close(session.pty_fd);
     if (session.terminal_model) |model| {
         model.destroy();
         session.terminal_model = null;
     }
-    removeEndedHints(session_runtime);
+    removeSessionDir(session_runtime);
     session.deinit();
     session.alive = false;
     session.attached = false;
 }
 
-fn removeEndedHints(session_runtime: *SessionRuntime) void {
-    if (session_runtime.session_paths) |paths| session_registry.removeEndedHints(paths) catch {};
+fn removeSessionDir(session_runtime: *SessionRuntime) void {
+    if (session_runtime.session_paths) |paths| session_registry.removeSessionDir(paths) catch {};
 }
 
 fn stopSessionRuntimeIfComplete(session_runtime: *SessionRuntime) void {
