@@ -23,8 +23,8 @@ pub fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
     return shCommand(allocator, bootstrapper_script);
 }
 
-pub fn directBrokerCommand(allocator: std.mem.Allocator) ![]u8 {
-    return directEntrypointCommand(allocator, .broker, &.{});
+pub fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []const u8) ![]u8 {
+    return directEntrypointCommand(allocator, .broker, broker_args);
 }
 
 pub fn directEntrypointCommand(

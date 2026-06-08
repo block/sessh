@@ -12,6 +12,7 @@ const proxy_control = @import("../stream/proxy_control.zig");
 const sessh_cli = @import("../sessh/cli.zig");
 const config = @import("../core/config.zig");
 const daemon_client = @import("../daemon/client.zig");
+const daemon_socket_namespace = @import("../daemon/socket_namespace.zig");
 const frame_forwarder = @import("frame_forwarder.zig");
 const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
@@ -466,32 +467,6 @@ fn runRemoteNewSession(
     );
 }
 
-fn startRemoteSessionBroker(
-    allocator: std.mem.Allocator,
-    target: SshTarget,
-    artifacts: ?*const ArtifactSet,
-    remote_command: []const u8,
-    failure_policy: BootstrapFailurePolicy,
-) !RuntimeConnection {
-    return startRuntimeConnection(
-        allocator,
-        target,
-        artifacts,
-        remote_command,
-        .broker,
-        &.{},
-        false,
-        null,
-        false,
-        null,
-        -1,
-        -1,
-        null,
-        null,
-        failure_policy,
-    );
-}
-
 pub fn serveTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
@@ -505,10 +480,20 @@ pub fn serveTerminalTransportFromDaemon(
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
     const artifacts = if (artifacts_storage) |*value| value else null;
 
+    var broker_socket_dir: ?[]u8 = null;
+    defer if (broker_socket_dir) |dir| allocator.free(dir);
+    var broker_arg_storage: [1][]const u8 = undefined;
+    var broker_args: []const []const u8 = broker_arg_storage[0..0];
+    if (request.bootstrap) {
+        broker_socket_dir = try daemon_socket_namespace.defaultDirName(allocator);
+        broker_arg_storage[0] = broker_socket_dir.?;
+        broker_args = broker_arg_storage[0..1];
+    }
+
     const remote_command = if (request.bootstrap)
         try bootstrapCommand(allocator)
     else
-        try directBrokerCommand(allocator);
+        try directBrokerCommand(allocator, broker_args);
     defer allocator.free(remote_command);
 
     const diagnostic_pipe = try posix.pipe();
@@ -529,7 +514,7 @@ pub fn serveTerminalTransportFromDaemon(
         artifacts,
         remote_command,
         .broker,
-        &.{},
+        broker_args,
         request.batch_mode,
         null,
         false,
@@ -1816,13 +1801,22 @@ const StreamClientStarter = struct {
     pub fn start(self: *StreamClientStarter) !StreamClientTransport {
         self.recordFailureTerm(null);
         var failure_term: ?std.process.Child.Term = null;
+        var broker_socket_dir: ?[]u8 = null;
+        defer if (broker_socket_dir) |dir| self.allocator.free(dir);
+        var broker_arg_storage: [1][]const u8 = undefined;
+        var broker_args: []const []const u8 = broker_arg_storage[0..0];
+        if (self.artifacts != null) {
+            broker_socket_dir = try daemon_socket_namespace.defaultDirName(self.allocator);
+            broker_arg_storage[0] = broker_socket_dir.?;
+            broker_args = broker_arg_storage[0..1];
+        }
         const connection = startRuntimeConnection(
             self.allocator,
             self.target,
             self.artifacts,
             self.remote_command,
             .broker,
-            &.{},
+            broker_args,
             true,
             null,
             false,
@@ -1941,6 +1935,7 @@ fn runProxyStreamSsh(
         if (client_socket_allocation) |allocation| allocation.path else null,
         diagnostics_plan.command_level,
         diagnostics_plan.client_ctrl_r,
+        common.bootstrap,
     );
     defer allocator.free(proxy_command_option);
 
@@ -2090,6 +2085,7 @@ fn proxyCommandOption(
     client_socket: ?[]const u8,
     filter_level: config.FilterLevel,
     client_ctrl_r: bool,
+    bootstrap: bool,
 ) ![]u8 {
     var command: std.ArrayList(u8) = .empty;
     defer command.deinit(allocator);
@@ -2106,6 +2102,7 @@ fn proxyCommandOption(
     try appendShellToken(allocator, &command, "%r");
     try appendShellToken(allocator, &command, "--filter-level");
     try appendShellToken(allocator, &command, filter_level.label());
+    try appendShellToken(allocator, &command, if (bootstrap) "--bootstrap" else "--no-bootstrap");
     if (client_socket) |path| {
         try appendShellToken(allocator, &command, "--client-socket");
         try appendShellToken(allocator, &command, path);
@@ -2177,6 +2174,7 @@ const ProxyStreamInvocation = struct {
     client_socket: ?[]const u8 = null,
     filter_level: config.FilterLevel = .raw,
     client_ctrl_r: bool = false,
+    bootstrap: bool = true,
     ssh_options: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *ProxyStreamInvocation, allocator: std.mem.Allocator) void {
@@ -2209,9 +2207,14 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
     const default_ipqos_option = try resolved_ssh_config.defaultIpQosOption(allocator);
     defer if (default_ipqos_option) |option| allocator.free(option);
 
-    var artifacts = try loadArtifactSet(allocator);
-    defer artifacts.deinit();
-    const remote_command = try bootstrapCommand(allocator);
+    var artifacts_storage: ?ArtifactSet = if (invocation.bootstrap) try loadArtifactSet(allocator) else null;
+    defer if (artifacts_storage) |*artifacts| artifacts.deinit();
+    const artifacts = if (artifacts_storage) |*value| value else null;
+
+    const remote_command = if (invocation.bootstrap)
+        try bootstrapCommand(allocator)
+    else
+        try directBrokerCommand(allocator, &.{});
     defer allocator.free(remote_command);
 
     const stream_target = SshTarget{
@@ -2224,7 +2227,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, _: []const u8, args: []const
     var starter = StreamClientStarter{
         .allocator = allocator,
         .target = stream_target,
-        .artifacts = &artifacts,
+        .artifacts = artifacts,
         .remote_command = remote_command,
         .stderr_mode = .forward,
     };
@@ -2321,6 +2324,12 @@ fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []cons
             i += 1;
             if (i >= args.len or args[i].len == 0) return error.MissingClientCtrlR;
             invocation.client_ctrl_r = parseProxyBool(args[i]) catch return error.InvalidClientCtrlR;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--bootstrap")) {
+            invocation.bootstrap = true;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--no-bootstrap")) {
+            invocation.bootstrap = false;
             i += 1;
         } else {
             return error.InvalidProxyStreamArgs;
@@ -2707,7 +2716,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(shouldUseProxyStreamForTest(parsed, true));
 
-    const option = try proxyCommandOption(std.testing.allocator, "sessh-dev", parsed.invocation.ssh_options, "/tmp/sessh-test/c/abc", .hygienic, true);
+    const option = try proxyCommandOption(std.testing.allocator, "sessh-dev", parsed.invocation.ssh_options, "/tmp/sessh-test/c/abc", .hygienic, true, true);
     defer std.testing.allocator.free(option);
 
     try std.testing.expect(std.mem.indexOf(u8, option, ":internal-proxy-stream:") != null);
@@ -2716,6 +2725,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "%r") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--filter-level") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "hygienic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "--bootstrap") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--client-socket") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "/tmp/sessh-test/c/abc") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--client-ctrl-r") != null);
@@ -2725,6 +2735,10 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "8080:localhost:80") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "'-X'") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "'-tt'") == null);
+
+    const no_bootstrap_option = try proxyCommandOption(std.testing.allocator, "sessh-dev", parsed.invocation.ssh_options, null, .raw, false, false);
+    defer std.testing.allocator.free(no_bootstrap_option);
+    try std.testing.expect(std.mem.indexOf(u8, no_bootstrap_option, "--no-bootstrap") != null);
 }
 
 test "stream routing preserves ssh remote command tty semantics" {

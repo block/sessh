@@ -13,6 +13,7 @@ from harness_cleanup import cleanup_runtime
 from socket_harness import (
     SESSION_CLIENT_CONTROL_RESPONSE,
     SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
+    daemon_socket_dir_name,
     recv_until_message,
     send_frame,
     send_hello,
@@ -133,7 +134,7 @@ def sever_attached_clients(env, timeout=10.0):
     runtime_root = Path(env.get("SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR", env["XDG_RUNTIME_DIR"] + ".remote"))
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
-        conn.connect(str(runtime_root / "d" / "sesshd.sock"))
+        conn.connect(str(runtime_root / daemon_socket_dir_name() / "sesshd.sock"))
         send_hello(conn)
         send_frame(conn, SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST, request.SerializeToString())
         recv_until_message(conn, SESSION_CLIENT_CONTROL_RESPONSE, timeout=timeout)

@@ -557,7 +557,7 @@ def sever_session_clients(env, timeout=30.0):
     request = sessh_pb().TeSessionClientDebugSeverConnectionRequest()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
-        conn.connect(str(fake_remote_runtime_root(env) / "d" / "sesshd.sock"))
+        conn.connect(str(daemon_socket_path(fake_remote_runtime_root(env))))
         send_hello(conn)
         send_frame(conn, SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST, request.SerializeToString())
         recv_until_message(conn, SESSION_CLIENT_CONTROL_RESPONSE, timeout=timeout)
@@ -567,7 +567,7 @@ def make_session_clients_unresponsive(env, seconds, timeout=30.0):
     request = sessh_pb().TeSessionClientDebugUnresponsiveConnectionRequest(seconds=seconds)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
-        conn.connect(str(fake_remote_runtime_root(env) / "d" / "sesshd.sock"))
+        conn.connect(str(daemon_socket_path(fake_remote_runtime_root(env))))
         send_hello(conn)
         send_frame(conn, SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST, request.SerializeToString())
         recv_until_message(conn, SESSION_CLIENT_CONTROL_RESPONSE, timeout=timeout)
@@ -1068,6 +1068,21 @@ def sessh_version():
         if line.startswith("pub const version = "):
             return line.split('"')[1]
     raise AssertionError("could not find sessh version")
+
+
+def daemon_socket_dir_name():
+    version = sessh_version()
+    parts = version.removesuffix("-dev").split(".")
+    if len(parts) < 1:
+        raise AssertionError(f"unexpected sessh version: {version}")
+    base = parts[0]
+    if not version.endswith("-dev"):
+        return base
+    return f"{base}.dev.{hashlib.sha256(remote_path_artifact().read_bytes()).hexdigest()[:8]}"
+
+
+def daemon_socket_path(runtime_root):
+    return runtime_root / daemon_socket_dir_name() / "sesshd.sock"
 
 
 def state_root(env):
@@ -2678,6 +2693,12 @@ def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
     (fake_bin / "sessh").write_text(
         "#!/bin/sh\n"
         "printf 'direct_broker=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "printf 'direct_broker_argc=%s\\n' \"$#\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "i=1\n"
+        "for arg in \"$@\"; do\n"
+        "  printf 'direct_broker_arg%s=%s\\n' \"$i\" \"$arg\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "  i=$((i + 1))\n"
+        "done\n"
         f"exec {shlex.quote(str(BIN))} \"$@\"\n"
     )
     (fake_bin / "sessh").chmod(0o700)
@@ -2693,6 +2714,8 @@ def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if "direct_broker=1" not in log_text:
+        raise AssertionError(log_text)
+    if "direct_broker_argc=1" not in log_text or "direct_broker_arg1=:internal-broker:" not in log_text:
         raise AssertionError(log_text)
     if "bootstrapper=1" in log_text:
         raise AssertionError(log_text)

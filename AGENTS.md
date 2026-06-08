@@ -11,8 +11,8 @@ scripts/check --fast
 ```
 
 Also run the specific tests that cover the code paths you changed. Do not run
-`scripts/check --ci` unless the user asks for it. If `--ci` seems warranted,
-tell the user why and ask before running it.
+`scripts/check` with `--ci` or `--full` unless the user asks for it. If
+`--ci`/`--full` seems warranted, tell the user why and ask before running it.
 
 ## Docs
 

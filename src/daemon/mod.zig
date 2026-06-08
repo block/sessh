@@ -8,6 +8,7 @@ const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const session_daemon_handler = @import("../session/daemon_handler.zig");
+const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
 const stream_runtime = @import("../stream/runtime.zig");
 const transport_ssh = @import("../transport/ssh.zig");
@@ -16,9 +17,13 @@ const hpb = protocol.hpb;
 const pb = protocol.pb;
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
-    const root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(root);
-    return std.fmt.allocPrint(allocator, "{s}/d/sesshd.sock", .{root});
+    const dir_name = try socket_namespace.defaultDirName(allocator);
+    defer allocator.free(dir_name);
+    return socketPathForDirName(allocator, dir_name);
+}
+
+pub fn socketPathForDirName(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
+    return socket_namespace.socketPath(allocator, dir_name);
 }
 
 pub fn connect(allocator: std.mem.Allocator) !c.fd_t {
@@ -28,7 +33,13 @@ pub fn connect(allocator: std.mem.Allocator) !c.fd_t {
 }
 
 pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
-    const fd = try connectOrStart(allocator, exe);
+    const dir_name = try socket_namespace.defaultDirName(allocator);
+    defer allocator.free(dir_name);
+    return ensureStartedForDirName(allocator, exe, dir_name);
+}
+
+fn ensureStartedForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !void {
+    const fd = try connectOrStartForDirName(allocator, exe, dir_name);
     defer _ = c.close(fd);
     try protocol.sendPing(fd);
     var frame = try protocol.readFrameAlloc(allocator, fd);
@@ -36,17 +47,24 @@ pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
     if (frame.message_type != .pong) return error.UnexpectedDaemonFrame;
 }
 
-pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8) !void {
-    try ensureStarted(allocator, exe);
-    const fd = try connect(allocator);
+pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+    if (args.len > 1) {
+        try io.writeAll(2, "sessh: :internal-broker: accepts at most one daemon socket namespace\n");
+        return error.InvalidBrokerArgs;
+    }
+    const dir_name = if (args.len == 1) args[0] else try socket_namespace.defaultDirName(allocator);
+    defer if (args.len == 0) allocator.free(dir_name);
+
+    try ensureStartedForDirName(allocator, exe, dir_name);
+    const fd = try connectForDirName(allocator, dir_name);
     defer _ = c.close(fd);
     try forwardBrokerFramesToDaemon(allocator, 0, 1, fd);
 }
 
-fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
-    if (connectAndHandshake(allocator)) |fd| return fd else |_| {}
+fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
+    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
 
-    const argv = [_][]const u8{ exe, ":internal-daemon:" };
+    const argv = [_][]const u8{ exe, ":internal-daemon:", dir_name };
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
@@ -56,14 +74,20 @@ fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
 
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
-        if (connectAndHandshake(allocator)) |fd| return fd else |_| {}
+        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
         io.sleepMillis(20);
     }
     return error.DaemonDidNotStart;
 }
 
-fn connectAndHandshake(allocator: std.mem.Allocator) !c.fd_t {
-    const fd = try connect(allocator);
+fn connectForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
+    const path = try socketPathForDirName(allocator, dir_name);
+    defer allocator.free(path);
+    return socket_transport.connectSocket(path);
+}
+
+fn connectAndHandshakeForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
+    const fd = try connectForDirName(allocator, dir_name);
     errdefer _ = c.close(fd);
     try initiateHandshake(allocator, fd);
     return fd;
@@ -129,16 +153,18 @@ fn copyFrame(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !b
 pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     core_fds.closeInheritedNonStdioFileDescriptors();
 
-    if (args.len != 0) {
-        try io.writeAll(2, "sessh: :internal-daemon: does not accept command arguments\n");
+    if (args.len > 1) {
+        try io.writeAll(2, "sessh: :internal-daemon: accepts at most one daemon socket namespace\n");
         return error.InvalidDaemonArgs;
     }
+    const dir_name = if (args.len == 1) args[0] else try socket_namespace.defaultDirName(allocator);
+    defer if (args.len == 0) allocator.free(dir_name);
 
     const daemon_exe = try allocator.dupe(u8, exe);
     defer allocator.free(daemon_exe);
 
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
-    const path = try socketPath(allocator);
+    const path = try socketPathForDirName(allocator, dir_name);
     defer allocator.free(path);
 
     if (socket_transport.connectSocket(path)) |fd| {
@@ -375,7 +401,7 @@ fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8
 
 test "daemon socket path uses runtime root" {
     const allocator = std.testing.allocator;
-    const path = try socketPath(allocator);
+    const path = try socketPathForDirName(allocator, "1.dev.abcdef12");
     defer allocator.free(path);
-    try std.testing.expect(std.mem.endsWith(u8, path, "/d/sesshd.sock"));
+    try std.testing.expect(std.mem.endsWith(u8, path, "/1.dev.abcdef12/sesshd.sock"));
 }

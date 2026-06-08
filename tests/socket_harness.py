@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import os
 import pty
 import re
@@ -144,6 +145,17 @@ def sessh_version():
         if line.startswith("pub const version = "):
             return line.split('"')[1]
     raise AssertionError("could not find sessh version")
+
+
+def daemon_socket_dir_name():
+    version = sessh_version()
+    parts = version.removesuffix("-dev").split(".")
+    if len(parts) < 1:
+        raise AssertionError(f"unexpected sessh version: {version}")
+    base = parts[0]
+    if not version.endswith("-dev"):
+        return base
+    return f"{base}.dev.{hashlib.sha256(BIN.read_bytes()).hexdigest()[:8]}"
 
 
 KITTY_KEYBOARD_QUERY = b"\x1b[?u"
@@ -741,7 +753,7 @@ def runtime_log_file(env, session_id=None):
 
 def socket_path(env, session_id=None):
     _ = session_id
-    return runtime_root(env) / "d" / "sesshd.sock"
+    return runtime_root(env) / daemon_socket_dir_name() / "sesshd.sock"
 
 
 def start_daemon(env, session_id=None):
@@ -1011,12 +1023,12 @@ def run_daemon_ping_test(env):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    socket_path = Path(env["XDG_RUNTIME_DIR"]) / "d" / "sesshd.sock"
+    daemon_socket_path = socket_path(env)
     try:
-        wait_file(socket_path)
+        wait_file(daemon_socket_path)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(5.0)
-            sock.connect(str(socket_path))
+            sock.connect(str(daemon_socket_path))
             send_hello(sock)
             send_frame(sock, PING, sessh_pb().Ping().SerializeToString())
             message_type, payload = recv_frame(sock)

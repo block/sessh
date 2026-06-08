@@ -5,14 +5,21 @@ as `sessh`, entered internally as `sessh :internal-daemon:`, but installed under
 a separate name so users can kill visible `sessh` clients without killing the
 cleanup owner.
 
-There is one local Unix-domain socket:
+There is one local Unix-domain socket per compatible build namespace:
 
 ```text
-d/sesshd.sock
+<major>/sesshd.sock
+<major.dev.hash>/sesshd.sock
 ```
 
 Public `sessh` invocations connect to that socket, starting the daemon when it
-is missing or stale. Remote bootstrap does the same thing on the server side.
+is missing or stale. Dev builds include a short executable hash in the
+namespace, so a local rebuild naturally starts a fresh daemon. Remote bootstrap
+passes the client-selected namespace into `:internal-broker:` so the remote side
+does not need to derive it independently. With `--no-bootstrap`, no namespace is
+passed; the remote broker uses its own default namespace and the handshake
+catches version mismatches. Minor version compatibility remains a protocol
+handshake concern, not a socket-name concern.
 
 # Filter Levels
 

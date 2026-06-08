@@ -11,10 +11,11 @@ If `XDG_RUNTIME_DIR` is missing, sessh falls back to `/tmp/sessh-<uid>`.
 
 # Runtime
 
-The stable local daemon socket lives at:
+The local daemon socket is scoped by compatibility namespace:
 
 ```text
-d/sesshd.sock
+<major>/sesshd.sock
+<major.dev.hash>/sesshd.sock
 ```
 
 Runtime GUID directories live under `guid/<s-guid>/` for terminal-emulator

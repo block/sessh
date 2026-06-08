@@ -5,14 +5,19 @@ const app_allocator = @import("../core/app_allocator.zig");
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
+const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
 
 const hpb = protocol.hpb;
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
-    const root = try socket_transport.runtimeRoot(allocator);
-    defer allocator.free(root);
-    return std.fmt.allocPrint(allocator, "{s}/d/sesshd.sock", .{root});
+    const dir_name = try socket_namespace.defaultDirName(allocator);
+    defer allocator.free(dir_name);
+    return socketPathForDirName(allocator, dir_name);
+}
+
+pub fn socketPathForDirName(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
+    return socket_namespace.socketPath(allocator, dir_name);
 }
 
 pub fn connect(allocator: std.mem.Allocator) !c.fd_t {
@@ -31,9 +36,15 @@ pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
 }
 
 pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
-    if (connectAndHandshake(allocator)) |fd| return fd else |_| {}
+    const dir_name = try socket_namespace.defaultDirName(allocator);
+    defer allocator.free(dir_name);
+    return connectOrStartForDirName(allocator, exe, dir_name);
+}
 
-    const argv = [_][]const u8{ exe, ":internal-daemon:" };
+pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
+    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
+
+    const argv = [_][]const u8{ exe, ":internal-daemon:", dir_name };
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
@@ -43,14 +54,22 @@ pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
 
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
-        if (connectAndHandshake(allocator)) |fd| return fd else |_| {}
+        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
         io.sleepMillis(20);
     }
     return error.DaemonDidNotStart;
 }
 
 pub fn connectAndHandshake(allocator: std.mem.Allocator) !c.fd_t {
-    const fd = try connect(allocator);
+    const dir_name = try socket_namespace.defaultDirName(allocator);
+    defer allocator.free(dir_name);
+    return connectAndHandshakeForDirName(allocator, dir_name);
+}
+
+pub fn connectAndHandshakeForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
+    const path = try socketPathForDirName(allocator, dir_name);
+    defer allocator.free(path);
+    const fd = try socket_transport.connectSocket(path);
     errdefer _ = c.close(fd);
     try initiateHandshake(allocator, fd);
     return fd;
