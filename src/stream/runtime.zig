@@ -4,6 +4,7 @@ const posix = std.posix;
 
 const io = @import("../core/io.zig");
 const app_allocator = @import("../core/app_allocator.zig");
+const daemon_log = @import("../daemon/log.zig");
 const protocol = @import("../protocol/mod.zig");
 const client_log = @import("../core/client_log.zig");
 const proxy_control = @import("proxy_control.zig");
@@ -846,7 +847,9 @@ const ProxyEndpoint = struct {
     fd: c.fd_t,
 
     fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16) !ProxyEndpoint {
+        daemon_log.infof(allocator, "proxy tcp connection starting host={s} port={}", .{ host, port });
         const stream = try std.net.tcpConnectToHost(allocator, host, port);
+        daemon_log.infof(allocator, "proxy tcp connection ready host={s} port={}", .{ host, port });
         return .{
             .stream = stream,
             .fd = stream.handle,

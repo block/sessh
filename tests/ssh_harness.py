@@ -615,6 +615,17 @@ def read_available_pipe(pipe, timeout=0.25):
         data += chunk
 
 
+def terminate_process(proc):
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2.0)
+
+
 def wait_for_path(path, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1238,7 +1249,23 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
+    log_proc = subprocess.Popen(
+        sessh_argv(["--daemon-log"]),
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
+        if b"daemon started socket=" in daemon_log_output:
+            raise AssertionError(f"daemon log replayed old entries: {daemon_log_output!r}")
+
+        result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
+        daemon_log_output += read_until_pipe(log_proc.stdout, b"terminal transport ready host=test-host", timeout=5.0)
+    finally:
+        terminate_process(log_proc)
 
     if not fake_log.exists():
         raise AssertionError(ssh_failure_diagnostics("fake ssh was not invoked", result, fake_log, fake_trace))
@@ -1289,6 +1316,19 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     if routes:
         raise AssertionError(f"completed uploaded session left route files: {routes}")
 
+    daemon_log_stdout = daemon_log_output.decode("utf-8", "replace")
+    for expected in (
+        "terminal transport opening host=test-host",
+        "ssh transport starting host=test-host bootstrap=true",
+        "bootstrap upload required host=test-host",
+        "bootstrap completed host=test-host uploaded=true",
+        "terminal transport ready host=test-host",
+    ):
+        if expected not in daemon_log_stdout:
+            raise AssertionError(
+                ssh_failure_diagnostics(f"daemon log missing {expected!r}", result, fake_log, fake_trace)
+            )
+
 
 def test_ssh_transport_cache_hit_suppresses_bootstrap_status(tmp):
     env = isolated_env(tmp)
@@ -1313,7 +1353,28 @@ def test_ssh_transport_cache_hit_suppresses_bootstrap_status(tmp):
     env["SHELL"] = str(remote_shell)
 
     installed = seed_remote_artifact_cache(env)
-    result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
+    log_proc = subprocess.Popen(
+        sessh_argv(["--daemon-log"]),
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
+        if b"daemon started socket=" in daemon_log_output:
+            raise AssertionError(f"daemon log replayed old entries: {daemon_log_output!r}")
+
+        result = run_sessh(["-F", str(fake_config), "test-host"], env, timeout=30.0)
+        daemon_log_output += read_until_pipe(
+            log_proc.stdout,
+            b"bootstrap skipped host=test-host reason=remote_artifact_present",
+            timeout=5.0,
+        )
+    finally:
+        terminate_process(log_proc)
+
     if result.returncode != 0:
         raise AssertionError(ssh_failure_diagnostics("sessh returned non-zero on cache hit", result, fake_log, fake_trace))
     if marker not in result.stdout:
@@ -1330,6 +1391,10 @@ def test_ssh_transport_cache_hit_suppresses_bootstrap_status(tmp):
         raise AssertionError(result)
     if f"SESSH_BIN={installed.resolve()}" not in result.stdout:
         raise AssertionError(result)
+
+    expected = "bootstrap skipped host=test-host reason=remote_artifact_present"
+    if expected not in daemon_log_output.decode("utf-8", "replace"):
+        raise AssertionError(ssh_failure_diagnostics(f"daemon log missing {expected!r}", result, fake_log, fake_trace))
 
 
 def test_ssh_clean_remote_exit_removes_routes(tmp):

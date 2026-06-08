@@ -30,10 +30,13 @@ Sessh accepts normal ssh options, plus a small set of sessh-specific options:
 - `--terminal-emulator` / `--no-terminal-emulator`
 - `--filter-level raw|hygienic|emulated`
 - `--capture-tty-transcript PATH.tar.gz`
+- `--daemon-log`
 
 `--filter-level emulated` is the default and naturally degrades when OpenSSH
 must own the stream. `raw` suppresses reconnect diagnostics, and `hygienic`
 uses the side-channel path when the visible client can support it.
+
+`--daemon-log` follows new local daemon log entries on stdout until stopped.
 
 # Config File
 

@@ -12,6 +12,7 @@ const proxy_control = @import("../stream/proxy_control.zig");
 const sessh_cli = @import("../sessh/cli.zig");
 const config = @import("../core/config.zig");
 const daemon_client = @import("../daemon/client.zig");
+const daemon_log = @import("../daemon/log.zig");
 const daemon_socket_namespace = @import("../daemon/socket_namespace.zig");
 const frame_forwarder = @import("frame_forwarder.zig");
 const io = @import("../core/io.zig");
@@ -475,6 +476,11 @@ pub fn serveTerminalTransportFromDaemon(
     var resolved_target = try resolveSshTarget(allocator, request.ssh_option.items, request.host);
     defer resolved_target.deinit(allocator);
     const target = resolved_target.target;
+    daemon_log.infof(
+        allocator,
+        "terminal transport opening host={s} resolved={s}:{s} bootstrap={}",
+        .{ target.host, target.resolved_host, target.resolved_port, request.bootstrap },
+    );
 
     var artifacts_storage: ?ArtifactSet = if (request.bootstrap) try loadArtifactSet(allocator) else null;
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
@@ -547,6 +553,7 @@ pub fn serveTerminalTransportFromDaemon(
     defer child.terminate();
 
     try frame_forwarder.forwardRawTransportDiagnostics(client_fd, diagnostic_pipe[0]);
+    daemon_log.infof(allocator, "terminal transport ready host={s}", .{target.host});
     try sendTerminalTransportReady(client_fd);
     try frame_forwarder.forwardFramesBetweenWithClientCloseActionAndDiagnostics(
         client_fd,
@@ -1594,6 +1601,7 @@ fn startRuntimeConnection(
     ssh_argv[arg_index] = "-T";
     ssh_argv[arg_index + 1] = target.host;
     ssh_argv[ssh_argv.len - 1] = remote_command;
+    daemon_log.infof(allocator, "ssh transport starting host={s} bootstrap={}", .{ target.host, artifacts != null });
 
     var child = std.process.Child.init(ssh_argv, allocator);
     child.expand_arg0 = .expand;
@@ -1602,6 +1610,7 @@ fn startRuntimeConnection(
     child.stderr_behavior = .Pipe;
     child.env_map = env_map;
     try child.spawn();
+    daemon_log.infof(allocator, "ssh transport started host={s}", .{target.host});
     var connection = RuntimeConnection{ .child = child };
     const stderr_file = connection.child.stderr.?;
     connection.child.stderr = null;
@@ -1611,7 +1620,10 @@ fn startRuntimeConnection(
         return err;
     };
 
-    const artifact_set = artifacts orelse return connection;
+    const artifact_set = artifacts orelse {
+        daemon_log.infof(allocator, "bootstrap skipped host={s} reason=disabled", .{target.host});
+        return connection;
+    };
 
     const stdin_fd = connection.child.stdin.?.handle;
     if (bootstrap_entrypoint) |entrypoint| {
@@ -1653,6 +1665,7 @@ fn startRuntimeConnection(
     };
     defer allocator.free(line);
 
+    var uploaded_bootstrap_artifact = false;
     if (std.mem.startsWith(u8, line, "MISSING ")) {
         const remote_platform = parseMissingPlatform(line) catch {
             connection.closeStdin();
@@ -1678,6 +1691,11 @@ fn startRuntimeConnection(
             );
             return process_exit.request(1);
         };
+        daemon_log.infof(
+            allocator,
+            "bootstrap upload required host={s} platform={s}/{s}",
+            .{ target.host, remote_platform.os, remote_platform.arch },
+        );
 
         var bootstrap_status_visible = false;
         defer clearClientBootstrapStatusOn(&bootstrap_status_visible, bootstrap_status_client_fd);
@@ -1692,6 +1710,7 @@ fn startRuntimeConnection(
             _ = connection.wait() catch {};
             return err;
         };
+        uploaded_bootstrap_artifact = true;
 
         allocator.free(line);
         line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
@@ -1710,6 +1729,11 @@ fn startRuntimeConnection(
     }
 
     if (std.mem.eql(u8, line, "OK")) {
+        if (uploaded_bootstrap_artifact) {
+            daemon_log.infof(allocator, "bootstrap completed host={s} uploaded=true", .{target.host});
+        } else {
+            daemon_log.infof(allocator, "bootstrap skipped host={s} reason=remote_artifact_present", .{target.host});
+        }
         if (exec_args.len == 0) connection.suppressSshStderr();
         return connection;
     }

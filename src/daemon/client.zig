@@ -9,6 +9,7 @@ const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
 
 const hpb = protocol.hpb;
+const pb = protocol.pb;
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
     const dir_name = try socket_namespace.defaultDirName(allocator);
@@ -58,6 +59,36 @@ pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, d
         io.sleepMillis(20);
     }
     return error.DaemonDidNotStart;
+}
+
+pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
+    const fd = try connectOrStart(allocator, exe);
+    defer _ = c.close(fd);
+
+    const request_payload = try protocol.encodePayload(allocator, pb.DaemonLogRequest{});
+    defer allocator.free(request_payload);
+    try protocol.sendFrame(fd, .daemon_log_request, request_payload);
+
+    while (true) {
+        var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return err,
+        };
+        defer frame.deinit(allocator);
+        switch (frame.message_type) {
+            .daemon_log_entry => {
+                var entry = try protocol.decodePayload(pb.DaemonLogEntry, allocator, frame.payload);
+                defer entry.deinit(allocator);
+                const line = try std.fmt.allocPrint(allocator, "{} {s}\n", .{ entry.unix_ms, entry.message });
+                defer allocator.free(line);
+                try io.writeAll(1, line);
+            },
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
+            },
+            else => return error.UnexpectedDaemonFrame,
+        }
+    }
 }
 
 pub fn connectAndHandshake(allocator: std.mem.Allocator) !c.fd_t {

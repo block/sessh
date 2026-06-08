@@ -665,6 +665,23 @@ def recv_exact(conn, length):
     return data
 
 
+def read_until_pipe(pipe, needle, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    data = b""
+    while needle not in data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"timed out waiting for {needle!r}; got {data!r}")
+        ready, _, _ = select.select([pipe], [], [], remaining)
+        if not ready:
+            raise AssertionError(f"timed out waiting for {needle!r}; got {data!r}")
+        chunk = os.read(pipe.fileno(), 4096)
+        if not chunk:
+            raise AssertionError(f"process exited before {needle!r}; got {data!r}")
+        data += chunk
+    return data
+
+
 def sessions_dir(env):
     runtime_dir = env.get("XDG_RUNTIME_DIR")
     if not runtime_dir:
@@ -1044,6 +1061,60 @@ def run_daemon_ping_test(env):
             proc.kill()
             proc.wait(timeout=5.0)
         cleanup_runtime(env)
+
+
+def run_daemon_log_test(_base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-daemon-log-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        cleanup_runtime(env)
+        proc = start_daemon(env)
+        log_proc = None
+        try:
+            log_proc = subprocess.Popen(
+                [str(BIN), "--daemon-log"],
+                cwd=ROOT,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            output = read_until_pipe(log_proc.stdout, b"daemon log subscribed")
+            if b"daemon started socket=" in output:
+                raise AssertionError(f"daemon log replayed old entries: {output!r}")
+
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5.0)
+                sock.connect(str(socket_path(env)))
+                send_hello(sock)
+                send_frame(sock, PING, sessh_pb().Ping().SerializeToString())
+                message_type, _payload = recv_frame(sock)
+                if message_type != PONG:
+                    raise AssertionError(f"expected PONG from sesshd, got {message_type}")
+
+            output += read_until_pipe(log_proc.stdout, b"client hello completed")
+            output = output.decode("utf-8", "replace")
+            for expected in (
+                "daemon log subscribed",
+                "client connected",
+                "client hello completed",
+            ):
+                if expected not in output:
+                    raise AssertionError(f"daemon log missing {expected!r}: {output!r}")
+        finally:
+            if log_proc is not None and log_proc.poll() is None:
+                log_proc.terminate()
+                try:
+                    log_proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    log_proc.kill()
+                    log_proc.wait(timeout=2.0)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
+            cleanup_runtime(env)
 
 
 def run_minor_version_compatibility_test(base_env):
@@ -2647,6 +2718,7 @@ def main():
 
             run_login_shell_profile_test(env)
             run_daemon_ping_test(env)
+            run_daemon_log_test(env)
             run_session_create_command_argv_test(env)
             run_session_create_shell_command_test(env)
             run_session_create_tty_settings_test(env)

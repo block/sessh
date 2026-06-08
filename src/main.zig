@@ -55,6 +55,7 @@ fn runMain() !void {
         try io.writeAll(1, "sessh " ++ config.version ++ "\n");
         return;
     }
+    if (topLevelArgIs(args, &.{"--daemon-log"})) return daemon_client.printDaemonLog(allocator, args[0]);
 
     try daemon_client.ensureStarted(allocator, args[0]);
     return transport_ssh.run(allocator, args);
@@ -62,6 +63,7 @@ fn runMain() !void {
 
 test "sessh top-level options do not match remote command arguments" {
     try std.testing.expect(topLevelArgIs(&.{ "sessh-dev", "--version" }, &.{"--version"}));
+    try std.testing.expect(topLevelArgIs(&.{ "sessh-dev", "--daemon-log" }, &.{"--daemon-log"}));
     try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "-V" }));
     try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "-vV", "example.com" }));
     try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "--no-terminal-emulator", "-V", "example.com" }));
@@ -74,6 +76,7 @@ fn usage(code: u8) !void {
     const text =
         \\usage:
         \\  sessh [ssh-option ...] destination [command argument ...]
+        \\  sessh --daemon-log
         \\
         \\sessh wraps ssh, making sessions persistent and automatically
         \\reconnecting when ssh drops.
@@ -151,6 +154,7 @@ test {
     _ = @import("core/process_exit.zig");
     _ = @import("core/shell.zig");
     _ = @import("daemon/client.zig");
+    _ = @import("daemon/log.zig");
     _ = @import("daemon/mod.zig");
     _ = @import("protocol/mod.zig");
     _ = @import("reconnect/control.zig");

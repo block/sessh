@@ -8,6 +8,7 @@ const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const session_daemon_handler = @import("../session/daemon_handler.zig");
+const daemon_log = @import("log.zig");
 const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
 const stream_runtime = @import("../stream/runtime.zig");
@@ -174,6 +175,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 
     const listen_fd = try socket_transport.listenSocket(path);
     defer _ = c.close(listen_fd);
+    daemon_log.infof(allocator, "daemon started socket={s}", .{path});
 
     var daemon_dispatcher = try dispatcher.Dispatcher.init(allocator);
     defer daemon_dispatcher.deinit();
@@ -210,6 +212,7 @@ fn acceptDaemonClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher
 
     const client_fd = c.accept(accept_context.listen_fd, null, null);
     if (client_fd < 0) return;
+    daemon_log.infof(accept_context.allocator, "client connected", .{});
     socket_transport.setCloseOnExec(client_fd) catch {
         _ = c.close(client_fd);
         return;
@@ -249,6 +252,7 @@ fn clientThread(context: *ClientContext) void {
 fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void {
     const handshake_result = try acceptHandshake(allocator, fd);
     if (handshake_result == .mismatch) return;
+    daemon_log.infof(allocator, "client hello completed", .{});
 
     while (true) {
         var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
@@ -276,15 +280,43 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                 return;
             },
             .client_te_transport_open => {
+                daemon_log.infof(allocator, "terminal transport requested", .{});
                 var request = try protocol.decodePayload(pb.ClientTeTransportOpen, allocator, frame.payload);
                 defer request.deinit(allocator);
                 try transport_ssh.serveTerminalTransportFromDaemon(allocator, fd, request);
+                return;
+            },
+            .daemon_log_request => {
+                try serveDaemonLogRequest(allocator, fd, frame.payload);
                 return;
             },
             else => {
                 try sendError(fd, "PROTOCOL_ERROR", "sesshd does not support this request yet", "");
                 return;
             },
+        }
+    }
+}
+
+fn serveDaemonLogRequest(allocator: std.mem.Allocator, fd: c.fd_t, payload: []const u8) !void {
+    var request = try protocol.decodePayload(pb.DaemonLogRequest, allocator, payload);
+    defer request.deinit(allocator);
+
+    try daemon_log.subscribe(allocator, fd);
+    defer daemon_log.unsubscribe(fd);
+    daemon_log.infof(allocator, "daemon log subscribed", .{});
+
+    while (true) {
+        var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return err,
+        };
+        defer frame.deinit(allocator);
+        switch (frame.message_type) {
+            .ping, .pong => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
+            },
+            else => return error.UnexpectedFrame,
         }
     }
 }

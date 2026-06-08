@@ -34,6 +34,8 @@ message Frame {
     ClientTeTransportOpen client_te_transport_open = 63;
     ClientTeTransportReady client_te_transport_ready = 64;
     ClientTeTransportDiagnostic client_te_transport_diagnostic = 65;
+    DaemonLogRequest daemon_log_request = 66;
+    DaemonLogEntry daemon_log_entry = 67;
   }
 }
 
@@ -59,6 +61,18 @@ message ClientTeTransportReady {
 // daemon owns. This is not remote process output.
 message ClientTeTransportDiagnostic {
   bytes chunk = 1;
+}
+
+// Local client -> local daemon request to follow new operational log entries.
+message DaemonLogRequest {
+}
+
+// One human-facing daemon log entry. The message is intentionally not overly
+// structured yet; the daemon log is for operator diagnosis, not stable API
+// consumption.
+message DaemonLogEntry {
+  int64 unix_ms = 1;
+  string message = 2;
 }
 
 // Framed payload, client coordinator <-> server coordinator.
