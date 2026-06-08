@@ -1093,6 +1093,14 @@ def run_daemon_log_test(_base_env):
 
             output += read_until_pipe(log_proc.stdout, b"client disconnected from daemon")
             output = output.decode("utf-8", "replace")
+            lines = output.splitlines()
+            if not lines or not lines[0].startswith("daemon socket "):
+                raise AssertionError(f"daemon log missing socket preamble: {output!r}")
+            if str(socket_path(env)) not in lines[0]:
+                raise AssertionError(f"daemon log preamble has wrong socket: {lines[0]!r}")
+            for line in lines[1:]:
+                if not re.match(r"^\d{2}:\d{2}:\d{2}\.\d{3} ", line):
+                    raise AssertionError(f"daemon log line has unreadable timestamp: {line!r}")
             for expected in (
                 "daemon log subscribed",
                 "client connected",

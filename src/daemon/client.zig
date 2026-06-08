@@ -62,8 +62,16 @@ pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, d
 }
 
 pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
-    const fd = try connectOrStart(allocator, exe);
+    const dir_name = try socket_namespace.defaultDirName(allocator);
+    defer allocator.free(dir_name);
+    const path = try socketPathForDirName(allocator, dir_name);
+    defer allocator.free(path);
+
+    const fd = try connectOrStartForDirName(allocator, exe, dir_name);
     defer _ = c.close(fd);
+    try io.writeAll(1, "daemon socket ");
+    try io.writeAll(1, path);
+    try io.writeAll(1, "\n");
 
     const request_payload = try protocol.encodePayload(allocator, pb.DaemonLogRequest{});
     defer allocator.free(request_payload);
@@ -79,7 +87,7 @@ pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
             .daemon_log_entry => {
                 var entry = try protocol.decodePayload(pb.DaemonLogEntry, allocator, frame.payload);
                 defer entry.deinit(allocator);
-                const line = try std.fmt.allocPrint(allocator, "{} {s}\n", .{ entry.unix_ms, entry.message });
+                const line = try daemonLogLine(allocator, entry.unix_ms, entry.message);
                 defer allocator.free(line);
                 try io.writeAll(1, line);
             },
@@ -89,6 +97,66 @@ pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
             else => return error.UnexpectedDaemonFrame,
         }
     }
+}
+
+fn daemonLogLine(allocator: std.mem.Allocator, unix_ms: i64, message: []const u8) ![]u8 {
+    var timestamp_buf: [daemon_log_timestamp_len]u8 = undefined;
+    if (formatDaemonLogTimestamp(&timestamp_buf, unix_ms)) |timestamp| {
+        return std.fmt.allocPrint(allocator, "{s} {s}\n", .{ timestamp, message });
+    } else |_| {
+        return std.fmt.allocPrint(allocator, "{} {s}\n", .{ unix_ms, message });
+    }
+}
+
+const daemon_log_timestamp_len = "00:00:00.000".len;
+
+const LocalTm = extern struct {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+    tm_gmtoff: c_long,
+    tm_zone: [*c]const u8,
+};
+
+extern "c" fn localtime_r(timer: *const c.time_t, result: *LocalTm) ?*LocalTm;
+
+fn formatDaemonLogTimestamp(buf: *[daemon_log_timestamp_len]u8, unix_ms: i64) ![]const u8 {
+    const seconds_i64 = @divFloor(unix_ms, 1000);
+    const milliseconds_i64 = @mod(unix_ms, 1000);
+    const seconds = std.math.cast(c.time_t, seconds_i64) orelse return error.TimestampOutOfRange;
+    const milliseconds = std.math.cast(u16, milliseconds_i64) orelse return error.TimestampOutOfRange;
+
+    var local_time: LocalTm = undefined;
+    if (localtime_r(&seconds, &local_time) == null) return error.TimestampOutOfRange;
+    return formatDaemonLogTimestampParts(buf, local_time, milliseconds);
+}
+
+fn formatDaemonLogTimestampParts(buf: *[daemon_log_timestamp_len]u8, local_time: LocalTm, milliseconds: u16) ![]const u8 {
+    const hour = std.math.cast(u8, local_time.tm_hour) orelse return error.InvalidLocalTime;
+    const minute = std.math.cast(u8, local_time.tm_min) orelse return error.InvalidLocalTime;
+    const second = std.math.cast(u8, local_time.tm_sec) orelse return error.InvalidLocalTime;
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+        hour,
+        minute,
+        second,
+        milliseconds,
+    });
+}
+
+test "daemon log timestamp uses readable milliseconds" {
+    var local_time = std.mem.zeroes(LocalTm);
+    local_time.tm_hour = 3;
+    local_time.tm_min = 4;
+    local_time.tm_sec = 5;
+    var buf: [daemon_log_timestamp_len]u8 = undefined;
+    const text = try formatDaemonLogTimestampParts(&buf, local_time, 7);
+    try std.testing.expectEqualStrings("03:04:05.007", text);
 }
 
 pub fn connectAndHandshake(allocator: std.mem.Allocator) !c.fd_t {
