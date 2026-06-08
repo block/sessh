@@ -38,6 +38,7 @@ pub const MessageType = enum {
     client_te_transport_open,
     client_te_transport_ready,
     client_te_transport_diagnostic,
+    client_te_transport_closed,
     daemon_log_request,
     daemon_log_entry,
 };
@@ -156,6 +157,7 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .client_te_transport_open => |message| ownedFrameFromMessage(allocator, .client_te_transport_open, message),
             .client_te_transport_ready => |message| ownedFrameFromMessage(allocator, .client_te_transport_ready, message),
             .client_te_transport_diagnostic => |message| ownedFrameFromMessage(allocator, .client_te_transport_diagnostic, message),
+            .client_te_transport_closed => |message| ownedFrameFromMessage(allocator, .client_te_transport_closed, message),
             .daemon_log_request => |message| ownedFrameFromMessage(allocator, .daemon_log_request, message),
             .daemon_log_entry => |message| ownedFrameFromMessage(allocator, .daemon_log_entry, message),
         };
@@ -361,6 +363,11 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.ClientTeTransportDiagnostic, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_te_transport_diagnostic = message } });
+        },
+        .client_te_transport_closed => blk: {
+            var message = try decodePayload(pb.ClientTeTransportClosed, allocator, payload);
+            defer message.deinit(allocator);
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_te_transport_closed = message } });
         },
         .daemon_log_request => blk: {
             var message = try decodePayload(pb.DaemonLogRequest, allocator, payload);

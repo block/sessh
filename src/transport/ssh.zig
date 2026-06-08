@@ -20,6 +20,7 @@ const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
 const protocol = @import("../protocol/mod.zig");
 const plain_ssh = @import("plain_ssh.zig");
+const reconnect = @import("../reconnect/mod.zig");
 const remote_shell = @import("remote_shell.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 const socket_transport = @import("socket.zig");
@@ -196,6 +197,8 @@ const SshStderrMode = enum(u8) {
     pipe,
     discard,
 };
+
+const reconnect_ready_switch_delay_ms: u64 = 10_000;
 
 const SshStderrPump = struct {
     allocator: std.mem.Allocator,
@@ -424,7 +427,11 @@ fn runRemoteNewSession(
         target.options,
     );
     try runAttachedRemoteClient(
+        allocator,
+        exe,
         target,
+        runtime_config,
+        failure_policy,
         &transport,
         &session,
     );
@@ -528,6 +535,7 @@ pub fn serveTerminalTransportFromDaemon(
         .te_session_hangup,
         .{
             .notify_read_fd = diagnostic_pipe[0],
+            .notify_remote_close = true,
             .log_context = .{ .host = target.host },
         },
     );
@@ -732,45 +740,210 @@ fn teardownTranscriptRecorder(transcript_recorder: *?tty_transcript.Recorder) vo
 }
 
 fn runAttachedRemoteClient(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
     target: SshTarget,
+    runtime_config: SessionRuntimeConfig,
+    failure_policy: BootstrapFailurePolicy,
     transport: *TerminalTransport,
     session: *attached_client.RuntimeSession,
 ) !void {
-    const end = attached_client.runAttachedClient(
-        transport.readFd(),
-        transport.writeFd(),
-        session,
-        .{ .monitor_connection = false },
-    ) catch |err| {
-        waitAfterRuntimeAttachFailure(transport, "attached client");
-        if (process_exit.is(err)) return err;
-        try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
-        return process_exit.request(1);
-    };
+    while (true) {
+        const end = attached_client.runAttachedClient(
+            transport.readFd(),
+            transport.writeFd(),
+            session,
+            .{ .monitor_connection = false },
+        ) catch |err| {
+            waitAfterRuntimeAttachFailure(transport, "attached client");
+            if (process_exit.is(err)) return err;
+            try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
+            return process_exit.request(1);
+        };
 
-    switch (end) {
-        .session_ended => {
-            client_log.debug("event=session_ended host={s} session={s}", .{ target.host, session.idSlice() });
-            const exit_status = try finishEndedRemoteSession(transport, session);
-            return process_exit.request(exit_status);
-        },
-        .client_hangup => {
-            client_log.debug("event=client_hangup host={s} session={s}", .{ target.host, session.idSlice() });
-            attached_client.drainLocalTransportDiagnostics(transport.readFd(), 100);
-            transport.terminate();
-            try finishHungUpSshSession(session);
-            return;
-        },
-        .unresponsive => {
-            client_log.debug("event=local_daemon_unresponsive host={s} session={s}", .{ target.host, session.idSlice() });
-            try finishLocalDaemonClosedSshSession(transport, session);
-            return process_exit.request(255);
-        },
-        .transport_closed => {
-            client_log.debug("event=local_daemon_closed host={s} session={s}", .{ target.host, session.idSlice() });
-            try finishLocalDaemonClosedSshSession(transport, session);
-            return process_exit.request(255);
-        },
+        switch (end) {
+            .session_ended => {
+                client_log.debug("event=session_ended host={s} session={s}", .{ target.host, session.idSlice() });
+                const exit_status = try finishEndedRemoteSession(transport, session);
+                return process_exit.request(exit_status);
+            },
+            .client_hangup => {
+                client_log.debug("event=client_hangup host={s} session={s}", .{ target.host, session.idSlice() });
+                attached_client.drainLocalTransportDiagnostics(transport.readFd(), 100);
+                transport.terminate();
+                try finishHungUpSshSession(session);
+                return;
+            },
+            .unresponsive => {
+                client_log.debug("event=local_daemon_unresponsive host={s} session={s}", .{ target.host, session.idSlice() });
+                try finishLocalDaemonClosedSshSession(transport, session);
+                return process_exit.request(255);
+            },
+            .transport_closed => {
+                client_log.debug("event=local_daemon_closed host={s} session={s}", .{ target.host, session.idSlice() });
+                try finishLocalDaemonClosedSshSession(transport, session);
+                return process_exit.request(255);
+            },
+            .remote_transport_closed => {
+                client_log.debug("event=disconnect reason=remote_transport_closed host={s} session={s}", .{ target.host, session.idSlice() });
+                transport.close();
+                try reconnectRemoteSessionClient(
+                    allocator,
+                    exe,
+                    target,
+                    runtime_config,
+                    failure_policy,
+                    transport,
+                    session,
+                );
+            },
+        }
+    }
+}
+
+fn reconnectRemoteSessionClient(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    target: SshTarget,
+    runtime_config: SessionRuntimeConfig,
+    failure_policy: BootstrapFailurePolicy,
+    transport: *TerminalTransport,
+    session: *attached_client.RuntimeSession,
+) !void {
+    const pending_input_at_disconnect = session.hasPendingInputAck();
+    const pending_paste_like_input_at_disconnect = session.hasPendingPasteLikeInputAck();
+    var reconnect_ui = try client_ui.ReconnectUi.beginWithPresentation(
+        session.viewport_offset,
+        reconnectPresentationForFilterLevel(runtime_config.common.filter_level),
+    );
+    var reconnect_ui_active = true;
+    defer if (reconnect_ui_active) reconnect_ui.deinit();
+
+    var reconnect_attempt: usize = 0;
+    while (true) {
+        const delay_ms = reconnect.delayMs(reconnect_attempt);
+        client_log.debug("event=reconnect_wait host={s} session={s} attempt={} delay_ms={}", .{
+            target.host,
+            session.idSlice(),
+            reconnect_attempt,
+            delay_ms,
+        });
+        switch (try reconnect_ui.waitForReconnect(delay_ms)) {
+            .client_hangup => {
+                finishReconnectUi(&reconnect_ui, &reconnect_ui_active);
+                try finishHungUpSshSession(session);
+                return;
+            },
+            .reconnect_now, .wait_elapsed => {
+                client_log.debug("event=reconnect_attempt host={s} session={s} attempt={}", .{
+                    target.host,
+                    session.idSlice(),
+                    reconnect_attempt,
+                });
+            },
+        }
+
+        var replacement = openTerminalDaemonTransport(
+            allocator,
+            exe,
+            target,
+            runtime_config.common,
+            true,
+            failure_policy.allow_plain_ssh_fallback,
+            &reconnect_ui,
+        ) catch |err| switch (err) {
+            error.DaemonTransportClosed => {
+                finishReconnectUi(&reconnect_ui, &reconnect_ui_active);
+                try finishLocalDaemonClosedSshSession(transport, session);
+                return process_exit.request(255);
+            },
+            error.OutOfMemory => return err,
+            else => {
+                noteReconnectFailure("transport", target, session, reconnect_attempt, err);
+                reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
+                continue;
+            },
+        };
+        var replacement_active = true;
+        defer if (replacement_active) replacement.close();
+
+        session.viewport_offset = reconnect_ui.currentViewportOffset();
+        attached_client.reconnectSessionOnRuntimeCancellable(
+            replacement.readFd(),
+            replacement.writeFd(),
+            session,
+            reconnect_ui.cancellationFlag(),
+        ) catch |err| switch (err) {
+            error.RemoteDaemonDied => {
+                finishReconnectUi(&reconnect_ui, &reconnect_ui_active);
+                try finishRemoteDaemonDiedSshSession(&replacement, session);
+                return process_exit.request(255);
+            },
+            error.RemoteTransportClosed => {
+                noteReconnectFailure("attach", target, session, reconnect_attempt, err);
+                reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
+                continue;
+            },
+            error.OutOfMemory => return err,
+            else => {
+                noteReconnectFailure("attach", target, session, reconnect_attempt, err);
+                reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
+                continue;
+            },
+        };
+
+        switch (try waitForReconnectSwitchIfNeeded(
+            &reconnect_ui,
+            pending_input_at_disconnect,
+            pending_paste_like_input_at_disconnect,
+            false,
+        )) {
+            .client_hangup => {
+                finishReconnectUi(&reconnect_ui, &reconnect_ui_active);
+                replacement.close();
+                try finishHungUpSshSession(session);
+                return;
+            },
+            .reconnect_now, .wait_elapsed => {},
+        }
+
+        session.discardPendingInputAcks();
+        session.viewport_offset = try reconnect_ui.clearOverlay();
+        attached_client.finishReconnectRepaint(
+            replacement.readFd(),
+            replacement.writeFd(),
+            session,
+        ) catch |err| switch (err) {
+            error.SessionEnded => {
+                replacement_active = false;
+                transport.* = replacement;
+                const exit_status = try finishEndedRemoteSession(transport, session);
+                return process_exit.request(exit_status);
+            },
+            error.RemoteTransportClosed => {
+                noteReconnectFailure("repaint", target, session, reconnect_attempt, err);
+                reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
+                continue;
+            },
+            error.OutOfMemory => return err,
+            else => {
+                noteReconnectFailure("repaint", target, session, reconnect_attempt, err);
+                reconnect_attempt = nextReconnectAttemptAfterFailure(reconnect_attempt, &reconnect_ui);
+                continue;
+            },
+        };
+
+        client_log.debug("event=reconnect_success host={s} session={s} attempt={}", .{
+            target.host,
+            session.idSlice(),
+            reconnect_attempt,
+        });
+        reconnect_ui.restoreTitleAfterReconnect(session.app_title_present, session.titleFallbackSlice());
+        reconnect_ui.deinit();
+        reconnect_ui_active = false;
+        replacement_active = false;
+        transport.* = replacement;
+        return;
     }
 }
 
@@ -791,16 +964,81 @@ fn finishLocalDaemonClosedSshSession(transport: *TerminalTransport, session: *at
     transport.close();
     session.restoreAttachedClientEndPresentationForExit();
     client_log.flush(2);
-    try printDaemonConnectionLost();
+    try printTerminalErrorLine("sessh: local daemon connection lost");
     try tty_transcript.finishActiveOrReport();
 }
 
-fn printDaemonConnectionLost() !void {
+fn finishRemoteDaemonDiedSshSession(transport: *TerminalTransport, session: *attached_client.RuntimeSession) !void {
+    transport.close();
+    session.restoreAttachedClientEndPresentationForExit();
+    client_log.flush(2);
+    try printTerminalErrorLine("sessh: remote daemon died");
+    try tty_transcript.finishActiveOrReport();
+}
+
+fn printTerminalErrorLine(message: []const u8) !void {
     if (c.isatty(2) != 0) {
-        try io.writeAll(2, "\nsessh: daemon connection lost\n");
+        try io.writeAll(2, "\n");
+        try io.writeAll(2, message);
+        try io.writeAll(2, "\n");
     } else {
-        try io.stderrPrint("sessh: daemon connection lost\n", .{});
+        try io.stderrPrint("{s}\n", .{message});
     }
+}
+
+fn finishReconnectUi(reconnect_ui: *client_ui.ReconnectUi, active: *bool) void {
+    if (!active.*) return;
+    _ = reconnect_ui.clearOverlay() catch {};
+    reconnect_ui.restoreTitleForEnd();
+    reconnect_ui.deinit();
+    active.* = false;
+}
+
+fn noteReconnectFailure(
+    comptime stage: []const u8,
+    target: SshTarget,
+    session: *const attached_client.RuntimeSession,
+    attempt: usize,
+    err: anyerror,
+) void {
+    client_log.debug("event=reconnect_failed stage=" ++ stage ++ " host={s} session={s} attempt={} error={t}", .{
+        target.host,
+        session.idSlice(),
+        attempt,
+        err,
+    });
+    client_log.userDiagnosticInfo("reconnect failed: " ++ stage ++ ": {t}", .{err});
+}
+
+fn reconnectPresentationForFilterLevel(level: config.FilterLevel) client_ui.ReconnectPresentation {
+    return switch (level) {
+        .raw => .none,
+        .hygienic => .title,
+        .emulated => .overlay,
+    };
+}
+
+fn waitForReconnectSwitchIfNeeded(
+    reconnect_ui: *client_ui.ReconnectUi,
+    pending_input_at_disconnect: bool,
+    pending_paste_like_input_at_disconnect: bool,
+    unresponsive: bool,
+) !client_ui.ReconnectDecision {
+    if (reconnect_ui.hasReconnectAcknowledgement()) return .reconnect_now;
+    const disposition = reconnect_ui.reconnectSwitchDisposition(
+        pending_input_at_disconnect,
+        pending_paste_like_input_at_disconnect,
+        unresponsive,
+    );
+    return switch (disposition) {
+        .automatic => .wait_elapsed,
+        .delayed => reconnect_ui.waitForReconnectSwitchOrTimeout(reconnect_ready_switch_delay_ms),
+        .manual_disconnected, .manual_unresponsive => reconnect_ui.waitForReconnectSwitch(disposition),
+    };
+}
+
+fn nextReconnectAttemptAfterFailure(attempt: usize, reconnect_ui: *client_ui.ReconnectUi) usize {
+    return reconnect.nextAttempt(attempt, reconnect_ui.consumeReconnectAcknowledgement());
 }
 
 fn finishEndedRemoteSession(transport: *TerminalTransport, session: *attached_client.RuntimeSession) !u8 {

@@ -34,6 +34,7 @@ const ErrorPayload = struct {
 pub const AttachedClientEnd = enum {
     unresponsive,
     transport_closed,
+    remote_transport_closed,
     session_ended,
     client_hangup,
 };
@@ -43,11 +44,13 @@ pub const ReconnectInputPumpResult = enum {
     reconnect_now,
     client_hangup,
     transport_closed,
+    remote_transport_closed,
 };
 
 pub const RuntimeRecovery = enum {
     recovered,
     transport_closed,
+    remote_transport_closed,
     session_ended,
 };
 
@@ -1057,6 +1060,7 @@ fn finishReconnectRepaintInner(
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
             },
+            .client_te_transport_closed => return error.RemoteTransportClosed,
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
@@ -1118,6 +1122,7 @@ pub fn drainLocalTransportDiagnostics(read_fd: c.fd_t, timeout_ms: u64) void {
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .client_te_transport_diagnostic => handleClientTeTransportDiagnosticFrame(frame.payload) catch return,
+            .client_te_transport_closed => return,
             .ping, .pong => {},
             else => return,
         }
@@ -1171,6 +1176,7 @@ pub fn pollRuntimeRecovery(
             try handleTtyTranscriptChunkFrame(frame.payload);
             return .recovered;
         },
+        .client_te_transport_closed => return .remote_transport_closed,
         .te_session_ended => {
             try session.recordSessionEndedPayload(frame.payload);
             _ = finishAttachedClient(.session_ended, &session.attached_client_end_restore);
@@ -1266,6 +1272,10 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                     freeErrorPayload(parsed);
                     return error.VersionMismatch;
                 }
+                if (std.mem.eql(u8, parsed.code, "SESSION_NOT_FOUND")) {
+                    freeErrorPayload(parsed);
+                    return error.RemoteDaemonDied;
+                }
                 try printParsedError(parsed);
                 return process_exit.request(1);
             },
@@ -1280,6 +1290,7 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
             },
+            .client_te_transport_closed => return error.RemoteTransportClosed,
             else => return error.UnexpectedFrame,
         }
     }
@@ -1323,6 +1334,10 @@ fn readSessionAttachedInner(
                     freeErrorPayload(parsed);
                     return error.VersionMismatch;
                 }
+                if (std.mem.eql(u8, parsed.code, "SESSION_NOT_FOUND")) {
+                    freeErrorPayload(parsed);
+                    return error.RemoteDaemonDied;
+                }
                 try printParsedError(parsed);
                 return process_exit.request(1);
             },
@@ -1334,6 +1349,7 @@ fn readSessionAttachedInner(
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
             },
+            .client_te_transport_closed => return error.RemoteTransportClosed,
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
@@ -1441,6 +1457,7 @@ fn readHelloReply(
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
             },
+            .client_te_transport_closed => return error.RemoteTransportClosed,
             else => return error.UnexpectedFrame,
         }
     }
@@ -1459,6 +1476,7 @@ fn readHelloRequest(
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
             },
+            .client_te_transport_closed => return error.RemoteTransportClosed,
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
@@ -1620,6 +1638,7 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
             },
+            .client_te_transport_closed => return error.RemoteTransportClosed,
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, conn);
             },
@@ -1990,6 +2009,7 @@ fn handleEscapeHelpRuntimeFrame(
             try handleClientTeTransportDiagnosticFrame(frame.payload);
             return null;
         },
+        .client_te_transport_closed => return .remote_transport_closed,
         .ping, .pong => {
             _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             return null;
@@ -2123,6 +2143,7 @@ fn handleAttachedClientRuntimeFrame(
             try handleClientTeTransportDiagnosticFrame(frame.payload);
             return null;
         },
+        .client_te_transport_closed => return .remote_transport_closed,
         .ping, .pong => {
             _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             return null;

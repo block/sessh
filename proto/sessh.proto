@@ -36,6 +36,7 @@ message Frame {
     ClientTeTransportDiagnostic client_te_transport_diagnostic = 65;
     DaemonLogRequest daemon_log_request = 66;
     DaemonLogEntry daemon_log_entry = 67;
+    ClientTeTransportClosed client_te_transport_closed = 68;
   }
 }
 
@@ -61,6 +62,11 @@ message ClientTeTransportReady {
 // daemon owns. This is not remote process output.
 message ClientTeTransportDiagnostic {
   bytes chunk = 1;
+}
+
+// Local daemon -> visible-client notification that the local daemon is still
+// alive, but its ssh transport to the remote sesshd closed.
+message ClientTeTransportClosed {
 }
 
 // Local client -> local daemon request to follow new operational log entries.

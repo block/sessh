@@ -13,6 +13,7 @@ pub const ClientCloseAction = enum {
 
 pub const ClientDiagnosticForwarding = struct {
     notify_read_fd: c.fd_t = -1,
+    notify_remote_close: bool = false,
     log_context: LogContext = .{},
 };
 
@@ -102,6 +103,7 @@ pub fn forwardFramesBetweenWithClientCloseActionAndDiagnostics(
         if ((pollfds[runtime_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             if (!try copyOneFrame(runtime_read_fd, client_write_fd)) {
                 logDaemonEvent(diagnostics.log_context, "ssh transport disconnected from daemon");
+                if (diagnostics.notify_remote_close) try sendClientTeTransportClosed(client_write_fd);
                 return;
             }
         }
@@ -182,4 +184,10 @@ pub fn forwardRawTransportDiagnostics(fd: c.fd_t, diagnostic_read_fd: c.fd_t) !v
         std.heap.page_allocator.free(payload);
         if (chunk.len < buf.len) return;
     }
+}
+
+fn sendClientTeTransportClosed(fd: c.fd_t) !void {
+    const payload = try protocol.encodePayload(std.heap.page_allocator, protocol.pb.ClientTeTransportClosed{});
+    defer std.heap.page_allocator.free(payload);
+    try protocol.sendFrame(fd, .client_te_transport_closed, payload);
 }

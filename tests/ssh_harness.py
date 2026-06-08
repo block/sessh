@@ -951,6 +951,59 @@ def run_sessh_reconnect_probe(
     )
 
 
+def run_sessh_reconnect_pty_probe(args, env, ready, after, timeout=30.0):
+    argv = sessh_argv(args)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(argv[0], argv, env)
+
+    output = b""
+    waited = False
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        output = read_pty_until(fd, output, ready.encode("utf-8"), timeout=timeout)
+        sever_session_clients(env, timeout)
+        output = read_pty_until(fd, output, b"sessh: disconnected: Retry connecting 10sec", timeout=timeout)
+        os.write(fd, b"\x12")
+        output = read_pty_until(fd, output, ready.encode("utf-8"), timeout=timeout)
+        time.sleep(0.2)
+        os.write(fd, after.encode("utf-8") + b"\r")
+        output = read_pty_until(fd, output, f"REMOTE:{after}".encode("utf-8"), timeout=timeout)
+        os.write(fd, b"~.")
+
+        deadline = time.monotonic() + timeout
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                waited = True
+                returncode = wait_status_to_returncode(status)
+                output += read_available_pty(fd)
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"timed out waiting for reconnect client close; got {output!r}")
+            output += read_available_pty(fd)
+            time.sleep(0.05)
+    finally:
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(fd)
+
+    return subprocess.CompletedProcess(
+        argv,
+        returncode,
+        output.decode("utf-8", "replace"),
+        "",
+    )
+
+
 OSC_RE = re.compile(r"\x1b\][^\x1b]*(?:\x1b\\|\x07)")
 CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 UI_MESSAGE_RE = re.compile(r"(?:---\s*)?(?:ssh|sessh): [^\r\n]+")
@@ -1107,6 +1160,11 @@ def remote_path_artifact():
 
 
 def command_executable(command):
+    exe = command_argv0(command)
+    return exe.resolve(strict=False) if exe is not None else None
+
+
+def command_argv0(command):
     try:
         parts = shlex.split(command)
     except ValueError:
@@ -1116,15 +1174,14 @@ def command_executable(command):
     exe = Path(parts[0])
     if not exe.is_absolute():
         exe = ROOT / exe
-    return exe.resolve(strict=False)
+    return exe
 
 
 def local_daemon_executable(env):
     return daemon_socket_path(Path(env["XDG_RUNTIME_DIR"])).parent / "sesshd"
 
 
-def local_daemon_pids(env):
-    target = local_daemon_executable(env)
+def daemon_pids_for_executable(target):
     result = subprocess.run(
         ["ps", "-axo", "pid=,command="],
         cwd=ROOT,
@@ -1145,9 +1202,13 @@ def local_daemon_pids(env):
             pid = int(pid_text)
         except ValueError:
             continue
-        if command_executable(command) == target:
+        if command_argv0(command) == target:
             pids.append(pid)
     return pids
+
+
+def local_daemon_pids(env):
+    return daemon_pids_for_executable(local_daemon_executable(env))
 
 
 def wait_local_daemon_pids(env, timeout=5.0):
@@ -1158,6 +1219,24 @@ def wait_local_daemon_pids(env, timeout=5.0):
             return pids
         time.sleep(0.05)
     raise AssertionError(f"timed out waiting for local daemon process {local_daemon_executable(env)}")
+
+
+def remote_daemon_executable(env):
+    return daemon_socket_path(fake_remote_runtime_root(env)).parent / "sesshd"
+
+
+def remote_daemon_pids(env):
+    return daemon_pids_for_executable(remote_daemon_executable(env))
+
+
+def wait_remote_daemon_pids(env, timeout=5.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        pids = remote_daemon_pids(env)
+        if pids:
+            return pids
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for remote daemon process {remote_daemon_executable(env)}")
 
 
 def artifact_cache_path(env, artifact):
@@ -1522,68 +1601,6 @@ def test_ssh_daemon_log_records_client_hangup_cleanup(tmp):
             )
 
 
-def test_ssh_local_daemon_death_exits_with_error(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    remote_shell = tmp / "remote-shell"
-    marker = "SSH_DAEMON_DEATH_READY"
-    remote_shell.write_text(
-        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
-    )
-    remote_shell.chmod(0o700)
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SHELL"] = str(remote_shell)
-
-    argv = sessh_argv(["test-host"])
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    stdout = b""
-    stderr = b""
-    returncode = None
-    daemon_pids = []
-    try:
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
-        daemon_pids = wait_local_daemon_pids(env, timeout=5.0)
-        for pid in daemon_pids:
-            os.kill(pid, signal.SIGTERM)
-        returncode = proc.wait(timeout=10.0)
-        stdout += proc.stdout.read()
-        stderr = proc.stderr.read()
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5.0)
-        for pid in daemon_pids:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-
-    result = subprocess.CompletedProcess(
-        argv,
-        returncode,
-        stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
-    )
-    if result.returncode != 255:
-        raise AssertionError(result)
-    if "sessh: daemon connection lost" not in result.stderr:
-        raise AssertionError(result)
-    if "Retry connecting" in result.stdout or "Reconnecting" in result.stdout:
-        raise AssertionError(result)
-    if "Retry connecting" in result.stderr or "Reconnecting" in result.stderr:
-        raise AssertionError(result)
-
-
 def test_ssh_local_daemon_death_tty_error_starts_on_new_line(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1646,7 +1663,7 @@ def test_ssh_local_daemon_death_tty_error_starts_on_new_line(tmp):
 
     if returncode != 255:
         raise AssertionError(output.decode("utf-8", "replace"))
-    if b"\r\nsessh: daemon connection lost\r\n" not in output:
+    if b"\r\nsessh: local daemon connection lost\r\n" not in output:
         raise AssertionError(output)
     if b"Retry connecting" in output or b"Reconnecting" in output:
         raise AssertionError(output)
@@ -3771,7 +3788,7 @@ def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
     env["SESSH_FAKE_SSH_STDERR_ON_BATCH"] = raw_ssh_error
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh_reconnect_probe(
+    result = run_sessh_reconnect_pty_probe(
         ["test-host"],
         env,
         marker,
@@ -3792,17 +3809,123 @@ def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
         "ssh: client_loop: send disconnect: Broken pipe",
         "ssh: control sequence: ?[31mred",
     ]
-    actual_messages = normalized_ui_messages(result.stdout)
-    if actual_messages != expected_messages:
-        raise AssertionError(f"expected UI messages {expected_messages!r}, got {actual_messages!r}\n{result}")
+    actual_messages = " ".join(normalized_ui_messages(result.stdout))
+    search_from = 0
+    for expected in expected_messages:
+        found_at = actual_messages.find(expected, search_from)
+        if found_at < 0:
+            raise AssertionError(f"expected UI message {expected!r} after offset {search_from}, got {actual_messages!r}\n{result}")
+        search_from = found_at + len(expected)
     if "\x1b[31mred" in result.stdout:
         raise AssertionError(result)
     if "ssh stderr:" in result.stdout or "sessh: log" in result.stdout or "level=warn" in result.stdout:
         raise AssertionError(result)
-    if strip_bootstrap_status(result.stderr):
-        raise AssertionError(result)
     if (Path(env["XDG_CACHE_HOME"]) / "sessh" / "clients").exists():
         raise AssertionError("client logs were written to persistent cache")
+
+
+def test_ssh_remote_transport_close_reconnects_in_tty(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_REMOTE_TRANSPORT_RECONNECT_READY"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    result = run_sessh_reconnect_pty_probe(
+        ["test-host"],
+        env,
+        marker,
+        "after-remote-transport-reconnect",
+        timeout=30.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    if "sessh: disconnected: Retry connecting 10sec" not in result.stdout:
+        raise AssertionError(result)
+    if "sessh: local daemon connection lost" in result.stdout:
+        raise AssertionError(result)
+    if "sessh: remote daemon died" in result.stdout:
+        raise AssertionError(result)
+    if "REMOTE:after-remote-transport-reconnect" not in result.stdout:
+        raise AssertionError(result)
+
+
+def test_ssh_remote_daemon_death_reports_remote_error(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    remote_shell = tmp / "remote-shell"
+    marker = "SSH_REMOTE_DAEMON_DEATH_READY"
+    remote_shell.write_text(
+        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
+    )
+    remote_shell.chmod(0o700)
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SHELL"] = str(remote_shell)
+
+    argv = sessh_argv(["test-host"])
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(argv[0], argv, env)
+
+    output = b""
+    waited = False
+    remote_pids = []
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        output = read_pty_until(fd, output, marker.encode("utf-8"), timeout=30.0)
+        remote_pids = wait_remote_daemon_pids(env, timeout=5.0)
+        for remote_pid in remote_pids:
+            os.kill(remote_pid, signal.SIGTERM)
+        output = read_pty_until(fd, output, b"sessh: disconnected: Retry connecting 10sec", timeout=30.0)
+        os.write(fd, b"\x12")
+        output = read_pty_until(fd, output, b"sessh: remote daemon died", timeout=30.0)
+
+        deadline = time.monotonic() + 10.0
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                waited = True
+                returncode = wait_status_to_returncode(status)
+                output += read_available_pty(fd)
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"timed out waiting for remote daemon death exit; got {output!r}")
+            output += read_available_pty(fd)
+            time.sleep(0.05)
+    finally:
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        for remote_pid in remote_pids:
+            try:
+                os.kill(remote_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        os.close(fd)
+
+    if returncode != 255:
+        raise AssertionError(output.decode("utf-8", "replace"))
+    if b"sessh: local daemon connection lost" in output:
+        raise AssertionError(output)
 
 
 def test_ssh_log_level_quiet_suppresses_buffered_stderr_display(tmp):
@@ -3822,7 +3945,7 @@ def test_ssh_log_level_quiet_suppresses_buffered_stderr_display(tmp):
     env["SESSH_FAKE_SSH_STDERR_ON_BATCH"] = raw_ssh_error
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh_reconnect_probe(
+    result = run_sessh_reconnect_pty_probe(
         ["--log-level", "quiet", "test-host"],
         env,
         marker,
@@ -4058,10 +4181,6 @@ def main(argv=None):
         (
             "ssh daemon log records client hangup cleanup",
             test_ssh_daemon_log_records_client_hangup_cleanup,
-        ),
-        (
-            "ssh local daemon death exits with error",
-            test_ssh_local_daemon_death_exits_with_error,
         ),
         (
             "ssh local daemon death tty error starts on new line",
@@ -4318,6 +4437,14 @@ def main(argv=None):
         (
             "ssh reconnect displays live ssh stderr in banner",
             test_ssh_reconnect_displays_live_ssh_stderr_in_banner,
+        ),
+        (
+            "ssh remote transport close reconnects in tty",
+            test_ssh_remote_transport_close_reconnects_in_tty,
+        ),
+        (
+            "ssh remote daemon death reports remote error",
+            test_ssh_remote_daemon_death_reports_remote_error,
         ),
         (
             "ssh log level quiet suppresses buffered stderr display",
