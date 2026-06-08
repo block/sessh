@@ -13,6 +13,7 @@ pub const SshTtyRequest = enum {
 };
 
 pub const ResolvedSshConfig = struct {
+    user: []u8,
     hostname: []u8,
     port: []u8,
     ipqos: ?[]u8 = null,
@@ -21,6 +22,7 @@ pub const ResolvedSshConfig = struct {
         if (self.ipqos) |value| allocator.free(value);
         allocator.free(self.port);
         allocator.free(self.hostname);
+        allocator.free(self.user);
         self.* = undefined;
     }
 
@@ -56,9 +58,17 @@ pub fn resolveSshConfig(allocator: std.mem.Allocator, ssh_options: []const []con
 fn fallbackResolvedSshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) !ResolvedSshConfig {
     const explicit_port = explicitSshPort(ssh_options) orelse session_registry.default_ssh_port;
     return .{
+        .user = try fallbackSshUser(allocator),
         .hostname = try allocator.dupe(u8, host),
         .port = try allocator.dupe(u8, explicit_port),
         .ipqos = null,
+    };
+}
+
+fn fallbackSshUser(allocator: std.mem.Allocator) ![]u8 {
+    return std.process.getEnvVarOwned(allocator, "USER") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => allocator.dupe(u8, ""),
+        else => return err,
     };
 }
 
@@ -89,10 +99,12 @@ fn querySshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8,
 }
 
 pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_options: []const []const u8, fallback_host: []const u8) !ResolvedSshConfig {
+    var user: ?[]u8 = null;
     var hostname: ?[]u8 = null;
     var port: ?[]u8 = null;
     var ipqos: ?[]u8 = null;
     errdefer {
+        if (user) |value| allocator.free(value);
         if (hostname) |value| allocator.free(value);
         if (port) |value| allocator.free(value);
         if (ipqos) |value| allocator.free(value);
@@ -102,7 +114,11 @@ pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_opti
     while (lines.next()) |line| {
         var fields = std.mem.tokenizeAny(u8, line, " \t\r");
         const key = fields.next() orelse continue;
-        if (std.ascii.eqlIgnoreCase(key, "hostname")) {
+        if (std.ascii.eqlIgnoreCase(key, "user")) {
+            const value = fields.next() orelse continue;
+            if (user) |old| allocator.free(old);
+            user = try allocator.dupe(u8, value);
+        } else if (std.ascii.eqlIgnoreCase(key, "hostname")) {
             const value = fields.next() orelse continue;
             if (hostname) |old| allocator.free(old);
             hostname = try allocator.dupe(u8, value);
@@ -117,12 +133,14 @@ pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_opti
             ipqos = try allocator.dupe(u8, interactive);
         }
     }
+    if (user == null) user = try fallbackSshUser(allocator);
     if (hostname == null) hostname = try allocator.dupe(u8, fallback_host);
     if (port == null) {
         const explicit_port = explicitSshPort(ssh_options) orelse session_registry.default_ssh_port;
         port = try allocator.dupe(u8, explicit_port);
     }
     return .{
+        .user = user.?,
         .hostname = hostname.?,
         .port = port.?,
         .ipqos = ipqos,

@@ -335,6 +335,7 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
 
 fn daemonHasLiveWork() bool {
     return active_client_threads.load(.acquire) != 0 or
+        transport_ssh.activeTerminalTunnelCount() != 0 or
         session_runtime.activeRuntimeCount() != 0 or
         stream_runtime.activeProxyRuntimeCount() != 0;
 }
@@ -426,7 +427,11 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                 return;
             },
             .mux_stream_frame => {
-                try stream_runtime.serveMuxStreamFrameAfterHandshake(allocator, exe, frame, fd);
+                if (session_daemon_handler.isTeMuxOpenFrame(allocator, frame)) {
+                    try session_daemon_handler.serveMuxStreamFrameAfterHandshake(allocator, exe, frame, fd);
+                } else {
+                    try stream_runtime.serveMuxStreamFrameAfterHandshake(allocator, exe, frame, fd);
+                }
                 return;
             },
             .client_te_transport_open => {

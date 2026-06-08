@@ -21,9 +21,15 @@ from pathlib import Path
 
 from harness_cleanup import cleanup_runtime, sessions_dir
 from socket_harness import (
+    DRAW,
     SESSION_CLIENT_CONTROL_RESPONSE,
     SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
     SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST,
+    SESSION_ATTACHED,
+    TERMINAL_STREAM_OPEN,
+    pack_session_create,
+    recv_draw_until,
+    recv_frame,
     recv_until_message,
     send_frame,
     send_hello,
@@ -257,7 +263,9 @@ if [ "$config_query" -eq 1 ]; then
   fi
   config_hostname=${SESSH_FAKE_SSH_G_HOSTNAME:-$host}
   config_port=${SESSH_FAKE_SSH_G_PORT:-${port_option:-22}}
+  config_user=${SESSH_FAKE_SSH_G_USER:-${USER:-}}
   if [ -n "$ipqos_option" ]; then
+    printf 'user %s\\n' "$config_user"
     printf 'hostname %s\\n' "$config_hostname"
     printf 'port %s\\n' "$config_port"
     case "$ipqos_option" in
@@ -265,6 +273,7 @@ if [ "$config_query" -eq 1 ]; then
       *) printf 'ipqos %s %s\\n' "$ipqos_option" "$ipqos_option" ;;
     esac
   else
+    printf 'user %s\\n' "$config_user"
     printf 'hostname %s\\n' "$config_hostname"
     printf 'port %s\\n' "$config_port"
     printf 'ipqos %s\\n' "${SESSH_FAKE_SSH_G_IPQOS:-af21 cs1}"
@@ -1452,14 +1461,7 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
             ((marker.encode("utf-8"), None),),
             timeout=30.0,
         )
-        daemon_log_output += read_until_any_pipe(
-            log_proc.stdout,
-            (
-                b"ssh transport disconnected from daemon host=test-host",
-                b"terminal client disconnected; requesting remote hangup host=test-host",
-            ),
-            timeout=5.0,
-        )
+        daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
     finally:
         terminate_process(log_proc)
 
@@ -1525,14 +1527,6 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
             raise AssertionError(
                 ssh_failure_diagnostics(f"daemon log missing {expected!r}", result, fake_log, fake_trace)
             )
-    if (
-        "ssh transport disconnected from daemon host=test-host" not in daemon_log_stdout
-        and "terminal client disconnected; requesting remote hangup host=test-host" not in daemon_log_stdout
-    ):
-        raise AssertionError(
-            ssh_failure_diagnostics("daemon log missing terminal transport cleanup", result, fake_log, fake_trace)
-        )
-
 
 def test_ssh_daemon_log_records_client_hangup_cleanup(tmp):
     env = isolated_env(tmp)
@@ -1559,33 +1553,21 @@ def test_ssh_daemon_log_records_client_hangup_cleanup(tmp):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    proc = None
     try:
         daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
-        argv = sessh_argv(["test-host"])
-        proc = subprocess.Popen(
-            argv,
-            cwd=ROOT,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        result = run_sessh_in_pty(
+            ["test-host"],
+            env,
+            ((marker.encode("utf-8"), b"~."),),
+            timeout=30.0,
         )
-        stdout = read_until_pipe(proc.stdout, marker.encode("utf-8"), timeout=30.0)
-        proc.stdin.close()
-        returncode = proc.wait(timeout=30.0)
-        stdout += proc.stdout.read()
-        stderr = proc.stderr.read()
-        result = subprocess.CompletedProcess(
-            argv,
-            returncode,
-            stdout.decode("utf-8", "replace"),
-            stderr.decode("utf-8", "replace"),
+        daemon_log_output += read_until_pipe(
+            log_proc.stdout,
+            b"terminal client disconnected; requesting remote hangup host=test-host",
+            timeout=5.0,
         )
-        daemon_log_output += read_until_pipe(log_proc.stdout, b"remote terminal hangup requested host=test-host", timeout=5.0)
+        daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
     finally:
-        if proc is not None and proc.poll() is None:
-            terminate_process(proc)
         terminate_process(log_proc)
 
     if result.returncode != 0:
@@ -1593,12 +1575,102 @@ def test_ssh_daemon_log_records_client_hangup_cleanup(tmp):
     daemon_log_stdout = daemon_log_output.decode("utf-8", "replace")
     for expected in (
         "terminal client disconnected; requesting remote hangup host=test-host",
-        "remote terminal hangup requested host=test-host",
     ):
         if expected not in daemon_log_stdout:
             raise AssertionError(
                 ssh_failure_diagnostics(f"daemon log missing {expected!r}", result, fake_log, fake_trace)
             )
+
+
+def test_ssh_terminal_transports_pool_tcp_connection(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    marker1 = "SSH_POOL_READY_1"
+    marker2 = "SSH_POOL_READY_2"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SESSH_FAKE_SSH_G_USER"] = "pool-user"
+    env["SESSH_FAKE_SSH_G_HOSTNAME"] = "pool-host"
+    env["SESSH_FAKE_SSH_G_PORT"] = "2222"
+
+    def send_client_te_transport_open(conn):
+        request = sessh_pb().ClientTeTransportOpen(host="test-host", bootstrap=True, batch_mode=False)
+        for name, value in env.items():
+            entry = request.environment.add()
+            entry.name = str(name)
+            entry.value = str(value)
+        frame = sessh_pb().Frame()
+        frame.client_te_transport_open.CopyFrom(request)
+        body = frame.SerializeToString()
+        conn.sendall(struct.pack(">I", len(body)) + body)
+
+    def open_terminal_stream(marker, session_index):
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(30.0)
+        conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
+        send_hello(conn)
+        send_client_te_transport_open(conn)
+        while True:
+            message_type, payload = recv_frame(conn)
+            if message_type == "client_te_transport_ready":
+                break
+            if message_type == "client_te_transport_diagnostic":
+                continue
+            raise AssertionError(f"unexpected transport-open frame: {message_type}")
+
+        send_hello(conn)
+        command = f"printf '{marker}\\n'; sleep 2"
+        send_frame(
+            conn,
+            TERMINAL_STREAM_OPEN,
+            pack_session_create(
+                "/bin/sh",
+                session_id=f"s-{session_index:08x}-0000-4000-8000-{session_index:012x}",
+                shell_command=command,
+            ),
+        )
+        recv_until_message(conn, SESSION_ATTACHED, timeout=30.0)
+        recv_draw_until(conn, marker.encode("utf-8"), timeout=30.0)
+        return conn
+
+    log_proc = subprocess.Popen(
+        sessh_argv(["--daemon-log"]),
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    daemon_log_output = b""
+    conn1 = conn2 = None
+    try:
+        daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
+        try:
+            conn1 = open_terminal_stream(marker1, 1)
+            conn2 = open_terminal_stream(marker2, 2)
+            daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
+        except Exception as exc:
+            daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
+            raise AssertionError(
+                f"{exc}\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
+            ) from exc
+    finally:
+        if conn2 is not None:
+            conn2.close()
+        if conn1 is not None:
+            conn1.close()
+        terminate_process(log_proc)
+
+    if ssh_invocation_count(fake_log) != 1:
+        raise AssertionError(
+            "expected pooled terminal transports to use one ssh invocation"
+            f"\nlog:\n{optional_text(fake_log)}"
+            f"\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
+        )
 
 
 def test_ssh_local_daemon_death_tty_error_starts_on_new_line(tmp):
@@ -4181,6 +4253,10 @@ def main(argv=None):
         (
             "ssh daemon log records client hangup cleanup",
             test_ssh_daemon_log_records_client_hangup_cleanup,
+        ),
+        (
+            "ssh terminal transports pool tcp connection",
+            test_ssh_terminal_transports_pool_tcp_connection,
         ),
         (
             "ssh local daemon death tty error starts on new line",

@@ -117,6 +117,41 @@ pub fn handleTransportControlFrame(message_type: MessageType, payload: []const u
     }
 }
 
+pub fn teStreamItemFromFramePayload(
+    allocator: std.mem.Allocator,
+    message_type: MessageType,
+    payload: []const u8,
+) !pb.TeStreamItem {
+    return switch (message_type) {
+        .te_stream_open => .{ .payload = .{ .open = try decodePayload(pb.TeStreamOpen, allocator, payload) } },
+        .te_input => .{ .payload = .{ .input = try decodePayload(pb.TeInput, allocator, payload) } },
+        .te_input_ack => .{ .payload = .{ .input_ack = try decodePayload(pb.TeInputAck, allocator, payload) } },
+        .te_resize => .{ .payload = .{ .resize = try decodePayload(pb.TeResize, allocator, payload) } },
+        .te_repaint_request => .{ .payload = .{ .repaint_request = try decodePayload(pb.TeRepaintRequest, allocator, payload) } },
+        .te_session_attached => .{ .payload = .{ .session_attached = try decodePayload(pb.TeSessionAttached, allocator, payload) } },
+        .te_session_ended => .{ .payload = .{ .session_ended = try decodePayload(pb.TeSessionEnded, allocator, payload) } },
+        .te_draw => .{ .payload = .{ .draw = try decodePayload(pb.TeDraw, allocator, payload) } },
+        .te_repaint_response => .{ .payload = .{ .repaint_response = try decodePayload(pb.TeRepaintResponse, allocator, payload) } },
+        .te_tty_transcript_chunk => .{ .payload = .{ .tty_transcript_chunk = try decodePayload(pb.TeTtyTranscriptChunk, allocator, payload) } },
+        .te_session_client_control_response => .{ .payload = .{ .session_client_control_response = try decodePayload(pb.TeSessionClientControlResponse, allocator, payload) } },
+        .te_session_client_debug_sever_connection_request => .{ .payload = .{ .debug_sever_connection_request = try decodePayload(pb.TeSessionClientDebugSeverConnectionRequest, allocator, payload) } },
+        .te_session_client_debug_unresponsive_connection_request => .{ .payload = .{ .debug_unresponsive_connection_request = try decodePayload(pb.TeSessionClientDebugUnresponsiveConnectionRequest, allocator, payload) } },
+        .te_session_hangup_request => .{ .payload = .{ .session_hangup_request = try decodePayload(pb.TeSessionHangupRequest, allocator, payload) } },
+        .te_stream_item => decodePayload(pb.TeStreamItem, allocator, payload),
+        else => return error.NotTeStreamItem,
+    };
+}
+
+pub fn sendTeStreamItemFrame(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    item: pb.TeStreamItem,
+) !void {
+    const payload = try encodePayload(allocator, item);
+    defer allocator.free(payload);
+    try sendFrame(fd, .te_stream_item, payload);
+}
+
 pub fn encodeFrame(allocator: std.mem.Allocator, message_type: MessageType, payload: []const u8) ![]u8 {
     const envelope = try encodeEnvelopePayload(allocator, message_type, payload);
     defer allocator.free(envelope);
