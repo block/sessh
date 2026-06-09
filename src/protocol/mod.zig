@@ -12,28 +12,10 @@ pub const MessageType = enum {
     hello_error,
     error_message,
 
-    te_stream_open,
-    te_input,
-    te_resize,
-    te_repaint_request,
-
-    te_session_attached,
-    te_session_ended,
-    te_draw,
-    te_repaint_response,
-    te_tty_transcript_chunk,
-    te_input_ack,
-    te_session_client_control_response,
-    te_session_client_debug_sever_connection_request,
-    te_session_client_debug_unresponsive_connection_request,
-    te_session_hangup_request,
     ping,
     pong,
     mux_stream_frame,
     proxy_stream_item,
-    proxy_control_capabilities,
-    proxy_control_diagnostic,
-    proxy_control_ctrl_r,
     te_stream_item,
     client_te_transport_open,
     client_te_transport_diagnostic,
@@ -117,31 +99,6 @@ pub fn handleTransportControlFrame(message_type: MessageType, payload: []const u
     }
 }
 
-pub fn teStreamItemFromFramePayload(
-    allocator: std.mem.Allocator,
-    message_type: MessageType,
-    payload: []const u8,
-) !pb.TeStreamItem {
-    return switch (message_type) {
-        .te_stream_open => .{ .payload = .{ .open = try decodePayload(pb.TeStreamOpen, allocator, payload) } },
-        .te_input => .{ .payload = .{ .input = try decodePayload(pb.TeInput, allocator, payload) } },
-        .te_input_ack => .{ .payload = .{ .input_ack = try decodePayload(pb.TeInputAck, allocator, payload) } },
-        .te_resize => .{ .payload = .{ .resize = try decodePayload(pb.TeResize, allocator, payload) } },
-        .te_repaint_request => .{ .payload = .{ .repaint_request = try decodePayload(pb.TeRepaintRequest, allocator, payload) } },
-        .te_session_attached => .{ .payload = .{ .session_attached = try decodePayload(pb.TeSessionAttached, allocator, payload) } },
-        .te_session_ended => .{ .payload = .{ .session_ended = try decodePayload(pb.TeSessionEnded, allocator, payload) } },
-        .te_draw => .{ .payload = .{ .draw = try decodePayload(pb.TeDraw, allocator, payload) } },
-        .te_repaint_response => .{ .payload = .{ .repaint_response = try decodePayload(pb.TeRepaintResponse, allocator, payload) } },
-        .te_tty_transcript_chunk => .{ .payload = .{ .tty_transcript_chunk = try decodePayload(pb.TeTtyTranscriptChunk, allocator, payload) } },
-        .te_session_client_control_response => .{ .payload = .{ .session_client_control_response = try decodePayload(pb.TeSessionClientControlResponse, allocator, payload) } },
-        .te_session_client_debug_sever_connection_request => .{ .payload = .{ .debug_sever_connection_request = try decodePayload(pb.TeSessionClientDebugSeverConnectionRequest, allocator, payload) } },
-        .te_session_client_debug_unresponsive_connection_request => .{ .payload = .{ .debug_unresponsive_connection_request = try decodePayload(pb.TeSessionClientDebugUnresponsiveConnectionRequest, allocator, payload) } },
-        .te_session_hangup_request => .{ .payload = .{ .session_hangup_request = try decodePayload(pb.TeSessionHangupRequest, allocator, payload) } },
-        .te_stream_item => decodePayload(pb.TeStreamItem, allocator, payload),
-        else => return error.NotTeStreamItem,
-    };
-}
-
 pub fn sendTeStreamItemFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
@@ -150,6 +107,24 @@ pub fn sendTeStreamItemFrame(
     const payload = try encodePayload(allocator, item);
     defer allocator.free(payload);
     try sendFrame(fd, .te_stream_item, payload);
+}
+
+pub fn sendTeStreamPayloadFrame(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    payload: pb.TeStreamItem.payload_union,
+) !void {
+    try sendTeStreamItemFrame(allocator, fd, .{ .payload = payload });
+}
+
+pub fn sendProxyStreamPayloadFrame(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    payload: pb.ProxyStreamItem.payload_union,
+) !void {
+    const encoded = try encodePayload(allocator, pb.ProxyStreamItem{ .payload = payload });
+    defer allocator.free(encoded);
+    try sendFrame(fd, .proxy_stream_item, encoded);
 }
 
 pub fn encodeFrame(allocator: std.mem.Allocator, message_type: MessageType, payload: []const u8) ![]u8 {
@@ -187,8 +162,8 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
             .ping => |message| ownedFrameFromMessage(allocator, .ping, message),
             .pong => |message| ownedFrameFromMessage(allocator, .pong, message),
             .mux_stream_frame => |message| ownedFrameFromMessage(allocator, .mux_stream_frame, message),
-            .te_stream_item => |message| ownedFrameFromTeStreamItem(allocator, message),
-            .proxy_stream_item => |message| ownedFrameFromProxyStreamItem(allocator, message),
+            .te_stream_item => |message| ownedFrameFromMessage(allocator, .te_stream_item, message),
+            .proxy_stream_item => |message| ownedFrameFromMessage(allocator, .proxy_stream_item, message),
             .client_te_transport_open => |message| ownedFrameFromMessage(allocator, .client_te_transport_open, message),
             .client_te_transport_diagnostic => |message| ownedFrameFromMessage(allocator, .client_te_transport_diagnostic, message),
             .client_te_transport_status => |message| ownedFrameFromMessage(allocator, .client_te_transport_status, message),
@@ -221,37 +196,6 @@ fn ownedFrameFromMessage(allocator: std.mem.Allocator, message_type: MessageType
     };
 }
 
-fn ownedFrameFromTeStreamItem(allocator: std.mem.Allocator, item: pb.TeStreamItem) !OwnedFrame {
-    const payload = item.payload orelse return error.UnknownFrame;
-    return switch (payload) {
-        .open => |message| ownedFrameFromMessage(allocator, .te_stream_open, message),
-        .input => |message| ownedFrameFromMessage(allocator, .te_input, message),
-        .input_ack => |message| ownedFrameFromMessage(allocator, .te_input_ack, message),
-        .resize => |message| ownedFrameFromMessage(allocator, .te_resize, message),
-        .repaint_request => |message| ownedFrameFromMessage(allocator, .te_repaint_request, message),
-        .session_attached => |message| ownedFrameFromMessage(allocator, .te_session_attached, message),
-        .session_ended => |message| ownedFrameFromMessage(allocator, .te_session_ended, message),
-        .draw => |message| ownedFrameFromMessage(allocator, .te_draw, message),
-        .repaint_response => |message| ownedFrameFromMessage(allocator, .te_repaint_response, message),
-        .tty_transcript_chunk => |message| ownedFrameFromMessage(allocator, .te_tty_transcript_chunk, message),
-        .diagnostic => |message| ownedFrameFromMessage(allocator, .te_stream_item, pb.TeStreamItem{ .payload = .{ .diagnostic = message } }),
-        .session_client_control_response => |message| ownedFrameFromMessage(allocator, .te_session_client_control_response, message),
-        .debug_sever_connection_request => |message| ownedFrameFromMessage(allocator, .te_session_client_debug_sever_connection_request, message),
-        .debug_unresponsive_connection_request => |message| ownedFrameFromMessage(allocator, .te_session_client_debug_unresponsive_connection_request, message),
-        .session_hangup_request => |message| ownedFrameFromMessage(allocator, .te_session_hangup_request, message),
-    };
-}
-
-fn ownedFrameFromProxyStreamItem(allocator: std.mem.Allocator, item: pb.ProxyStreamItem) !OwnedFrame {
-    const payload = item.payload orelse return error.UnknownFrame;
-    return switch (payload) {
-        .control_capabilities => |message| ownedFrameFromMessage(allocator, .proxy_control_capabilities, message),
-        .control_diagnostic => |message| ownedFrameFromMessage(allocator, .proxy_control_diagnostic, message),
-        .control_ctrl_r => |message| ownedFrameFromMessage(allocator, .proxy_control_ctrl_r, message),
-        else => ownedFrameFromMessage(allocator, .proxy_stream_item, item),
-    };
-}
-
 fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType, payload: []const u8) ![]u8 {
     return switch (message_type) {
         .hello_request => blk: {
@@ -274,76 +218,6 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .@"error" = message } });
         },
-        .te_stream_open => blk: {
-            var message = try decodePayload(pb.TeStreamOpen, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .open = message } } } });
-        },
-        .te_input => blk: {
-            var message = try decodePayload(pb.TeInput, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .input = message } } } });
-        },
-        .te_resize => blk: {
-            var message = try decodePayload(pb.TeResize, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .resize = message } } } });
-        },
-        .te_repaint_request => blk: {
-            var message = try decodePayload(pb.TeRepaintRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .repaint_request = message } } } });
-        },
-        .te_session_attached => blk: {
-            var message = try decodePayload(pb.TeSessionAttached, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .session_attached = message } } } });
-        },
-        .te_session_ended => blk: {
-            var message = try decodePayload(pb.TeSessionEnded, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .session_ended = message } } } });
-        },
-        .te_draw => blk: {
-            var message = try decodePayload(pb.TeDraw, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .draw = message } } } });
-        },
-        .te_repaint_response => blk: {
-            var message = try decodePayload(pb.TeRepaintResponse, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .repaint_response = message } } } });
-        },
-        .te_tty_transcript_chunk => blk: {
-            var message = try decodePayload(pb.TeTtyTranscriptChunk, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .tty_transcript_chunk = message } } } });
-        },
-        .te_input_ack => blk: {
-            var message = try decodePayload(pb.TeInputAck, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .input_ack = message } } } });
-        },
-        .te_session_client_control_response => blk: {
-            var message = try decodePayload(pb.TeSessionClientControlResponse, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .session_client_control_response = message } } } });
-        },
-        .te_session_client_debug_sever_connection_request => blk: {
-            var message = try decodePayload(pb.TeSessionClientDebugSeverConnectionRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .debug_sever_connection_request = message } } } });
-        },
-        .te_session_client_debug_unresponsive_connection_request => blk: {
-            var message = try decodePayload(pb.TeSessionClientDebugUnresponsiveConnectionRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .debug_unresponsive_connection_request = message } } } });
-        },
-        .te_session_hangup_request => blk: {
-            var message = try decodePayload(pb.TeSessionHangupRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = .{ .payload = .{ .session_hangup_request = message } } } });
-        },
         .ping => blk: {
             var message = try decodePayload(pb.Ping, allocator, payload);
             defer message.deinit(allocator);
@@ -363,21 +237,6 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             var message = try decodePayload(pb.ProxyStreamItem, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_item = message } });
-        },
-        .proxy_control_capabilities => blk: {
-            var message = try decodePayload(pb.ProxyStreamItem.ControlCapabilities, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_item = .{ .payload = .{ .control_capabilities = message } } } });
-        },
-        .proxy_control_diagnostic => blk: {
-            var message = try decodePayload(pb.ProxyStreamItem.ControlDiagnostic, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_item = .{ .payload = .{ .control_diagnostic = message } } } });
-        },
-        .proxy_control_ctrl_r => blk: {
-            var message = try decodePayload(pb.ProxyStreamItem.ControlCtrlR, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_item = .{ .payload = .{ .control_ctrl_r = message } } } });
         },
         .te_stream_item => blk: {
             var message = try decodePayload(pb.TeStreamItem, allocator, payload);
@@ -448,19 +307,25 @@ test "generated protobuf payload round trip" {
 }
 
 test "frame envelope round trip" {
-    const payload = try encodePayload(std.testing.allocator, pb.TeInputAck{ .input_seq = 42 });
+    const payload = try encodePayload(std.testing.allocator, pb.TeStreamItem{
+        .payload = .{ .input_ack = .{ .input_seq = 42 } },
+    });
     defer std.testing.allocator.free(payload);
-    const frame_bytes = try encodeFrame(std.testing.allocator, .te_input_ack, payload);
+    const frame_bytes = try encodeFrame(std.testing.allocator, .te_stream_item, payload);
     defer std.testing.allocator.free(frame_bytes);
 
     const envelope = frame_bytes[frame_header_len..];
     var frame = try decodeEnvelopeAlloc(std.testing.allocator, envelope);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(MessageType.te_input_ack, frame.message_type);
+    try std.testing.expectEqual(MessageType.te_stream_item, frame.message_type);
 
-    var decoded = try decodePayload(pb.TeInputAck, std.testing.allocator, frame.payload);
+    var decoded = try decodePayload(pb.TeStreamItem, std.testing.allocator, frame.payload);
     defer decoded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 42), decoded.input_seq);
+    const decoded_payload = decoded.payload orelse return error.MissingTePayload;
+    switch (decoded_payload) {
+        .input_ack => |ack| try std.testing.expectEqual(@as(u64, 42), ack.input_seq),
+        else => return error.UnexpectedTePayload,
+    }
 }
 
 test "mux stream frame preserves stream id offset and proxy payload" {

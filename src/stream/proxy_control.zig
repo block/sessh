@@ -75,22 +75,22 @@ pub fn serverHandshake(allocator: std.mem.Allocator, fd: c.fd_t, capabilities: C
 }
 
 fn writeCapabilities(fd: c.fd_t, capabilities: Capabilities) !void {
-    try sendMessage(fd, .proxy_control_capabilities, pb.ProxyStreamItem.ControlCapabilities{
+    try protocol.sendProxyStreamPayloadFrame(app_allocator.allocator(), fd, .{ .control_capabilities = .{
         .output_mode = toPbOutputMode(capabilities.output_mode),
         .ctrl_r_available = capabilities.ctrl_r_available,
-    });
+    } });
 }
 
 pub fn writeDiagnostic(fd: c.fd_t, diagnostic: Diagnostic) !void {
-    try sendMessage(fd, .proxy_control_diagnostic, pb.ProxyStreamItem.ControlDiagnostic{
+    try protocol.sendProxyStreamPayloadFrame(app_allocator.allocator(), fd, .{ .control_diagnostic = .{
         .update = diagnostic.update,
         .diagnostic_line = diagnostic.diagnostic_line,
         .intercept_ctrl_r = diagnostic.intercept_ctrl_r,
-    });
+    } });
 }
 
 pub fn writeCtrlR(fd: c.fd_t) !void {
-    try sendMessage(fd, .proxy_control_ctrl_r, pb.ProxyStreamItem.ControlCtrlR{});
+    try protocol.sendProxyStreamPayloadFrame(app_allocator.allocator(), fd, .{ .control_ctrl_r = .{} });
 }
 
 fn readCapabilities(allocator: std.mem.Allocator, fd: c.fd_t) !Capabilities {
@@ -99,9 +99,14 @@ fn readCapabilities(allocator: std.mem.Allocator, fd: c.fd_t) !Capabilities {
         defer frame.deinit(allocator);
 
         switch (frame.message_type) {
-            .proxy_control_capabilities => {
-                var message = try protocol.decodePayload(pb.ProxyStreamItem.ControlCapabilities, allocator, frame.payload);
-                defer message.deinit(allocator);
+            .proxy_stream_item => {
+                var item = try protocol.decodePayload(pb.ProxyStreamItem, allocator, frame.payload);
+                defer item.deinit(allocator);
+                const item_payload = item.payload orelse return error.UnexpectedProxyControlFrame;
+                const message = switch (item_payload) {
+                    .control_capabilities => |capabilities| capabilities,
+                    else => return error.UnexpectedProxyControlFrame,
+                };
                 return .{
                     .output_mode = fromPbOutputMode(message.output_mode),
                     .ctrl_r_available = message.ctrl_r_available,
@@ -119,11 +124,12 @@ pub fn readMessage(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
     var frame = try protocol.readFrameAlloc(allocator, fd);
     defer frame.deinit(allocator);
 
-    return switch (frame.message_type) {
-        .proxy_control_diagnostic => blk: {
-            var message = try protocol.decodePayload(pb.ProxyStreamItem.ControlDiagnostic, allocator, frame.payload);
-            defer message.deinit(allocator);
-
+    if (frame.message_type != .proxy_stream_item) return error.UnexpectedProxyControlFrame;
+    var item = try protocol.decodePayload(pb.ProxyStreamItem, allocator, frame.payload);
+    defer item.deinit(allocator);
+    const item_payload = item.payload orelse return error.UnexpectedProxyControlFrame;
+    return switch (item_payload) {
+        .control_diagnostic => |message| blk: {
             const update = if (message.update) |line| try allocator.dupe(u8, line) else null;
             errdefer if (update) |owned| allocator.free(owned);
             const diagnostic_line = if (message.diagnostic_line) |line| try allocator.dupe(u8, line) else null;
@@ -139,19 +145,9 @@ pub fn readMessage(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
                 .owned_diagnostic_line = diagnostic_line,
             };
         },
-        .proxy_control_ctrl_r => blk: {
-            var message = try protocol.decodePayload(pb.ProxyStreamItem.ControlCtrlR, allocator, frame.payload);
-            defer message.deinit(allocator);
-            break :blk OwnedMessage{ .message = .ctrl_r };
-        },
+        .control_ctrl_r => OwnedMessage{ .message = .ctrl_r },
         else => error.UnexpectedProxyControlFrame,
     };
-}
-
-fn sendMessage(fd: c.fd_t, message_type: protocol.MessageType, message: anytype) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), message);
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, message_type, payload);
 }
 
 fn sendHelloRequest(fd: c.fd_t) !void {

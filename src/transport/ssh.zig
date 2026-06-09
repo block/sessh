@@ -929,17 +929,32 @@ fn openPooledTerminalClientStream(tunnel: *TerminalTunnel, client: *PooledTermin
         else => return err,
     };
     defer frame.deinit(tunnel.allocator);
-    if (frame.message_type != .te_stream_open) {
-        if (frame.message_type == .mux_stream_frame) {
-            try sendPooledProxyMuxOpen(tunnel, client, frame.payload);
-            client.state = .active;
-            return;
-        }
+    if (frame.message_type == .mux_stream_frame) {
+        try sendPooledProxyMuxOpen(tunnel, client, frame.payload);
+        client.state = .active;
+        return;
+    }
+    if (frame.message_type != .te_stream_item) {
         try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal or proxy stream open", "");
         finishPooledTerminalClient(tunnel, client, false);
         return;
     }
-    try sendPooledTeMuxOpen(tunnel, client, frame.payload);
+    var item = try protocol.decodePayload(pb.TeStreamItem, tunnel.allocator, frame.payload);
+    defer item.deinit(tunnel.allocator);
+    const item_payload = item.payload orelse {
+        try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal stream open", "");
+        finishPooledTerminalClient(tunnel, client, false);
+        return;
+    };
+    const open = switch (item_payload) {
+        .open => |request| request,
+        else => {
+            try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal stream open", "");
+            finishPooledTerminalClient(tunnel, client, false);
+            return;
+        },
+    };
+    try sendPooledTeMuxOpen(tunnel, client, open);
     client.kind = .te;
     client.state = .active;
 }
@@ -965,20 +980,15 @@ fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerm
             }
             try sendPooledProxyMuxFrame(tunnel, client, frame.payload);
         },
-        .te_input,
-        .te_resize,
-        .te_repaint_request,
-        .te_session_client_debug_sever_connection_request,
-        .te_session_client_debug_unresponsive_connection_request,
-        .te_session_hangup_request,
-        .te_stream_item,
-        => {
+        .te_stream_item => {
             if (client.kind != .te) {
                 try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected terminal stream frame", "");
                 finishPooledTerminalClient(tunnel, client, true);
                 return;
             }
-            try sendPooledTeMuxPayloadFromFrame(tunnel, client, frame.message_type, frame.payload);
+            var item = try protocol.decodePayload(pb.TeStreamItem, tunnel.allocator, frame.payload);
+            defer item.deinit(tunnel.allocator);
+            try sendPooledTeMuxPayload(tunnel, client, item);
         },
         else => {
             try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected terminal client frame", "");
@@ -990,10 +1000,8 @@ fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerm
 fn sendPooledTeMuxOpen(
     tunnel: *TerminalTunnel,
     client: *PooledTerminalClient,
-    payload: []const u8,
+    request: pb.TeStreamOpen,
 ) !void {
-    var request = try protocol.decodePayload(pb.TeStreamOpen, tunnel.allocator, payload);
-    defer request.deinit(tunnel.allocator);
     try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, .{
         .stream_id = client.stream_id,
         .message = .{ .open = .{
@@ -1039,17 +1047,6 @@ fn sendPooledProxyMuxFrame(
     if (mux_frame.stream_id != client.local_stream_id) return error.UnexpectedDaemonFrame;
     mux_frame.stream_id = client.stream_id;
     try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, mux_frame);
-}
-
-fn sendPooledTeMuxPayloadFromFrame(
-    tunnel: *TerminalTunnel,
-    client: *PooledTerminalClient,
-    message_type: protocol.MessageType,
-    payload: []const u8,
-) !void {
-    var item = try protocol.teStreamItemFromFramePayload(tunnel.allocator, message_type, payload);
-    defer item.deinit(tunnel.allocator);
-    try sendPooledTeMuxPayload(tunnel, client, item);
 }
 
 fn sendPooledTeMuxPayload(

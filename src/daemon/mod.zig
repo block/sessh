@@ -174,11 +174,24 @@ fn copyClientFrameToDaemon(allocator: std.mem.Allocator, read_fd: c.fd_t, write_
     };
     defer frame.deinit(allocator);
 
-    if (frame.message_type == .te_stream_open) {
-        const payload = try session_daemon_handler.sessionOpenPayloadWithCurrentEnvironment(allocator, frame.payload);
-        defer allocator.free(payload);
-        try protocol.sendFrame(write_fd, frame.message_type, payload);
-        return true;
+    if (frame.message_type == .te_stream_item) {
+        var item = try protocol.decodePayload(pb.TeStreamItem, allocator, frame.payload);
+        defer item.deinit(allocator);
+        if (item.payload) |item_payload| {
+            switch (item_payload) {
+                .open => |request| {
+                    const open_payload = try protocol.encodePayload(allocator, request);
+                    defer allocator.free(open_payload);
+                    const payload = try session_daemon_handler.sessionOpenPayloadWithCurrentEnvironment(allocator, open_payload);
+                    defer allocator.free(payload);
+                    var open = try protocol.decodePayload(pb.TeStreamOpen, allocator, payload);
+                    defer open.deinit(allocator);
+                    try protocol.sendTeStreamPayloadFrame(allocator, write_fd, .{ .open = open });
+                    return true;
+                },
+                else => {},
+            }
+        }
     }
 
     try protocol.sendFrame(write_fd, frame.message_type, frame.payload);
@@ -415,16 +428,30 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
             },
-            .te_resize => continue,
-            .te_stream_open => {
-                try session_daemon_handler.serveFrameAfterHandshake(allocator, exe, frame, fd, fd);
-                return;
-            },
-            .te_session_client_debug_sever_connection_request,
-            .te_session_client_debug_unresponsive_connection_request,
-            => {
-                try session_daemon_handler.serveDebugFrameAfterHandshake(allocator, frame, fd);
-                return;
+            .te_stream_item => {
+                var item = try protocol.decodePayload(pb.TeStreamItem, allocator, frame.payload);
+                defer item.deinit(allocator);
+                const item_payload = item.payload orelse {
+                    try sendError(fd, "PROTOCOL_ERROR", "empty terminal stream item", "");
+                    return;
+                };
+                switch (item_payload) {
+                    .resize => continue,
+                    .open => {
+                        try session_daemon_handler.serveFrameAfterHandshake(allocator, exe, frame, fd, fd);
+                        return;
+                    },
+                    .debug_sever_connection_request,
+                    .debug_unresponsive_connection_request,
+                    => {
+                        try session_daemon_handler.serveDebugFrameAfterHandshake(allocator, frame, fd);
+                        return;
+                    },
+                    else => {
+                        try sendError(fd, "PROTOCOL_ERROR", "unexpected terminal stream item", "");
+                        return;
+                    },
+                }
             },
             .mux_stream_frame => {
                 if (session_daemon_handler.isTeMuxOpenFrame(allocator, frame)) {

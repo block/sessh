@@ -426,9 +426,7 @@ pub const RuntimeSession = struct {
         tty_transcript.setSessionGuid(guid);
     }
 
-    fn recordSessionEndedPayload(self: *RuntimeSession, payload: []const u8) !void {
-        var ended = try protocol.decodePayload(pb.TeSessionEnded, app_allocator.allocator(), payload);
-        defer ended.deinit(app_allocator.allocator());
+    fn recordSessionEnded(self: *RuntimeSession, ended: pb.TeSessionEnded) void {
         self.ended_process_exit_code = processExitCodeFromSessionEnded(ended);
     }
 
@@ -613,17 +611,13 @@ test "attached client drains pending session end before monitor timeout" {
     defer posix.close(remote_to_client[0]);
     defer posix.close(remote_to_client[1]);
 
-    const draw = try protocol.encodePayload(app_allocator.allocator(), pb.TeDraw{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), remote_to_client[1], .{ .draw = .{
         .scrollback_cursor = "cursor-v1",
-    });
-    defer app_allocator.allocator().free(draw);
-    try protocol.sendFrame(remote_to_client[1], .te_draw, draw);
+    } });
 
-    const session_ended = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionEnded{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), remote_to_client[1], .{ .session_ended = .{
         .reason = .TE_SESSION_END_REASON_PROCESS_EXITED,
-    });
-    defer app_allocator.allocator().free(session_ended);
-    try protocol.sendFrame(remote_to_client[1], .te_session_ended, session_ended);
+    } });
 
     var presentation_guard = client_renderer.PresentationGuard.init(1);
     var scrollback_cursor = ScrollbackCursor{};
@@ -785,14 +779,12 @@ test "recovery polling stores attached-client-end restore bytes from draw" {
     var session = RuntimeSession{};
     defer session.attached_client_end_restore.deinit(app_allocator.allocator());
 
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeDraw{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fds[1], .{ .draw = .{
         .scrollback_cursor = "opaque-cursor",
         .viewport_offset = 0,
         .draw_bytes = "",
         .attached_client_end_restore_bytes = "restore-primary",
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fds[1], .te_draw, payload);
+    } });
 
     try std.testing.expectEqual(RuntimeRecovery.recovered, (try pollRuntimeRecovery(fds[0], &session, 0)).?);
     try std.testing.expectEqualStrings("restore-primary", session.attached_client_end_restore.items);
@@ -806,13 +798,11 @@ test "recovery polling ignores draw while repaint is outstanding" {
     var session = RuntimeSession{ .pending_repaint = .{ .repaint_request_seq = 7 } };
     defer session.attached_client_end_restore.deinit(app_allocator.allocator());
 
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeDraw{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fds[1], .{ .draw = .{
         .scrollback_cursor = "stale-cursor",
         .viewport_offset = 3,
         .draw_bytes = "",
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fds[1], .te_draw, payload);
+    } });
 
     try std.testing.expectEqual(@as(?RuntimeRecovery, null), try pollRuntimeRecovery(fds[0], &session, 0));
     try std.testing.expectEqual(@as(usize, 0), session.scrollback_cursor.len);
@@ -829,25 +819,21 @@ test "recovery polling waits for resize repaint after input ack" {
     defer session.attached_client_end_restore.deinit(app_allocator.allocator());
     const repaint_seq = session.pending_repaint.startResizeAt(1_000);
 
-    const ack_payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeInputAck{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fds[1], .{ .input_ack = .{
         .input_seq = 1,
-    });
-    defer app_allocator.allocator().free(ack_payload);
-    try protocol.sendFrame(fds[1], .te_input_ack, ack_payload);
+    } });
 
     try std.testing.expectEqual(@as(?RuntimeRecovery, null), try pollRuntimeRecovery(fds[0], &session, 0));
     try std.testing.expect(session.pending_repaint.requiresRepaintForRecovery());
 
-    const repaint_payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeRepaintResponse{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fds[1], .{ .repaint_response = .{
         .repaint_request_seq = repaint_seq,
         .draw = .{
             .scrollback_cursor = "fresh-cursor",
             .viewport_offset = 0,
             .draw_bytes = "",
         },
-    });
-    defer app_allocator.allocator().free(repaint_payload);
-    try protocol.sendFrame(fds[1], .te_repaint_response, repaint_payload);
+    } });
 
     try std.testing.expectEqual(RuntimeRecovery.recovered, (try pollRuntimeRecovery(fds[0], &session, 0)).?);
     try std.testing.expect(!session.pending_repaint.active());
@@ -898,20 +884,16 @@ test "reconnect waits for repaint response before returning" {
 
     next_repaint_request_seq = 77;
 
-    const session_attached = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionAttached{});
-    defer app_allocator.allocator().free(session_attached);
-    try protocol.sendFrame(remote_to_client[1], .te_session_attached, session_attached);
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), remote_to_client[1], .{ .session_attached = .{} });
 
-    const repaint_response = try protocol.encodePayload(app_allocator.allocator(), pb.TeRepaintResponse{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), remote_to_client[1], .{ .repaint_response = .{
         .repaint_request_seq = 77,
         .draw = .{
             .scrollback_cursor = "fresh-cursor",
             .viewport_offset = 5,
             .draw_bytes = "",
         },
-    });
-    defer app_allocator.allocator().free(repaint_response);
-    try protocol.sendFrame(remote_to_client[1], .te_repaint_response, repaint_response);
+    } });
 
     var session = RuntimeSession{};
     defer session.attached_client_end_restore.deinit(app_allocator.allocator());
@@ -934,16 +916,14 @@ test "runtime repaint after local ui requests screen-only repaint" {
 
     next_repaint_request_seq = 91;
 
-    const repaint_response = try protocol.encodePayload(app_allocator.allocator(), pb.TeRepaintResponse{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), remote_to_client[1], .{ .repaint_response = .{
         .repaint_request_seq = 91,
         .draw = .{
             .scrollback_cursor = "fresh-cursor",
             .viewport_offset = 6,
             .draw_bytes = "",
         },
-    });
-    defer app_allocator.allocator().free(repaint_response);
-    try protocol.sendFrame(remote_to_client[1], .te_repaint_response, repaint_response);
+    } });
 
     var session = RuntimeSession{};
     defer session.attached_client_end_restore.deinit(app_allocator.allocator());
@@ -954,9 +934,14 @@ test "runtime repaint after local ui requests screen-only repaint" {
 
     var frame = try protocol.readFrameAlloc(app_allocator.allocator(), client_to_remote[0]);
     defer frame.deinit(app_allocator.allocator());
-    try std.testing.expectEqual(protocol.MessageType.te_resize, frame.message_type);
-    var resize = try protocol.decodePayload(pb.TeResize, app_allocator.allocator(), frame.payload);
-    defer resize.deinit(app_allocator.allocator());
+    try std.testing.expectEqual(protocol.MessageType.te_stream_item, frame.message_type);
+    var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+    defer item.deinit(app_allocator.allocator());
+    const item_payload = item.payload orelse return error.MissingTePayload;
+    const resize = switch (item_payload) {
+        .resize => |message| message,
+        else => return error.UnexpectedTePayload,
+    };
     try std.testing.expectEqual(@as(u32, 24), resize.terminal_rows);
     try std.testing.expectEqual(@as(u32, 80), resize.terminal_cols);
     try std.testing.expectEqual(@as(?i32, 5), resize.viewport_offset);
@@ -1062,19 +1047,34 @@ fn finishReconnectRepaintInner(
         var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .te_draw => {},
-            .te_repaint_response => {
-                _ = try handleRepaintResponseFrame(
-                    frame.payload,
-                    &session.attached_client_end_restore,
-                    &session.scrollback_cursor,
-                    &session.viewport_offset,
-                    &session.pending_repaint,
-                    &session.app_title_present,
-                );
-            },
-            .te_input_ack => {
-                _ = try handleInputAckFrame(frame.payload, &session.input_ack_tracker);
+            .te_stream_item => {
+                var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+                defer item.deinit(app_allocator.allocator());
+                const item_payload = item.payload orelse return error.UnexpectedFrame;
+                switch (item_payload) {
+                    .draw => {},
+                    .repaint_response => |response| {
+                        _ = try handleRepaintResponseMessageWithInitialAlignment(
+                            response,
+                            &session.attached_client_end_restore,
+                            &session.scrollback_cursor,
+                            &session.viewport_offset,
+                            &session.pending_repaint,
+                            &session.app_title_present,
+                            null,
+                            null,
+                        );
+                    },
+                    .input_ack => |ack| {
+                        _ = handleInputAckMessage(ack, &session.input_ack_tracker);
+                    },
+                    .tty_transcript_chunk => |chunk| handleTtyTranscriptChunkMessage(chunk),
+                    .session_ended => |ended| {
+                        session.recordSessionEnded(ended);
+                        return error.SessionEnded;
+                    },
+                    else => return error.UnexpectedFrame,
+                }
             },
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
@@ -1085,11 +1085,6 @@ fn finishReconnectRepaintInner(
             .client_te_transport_closed => return error.RemoteTransportClosed,
             .ping, .pong => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
-            },
-            .te_tty_transcript_chunk => try handleTtyTranscriptChunkFrame(frame.payload),
-            .te_session_ended => {
-                try session.recordSessionEndedPayload(frame.payload);
-                return error.SessionEnded;
             },
             .error_message => {
                 try printErrorPayload(frame.payload);
@@ -1177,37 +1172,47 @@ pub fn pollRuntimeRecovery(
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        .te_draw => {
-            if (session.pending_repaint.active()) return null;
-            try handleDrawFrame(frame.payload, &session.attached_client_end_restore, &session.scrollback_cursor, &session.viewport_offset, &session.app_title_present);
-            return .recovered;
-        },
-        .te_repaint_response => {
-            const applied = try handleRepaintResponseFrame(
-                frame.payload,
-                &session.attached_client_end_restore,
-                &session.scrollback_cursor,
-                &session.viewport_offset,
-                &session.pending_repaint,
-                &session.app_title_present,
-            );
-            return if (applied) .recovered else null;
-        },
-        .te_input_ack => {
-            _ = try handleInputAckFrame(frame.payload, &session.input_ack_tracker);
-            if (session.pending_repaint.requiresRepaintForRecovery()) return null;
-            return .recovered;
-        },
-        .te_tty_transcript_chunk => {
-            try handleTtyTranscriptChunkFrame(frame.payload);
-            return .recovered;
+        .te_stream_item => {
+            var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+            defer item.deinit(app_allocator.allocator());
+            const item_payload = item.payload orelse return error.UnexpectedFrame;
+            switch (item_payload) {
+                .draw => |draw| {
+                    if (session.pending_repaint.active()) return null;
+                    try handleDrawMessageWithInitialAlignment(draw, &session.attached_client_end_restore, &session.scrollback_cursor, &session.viewport_offset, &session.app_title_present, null, null);
+                    return .recovered;
+                },
+                .repaint_response => |response| {
+                    const applied = try handleRepaintResponseMessageWithInitialAlignment(
+                        response,
+                        &session.attached_client_end_restore,
+                        &session.scrollback_cursor,
+                        &session.viewport_offset,
+                        &session.pending_repaint,
+                        &session.app_title_present,
+                        null,
+                        null,
+                    );
+                    return if (applied) .recovered else null;
+                },
+                .input_ack => |ack| {
+                    _ = handleInputAckMessage(ack, &session.input_ack_tracker);
+                    if (session.pending_repaint.requiresRepaintForRecovery()) return null;
+                    return .recovered;
+                },
+                .tty_transcript_chunk => |chunk| {
+                    handleTtyTranscriptChunkMessage(chunk);
+                    return .recovered;
+                },
+                .session_ended => |ended| {
+                    session.recordSessionEnded(ended);
+                    _ = finishAttachedClient(.session_ended, &session.attached_client_end_restore);
+                    return .session_ended;
+                },
+                else => return error.UnexpectedFrame,
+            }
         },
         .client_te_transport_closed => return .remote_transport_closed,
-        .te_session_ended => {
-            try session.recordSessionEndedPayload(frame.payload);
-            _ = finishAttachedClient(.session_ended, &session.attached_client_end_restore);
-            return .session_ended;
-        },
         .error_message => {
             try printErrorPayload(frame.payload);
             _ = finishAttachedClient(.session_ended, &session.attached_client_end_restore);
@@ -1313,9 +1318,14 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                 try printParsedError(parsed);
                 return process_exit.request(1);
             },
-            .te_session_attached => {
-                var attached = try protocol.decodePayload(pb.TeSessionAttached, app_allocator.allocator(), frame.payload);
-                defer attached.deinit(app_allocator.allocator());
+            .te_stream_item => {
+                var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+                defer item.deinit(app_allocator.allocator());
+                const item_payload = item.payload orelse return error.UnexpectedFrame;
+                const attached = switch (item_payload) {
+                    .session_attached => |message| message,
+                    else => return error.UnexpectedFrame,
+                };
                 var session = RuntimeSession{};
                 try session.setIdentity(attached.session_guid);
                 try session.setSessionDir(attached.session_dir);
@@ -1380,10 +1390,14 @@ fn readSessionAttachedInner(
                 try printParsedError(parsed);
                 return process_exit.request(1);
             },
-            .te_session_attached => {
-                var attached = try protocol.decodePayload(pb.TeSessionAttached, app_allocator.allocator(), frame.payload);
-                defer attached.deinit(app_allocator.allocator());
-                return;
+            .te_stream_item => {
+                var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+                defer item.deinit(app_allocator.allocator());
+                const item_payload = item.payload orelse return error.UnexpectedFrame;
+                switch (item_payload) {
+                    .session_attached => return,
+                    else => return error.UnexpectedFrame,
+                }
             },
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
@@ -1477,9 +1491,7 @@ fn sendSessionCreate(
         .capture_tty_transcript = tty_transcript.enabled(),
         .create = create,
     };
-    const payload = try protocol.encodePayload(app_allocator.allocator(), message);
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(conn, .te_stream_open, payload);
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), conn, .{ .open = message });
     return repaint_request_seq;
 }
 
@@ -1561,9 +1573,7 @@ fn sendSessionAttach(
         },
         .capture_tty_transcript = tty_transcript.enabled(),
     };
-    const payload = try protocol.encodePayload(app_allocator.allocator(), message);
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(conn, .te_stream_open, payload);
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), conn, .{ .open = message });
     return repaint_request_seq;
 }
 
@@ -1576,7 +1586,15 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
                 try printErrorPayload(frame.payload);
                 return true;
             },
-            .te_session_ended => return false,
+            .te_stream_item => {
+                var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+                defer item.deinit(app_allocator.allocator());
+                const item_payload = item.payload orelse return error.UnexpectedFrame;
+                switch (item_payload) {
+                    .session_ended => return false,
+                    else => return error.UnexpectedFrame,
+                }
+            },
             .client_te_transport_diagnostic => {
                 try handleClientTeTransportDiagnosticFrame(frame.payload);
             },
@@ -1964,17 +1982,32 @@ fn handleEscapeHelpRuntimeFrame(
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        // The overlay sits on top of the last rendered screen. Applying remote
-        // draws here would interleave two renderers; repaint-after-dismiss is
-        // the boundary that gets us back to a single source of screen truth.
-        .te_draw, .te_repaint_response => return null,
-        .te_tty_transcript_chunk => {
-            try handleTtyTranscriptChunkFrame(frame.payload);
-            return null;
-        },
-        .te_input_ack => {
-            _ = try handleInputAckFrame(frame.payload, input_ack_tracker);
-            return null;
+        .te_stream_item => {
+            var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+            defer item.deinit(app_allocator.allocator());
+            const item_payload = item.payload orelse return error.UnexpectedFrame;
+            switch (item_payload) {
+                // The overlay sits on top of the last rendered screen. Applying
+                // remote draws here would interleave two renderers;
+                // repaint-after-dismiss is the boundary that gets us back to a
+                // single source of screen truth.
+                .draw, .repaint_response => return null,
+                .tty_transcript_chunk => |chunk| {
+                    handleTtyTranscriptChunkMessage(chunk);
+                    return null;
+                },
+                .input_ack => |ack| {
+                    _ = handleInputAckMessage(ack, input_ack_tracker);
+                    return null;
+                },
+                .session_ended => |ended| {
+                    if (ended_process_exit_code) |exit_code| {
+                        exit_code.* = processExitCodeFromSessionEnded(ended);
+                    }
+                    return .session_ended;
+                },
+                else => return error.UnexpectedFrame,
+            }
         },
         .client_te_transport_diagnostic => {
             try handleClientTeTransportDiagnosticFrame(frame.payload);
@@ -1988,14 +2021,6 @@ fn handleEscapeHelpRuntimeFrame(
         .ping, .pong => {
             _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             return null;
-        },
-        .te_session_ended => {
-            if (ended_process_exit_code) |exit_code| {
-                var ended = try protocol.decodePayload(pb.TeSessionEnded, app_allocator.allocator(), frame.payload);
-                defer ended.deinit(app_allocator.allocator());
-                exit_code.* = processExitCodeFromSessionEnded(ended);
-            }
-            return .session_ended;
         },
         .error_message => {
             try printErrorPayload(frame.payload);
@@ -2098,41 +2123,55 @@ fn handleAttachedClientRuntimeFrame(
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        .te_draw => {
-            if (!pending_repaint.active()) {
-                try handleDrawFrameWithInitialAlignment(
-                    frame.payload,
-                    attached_client_end_restore,
-                    scrollback_cursor,
-                    viewport_offset,
-                    app_title_present,
-                    initial_cursor_position,
-                    initial_draw_alignment_pending,
-                );
+        .te_stream_item => {
+            var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+            defer item.deinit(app_allocator.allocator());
+            const item_payload = item.payload orelse return error.UnexpectedFrame;
+            switch (item_payload) {
+                .draw => |draw| {
+                    if (!pending_repaint.active()) {
+                        try handleDrawMessageWithInitialAlignment(
+                            draw,
+                            attached_client_end_restore,
+                            scrollback_cursor,
+                            viewport_offset,
+                            app_title_present,
+                            initial_cursor_position,
+                            initial_draw_alignment_pending,
+                        );
+                    }
+                    return null;
+                },
+                .repaint_response => |response| {
+                    _ = try handleRepaintResponseMessageWithInitialAlignment(
+                        response,
+                        attached_client_end_restore,
+                        scrollback_cursor,
+                        viewport_offset,
+                        pending_repaint,
+                        app_title_present,
+                        initial_cursor_position,
+                        initial_draw_alignment_pending,
+                    );
+                    return null;
+                },
+                .tty_transcript_chunk => |chunk| {
+                    handleTtyTranscriptChunkMessage(chunk);
+                    return null;
+                },
+                .input_ack => |ack_message| {
+                    const ack = handleInputAckMessage(ack_message, input_ack_tracker);
+                    if (ack.progressed) connection_monitor.noteInputAckProgress(ack.still_pending);
+                    return null;
+                },
+                .session_ended => |ended| {
+                    if (ended_process_exit_code) |exit_code| {
+                        exit_code.* = processExitCodeFromSessionEnded(ended);
+                    }
+                    return .session_ended;
+                },
+                else => return error.UnexpectedFrame,
             }
-            return null;
-        },
-        .te_repaint_response => {
-            _ = try handleRepaintResponseFrameWithInitialAlignment(
-                frame.payload,
-                attached_client_end_restore,
-                scrollback_cursor,
-                viewport_offset,
-                pending_repaint,
-                app_title_present,
-                initial_cursor_position,
-                initial_draw_alignment_pending,
-            );
-            return null;
-        },
-        .te_tty_transcript_chunk => {
-            try handleTtyTranscriptChunkFrame(frame.payload);
-            return null;
-        },
-        .te_input_ack => {
-            const ack = try handleInputAckFrame(frame.payload, input_ack_tracker);
-            if (ack.progressed) connection_monitor.noteInputAckProgress(ack.still_pending);
-            return null;
         },
         .client_te_transport_diagnostic => {
             try handleClientTeTransportDiagnosticFrame(frame.payload);
@@ -2146,14 +2185,6 @@ fn handleAttachedClientRuntimeFrame(
         .ping, .pong => {
             _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             return null;
-        },
-        .te_session_ended => {
-            if (ended_process_exit_code) |exit_code| {
-                var ended = try protocol.decodePayload(pb.TeSessionEnded, app_allocator.allocator(), frame.payload);
-                defer ended.deinit(app_allocator.allocator());
-                exit_code.* = processExitCodeFromSessionEnded(ended);
-            }
-            return .session_ended;
         },
         .error_message => {
             try printErrorPayload(frame.payload);
@@ -2219,46 +2250,6 @@ fn writeClientCloseBoundary() void {
     io_helpers.writeAll(posix.STDOUT_FILENO, "\r\n") catch {};
 }
 
-fn handleDrawFrame(
-    payload: []const u8,
-    attached_client_end_restore: ?*std.ArrayList(u8),
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    app_title_present: ?*?bool,
-) !void {
-    try handleDrawFrameWithInitialAlignment(
-        payload,
-        attached_client_end_restore,
-        scrollback_cursor,
-        viewport_offset,
-        app_title_present,
-        null,
-        null,
-    );
-}
-
-fn handleDrawFrameWithInitialAlignment(
-    payload: []const u8,
-    attached_client_end_restore: ?*std.ArrayList(u8),
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    app_title_present: ?*?bool,
-    initial_cursor_position: ?*?terminal.CursorPosition,
-    initial_draw_alignment_pending: ?*bool,
-) !void {
-    const draw = try parseDrawPayload(payload);
-    defer freeDrawPayload(draw);
-    try handleDrawPayloadWithInitialAlignment(
-        draw,
-        attached_client_end_restore,
-        scrollback_cursor,
-        viewport_offset,
-        app_title_present,
-        initial_cursor_position,
-        initial_draw_alignment_pending,
-    );
-}
-
 fn handleRepaintResponseFrame(
     payload: []const u8,
     attached_client_end_restore: ?*std.ArrayList(u8),
@@ -2267,8 +2258,10 @@ fn handleRepaintResponseFrame(
     pending_repaint: *PendingRepaint,
     app_title_present: ?*?bool,
 ) !bool {
-    return handleRepaintResponseFrameWithInitialAlignment(
-        payload,
+    var response = try protocol.decodePayload(pb.TeRepaintResponse, app_allocator.allocator(), payload);
+    defer response.deinit(app_allocator.allocator());
+    return handleRepaintResponseMessageWithInitialAlignment(
+        response,
         attached_client_end_restore,
         scrollback_cursor,
         viewport_offset,
@@ -2279,8 +2272,8 @@ fn handleRepaintResponseFrame(
     );
 }
 
-fn handleRepaintResponseFrameWithInitialAlignment(
-    payload: []const u8,
+fn handleRepaintResponseMessageWithInitialAlignment(
+    response: pb.TeRepaintResponse,
     attached_client_end_restore: ?*std.ArrayList(u8),
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
@@ -2289,14 +2282,10 @@ fn handleRepaintResponseFrameWithInitialAlignment(
     initial_cursor_position: ?*?terminal.CursorPosition,
     initial_draw_alignment_pending: ?*bool,
 ) !bool {
-    var response = try protocol.decodePayload(pb.TeRepaintResponse, app_allocator.allocator(), payload);
-    defer response.deinit(app_allocator.allocator());
     if (!pending_repaint.active() or !pending_repaint.matches(response.repaint_request_seq)) return false;
     const response_draw = response.draw orelse return error.MissingDraw;
-    const draw = try drawPayloadFromMessage(response_draw);
-    defer freeDrawPayload(draw);
-    try handleDrawPayloadWithInitialAlignment(
-        draw,
+    try handleDrawMessageWithInitialAlignment(
+        response_draw,
         attached_client_end_restore,
         scrollback_cursor,
         viewport_offset,
@@ -2308,9 +2297,7 @@ fn handleRepaintResponseFrameWithInitialAlignment(
     return true;
 }
 
-fn handleTtyTranscriptChunkFrame(payload: []const u8) !void {
-    var chunk = try protocol.decodePayload(pb.TeTtyTranscriptChunk, app_allocator.allocator(), payload);
-    defer chunk.deinit(app_allocator.allocator());
+fn handleTtyTranscriptChunkMessage(chunk: pb.TeTtyTranscriptChunk) void {
     switch (chunk.stream) {
         .TE_TTY_TRANSCRIPT_STREAM_INNER_IN => tty_transcript.recordInnerIn(chunk.data),
         .TE_TTY_TRANSCRIPT_STREAM_INNER_OUT => tty_transcript.recordInnerOut(chunk.data),
@@ -2340,9 +2327,7 @@ const InputAckResult = struct {
     still_pending: bool,
 };
 
-fn handleInputAckFrame(payload: []const u8, input_ack_tracker: *InputAckTracker) !InputAckResult {
-    var ack = try protocol.decodePayload(pb.TeInputAck, app_allocator.allocator(), payload);
-    defer ack.deinit(app_allocator.allocator());
+fn handleInputAckMessage(ack: pb.TeInputAck, input_ack_tracker: *InputAckTracker) InputAckResult {
     return .{
         .progressed = input_ack_tracker.acknowledge(ack.input_seq),
         .still_pending = input_ack_tracker.pending(),
@@ -2391,6 +2376,28 @@ fn handleDrawPayloadWithInitialAlignment(
     }
 }
 
+fn handleDrawMessageWithInitialAlignment(
+    message: pb.TeDraw,
+    attached_client_end_restore: ?*std.ArrayList(u8),
+    scrollback_cursor: *ScrollbackCursor,
+    viewport_offset: *i32,
+    app_title_present: ?*?bool,
+    initial_cursor_position: ?*?terminal.CursorPosition,
+    initial_draw_alignment_pending: ?*bool,
+) !void {
+    const draw = try drawPayloadFromMessage(message);
+    defer freeDrawPayload(draw);
+    try handleDrawPayloadWithInitialAlignment(
+        draw,
+        attached_client_end_restore,
+        scrollback_cursor,
+        viewport_offset,
+        app_title_present,
+        initial_cursor_position,
+        initial_draw_alignment_pending,
+    );
+}
+
 fn restoreInitialCursorAndClearBelow(
     initial_cursor_position: ?*?terminal.CursorPosition,
     initial_draw_alignment_pending: ?*bool,
@@ -2405,12 +2412,6 @@ fn restoreInitialCursorAndClearBelow(
     const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
     renderer.moveCursor(position.row, position.col) catch return;
     renderer.clearBelowCursor() catch {};
-}
-
-fn parseDrawPayload(payload: []const u8) !DrawPayload {
-    var message = try protocol.decodePayload(pb.TeDraw, app_allocator.allocator(), payload);
-    defer message.deinit(app_allocator.allocator());
-    return drawPayloadFromMessage(message);
 }
 
 fn drawPayloadFromMessage(message: pb.TeDraw) !DrawPayload {
@@ -2456,12 +2457,10 @@ fn maybeSendResize(
 }
 
 fn sendResize(socket_fd: c.fd_t, size: WindowSize) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeResize{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), socket_fd, .{ .resize = .{
         .terminal_rows = size.rows,
         .terminal_cols = size.cols,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .te_resize, payload);
+    } });
 }
 
 fn sendResizeWithRepaint(
@@ -2472,7 +2471,7 @@ fn sendResizeWithRepaint(
     pending_repaint: *PendingRepaint,
 ) !void {
     const repaint_request_seq = pending_repaint.startResize();
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeResize{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), socket_fd, .{ .resize = .{
         .terminal_rows = size.rows,
         .terminal_cols = size.cols,
         .viewport_offset = nonZeroViewportOffset(viewport_offset),
@@ -2480,9 +2479,7 @@ fn sendResizeWithRepaint(
             .repaint_request_seq = repaint_request_seq,
             .scrollback_cursor = scrollback_cursor.slice(),
         },
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .te_resize, payload);
+    } });
 }
 
 fn sendResizeScreenRepaint(
@@ -2492,33 +2489,27 @@ fn sendResizeScreenRepaint(
     pending_repaint: *PendingRepaint,
 ) !void {
     const repaint_request_seq = pending_repaint.start();
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeResize{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), socket_fd, .{ .resize = .{
         .terminal_rows = size.rows,
         .terminal_cols = size.cols,
         .viewport_offset = nonZeroViewportOffset(viewport_offset),
         .repaint_request = .{
             .repaint_request_seq = repaint_request_seq,
         },
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .te_resize, payload);
+    } });
 }
 
 fn sendRepaint(socket_fd: c.fd_t, scrollback_cursor: []const u8, pending_repaint: *PendingRepaint) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeRepaintRequest{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), socket_fd, .{ .repaint_request = .{
         .repaint_request_seq = pending_repaint.start(),
         .scrollback_cursor = scrollback_cursor,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .te_repaint_request, payload);
+    } });
 }
 
 fn sendScreenRepaint(socket_fd: c.fd_t, pending_repaint: *PendingRepaint) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeRepaintRequest{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), socket_fd, .{ .repaint_request = .{
         .repaint_request_seq = pending_repaint.start(),
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .te_repaint_request, payload);
+    } });
 }
 
 fn allocateRepaintRequestSeq() u64 {
@@ -2529,12 +2520,10 @@ fn allocateRepaintRequestSeq() u64 {
 }
 
 fn sendInput(socket_fd: c.fd_t, bytes: []const u8, input_ack_tracker: *InputAckTracker, paste_like: bool) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeInput{
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), socket_fd, .{ .input = .{
         .data = bytes,
         .input_seq = input_ack_tracker.allocate(paste_like),
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(socket_fd, .te_input, payload);
+    } });
 }
 
 fn sendInputChunks(socket_fd: c.fd_t, bytes: []const u8, input_ack_tracker: *InputAckTracker, paste_like: bool) !void {

@@ -22,16 +22,26 @@ pub fn serveFrameAfterHandshake(
     write_fd: c.fd_t,
 ) !void {
     switch (frame.message_type) {
-        .te_resize => return,
-        .te_stream_open => {
-            var request = try protocol.decodePayload(pb.TeStreamOpen, allocator, frame.payload);
-            defer request.deinit(allocator);
+        .te_stream_item => {
+            var item = try protocol.decodePayload(pb.TeStreamItem, allocator, frame.payload);
+            defer item.deinit(allocator);
+            const item_payload = item.payload orelse return error.UnexpectedFrame;
+            const request = switch (item_payload) {
+                .resize => return,
+                .open => |open| open,
+                else => {
+                    try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports terminal stream open in this mode", "");
+                    return;
+                },
+            };
             const action = teStreamActionName(request);
             daemon_log.infof(
                 allocator,
                 "terminal stream opening session={s} action={s}",
                 .{ request.session_guid, action },
             );
+            const request_payload = try protocol.encodePayload(allocator, request);
+            defer allocator.free(request_payload);
             if (request.create == null) {
                 const runtime_fd = connectRuntimeForOpen(allocator, request) catch |err| switch (err) {
                     error.InvalidSessionGuid, error.SessionNotFound => {
@@ -46,11 +56,11 @@ pub fn serveFrameAfterHandshake(
                     "terminal stream runtime connected session={s} action={s}",
                     .{ request.session_guid, action },
                 );
-                try openRuntimeAndForwardFrames(allocator, runtime_fd, frame.payload, read_fd, write_fd);
+                try openRuntimeAndForwardFrames(allocator, runtime_fd, request_payload, read_fd, write_fd);
                 return;
             }
 
-            const open_payload = try sessionOpenPayloadWithCurrentEnvironment(allocator, frame.payload);
+            const open_payload = try sessionOpenPayloadWithCurrentEnvironment(allocator, request_payload);
             defer allocator.free(open_payload);
             const runtime_fd = startSessionRuntimeAndConnect(allocator, exe, open_payload) catch |err| switch (err) {
                 else => return err,
@@ -76,9 +86,19 @@ pub fn serveDebugFrameAfterHandshake(
     frame: protocol.OwnedFrame,
     write_fd: c.fd_t,
 ) !void {
-    switch (frame.message_type) {
-        .te_session_client_debug_sever_connection_request,
-        .te_session_client_debug_unresponsive_connection_request,
+    if (frame.message_type != .te_stream_item) {
+        try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
+        return;
+    }
+    var item = try protocol.decodePayload(pb.TeStreamItem, allocator, frame.payload);
+    defer item.deinit(allocator);
+    const item_payload = item.payload orelse {
+        try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
+        return;
+    };
+    switch (item_payload) {
+        .debug_sever_connection_request,
+        .debug_unresponsive_connection_request,
         => {},
         else => {
             try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
@@ -340,7 +360,9 @@ fn openTeMuxRuntime(
         .{ stream_id, request.session_guid, action, elapsedMsSince(handshake_started_ms), elapsedMsSince(open_started_ms) },
     );
     const send_started_ms = std.time.milliTimestamp();
-    try protocol.sendFrame(runtime_fd, .te_stream_open, runtime_payload);
+    var runtime_open = try protocol.decodePayload(pb.TeStreamOpen, allocator, runtime_payload);
+    defer runtime_open.deinit(allocator);
+    try protocol.sendTeStreamPayloadFrame(allocator, runtime_fd, .{ .open = runtime_open });
     daemon_log.infof(
         allocator,
         "terminal mux runtime open sent stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
@@ -393,25 +415,28 @@ fn forwardTeRuntimeFrameToMux(
         try sendTeMuxReset(allocator, mux_fd, runtime.stream_id, "RUNTIME_ERROR", "terminal runtime error");
         return false;
     }
-    var item = try protocol.teStreamItemFromFramePayload(allocator, frame.message_type, frame.payload);
+    if (frame.message_type != .te_stream_item) return error.UnexpectedFrame;
+    var item = try protocol.decodePayload(pb.TeStreamItem, allocator, frame.payload);
     defer item.deinit(allocator);
     try sendTeMuxPayload(allocator, mux_fd, runtime.stream_id, runtime.outbound_next_offset, item);
     runtime.outbound_next_offset +|= 1;
-    if (frame.message_type == .te_session_attached and !runtime.attached_logged) {
-        runtime.attached_logged = true;
-        daemon_log.infof(
-            allocator,
-            "terminal session attached stream_id={} session={s}",
-            .{ runtime.stream_id, runtime.session_guid },
-        );
-    }
-    if (frame.message_type == .te_session_ended) {
-        runtime.ended = true;
-        daemon_log.infof(
-            allocator,
-            "terminal session ended stream_id={} session={s}",
-            .{ runtime.stream_id, runtime.session_guid },
-        );
+    if (item.payload) |item_payload| {
+        if (item_payload == .session_attached and !runtime.attached_logged) {
+            runtime.attached_logged = true;
+            daemon_log.infof(
+                allocator,
+                "terminal session attached stream_id={} session={s}",
+                .{ runtime.stream_id, runtime.session_guid },
+            );
+        }
+        if (item_payload == .session_ended) {
+            runtime.ended = true;
+            daemon_log.infof(
+                allocator,
+                "terminal session ended stream_id={} session={s}",
+                .{ runtime.stream_id, runtime.session_guid },
+            );
+        }
     }
     return true;
 }
@@ -495,9 +520,7 @@ fn sendTeMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.MuxStrea
 }
 
 fn sendTeHangupToRuntime(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionHangupRequest{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .te_session_hangup_request, payload);
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fd, .{ .session_hangup_request = .{} });
 }
 
 fn connectRuntimeForOpen(allocator: std.mem.Allocator, request: pb.TeStreamOpen) !c.fd_t {
@@ -591,7 +614,9 @@ fn openRuntimeAndForwardFrames(
         },
         else => return err,
     };
-    try protocol.sendFrame(runtime_fd, .te_stream_open, session_open_payload);
+    var session_open = try protocol.decodePayload(pb.TeStreamOpen, allocator, session_open_payload);
+    defer session_open.deinit(allocator);
+    try protocol.sendTeStreamPayloadFrame(allocator, runtime_fd, .{ .open = session_open });
     try frame_forwarder.forwardFrames(read_fd, write_fd, runtime_fd);
 }
 

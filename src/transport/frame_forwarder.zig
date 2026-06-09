@@ -134,9 +134,7 @@ fn handleClientClose(runtime_write_fd: c.fd_t, action: ClientCloseAction, log_co
         .none => {},
         .te_session_hangup => {
             logDaemonEvent(log_context, "terminal client disconnected; requesting remote hangup");
-            const payload = try protocol.encodePayload(std.heap.page_allocator, protocol.pb.TeSessionHangupRequest{});
-            defer std.heap.page_allocator.free(payload);
-            protocol.sendFrame(runtime_write_fd, .te_session_hangup_request, payload) catch |err| {
+            protocol.sendTeStreamPayloadFrame(std.heap.page_allocator, runtime_write_fd, .{ .session_hangup_request = .{} }) catch |err| {
                 logDaemonEventFmt(log_context, "remote terminal hangup request failed error={t}", .{err});
                 return err;
             };

@@ -1524,52 +1524,66 @@ fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !boo
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
                 continue;
             },
-            .te_resize => continue,
-            .te_stream_open => {
-                var open = try protocol.decodePayload(pb.TeStreamOpen, app_allocator.allocator(), frame.payload);
-                defer open.deinit(app_allocator.allocator());
-                if (open.create == null) {
-                    var request = try attachRequestFromOpen(open);
-                    defer request.deinit();
-                    if (request.session_guid.len == 0) return error.MissingSessionGuid;
-                    const session = findSession(session_runtime, request.session_guid);
-                    const resolved_session = session orelse {
-                        try sendError(session_runtime, fd, "SESSION_NOT_FOUND", "session not found", "");
-                        return false;
-                    };
-                    updateSessionSize(resolved_session, request.resize.rows, request.resize.cols);
-                    try attachSession(session_runtime, fd, request.resize, request.capture_tty_transcript);
-                    return true;
-                }
-
-                var request = readSessionCreateRequest(frame.payload) catch {
-                    try sendError(session_runtime, fd, "PROTOCOL_ERROR", "invalid terminal stream open payload", "");
+            .te_stream_item => {
+                var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+                defer item.deinit(app_allocator.allocator());
+                const item_payload = item.payload orelse {
+                    try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected empty terminal stream item", "");
                     return false;
                 };
-                defer request.deinit();
-                _ = try createSession(
-                    session_runtime,
-                    request.resize.rows,
-                    request.resize.cols,
-                    request.scrollback_row_count,
-                    request.environment,
-                    request.query_default_colors,
-                    request.session_guid,
-                    request.command_argv,
-                    request.shell_command,
-                    request.tty_settings,
-                    request.reap_ms,
-                );
-                try attachSession(session_runtime, fd, request.resize, request.capture_tty_transcript);
-                return true;
-            },
-            .te_session_client_debug_sever_connection_request => {
-                try handleSessionClientDebugSeverConnectionRequest(session_runtime, fd, frame.payload);
-                return false;
-            },
-            .te_session_client_debug_unresponsive_connection_request => {
-                try handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime, fd, frame.payload);
-                return false;
+                switch (item_payload) {
+                    .resize => continue,
+                    .open => |open| {
+                        if (open.create == null) {
+                            var request = try attachRequestFromOpen(open);
+                            defer request.deinit();
+                            if (request.session_guid.len == 0) return error.MissingSessionGuid;
+                            const session = findSession(session_runtime, request.session_guid);
+                            const resolved_session = session orelse {
+                                try sendError(session_runtime, fd, "SESSION_NOT_FOUND", "session not found", "");
+                                return false;
+                            };
+                            updateSessionSize(resolved_session, request.resize.rows, request.resize.cols);
+                            try attachSession(session_runtime, fd, request.resize, request.capture_tty_transcript);
+                            return true;
+                        }
+
+                        const open_payload = try protocol.encodePayload(app_allocator.allocator(), open);
+                        defer app_allocator.allocator().free(open_payload);
+                        var request = readSessionCreateRequest(open_payload) catch {
+                            try sendError(session_runtime, fd, "PROTOCOL_ERROR", "invalid terminal stream open payload", "");
+                            return false;
+                        };
+                        defer request.deinit();
+                        _ = try createSession(
+                            session_runtime,
+                            request.resize.rows,
+                            request.resize.cols,
+                            request.scrollback_row_count,
+                            request.environment,
+                            request.query_default_colors,
+                            request.session_guid,
+                            request.command_argv,
+                            request.shell_command,
+                            request.tty_settings,
+                            request.reap_ms,
+                        );
+                        try attachSession(session_runtime, fd, request.resize, request.capture_tty_transcript);
+                        return true;
+                    },
+                    .debug_sever_connection_request => |request| {
+                        try handleSessionClientDebugSeverConnectionRequest(session_runtime, fd, request);
+                        return false;
+                    },
+                    .debug_unresponsive_connection_request => |request| {
+                        try handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime, fd, request);
+                        return false;
+                    },
+                    else => {
+                        try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected first terminal stream item", "");
+                        return false;
+                    },
+                }
             },
             else => {
                 try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected first action", "");
@@ -1706,6 +1720,12 @@ fn queueAttachedClientFrame(attached_client: *AttachedClient, message_type: prot
     try attached_client.output.appendSlice(app_allocator.allocator(), frame);
 }
 
+fn queueAttachedClientTeFrame(attached_client: *AttachedClient, payload: pb.TeStreamItem.payload_union) !void {
+    const encoded = try protocol.encodePayload(app_allocator.allocator(), pb.TeStreamItem{ .payload = payload });
+    defer app_allocator.allocator().free(encoded);
+    try queueAttachedClientFrame(attached_client, .te_stream_item, encoded);
+}
+
 fn compactAttachedClientOutput(attached_client: *AttachedClient) void {
     if (attached_client.output_offset == 0) return;
     if (attached_client.output_offset >= attached_client.output.items.len) {
@@ -1757,17 +1777,14 @@ fn flushAttachedClientOutput(session_runtime: *SessionRuntime) void {
 }
 
 fn sendSessionAttachedForSession(session_runtime: *const SessionRuntime, attached_client: *AttachedClient, session: *const Session) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionAttached{
+    try queueAttachedClientTeFrame(attached_client, .{ .session_attached = .{
         .session_guid = session.idSlice(),
         .session_dir = sessionDirSlice(session_runtime),
-    });
-    defer app_allocator.allocator().free(payload);
-    try queueAttachedClientFrame(attached_client, .te_session_attached, payload);
+    } });
 }
 
-fn handleSessionClientDebugSeverConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.TeSessionClientDebugSeverConnectionRequest, app_allocator.allocator(), payload);
-    defer request.deinit(app_allocator.allocator());
+fn handleSessionClientDebugSeverConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, request: pb.TeSessionClientDebugSeverConnectionRequest) !void {
+    _ = request;
     const attached_client = &session_runtime.attached_client;
     if (!attached_client.active or attached_client.close_after_flush) {
         try sendError(session_runtime, fd, "NO_ATTACHED_CLIENTS", "no attached clients", "");
@@ -1777,9 +1794,7 @@ fn handleSessionClientDebugSeverConnectionRequest(session_runtime: *SessionRunti
     try sendClientControlResponse(fd);
 }
 
-fn handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.TeSessionClientDebugUnresponsiveConnectionRequest, app_allocator.allocator(), payload);
-    defer request.deinit(app_allocator.allocator());
+fn handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, request: pb.TeSessionClientDebugUnresponsiveConnectionRequest) !void {
     const seconds = if (request.seconds == 0)
         config.default_debug_unresponsive_seconds
     else
@@ -1795,9 +1810,7 @@ fn handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime: *Sessi
 }
 
 fn sendClientControlResponse(fd: c.fd_t) !void {
-    const response_payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionClientControlResponse{});
-    defer app_allocator.allocator().free(response_payload);
-    try protocol.sendFrame(fd, .te_session_client_control_response, response_payload);
+    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fd, .{ .session_client_control_response = .{} });
 }
 
 fn sessionDirSlice(session_runtime: *const SessionRuntime) []const u8 {
@@ -1810,18 +1823,16 @@ fn sendSessionEnded(attached_client: *AttachedClient, reason: u8, exit_info: Exi
         2 => .{ .kind = .EXIT_STATUS_KIND_SIGNALLED, .status = exit_info.status },
         else => null,
     };
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeSessionEnded{
+    try queueAttachedClientTeFrame(attached_client, .{ .session_ended = .{
         .reason = switch (reason) {
             1 => .TE_SESSION_END_REASON_KILLED_BY_REQUEST,
-            2 => .TE_SESSION_END_REASON_AGENT_SHUTDOWN,
+            2 => .TE_SESSION_END_REASON_DAEMON_SHUTDOWN,
             3 => .TE_SESSION_END_REASON_REAPED,
             else => .TE_SESSION_END_REASON_PROCESS_EXITED,
         },
         .exit_status = exit_status,
         .ended_at_unix_ms = if (exit_info.ended_at_unix_ms == 0) null else exit_info.ended_at_unix_ms,
-    });
-    defer app_allocator.allocator().free(payload);
-    try queueAttachedClientFrame(attached_client, .te_session_ended, payload);
+    } });
 }
 
 fn queueTtyTranscriptChunk(
@@ -1830,12 +1841,10 @@ fn queueTtyTranscriptChunk(
     bytes: []const u8,
 ) !void {
     if (!attached_client.capture_tty_transcript or bytes.len == 0) return;
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeTtyTranscriptChunk{
+    try queueAttachedClientTeFrame(attached_client, .{ .tty_transcript_chunk = .{
         .stream = stream,
         .data = bytes,
-    });
-    defer app_allocator.allocator().free(payload);
-    try queueAttachedClientFrame(attached_client, .te_tty_transcript_chunk, payload);
+    } });
 }
 
 fn queueTtyTranscriptChunkForSession(
@@ -1904,15 +1913,13 @@ fn queueDrawFrame(
 ) !void {
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
     encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeDraw{
+    try queueAttachedClientTeFrame(attached_client, .{ .draw = .{
         .scrollback_cursor = encoded_cursor[0..],
         .viewport_offset = attached_client.presentation.protocolViewportOffset(),
         .draw_bytes = draw_bytes,
         .app_title_present = app_title_present,
         .attached_client_end_restore_bytes = attached_client_end_restore_bytes,
-    });
-    defer app_allocator.allocator().free(payload);
-    try queueAttachedClientFrame(attached_client, .te_draw, payload);
+    } });
 }
 
 fn appendDrawCleanup(draw_bytes: *std.ArrayList(u8)) !void {
@@ -2181,7 +2188,7 @@ fn queueRepaintResponseFrame(
 ) !void {
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
     encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeRepaintResponse{
+    try queueAttachedClientTeFrame(attached_client, .{ .repaint_response = .{
         .repaint_request_seq = repaint_request_seq,
         .draw = .{
             .scrollback_cursor = encoded_cursor[0..],
@@ -2190,9 +2197,7 @@ fn queueRepaintResponseFrame(
             .app_title_present = app_title_present,
             .attached_client_end_restore_bytes = attached_client_end_restore_bytes,
         },
-    });
-    defer app_allocator.allocator().free(payload);
-    try queueAttachedClientFrame(attached_client, .te_repaint_response, payload);
+    } });
 }
 
 fn queueRepaintResponseDraw(
@@ -2494,12 +2499,6 @@ fn readDefaultColors(colors: pb.TeSessionCreate.DefaultColors) !vt.DefaultColors
     };
 }
 
-fn readResizePayload(payload: []const u8) !ResizePayload {
-    var message = try protocol.decodePayload(pb.TeResize, app_allocator.allocator(), payload);
-    defer message.deinit(app_allocator.allocator());
-    return try resizePayloadFromMessage(message);
-}
-
 fn resizePayloadFromMessage(message: pb.TeResize) !ResizePayload {
     if (message.terminal_rows > std.math.maxInt(u16) or
         message.terminal_cols > std.math.maxInt(u16))
@@ -2526,12 +2525,6 @@ fn attachRequestFromOpen(message: pb.TeStreamOpen) !AttachRequest {
         .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
         .capture_tty_transcript = message.capture_tty_transcript,
     };
-}
-
-fn readRepaintRequest(payload: []const u8) !RepaintRequest {
-    var message = try protocol.decodePayload(pb.TeRepaintRequest, app_allocator.allocator(), payload);
-    defer message.deinit(app_allocator.allocator());
-    return repaintRequestFromMessage(message);
 }
 
 fn repaintRequestFromMessage(message: pb.TeRepaintRequest) !RepaintRequest {
@@ -2893,10 +2886,30 @@ fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
     defer frame.deinit(app_allocator.allocator());
 
     switch (frame.message_type) {
-        .te_input => handleInputFrame(session_runtime, frame.payload),
-        .te_resize => handleResizeFrame(session_runtime, frame.payload),
-        .te_repaint_request => handleRepaintFrame(session_runtime, frame.payload),
-        .te_session_hangup_request => handleSessionHangupRequest(session_runtime, frame.payload),
+        .te_stream_item => {
+            var item = protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload) catch {
+                disconnectAttachedClient(session_runtime);
+                return;
+            };
+            defer item.deinit(app_allocator.allocator());
+            const item_payload = item.payload orelse {
+                disconnectAttachedClient(session_runtime);
+                return;
+            };
+            switch (item_payload) {
+                .input => |input| handleInputFrame(session_runtime, input),
+                .resize => |resize| handleResizeFrame(session_runtime, resize),
+                .repaint_request => |repaint| handleRepaintFrame(session_runtime, repaint),
+                .session_hangup_request => handleSessionHangupRequest(session_runtime),
+                else => {
+                    queueAttachedClientError(session_runtime, attached_client, "PROTOCOL_ERROR", "unexpected attached terminal stream item", "") catch {
+                        disconnectAttachedClient(session_runtime);
+                        return;
+                    };
+                    closeAttachedClientAfterFlush(session_runtime);
+                },
+            }
+        },
         .ping, .pong => {
             _ = protocol.handleTransportControlFrame(frame.message_type, frame.payload, attached_client.fd) catch {
                 disconnectAttachedClient(session_runtime);
@@ -2913,12 +2926,7 @@ fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
     }
 }
 
-fn handleSessionHangupRequest(session_runtime: *SessionRuntime, payload: []const u8) void {
-    var request = protocol.decodePayload(pb.TeSessionHangupRequest, app_allocator.allocator(), payload) catch {
-        disconnectAttachedClient(session_runtime);
-        return;
-    };
-    defer request.deinit(app_allocator.allocator());
+fn handleSessionHangupRequest(session_runtime: *SessionRuntime) void {
     requestSessionPtyHangup(session_runtime);
 }
 
@@ -2965,25 +2973,15 @@ fn reapPtyHangupSessionIfExited(session_runtime: *SessionRuntime) bool {
     return false;
 }
 
-fn handleInputFrame(session_runtime: *SessionRuntime, payload: []const u8) void {
+fn handleInputFrame(session_runtime: *SessionRuntime, input: pb.TeInput) void {
     const attached_client = &session_runtime.attached_client;
     const session = &session_runtime.session;
-    var input = protocol.decodePayload(pb.TeInput, app_allocator.allocator(), payload) catch {
-        disconnectAttachedClient(session_runtime);
-        return;
-    };
-    defer input.deinit(app_allocator.allocator());
     if (input.data.len == 0) return;
 
     if (input.input_seq != 0) {
-        const ack_payload = protocol.encodePayload(app_allocator.allocator(), pb.TeInputAck{
+        queueAttachedClientTeFrame(attached_client, .{ .input_ack = .{
             .input_seq = input.input_seq,
-        }) catch {
-            disconnectAttachedClient(session_runtime);
-            return;
-        };
-        defer app_allocator.allocator().free(ack_payload);
-        queueAttachedClientFrame(attached_client, .te_input_ack, ack_payload) catch {
+        } }) catch {
             disconnectAttachedClient(session_runtime);
             return;
         };
@@ -3438,10 +3436,10 @@ test "bare escape is not held by kitty keyboard translation" {
     try std.testing.expectEqual(@as(usize, 0), attached_client.input_pending_len);
 }
 
-fn handleResizeFrame(session_runtime: *SessionRuntime, payload: []const u8) void {
+fn handleResizeFrame(session_runtime: *SessionRuntime, message: pb.TeResize) void {
     const attached_client = &session_runtime.attached_client;
     const session = &session_runtime.session;
-    const resize = readResizePayload(payload) catch {
+    const resize = resizePayloadFromMessage(message) catch {
         disconnectAttachedClient(session_runtime);
         return;
     };
@@ -3457,8 +3455,8 @@ fn handleResizeFrame(session_runtime: *SessionRuntime, payload: []const u8) void
     }
 }
 
-fn handleRepaintFrame(session_runtime: *SessionRuntime, payload: []const u8) void {
-    const request = readRepaintRequest(payload) catch {
+fn handleRepaintFrame(session_runtime: *SessionRuntime, message: pb.TeRepaintRequest) void {
+    const request = repaintRequestFromMessage(message) catch {
         disconnectAttachedClient(session_runtime);
         return;
     };
