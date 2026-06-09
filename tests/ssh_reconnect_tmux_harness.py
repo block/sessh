@@ -23,7 +23,7 @@ from test_env import isolated_env
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
+BIN = Path(os.environ.get("SESSH_TEST_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
 TMUX = shutil.which("tmux")
 TMUX_ARGS = [TMUX, "-L", f"sessh-ssh-reconnect-{os.getpid()}"] if TMUX else []
 PROMPT = "OUTER_TEST>"

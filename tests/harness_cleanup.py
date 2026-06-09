@@ -1,14 +1,18 @@
 import os
 import shutil
-import shlex
 import signal
+import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
+# cleanup_runtime removes SESSH_TEST_ROOT wholesale. The sentinel is a cheap
+# second lock on that destructive operation: callers must point us at a temp
+# tree that was deliberately created by isolated_env, not at a normal runtime
+# or cache directory that merely happens to contain sessh files.
+TEST_ROOT_SENTINEL = ".sessh-test-root"
 
 
 def sessions_dir(env):
@@ -29,13 +33,89 @@ def state_root(env):
 
 
 def cleanup_runtime(env, timeout=5.0):
-    kill_build_sessh_processes(timeout=timeout)
-    shutil.rmtree(Path(env["XDG_RUNTIME_DIR"]), ignore_errors=True)
-    shutil.rmtree(state_root(env), ignore_errors=True)
+    validate_cleanup_env(env)
+    kill_test_daemons(env, timeout=timeout)
+    shutil.rmtree(cleanup_test_root(env), ignore_errors=True)
+    recreate_test_root(env)
 
 
-def kill_build_sessh_processes(timeout=5.0):
-    pids = build_sessh_pids()
+def validate_cleanup_env(env):
+    test_root = cleanup_test_root(env)
+    require_tmp_test_root(test_root)
+    require_test_root_sentinel(test_root)
+    for key in (
+        "HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "TMPDIR",
+    ):
+        require_under_test_root(Path(env[key]), test_root)
+    if env.get("SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"):
+        require_under_test_root(Path(env["SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"]), test_root)
+
+
+def cleanup_test_root(env):
+    value = env.get("SESSH_TEST_ROOT")
+    if not value:
+        raise AssertionError("test cleanup requires SESSH_TEST_ROOT")
+    return Path(value)
+
+
+def require_tmp_test_root(test_root):
+    resolved_test_root = test_root.resolve(strict=False)
+    tmp_roots = {
+        Path(tempfile.gettempdir()).resolve(strict=False),
+        Path("/tmp").resolve(strict=False),
+    }
+    for tmp_root in tmp_roots:
+        try:
+            resolved_test_root.relative_to(tmp_root)
+            return
+        except ValueError:
+            continue
+    roots = ", ".join(str(root) for root in sorted(tmp_roots))
+    raise AssertionError(f"refusing to clean non-temp test root {test_root}; temp roots are {roots}")
+
+
+def require_test_root_sentinel(test_root):
+    sentinel = test_root / TEST_ROOT_SENTINEL
+    if not sentinel.is_file():
+        raise AssertionError(f"refusing to clean unmarked test root {test_root}")
+
+
+def recreate_test_root(env):
+    for key in (
+        "HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "TMPDIR",
+    ):
+        path = Path(env[key])
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o700)
+
+    test_root = cleanup_test_root(env)
+    (test_root / TEST_ROOT_SENTINEL).write_text("sessh test root\n")
+
+
+def require_under_test_root(path, test_root, resolve=True):
+    raw = Path(path)
+    resolved_test_root = test_root.resolve(strict=False)
+    resolved = raw.resolve(strict=False) if resolve else raw.parent.resolve(strict=False) / raw.name
+    try:
+        resolved.relative_to(resolved_test_root)
+    except ValueError:
+        raise AssertionError(f"refusing to clean non-test path {resolved}; test root is {resolved_test_root}")
+
+
+def kill_test_daemons(env, timeout=5.0):
+    pids = sesshd_socket_owner_pids(env)
     if not pids:
         return
 
@@ -50,94 +130,80 @@ def kill_build_sessh_processes(timeout=5.0):
 
     remaining = [pid for pid in pids if pid_exists(pid)]
     if remaining:
-        raise AssertionError(f"stray build sessh processes survived cleanup: {remaining}")
+        raise AssertionError(f"stray test sesshd processes survived cleanup: {remaining}")
 
 
-def build_sessh_pids():
-    expected = BIN.resolve(strict=False)
+def sesshd_socket_owner_pids(env):
     current_pid = os.getpid()
-    result = subprocess.run(
-        ["ps", "-axo", "pid=,command="],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    pids = set()
+    for socket_path in cleanup_test_root(env).rglob("sesshd.sock"):
+        if not socket_path.exists():
+            continue
+        owners = socket_owner_pids(socket_path)
+        if not owners and socket_accepts_connection(socket_path):
+            raise AssertionError(f"live test daemon socket has no discoverable owner: {socket_path}")
+        pids.update(owners)
+    pids.discard(current_pid)
+    return sorted(pids)
 
-    pids = []
-    for line in result.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        pid_text, _, command = stripped.partition(" ")
-        try:
-            pid = int(pid_text)
-        except ValueError:
-            continue
-        if pid == current_pid or not command:
-            continue
 
-        exe = command_executable(command)
-        if exe is None:
-            continue
-        try:
-            resolved = exe.resolve(strict=False)
-        except OSError:
-            continue
-        if is_build_sessh_executable(resolved, expected) or is_test_cached_sessh_command(resolved, command):
-            pids.append(pid)
+def socket_owner_pids(socket_path):
+    pids = set()
+    pids.update(socket_owner_pids_lsof(socket_path))
+    pids.update(socket_owner_pids_fuser(socket_path))
     return pids
 
 
-def is_build_sessh_executable(resolved, expected_wrapper):
-    if resolved == expected_wrapper:
+def socket_owner_pids_lsof(socket_path):
+    if shutil.which("lsof") is None:
+        return set()
+    result = subprocess.run(
+        ["lsof", "-nP", "-t", str(socket_path)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        return set()
+    return parse_pid_words(result.stdout)
+
+
+def socket_owner_pids_fuser(socket_path):
+    if shutil.which("fuser") is None:
+        return set()
+    result = subprocess.run(
+        ["fuser", str(socket_path)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        return set()
+    return parse_pid_words(result.stdout)
+
+
+def parse_pid_words(text):
+    pids = set()
+    for word in text.split():
+        try:
+            pids.add(int(word))
+        except ValueError:
+            pass
+    return pids
+
+
+def socket_accepts_connection(socket_path):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.1)
+        sock.connect(str(socket_path))
         return True
-
-    libexec = ROOT / "zig-out" / "libexec" / "sessh"
-    try:
-        resolved.relative_to(libexec.resolve(strict=False))
-    except ValueError:
+    except OSError:
         return False
-    return resolved.name.startswith("sessh-")
-
-
-def is_test_cached_sessh_command(resolved, command):
-    command_name = command_basename(command)
-    if command_name not in ("sesshd", "sessh-broker", "sessh-proxy") and (
-        ":internal-broker:" not in command
-        and ":internal-daemon:" not in command
-        and ":internal-proxy-stream:" not in command
-    ):
-        return False
-    parts = resolved.parts
-    try:
-        tmp_index = parts.index("tmp")
-    except ValueError:
-        return False
-    if len(parts) <= tmp_index + 5 or not parts[tmp_index + 1].startswith("sessh-"):
-        return False
-    for index in range(tmp_index + 2, len(parts) - 3):
-        if parts[index : index + 3] == ("cache", "sessh", "bin"):
-            return True
-    return False
-
-
-def command_basename(command):
-    exe = command_executable(command)
-    if exe is None:
-        return ""
-    return exe.name
-
-
-def command_executable(command):
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        parts = command.split()
-    if not parts:
-        return None
-    return Path(parts[0])
+    finally:
+        sock.close()
 
 
 def wait_pids_gone(pids, timeout):

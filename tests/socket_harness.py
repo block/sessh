@@ -21,7 +21,7 @@ from test_env import isolated_env
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
+BIN = Path(os.environ.get("SESSH_TEST_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
 _PROTO_TMP = None
 _PROTO_MODULE = None
 _PROTO_HANDSHAKE_MODULE = None
@@ -919,9 +919,9 @@ def run_login_shell_profile_test(_base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-login-shell-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         env["SHELL"] = "/bin/sh"
+        cleanup_runtime(env)
         profile = Path(env["HOME"]) / ".profile"
         profile.write_text("printf 'LOGIN_PROFILE_READY\\n'\n")
-        cleanup_runtime(env)
         try:
             start_daemon(env)
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

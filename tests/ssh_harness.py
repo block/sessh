@@ -40,7 +40,7 @@ from test_env import isolated_env
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BIN = Path(os.environ.get("SESSH_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
+BIN = Path(os.environ.get("SESSH_TEST_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
 GUID_RE = re.compile(r"^s-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 COMPACT_GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
@@ -1961,8 +1961,8 @@ def test_ssh_clean_remote_exit_removes_routes(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
-    remote_runtime = tmp / "remote-runtime"
-    remote_state = tmp / "remote-state"
+    remote_runtime = Path(env["SESSH_TEST_ROOT"]) / "remote-runtime"
+    remote_state = Path(env["SESSH_TEST_ROOT"]) / "remote-state"
     remote_shell = tmp / "remote-shell"
     marker = "SSH_REMOTE_EXIT_READY"
     remote_runtime.mkdir(mode=0o700)

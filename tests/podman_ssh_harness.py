@@ -1039,7 +1039,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
         if uname != expected_uname:
             raise AssertionError(f"{container_platform} reported uname -m={uname!r}")
 
-        env["HOME"] = str(tmp / f"home-{arch}")
+        env["HOME"] = str(Path(env["SESSH_TEST_ROOT"]) / f"home-{arch}")
         Path(env["HOME"]).mkdir(mode=0o700, exist_ok=True)
 
         warm_sessh_artifact_cache(prefix, config, host_alias, env)

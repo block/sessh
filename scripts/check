@@ -72,7 +72,7 @@ run_isolated() {
   printf '\n==> %s\n' "$*"
   HOME=$SESSH_CHECK_HOME \
     HISTFILE=/dev/null \
-    SESSH_BIN=zig-out/bin/sessh-dev \
+    SESSH_TEST_BIN=zig-out/bin/sessh-dev \
     XDG_RUNTIME_DIR=$SESSH_CHECK_XDG_RUNTIME_DIR \
     XDG_CACHE_HOME=$SESSH_CHECK_XDG_CACHE_HOME \
     XDG_CONFIG_HOME=$SESSH_CHECK_XDG_CONFIG_HOME \
@@ -92,8 +92,8 @@ run_with_host_podman_environment() {
     # creates isolated sessh client environments internally, so only point it at
     # the freshly built binary here.
     HISTFILE=/dev/null
-    SESSH_BIN=zig-out/bin/sessh-dev
-    export HISTFILE SESSH_BIN
+    SESSH_TEST_BIN=zig-out/bin/sessh-dev
+    export HISTFILE SESSH_TEST_BIN
     "$@"
   )
   check_isolation_empty "$*"
