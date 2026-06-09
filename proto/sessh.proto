@@ -36,8 +36,8 @@ message Frame {
 
 message ClientDaemonItem {
   oneof payload {
-    TeTransportOpen te_transport_open = 1;
-    TeTransportEvent te_transport_event = 2;
+    SshTransportOpen ssh_transport_open = 1;
+    SshTransportEvent ssh_transport_event = 2;
     DaemonLogRequest log_request = 10;
     DaemonLogEntry log_entry = 11;
   }
@@ -58,23 +58,30 @@ message DaemonTunnelItem {
   }
 }
 
-// Local visible-client -> local daemon request to open a terminal-emulator
-// transport to a remote sesshd. The client may immediately pipeline stream
-// frames after this request; the local daemon queues them behind tunnel setup
-// and forwards them over ssh when the remote daemon endpoint is ready.
-message TeTransportOpen {
+// Generic environment name/value pair. The enclosing message defines where the
+// entry is applied.
+message EnvironmentEntry {
+  string name = 1;
+  string value = 2;
+}
+
+// Local visible-client -> local daemon request to open an SSH-backed transport
+// to a remote sesshd. The client may immediately pipeline stream frames after
+// this request; the local daemon queues them behind tunnel setup and forwards
+// them over ssh when the remote daemon endpoint is ready.
+message SshTransportOpen {
   repeated string ssh_option = 1;
   string host = 2;
   bool bootstrap = 3;
   bool batch_mode = 4;
   // Environment for the local daemon when it launches the local ssh transport.
   // These entries are not part of the remote PTY child environment.
-  repeated TeSessionCreate.EnvironmentEntry environment = 5;
+  repeated EnvironmentEntry environment = 5;
 }
 
 // Local daemon -> visible-client event for the transport the daemon owns. These
 // are local sessh UI/diagnostic events, not remote process output.
-message TeTransportEvent {
+message SshTransportEvent {
   message StderrChunk {
     bytes chunk = 1;
   }
@@ -161,8 +168,15 @@ message MuxStreamFrame {
     uint32 receive_window_bytes = 2;
   }
 
+  // Graceful end of this peer's outbound direction for the mux stream. The
+  // final offset is the first byte offset after the last payload item, so EOF
+  // can be acknowledged and replayed idempotently after reconnect.
+  message Eof {
+    uint64 final_offset = 1;
+  }
+
   // Abrupt mux-stream termination, analogous to TCP RST or HTTP/2 RST_STREAM.
-  // Graceful proxy EOF and terminal session exit are stream payload items instead.
+  // Graceful terminal session exit is sent as a stream payload before Eof.
   message Reset {
     string code = 1;
     string message = 2;
@@ -174,7 +188,8 @@ message MuxStreamFrame {
     OpenOk open_ok = 3;
     Payload payload = 4;
     Ack ack = 5;
-    Reset reset = 6;
+    Eof eof = 6;
+    Reset reset = 7;
   }
 }
 
@@ -262,9 +277,6 @@ message ProxyStreamOpen {
 // Ordered proxy stream item. Data is offset-free here; mux offsets live in
 // MuxStreamFrame.Payload, and direct local IPC relies on socket ordering.
 message ProxyStreamItem {
-  message Eof {
-  }
-
   // Sent immediately after the local IPC socket's normal HelloFrame handshake
   // so the ProxyCommand process can choose the right diagnostic stream shape.
   message ControlCapabilities {
@@ -301,7 +313,6 @@ message ProxyStreamItem {
 
   oneof payload {
     bytes data = 2;
-    Eof eof = 3;
     ControlCapabilities control_capabilities = 10;
     ControlDiagnostic control_diagnostic = 11;
     ControlCtrlR control_ctrl_r = 12;
@@ -343,12 +354,6 @@ message TeSessionCreate {
     // SSH/RFC 4254 terminal-mode opcode/value pairs. Unknown opcodes are
     // ignored by the receiver, matching SSH server behavior.
     repeated Mode tty_mode = 2;
-  }
-
-  // Environment value used when creating a new session.
-  message EnvironmentEntry {
-    string name = 1;
-    string value = 2;
   }
 
   // Outer terminal default colors reported by the client.

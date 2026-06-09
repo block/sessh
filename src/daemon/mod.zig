@@ -463,7 +463,7 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                     return;
                 };
                 switch (item_payload) {
-                    .te_transport_open => |request| {
+                    .ssh_transport_open => |request| {
                         daemon_log.infof(allocator, "terminal transport requested", .{});
                         try transport_ssh.serveTerminalTransportFromDaemon(allocator, fd, request);
                         return;

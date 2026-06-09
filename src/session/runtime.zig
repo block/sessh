@@ -2457,7 +2457,7 @@ fn readTtySettings(message: pb.TeSessionCreate.TtySettings) !tty_settings.Settin
     };
 }
 
-fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.TeSessionCreate.EnvironmentEntry) !void {
+fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.EnvironmentEntry) !void {
     if (!isValidEnvironmentEntry(entry)) return error.InvalidEnvironmentEntry;
     if (sessionEnvironmentHasEntry(environment, entry.name)) return;
 
@@ -2483,7 +2483,7 @@ fn sessionEnvironmentHasEntry(environment: *const SessionEnvironment, name: []co
     return false;
 }
 
-fn isValidEnvironmentEntry(entry: pb.TeSessionCreate.EnvironmentEntry) bool {
+fn isValidEnvironmentEntry(entry: pb.EnvironmentEntry) bool {
     return isValidEnvironmentName(entry.name) and
         std.mem.indexOfScalar(u8, entry.value, 0) == null;
 }

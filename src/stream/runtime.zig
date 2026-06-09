@@ -954,7 +954,7 @@ fn handleProxyMuxFrame(
     const message = mux_frame.message orelse return error.StreamUnexpectedFrame;
     switch (message) {
         .open => |open| try handleProxyMuxOpen(allocator, exe, streams, mux_fd, mux_frame.stream_id, open),
-        .open_ok, .ack, .payload => try forwardProxyMuxFrameToRuntime(allocator, streams, mux_frame),
+        .open_ok, .ack, .payload, .eof => try forwardProxyMuxFrameToRuntime(allocator, streams, mux_frame),
         .reset => {
             forwardProxyMuxFrameToRuntime(allocator, streams, mux_frame) catch {};
             try removeProxyMuxRuntime(streams, mux_frame.stream_id);
@@ -1509,6 +1509,12 @@ fn handleMuxStreamFrame(
                 .te => return error.StreamUnexpectedFrame,
             }
         },
+        .eof => |eof| try handleInboundEof(
+            state,
+            transport_write_fd,
+            options,
+            eof.final_offset,
+        ),
         .reset => return error.StreamReset,
     }
 }
@@ -1528,12 +1534,6 @@ fn handleProxyStreamPayload(
             options,
             offset,
             data,
-        ),
-        .eof => try handleInboundEof(
-            state,
-            transport_write_fd,
-            options,
-            offset,
         ),
         else => return error.StreamUnexpectedFrame,
     }
@@ -1592,9 +1592,9 @@ fn handleInboundEof(
     state: *StreamState,
     transport_write_fd: c.fd_t,
     options: *const StreamAttachedClientOptions,
-    offset: u64,
+    final_offset: u64,
 ) !void {
-    if (offset > state.inbound.recv_next_offset) return error.StreamOffsetGap;
+    if (final_offset != state.inbound.recv_next_offset) return error.StreamOffsetGap;
     state.inbound.inbound_eof = true;
     const sink = options.sink;
     if (sink.shutdown_on_eof and sink.fd >= 0) _ = c.shutdown(sink.fd, c.SHUT.WR);
@@ -1671,10 +1671,7 @@ fn sendData(
 fn sendEof(state: *StreamState, fd: c.fd_t, offset: u64) !void {
     try sendMuxStreamFrame(state.allocator, fd, .{
         .stream_id = proxy_mux_stream_id,
-        .message = .{ .payload = .{
-            .offset = offset,
-            .item = .{ .proxy = .{ .payload = .{ .eof = .{} } } },
-        } },
+        .message = .{ .eof = .{ .final_offset = offset } },
     });
 }
 
@@ -2530,10 +2527,7 @@ fn encodeMuxProxyEofPayload(allocator: std.mem.Allocator, offset: u64) ![]u8 {
     return protocol.encodePayload(allocator, pb.DaemonTunnelItem{
         .payload = .{ .mux_stream = .{
             .stream_id = proxy_mux_stream_id,
-            .message = .{ .payload = .{
-                .offset = offset,
-                .item = .{ .proxy = .{ .payload = .{ .eof = .{} } } },
-            } },
+            .message = .{ .eof = .{ .final_offset = offset } },
         } },
     });
 }
@@ -2588,20 +2582,7 @@ fn expectProxyEofFrame(fd: c.fd_t, expected_offset: u64) !void {
     defer mux.deinit(std.testing.allocator);
     const message = mux.message orelse return error.UnexpectedMuxFrame;
     switch (message) {
-        .payload => |payload| {
-            try std.testing.expectEqual(expected_offset, payload.offset);
-            const item = payload.item orelse return error.UnexpectedMuxFrame;
-            switch (item) {
-                .proxy => |proxy_item| {
-                    const proxy_payload = proxy_item.payload orelse return error.UnexpectedMuxFrame;
-                    switch (proxy_payload) {
-                        .eof => {},
-                        else => return error.UnexpectedMuxFrame,
-                    }
-                },
-                else => return error.UnexpectedMuxFrame,
-            }
-        },
+        .eof => |eof| try std.testing.expectEqual(expected_offset, eof.final_offset),
         else => return error.UnexpectedMuxFrame,
     }
 }

@@ -714,7 +714,7 @@ def send_mux_te_open(conn, shell, stream_id=1, session_id=None):
     send_frame(conn, MUX_STREAM_FRAME, mux.SerializeToString())
 
 
-def recv_mux_te_payload(conn, expected_payload, timeout=5.0):
+def recv_mux_te_payload_frame(conn, expected_payload, timeout=5.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         mux = recv_mux_frame(conn, timeout=max(0.1, end - time.monotonic()))
@@ -723,8 +723,28 @@ def recv_mux_te_payload(conn, expected_payload, timeout=5.0):
         if mux.payload.WhichOneof("item") != "te":
             continue
         if mux.payload.te.WhichOneof("payload") == expected_payload:
-            return mux.payload.te
+            return mux
     raise AssertionError(f"did not receive mux terminal payload {expected_payload}")
+
+
+def recv_mux_te_payload(conn, expected_payload, timeout=5.0):
+    return recv_mux_te_payload_frame(conn, expected_payload, timeout=timeout).payload.te
+
+
+def recv_mux_eof(conn, stream_id=1, expected_final_offset=None, timeout=5.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        mux = recv_mux_frame(conn, timeout=max(0.1, end - time.monotonic()))
+        if mux.stream_id != stream_id:
+            continue
+        if mux.WhichOneof("message") != "eof":
+            continue
+        if expected_final_offset is not None and mux.eof.final_offset != expected_final_offset:
+            raise AssertionError(
+                f"unexpected mux eof offset: expected {expected_final_offset}, got {mux.eof.final_offset}"
+            )
+        return mux.eof
+    raise AssertionError(f"did not receive mux eof for stream {stream_id}")
 
 
 def send_frame(conn, message_kind, payload=b""):
@@ -1440,7 +1460,8 @@ def run_daemon_log_mux_session_lifecycle_test(_base_env):
             while recv_mux_frame(conn).WhichOneof("message") != "open_ok":
                 pass
             recv_mux_te_payload(conn, "session_attached")
-            recv_mux_te_payload(conn, "session_ended")
+            ended_mux = recv_mux_te_payload_frame(conn, "session_ended")
+            recv_mux_eof(conn, stream_id=1, expected_final_offset=ended_mux.payload.offset + 1)
 
             output += read_until_pipe(log_proc.stdout, b"terminal session ended stream_id=1", timeout=5.0)
             text = output.decode("utf-8", "replace")

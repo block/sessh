@@ -2295,12 +2295,12 @@ fn handleClientDaemonFrame(payload: []const u8) !ClientDaemonFrameAction {
 
     const item_payload = item.payload orelse return .unexpected;
     return switch (item_payload) {
-        .te_transport_event => |event| handleTeTransportEvent(event),
+        .ssh_transport_event => |event| handleSshTransportEvent(event),
         else => .unexpected,
     };
 }
 
-fn handleTeTransportEvent(event: pb.TeTransportEvent) !ClientDaemonFrameAction {
+fn handleSshTransportEvent(event: pb.SshTransportEvent) !ClientDaemonFrameAction {
     const payload = event.payload orelse return .unexpected;
     switch (payload) {
         .stderr_chunk => |diagnostic| client_log.appendSshStderr(diagnostic.chunk),

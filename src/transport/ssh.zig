@@ -542,7 +542,7 @@ fn runRemoteNewSession(
 pub fn serveTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
-    request: pb.TeTransportOpen,
+    request: pb.SshTransportOpen,
 ) !void {
     var resolved_target = try resolveSshTarget(allocator, request.ssh_option.items, request.host);
     defer resolved_target.deinit(allocator);
@@ -560,7 +560,7 @@ fn startTerminalTransportForDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.TeTransportOpen,
+    request: pb.SshTransportOpen,
 ) !TerminalTransportStart {
     var artifacts_storage: ?ArtifactSet = if (request.bootstrap) try loadArtifactSet(allocator) else null;
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
@@ -595,7 +595,7 @@ fn startTerminalTransportForDaemon(
     socket_transport.setCloseOnExec(diagnostic_pipe[0]) catch {};
     socket_transport.setCloseOnExec(diagnostic_pipe[1]) catch {};
 
-    var client_environment = try envMapFromTransportOpen(allocator, request);
+    var client_environment = try envMapFromSshTransportOpen(allocator, request);
     defer client_environment.deinit();
 
     var bootstrap_failure_term: ?std.process.Child.Term = null;
@@ -654,7 +654,7 @@ fn servePooledTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.TeTransportOpen,
+    request: pb.SshTransportOpen,
 ) !void {
     const client = try allocator.create(PooledTerminalClient);
     errdefer allocator.destroy(client);
@@ -747,7 +747,7 @@ fn startNewTerminalTunnel(
     tunnel: *TerminalTunnel,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.TeTransportOpen,
+    request: pb.SshTransportOpen,
 ) !void {
     var started = try startTerminalTransportForDaemon(allocator, client_fd, target, request);
     errdefer {
@@ -1086,6 +1086,9 @@ fn readPooledRemoteMuxFrame(tunnel: *TerminalTunnel) !bool {
             .reset => {
                 if (client.first_payload_ms == 0) client.first_payload_ms = nowUnixMs();
             },
+            .eof => {
+                if (client.first_payload_ms == 0) client.first_payload_ms = nowUnixMs();
+            },
             .open, .ack => {},
         }
         mux_frame.stream_id = client.local_stream_id;
@@ -1116,6 +1119,13 @@ fn readPooledRemoteMuxFrame(tunnel: *TerminalTunnel) !bool {
         },
         .reset => |reset| {
             try sendDaemonTransportError(client.fd, reset.code, reset.message, reset.hint orelse "");
+            finishPooledTerminalClient(tunnel, client, false);
+        },
+        .eof => {
+            if (client.first_payload_ms == 0) {
+                client.first_payload_ms = nowUnixMs();
+                logPooledTerminalClientStartupTiming(tunnel, client);
+            }
             finishPooledTerminalClient(tunnel, client, false);
         },
         .open => return error.UnexpectedDaemonFrame,
@@ -1177,7 +1187,7 @@ fn notifyPooledTerminalRemoteClosed(tunnel: *TerminalTunnel) void {
     terminal_pool_mutex.lock();
     while (tunnel.clients.items.len > 0) {
         const client = tunnel.clients.items[0];
-        sendTeTransportClosed(client.fd) catch {};
+        sendSshTransportClosed(client.fd) catch {};
         markPooledTerminalClientDoneLocked(tunnel, client);
     }
     terminal_pool_condition.broadcast();
@@ -1198,19 +1208,19 @@ fn forwardPooledTerminalDiagnostics(tunnel: *TerminalTunnel) !void {
         terminal_pool_mutex.lock();
         for (tunnel.clients.items) |client| {
             if (client.state == .done) continue;
-            sendTeTransportDiagnostic(client.fd, bytes) catch {};
+            sendSshTransportDiagnostic(client.fd, bytes) catch {};
         }
         terminal_pool_mutex.unlock();
         if (@as(usize, @intCast(n)) < buf.len) return;
     }
 }
 
-fn sendTeTransportDiagnostic(fd: c.fd_t, chunk: []const u8) !void {
-    try protocol.sendTeTransportStderrFrame(app_allocator.allocator(), fd, chunk);
+fn sendSshTransportDiagnostic(fd: c.fd_t, chunk: []const u8) !void {
+    try protocol.sendSshTransportStderrFrame(app_allocator.allocator(), fd, chunk);
 }
 
-fn sendTeTransportClosed(fd: c.fd_t) !void {
-    try protocol.sendTeTransportClosedFrame(app_allocator.allocator(), fd);
+fn sendSshTransportClosed(fd: c.fd_t) !void {
+    try protocol.sendSshTransportClosedFrame(app_allocator.allocator(), fd);
 }
 
 fn finishTerminalTunnel(tunnel: *TerminalTunnel) void {
@@ -1393,17 +1403,17 @@ fn openTerminalDaemonTransport(
     const fd = try daemon_client.connectOrStart(allocator, exe);
     errdefer _ = c.close(fd);
 
-    var request = pb.TeTransportOpen{
+    var request = pb.SshTransportOpen{
         .host = target.host,
         .bootstrap = common.bootstrap,
         .batch_mode = batch_mode,
     };
     defer request.ssh_option.deinit(allocator);
-    defer deinitTransportOpenEnvironment(allocator, &request);
+    defer deinitSshTransportOpenEnvironment(allocator, &request);
     try request.ssh_option.appendSlice(allocator, target.options);
-    try appendCurrentEnvironmentToTransportOpen(allocator, &request);
+    try appendCurrentEnvironmentToSshTransportOpen(allocator, &request);
 
-    try protocol.sendTeTransportOpenFrame(allocator, fd, request);
+    try protocol.sendSshTransportOpenFrame(allocator, fd, request);
     return .{ .fd = fd };
 }
 
@@ -1444,7 +1454,7 @@ fn sendDaemonSshFailure(
     }
 }
 
-fn appendCurrentEnvironmentToTransportOpen(allocator: std.mem.Allocator, request: *pb.TeTransportOpen) !void {
+fn appendCurrentEnvironmentToSshTransportOpen(allocator: std.mem.Allocator, request: *pb.SshTransportOpen) !void {
     var index: usize = 0;
     while (c.environ[index]) |entry_z| : (index += 1) {
         const entry = std.mem.span(entry_z);
@@ -1458,7 +1468,7 @@ fn appendCurrentEnvironmentToTransportOpen(allocator: std.mem.Allocator, request
     }
 }
 
-fn deinitTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.TeTransportOpen) void {
+fn deinitSshTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.SshTransportOpen) void {
     for (request.environment.items) |entry| {
         allocator.free(entry.name);
         allocator.free(entry.value);
@@ -1466,7 +1476,7 @@ fn deinitTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.TeT
     request.environment.deinit(allocator);
 }
 
-fn envMapFromTransportOpen(allocator: std.mem.Allocator, request: pb.TeTransportOpen) !std.process.EnvMap {
+fn envMapFromSshTransportOpen(allocator: std.mem.Allocator, request: pb.SshTransportOpen) !std.process.EnvMap {
     var env = std.process.EnvMap.init(allocator);
     errdefer env.deinit();
     for (request.environment.items) |entry| {
@@ -1815,8 +1825,8 @@ fn bootstrapStatusBytes(status: BootstrapStatus) []const u8 {
 fn sendBootstrapStatus(client_status_fd: c.fd_t, status: BootstrapStatus) !void {
     if (client_status_fd >= 0) {
         switch (status) {
-            .started => try protocol.sendTeTransportBootstrapStartedFrame(app_allocator.allocator(), client_status_fd),
-            .finished => try protocol.sendTeTransportBootstrapFinishedFrame(app_allocator.allocator(), client_status_fd),
+            .started => try protocol.sendSshTransportBootstrapStartedFrame(app_allocator.allocator(), client_status_fd),
+            .finished => try protocol.sendSshTransportBootstrapFinishedFrame(app_allocator.allocator(), client_status_fd),
         }
     } else {
         try io.writeAll(2, bootstrapStatusBytes(status));
@@ -2189,17 +2199,17 @@ const DaemonStreamClientStarter = struct {
         const fd = try daemon_client.connectOrStart(self.allocator, self.exe);
         errdefer _ = c.close(fd);
 
-        var request = pb.TeTransportOpen{
+        var request = pb.SshTransportOpen{
             .host = self.target.host,
             .bootstrap = self.bootstrap,
             .batch_mode = true,
         };
         defer request.ssh_option.deinit(self.allocator);
-        defer deinitTransportOpenEnvironment(self.allocator, &request);
+        defer deinitSshTransportOpenEnvironment(self.allocator, &request);
         try request.ssh_option.appendSlice(self.allocator, self.target.options);
-        try appendCurrentEnvironmentToTransportOpen(self.allocator, &request);
+        try appendCurrentEnvironmentToSshTransportOpen(self.allocator, &request);
 
-        try protocol.sendTeTransportOpenFrame(self.allocator, fd, request);
+        try protocol.sendSshTransportOpenFrame(self.allocator, fd, request);
         return .{ .fd = fd };
     }
 

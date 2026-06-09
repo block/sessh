@@ -245,6 +245,7 @@ fn handleTeMuxFrame(
             try removeTeMuxRuntime(allocator, sessions, mux_frame.stream_id);
         },
         .ack, .open_ok => {},
+        .eof => try removeTeMuxRuntime(allocator, sessions, mux_frame.stream_id),
         .reset => try removeTeMuxRuntime(allocator, sessions, mux_frame.stream_id),
     }
 }
@@ -436,6 +437,7 @@ fn forwardTeRuntimeFrameToMux(
                 "terminal session ended stream_id={} session={s}",
                 .{ runtime.stream_id, runtime.session_guid },
             );
+            try sendTeMuxEof(allocator, mux_fd, runtime.stream_id, runtime.outbound_next_offset);
         }
     }
     return true;
@@ -482,6 +484,13 @@ fn sendTeMuxPayload(
             .offset = offset,
             .item = .{ .te = item },
         } },
+    });
+}
+
+fn sendTeMuxEof(allocator: std.mem.Allocator, fd: c.fd_t, stream_id: u64, final_offset: u64) !void {
+    try sendTeMuxFrame(allocator, fd, .{
+        .stream_id = stream_id,
+        .message = .{ .eof = .{ .final_offset = final_offset } },
     });
 }
 

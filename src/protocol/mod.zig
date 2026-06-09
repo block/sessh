@@ -145,32 +145,32 @@ pub fn sendProxyStreamPayloadFrame(
     try sendRemoteStreamPayloadFrame(allocator, fd, .{ .proxy = .{ .payload = payload } });
 }
 
-pub fn sendTeTransportOpenFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.TeTransportOpen) !void {
-    try sendClientDaemonPayloadFrame(allocator, fd, .{ .te_transport_open = request });
+pub fn sendSshTransportOpenFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.SshTransportOpen) !void {
+    try sendClientDaemonPayloadFrame(allocator, fd, .{ .ssh_transport_open = request });
 }
 
-pub fn sendTeTransportEventFrame(
+pub fn sendSshTransportEventFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    payload: pb.TeTransportEvent.payload_union,
+    payload: pb.SshTransportEvent.payload_union,
 ) !void {
-    try sendClientDaemonPayloadFrame(allocator, fd, .{ .te_transport_event = .{ .payload = payload } });
+    try sendClientDaemonPayloadFrame(allocator, fd, .{ .ssh_transport_event = .{ .payload = payload } });
 }
 
-pub fn sendTeTransportStderrFrame(allocator: std.mem.Allocator, fd: c.fd_t, chunk: []const u8) !void {
-    try sendTeTransportEventFrame(allocator, fd, .{ .stderr_chunk = .{ .chunk = chunk } });
+pub fn sendSshTransportStderrFrame(allocator: std.mem.Allocator, fd: c.fd_t, chunk: []const u8) !void {
+    try sendSshTransportEventFrame(allocator, fd, .{ .stderr_chunk = .{ .chunk = chunk } });
 }
 
-pub fn sendTeTransportClosedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendTeTransportEventFrame(allocator, fd, .{ .closed = .{} });
+pub fn sendSshTransportClosedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    try sendSshTransportEventFrame(allocator, fd, .{ .closed = .{} });
 }
 
-pub fn sendTeTransportBootstrapStartedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendTeTransportEventFrame(allocator, fd, .{ .bootstrap_started = .{} });
+pub fn sendSshTransportBootstrapStartedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    try sendSshTransportEventFrame(allocator, fd, .{ .bootstrap_started = .{} });
 }
 
-pub fn sendTeTransportBootstrapFinishedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendTeTransportEventFrame(allocator, fd, .{ .bootstrap_finished = .{} });
+pub fn sendSshTransportBootstrapFinishedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    try sendSshTransportEventFrame(allocator, fd, .{ .bootstrap_finished = .{} });
 }
 
 pub fn sendDaemonLogRequestFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.DaemonLogRequest) !void {
@@ -232,13 +232,13 @@ pub fn decodeDaemonMuxStreamFrame(allocator: std.mem.Allocator, payload: []const
     }
 }
 
-pub fn decodeClientDaemonTeTransportOpen(allocator: std.mem.Allocator, payload: []const u8) !pb.TeTransportOpen {
+pub fn decodeClientDaemonSshTransportOpen(allocator: std.mem.Allocator, payload: []const u8) !pb.SshTransportOpen {
     var item = try decodePayload(pb.ClientDaemonItem, allocator, payload);
     switch (item.payload orelse {
         item.deinit(allocator);
         return error.UnexpectedFrame;
     }) {
-        .te_transport_open => |open| {
+        .ssh_transport_open => |open| {
             item.payload = null;
             return open;
         },
@@ -249,13 +249,13 @@ pub fn decodeClientDaemonTeTransportOpen(allocator: std.mem.Allocator, payload: 
     }
 }
 
-pub fn decodeClientDaemonTeTransportEvent(allocator: std.mem.Allocator, payload: []const u8) !pb.TeTransportEvent {
+pub fn decodeClientDaemonSshTransportEvent(allocator: std.mem.Allocator, payload: []const u8) !pb.SshTransportEvent {
     var item = try decodePayload(pb.ClientDaemonItem, allocator, payload);
     switch (item.payload orelse {
         item.deinit(allocator);
         return error.UnexpectedFrame;
     }) {
-        .te_transport_event => |event| {
+        .ssh_transport_event => |event| {
             item.payload = null;
             return event;
         },
