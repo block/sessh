@@ -54,10 +54,6 @@ pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
 fn ensureStartedForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !void {
     const fd = try connectOrStartForDirName(allocator, exe, dir_name);
     defer _ = c.close(fd);
-    try protocol.sendPing(fd);
-    var frame = try protocol.readFrameAlloc(allocator, fd);
-    defer frame.deinit(allocator);
-    if (frame.message_type != .pong) return error.UnexpectedDaemonFrame;
 }
 
 pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
@@ -174,8 +170,8 @@ fn copyClientFrameToDaemon(allocator: std.mem.Allocator, read_fd: c.fd_t, write_
     };
     defer frame.deinit(allocator);
 
-    if (frame.message_type == .te_stream_item) {
-        var item = try protocol.decodePayload(pb.TeStreamItem, allocator, frame.payload);
+    if (frame.message_type == .remote_stream) {
+        var item = try protocol.decodeRemoteTeStreamItem(allocator, frame.payload);
         defer item.deinit(allocator);
         if (item.payload) |item_payload| {
             switch (item_payload) {
@@ -425,11 +421,8 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
         };
         defer frame.deinit(allocator);
         switch (frame.message_type) {
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
-            },
-            .te_stream_item => {
-                var item = try protocol.decodePayload(pb.TeStreamItem, allocator, frame.payload);
+            .remote_stream => {
+                var item = try protocol.decodeRemoteTeStreamItem(allocator, frame.payload);
                 defer item.deinit(allocator);
                 const item_payload = item.payload orelse {
                     try sendError(fd, "PROTOCOL_ERROR", "empty terminal stream item", "");
@@ -453,7 +446,8 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                     },
                 }
             },
-            .mux_stream_frame => {
+            .daemon_tunnel => {
+                if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd)) continue;
                 if (session_daemon_handler.isTeMuxOpenFrame(allocator, frame)) {
                     try session_daemon_handler.serveMuxStreamFrameAfterHandshake(allocator, exe, frame, fd);
                 } else {
@@ -461,16 +455,28 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                 }
                 return;
             },
-            .client_te_transport_open => {
-                daemon_log.infof(allocator, "terminal transport requested", .{});
-                var request = try protocol.decodePayload(pb.ClientTeTransportOpen, allocator, frame.payload);
-                defer request.deinit(allocator);
-                try transport_ssh.serveTerminalTransportFromDaemon(allocator, fd, request);
-                return;
-            },
-            .daemon_log_request => {
-                try serveDaemonLogRequest(allocator, fd, frame.payload);
-                return;
+            .client_daemon => {
+                var item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, frame.payload);
+                defer item.deinit(allocator);
+                const item_payload = item.payload orelse {
+                    try sendError(fd, "PROTOCOL_ERROR", "empty client daemon item", "");
+                    return;
+                };
+                switch (item_payload) {
+                    .te_transport_open => |request| {
+                        daemon_log.infof(allocator, "terminal transport requested", .{});
+                        try transport_ssh.serveTerminalTransportFromDaemon(allocator, fd, request);
+                        return;
+                    },
+                    .log_request => {
+                        try serveDaemonLogRequest(allocator, fd);
+                        return;
+                    },
+                    else => {
+                        try sendError(fd, "PROTOCOL_ERROR", "unexpected client daemon item", "");
+                        return;
+                    },
+                }
             },
             else => {
                 try sendError(fd, "PROTOCOL_ERROR", "sesshd does not support this request yet", "");
@@ -480,10 +486,7 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
     }
 }
 
-fn serveDaemonLogRequest(allocator: std.mem.Allocator, fd: c.fd_t, payload: []const u8) !void {
-    var request = try protocol.decodePayload(pb.DaemonLogRequest, allocator, payload);
-    defer request.deinit(allocator);
-
+fn serveDaemonLogRequest(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     try daemon_log.subscribe(allocator, fd);
     defer daemon_log.unsubscribe(fd);
     daemon_log.infof(allocator, "daemon log subscribed", .{});
@@ -498,9 +501,6 @@ fn serveDaemonLogRequest(allocator: std.mem.Allocator, fd: c.fd_t, payload: []co
         };
         defer frame.deinit(allocator);
         switch (frame.message_type) {
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
-            },
             else => return error.UnexpectedFrame,
         }
     }

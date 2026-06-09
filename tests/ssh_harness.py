@@ -1572,14 +1572,14 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
     env["SESSH_FAKE_SSH_G_HOSTNAME"] = "pool-host"
     env["SESSH_FAKE_SSH_G_PORT"] = "2222"
 
-    def send_client_te_transport_open(conn):
-        request = sessh_pb().ClientTeTransportOpen(host="test-host", bootstrap=True, batch_mode=False)
+    def send_te_transport_open(conn):
+        request = sessh_pb().TeTransportOpen(host="test-host", bootstrap=True, batch_mode=False)
         for name, value in env.items():
             entry = request.environment.add()
             entry.name = str(name)
             entry.value = str(value)
         frame = sessh_pb().Frame()
-        frame.client_te_transport_open.CopyFrom(request)
+        frame.client_daemon.te_transport_open.CopyFrom(request)
         body = frame.SerializeToString()
         conn.sendall(struct.pack(">I", len(body)) + body)
 
@@ -1588,7 +1588,7 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
         conn.settimeout(30.0)
         conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
         send_hello(conn)
-        send_client_te_transport_open(conn)
+        send_te_transport_open(conn)
         command = f"printf '{marker}\\n'; sleep 2"
         send_frame(
             conn,
@@ -1693,20 +1693,20 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
     server_thread = threading.Thread(target=echo_server, daemon=True)
     server_thread.start()
 
-    def send_client_te_transport_open(conn):
-        request = sessh_pb().ClientTeTransportOpen(host="test-host", bootstrap=True, batch_mode=True)
+    def send_te_transport_open(conn):
+        request = sessh_pb().TeTransportOpen(host="test-host", bootstrap=True, batch_mode=True)
         for name, value in env.items():
             entry = request.environment.add()
             entry.name = str(name)
             entry.value = str(value)
         frame = sessh_pb().Frame()
-        frame.client_te_transport_open.CopyFrom(request)
+        frame.client_daemon.te_transport_open.CopyFrom(request)
         body = frame.SerializeToString()
         conn.sendall(struct.pack(">I", len(body)) + body)
 
     def send_mux_frame(conn, mux):
         frame = sessh_pb().Frame()
-        frame.mux_stream_frame.CopyFrom(mux)
+        frame.daemon_tunnel.mux_stream.CopyFrom(mux)
         body = frame.SerializeToString()
         conn.sendall(struct.pack(">I", len(body)) + body)
 
@@ -1760,7 +1760,7 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
         conn.settimeout(30.0)
         conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
         send_hello(conn)
-        send_client_te_transport_open(conn)
+        send_te_transport_open(conn)
         send_proxy_open(conn, session_index)
         while recv_mux_frame(conn).WhichOneof("message") != "open_ok":
             pass

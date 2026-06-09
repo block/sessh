@@ -22,8 +22,8 @@ pub fn serveFrameAfterHandshake(
     write_fd: c.fd_t,
 ) !void {
     switch (frame.message_type) {
-        .te_stream_item => {
-            var item = try protocol.decodePayload(pb.TeStreamItem, allocator, frame.payload);
+        .remote_stream => {
+            var item = try protocol.decodeRemoteTeStreamItem(allocator, frame.payload);
             defer item.deinit(allocator);
             const item_payload = item.payload orelse return error.UnexpectedFrame;
             const request = switch (item_payload) {
@@ -86,11 +86,11 @@ pub fn serveDebugFrameAfterHandshake(
     frame: protocol.OwnedFrame,
     write_fd: c.fd_t,
 ) !void {
-    if (frame.message_type != .te_stream_item) {
+    if (frame.message_type != .remote_stream) {
         try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
         return;
     }
-    var item = try protocol.decodePayload(pb.TeStreamItem, allocator, frame.payload);
+    var item = try protocol.decodeRemoteTeStreamItem(allocator, frame.payload);
     defer item.deinit(allocator);
     const item_payload = item.payload orelse {
         try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
@@ -121,8 +121,8 @@ pub fn serveDebugFrameAfterHandshake(
 }
 
 pub fn isTeMuxOpenFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) bool {
-    if (frame.message_type != .mux_stream_frame) return false;
-    var mux_frame = protocol.decodePayload(pb.MuxStreamFrame, allocator, frame.payload) catch return false;
+    if (frame.message_type != .daemon_tunnel) return false;
+    var mux_frame = protocol.decodeDaemonMuxStreamFrame(allocator, frame.payload) catch return false;
     defer mux_frame.deinit(allocator);
     const message = mux_frame.message orelse return false;
     return switch (message) {
@@ -232,8 +232,8 @@ fn handleTeMuxFrame(
     mux_fd: c.fd_t,
     frame: protocol.OwnedFrame,
 ) !void {
-    if (frame.message_type != .mux_stream_frame) return error.UnexpectedFrame;
-    var mux_frame = try protocol.decodePayload(pb.MuxStreamFrame, allocator, frame.payload);
+    if (frame.message_type != .daemon_tunnel) return error.UnexpectedFrame;
+    var mux_frame = try protocol.decodeDaemonMuxStreamFrame(allocator, frame.payload);
     defer mux_frame.deinit(allocator);
     const message = mux_frame.message orelse return error.UnexpectedFrame;
     switch (message) {
@@ -415,8 +415,8 @@ fn forwardTeRuntimeFrameToMux(
         try sendTeMuxReset(allocator, mux_fd, runtime.stream_id, "RUNTIME_ERROR", "terminal runtime error");
         return false;
     }
-    if (frame.message_type != .te_stream_item) return error.UnexpectedFrame;
-    var item = try protocol.decodePayload(pb.TeStreamItem, allocator, frame.payload);
+    if (frame.message_type != .remote_stream) return error.UnexpectedFrame;
+    var item = try protocol.decodeRemoteTeStreamItem(allocator, frame.payload);
     defer item.deinit(allocator);
     try sendTeMuxPayload(allocator, mux_fd, runtime.stream_id, runtime.outbound_next_offset, item);
     runtime.outbound_next_offset +|= 1;
@@ -514,9 +514,7 @@ fn sendTeMuxResetForError(
 }
 
 fn sendTeMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.MuxStreamFrame) !void {
-    const payload = try protocol.encodePayload(allocator, message);
-    defer allocator.free(payload);
-    try protocol.sendFrame(fd, .mux_stream_frame, payload);
+    try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
 
 fn sendTeHangupToRuntime(fd: c.fd_t) !void {

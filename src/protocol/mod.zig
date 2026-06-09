@@ -11,18 +11,9 @@ pub const MessageType = enum {
     hello_ok,
     hello_error,
     error_message,
-
-    ping,
-    pong,
-    mux_stream_frame,
-    proxy_stream_item,
-    te_stream_item,
-    client_te_transport_open,
-    client_te_transport_diagnostic,
-    client_te_transport_status,
-    client_te_transport_closed,
-    daemon_log_request,
-    daemon_log_entry,
+    client_daemon,
+    remote_stream,
+    daemon_tunnel,
 };
 
 pub const frame_header_len = 4;
@@ -71,32 +62,63 @@ pub fn sendFrame(fd: c.fd_t, message_type: MessageType, payload: []const u8) !vo
 }
 
 pub fn sendPing(fd: c.fd_t) !void {
-    const payload = try encodePayload(app_allocator.allocator(), pb.Ping{});
-    defer app_allocator.allocator().free(payload);
-    try sendFrame(fd, .ping, payload);
+    try sendDaemonTunnelPayloadFrame(app_allocator.allocator(), fd, .{ .ping = .{} });
 }
 
 pub fn sendPong(fd: c.fd_t) !void {
-    const payload = try encodePayload(app_allocator.allocator(), pb.Pong{});
-    defer app_allocator.allocator().free(payload);
-    try sendFrame(fd, .pong, payload);
+    try sendDaemonTunnelPayloadFrame(app_allocator.allocator(), fd, .{ .pong = .{} });
 }
 
 pub fn handleTransportControlFrame(message_type: MessageType, payload: []const u8, write_fd: c.fd_t) !bool {
-    switch (message_type) {
-        .ping => {
-            var message = try decodePayload(pb.Ping, app_allocator.allocator(), payload);
-            defer message.deinit(app_allocator.allocator());
-            try sendPong(write_fd);
-            return true;
-        },
-        .pong => {
-            var message = try decodePayload(pb.Pong, app_allocator.allocator(), payload);
-            defer message.deinit(app_allocator.allocator());
-            return true;
-        },
+    if (message_type != .daemon_tunnel) return false;
+
+    var item = try decodePayload(pb.DaemonTunnelItem, app_allocator.allocator(), payload);
+    defer item.deinit(app_allocator.allocator());
+
+    switch (item.payload orelse return false) {
+        .ping => try sendPong(write_fd),
+        .pong => {},
         else => return false,
     }
+    return true;
+}
+
+pub fn sendClientDaemonPayloadFrame(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    payload: pb.ClientDaemonItem.payload_union,
+) !void {
+    const encoded = try encodePayload(allocator, pb.ClientDaemonItem{ .payload = payload });
+    defer allocator.free(encoded);
+    try sendFrame(fd, .client_daemon, encoded);
+}
+
+pub fn sendDaemonTunnelPayloadFrame(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    payload: pb.DaemonTunnelItem.payload_union,
+) !void {
+    const encoded = try encodePayload(allocator, pb.DaemonTunnelItem{ .payload = payload });
+    defer allocator.free(encoded);
+    try sendFrame(fd, .daemon_tunnel, encoded);
+}
+
+pub fn sendRemoteStreamPayloadFrame(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    payload: pb.RemoteStreamItem.payload_union,
+) !void {
+    const encoded = try encodePayload(allocator, pb.RemoteStreamItem{ .payload = payload });
+    defer allocator.free(encoded);
+    try sendFrame(fd, .remote_stream, encoded);
+}
+
+pub fn sendMuxStreamFrame(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    message: pb.MuxStreamFrame,
+) !void {
+    try sendDaemonTunnelPayloadFrame(allocator, fd, .{ .mux_stream = message });
 }
 
 pub fn sendTeStreamItemFrame(
@@ -104,9 +126,7 @@ pub fn sendTeStreamItemFrame(
     fd: c.fd_t,
     item: pb.TeStreamItem,
 ) !void {
-    const payload = try encodePayload(allocator, item);
-    defer allocator.free(payload);
-    try sendFrame(fd, .te_stream_item, payload);
+    try sendRemoteStreamPayloadFrame(allocator, fd, .{ .te = item });
 }
 
 pub fn sendTeStreamPayloadFrame(
@@ -122,15 +142,152 @@ pub fn sendProxyStreamPayloadFrame(
     fd: c.fd_t,
     payload: pb.ProxyStreamItem.payload_union,
 ) !void {
-    const encoded = try encodePayload(allocator, pb.ProxyStreamItem{ .payload = payload });
-    defer allocator.free(encoded);
-    try sendFrame(fd, .proxy_stream_item, encoded);
+    try sendRemoteStreamPayloadFrame(allocator, fd, .{ .proxy = .{ .payload = payload } });
+}
+
+pub fn sendTeTransportOpenFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.TeTransportOpen) !void {
+    try sendClientDaemonPayloadFrame(allocator, fd, .{ .te_transport_open = request });
+}
+
+pub fn sendTeTransportEventFrame(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    payload: pb.TeTransportEvent.payload_union,
+) !void {
+    try sendClientDaemonPayloadFrame(allocator, fd, .{ .te_transport_event = .{ .payload = payload } });
+}
+
+pub fn sendTeTransportStderrFrame(allocator: std.mem.Allocator, fd: c.fd_t, chunk: []const u8) !void {
+    try sendTeTransportEventFrame(allocator, fd, .{ .stderr_chunk = .{ .chunk = chunk } });
+}
+
+pub fn sendTeTransportClosedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    try sendTeTransportEventFrame(allocator, fd, .{ .closed = .{} });
+}
+
+pub fn sendTeTransportBootstrapStartedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    try sendTeTransportEventFrame(allocator, fd, .{ .bootstrap_started = .{} });
+}
+
+pub fn sendTeTransportBootstrapFinishedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    try sendTeTransportEventFrame(allocator, fd, .{ .bootstrap_finished = .{} });
+}
+
+pub fn sendDaemonLogRequestFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.DaemonLogRequest) !void {
+    try sendClientDaemonPayloadFrame(allocator, fd, .{ .log_request = request });
+}
+
+pub fn sendDaemonLogEntryFrame(allocator: std.mem.Allocator, fd: c.fd_t, entry: pb.DaemonLogEntry) !void {
+    try sendClientDaemonPayloadFrame(allocator, fd, .{ .log_entry = entry });
+}
+
+pub fn decodeRemoteTeStreamItem(allocator: std.mem.Allocator, payload: []const u8) !pb.TeStreamItem {
+    var item = try decodePayload(pb.RemoteStreamItem, allocator, payload);
+    switch (item.payload orelse {
+        item.deinit(allocator);
+        return error.UnexpectedFrame;
+    }) {
+        .te => |te| {
+            item.payload = null;
+            return te;
+        },
+        else => {
+            item.deinit(allocator);
+            return error.UnexpectedFrame;
+        },
+    }
+}
+
+pub fn decodeRemoteProxyStreamItem(allocator: std.mem.Allocator, payload: []const u8) !pb.ProxyStreamItem {
+    var item = try decodePayload(pb.RemoteStreamItem, allocator, payload);
+    switch (item.payload orelse {
+        item.deinit(allocator);
+        return error.UnexpectedFrame;
+    }) {
+        .proxy => |proxy| {
+            item.payload = null;
+            return proxy;
+        },
+        else => {
+            item.deinit(allocator);
+            return error.UnexpectedFrame;
+        },
+    }
+}
+
+pub fn decodeDaemonMuxStreamFrame(allocator: std.mem.Allocator, payload: []const u8) !pb.MuxStreamFrame {
+    var item = try decodePayload(pb.DaemonTunnelItem, allocator, payload);
+    switch (item.payload orelse {
+        item.deinit(allocator);
+        return error.UnexpectedFrame;
+    }) {
+        .mux_stream => |mux| {
+            item.payload = null;
+            return mux;
+        },
+        else => {
+            item.deinit(allocator);
+            return error.UnexpectedFrame;
+        },
+    }
+}
+
+pub fn decodeClientDaemonTeTransportOpen(allocator: std.mem.Allocator, payload: []const u8) !pb.TeTransportOpen {
+    var item = try decodePayload(pb.ClientDaemonItem, allocator, payload);
+    switch (item.payload orelse {
+        item.deinit(allocator);
+        return error.UnexpectedFrame;
+    }) {
+        .te_transport_open => |open| {
+            item.payload = null;
+            return open;
+        },
+        else => {
+            item.deinit(allocator);
+            return error.UnexpectedFrame;
+        },
+    }
+}
+
+pub fn decodeClientDaemonTeTransportEvent(allocator: std.mem.Allocator, payload: []const u8) !pb.TeTransportEvent {
+    var item = try decodePayload(pb.ClientDaemonItem, allocator, payload);
+    switch (item.payload orelse {
+        item.deinit(allocator);
+        return error.UnexpectedFrame;
+    }) {
+        .te_transport_event => |event| {
+            item.payload = null;
+            return event;
+        },
+        else => {
+            item.deinit(allocator);
+            return error.UnexpectedFrame;
+        },
+    }
+}
+
+pub fn decodeClientDaemonLogEntry(allocator: std.mem.Allocator, payload: []const u8) !pb.DaemonLogEntry {
+    var item = try decodePayload(pb.ClientDaemonItem, allocator, payload);
+    switch (item.payload orelse {
+        item.deinit(allocator);
+        return error.UnexpectedFrame;
+    }) {
+        .log_entry => |entry| {
+            item.payload = null;
+            return entry;
+        },
+        else => {
+            item.deinit(allocator);
+            return error.UnexpectedFrame;
+        },
+    }
 }
 
 pub fn encodeFrame(allocator: std.mem.Allocator, message_type: MessageType, payload: []const u8) ![]u8 {
     const envelope = try encodeEnvelopePayload(allocator, message_type, payload);
     defer allocator.free(envelope);
     if (envelope.len > std.math.maxInt(u32)) return error.FrameTooLarge;
+
     const frame = try allocator.alloc(u8, frame_header_len + envelope.len);
     writeU32(frame[0..frame_header_len], @intCast(envelope.len));
     @memcpy(frame[frame_header_len..], envelope);
@@ -144,6 +301,7 @@ pub fn payloadLenFromHeader(header: *const [frame_header_len]u8) usize {
 fn readEnvelopeAlloc(allocator: std.mem.Allocator, fd: c.fd_t) ![]u8 {
     var length_bytes: [frame_header_len]u8 = undefined;
     try io.readExact(fd, &length_bytes);
+
     const payload_len: usize = @intCast(readU32(&length_bytes));
     const payload = try allocator.alloc(u8, payload_len);
     errdefer allocator.free(payload);
@@ -153,36 +311,28 @@ fn readEnvelopeAlloc(allocator: std.mem.Allocator, fd: c.fd_t) ![]u8 {
 
 fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !OwnedFrame {
     if (envelope.len == 0) return error.UnknownFrame;
-    if (!isHelloFrameEnvelope(envelope)) {
-        var frame = try decodePayload(pb.Frame, allocator, envelope);
-        defer frame.deinit(allocator);
-        const payload = frame.payload orelse return error.UnknownFrame;
-        return switch (payload) {
-            .@"error" => |message| ownedFrameFromMessage(allocator, .error_message, message),
-            .ping => |message| ownedFrameFromMessage(allocator, .ping, message),
-            .pong => |message| ownedFrameFromMessage(allocator, .pong, message),
-            .mux_stream_frame => |message| ownedFrameFromMessage(allocator, .mux_stream_frame, message),
-            .te_stream_item => |message| ownedFrameFromMessage(allocator, .te_stream_item, message),
-            .proxy_stream_item => |message| ownedFrameFromMessage(allocator, .proxy_stream_item, message),
-            .client_te_transport_open => |message| ownedFrameFromMessage(allocator, .client_te_transport_open, message),
-            .client_te_transport_diagnostic => |message| ownedFrameFromMessage(allocator, .client_te_transport_diagnostic, message),
-            .client_te_transport_status => |message| ownedFrameFromMessage(allocator, .client_te_transport_status, message),
-            .client_te_transport_closed => |message| ownedFrameFromMessage(allocator, .client_te_transport_closed, message),
-            .daemon_log_request => |message| ownedFrameFromMessage(allocator, .daemon_log_request, message),
-            .daemon_log_entry => |message| ownedFrameFromMessage(allocator, .daemon_log_entry, message),
-        };
-    }
+    if (isHelloFrameEnvelope(envelope)) return decodeHelloEnvelopeAlloc(allocator, envelope);
 
+    var frame = try decodePayload(pb.Frame, allocator, envelope);
+    defer frame.deinit(allocator);
+
+    return switch (frame.payload orelse return error.UnknownFrame) {
+        .@"error" => |message| ownedFrameFromMessage(allocator, .error_message, message),
+        .client_daemon => |message| ownedFrameFromMessage(allocator, .client_daemon, message),
+        .remote_stream => |message| ownedFrameFromMessage(allocator, .remote_stream, message),
+        .daemon_tunnel => |message| ownedFrameFromMessage(allocator, .daemon_tunnel, message),
+    };
+}
+
+fn decodeHelloEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !OwnedFrame {
     var hello_frame = try decodePayload(hpb.HelloFrame, allocator, envelope);
     defer hello_frame.deinit(allocator);
-    if (hello_frame.payload) |payload| {
-        return switch (payload) {
-            .hello_request => |message| ownedFrameFromMessage(allocator, .hello_request, message),
-            .hello_ok => |message| ownedFrameFromMessage(allocator, .hello_ok, message),
-            .hello_error => |message| ownedFrameFromMessage(allocator, .hello_error, message),
-        };
-    }
-    return error.UnknownFrame;
+
+    return switch (hello_frame.payload orelse return error.UnknownFrame) {
+        .hello_request => |message| ownedFrameFromMessage(allocator, .hello_request, message),
+        .hello_ok => |message| ownedFrameFromMessage(allocator, .hello_ok, message),
+        .hello_error => |message| ownedFrameFromMessage(allocator, .hello_error, message),
+    };
 }
 
 fn isHelloFrameEnvelope(envelope: []const u8) bool {
@@ -218,60 +368,20 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .@"error" = message } });
         },
-        .ping => blk: {
-            var message = try decodePayload(pb.Ping, allocator, payload);
+        .client_daemon => blk: {
+            var message = try decodePayload(pb.ClientDaemonItem, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .ping = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_daemon = message } });
         },
-        .pong => blk: {
-            var message = try decodePayload(pb.Pong, allocator, payload);
+        .remote_stream => blk: {
+            var message = try decodePayload(pb.RemoteStreamItem, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .pong = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .remote_stream = message } });
         },
-        .mux_stream_frame => blk: {
-            var message = try decodePayload(pb.MuxStreamFrame, allocator, payload);
+        .daemon_tunnel => blk: {
+            var message = try decodePayload(pb.DaemonTunnelItem, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .mux_stream_frame = message } });
-        },
-        .proxy_stream_item => blk: {
-            var message = try decodePayload(pb.ProxyStreamItem, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .proxy_stream_item = message } });
-        },
-        .te_stream_item => blk: {
-            var message = try decodePayload(pb.TeStreamItem, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .te_stream_item = message } });
-        },
-        .client_te_transport_open => blk: {
-            var message = try decodePayload(pb.ClientTeTransportOpen, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_te_transport_open = message } });
-        },
-        .client_te_transport_diagnostic => blk: {
-            var message = try decodePayload(pb.ClientTeTransportDiagnostic, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_te_transport_diagnostic = message } });
-        },
-        .client_te_transport_status => blk: {
-            var message = try decodePayload(pb.ClientTeTransportStatus, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_te_transport_status = message } });
-        },
-        .client_te_transport_closed => blk: {
-            var message = try decodePayload(pb.ClientTeTransportClosed, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_te_transport_closed = message } });
-        },
-        .daemon_log_request => blk: {
-            var message = try decodePayload(pb.DaemonLogRequest, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .daemon_log_request = message } });
-        },
-        .daemon_log_entry => blk: {
-            var message = try decodePayload(pb.DaemonLogEntry, allocator, payload);
-            defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .daemon_log_entry = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .daemon_tunnel = message } });
         },
     };
 }
@@ -307,45 +417,46 @@ test "generated protobuf payload round trip" {
 }
 
 test "frame envelope round trip" {
-    const payload = try encodePayload(std.testing.allocator, pb.TeStreamItem{
-        .payload = .{ .input_ack = .{ .input_seq = 42 } },
+    const payload = try encodePayload(std.testing.allocator, pb.RemoteStreamItem{
+        .payload = .{ .te = .{ .payload = .{ .input_ack = .{ .input_seq = 42 } } } },
     });
     defer std.testing.allocator.free(payload);
-    const frame_bytes = try encodeFrame(std.testing.allocator, .te_stream_item, payload);
+    const frame_bytes = try encodeFrame(std.testing.allocator, .remote_stream, payload);
     defer std.testing.allocator.free(frame_bytes);
 
-    const envelope = frame_bytes[frame_header_len..];
-    var frame = try decodeEnvelopeAlloc(std.testing.allocator, envelope);
+    var frame = try decodeEnvelopeAlloc(std.testing.allocator, frame_bytes[frame_header_len..]);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(MessageType.te_stream_item, frame.message_type);
+    try std.testing.expectEqual(MessageType.remote_stream, frame.message_type);
 
-    var decoded = try decodePayload(pb.TeStreamItem, std.testing.allocator, frame.payload);
-    defer decoded.deinit(std.testing.allocator);
-    const decoded_payload = decoded.payload orelse return error.MissingTePayload;
-    switch (decoded_payload) {
+    var item = try decodeRemoteTeStreamItem(std.testing.allocator, frame.payload);
+    defer item.deinit(std.testing.allocator);
+    const item_payload = item.payload orelse return error.MissingTePayload;
+    switch (item_payload) {
         .input_ack => |ack| try std.testing.expectEqual(@as(u64, 42), ack.input_seq),
         else => return error.UnexpectedTePayload,
     }
 }
 
 test "mux stream frame preserves stream id offset and proxy payload" {
-    const payload = try encodePayload(std.testing.allocator, pb.MuxStreamFrame{
-        .stream_id = 7,
-        .message = .{ .payload = .{
-            .offset = 42,
-            .item = .{ .proxy = .{ .payload = .{ .data = "hello" } } },
+    const payload = try encodePayload(std.testing.allocator, pb.DaemonTunnelItem{
+        .payload = .{ .mux_stream = .{
+            .stream_id = 7,
+            .message = .{ .payload = .{
+                .offset = 42,
+                .item = .{ .proxy = .{ .payload = .{ .data = "hello" } } },
+            } },
         } },
     });
     defer std.testing.allocator.free(payload);
 
-    const frame_bytes = try encodeFrame(std.testing.allocator, .mux_stream_frame, payload);
+    const frame_bytes = try encodeFrame(std.testing.allocator, .daemon_tunnel, payload);
     defer std.testing.allocator.free(frame_bytes);
 
     var frame = try decodeEnvelopeAlloc(std.testing.allocator, frame_bytes[frame_header_len..]);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(MessageType.mux_stream_frame, frame.message_type);
+    try std.testing.expectEqual(MessageType.daemon_tunnel, frame.message_type);
 
-    var decoded = try decodePayload(pb.MuxStreamFrame, std.testing.allocator, frame.payload);
+    var decoded = try decodeDaemonMuxStreamFrame(std.testing.allocator, frame.payload);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 7), decoded.stream_id);
 
@@ -388,11 +499,6 @@ test "hello compatibility accepts peer max protocol when it satisfies local mini
     try std.testing.expect(helloRequestIsCompatible(.{
         .protocol_major = 4,
         .protocol_minor = 0,
-        .version = "0.5.0-dev",
-    }, 3, 0));
-    try std.testing.expect(helloRequestIsCompatible(.{
-        .protocol_major = 3,
-        .protocol_minor = 1,
         .version = "0.5.0-dev",
     }, 3, 0));
     try std.testing.expect(helloRequestIsCompatible(.{

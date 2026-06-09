@@ -21,22 +21,40 @@ message Frame {
 
   oneof payload {
     sessh.handshake.v1.Error error = 10;
-    Ping ping = 39;
-    Pong pong = 40;
 
-    // Coordinator-to-coordinator tunnel traffic. The stream id is scoped to
-    // one tunnel and is not durable.
-    MuxStreamFrame mux_stream_frame = 60;
-    // Single-stream IPC payloads. Local client/coordinator sockets do not need
-    // a mux stream id because the socket itself identifies the stream.
-    TeStreamItem te_stream_item = 61;
-    ProxyStreamItem proxy_stream_item = 62;
-    ClientTeTransportOpen client_te_transport_open = 63;
-    ClientTeTransportDiagnostic client_te_transport_diagnostic = 65;
-    DaemonLogRequest daemon_log_request = 66;
-    DaemonLogEntry daemon_log_entry = 67;
-    ClientTeTransportClosed client_te_transport_closed = 68;
-    ClientTeTransportStatus client_te_transport_status = 69;
+    // Local client <-> local daemon API traffic. These frames are never
+    // forwarded to the remote daemon.
+    ClientDaemonItem client_daemon = 20;
+    // Logical client <-> remote daemon stream traffic. Local client sockets can
+    // carry these directly; daemon-to-daemon tunnels carry them inside mux
+    // payloads.
+    RemoteStreamItem remote_stream = 21;
+    // Local daemon <-> remote daemon tunnel traffic.
+    DaemonTunnelItem daemon_tunnel = 22;
+  }
+}
+
+message ClientDaemonItem {
+  oneof payload {
+    TeTransportOpen te_transport_open = 1;
+    TeTransportEvent te_transport_event = 2;
+    DaemonLogRequest log_request = 10;
+    DaemonLogEntry log_entry = 11;
+  }
+}
+
+message RemoteStreamItem {
+  oneof payload {
+    TeStreamItem te = 1;
+    ProxyStreamItem proxy = 2;
+  }
+}
+
+message DaemonTunnelItem {
+  oneof payload {
+    Ping ping = 1;
+    Pong pong = 2;
+    MuxStreamFrame mux_stream = 10;
   }
 }
 
@@ -44,7 +62,7 @@ message Frame {
 // transport to a remote sesshd. The client may immediately pipeline stream
 // frames after this request; the local daemon queues them behind tunnel setup
 // and forwards them over ssh when the remote daemon endpoint is ready.
-message ClientTeTransportOpen {
+message TeTransportOpen {
   repeated string ssh_option = 1;
   string host = 2;
   bool bootstrap = 3;
@@ -54,31 +72,28 @@ message ClientTeTransportOpen {
   repeated TeSessionCreate.EnvironmentEntry environment = 5;
 }
 
-// Local daemon -> visible-client ssh stderr diagnostic for the transport the
-// daemon owns. This is not remote process output.
-message ClientTeTransportDiagnostic {
-  bytes chunk = 1;
-}
+// Local daemon -> visible-client event for the transport the daemon owns. These
+// are local sessh UI/diagnostic events, not remote process output.
+message TeTransportEvent {
+  message StderrChunk {
+    bytes chunk = 1;
+  }
 
-// Local daemon -> visible-client status for the transport the daemon owns.
-// Unlike ClientTeTransportDiagnostic, this is local sessh UI state and should
-// be rendered immediately rather than buffered as delayed ssh stderr.
-message ClientTeTransportStatus {
   message BootstrapStarted {
   }
 
   message BootstrapFinished {
   }
 
-  oneof status {
-    BootstrapStarted bootstrap_started = 1;
-    BootstrapFinished bootstrap_finished = 2;
+  message Closed {
   }
-}
 
-// Local daemon -> visible-client notification that the local daemon is still
-// alive, but its ssh transport to the remote sesshd closed.
-message ClientTeTransportClosed {
+  oneof payload {
+    StderrChunk stderr_chunk = 1;
+    BootstrapStarted bootstrap_started = 2;
+    BootstrapFinished bootstrap_finished = 3;
+    Closed closed = 4;
+  }
 }
 
 // Local client -> local daemon request to follow new operational log entries.

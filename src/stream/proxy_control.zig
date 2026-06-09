@@ -99,8 +99,8 @@ fn readCapabilities(allocator: std.mem.Allocator, fd: c.fd_t) !Capabilities {
         defer frame.deinit(allocator);
 
         switch (frame.message_type) {
-            .proxy_stream_item => {
-                var item = try protocol.decodePayload(pb.ProxyStreamItem, allocator, frame.payload);
+            .remote_stream => {
+                var item = try protocol.decodeRemoteProxyStreamItem(allocator, frame.payload);
                 defer item.deinit(allocator);
                 const item_payload = item.payload orelse return error.UnexpectedProxyControlFrame;
                 const message = switch (item_payload) {
@@ -112,7 +112,7 @@ fn readCapabilities(allocator: std.mem.Allocator, fd: c.fd_t) !Capabilities {
                     .ctrl_r_available = message.ctrl_r_available,
                 };
             },
-            .ping, .pong => {
+            .daemon_tunnel => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
             },
             else => return error.UnexpectedProxyControlFrame,
@@ -124,8 +124,8 @@ pub fn readMessage(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
     var frame = try protocol.readFrameAlloc(allocator, fd);
     defer frame.deinit(allocator);
 
-    if (frame.message_type != .proxy_stream_item) return error.UnexpectedProxyControlFrame;
-    var item = try protocol.decodePayload(pb.ProxyStreamItem, allocator, frame.payload);
+    if (frame.message_type != .remote_stream) return error.UnexpectedProxyControlFrame;
+    var item = try protocol.decodeRemoteProxyStreamItem(allocator, frame.payload);
     defer item.deinit(allocator);
     const item_payload = item.payload orelse return error.UnexpectedProxyControlFrame;
     return switch (item_payload) {
@@ -202,7 +202,7 @@ fn readHelloRequest(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.f
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
-            .ping, .pong => {
+            .daemon_tunnel => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
             },
             else => {

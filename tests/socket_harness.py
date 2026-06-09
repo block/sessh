@@ -61,9 +61,6 @@ _HELLO_FRAME_FIELDS = {
 }
 _FRAME_FIELDS = {
     ERROR: ERROR,
-    PING: PING,
-    PONG: PONG,
-    MUX_STREAM_FRAME: MUX_STREAM_FRAME,
 }
 _TE_STREAM_ITEM_FIELDS = {
     TERMINAL_STREAM_OPEN: "open",
@@ -744,11 +741,18 @@ def encode_frame_body(message_kind, payload):
         frame = sessh_pb().Frame()
         set_submessage(frame, _FRAME_FIELDS[message_kind], payload)
         return frame.SerializeToString()
+    if message_kind in (PING, PONG, MUX_STREAM_FRAME):
+        frame = sessh_pb().Frame()
+        if message_kind == MUX_STREAM_FRAME:
+            set_submessage(frame.daemon_tunnel, "mux_stream", payload)
+        else:
+            set_submessage(frame.daemon_tunnel, message_kind, payload)
+        return frame.SerializeToString()
     if message_kind in _TE_STREAM_ITEM_FIELDS:
         frame = sessh_pb().Frame()
         item = sessh_pb().TeStreamItem()
         set_submessage(item, _TE_STREAM_ITEM_FIELDS[message_kind], payload)
-        frame.te_stream_item.CopyFrom(item)
+        frame.remote_stream.te.CopyFrom(item)
         return frame.SerializeToString()
     raise AssertionError(f"unknown test message kind: {message_kind}")
 
@@ -775,8 +779,10 @@ def recv_frame(conn):
     field = frame.WhichOneof("payload")
     if field is None:
         raise AssertionError(f"missing frame payload: {body!r}")
-    if field == "te_stream_item":
-        item = frame.te_stream_item
+    if field == "remote_stream":
+        if frame.remote_stream.WhichOneof("payload") != "te":
+            return field, getattr(frame, field).SerializeToString()
+        item = frame.remote_stream.te
         item_field = item.WhichOneof("payload")
         if item_field is None:
             raise AssertionError(f"missing terminal stream item payload: {body!r}")
@@ -784,6 +790,15 @@ def recv_frame(conn):
             if mapped_field == item_field:
                 return message_kind, getattr(item, item_field).SerializeToString()
         raise AssertionError(f"unknown terminal stream item payload: {item_field}")
+    if field == "daemon_tunnel":
+        tunnel_field = frame.daemon_tunnel.WhichOneof("payload")
+        if tunnel_field is None:
+            raise AssertionError(f"missing daemon tunnel payload: {body!r}")
+        if tunnel_field == "mux_stream":
+            return MUX_STREAM_FRAME, frame.daemon_tunnel.mux_stream.SerializeToString()
+        if tunnel_field in (PING, PONG):
+            return tunnel_field, getattr(frame.daemon_tunnel, tunnel_field).SerializeToString()
+        raise AssertionError(f"unknown daemon tunnel payload: {tunnel_field}")
     return field, getattr(frame, field).SerializeToString()
 
 

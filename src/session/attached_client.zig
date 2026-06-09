@@ -934,8 +934,8 @@ test "runtime repaint after local ui requests screen-only repaint" {
 
     var frame = try protocol.readFrameAlloc(app_allocator.allocator(), client_to_remote[0]);
     defer frame.deinit(app_allocator.allocator());
-    try std.testing.expectEqual(protocol.MessageType.te_stream_item, frame.message_type);
-    var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+    try std.testing.expectEqual(protocol.MessageType.remote_stream, frame.message_type);
+    var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
     defer item.deinit(app_allocator.allocator());
     const item_payload = item.payload orelse return error.MissingTePayload;
     const resize = switch (item_payload) {
@@ -1043,12 +1043,13 @@ fn finishReconnectRepaintInner(
     session: *RuntimeSession,
     cancelled: ?*const std.atomic.Value(bool),
 ) !void {
+    _ = write_fd;
     while (session.pending_repaint.active()) {
         var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .te_stream_item => {
-                var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+            .remote_stream => {
+                var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
                 defer item.deinit(app_allocator.allocator());
                 const item_payload = item.payload orelse return error.UnexpectedFrame;
                 switch (item_payload) {
@@ -1076,15 +1077,12 @@ fn finishReconnectRepaintInner(
                     else => return error.UnexpectedFrame,
                 }
             },
-            .client_te_transport_diagnostic => {
-                try handleClientTeTransportDiagnosticFrame(frame.payload);
-            },
-            .client_te_transport_status => {
-                try handleClientTeTransportStatusFrame(frame.payload);
-            },
-            .client_te_transport_closed => return error.RemoteTransportClosed,
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
+            .client_daemon => {
+                switch (try handleClientDaemonFrame(frame.payload)) {
+                    .handled => {},
+                    .transport_closed => return error.RemoteTransportClosed,
+                    .unexpected => return error.UnexpectedFrame,
+                }
             },
             .error_message => {
                 try printErrorPayload(frame.payload);
@@ -1141,10 +1139,10 @@ pub fn drainLocalTransportDiagnostics(read_fd: c.fd_t, timeout_ms: u64) void {
         var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return;
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .client_te_transport_diagnostic => handleClientTeTransportDiagnosticFrame(frame.payload) catch return,
-            .client_te_transport_status => handleClientTeTransportStatusFrame(frame.payload) catch return,
-            .client_te_transport_closed => return,
-            .ping, .pong => {},
+            .client_daemon => switch (handleClientDaemonFrame(frame.payload) catch return) {
+                .handled => {},
+                .transport_closed, .unexpected => return,
+            },
             else => return,
         }
     }
@@ -1172,8 +1170,8 @@ pub fn pollRuntimeRecovery(
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        .te_stream_item => {
-            var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+        .remote_stream => {
+            var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
             defer item.deinit(app_allocator.allocator());
             const item_payload = item.payload orelse return error.UnexpectedFrame;
             switch (item_payload) {
@@ -1212,7 +1210,11 @@ pub fn pollRuntimeRecovery(
                 else => return error.UnexpectedFrame,
             }
         },
-        .client_te_transport_closed => return .remote_transport_closed,
+        .client_daemon => switch (try handleClientDaemonFrame(frame.payload)) {
+            .handled => return null,
+            .transport_closed => return .remote_transport_closed,
+            .unexpected => return error.UnexpectedFrame,
+        },
         .error_message => {
             try printErrorPayload(frame.payload);
             _ = finishAttachedClient(.session_ended, &session.attached_client_end_restore);
@@ -1318,8 +1320,8 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                 try printParsedError(parsed);
                 return process_exit.request(1);
             },
-            .te_stream_item => {
-                var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+            .remote_stream => {
+                var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
                 defer item.deinit(app_allocator.allocator());
                 const item_payload = item.payload orelse return error.UnexpectedFrame;
                 const attached = switch (item_payload) {
@@ -1331,13 +1333,11 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                 try session.setSessionDir(attached.session_dir);
                 return session;
             },
-            .client_te_transport_diagnostic => {
-                try handleClientTeTransportDiagnosticFrame(frame.payload);
+            .client_daemon => switch (try handleClientDaemonFrame(frame.payload)) {
+                .handled => {},
+                .transport_closed => return error.RemoteTransportClosed,
+                .unexpected => return error.UnexpectedFrame,
             },
-            .client_te_transport_status => {
-                try handleClientTeTransportStatusFrame(frame.payload);
-            },
-            .client_te_transport_closed => return error.RemoteTransportClosed,
             else => return error.UnexpectedFrame,
         }
     }
@@ -1365,6 +1365,7 @@ fn readSessionAttachedInner(
     write_fd: c.fd_t,
     cancelled: ?*const std.atomic.Value(bool),
 ) !void {
+    _ = write_fd;
     while (true) {
         var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
@@ -1390,8 +1391,8 @@ fn readSessionAttachedInner(
                 try printParsedError(parsed);
                 return process_exit.request(1);
             },
-            .te_stream_item => {
-                var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+            .remote_stream => {
+                var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
                 defer item.deinit(app_allocator.allocator());
                 const item_payload = item.payload orelse return error.UnexpectedFrame;
                 switch (item_payload) {
@@ -1399,15 +1400,10 @@ fn readSessionAttachedInner(
                     else => return error.UnexpectedFrame,
                 }
             },
-            .client_te_transport_diagnostic => {
-                try handleClientTeTransportDiagnosticFrame(frame.payload);
-            },
-            .client_te_transport_status => {
-                try handleClientTeTransportStatusFrame(frame.payload);
-            },
-            .client_te_transport_closed => return error.RemoteTransportClosed,
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
+            .client_daemon => switch (try handleClientDaemonFrame(frame.payload)) {
+                .handled => {},
+                .transport_closed => return error.RemoteTransportClosed,
+                .unexpected => return error.UnexpectedFrame,
             },
             else => return error.UnexpectedFrame,
         }
@@ -1586,8 +1582,8 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
                 try printErrorPayload(frame.payload);
                 return true;
             },
-            .te_stream_item => {
-                var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+            .remote_stream => {
+                var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
                 defer item.deinit(app_allocator.allocator());
                 const item_payload = item.payload orelse return error.UnexpectedFrame;
                 switch (item_payload) {
@@ -1595,15 +1591,10 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
                     else => return error.UnexpectedFrame,
                 }
             },
-            .client_te_transport_diagnostic => {
-                try handleClientTeTransportDiagnosticFrame(frame.payload);
-            },
-            .client_te_transport_status => {
-                try handleClientTeTransportStatusFrame(frame.payload);
-            },
-            .client_te_transport_closed => return error.RemoteTransportClosed,
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, conn);
+            .client_daemon => switch (try handleClientDaemonFrame(frame.payload)) {
+                .handled => {},
+                .transport_closed => return error.RemoteTransportClosed,
+                .unexpected => return error.UnexpectedFrame,
             },
             else => return error.UnexpectedFrame,
         }
@@ -1979,11 +1970,12 @@ fn handleEscapeHelpRuntimeFrame(
     input_ack_tracker: *InputAckTracker,
     ended_process_exit_code: ?*?u8,
 ) !?AttachedClientEnd {
+    _ = write_fd;
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        .te_stream_item => {
-            var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+        .remote_stream => {
+            var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
             defer item.deinit(app_allocator.allocator());
             const item_payload = item.payload orelse return error.UnexpectedFrame;
             switch (item_payload) {
@@ -2009,18 +2001,10 @@ fn handleEscapeHelpRuntimeFrame(
                 else => return error.UnexpectedFrame,
             }
         },
-        .client_te_transport_diagnostic => {
-            try handleClientTeTransportDiagnosticFrame(frame.payload);
-            return null;
-        },
-        .client_te_transport_status => {
-            try handleClientTeTransportStatusFrame(frame.payload);
-            return null;
-        },
-        .client_te_transport_closed => return .remote_transport_closed,
-        .ping, .pong => {
-            _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
-            return null;
+        .client_daemon => switch (try handleClientDaemonFrame(frame.payload)) {
+            .handled => return null,
+            .transport_closed => return .remote_transport_closed,
+            .unexpected => return error.UnexpectedFrame,
         },
         .error_message => {
             try printErrorPayload(frame.payload);
@@ -2120,11 +2104,12 @@ fn handleAttachedClientRuntimeFrame(
     initial_cursor_position: *?terminal.CursorPosition,
     initial_draw_alignment_pending: *bool,
 ) !?AttachedClientEnd {
+    _ = write_fd;
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        .te_stream_item => {
-            var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+        .remote_stream => {
+            var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
             defer item.deinit(app_allocator.allocator());
             const item_payload = item.payload orelse return error.UnexpectedFrame;
             switch (item_payload) {
@@ -2173,18 +2158,10 @@ fn handleAttachedClientRuntimeFrame(
                 else => return error.UnexpectedFrame,
             }
         },
-        .client_te_transport_diagnostic => {
-            try handleClientTeTransportDiagnosticFrame(frame.payload);
-            return null;
-        },
-        .client_te_transport_status => {
-            try handleClientTeTransportStatusFrame(frame.payload);
-            return null;
-        },
-        .client_te_transport_closed => return .remote_transport_closed,
-        .ping, .pong => {
-            _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
-            return null;
+        .client_daemon => switch (try handleClientDaemonFrame(frame.payload)) {
+            .handled => return null,
+            .transport_closed => return .remote_transport_closed,
+            .unexpected => return error.UnexpectedFrame,
         },
         .error_message => {
             try printErrorPayload(frame.payload);
@@ -2306,20 +2283,32 @@ fn handleTtyTranscriptChunkMessage(chunk: pb.TeTtyTranscriptChunk) void {
     }
 }
 
-fn handleClientTeTransportDiagnosticFrame(payload: []const u8) !void {
-    var diagnostic = try protocol.decodePayload(pb.ClientTeTransportDiagnostic, app_allocator.allocator(), payload);
-    defer diagnostic.deinit(app_allocator.allocator());
-    client_log.appendSshStderr(diagnostic.chunk);
+const ClientDaemonFrameAction = enum {
+    handled,
+    transport_closed,
+    unexpected,
+};
+
+fn handleClientDaemonFrame(payload: []const u8) !ClientDaemonFrameAction {
+    var item = try protocol.decodePayload(pb.ClientDaemonItem, app_allocator.allocator(), payload);
+    defer item.deinit(app_allocator.allocator());
+
+    const item_payload = item.payload orelse return .unexpected;
+    return switch (item_payload) {
+        .te_transport_event => |event| handleTeTransportEvent(event),
+        else => .unexpected,
+    };
 }
 
-fn handleClientTeTransportStatusFrame(payload: []const u8) !void {
-    var status = try protocol.decodePayload(pb.ClientTeTransportStatus, app_allocator.allocator(), payload);
-    defer status.deinit(app_allocator.allocator());
-    const state = status.status orelse return;
-    switch (state) {
+fn handleTeTransportEvent(event: pb.TeTransportEvent) !ClientDaemonFrameAction {
+    const payload = event.payload orelse return .unexpected;
+    switch (payload) {
+        .stderr_chunk => |diagnostic| client_log.appendSshStderr(diagnostic.chunk),
         .bootstrap_started => try io_helpers.writeAll(2, "\rsessh: bootstrapping..."),
         .bootstrap_finished => try io_helpers.writeAll(2, "\r\x1b[K"),
+        .closed => return .transport_closed,
     }
+    return .handled;
 }
 
 const InputAckResult = struct {

@@ -32,10 +32,6 @@ pub fn connect(allocator: std.mem.Allocator) !c.fd_t {
 pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
     const fd = try connectOrStart(allocator, exe);
     defer _ = c.close(fd);
-    try protocol.sendPing(fd);
-    var frame = try protocol.readFrameAlloc(allocator, fd);
-    defer frame.deinit(allocator);
-    if (frame.message_type != .pong) return error.UnexpectedDaemonFrame;
 }
 
 pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
@@ -82,9 +78,7 @@ pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
     try io.writeAll(posix.STDOUT_FILENO, path);
     try io.writeAll(posix.STDOUT_FILENO, "\n");
 
-    const request_payload = try protocol.encodePayload(allocator, pb.DaemonLogRequest{});
-    defer allocator.free(request_payload);
-    try protocol.sendFrame(fd, .daemon_log_request, request_payload);
+    try protocol.sendDaemonLogRequestFrame(allocator, fd, .{});
 
     while (true) {
         var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
@@ -93,15 +87,12 @@ pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
         };
         defer frame.deinit(allocator);
         switch (frame.message_type) {
-            .daemon_log_entry => {
-                var entry = try protocol.decodePayload(pb.DaemonLogEntry, allocator, frame.payload);
+            .client_daemon => {
+                var entry = try protocol.decodeClientDaemonLogEntry(allocator, frame.payload);
                 defer entry.deinit(allocator);
                 const line = try daemonLogLine(allocator, entry.unix_ms, entry.message);
                 defer allocator.free(line);
                 try io.writeAll(posix.STDOUT_FILENO, line);
-            },
-            .ping, .pong => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
             },
             else => return error.UnexpectedDaemonFrame,
         }

@@ -103,7 +103,7 @@ pub fn forwardFramesBetweenWithClientCloseActionAndDiagnostics(
         if ((pollfds[runtime_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             if (!try copyOneFrame(runtime_read_fd, client_write_fd)) {
                 logDaemonEvent(diagnostics.log_context, "ssh transport disconnected from daemon");
-                if (diagnostics.notify_remote_close) try sendClientTeTransportClosed(client_write_fd);
+                if (diagnostics.notify_remote_close) try sendTeTransportClosed(client_write_fd);
                 return;
             }
         }
@@ -175,17 +175,11 @@ pub fn forwardRawTransportDiagnostics(fd: c.fd_t, diagnostic_read_fd: c.fd_t) !v
         const n = c.read(diagnostic_read_fd, &buf, buf.len);
         if (n <= 0) return;
         const chunk = buf[0..@intCast(n)];
-        const payload = try protocol.encodePayload(std.heap.page_allocator, protocol.pb.ClientTeTransportDiagnostic{
-            .chunk = chunk,
-        });
-        try protocol.sendFrame(fd, .client_te_transport_diagnostic, payload);
-        std.heap.page_allocator.free(payload);
+        try protocol.sendTeTransportStderrFrame(std.heap.page_allocator, fd, chunk);
         if (chunk.len < buf.len) return;
     }
 }
 
-fn sendClientTeTransportClosed(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(std.heap.page_allocator, protocol.pb.ClientTeTransportClosed{});
-    defer std.heap.page_allocator.free(payload);
-    try protocol.sendFrame(fd, .client_te_transport_closed, payload);
+fn sendTeTransportClosed(fd: c.fd_t) !void {
+    try protocol.sendTeTransportClosedFrame(std.heap.page_allocator, fd);
 }

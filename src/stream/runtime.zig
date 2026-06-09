@@ -948,8 +948,8 @@ fn handleProxyMuxFrame(
     mux_fd: c.fd_t,
     frame: protocol.OwnedFrame,
 ) !void {
-    if (frame.message_type != .mux_stream_frame) return error.StreamUnexpectedFrame;
-    var mux_frame = try protocol.decodePayload(pb.MuxStreamFrame, allocator, frame.payload);
+    if (frame.message_type != .daemon_tunnel) return error.StreamUnexpectedFrame;
+    var mux_frame = try protocol.decodeDaemonMuxStreamFrame(allocator, frame.payload);
     defer mux_frame.deinit(allocator);
     const message = mux_frame.message orelse return error.StreamUnexpectedFrame;
     switch (message) {
@@ -1022,8 +1022,8 @@ fn forwardProxyRuntimeFrameToMux(
         else => return err,
     };
     defer frame.deinit(allocator);
-    if (frame.message_type != .mux_stream_frame) return error.StreamUnexpectedFrame;
-    var mux_frame = try protocol.decodePayload(pb.MuxStreamFrame, allocator, frame.payload);
+    if (frame.message_type != .daemon_tunnel) return error.StreamUnexpectedFrame;
+    var mux_frame = try protocol.decodeDaemonMuxStreamFrame(allocator, frame.payload);
     defer mux_frame.deinit(allocator);
     mux_frame.stream_id = runtime.stream_id;
     try sendProxyRuntimeMuxFrame(allocator, mux_fd, mux_frame);
@@ -1060,9 +1060,7 @@ fn sendProxyMuxReset(
 }
 
 fn sendProxyRuntimeMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.MuxStreamFrame) !void {
-    const payload = try protocol.encodePayload(allocator, message);
-    defer allocator.free(payload);
-    try protocol.sendFrame(fd, .mux_stream_frame, payload);
+    try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
 
 fn runProxyRuntime(allocator: std.mem.Allocator, control: *ProxyRuntimeControl, proxy_host: []const u8, proxy_port: u16) !void {
@@ -1452,16 +1450,14 @@ fn handleFrame(
     defer mutable.deinit(state.allocator);
 
     switch (mutable.message_type) {
-        .mux_stream_frame => {
-            var message = try protocol.decodePayload(pb.MuxStreamFrame, state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
-            try handleMuxStreamFrame(state, transport_write_fd, options, message);
-        },
-        .ping, .pong => {
-            _ = protocol.handleTransportControlFrame(mutable.message_type, mutable.payload, transport_write_fd) catch |err| switch (err) {
+        .daemon_tunnel => {
+            if (protocol.handleTransportControlFrame(mutable.message_type, mutable.payload, transport_write_fd) catch |err| switch (err) {
                 error.WriteFailed => return error.StreamTransportWriteFailed,
                 else => return err,
-            };
+            }) return;
+            var message = try protocol.decodeDaemonMuxStreamFrame(state.allocator, mutable.payload);
+            defer message.deinit(state.allocator);
+            try handleMuxStreamFrame(state, transport_write_fd, options, message);
         },
         .error_message => {
             var message = try protocol.decodePayload(protocol.hpb.Error, state.allocator, mutable.payload);
@@ -1730,9 +1726,7 @@ fn sendMuxStreamFrame(
     fd: c.fd_t,
     message: pb.MuxStreamFrame,
 ) !void {
-    const payload = try protocol.encodePayload(allocator, message);
-    defer allocator.free(payload);
-    try protocol.sendFrame(fd, .mux_stream_frame, payload);
+    try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
 
 fn abortTransport(transport: anytype) void {
@@ -2521,31 +2515,37 @@ fn formatDiagnosticLine(
 }
 
 fn encodeMuxProxyDataPayload(allocator: std.mem.Allocator, offset: u64, data: []const u8) ![]u8 {
-    return protocol.encodePayload(allocator, pb.MuxStreamFrame{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .payload = .{
-            .offset = offset,
-            .item = .{ .proxy = .{ .payload = .{ .data = data } } },
+    return protocol.encodePayload(allocator, pb.DaemonTunnelItem{
+        .payload = .{ .mux_stream = .{
+            .stream_id = proxy_mux_stream_id,
+            .message = .{ .payload = .{
+                .offset = offset,
+                .item = .{ .proxy = .{ .payload = .{ .data = data } } },
+            } },
         } },
     });
 }
 
 fn encodeMuxProxyEofPayload(allocator: std.mem.Allocator, offset: u64) ![]u8 {
-    return protocol.encodePayload(allocator, pb.MuxStreamFrame{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .payload = .{
-            .offset = offset,
-            .item = .{ .proxy = .{ .payload = .{ .eof = .{} } } },
+    return protocol.encodePayload(allocator, pb.DaemonTunnelItem{
+        .payload = .{ .mux_stream = .{
+            .stream_id = proxy_mux_stream_id,
+            .message = .{ .payload = .{
+                .offset = offset,
+                .item = .{ .proxy = .{ .payload = .{ .eof = .{} } } },
+            } },
         } },
     });
 }
 
 fn encodeMuxAckPayload(allocator: std.mem.Allocator, recv_next_offset: u64) ![]u8 {
-    return protocol.encodePayload(allocator, pb.MuxStreamFrame{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .ack = .{
-            .recv_next_offset = recv_next_offset,
-            .receive_window_bytes = max_buffered_bytes,
+    return protocol.encodePayload(allocator, pb.DaemonTunnelItem{
+        .payload = .{ .mux_stream = .{
+            .stream_id = proxy_mux_stream_id,
+            .message = .{ .ack = .{
+                .recv_next_offset = recv_next_offset,
+                .receive_window_bytes = max_buffered_bytes,
+            } },
         } },
     });
 }
@@ -2553,8 +2553,8 @@ fn encodeMuxAckPayload(allocator: std.mem.Allocator, recv_next_offset: u64) ![]u
 fn expectMuxStreamFrame(fd: c.fd_t) !pb.MuxStreamFrame {
     var frame = try protocol.readFrameAlloc(std.testing.allocator, fd);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.mux_stream_frame, frame.message_type);
-    var mux = try protocol.decodePayload(pb.MuxStreamFrame, std.testing.allocator, frame.payload);
+    try std.testing.expectEqual(protocol.MessageType.daemon_tunnel, frame.message_type);
+    var mux = try protocol.decodeDaemonMuxStreamFrame(std.testing.allocator, frame.payload);
     errdefer mux.deinit(std.testing.allocator);
     try std.testing.expectEqual(proxy_mux_stream_id, mux.stream_id);
     return mux;
@@ -2687,16 +2687,16 @@ test "stream ping receives pong without changing offsets" {
 
     var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
     defer state.deinit();
-    const payload = try protocol.encodePayload(std.testing.allocator, pb.Ping{});
+    const payload = try protocol.encodePayload(std.testing.allocator, pb.DaemonTunnelItem{ .payload = .{ .ping = .{} } });
     const options = StreamAttachedClientOptions{};
     try handleFrame(&state, fds[1], &options, .{
-        .message_type = .ping,
+        .message_type = .daemon_tunnel,
         .payload = payload,
     });
 
     var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.pong, frame.message_type);
+    try std.testing.expectEqual(protocol.MessageType.daemon_tunnel, frame.message_type);
     try std.testing.expectEqual(@as(u64, 0), state.inbound.recv_next_offset);
     try std.testing.expectEqual(@as(u64, 0), state.outbound.outboundNext());
 }
@@ -2735,7 +2735,7 @@ test "stream receiver keeps suffix from overlapping data frame" {
     var options = StreamAttachedClientOptions{};
     options.sink = .{ .fd = sink[1] };
     try handleFrame(&state, ack[1], &options, .{
-        .message_type = .mux_stream_frame,
+        .message_type = .daemon_tunnel,
         .payload = payload,
     });
 
@@ -2760,7 +2760,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
 
     const payload = try encodeMuxProxyEofPayload(std.testing.allocator, 0);
     defer std.testing.allocator.free(payload);
-    try protocol.sendFrame(transport_in[1], .mux_stream_frame, payload);
+    try protocol.sendFrame(transport_in[1], .daemon_tunnel, payload);
 
     var attached_client = StreamAttachedClient{
         .state = &state,
@@ -2983,7 +2983,7 @@ test "stream completion waits for eof acknowledgement" {
     const payload = try encodeMuxAckPayload(std.testing.allocator, 0);
     const options = StreamAttachedClientOptions{};
     try handleFrame(&state, -1, &options, .{
-        .message_type = .mux_stream_frame,
+        .message_type = .daemon_tunnel,
         .payload = payload,
     });
     try std.testing.expect(state.complete());

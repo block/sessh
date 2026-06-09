@@ -1520,12 +1520,12 @@ fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !boo
         };
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .ping, .pong => {
+            .daemon_tunnel => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
                 continue;
             },
-            .te_stream_item => {
-                var item = try protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload);
+            .remote_stream => {
+                var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
                 defer item.deinit(app_allocator.allocator());
                 const item_payload = item.payload orelse {
                     try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected empty terminal stream item", "");
@@ -1721,9 +1721,11 @@ fn queueAttachedClientFrame(attached_client: *AttachedClient, message_type: prot
 }
 
 fn queueAttachedClientTeFrame(attached_client: *AttachedClient, payload: pb.TeStreamItem.payload_union) !void {
-    const encoded = try protocol.encodePayload(app_allocator.allocator(), pb.TeStreamItem{ .payload = payload });
+    const encoded = try protocol.encodePayload(app_allocator.allocator(), pb.RemoteStreamItem{
+        .payload = .{ .te = .{ .payload = payload } },
+    });
     defer app_allocator.allocator().free(encoded);
-    try queueAttachedClientFrame(attached_client, .te_stream_item, encoded);
+    try queueAttachedClientFrame(attached_client, .remote_stream, encoded);
 }
 
 fn compactAttachedClientOutput(attached_client: *AttachedClient) void {
@@ -2886,8 +2888,8 @@ fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
     defer frame.deinit(app_allocator.allocator());
 
     switch (frame.message_type) {
-        .te_stream_item => {
-            var item = protocol.decodePayload(pb.TeStreamItem, app_allocator.allocator(), frame.payload) catch {
+        .remote_stream => {
+            var item = protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload) catch {
                 disconnectAttachedClient(session_runtime);
                 return;
             };
@@ -2910,7 +2912,7 @@ fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
                 },
             }
         },
-        .ping, .pong => {
+        .daemon_tunnel => {
             _ = protocol.handleTransportControlFrame(frame.message_type, frame.payload, attached_client.fd) catch {
                 disconnectAttachedClient(session_runtime);
                 return;

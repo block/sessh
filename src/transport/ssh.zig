@@ -542,7 +542,7 @@ fn runRemoteNewSession(
 pub fn serveTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
-    request: pb.ClientTeTransportOpen,
+    request: pb.TeTransportOpen,
 ) !void {
     var resolved_target = try resolveSshTarget(allocator, request.ssh_option.items, request.host);
     defer resolved_target.deinit(allocator);
@@ -560,7 +560,7 @@ fn startTerminalTransportForDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.ClientTeTransportOpen,
+    request: pb.TeTransportOpen,
 ) !TerminalTransportStart {
     var artifacts_storage: ?ArtifactSet = if (request.bootstrap) try loadArtifactSet(allocator) else null;
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
@@ -654,7 +654,7 @@ fn servePooledTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.ClientTeTransportOpen,
+    request: pb.TeTransportOpen,
 ) !void {
     const client = try allocator.create(PooledTerminalClient);
     errdefer allocator.destroy(client);
@@ -747,7 +747,7 @@ fn startNewTerminalTunnel(
     tunnel: *TerminalTunnel,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.ClientTeTransportOpen,
+    request: pb.TeTransportOpen,
 ) !void {
     var started = try startTerminalTransportForDaemon(allocator, client_fd, target, request);
     errdefer {
@@ -929,17 +929,17 @@ fn openPooledTerminalClientStream(tunnel: *TerminalTunnel, client: *PooledTermin
         else => return err,
     };
     defer frame.deinit(tunnel.allocator);
-    if (frame.message_type == .mux_stream_frame) {
+    if (frame.message_type == .daemon_tunnel) {
         try sendPooledProxyMuxOpen(tunnel, client, frame.payload);
         client.state = .active;
         return;
     }
-    if (frame.message_type != .te_stream_item) {
+    if (frame.message_type != .remote_stream) {
         try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal or proxy stream open", "");
         finishPooledTerminalClient(tunnel, client, false);
         return;
     }
-    var item = try protocol.decodePayload(pb.TeStreamItem, tunnel.allocator, frame.payload);
+    var item = try protocol.decodeRemoteTeStreamItem(tunnel.allocator, frame.payload);
     defer item.deinit(tunnel.allocator);
     const item_payload = item.payload orelse {
         try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal stream open", "");
@@ -969,10 +969,7 @@ fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerm
     };
     defer frame.deinit(tunnel.allocator);
     switch (frame.message_type) {
-        .ping, .pong => {
-            _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, client.fd);
-        },
-        .mux_stream_frame => {
+        .daemon_tunnel => {
             if (client.kind != .proxy) {
                 try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected proxy stream frame", "");
                 finishPooledTerminalClient(tunnel, client, true);
@@ -980,13 +977,13 @@ fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerm
             }
             try sendPooledProxyMuxFrame(tunnel, client, frame.payload);
         },
-        .te_stream_item => {
+        .remote_stream => {
             if (client.kind != .te) {
                 try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected terminal stream frame", "");
                 finishPooledTerminalClient(tunnel, client, true);
                 return;
             }
-            var item = try protocol.decodePayload(pb.TeStreamItem, tunnel.allocator, frame.payload);
+            var item = try protocol.decodeRemoteTeStreamItem(tunnel.allocator, frame.payload);
             defer item.deinit(tunnel.allocator);
             try sendPooledTeMuxPayload(tunnel, client, item);
         },
@@ -1018,7 +1015,7 @@ fn sendPooledProxyMuxOpen(
     client: *PooledTerminalClient,
     payload: []const u8,
 ) !void {
-    var mux_frame = try protocol.decodePayload(pb.MuxStreamFrame, tunnel.allocator, payload);
+    var mux_frame = try protocol.decodeDaemonMuxStreamFrame(tunnel.allocator, payload);
     defer mux_frame.deinit(tunnel.allocator);
     const message = mux_frame.message orelse return error.UnexpectedDaemonFrame;
     const open = switch (message) {
@@ -1042,7 +1039,7 @@ fn sendPooledProxyMuxFrame(
     client: *PooledTerminalClient,
     payload: []const u8,
 ) !void {
-    var mux_frame = try protocol.decodePayload(pb.MuxStreamFrame, tunnel.allocator, payload);
+    var mux_frame = try protocol.decodeDaemonMuxStreamFrame(tunnel.allocator, payload);
     defer mux_frame.deinit(tunnel.allocator);
     if (mux_frame.stream_id != client.local_stream_id) return error.UnexpectedDaemonFrame;
     mux_frame.stream_id = client.stream_id;
@@ -1070,8 +1067,8 @@ fn readPooledRemoteMuxFrame(tunnel: *TerminalTunnel) !bool {
         else => return err,
     };
     defer frame.deinit(tunnel.allocator);
-    if (frame.message_type != .mux_stream_frame) return error.UnexpectedDaemonFrame;
-    var mux_frame = try protocol.decodePayload(pb.MuxStreamFrame, tunnel.allocator, frame.payload);
+    if (frame.message_type != .daemon_tunnel) return error.UnexpectedDaemonFrame;
+    var mux_frame = try protocol.decodeDaemonMuxStreamFrame(tunnel.allocator, frame.payload);
     defer mux_frame.deinit(tunnel.allocator);
     const client = findPooledTerminalClient(tunnel, mux_frame.stream_id) orelse return true;
     const message = mux_frame.message orelse return error.UnexpectedDaemonFrame;
@@ -1180,7 +1177,7 @@ fn notifyPooledTerminalRemoteClosed(tunnel: *TerminalTunnel) void {
     terminal_pool_mutex.lock();
     while (tunnel.clients.items.len > 0) {
         const client = tunnel.clients.items[0];
-        sendClientTeTransportClosed(client.fd) catch {};
+        sendTeTransportClosed(client.fd) catch {};
         markPooledTerminalClientDoneLocked(tunnel, client);
     }
     terminal_pool_condition.broadcast();
@@ -1201,23 +1198,19 @@ fn forwardPooledTerminalDiagnostics(tunnel: *TerminalTunnel) !void {
         terminal_pool_mutex.lock();
         for (tunnel.clients.items) |client| {
             if (client.state == .done) continue;
-            sendClientTeTransportDiagnostic(client.fd, bytes) catch {};
+            sendTeTransportDiagnostic(client.fd, bytes) catch {};
         }
         terminal_pool_mutex.unlock();
         if (@as(usize, @intCast(n)) < buf.len) return;
     }
 }
 
-fn sendClientTeTransportDiagnostic(fd: c.fd_t, chunk: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.ClientTeTransportDiagnostic{ .chunk = chunk });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .client_te_transport_diagnostic, payload);
+fn sendTeTransportDiagnostic(fd: c.fd_t, chunk: []const u8) !void {
+    try protocol.sendTeTransportStderrFrame(app_allocator.allocator(), fd, chunk);
 }
 
-fn sendClientTeTransportClosed(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.ClientTeTransportClosed{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .client_te_transport_closed, payload);
+fn sendTeTransportClosed(fd: c.fd_t) !void {
+    try protocol.sendTeTransportClosedFrame(app_allocator.allocator(), fd);
 }
 
 fn finishTerminalTunnel(tunnel: *TerminalTunnel) void {
@@ -1314,9 +1307,7 @@ fn drainTerminalTunnelWake(tunnel: *TerminalTunnel) void {
 }
 
 fn sendPooledMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.MuxStreamFrame) !void {
-    const payload = try protocol.encodePayload(allocator, message);
-    defer allocator.free(payload);
-    try protocol.sendFrame(fd, .mux_stream_frame, payload);
+    try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
 
 fn initiatePooledRemoteDaemonHandshake(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !void {
@@ -1365,7 +1356,7 @@ fn readPooledHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.hp
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(protocol.hpb.HelloRequest, allocator, frame.payload),
-            .ping, .pong => {
+            .daemon_tunnel => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
             },
             else => return error.UnexpectedDaemonFrame,
@@ -1384,7 +1375,7 @@ fn readPooledHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?protocol.hpb
                 return null;
             },
             .hello_error => return try protocol.decodePayload(protocol.hpb.HelloError, allocator, frame.payload),
-            .ping, .pong => {
+            .daemon_tunnel => {
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
             },
             else => return error.UnexpectedDaemonFrame,
@@ -1402,7 +1393,7 @@ fn openTerminalDaemonTransport(
     const fd = try daemon_client.connectOrStart(allocator, exe);
     errdefer _ = c.close(fd);
 
-    var request = pb.ClientTeTransportOpen{
+    var request = pb.TeTransportOpen{
         .host = target.host,
         .bootstrap = common.bootstrap,
         .batch_mode = batch_mode,
@@ -1412,9 +1403,7 @@ fn openTerminalDaemonTransport(
     try request.ssh_option.appendSlice(allocator, target.options);
     try appendCurrentEnvironmentToTransportOpen(allocator, &request);
 
-    const payload = try protocol.encodePayload(allocator, request);
-    defer allocator.free(payload);
-    try protocol.sendFrame(fd, .client_te_transport_open, payload);
+    try protocol.sendTeTransportOpenFrame(allocator, fd, request);
     return .{ .fd = fd };
 }
 
@@ -1455,7 +1444,7 @@ fn sendDaemonSshFailure(
     }
 }
 
-fn appendCurrentEnvironmentToTransportOpen(allocator: std.mem.Allocator, request: *pb.ClientTeTransportOpen) !void {
+fn appendCurrentEnvironmentToTransportOpen(allocator: std.mem.Allocator, request: *pb.TeTransportOpen) !void {
     var index: usize = 0;
     while (c.environ[index]) |entry_z| : (index += 1) {
         const entry = std.mem.span(entry_z);
@@ -1469,7 +1458,7 @@ fn appendCurrentEnvironmentToTransportOpen(allocator: std.mem.Allocator, request
     }
 }
 
-fn deinitTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.ClientTeTransportOpen) void {
+fn deinitTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.TeTransportOpen) void {
     for (request.environment.items) |entry| {
         allocator.free(entry.name);
         allocator.free(entry.value);
@@ -1477,7 +1466,7 @@ fn deinitTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.Cli
     request.environment.deinit(allocator);
 }
 
-fn envMapFromTransportOpen(allocator: std.mem.Allocator, request: pb.ClientTeTransportOpen) !std.process.EnvMap {
+fn envMapFromTransportOpen(allocator: std.mem.Allocator, request: pb.TeTransportOpen) !std.process.EnvMap {
     var env = std.process.EnvMap.init(allocator);
     errdefer env.deinit();
     for (request.environment.items) |entry| {
@@ -1825,13 +1814,10 @@ fn bootstrapStatusBytes(status: BootstrapStatus) []const u8 {
 
 fn sendBootstrapStatus(client_status_fd: c.fd_t, status: BootstrapStatus) !void {
     if (client_status_fd >= 0) {
-        const message = switch (status) {
-            .started => pb.ClientTeTransportStatus{ .status = .{ .bootstrap_started = .{} } },
-            .finished => pb.ClientTeTransportStatus{ .status = .{ .bootstrap_finished = .{} } },
-        };
-        const payload = try protocol.encodePayload(app_allocator.allocator(), message);
-        defer app_allocator.allocator().free(payload);
-        try protocol.sendFrame(client_status_fd, .client_te_transport_status, payload);
+        switch (status) {
+            .started => try protocol.sendTeTransportBootstrapStartedFrame(app_allocator.allocator(), client_status_fd),
+            .finished => try protocol.sendTeTransportBootstrapFinishedFrame(app_allocator.allocator(), client_status_fd),
+        }
     } else {
         try io.writeAll(2, bootstrapStatusBytes(status));
     }
@@ -2203,7 +2189,7 @@ const DaemonStreamClientStarter = struct {
         const fd = try daemon_client.connectOrStart(self.allocator, self.exe);
         errdefer _ = c.close(fd);
 
-        var request = pb.ClientTeTransportOpen{
+        var request = pb.TeTransportOpen{
             .host = self.target.host,
             .bootstrap = self.bootstrap,
             .batch_mode = true,
@@ -2213,9 +2199,7 @@ const DaemonStreamClientStarter = struct {
         try request.ssh_option.appendSlice(self.allocator, self.target.options);
         try appendCurrentEnvironmentToTransportOpen(self.allocator, &request);
 
-        const payload = try protocol.encodePayload(self.allocator, request);
-        defer self.allocator.free(payload);
-        try protocol.sendFrame(fd, .client_te_transport_open, payload);
+        try protocol.sendTeTransportOpenFrame(self.allocator, fd, request);
         return .{ .fd = fd };
     }
 

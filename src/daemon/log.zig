@@ -41,9 +41,11 @@ pub fn infof(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anyty
 }
 
 fn sendEntry(allocator: std.mem.Allocator, entry: pb.DaemonLogEntry) !void {
-    const payload = try protocol.encodePayload(allocator, entry);
-    defer allocator.free(payload);
-    const frame = try protocol.encodeFrame(allocator, .daemon_log_entry, payload);
+    const item_payload = try protocol.encodePayload(allocator, pb.ClientDaemonItem{
+        .payload = .{ .log_entry = entry },
+    });
+    defer allocator.free(item_payload);
+    const frame = try protocol.encodeFrame(allocator, .client_daemon, item_payload);
     defer allocator.free(frame);
 
     mutex.lock();
@@ -81,8 +83,8 @@ test "daemon log writes new events to live subscribers" {
 
     var frame = try protocol.readFrameAlloc(allocator, fds[0]);
     defer frame.deinit(allocator);
-    try std.testing.expectEqual(protocol.MessageType.daemon_log_entry, frame.message_type);
-    var entry = try protocol.decodePayload(pb.DaemonLogEntry, allocator, frame.payload);
+    try std.testing.expectEqual(protocol.MessageType.client_daemon, frame.message_type);
+    var entry = try protocol.decodeClientDaemonLogEntry(allocator, frame.payload);
     defer entry.deinit(allocator);
     try std.testing.expectEqualStrings("test event 1", entry.message);
 }
