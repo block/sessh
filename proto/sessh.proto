@@ -25,10 +25,10 @@ message Frame {
     // Local client <-> local daemon API traffic. These frames are never
     // forwarded to the remote daemon.
     ClientDaemonItem client_daemon = 20;
-    // Logical client <-> remote daemon stream traffic. Local client sockets can
-    // carry these directly; daemon-to-daemon tunnels carry them inside mux
+    // Logical visible-client <-> remote endpoint traffic. Local client sockets
+    // can carry these directly; daemon-to-daemon tunnels carry them inside mux
     // payloads.
-    RemoteStreamItem remote_stream = 21;
+    ClientRemoteItem client_remote = 21;
     // Local daemon <-> remote daemon tunnel traffic.
     DaemonTunnelItem daemon_tunnel = 22;
   }
@@ -101,7 +101,7 @@ message ClientDaemonItem {
   }
 }
 
-message RemoteStreamItem {
+message ClientRemoteItem {
   oneof payload {
     TerminalEmulatorItem terminal_emulator = 1;
     ProxyStreamItem proxy = 2;

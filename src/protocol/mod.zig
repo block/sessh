@@ -12,7 +12,7 @@ pub const MessageType = enum {
     hello_error,
     error_message,
     client_daemon,
-    remote_stream,
+    client_remote,
     daemon_tunnel,
 };
 
@@ -103,14 +103,14 @@ pub fn sendDaemonTunnelPayloadFrame(
     try sendFrame(fd, .daemon_tunnel, encoded);
 }
 
-pub fn sendRemoteStreamPayloadFrame(
+pub fn sendClientRemotePayloadFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    payload: pb.RemoteStreamItem.payload_union,
+    payload: pb.ClientRemoteItem.payload_union,
 ) !void {
-    const encoded = try encodePayload(allocator, pb.RemoteStreamItem{ .payload = payload });
+    const encoded = try encodePayload(allocator, pb.ClientRemoteItem{ .payload = payload });
     defer allocator.free(encoded);
-    try sendFrame(fd, .remote_stream, encoded);
+    try sendFrame(fd, .client_remote, encoded);
 }
 
 pub fn sendMuxStreamFrame(
@@ -126,7 +126,7 @@ pub fn sendTeStreamItemFrame(
     fd: c.fd_t,
     item: pb.TerminalEmulatorItem,
 ) !void {
-    try sendRemoteStreamPayloadFrame(allocator, fd, .{ .terminal_emulator = item });
+    try sendClientRemotePayloadFrame(allocator, fd, .{ .terminal_emulator = item });
 }
 
 pub fn sendTeStreamPayloadFrame(
@@ -142,7 +142,7 @@ pub fn sendProxyStreamPayloadFrame(
     fd: c.fd_t,
     payload: pb.ProxyStreamItem.payload_union,
 ) !void {
-    try sendRemoteStreamPayloadFrame(allocator, fd, .{ .proxy = .{ .payload = payload } });
+    try sendClientRemotePayloadFrame(allocator, fd, .{ .proxy = .{ .payload = payload } });
 }
 
 pub fn sendSshTransportOpenFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.ClientDaemonItem.SshTransportOpen) !void {
@@ -181,8 +181,8 @@ pub fn sendDaemonLogEntryFrame(allocator: std.mem.Allocator, fd: c.fd_t, entry: 
     try sendClientDaemonPayloadFrame(allocator, fd, .{ .log_entry = entry });
 }
 
-pub fn decodeRemoteTeStreamItem(allocator: std.mem.Allocator, payload: []const u8) !pb.TerminalEmulatorItem {
-    var item = try decodePayload(pb.RemoteStreamItem, allocator, payload);
+pub fn decodeClientRemoteTerminalEmulatorItem(allocator: std.mem.Allocator, payload: []const u8) !pb.TerminalEmulatorItem {
+    var item = try decodePayload(pb.ClientRemoteItem, allocator, payload);
     switch (item.payload orelse {
         item.deinit(allocator);
         return error.UnexpectedFrame;
@@ -198,8 +198,8 @@ pub fn decodeRemoteTeStreamItem(allocator: std.mem.Allocator, payload: []const u
     }
 }
 
-pub fn decodeRemoteProxyStreamItem(allocator: std.mem.Allocator, payload: []const u8) !pb.ProxyStreamItem {
-    var item = try decodePayload(pb.RemoteStreamItem, allocator, payload);
+pub fn decodeClientRemoteProxyStreamItem(allocator: std.mem.Allocator, payload: []const u8) !pb.ProxyStreamItem {
+    var item = try decodePayload(pb.ClientRemoteItem, allocator, payload);
     switch (item.payload orelse {
         item.deinit(allocator);
         return error.UnexpectedFrame;
@@ -319,7 +319,7 @@ fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !Owne
     return switch (frame.payload orelse return error.UnknownFrame) {
         .@"error" => |message| ownedFrameFromMessage(allocator, .error_message, message),
         .client_daemon => |message| ownedFrameFromMessage(allocator, .client_daemon, message),
-        .remote_stream => |message| ownedFrameFromMessage(allocator, .remote_stream, message),
+        .client_remote => |message| ownedFrameFromMessage(allocator, .client_remote, message),
         .daemon_tunnel => |message| ownedFrameFromMessage(allocator, .daemon_tunnel, message),
     };
 }
@@ -373,10 +373,10 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_daemon = message } });
         },
-        .remote_stream => blk: {
-            var message = try decodePayload(pb.RemoteStreamItem, allocator, payload);
+        .client_remote => blk: {
+            var message = try decodePayload(pb.ClientRemoteItem, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .remote_stream = message } });
+            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_remote = message } });
         },
         .daemon_tunnel => blk: {
             var message = try decodePayload(pb.DaemonTunnelItem, allocator, payload);
@@ -417,18 +417,18 @@ test "generated protobuf payload round trip" {
 }
 
 test "frame envelope round trip" {
-    const payload = try encodePayload(std.testing.allocator, pb.RemoteStreamItem{
+    const payload = try encodePayload(std.testing.allocator, pb.ClientRemoteItem{
         .payload = .{ .terminal_emulator = .{ .payload = .{ .input_ack = .{ .input_seq = 42 } } } },
     });
     defer std.testing.allocator.free(payload);
-    const frame_bytes = try encodeFrame(std.testing.allocator, .remote_stream, payload);
+    const frame_bytes = try encodeFrame(std.testing.allocator, .client_remote, payload);
     defer std.testing.allocator.free(frame_bytes);
 
     var frame = try decodeEnvelopeAlloc(std.testing.allocator, frame_bytes[frame_header_len..]);
     defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(MessageType.remote_stream, frame.message_type);
+    try std.testing.expectEqual(MessageType.client_remote, frame.message_type);
 
-    var item = try decodeRemoteTeStreamItem(std.testing.allocator, frame.payload);
+    var item = try decodeClientRemoteTerminalEmulatorItem(std.testing.allocator, frame.payload);
     defer item.deinit(std.testing.allocator);
     const item_payload = item.payload orelse return error.MissingTePayload;
     switch (item_payload) {

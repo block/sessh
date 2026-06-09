@@ -772,7 +772,7 @@ def encode_frame_body(message_kind, payload):
         frame = sessh_pb().Frame()
         item = sessh_pb().TerminalEmulatorItem()
         set_submessage(item, _TE_STREAM_ITEM_FIELDS[message_kind], payload)
-        frame.remote_stream.terminal_emulator.CopyFrom(item)
+        frame.client_remote.terminal_emulator.CopyFrom(item)
         return frame.SerializeToString()
     raise AssertionError(f"unknown test message kind: {message_kind}")
 
@@ -799,10 +799,10 @@ def recv_frame(conn):
     field = frame.WhichOneof("payload")
     if field is None:
         raise AssertionError(f"missing frame payload: {body!r}")
-    if field == "remote_stream":
-        if frame.remote_stream.WhichOneof("payload") != "terminal_emulator":
+    if field == "client_remote":
+        if frame.client_remote.WhichOneof("payload") != "terminal_emulator":
             return field, getattr(frame, field).SerializeToString()
-        item = frame.remote_stream.terminal_emulator
+        item = frame.client_remote.terminal_emulator
         item_field = item.WhichOneof("payload")
         if item_field is None:
             raise AssertionError(f"missing terminal stream item payload: {body!r}")

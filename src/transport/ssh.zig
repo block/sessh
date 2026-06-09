@@ -934,12 +934,12 @@ fn openPooledTerminalClientStream(tunnel: *TerminalTunnel, client: *PooledTermin
         client.state = .active;
         return;
     }
-    if (frame.message_type != .remote_stream) {
+    if (frame.message_type != .client_remote) {
         try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal or proxy stream open", "");
         finishPooledTerminalClient(tunnel, client, false);
         return;
     }
-    var item = try protocol.decodeRemoteTeStreamItem(tunnel.allocator, frame.payload);
+    var item = try protocol.decodeClientRemoteTerminalEmulatorItem(tunnel.allocator, frame.payload);
     defer item.deinit(tunnel.allocator);
     const item_payload = item.payload orelse {
         try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal stream open", "");
@@ -977,13 +977,13 @@ fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerm
             }
             try sendPooledProxyMuxFrame(tunnel, client, frame.payload);
         },
-        .remote_stream => {
+        .client_remote => {
             if (client.kind != .te) {
                 try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected terminal stream frame", "");
                 finishPooledTerminalClient(tunnel, client, true);
                 return;
             }
-            var item = try protocol.decodeRemoteTeStreamItem(tunnel.allocator, frame.payload);
+            var item = try protocol.decodeClientRemoteTerminalEmulatorItem(tunnel.allocator, frame.payload);
             defer item.deinit(tunnel.allocator);
             try sendPooledTeMuxPayload(tunnel, client, item);
         },

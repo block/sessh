@@ -99,8 +99,8 @@ fn readCapabilities(allocator: std.mem.Allocator, fd: c.fd_t) !Capabilities {
         defer frame.deinit(allocator);
 
         switch (frame.message_type) {
-            .remote_stream => {
-                var item = try protocol.decodeRemoteProxyStreamItem(allocator, frame.payload);
+            .client_remote => {
+                var item = try protocol.decodeClientRemoteProxyStreamItem(allocator, frame.payload);
                 defer item.deinit(allocator);
                 const item_payload = item.payload orelse return error.UnexpectedProxyControlFrame;
                 const message = switch (item_payload) {
@@ -124,8 +124,8 @@ pub fn readMessage(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
     var frame = try protocol.readFrameAlloc(allocator, fd);
     defer frame.deinit(allocator);
 
-    if (frame.message_type != .remote_stream) return error.UnexpectedProxyControlFrame;
-    var item = try protocol.decodeRemoteProxyStreamItem(allocator, frame.payload);
+    if (frame.message_type != .client_remote) return error.UnexpectedProxyControlFrame;
+    var item = try protocol.decodeClientRemoteProxyStreamItem(allocator, frame.payload);
     defer item.deinit(allocator);
     const item_payload = item.payload orelse return error.UnexpectedProxyControlFrame;
     return switch (item_payload) {

@@ -22,8 +22,8 @@ pub fn serveFrameAfterHandshake(
     write_fd: c.fd_t,
 ) !void {
     switch (frame.message_type) {
-        .remote_stream => {
-            var item = try protocol.decodeRemoteTeStreamItem(allocator, frame.payload);
+        .client_remote => {
+            var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
             defer item.deinit(allocator);
             const item_payload = item.payload orelse return error.UnexpectedFrame;
             const request = switch (item_payload) {
@@ -86,11 +86,11 @@ pub fn serveDebugFrameAfterHandshake(
     frame: protocol.OwnedFrame,
     write_fd: c.fd_t,
 ) !void {
-    if (frame.message_type != .remote_stream) {
+    if (frame.message_type != .client_remote) {
         try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
         return;
     }
-    var item = try protocol.decodeRemoteTeStreamItem(allocator, frame.payload);
+    var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
     defer item.deinit(allocator);
     const item_payload = item.payload orelse {
         try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
@@ -416,8 +416,8 @@ fn forwardTeRuntimeFrameToMux(
         try sendTeMuxReset(allocator, mux_fd, runtime.stream_id, "RUNTIME_ERROR", "terminal runtime error");
         return false;
     }
-    if (frame.message_type != .remote_stream) return error.UnexpectedFrame;
-    var item = try protocol.decodeRemoteTeStreamItem(allocator, frame.payload);
+    if (frame.message_type != .client_remote) return error.UnexpectedFrame;
+    var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
     defer item.deinit(allocator);
     try sendTeMuxPayload(allocator, mux_fd, runtime.stream_id, runtime.outbound_next_offset, item);
     runtime.outbound_next_offset +|= 1;

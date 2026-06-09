@@ -170,8 +170,8 @@ fn copyClientFrameToDaemon(allocator: std.mem.Allocator, read_fd: c.fd_t, write_
     };
     defer frame.deinit(allocator);
 
-    if (frame.message_type == .remote_stream) {
-        var item = try protocol.decodeRemoteTeStreamItem(allocator, frame.payload);
+    if (frame.message_type == .client_remote) {
+        var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
         defer item.deinit(allocator);
         if (item.payload) |item_payload| {
             switch (item_payload) {
@@ -421,8 +421,8 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
         };
         defer frame.deinit(allocator);
         switch (frame.message_type) {
-            .remote_stream => {
-                var item = try protocol.decodeRemoteTeStreamItem(allocator, frame.payload);
+            .client_remote => {
+                var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
                 defer item.deinit(allocator);
                 const item_payload = item.payload orelse {
                     try sendError(fd, "PROTOCOL_ERROR", "empty terminal stream item", "");

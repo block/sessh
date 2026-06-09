@@ -24,18 +24,18 @@ pub const Frame = struct {
     pub const _payload_case = enum {
         @"error",
         client_daemon,
-        remote_stream,
+        client_remote,
         daemon_tunnel,
     };
     pub const payload_union = union(_payload_case) {
         @"error": sessh_handshake_v1.Error,
         client_daemon: ClientDaemonItem,
-        remote_stream: RemoteStreamItem,
+        client_remote: ClientRemoteItem,
         daemon_tunnel: DaemonTunnelItem,
         pub const _desc_table = .{
             .@"error" = fd(10, .submessage),
             .client_daemon = fd(20, .submessage),
-            .remote_stream = fd(21, .submessage),
+            .client_remote = fd(21, .submessage),
             .daemon_tunnel = fd(22, .submessage),
         };
     };
@@ -809,7 +809,7 @@ pub const ClientDaemonItem = struct {
     }
 };
 
-pub const RemoteStreamItem = struct {
+pub const ClientRemoteItem = struct {
     payload: ?payload_union = null,
 
     pub const _payload_case = enum {

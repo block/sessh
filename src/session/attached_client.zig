@@ -934,8 +934,8 @@ test "runtime repaint after local ui requests screen-only repaint" {
 
     var frame = try protocol.readFrameAlloc(app_allocator.allocator(), client_to_remote[0]);
     defer frame.deinit(app_allocator.allocator());
-    try std.testing.expectEqual(protocol.MessageType.remote_stream, frame.message_type);
-    var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
+    try std.testing.expectEqual(protocol.MessageType.client_remote, frame.message_type);
+    var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
     defer item.deinit(app_allocator.allocator());
     const item_payload = item.payload orelse return error.MissingTePayload;
     const resize = switch (item_payload) {
@@ -1048,8 +1048,8 @@ fn finishReconnectRepaintInner(
         var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
-            .remote_stream => {
-                var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
+            .client_remote => {
+                var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
                 defer item.deinit(app_allocator.allocator());
                 const item_payload = item.payload orelse return error.UnexpectedFrame;
                 switch (item_payload) {
@@ -1170,8 +1170,8 @@ pub fn pollRuntimeRecovery(
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        .remote_stream => {
-            var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
+        .client_remote => {
+            var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
             defer item.deinit(app_allocator.allocator());
             const item_payload = item.payload orelse return error.UnexpectedFrame;
             switch (item_payload) {
@@ -1320,8 +1320,8 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                 try printParsedError(parsed);
                 return process_exit.request(1);
             },
-            .remote_stream => {
-                var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
+            .client_remote => {
+                var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
                 defer item.deinit(app_allocator.allocator());
                 const item_payload = item.payload orelse return error.UnexpectedFrame;
                 const attached = switch (item_payload) {
@@ -1391,8 +1391,8 @@ fn readSessionAttachedInner(
                 try printParsedError(parsed);
                 return process_exit.request(1);
             },
-            .remote_stream => {
-                var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
+            .client_remote => {
+                var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
                 defer item.deinit(app_allocator.allocator());
                 const item_payload = item.payload orelse return error.UnexpectedFrame;
                 switch (item_payload) {
@@ -1582,8 +1582,8 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
                 try printErrorPayload(frame.payload);
                 return true;
             },
-            .remote_stream => {
-                var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
+            .client_remote => {
+                var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
                 defer item.deinit(app_allocator.allocator());
                 const item_payload = item.payload orelse return error.UnexpectedFrame;
                 switch (item_payload) {
@@ -1974,8 +1974,8 @@ fn handleEscapeHelpRuntimeFrame(
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        .remote_stream => {
-            var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
+        .client_remote => {
+            var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
             defer item.deinit(app_allocator.allocator());
             const item_payload = item.payload orelse return error.UnexpectedFrame;
             switch (item_payload) {
@@ -2108,8 +2108,8 @@ fn handleAttachedClientRuntimeFrame(
     var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
-        .remote_stream => {
-            var item = try protocol.decodeRemoteTeStreamItem(app_allocator.allocator(), frame.payload);
+        .client_remote => {
+            var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
             defer item.deinit(app_allocator.allocator());
             const item_payload = item.payload orelse return error.UnexpectedFrame;
             switch (item_payload) {
