@@ -1720,9 +1720,9 @@ fn queueAttachedClientFrame(attached_client: *AttachedClient, message_type: prot
     try attached_client.output.appendSlice(app_allocator.allocator(), frame);
 }
 
-fn queueAttachedClientTeFrame(attached_client: *AttachedClient, payload: pb.TeStreamItem.payload_union) !void {
+fn queueAttachedClientTeFrame(attached_client: *AttachedClient, payload: pb.TerminalEmulatorItem.payload_union) !void {
     const encoded = try protocol.encodePayload(app_allocator.allocator(), pb.RemoteStreamItem{
-        .payload = .{ .te = .{ .payload = payload } },
+        .payload = .{ .terminal_emulator = .{ .payload = payload } },
     });
     defer app_allocator.allocator().free(encoded);
     try queueAttachedClientFrame(attached_client, .remote_stream, encoded);
@@ -1785,7 +1785,7 @@ fn sendSessionAttachedForSession(session_runtime: *const SessionRuntime, attache
     } });
 }
 
-fn handleSessionClientDebugSeverConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, request: pb.TeSessionClientDebugSeverConnectionRequest) !void {
+fn handleSessionClientDebugSeverConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, request: pb.TerminalEmulatorItem.SessionClientDebugSeverConnectionRequest) !void {
     _ = request;
     const attached_client = &session_runtime.attached_client;
     if (!attached_client.active or attached_client.close_after_flush) {
@@ -1796,7 +1796,7 @@ fn handleSessionClientDebugSeverConnectionRequest(session_runtime: *SessionRunti
     try sendClientControlResponse(fd);
 }
 
-fn handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, request: pb.TeSessionClientDebugUnresponsiveConnectionRequest) !void {
+fn handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, request: pb.TerminalEmulatorItem.SessionClientDebugUnresponsiveConnectionRequest) !void {
     const seconds = if (request.seconds == 0)
         config.default_debug_unresponsive_seconds
     else
@@ -1820,17 +1820,17 @@ fn sessionDirSlice(session_runtime: *const SessionRuntime) []const u8 {
 }
 
 fn sendSessionEnded(attached_client: *AttachedClient, reason: u8, exit_info: ExitInfo) !void {
-    const exit_status: ?pb.ExitStatus = switch (exit_info.kind) {
-        1 => .{ .kind = .EXIT_STATUS_KIND_EXITED, .status = exit_info.status },
-        2 => .{ .kind = .EXIT_STATUS_KIND_SIGNALLED, .status = exit_info.status },
+    const exit_status: ?pb.TerminalEmulatorItem.SessionEnded.ExitStatus = switch (exit_info.kind) {
+        1 => .{ .kind = .KIND_EXITED, .status = exit_info.status },
+        2 => .{ .kind = .KIND_SIGNALLED, .status = exit_info.status },
         else => null,
     };
     try queueAttachedClientTeFrame(attached_client, .{ .session_ended = .{
         .reason = switch (reason) {
-            1 => .TE_SESSION_END_REASON_KILLED_BY_REQUEST,
-            2 => .TE_SESSION_END_REASON_DAEMON_SHUTDOWN,
-            3 => .TE_SESSION_END_REASON_REAPED,
-            else => .TE_SESSION_END_REASON_PROCESS_EXITED,
+            1 => .REASON_KILLED_BY_REQUEST,
+            2 => .REASON_DAEMON_SHUTDOWN,
+            3 => .REASON_REAPED,
+            else => .REASON_PROCESS_EXITED,
         },
         .exit_status = exit_status,
         .ended_at_unix_ms = if (exit_info.ended_at_unix_ms == 0) null else exit_info.ended_at_unix_ms,
@@ -1839,7 +1839,7 @@ fn sendSessionEnded(attached_client: *AttachedClient, reason: u8, exit_info: Exi
 
 fn queueTtyTranscriptChunk(
     attached_client: *AttachedClient,
-    stream: pb.TeTtyTranscriptStream,
+    stream: pb.TerminalEmulatorItem.TtyTranscriptChunk.Stream,
     bytes: []const u8,
 ) !void {
     if (!attached_client.capture_tty_transcript or bytes.len == 0) return;
@@ -1851,7 +1851,7 @@ fn queueTtyTranscriptChunk(
 
 fn queueTtyTranscriptChunkForSession(
     session_runtime: *SessionRuntime,
-    stream: pb.TeTtyTranscriptStream,
+    stream: pb.TerminalEmulatorItem.TtyTranscriptChunk.Stream,
     bytes: []const u8,
 ) void {
     if (bytes.len == 0) return;
@@ -2381,7 +2381,7 @@ fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
 }
 
 fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
-    var open = try protocol.decodePayload(pb.TeStreamOpen, app_allocator.allocator(), payload);
+    var open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, app_allocator.allocator(), payload);
     defer open.deinit(app_allocator.allocator());
     const message = open.create orelse return error.MissingSessionCreate;
     const resize = open.resize orelse return error.MissingResize;
@@ -2437,7 +2437,7 @@ fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
     };
 }
 
-fn readTtySettings(message: pb.TeSessionCreate.TtySettings) !tty_settings.Settings {
+fn readTtySettings(message: pb.TerminalEmulatorItem.SessionCreate.TtySettings) !tty_settings.Settings {
     var modes = try app_allocator.allocator().alloc(tty_settings.Mode, message.tty_mode.items.len);
     errdefer app_allocator.allocator().free(modes);
     for (message.tty_mode.items, 0..) |mode, i| {
@@ -2494,14 +2494,14 @@ fn isValidEnvironmentName(name: []const u8) bool {
         std.mem.indexOfScalar(u8, name, 0) == null;
 }
 
-fn readDefaultColors(colors: pb.TeSessionCreate.DefaultColors) !vt.DefaultColors {
+fn readDefaultColors(colors: pb.TerminalEmulatorItem.SessionCreate.DefaultColors) !vt.DefaultColors {
     return .{
         .foreground_color = try readDefaultColorValue(colors.foreground_color),
         .background_color = try readDefaultColorValue(colors.background_color),
     };
 }
 
-fn resizePayloadFromMessage(message: pb.TeResize) !ResizePayload {
+fn resizePayloadFromMessage(message: pb.TerminalEmulatorItem.Resize) !ResizePayload {
     if (message.terminal_rows > std.math.maxInt(u16) or
         message.terminal_cols > std.math.maxInt(u16))
     {
@@ -2519,7 +2519,7 @@ fn resizePayloadFromMessage(message: pb.TeResize) !ResizePayload {
     };
 }
 
-fn attachRequestFromOpen(message: pb.TeStreamOpen) !AttachRequest {
+fn attachRequestFromOpen(message: pb.TerminalEmulatorItem.Open) !AttachRequest {
     const resize = message.resize orelse return error.MissingResize;
     if (message.session_guid.len > 0 and !session_registry.isValidSessionGuid(message.session_guid)) return error.InvalidSessionGuid;
     return .{
@@ -2529,7 +2529,7 @@ fn attachRequestFromOpen(message: pb.TeStreamOpen) !AttachRequest {
     };
 }
 
-fn repaintRequestFromMessage(message: pb.TeRepaintRequest) !RepaintRequest {
+fn repaintRequestFromMessage(message: pb.TerminalEmulatorItem.RepaintRequest) !RepaintRequest {
     return .{
         .repaint_request_seq = message.repaint_request_seq,
         .scrollback_cursor = if (message.scrollback_cursor) |cursor|
@@ -2855,7 +2855,7 @@ fn flushSessionRenderBarrier(session_runtime: *SessionRuntime, barrier: vt.Rende
 
 fn feedSessionOutputBytes(session_runtime: *SessionRuntime, bytes: []const u8) !void {
     const session = &session_runtime.session;
-    queueTtyTranscriptChunkForSession(session_runtime, .TE_TTY_TRANSCRIPT_STREAM_INNER_OUT, bytes);
+    queueTtyTranscriptChunkForSession(session_runtime, .STREAM_INNER_OUT, bytes);
     if (session.terminal_model) |model| {
         const starts_at_boundary = model.isPlainTextParserBoundary();
         var barrier_context = RenderBarrierContext{
@@ -2975,7 +2975,7 @@ fn reapPtyHangupSessionIfExited(session_runtime: *SessionRuntime) bool {
     return false;
 }
 
-fn handleInputFrame(session_runtime: *SessionRuntime, input: pb.TeInput) void {
+fn handleInputFrame(session_runtime: *SessionRuntime, input: pb.TerminalEmulatorItem.Input) void {
     const attached_client = &session_runtime.attached_client;
     const session = &session_runtime.session;
     if (input.data.len == 0) return;
@@ -3002,7 +3002,7 @@ fn handleInputFrame(session_runtime: *SessionRuntime, input: pb.TeInput) void {
     };
     if (translated.items.len == 0) return;
 
-    queueTtyTranscriptChunk(attached_client, .TE_TTY_TRANSCRIPT_STREAM_INNER_IN, translated.items) catch {
+    queueTtyTranscriptChunk(attached_client, .STREAM_INNER_IN, translated.items) catch {
         disconnectAttachedClient(session_runtime);
         return;
     };
@@ -3438,7 +3438,7 @@ test "bare escape is not held by kitty keyboard translation" {
     try std.testing.expectEqual(@as(usize, 0), attached_client.input_pending_len);
 }
 
-fn handleResizeFrame(session_runtime: *SessionRuntime, message: pb.TeResize) void {
+fn handleResizeFrame(session_runtime: *SessionRuntime, message: pb.TerminalEmulatorItem.Resize) void {
     const attached_client = &session_runtime.attached_client;
     const session = &session_runtime.session;
     const resize = resizePayloadFromMessage(message) catch {
@@ -3457,7 +3457,7 @@ fn handleResizeFrame(session_runtime: *SessionRuntime, message: pb.TeResize) voi
     }
 }
 
-fn handleRepaintFrame(session_runtime: *SessionRuntime, message: pb.TeRepaintRequest) void {
+fn handleRepaintFrame(session_runtime: *SessionRuntime, message: pb.TerminalEmulatorItem.RepaintRequest) void {
     const request = repaintRequestFromMessage(message) catch {
         disconnectAttachedClient(session_runtime);
         return;

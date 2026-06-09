@@ -130,7 +130,7 @@ def run(env, args, **kwargs):
 
 
 def sever_attached_clients(env, timeout=10.0):
-    request = sessh_pb().TeSessionClientDebugSeverConnectionRequest()
+    request = sessh_pb().TerminalEmulatorItem.SessionClientDebugSeverConnectionRequest()
     runtime_root = Path(env.get("SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR", env["XDG_RUNTIME_DIR"] + ".remote"))
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)

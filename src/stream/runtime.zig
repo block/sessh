@@ -968,7 +968,7 @@ fn handleProxyMuxOpen(
     streams: *std.ArrayList(ProxyMuxRuntime),
     mux_fd: c.fd_t,
     stream_id: u64,
-    open: pb.MuxStreamFrame.Open,
+    open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
 ) !void {
     if (findProxyMuxRuntimeIndex(streams, stream_id) != null) {
         try sendProxyMuxReset(allocator, mux_fd, stream_id, "STREAM_EXISTS", "mux stream already exists");
@@ -1004,7 +1004,7 @@ fn handleProxyMuxOpen(
 fn forwardProxyMuxFrameToRuntime(
     allocator: std.mem.Allocator,
     streams: *std.ArrayList(ProxyMuxRuntime),
-    mux_frame: pb.MuxStreamFrame,
+    mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !void {
     const index = findProxyMuxRuntimeIndex(streams, mux_frame.stream_id) orelse return error.StreamUnexpectedFrame;
     var remapped = mux_frame;
@@ -1059,7 +1059,7 @@ fn sendProxyMuxReset(
     });
 }
 
-fn sendProxyRuntimeMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.MuxStreamFrame) !void {
+fn sendProxyRuntimeMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
     try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
 
@@ -1476,7 +1476,7 @@ fn handleMuxStreamFrame(
     state: *StreamState,
     transport_write_fd: c.fd_t,
     options: *const StreamAttachedClientOptions,
-    frame: pb.MuxStreamFrame,
+    frame: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !void {
     if (frame.stream_id != proxy_mux_stream_id) return error.StreamUnexpectedFrame;
     const message = frame.message orelse return error.StreamUnexpectedFrame;
@@ -1506,7 +1506,7 @@ fn handleMuxStreamFrame(
             const item = payload.item orelse return error.StreamUnexpectedFrame;
             switch (item) {
                 .proxy => |proxy_item| try handleProxyStreamPayload(state, transport_write_fd, options, payload.offset, proxy_item),
-                .te => return error.StreamUnexpectedFrame,
+                .terminal_emulator => return error.StreamUnexpectedFrame,
             }
         },
         .eof => |eof| try handleInboundEof(
@@ -1721,7 +1721,7 @@ fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
 fn sendMuxStreamFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    message: pb.MuxStreamFrame,
+    message: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !void {
     try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
@@ -2544,7 +2544,7 @@ fn encodeMuxAckPayload(allocator: std.mem.Allocator, recv_next_offset: u64) ![]u
     });
 }
 
-fn expectMuxStreamFrame(fd: c.fd_t) !pb.MuxStreamFrame {
+fn expectMuxStreamFrame(fd: c.fd_t) !pb.DaemonTunnelItem.MuxStreamFrame {
     var frame = try protocol.readFrameAlloc(std.testing.allocator, fd);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.daemon_tunnel, frame.message_type);

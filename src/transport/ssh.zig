@@ -542,7 +542,7 @@ fn runRemoteNewSession(
 pub fn serveTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
-    request: pb.SshTransportOpen,
+    request: pb.ClientDaemonItem.SshTransportOpen,
 ) !void {
     var resolved_target = try resolveSshTarget(allocator, request.ssh_option.items, request.host);
     defer resolved_target.deinit(allocator);
@@ -560,7 +560,7 @@ fn startTerminalTransportForDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.SshTransportOpen,
+    request: pb.ClientDaemonItem.SshTransportOpen,
 ) !TerminalTransportStart {
     var artifacts_storage: ?ArtifactSet = if (request.bootstrap) try loadArtifactSet(allocator) else null;
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
@@ -654,7 +654,7 @@ fn servePooledTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.SshTransportOpen,
+    request: pb.ClientDaemonItem.SshTransportOpen,
 ) !void {
     const client = try allocator.create(PooledTerminalClient);
     errdefer allocator.destroy(client);
@@ -747,7 +747,7 @@ fn startNewTerminalTunnel(
     tunnel: *TerminalTunnel,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.SshTransportOpen,
+    request: pb.ClientDaemonItem.SshTransportOpen,
 ) !void {
     var started = try startTerminalTransportForDaemon(allocator, client_fd, target, request);
     errdefer {
@@ -997,14 +997,14 @@ fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerm
 fn sendPooledTeMuxOpen(
     tunnel: *TerminalTunnel,
     client: *PooledTerminalClient,
-    request: pb.TeStreamOpen,
+    request: pb.TerminalEmulatorItem.Open,
 ) !void {
     try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, .{
         .stream_id = client.stream_id,
         .message = .{ .open = .{
             .recv_next_offset = client.inbound_next_offset,
             .receive_window_bytes = 0,
-            .detail = .{ .te = request },
+            .detail = .{ .terminal_emulator = request },
         } },
     });
     client.mux_open_sent_ms = nowUnixMs();
@@ -1049,13 +1049,13 @@ fn sendPooledProxyMuxFrame(
 fn sendPooledTeMuxPayload(
     tunnel: *TerminalTunnel,
     client: *PooledTerminalClient,
-    item: pb.TeStreamItem,
+    item: pb.TerminalEmulatorItem,
 ) !void {
     try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, .{
         .stream_id = client.stream_id,
         .message = .{ .payload = .{
             .offset = client.outbound_next_offset,
-            .item = .{ .te = item },
+            .item = .{ .terminal_emulator = item },
         } },
     });
     client.outbound_next_offset +|= 1;
@@ -1107,7 +1107,7 @@ fn readPooledRemoteMuxFrame(tunnel: *TerminalTunnel) !bool {
             }
             const item = payload.item orelse return error.UnexpectedDaemonFrame;
             const te_item = switch (item) {
-                .te => |te| te,
+                .terminal_emulator => |terminal_emulator| terminal_emulator,
                 else => return error.UnexpectedDaemonFrame,
             };
             client.inbound_next_offset = @max(client.inbound_next_offset, payload.offset +| 1);
@@ -1316,7 +1316,7 @@ fn drainTerminalTunnelWake(tunnel: *TerminalTunnel) void {
     }
 }
 
-fn sendPooledMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.MuxStreamFrame) !void {
+fn sendPooledMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
     try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
 
@@ -1403,7 +1403,7 @@ fn openTerminalDaemonTransport(
     const fd = try daemon_client.connectOrStart(allocator, exe);
     errdefer _ = c.close(fd);
 
-    var request = pb.SshTransportOpen{
+    var request = pb.ClientDaemonItem.SshTransportOpen{
         .host = target.host,
         .bootstrap = common.bootstrap,
         .batch_mode = batch_mode,
@@ -1454,7 +1454,7 @@ fn sendDaemonSshFailure(
     }
 }
 
-fn appendCurrentEnvironmentToSshTransportOpen(allocator: std.mem.Allocator, request: *pb.SshTransportOpen) !void {
+fn appendCurrentEnvironmentToSshTransportOpen(allocator: std.mem.Allocator, request: *pb.ClientDaemonItem.SshTransportOpen) !void {
     var index: usize = 0;
     while (c.environ[index]) |entry_z| : (index += 1) {
         const entry = std.mem.span(entry_z);
@@ -1468,7 +1468,7 @@ fn appendCurrentEnvironmentToSshTransportOpen(allocator: std.mem.Allocator, requ
     }
 }
 
-fn deinitSshTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.SshTransportOpen) void {
+fn deinitSshTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.ClientDaemonItem.SshTransportOpen) void {
     for (request.environment.items) |entry| {
         allocator.free(entry.name);
         allocator.free(entry.value);
@@ -1476,7 +1476,7 @@ fn deinitSshTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.
     request.environment.deinit(allocator);
 }
 
-fn envMapFromSshTransportOpen(allocator: std.mem.Allocator, request: pb.SshTransportOpen) !std.process.EnvMap {
+fn envMapFromSshTransportOpen(allocator: std.mem.Allocator, request: pb.ClientDaemonItem.SshTransportOpen) !std.process.EnvMap {
     var env = std.process.EnvMap.init(allocator);
     errdefer env.deinit();
     for (request.environment.items) |entry| {
@@ -2199,7 +2199,7 @@ const DaemonStreamClientStarter = struct {
         const fd = try daemon_client.connectOrStart(self.allocator, self.exe);
         errdefer _ = c.close(fd);
 
-        var request = pb.SshTransportOpen{
+        var request = pb.ClientDaemonItem.SshTransportOpen{
             .host = self.target.host,
             .bootstrap = self.bootstrap,
             .batch_mode = true,

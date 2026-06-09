@@ -594,7 +594,7 @@ def process_diagnostics(result):
 
 
 def sever_session_clients(env, timeout=30.0):
-    request = sessh_pb().TeSessionClientDebugSeverConnectionRequest()
+    request = sessh_pb().TerminalEmulatorItem.SessionClientDebugSeverConnectionRequest()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
         conn.connect(str(daemon_socket_path(fake_remote_runtime_root(env))))
@@ -604,7 +604,7 @@ def sever_session_clients(env, timeout=30.0):
 
 
 def make_session_clients_unresponsive(env, seconds, timeout=30.0):
-    request = sessh_pb().TeSessionClientDebugUnresponsiveConnectionRequest(seconds=seconds)
+    request = sessh_pb().TerminalEmulatorItem.SessionClientDebugUnresponsiveConnectionRequest(seconds=seconds)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
         conn.connect(str(daemon_socket_path(fake_remote_runtime_root(env))))
@@ -1573,7 +1573,7 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
     env["SESSH_FAKE_SSH_G_PORT"] = "2222"
 
     def send_ssh_transport_open(conn):
-        request = sessh_pb().SshTransportOpen(host="test-host", bootstrap=True, batch_mode=False)
+        request = sessh_pb().ClientDaemonItem.SshTransportOpen(host="test-host", bootstrap=True, batch_mode=False)
         for name, value in env.items():
             entry = request.environment.add()
             entry.name = str(name)
@@ -1694,7 +1694,7 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
     server_thread.start()
 
     def send_ssh_transport_open(conn):
-        request = sessh_pb().SshTransportOpen(host="test-host", bootstrap=True, batch_mode=True)
+        request = sessh_pb().ClientDaemonItem.SshTransportOpen(host="test-host", bootstrap=True, batch_mode=True)
         for name, value in env.items():
             entry = request.environment.add()
             entry.name = str(name)
@@ -1718,14 +1718,14 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
                 message_type, payload = recv_frame(conn)
                 if message_type != "mux_stream_frame":
                     continue
-                mux = sessh_pb().MuxStreamFrame()
+                mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame()
                 mux.ParseFromString(payload)
                 return mux
         finally:
             conn.settimeout(old_timeout)
 
     def send_proxy_open(conn, session_index):
-        mux = sessh_pb().MuxStreamFrame(stream_id=1)
+        mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=1)
         mux.open.recv_next_offset = 0
         mux.open.receive_window_bytes = 65536
         mux.open.proxy.proxy_guid = f"p-{session_index:08x}-0000-4000-8000-{session_index:012x}"
@@ -1734,7 +1734,7 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
         send_mux_frame(conn, mux)
 
     def send_proxy_data(conn, data):
-        mux = sessh_pb().MuxStreamFrame(stream_id=1)
+        mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=1)
         mux.payload.offset = 0
         mux.payload.proxy.data = data
         send_mux_frame(conn, mux)

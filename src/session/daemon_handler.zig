@@ -127,7 +127,7 @@ pub fn isTeMuxOpenFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame
     const message = mux_frame.message orelse return false;
     return switch (message) {
         .open => |open| switch (open.detail orelse return false) {
-            .te => true,
+            .terminal_emulator => true,
             else => false,
         },
         else => false,
@@ -256,11 +256,11 @@ fn handleTeMuxOpen(
     sessions: *std.ArrayList(TeMuxRuntime),
     mux_fd: c.fd_t,
     stream_id: u64,
-    open: pb.MuxStreamFrame.Open,
+    open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
 ) !void {
     const detail = open.detail orelse return error.UnexpectedFrame;
     const te_open = switch (detail) {
-        .te => |te| te,
+        .terminal_emulator => |terminal_emulator| terminal_emulator,
         else => return error.UnexpectedFrame,
     };
     const action = teStreamActionName(te_open);
@@ -331,7 +331,7 @@ fn openTeMuxRuntime(
     allocator: std.mem.Allocator,
     exe: []const u8,
     stream_id: u64,
-    request: pb.TeStreamOpen,
+    request: pb.TerminalEmulatorItem.Open,
     action: []const u8,
     open_payload: []const u8,
     open_started_ms: i64,
@@ -361,7 +361,7 @@ fn openTeMuxRuntime(
         .{ stream_id, request.session_guid, action, elapsedMsSince(handshake_started_ms), elapsedMsSince(open_started_ms) },
     );
     const send_started_ms = std.time.milliTimestamp();
-    var runtime_open = try protocol.decodePayload(pb.TeStreamOpen, allocator, runtime_payload);
+    var runtime_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, runtime_payload);
     defer runtime_open.deinit(allocator);
     try protocol.sendTeStreamPayloadFrame(allocator, runtime_fd, .{ .open = runtime_open });
     daemon_log.infof(
@@ -377,7 +377,7 @@ fn handleTeMuxPayload(
     sessions: *std.ArrayList(TeMuxRuntime),
     mux_fd: c.fd_t,
     stream_id: u64,
-    payload: pb.MuxStreamFrame.Payload,
+    payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload,
 ) !void {
     const index = findTeMuxRuntimeIndex(sessions, stream_id) orelse {
         try sendTeMuxReset(allocator, mux_fd, stream_id, "STREAM_NOT_FOUND", "mux stream not found");
@@ -385,7 +385,7 @@ fn handleTeMuxPayload(
     };
     const item = payload.item orelse return error.UnexpectedFrame;
     const te_item = switch (item) {
-        .te => |te| te,
+        .terminal_emulator => |terminal_emulator| terminal_emulator,
         else => return error.UnexpectedFrame,
     };
     var runtime = &sessions.items[index];
@@ -476,13 +476,13 @@ fn sendTeMuxPayload(
     fd: c.fd_t,
     stream_id: u64,
     offset: u64,
-    item: pb.TeStreamItem,
+    item: pb.TerminalEmulatorItem,
 ) !void {
     try sendTeMuxFrame(allocator, fd, .{
         .stream_id = stream_id,
         .message = .{ .payload = .{
             .offset = offset,
-            .item = .{ .te = item },
+            .item = .{ .terminal_emulator = item },
         } },
     });
 }
@@ -522,7 +522,7 @@ fn sendTeMuxResetForError(
     try sendTeMuxReset(allocator, fd, stream_id, code, message);
 }
 
-fn sendTeMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.MuxStreamFrame) !void {
+fn sendTeMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
     try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
 
@@ -530,14 +530,14 @@ fn sendTeHangupToRuntime(fd: c.fd_t) !void {
     try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fd, .{ .session_hangup_request = .{} });
 }
 
-fn connectRuntimeForOpen(allocator: std.mem.Allocator, request: pb.TeStreamOpen) !c.fd_t {
+fn connectRuntimeForOpen(allocator: std.mem.Allocator, request: pb.TerminalEmulatorItem.Open) !c.fd_t {
     if (!session_registry.isValidSessionGuid(request.session_guid)) return error.InvalidSessionGuid;
     return session_runtime.connectSessionRuntime(allocator, request.session_guid);
 }
 
 fn startSessionRuntimeAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_open_payload: []const u8) !c.fd_t {
     const started_ms = std.time.milliTimestamp();
-    var request = try protocol.decodePayload(pb.TeStreamOpen, allocator, session_open_payload);
+    var request = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, session_open_payload);
     defer request.deinit(allocator);
     if (request.create == null) return error.MissingSessionCreate;
     var allocation = if (request.session_guid.len > 0)
@@ -558,7 +558,7 @@ fn startSessionRuntimeAndConnect(allocator: std.mem.Allocator, exe: []const u8, 
     return runtime_fd;
 }
 
-fn teStreamActionName(request: pb.TeStreamOpen) []const u8 {
+fn teStreamActionName(request: pb.TerminalEmulatorItem.Open) []const u8 {
     return if (request.create == null) "resume" else "create";
 }
 
@@ -569,7 +569,7 @@ fn elapsedMsSince(start_ms: i64) u64 {
 }
 
 pub fn sessionOpenPayloadWithCurrentEnvironment(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
-    var request = try protocol.decodePayload(pb.TeStreamOpen, allocator, payload);
+    var request = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, payload);
     defer request.deinit(allocator);
     if (request.create) |*create| {
         try appendCurrentEnvironment(allocator, create);
@@ -581,7 +581,7 @@ pub fn sessionOpenPayloadWithCurrentEnvironment(allocator: std.mem.Allocator, pa
 
 pub const sessionCreatePayloadWithCurrentEnvironment = sessionOpenPayloadWithCurrentEnvironment;
 
-fn appendCurrentEnvironment(allocator: std.mem.Allocator, request: *pb.TeSessionCreate) !void {
+fn appendCurrentEnvironment(allocator: std.mem.Allocator, request: *pb.TerminalEmulatorItem.SessionCreate) !void {
     var index: usize = 0;
     while (c.environ[index]) |entry_z| : (index += 1) {
         const entry = std.mem.span(entry_z);
@@ -593,7 +593,7 @@ fn appendCurrentEnvironment(allocator: std.mem.Allocator, request: *pb.TeSession
 
 fn appendEnvironmentEntry(
     allocator: std.mem.Allocator,
-    request: *pb.TeSessionCreate,
+    request: *pb.TerminalEmulatorItem.SessionCreate,
     name_bytes: []const u8,
     value_bytes: []const u8,
 ) !void {
@@ -621,7 +621,7 @@ fn openRuntimeAndForwardFrames(
         },
         else => return err,
     };
-    var session_open = try protocol.decodePayload(pb.TeStreamOpen, allocator, session_open_payload);
+    var session_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, session_open_payload);
     defer session_open.deinit(allocator);
     try protocol.sendTeStreamPayloadFrame(allocator, runtime_fd, .{ .open = session_open });
     try frame_forwarder.forwardFrames(read_fd, write_fd, runtime_fd);

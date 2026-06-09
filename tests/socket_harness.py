@@ -447,7 +447,7 @@ def sessh_hpb():
 
 
 def pack_input(value, input_seq=0):
-    return sessh_pb().TeInput(data=value, input_seq=input_seq).SerializeToString()
+    return sessh_pb().TerminalEmulatorItem.Input(data=value, input_seq=input_seq).SerializeToString()
 
 
 def pack_bytes(value):
@@ -467,7 +467,7 @@ def pack_session_create(
 ):
     global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
-    message = pb.TeStreamOpen()
+    message = pb.TerminalEmulatorItem.Open()
     create = message.create
     create.scrollback_row_limit = scrollback
     if session_id is None:
@@ -505,7 +505,7 @@ def pack_session_create(
 def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_guid="", session_dir_path=""):
     global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
-    message = pb.TeStreamOpen()
+    message = pb.TerminalEmulatorItem.Open()
     message.session_guid = session_guid
     _ = session_dir_path
     rows, cols = _LAST_RESIZE
@@ -528,7 +528,7 @@ def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_
 def send_resize(conn, rows=24, cols=80, repaint=None, viewport_offset=None):
     global _LAST_RESIZE
     _LAST_RESIZE = (rows, cols)
-    message = sessh_pb().TeResize(terminal_rows=rows, terminal_cols=cols)
+    message = sessh_pb().TerminalEmulatorItem.Resize(terminal_rows=rows, terminal_cols=cols)
     if viewport_offset is not None:
         message.viewport_offset = viewport_offset
     if repaint is not None:
@@ -545,7 +545,7 @@ def send_resize(conn, rows=24, cols=80, repaint=None, viewport_offset=None):
 def send_resize_screen_repaint(conn, rows, cols, repaint_request_seq, viewport_offset=None):
     global _LAST_RESIZE
     _LAST_RESIZE = (rows, cols)
-    message = sessh_pb().TeResize(terminal_rows=rows, terminal_cols=cols)
+    message = sessh_pb().TerminalEmulatorItem.Resize(terminal_rows=rows, terminal_cols=cols)
     if viewport_offset is not None:
         message.viewport_offset = viewport_offset
     message.repaint_request.repaint_request_seq = repaint_request_seq
@@ -553,26 +553,26 @@ def send_resize_screen_repaint(conn, rows, cols, repaint_request_seq, viewport_o
 
 
 def pack_repaint(repaint_request_seq, scrollback_cursor=None, scrollback_epoch=0):
-    message = sessh_pb().TeRepaintRequest(repaint_request_seq=repaint_request_seq)
+    message = sessh_pb().TerminalEmulatorItem.RepaintRequest(repaint_request_seq=repaint_request_seq)
     if scrollback_cursor is not None:
         message.scrollback_cursor = encode_request_scrollback_cursor(scrollback_epoch, scrollback_cursor)
     return message.SerializeToString()
 
 
 def parse_input_ack(payload):
-    message = sessh_pb().TeInputAck()
+    message = sessh_pb().TerminalEmulatorItem.InputAck()
     message.ParseFromString(payload)
     return message.input_seq
 
 
 def parse_session_ended(payload):
-    message = sessh_pb().TeSessionEnded()
+    message = sessh_pb().TerminalEmulatorItem.SessionEnded()
     message.ParseFromString(payload)
     return message
 
 
 def assert_session_attached(payload):
-    message = sessh_pb().TeSessionAttached()
+    message = sessh_pb().TerminalEmulatorItem.SessionAttached()
     message.ParseFromString(payload)
     return message
 
@@ -607,7 +607,7 @@ def create_and_attach_session(
 
 
 def parse_draw(payload):
-    message = sessh_pb().TeDraw()
+    message = sessh_pb().TerminalEmulatorItem.Draw()
     message.ParseFromString(payload)
     if not message.scrollback_cursor:
         raise AssertionError(f"missing scrollback cursor: {payload!r}")
@@ -623,7 +623,7 @@ def parse_draw(payload):
 
 
 def parse_repaint_response(payload):
-    message = sessh_pb().TeRepaintResponse()
+    message = sessh_pb().TerminalEmulatorItem.RepaintResponse()
     message.ParseFromString(payload)
     if not message.HasField("draw"):
         raise AssertionError(f"missing repaint response draw: {payload!r}")
@@ -697,7 +697,7 @@ def recv_mux_frame(conn, timeout=5.0):
             message_kind, payload = recv_frame(conn)
             if message_kind != MUX_STREAM_FRAME:
                 continue
-            mux = sessh_pb().MuxStreamFrame()
+            mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame()
             mux.ParseFromString(payload)
             return mux
     finally:
@@ -705,12 +705,12 @@ def recv_mux_frame(conn, timeout=5.0):
 
 
 def send_mux_te_open(conn, shell, stream_id=1, session_id=None):
-    te_open = sessh_pb().TeStreamOpen()
+    te_open = sessh_pb().TerminalEmulatorItem.Open()
     te_open.ParseFromString(pack_session_create(shell, session_id=session_id))
-    mux = sessh_pb().MuxStreamFrame(stream_id=stream_id)
+    mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=stream_id)
     mux.open.recv_next_offset = 0
     mux.open.receive_window_bytes = 0
-    mux.open.te.CopyFrom(te_open)
+    mux.open.terminal_emulator.CopyFrom(te_open)
     send_frame(conn, MUX_STREAM_FRAME, mux.SerializeToString())
 
 
@@ -720,15 +720,15 @@ def recv_mux_te_payload_frame(conn, expected_payload, timeout=5.0):
         mux = recv_mux_frame(conn, timeout=max(0.1, end - time.monotonic()))
         if mux.WhichOneof("message") != "payload":
             continue
-        if mux.payload.WhichOneof("item") != "te":
+        if mux.payload.WhichOneof("item") != "terminal_emulator":
             continue
-        if mux.payload.te.WhichOneof("payload") == expected_payload:
+        if mux.payload.terminal_emulator.WhichOneof("payload") == expected_payload:
             return mux
     raise AssertionError(f"did not receive mux terminal payload {expected_payload}")
 
 
 def recv_mux_te_payload(conn, expected_payload, timeout=5.0):
-    return recv_mux_te_payload_frame(conn, expected_payload, timeout=timeout).payload.te
+    return recv_mux_te_payload_frame(conn, expected_payload, timeout=timeout).payload.terminal_emulator
 
 
 def recv_mux_eof(conn, stream_id=1, expected_final_offset=None, timeout=5.0):
@@ -770,9 +770,9 @@ def encode_frame_body(message_kind, payload):
         return frame.SerializeToString()
     if message_kind in _TE_STREAM_ITEM_FIELDS:
         frame = sessh_pb().Frame()
-        item = sessh_pb().TeStreamItem()
+        item = sessh_pb().TerminalEmulatorItem()
         set_submessage(item, _TE_STREAM_ITEM_FIELDS[message_kind], payload)
-        frame.remote_stream.te.CopyFrom(item)
+        frame.remote_stream.terminal_emulator.CopyFrom(item)
         return frame.SerializeToString()
     raise AssertionError(f"unknown test message kind: {message_kind}")
 
@@ -800,9 +800,9 @@ def recv_frame(conn):
     if field is None:
         raise AssertionError(f"missing frame payload: {body!r}")
     if field == "remote_stream":
-        if frame.remote_stream.WhichOneof("payload") != "te":
+        if frame.remote_stream.WhichOneof("payload") != "terminal_emulator":
             return field, getattr(frame, field).SerializeToString()
-        item = frame.remote_stream.te
+        item = frame.remote_stream.terminal_emulator
         item_field = item.WhichOneof("payload")
         if item_field is None:
             raise AssertionError(f"missing terminal stream item payload: {body!r}")
@@ -1195,11 +1195,11 @@ def run_daemon_ping_test(env):
             sock.settimeout(5.0)
             sock.connect(str(daemon_socket_path))
             send_hello(sock)
-            send_frame(sock, PING, sessh_pb().Ping().SerializeToString())
+            send_frame(sock, PING, sessh_pb().DaemonTunnelItem.Ping().SerializeToString())
             message_type, payload = recv_frame(sock)
             if message_type != PONG:
                 raise AssertionError(f"expected PONG from sesshd, got {message_type}")
-            pong = sessh_pb().Pong()
+            pong = sessh_pb().DaemonTunnelItem.Pong()
             pong.ParseFromString(payload)
 
         try:
@@ -1246,7 +1246,7 @@ def run_daemon_concurrent_start_test(_base_env):
                 sock.settimeout(5.0)
                 sock.connect(str(daemon_socket_path))
                 send_hello(sock)
-                send_frame(sock, PING, sessh_pb().Ping().SerializeToString())
+                send_frame(sock, PING, sessh_pb().DaemonTunnelItem.Ping().SerializeToString())
                 message_type, _payload = recv_frame(sock)
                 if message_type != PONG:
                     raise AssertionError(f"expected PONG from sesshd, got {message_type}")
@@ -1296,7 +1296,7 @@ def run_daemon_log_test(_base_env):
                 sock.settimeout(5.0)
                 sock.connect(str(socket_path(env)))
                 send_hello(sock)
-                send_frame(sock, PING, sessh_pb().Ping().SerializeToString())
+                send_frame(sock, PING, sessh_pb().DaemonTunnelItem.Ping().SerializeToString())
                 message_type, _payload = recv_frame(sock)
                 if message_type != PONG:
                     raise AssertionError(f"expected PONG from sesshd, got {message_type}")
@@ -1720,11 +1720,14 @@ def run_session_ended_payload_protocol_test(base_env):
 
             ended = parse_session_ended(recv_until_message(conn, SESSION_ENDED))
             pb = sessh_pb()
-            if ended.reason != pb.TE_SESSION_END_REASON_PROCESS_EXITED:
+            if ended.reason != pb.TerminalEmulatorItem.SessionEnded.REASON_PROCESS_EXITED:
                 raise AssertionError(f"unexpected process-exit reason: {ended!r}")
             if not ended.HasField("exit_status"):
                 raise AssertionError(f"missing process exit status: {ended!r}")
-            if ended.exit_status.kind != pb.EXIT_STATUS_KIND_EXITED or ended.exit_status.status != 7:
+            if (
+                ended.exit_status.kind != pb.TerminalEmulatorItem.SessionEnded.ExitStatus.KIND_EXITED
+                or ended.exit_status.status != 7
+            ):
                 raise AssertionError(f"unexpected process exit status: {ended!r}")
             if not ended.HasField("ended_at_unix_ms"):
                 raise AssertionError(f"missing end timestamp: {ended!r}")

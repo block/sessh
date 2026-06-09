@@ -426,7 +426,7 @@ pub const RuntimeSession = struct {
         tty_transcript.setSessionGuid(guid);
     }
 
-    fn recordSessionEnded(self: *RuntimeSession, ended: pb.TeSessionEnded) void {
+    fn recordSessionEnded(self: *RuntimeSession, ended: pb.TerminalEmulatorItem.SessionEnded) void {
         self.ended_process_exit_code = processExitCodeFromSessionEnded(ended);
     }
 
@@ -435,11 +435,11 @@ pub const RuntimeSession = struct {
     }
 };
 
-fn processExitCodeFromSessionEnded(ended: pb.TeSessionEnded) u8 {
+fn processExitCodeFromSessionEnded(ended: pb.TerminalEmulatorItem.SessionEnded) u8 {
     const status = ended.exit_status orelse return 0;
     return switch (status.kind) {
-        .EXIT_STATUS_KIND_EXITED => if (status.status >= 0 and status.status <= 255) @intCast(status.status) else 255,
-        .EXIT_STATUS_KIND_SIGNALLED => if (status.status >= 0 and status.status <= 127) @intCast(128 + status.status) else 255,
+        .KIND_EXITED => if (status.status >= 0 and status.status <= 255) @intCast(status.status) else 255,
+        .KIND_SIGNALLED => if (status.status >= 0 and status.status <= 127) @intCast(128 + status.status) else 255,
         else => 0,
     };
 }
@@ -616,7 +616,7 @@ test "attached client drains pending session end before monitor timeout" {
     } });
 
     try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), remote_to_client[1], .{ .session_ended = .{
-        .reason = .TE_SESSION_END_REASON_PROCESS_EXITED,
+        .reason = .REASON_PROCESS_EXITED,
     } });
 
     var presentation_guard = client_renderer.PresentationGuard.init(1);
@@ -841,7 +841,7 @@ test "recovery polling waits for resize repaint after input ack" {
 }
 
 test "repaint response applies only latest outstanding request" {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TeRepaintResponse{
+    const payload = try protocol.encodePayload(app_allocator.allocator(), pb.TerminalEmulatorItem.RepaintResponse{
         .repaint_request_seq = 7,
         .draw = .{
             .scrollback_cursor = "cursor-v7",
@@ -1445,12 +1445,12 @@ fn sendSessionCreate(
 ) !u64 {
     if (command_argv.len > 0 and shell_command != null) return error.InvalidSessionCommand;
     const repaint_request_seq = allocateRepaintRequestSeq();
-    var create = pb.TeSessionCreate{
+    var create = pb.TerminalEmulatorItem.SessionCreate{
         .scrollback_row_limit = scrollback_row_count,
         .reap_ms = reap_ms,
     };
     defer create.environment.deinit(app_allocator.allocator());
-    var protocol_tty_settings = pb.TeSessionCreate.TtySettings{};
+    var protocol_tty_settings = pb.TerminalEmulatorItem.SessionCreate.TtySettings{};
     defer protocol_tty_settings.tty_mode.deinit(app_allocator.allocator());
     if (local_terminal.tty_settings) |settings| {
         for (settings.modes) |mode| {
@@ -1461,7 +1461,7 @@ fn sendSessionCreate(
         }
         create.tty_settings = protocol_tty_settings;
     }
-    var exec_command = pb.TeSessionCreate.ExecCommand{};
+    var exec_command = pb.TerminalEmulatorItem.SessionCreate.ExecCommand{};
     defer exec_command.argv.deinit(app_allocator.allocator());
     if (shell_command) |command| {
         create.command = .{ .shell_command = .{ .command = command } };
@@ -1473,7 +1473,7 @@ fn sendSessionCreate(
         .foreground_color = local_terminal.default_colors.foreground_color,
         .background_color = local_terminal.default_colors.background_color,
     };
-    const message = pb.TeStreamOpen{
+    const message = pb.TerminalEmulatorItem.Open{
         .session_guid = session_guid,
         .resize = .{
             .terminal_rows = local_terminal.size.rows,
@@ -1549,7 +1549,7 @@ fn sendSessionAttach(
     session_guid: []const u8,
 ) !u64 {
     const repaint_request_seq = allocateRepaintRequestSeq();
-    const message = pb.TeStreamOpen{
+    const message = pb.TerminalEmulatorItem.Open{
         .session_guid = session_guid,
         .resize = .{
             .terminal_rows = size.rows,
@@ -2235,7 +2235,7 @@ fn handleRepaintResponseFrame(
     pending_repaint: *PendingRepaint,
     app_title_present: ?*?bool,
 ) !bool {
-    var response = try protocol.decodePayload(pb.TeRepaintResponse, app_allocator.allocator(), payload);
+    var response = try protocol.decodePayload(pb.TerminalEmulatorItem.RepaintResponse, app_allocator.allocator(), payload);
     defer response.deinit(app_allocator.allocator());
     return handleRepaintResponseMessageWithInitialAlignment(
         response,
@@ -2250,7 +2250,7 @@ fn handleRepaintResponseFrame(
 }
 
 fn handleRepaintResponseMessageWithInitialAlignment(
-    response: pb.TeRepaintResponse,
+    response: pb.TerminalEmulatorItem.RepaintResponse,
     attached_client_end_restore: ?*std.ArrayList(u8),
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
@@ -2274,11 +2274,11 @@ fn handleRepaintResponseMessageWithInitialAlignment(
     return true;
 }
 
-fn handleTtyTranscriptChunkMessage(chunk: pb.TeTtyTranscriptChunk) void {
+fn handleTtyTranscriptChunkMessage(chunk: pb.TerminalEmulatorItem.TtyTranscriptChunk) void {
     switch (chunk.stream) {
-        .TE_TTY_TRANSCRIPT_STREAM_INNER_IN => tty_transcript.recordInnerIn(chunk.data),
-        .TE_TTY_TRANSCRIPT_STREAM_INNER_OUT => tty_transcript.recordInnerOut(chunk.data),
-        .TE_TTY_TRANSCRIPT_STREAM_UNSPECIFIED => {},
+        .STREAM_INNER_IN => tty_transcript.recordInnerIn(chunk.data),
+        .STREAM_INNER_OUT => tty_transcript.recordInnerOut(chunk.data),
+        .STREAM_UNSPECIFIED => {},
         _ => {},
     }
 }
@@ -2300,8 +2300,8 @@ fn handleClientDaemonFrame(payload: []const u8) !ClientDaemonFrameAction {
     };
 }
 
-fn handleSshTransportEvent(event: pb.SshTransportEvent) !ClientDaemonFrameAction {
-    const payload = event.payload orelse return .unexpected;
+fn handleSshTransportEvent(event: pb.ClientDaemonItem.SshTransportEvent) !ClientDaemonFrameAction {
+    const payload = event.event orelse return .unexpected;
     switch (payload) {
         .stderr_chunk => |diagnostic| client_log.appendSshStderr(diagnostic.chunk),
         .bootstrap_started => try io_helpers.writeAll(2, "\rsessh: bootstrapping..."),
@@ -2316,7 +2316,7 @@ const InputAckResult = struct {
     still_pending: bool,
 };
 
-fn handleInputAckMessage(ack: pb.TeInputAck, input_ack_tracker: *InputAckTracker) InputAckResult {
+fn handleInputAckMessage(ack: pb.TerminalEmulatorItem.InputAck, input_ack_tracker: *InputAckTracker) InputAckResult {
     return .{
         .progressed = input_ack_tracker.acknowledge(ack.input_seq),
         .still_pending = input_ack_tracker.pending(),
@@ -2366,7 +2366,7 @@ fn handleDrawPayloadWithInitialAlignment(
 }
 
 fn handleDrawMessageWithInitialAlignment(
-    message: pb.TeDraw,
+    message: pb.TerminalEmulatorItem.Draw,
     attached_client_end_restore: ?*std.ArrayList(u8),
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
@@ -2403,7 +2403,7 @@ fn restoreInitialCursorAndClearBelow(
     renderer.clearBelowCursor() catch {};
 }
 
-fn drawPayloadFromMessage(message: pb.TeDraw) !DrawPayload {
+fn drawPayloadFromMessage(message: pb.TerminalEmulatorItem.Draw) !DrawPayload {
     if (message.viewport_offset) |offset| {
         if (offset < -1) return error.InvalidViewportOffset;
         if (offset > std.math.maxInt(u16)) return error.IntOutOfRange;

@@ -40,7 +40,7 @@ pub fn infof(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anyty
     }) catch return;
 }
 
-fn sendEntry(allocator: std.mem.Allocator, entry: pb.DaemonLogEntry) !void {
+fn sendEntry(allocator: std.mem.Allocator, entry: pb.ClientDaemonItem.DaemonLogEntry) !void {
     const item_payload = try protocol.encodePayload(allocator, pb.ClientDaemonItem{
         .payload = .{ .log_entry = entry },
     });

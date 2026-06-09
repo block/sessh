@@ -116,7 +116,7 @@ pub fn sendRemoteStreamPayloadFrame(
 pub fn sendMuxStreamFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    message: pb.MuxStreamFrame,
+    message: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !void {
     try sendDaemonTunnelPayloadFrame(allocator, fd, .{ .mux_stream = message });
 }
@@ -124,15 +124,15 @@ pub fn sendMuxStreamFrame(
 pub fn sendTeStreamItemFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    item: pb.TeStreamItem,
+    item: pb.TerminalEmulatorItem,
 ) !void {
-    try sendRemoteStreamPayloadFrame(allocator, fd, .{ .te = item });
+    try sendRemoteStreamPayloadFrame(allocator, fd, .{ .terminal_emulator = item });
 }
 
 pub fn sendTeStreamPayloadFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    payload: pb.TeStreamItem.payload_union,
+    payload: pb.TerminalEmulatorItem.payload_union,
 ) !void {
     try sendTeStreamItemFrame(allocator, fd, .{ .payload = payload });
 }
@@ -145,16 +145,16 @@ pub fn sendProxyStreamPayloadFrame(
     try sendRemoteStreamPayloadFrame(allocator, fd, .{ .proxy = .{ .payload = payload } });
 }
 
-pub fn sendSshTransportOpenFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.SshTransportOpen) !void {
+pub fn sendSshTransportOpenFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.ClientDaemonItem.SshTransportOpen) !void {
     try sendClientDaemonPayloadFrame(allocator, fd, .{ .ssh_transport_open = request });
 }
 
 pub fn sendSshTransportEventFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    payload: pb.SshTransportEvent.payload_union,
+    payload: pb.ClientDaemonItem.SshTransportEvent.event_union,
 ) !void {
-    try sendClientDaemonPayloadFrame(allocator, fd, .{ .ssh_transport_event = .{ .payload = payload } });
+    try sendClientDaemonPayloadFrame(allocator, fd, .{ .ssh_transport_event = .{ .event = payload } });
 }
 
 pub fn sendSshTransportStderrFrame(allocator: std.mem.Allocator, fd: c.fd_t, chunk: []const u8) !void {
@@ -173,23 +173,23 @@ pub fn sendSshTransportBootstrapFinishedFrame(allocator: std.mem.Allocator, fd: 
     try sendSshTransportEventFrame(allocator, fd, .{ .bootstrap_finished = .{} });
 }
 
-pub fn sendDaemonLogRequestFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.DaemonLogRequest) !void {
+pub fn sendDaemonLogRequestFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.ClientDaemonItem.DaemonLogRequest) !void {
     try sendClientDaemonPayloadFrame(allocator, fd, .{ .log_request = request });
 }
 
-pub fn sendDaemonLogEntryFrame(allocator: std.mem.Allocator, fd: c.fd_t, entry: pb.DaemonLogEntry) !void {
+pub fn sendDaemonLogEntryFrame(allocator: std.mem.Allocator, fd: c.fd_t, entry: pb.ClientDaemonItem.DaemonLogEntry) !void {
     try sendClientDaemonPayloadFrame(allocator, fd, .{ .log_entry = entry });
 }
 
-pub fn decodeRemoteTeStreamItem(allocator: std.mem.Allocator, payload: []const u8) !pb.TeStreamItem {
+pub fn decodeRemoteTeStreamItem(allocator: std.mem.Allocator, payload: []const u8) !pb.TerminalEmulatorItem {
     var item = try decodePayload(pb.RemoteStreamItem, allocator, payload);
     switch (item.payload orelse {
         item.deinit(allocator);
         return error.UnexpectedFrame;
     }) {
-        .te => |te| {
+        .terminal_emulator => |terminal_emulator| {
             item.payload = null;
-            return te;
+            return terminal_emulator;
         },
         else => {
             item.deinit(allocator);
@@ -215,7 +215,7 @@ pub fn decodeRemoteProxyStreamItem(allocator: std.mem.Allocator, payload: []cons
     }
 }
 
-pub fn decodeDaemonMuxStreamFrame(allocator: std.mem.Allocator, payload: []const u8) !pb.MuxStreamFrame {
+pub fn decodeDaemonMuxStreamFrame(allocator: std.mem.Allocator, payload: []const u8) !pb.DaemonTunnelItem.MuxStreamFrame {
     var item = try decodePayload(pb.DaemonTunnelItem, allocator, payload);
     switch (item.payload orelse {
         item.deinit(allocator);
@@ -232,7 +232,7 @@ pub fn decodeDaemonMuxStreamFrame(allocator: std.mem.Allocator, payload: []const
     }
 }
 
-pub fn decodeClientDaemonSshTransportOpen(allocator: std.mem.Allocator, payload: []const u8) !pb.SshTransportOpen {
+pub fn decodeClientDaemonSshTransportOpen(allocator: std.mem.Allocator, payload: []const u8) !pb.ClientDaemonItem.SshTransportOpen {
     var item = try decodePayload(pb.ClientDaemonItem, allocator, payload);
     switch (item.payload orelse {
         item.deinit(allocator);
@@ -249,7 +249,7 @@ pub fn decodeClientDaemonSshTransportOpen(allocator: std.mem.Allocator, payload:
     }
 }
 
-pub fn decodeClientDaemonSshTransportEvent(allocator: std.mem.Allocator, payload: []const u8) !pb.SshTransportEvent {
+pub fn decodeClientDaemonSshTransportEvent(allocator: std.mem.Allocator, payload: []const u8) !pb.ClientDaemonItem.SshTransportEvent {
     var item = try decodePayload(pb.ClientDaemonItem, allocator, payload);
     switch (item.payload orelse {
         item.deinit(allocator);
@@ -266,7 +266,7 @@ pub fn decodeClientDaemonSshTransportEvent(allocator: std.mem.Allocator, payload
     }
 }
 
-pub fn decodeClientDaemonLogEntry(allocator: std.mem.Allocator, payload: []const u8) !pb.DaemonLogEntry {
+pub fn decodeClientDaemonLogEntry(allocator: std.mem.Allocator, payload: []const u8) !pb.ClientDaemonItem.DaemonLogEntry {
     var item = try decodePayload(pb.ClientDaemonItem, allocator, payload);
     switch (item.payload orelse {
         item.deinit(allocator);
@@ -401,7 +401,7 @@ fn writeU32(bytes: []u8, value: u32) void {
 }
 
 test "generated protobuf payload round trip" {
-    const original = pb.TeDraw{
+    const original = pb.TerminalEmulatorItem.Draw{
         .scrollback_cursor = "opaque-cursor",
         .viewport_offset = 4,
         .draw_bytes = "sessh",
@@ -409,7 +409,7 @@ test "generated protobuf payload round trip" {
     const encoded = try encodePayload(std.testing.allocator, original);
     defer std.testing.allocator.free(encoded);
 
-    var decoded = try decodePayload(pb.TeDraw, std.testing.allocator, encoded);
+    var decoded = try decodePayload(pb.TerminalEmulatorItem.Draw, std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("opaque-cursor", decoded.scrollback_cursor);
     try std.testing.expectEqual(@as(?i32, 4), decoded.viewport_offset);
@@ -418,7 +418,7 @@ test "generated protobuf payload round trip" {
 
 test "frame envelope round trip" {
     const payload = try encodePayload(std.testing.allocator, pb.RemoteStreamItem{
-        .payload = .{ .te = .{ .payload = .{ .input_ack = .{ .input_seq = 42 } } } },
+        .payload = .{ .terminal_emulator = .{ .payload = .{ .input_ack = .{ .input_seq = 42 } } } },
     });
     defer std.testing.allocator.free(payload);
     const frame_bytes = try encodeFrame(std.testing.allocator, .remote_stream, payload);
@@ -509,15 +509,15 @@ test "hello compatibility accepts peer max protocol when it satisfies local mini
 }
 
 test "session ended exit status is optional" {
-    const payload = try encodePayload(std.testing.allocator, pb.TeSessionEnded{
-        .reason = .TE_SESSION_END_REASON_KILLED_BY_REQUEST,
+    const payload = try encodePayload(std.testing.allocator, pb.TerminalEmulatorItem.SessionEnded{
+        .reason = .REASON_KILLED_BY_REQUEST,
         .ended_at_unix_ms = 42,
     });
     defer std.testing.allocator.free(payload);
 
-    var decoded = try decodePayload(pb.TeSessionEnded, std.testing.allocator, payload);
+    var decoded = try decodePayload(pb.TerminalEmulatorItem.SessionEnded, std.testing.allocator, payload);
     defer decoded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(pb.TeSessionEndReason.TE_SESSION_END_REASON_KILLED_BY_REQUEST, decoded.reason);
-    try std.testing.expectEqual(@as(?pb.ExitStatus, null), decoded.exit_status);
+    try std.testing.expectEqual(pb.TerminalEmulatorItem.SessionEnded.Reason.REASON_KILLED_BY_REQUEST, decoded.reason);
+    try std.testing.expectEqual(@as(?pb.TerminalEmulatorItem.SessionEnded.ExitStatus, null), decoded.exit_status);
     try std.testing.expectEqual(@as(?u64, 42), decoded.ended_at_unix_ms);
 }

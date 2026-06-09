@@ -34,7 +34,65 @@ message Frame {
   }
 }
 
+// Generic environment name/value pair. The enclosing message defines where the
+// entry is applied.
+message EnvironmentEntry {
+  string name = 1;
+  string value = 2;
+}
+
 message ClientDaemonItem {
+  // Local visible-client -> local daemon request to open an SSH-backed
+  // transport to a remote sesshd. The client may immediately pipeline stream
+  // frames after this request; the local daemon queues them behind tunnel setup
+  // and forwards them over ssh when the remote daemon endpoint is ready.
+  message SshTransportOpen {
+    repeated string ssh_option = 1;
+    string host = 2;
+    bool bootstrap = 3;
+    bool batch_mode = 4;
+    // Environment for the local daemon when it launches the local ssh
+    // transport. These entries are not part of the remote PTY child
+    // environment.
+    repeated EnvironmentEntry environment = 5;
+  }
+
+  // Local daemon -> visible-client event for the transport the daemon owns.
+  // These are local sessh UI/diagnostic events, not remote process output.
+  message SshTransportEvent {
+    message StderrChunk {
+      bytes chunk = 1;
+    }
+
+    message BootstrapStarted {
+    }
+
+    message BootstrapFinished {
+    }
+
+    message Closed {
+    }
+
+    oneof event {
+      StderrChunk stderr_chunk = 1;
+      BootstrapStarted bootstrap_started = 2;
+      BootstrapFinished bootstrap_finished = 3;
+      Closed closed = 4;
+    }
+  }
+
+  // Local client -> local daemon request to follow new operational log entries.
+  message DaemonLogRequest {
+  }
+
+  // One human-facing daemon log entry. The message is intentionally not overly
+  // structured yet; the daemon log is for operator diagnosis, not stable API
+  // consumption.
+  message DaemonLogEntry {
+    int64 unix_ms = 1;
+    string message = 2;
+  }
+
   oneof payload {
     SshTransportOpen ssh_transport_open = 1;
     SshTransportEvent ssh_transport_event = 2;
@@ -45,12 +103,100 @@ message ClientDaemonItem {
 
 message RemoteStreamItem {
   oneof payload {
-    TeStreamItem te = 1;
+    TerminalEmulatorItem terminal_emulator = 1;
     ProxyStreamItem proxy = 2;
   }
 }
 
 message DaemonTunnelItem {
+  // Transport control frame used to check whether the peer is still responsive.
+  // Ping/Pong live outside all logical streams, so handling them must not
+  // advance stream offsets or mutate terminal contents.
+  message Ping {
+  }
+
+  // Response to Ping.
+  message Pong {
+  }
+
+  // Framed payload, client daemon <-> server daemon.
+  //
+  // This is the only multiplexing envelope. All stream identity lives here; the
+  // payload items inside remain usable on non-muxed local IPC sockets.
+  message MuxStreamFrame {
+    uint64 stream_id = 1;
+
+    // Opens or resumes a mux stream. The detail oneof identifies the stream
+    // type; there is no separate stream-kind field to keep in sync.
+    message Open {
+      // First byte this side still needs from the peer's outbound stream.
+      uint64 recv_next_offset = 1;
+      // Backpressure credit this side grants the peer. The peer may send bytes
+      // in [recv_next_offset, recv_next_offset + receive_window_bytes) for this
+      // mux stream and must stop when that window is exhausted.
+      uint32 receive_window_bytes = 2;
+
+      oneof detail {
+        TerminalEmulatorItem.Open terminal_emulator = 10;
+        ProxyStreamItem.Open proxy = 11;
+      }
+    }
+
+    // Accepts a mux stream open and reports the acceptor's receive state. This
+    // is not a required round-trip barrier; peers may pipeline payload after
+    // open when they already have credit.
+    message OpenOk {
+      uint64 recv_next_offset = 1;
+      // Initial backpressure credit granted by the stream acceptor. This has
+      // the same meaning as Open.receive_window_bytes.
+      uint32 receive_window_bytes = 2;
+    }
+
+    // Ordered durable stream payload carried over a mux stream.
+    message Payload {
+      uint64 offset = 1;
+
+      oneof item {
+        TerminalEmulatorItem terminal_emulator = 2;
+        ProxyStreamItem proxy = 3;
+      }
+    }
+
+    message Ack {
+      // First byte offset not yet received from the peer.
+      uint64 recv_next_offset = 1;
+      // Updated backpressure credit. Receivers increase this as they drain
+      // their bounded per-stream buffer; senders stop sending on this mux
+      // stream when the advertised window is exhausted. Other mux streams have
+      // independent windows and may continue making progress.
+      uint32 receive_window_bytes = 2;
+    }
+
+    // Graceful end of this peer's outbound direction for the mux stream. The
+    // final offset is the first byte offset after the last payload item, so EOF
+    // can be acknowledged and replayed idempotently after reconnect.
+    message Eof {
+      uint64 final_offset = 1;
+    }
+
+    // Abrupt mux-stream termination, analogous to TCP RST or HTTP/2 RST_STREAM.
+    // Graceful terminal session exit is sent as a stream payload before Eof.
+    message Reset {
+      string code = 1;
+      string message = 2;
+      optional string hint = 3;
+    }
+
+    oneof message {
+      Open open = 2;
+      OpenOk open_ok = 3;
+      Payload payload = 4;
+      Ack ack = 5;
+      Eof eof = 6;
+      Reset reset = 7;
+    }
+  }
+
   oneof payload {
     Ping ping = 1;
     Pong pong = 2;
@@ -58,225 +204,312 @@ message DaemonTunnelItem {
   }
 }
 
-// Generic environment name/value pair. The enclosing message defines where the
-// entry is applied.
-message EnvironmentEntry {
-  string name = 1;
-  string value = 2;
-}
-
-// Local visible-client -> local daemon request to open an SSH-backed transport
-// to a remote sesshd. The client may immediately pipeline stream frames after
-// this request; the local daemon queues them behind tunnel setup and forwards
-// them over ssh when the remote daemon endpoint is ready.
-message SshTransportOpen {
-  repeated string ssh_option = 1;
-  string host = 2;
-  bool bootstrap = 3;
-  bool batch_mode = 4;
-  // Environment for the local daemon when it launches the local ssh transport.
-  // These entries are not part of the remote PTY child environment.
-  repeated EnvironmentEntry environment = 5;
-}
-
-// Local daemon -> visible-client event for the transport the daemon owns. These
-// are local sessh UI/diagnostic events, not remote process output.
-message SshTransportEvent {
-  message StderrChunk {
-    bytes chunk = 1;
-  }
-
-  message BootstrapStarted {
-  }
-
-  message BootstrapFinished {
-  }
-
-  message Closed {
-  }
-
-  oneof payload {
-    StderrChunk stderr_chunk = 1;
-    BootstrapStarted bootstrap_started = 2;
-    BootstrapFinished bootstrap_finished = 3;
-    Closed closed = 4;
-  }
-}
-
-// Local client -> local daemon request to follow new operational log entries.
-message DaemonLogRequest {
-}
-
-// One human-facing daemon log entry. The message is intentionally not overly
-// structured yet; the daemon log is for operator diagnosis, not stable API
-// consumption.
-message DaemonLogEntry {
-  int64 unix_ms = 1;
-  string message = 2;
-}
-
-// Framed payload, client coordinator <-> server coordinator.
-//
-// This is the only multiplexing envelope. All stream identity lives here; the
-// payload items inside remain usable on non-muxed local IPC sockets.
-message MuxStreamFrame {
-  uint64 stream_id = 1;
-
-  // Opens or resumes a mux stream. The detail oneof identifies the stream type;
-  // there is no separate stream-kind field to keep in sync.
-  message Open {
-    // First byte this side still needs from the peer's outbound stream.
-    uint64 recv_next_offset = 1;
-    // Backpressure credit this side grants the peer. The peer may send bytes in
-    // [recv_next_offset, recv_next_offset + receive_window_bytes) for this mux
-    // stream and must stop when that window is exhausted.
-    uint32 receive_window_bytes = 2;
-
-    oneof detail {
-      TeStreamOpen te = 10;
-      ProxyStreamOpen proxy = 11;
-    }
-  }
-
-  // Accepts a mux stream open and reports the acceptor's receive state. This is
-  // not a required round-trip barrier; peers may pipeline payload after open when
-  // they already have credit.
-  message OpenOk {
-    uint64 recv_next_offset = 1;
-    // Initial backpressure credit granted by the stream acceptor. This has the
-    // same meaning as Open.receive_window_bytes.
-    uint32 receive_window_bytes = 2;
-  }
-
-  // Ordered durable stream payload carried over a mux stream.
-  message Payload {
-    uint64 offset = 1;
-
-    oneof item {
-      TeStreamItem te = 2;
-      ProxyStreamItem proxy = 3;
-    }
-  }
-
-  message Ack {
-    // First byte offset not yet received from the peer.
-    uint64 recv_next_offset = 1;
-    // Updated backpressure credit. Receivers increase this as they drain their
-    // bounded per-stream buffer; senders stop sending on this mux stream when
-    // the advertised window is exhausted. Other mux streams have independent
-    // windows and may continue making progress.
-    uint32 receive_window_bytes = 2;
-  }
-
-  // Graceful end of this peer's outbound direction for the mux stream. The
-  // final offset is the first byte offset after the last payload item, so EOF
-  // can be acknowledged and replayed idempotently after reconnect.
-  message Eof {
-    uint64 final_offset = 1;
-  }
-
-  // Abrupt mux-stream termination, analogous to TCP RST or HTTP/2 RST_STREAM.
-  // Graceful terminal session exit is sent as a stream payload before Eof.
-  message Reset {
-    string code = 1;
-    string message = 2;
-    optional string hint = 3;
-  }
-
-  oneof message {
-    Open open = 2;
-    OpenOk open_ok = 3;
-    Payload payload = 4;
-    Ack ack = 5;
-    Eof eof = 6;
-    Reset reset = 7;
-  }
-}
-
-// Terminal-emulator stream open details.
-message TeStreamOpen {
-  // Durable session GUID.
-  string session_guid = 1;
-  // Initial terminal size and repaint request for this client view.
-  TeResize resize = 2;
-  // When true, the remote session runtime sends raw inner PTY transcript chunks
-  // for this client view. The client still owns archive creation and storage.
-  bool capture_tty_transcript = 3;
-  // Present for a new terminal-emulator stream. Absent means resume the
-  // existing stream identified by session_guid.
-  TeSessionCreate create = 4;
-}
-
 // Ordered terminal-emulator stream item. Direct local IPC can carry this as a
 // top-level Frame payload; mux tunnels carry it inside MuxStreamFrame.Payload.
-message TeStreamItem {
+message TerminalEmulatorItem {
+  // Terminal-emulator stream open details.
+  message Open {
+    // Durable session GUID.
+    string session_guid = 1;
+    // Initial terminal size and repaint request for this client view.
+    Resize resize = 2;
+    // When true, the remote session runtime sends raw inner PTY transcript
+    // chunks for this client view. The client still owns archive creation and
+    // storage.
+    bool capture_tty_transcript = 3;
+    // Present for a new terminal-emulator stream. Absent means resume the
+    // existing stream identified by session_guid.
+    SessionCreate create = 4;
+  }
+
+  // Creates a new interactive PTY session for this terminal-emulator stream.
+  message SessionCreate {
+  // Portable PTY settings captured from the client-side tty before sessh puts it
+  // into raw mode. This follows SSH's pty-req model: do not send a native
+  // termios struct, because those layouts and flag values are OS-specific.
+    message TtySettings {
+      message Mode {
+        // SSH terminal-mode opcode. Opcodes 1-159 have uint32 values; 128/129
+        // are input/output baud rates.
+        uint32 opcode = 1;
+        uint32 value = 2;
+      }
+
+      // TERM value from the client environment. This is only present when the
+      // remote PTY exposes the client's real terminal, such as
+      // no-terminal-emulator mode.
+      // Normal sessh sessions leave this absent so the remote advertises
+      // sessh's terminal-emulator TERM instead. Empty is meaningful when the
+      // client had TERM set to an empty string.
+      optional string term = 1;
+      // SSH/RFC 4254 terminal-mode opcode/value pairs. Unknown opcodes are
+      // ignored by the receiver, matching SSH server behavior.
+      repeated Mode tty_mode = 2;
+    }
+
+    // Outer terminal default colors reported by the client.
+    message DefaultColors {
+      // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
+      uint32 foreground_color = 1;
+      // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
+      uint32 background_color = 2;
+    }
+
+    // Execs a program directly, preserving argv boundaries. Empty argv is
+    // treated the same as no command.
+    message ExecCommand {
+      repeated string argv = 1;
+    }
+
+    // Evaluates a command string with the remote account's shell. An empty
+    // command is still a command; clients that want an interactive login shell
+    // must leave SessionCreate.command unset.
+    message ShellCommand {
+      string command = 1;
+    }
+
+    // Maximum runtime-retained scrollback rows for this session.
+    uint32 scrollback_row_limit = 2;
+    // Environment entries to apply to the PTY child. Entries already present in
+    // the request take precedence over environment inherited by the remote
+    // broker/daemon.
+    repeated EnvironmentEntry environment = 3;
+    // Colors the remote session runtime may use to answer early OSC 10/11
+    // queries.
+    DefaultColors query_default_colors = 4;
+    // At most one command form may be present. When command is unset, the
+    // runtime starts the user's interactive login shell. The shell_command
+    // variant mirrors ssh's `ssh HOST cmd args...` behavior after the local argv
+    // has been joined into a command string for the remote shell.
+    oneof command {
+      ExecCommand exec_command = 8;
+      ShellCommand shell_command = 9;
+    }
+    // Portable local tty settings to apply to the newly created remote PTY.
+    TtySettings tty_settings = 10;
+    // Maximum time the session may remain disconnected before the runtime ends
+    // it. Zero means disabled.
+    uint64 reap_ms = 11;
+  }
+
+  // Local terminal input bytes.
+  message Input {
+    // Raw bytes read from the local terminal.
+    bytes data = 1;
+    // Client-assigned input sequence. The remote session runtime acknowledges
+    // nonzero sequence numbers after receiving the input frame.
+    uint64 input_seq = 2;
+  }
+
+  // Confirms that the remote session runtime received an Input frame.
+  message InputAck {
+    uint64 input_seq = 1;
+  }
+
+  // Current terminal size for this attached client.
+  message Resize {
+    // Rows visible in the local terminal. The remote session runtime bounds
+    // this to u16.
+    uint32 terminal_rows = 1;
+    // Columns visible in the local terminal. The remote session runtime bounds
+    // this to u16.
+    uint32 terminal_cols = 2;
+    // Present for resize frames that need a redraw. The remote session runtime
+    // applies the new size, then answers this request with a RepaintResponse.
+    optional RepaintRequest repaint_request = 3;
+    // Rows between the outer terminal viewport top and the sessh viewport top.
+    // Omitted means the viewports are aligned. -1 means the client no longer
+    // knows the offset, typically after SIGWINCH resized an unaligned viewport;
+    // the remote session runtime must align the viewports in its repaint
+    // response.
+    optional sint32 viewport_offset = 4;
+  }
+
+  // Requests that the remote session runtime redraw terminal state for this
+  // attached client.
+  message RepaintRequest {
+    // Client-local repaint request sequence copied into RepaintResponse. While
+    // this repaint is outstanding, the client ignores framed Draw messages and
+    // resumes applying draws only after receiving the matching RepaintResponse.
+    // If multiple RepaintRequests are in flight, the remote session runtime may
+    // ignore all but the last one.
+    uint64 repaint_request_seq = 1;
+    // Opaque scrollback cursor. Absent means assume the client has current
+    // scrollback and send none. Present empty bytes means send all retained
+    // scrollback available; present non-empty bytes must come from a previous
+    // Draw.scrollback_cursor.
+    optional bytes scrollback_cursor = 2;
+    // Optional cap for retained scrollback rows included with an initial stream
+    // open repaint. Absent means all available retained scrollback.
+    optional uint32 initial_scrollback_rows = 3;
+  }
+
+  // Confirms the session selected for this connection.
+  message SessionAttached {
+    // Canonical session GUID in s-prefixed hyphenated UUID form.
+    string session_guid = 1;
+    // Absolute path to this session's GUID directory
+    string session_dir = 3;
+  }
+
+  // Debug-only request that severs all attached client connections.
+  message SessionClientDebugSeverConnectionRequest {}
+
+  // Debug-only request that makes all attached client connections stop
+  // responding for a bounded duration. Omitted or zero seconds asks the
+  // receiver to use its default debug-unresponsive duration.
+  message SessionClientDebugUnresponsiveConnectionRequest {
+    uint32 seconds = 1;
+  }
+
+  // Confirms that a debug client-control request was accepted.
+  message SessionClientControlResponse {}
+
+  // Requests ssh-shaped hangup for the remote PTY session. This is sent by a
+  // daemon when its local visible-client socket closes.
+  message SessionHangupRequest {}
+
+  // Tells an attached client that the session has ended.
+  message SessionEnded {
+    enum Reason {
+      REASON_UNSPECIFIED = 0;
+      REASON_PROCESS_EXITED = 1;
+      REASON_KILLED_BY_REQUEST = 2;
+      REASON_DAEMON_SHUTDOWN = 3;
+      REASON_REAPED = 4;
+    }
+
+    message ExitStatus {
+      enum Kind {
+        KIND_UNSPECIFIED = 0;
+        KIND_EXITED = 1;
+        KIND_SIGNALLED = 2;
+      }
+
+      Kind kind = 1;
+      // Process exit status when kind is EXITED, or signal number when kind is
+      // SIGNALLED.
+      sint32 status = 2;
+    }
+
+    Reason reason = 1;
+    // Absent means the remote session runtime did not observe a wait status,
+    // for example because it is shutting down and synthesized the end
+    // notification.
+    optional ExitStatus exit_status = 2;
+    optional uint64 ended_at_unix_ms = 3;
+  }
+
+  // Session-runtime-generated terminal bytes for the attached session.
+  message Draw {
+    // Opaque cursor representing the client scrollback state after applying
+    // this draw. Clients must store and pass this back without interpreting it.
+    bytes scrollback_cursor = 1;
+    // Rows between the outer terminal viewport top and the sessh viewport top
+    // after applying this draw. Omitted means the viewports are aligned.
+    optional sint32 viewport_offset = 2;
+    // Self-contained terminal bytes to write to the outer terminal in protocol
+    // order. A Draw must apply and clean up any temporary terminal state it
+    // uses.
+    bytes draw_bytes = 3;
+    // Terminal bytes the client keeps in memory until it really leaves the
+    // session view. Transport loss starts reconnect, so the client keeps this
+    // payload active; client close or session-end writes it. Present empty
+    // clears a previous restore.
+    optional bytes attached_client_end_restore_bytes = 4;
+    // Present when this draw includes the current screen title state. True means
+    // the remote app has set a terminal title, even if that title is the empty
+    // string. False means no app title is known. The client needs this bit so a
+    // temporary local title such as reconnect status can be restored correctly:
+    // use the app title when present, otherwise use a client-local fallback. Do
+    // not send that fallback to the remote session runtime. It may contain the
+    // user's local ssh alias or other client-private naming for the remote host,
+    // which ssh does not normally reveal to the remote side.
+    optional bool app_title_present = 5;
+  }
+
+  // Response for a RepaintRequest. The embedded Draw is applied exactly like a
+  // framed Draw.
+  message RepaintResponse {
+    uint64 repaint_request_seq = 1;
+    Draw draw = 2;
+  }
+
+  // Raw inner PTY bytes captured for a client-requested tty transcript.
+  message TtyTranscriptChunk {
+    enum Stream {
+      STREAM_UNSPECIFIED = 0;
+      STREAM_INNER_IN = 1;
+      STREAM_INNER_OUT = 2;
+    }
+
+    Stream stream = 1;
+    bytes data = 2;
+  }
+
+  // Coordinator-injected terminal-emulator diagnostic. This is not remote
+  // process output; the visible client renders it according to its filter
+  // level.
+  message Diagnostic {
+    message Disconnected {
+      optional uint64 next_retry_unix_ms = 1;
+    }
+
+    message Connecting {
+      uint64 attempt = 1;
+    }
+
+    message Reconnected {
+    }
+
+    message Unresponsive {
+      uint64 attempt = 1;
+    }
+
+    message ReconnectFailed {
+      uint64 attempt = 1;
+      string message = 2;
+      optional uint64 next_retry_unix_ms = 3;
+    }
+
+    oneof diagnostic {
+      Disconnected disconnected = 1;
+      Connecting connecting = 2;
+      Reconnected reconnected = 3;
+      Unresponsive unresponsive = 4;
+      ReconnectFailed reconnect_failed = 5;
+    }
+  }
+
   oneof payload {
-    TeStreamOpen open = 1;
-    TeInput input = 2;
-    TeInputAck input_ack = 3;
-    TeResize resize = 4;
-    TeRepaintRequest repaint_request = 5;
-    TeSessionAttached session_attached = 6;
-    TeSessionEnded session_ended = 7;
-    TeDraw draw = 8;
-    TeRepaintResponse repaint_response = 9;
-    TeTtyTranscriptChunk tty_transcript_chunk = 10;
-    TeDiagnostic diagnostic = 11;
-    TeSessionClientControlResponse session_client_control_response = 12;
-    TeSessionClientDebugSeverConnectionRequest debug_sever_connection_request = 13;
-    TeSessionClientDebugUnresponsiveConnectionRequest debug_unresponsive_connection_request = 14;
-    TeSessionHangupRequest session_hangup_request = 15;
+    Open open = 1;
+    Input input = 2;
+    InputAck input_ack = 3;
+    Resize resize = 4;
+    RepaintRequest repaint_request = 5;
+    SessionAttached session_attached = 6;
+    SessionEnded session_ended = 7;
+    Draw draw = 8;
+    RepaintResponse repaint_response = 9;
+    TtyTranscriptChunk tty_transcript_chunk = 10;
+    Diagnostic diagnostic = 11;
+    SessionClientControlResponse session_client_control_response = 12;
+    SessionClientDebugSeverConnectionRequest debug_sever_connection_request = 13;
+    SessionClientDebugUnresponsiveConnectionRequest debug_unresponsive_connection_request = 14;
+    SessionHangupRequest session_hangup_request = 15;
   }
-}
-
-// Coordinator-injected terminal-emulator diagnostic. This is not remote process
-// output; the visible client renders it according to its filter level.
-message TeDiagnostic {
-  message Disconnected {
-    optional uint64 next_retry_unix_ms = 1;
-  }
-
-  message Connecting {
-    uint64 attempt = 1;
-  }
-
-  message Reconnected {
-  }
-
-  message Unresponsive {
-    uint64 attempt = 1;
-  }
-
-  message ReconnectFailed {
-    uint64 attempt = 1;
-    string message = 2;
-    optional uint64 next_retry_unix_ms = 3;
-  }
-
-  message CleanupPending {
-    string message = 1;
-  }
-
-  oneof payload {
-    Disconnected disconnected = 1;
-    Connecting connecting = 2;
-    Reconnected reconnected = 3;
-    Unresponsive unresponsive = 4;
-    ReconnectFailed reconnect_failed = 5;
-    CleanupPending cleanup_pending = 6;
-  }
-}
-
-// Proxy stream open details carried by MuxStreamFrame.Open.detail.
-message ProxyStreamOpen {
-  string proxy_guid = 1;
-  string proxy_host = 2;
-  uint32 proxy_port = 3;
 }
 
 // Ordered proxy stream item. Data is offset-free here; mux offsets live in
 // MuxStreamFrame.Payload, and direct local IPC relies on socket ordering.
 message ProxyStreamItem {
+  // Proxy stream open details carried by MuxStreamFrame.Open.detail.
+  message Open {
+    string proxy_guid = 1;
+    string proxy_host = 2;
+    uint32 proxy_port = 3;
+  }
+
   // Sent immediately after the local IPC socket's normal HelloFrame handshake
   // so the ProxyCommand process can choose the right diagnostic stream shape.
   message ControlCapabilities {
@@ -317,260 +550,4 @@ message ProxyStreamItem {
     ControlDiagnostic control_diagnostic = 11;
     ControlCtrlR control_ctrl_r = 12;
   }
-}
-
-// Transport control frame used to check whether the peer is still responsive.
-// Ping/Pong live outside all logical streams, so handling them must not advance
-// stream offsets or mutate terminal contents.
-message Ping {
-}
-
-// Response to Ping.
-message Pong {
-}
-
-// Embedded in TeStreamOpen.
-//
-// Creates a new interactive PTY session for this terminal-emulator stream.
-message TeSessionCreate {
-  // Portable PTY settings captured from the client-side tty before sessh puts it
-  // into raw mode. This follows SSH's pty-req model: do not send a native
-  // termios struct, because those layouts and flag values are OS-specific.
-  message TtySettings {
-    message Mode {
-      // SSH terminal-mode opcode. Opcodes 1-159 have uint32 values; 128/129 are
-      // input/output baud rates.
-      uint32 opcode = 1;
-      uint32 value = 2;
-    }
-
-    // TERM value from the client environment. This is only present when the
-    // remote PTY exposes the client's real terminal, such as
-    // no-terminal-emulator mode.
-    // Normal sessh sessions leave this absent so the remote advertises sessh's
-    // terminal-emulator TERM instead. Empty is meaningful when the client had
-    // TERM set to an empty string.
-    optional string term = 1;
-    // SSH/RFC 4254 terminal-mode opcode/value pairs. Unknown opcodes are
-    // ignored by the receiver, matching SSH server behavior.
-    repeated Mode tty_mode = 2;
-  }
-
-  // Outer terminal default colors reported by the client.
-  message DefaultColors {
-    // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
-    uint32 foreground_color = 1;
-    // 0xffffffff means unknown/default; 0x01RRGGBB means explicit RGB.
-    uint32 background_color = 2;
-  }
-
-  // Execs a program directly, preserving argv boundaries. Empty argv is treated
-  // the same as no command.
-  message ExecCommand {
-    repeated string argv = 1;
-  }
-
-  // Evaluates a command string with the remote account's shell. An empty command
-  // is still a command; clients that want an interactive login shell must leave
-  // TeSessionCreate.command unset.
-  message ShellCommand {
-    string command = 1;
-  }
-
-  // Maximum runtime-retained scrollback rows for this session.
-  uint32 scrollback_row_limit = 2;
-  // Environment entries to apply to the PTY child. Entries already present in
-  // the request take precedence over environment inherited by the remote
-  // broker/daemon.
-  repeated EnvironmentEntry environment = 3;
-  // Colors the remote session runtime may use to answer early OSC 10/11 queries.
-  DefaultColors query_default_colors = 4;
-  // At most one command form may be present. When command is unset, the runtime
-  // starts the user's interactive login shell. The shell_command variant
-  // mirrors ssh's `ssh HOST cmd args...` behavior after the local argv has
-  // been joined into a command string for the remote shell.
-  oneof command {
-    ExecCommand exec_command = 8;
-    ShellCommand shell_command = 9;
-  }
-  // Portable local tty settings to apply to the newly created remote PTY.
-  TtySettings tty_settings = 10;
-  // Maximum time the session may remain disconnected before the runtime ends it.
-  // Zero means disabled.
-  uint64 reap_ms = 11;
-}
-
-// Embedded in TeStreamItem.
-//
-// Local terminal input bytes.
-message TeInput {
-  // Raw bytes read from the local terminal.
-  bytes data = 1;
-  // Client-assigned input sequence. The remote session runtime acknowledges nonzero
-  // sequence numbers after receiving the input frame.
-  uint64 input_seq = 2;
-}
-
-// Embedded in TeStreamItem.
-//
-// Confirms that the remote session runtime received a TeInput frame.
-message TeInputAck {
-  uint64 input_seq = 1;
-}
-
-// Embedded in TeStreamItem.
-//
-// Current terminal size for this attached client.
-message TeResize {
-  // Rows visible in the local terminal. The remote session runtime bounds this to u16.
-  uint32 terminal_rows = 1;
-  // Columns visible in the local terminal. The remote session runtime bounds this to u16.
-  uint32 terminal_cols = 2;
-  // Present for resize frames that need a redraw. The remote session runtime
-  // applies the new size, then answers this request with a TeRepaintResponse.
-  optional TeRepaintRequest repaint_request = 3;
-  // Rows between the outer terminal viewport top and the sessh viewport top.
-  // Omitted means the viewports are aligned. -1 means the client no longer
-  // knows the offset, typically after SIGWINCH resized an unaligned viewport;
-  // the remote session runtime must align the viewports in its repaint response.
-  optional sint32 viewport_offset = 4;
-}
-
-// Embedded in TeStreamItem.
-//
-// Requests that the remote session runtime redraw terminal state for this attached client.
-message TeRepaintRequest {
-  // Client-local repaint request sequence copied into TeRepaintResponse. While
-  // this repaint is outstanding, the client ignores framed TeDraw messages and
-  // resumes applying draws only after receiving the matching TeRepaintResponse.
-  // If multiple TeRepaintRequests are in flight, the remote session runtime may ignore all
-  // but the last one.
-  uint64 repaint_request_seq = 1;
-  // Opaque scrollback cursor. Absent means assume the client has current
-  // scrollback and send none. Present empty bytes means send all retained
-  // scrollback available; present non-empty bytes must come from a previous
-  // TeDraw.scrollback_cursor.
-  optional bytes scrollback_cursor = 2;
-  // Optional cap for retained scrollback rows included with an initial stream
-  // open repaint. Absent means all available retained scrollback.
-  optional uint32 initial_scrollback_rows = 3;
-}
-
-// Embedded in TeStreamItem.
-//
-// Confirms the session selected for this connection.
-message TeSessionAttached {
-  // Canonical session GUID in s-prefixed hyphenated UUID form.
-  string session_guid = 1;
-  // Absolute path to this session's GUID directory
-  string session_dir = 3;
-}
-
-// Embedded in TeStreamItem.
-//
-// Debug-only request that severs all attached client connections.
-message TeSessionClientDebugSeverConnectionRequest {}
-
-// Embedded in TeStreamItem.
-//
-// Debug-only request that makes all attached client connections stop responding
-// for a bounded duration. Omitted or zero seconds asks the receiver to use its
-// default debug-unresponsive duration.
-message TeSessionClientDebugUnresponsiveConnectionRequest {
-  uint32 seconds = 1;
-}
-
-// Embedded in TeStreamItem.
-//
-// Confirms that a debug client-control request was accepted.
-message TeSessionClientControlResponse {}
-
-// Embedded in TeStreamItem.
-//
-// Requests ssh-shaped hangup for the remote PTY session. This is sent by a
-// daemon when its local visible-client socket closes.
-message TeSessionHangupRequest {}
-
-enum TeSessionEndReason {
-  TE_SESSION_END_REASON_UNSPECIFIED = 0;
-  TE_SESSION_END_REASON_PROCESS_EXITED = 1;
-  TE_SESSION_END_REASON_KILLED_BY_REQUEST = 2;
-  TE_SESSION_END_REASON_DAEMON_SHUTDOWN = 3;
-  TE_SESSION_END_REASON_REAPED = 4;
-}
-
-enum ExitStatusKind {
-  EXIT_STATUS_KIND_UNSPECIFIED = 0;
-  EXIT_STATUS_KIND_EXITED = 1;
-  EXIT_STATUS_KIND_SIGNALLED = 2;
-}
-
-message ExitStatus {
-  ExitStatusKind kind = 1;
-  // Process exit status when kind is EXITED, or signal number when kind is
-  // SIGNALLED.
-  sint32 status = 2;
-}
-
-// Embedded in TeStreamItem.
-//
-// Tells an attached client that the session has ended.
-message TeSessionEnded {
-  TeSessionEndReason reason = 1;
-  // Absent means the remote session runtime did not observe a wait status, for example
-  // because it is shutting down and synthesized the end notification.
-  optional ExitStatus exit_status = 2;
-  optional uint64 ended_at_unix_ms = 3;
-}
-
-// Embedded in TeStreamItem.
-//
-// Session-runtime-generated terminal bytes for the attached session.
-message TeDraw {
-  // Opaque cursor representing the client scrollback state after applying this
-  // draw. Clients must store and pass this back without interpreting it.
-  bytes scrollback_cursor = 1;
-  // Rows between the outer terminal viewport top and the sessh viewport top
-  // after applying this draw. Omitted means the viewports are aligned.
-  optional sint32 viewport_offset = 2;
-  // Self-contained terminal bytes to write to the outer terminal in protocol
-  // order. A TeDraw must apply and clean up any temporary terminal state it uses.
-  bytes draw_bytes = 3;
-  // Terminal bytes the client keeps in memory until it really leaves the
-  // session view. Transport loss starts reconnect, so the client keeps this
-  // payload active; client close or session-end writes it. Present empty clears a
-  // previous restore.
-  optional bytes attached_client_end_restore_bytes = 4;
-  // Present when this draw includes the current screen title state. True means
-  // the remote app has set a terminal title, even if that title is the empty
-  // string. False means no app title is known. The client needs this bit so a
-  // temporary local title such as reconnect status can be restored correctly:
-  // use the app title when present, otherwise use a client-local fallback. Do
-  // not send that fallback to the remote session runtime. It may contain the user's
-  // local ssh alias or other client-private naming for the remote host, which
-  // ssh does not normally reveal to the remote side.
-  optional bool app_title_present = 5;
-}
-
-// Embedded in TeStreamItem.
-//
-// Response for a TeRepaintRequest. The embedded TeDraw is applied exactly like a
-// framed TeDraw.
-message TeRepaintResponse {
-  uint64 repaint_request_seq = 1;
-  TeDraw draw = 2;
-}
-
-enum TeTtyTranscriptStream {
-  TE_TTY_TRANSCRIPT_STREAM_UNSPECIFIED = 0;
-  TE_TTY_TRANSCRIPT_STREAM_INNER_IN = 1;
-  TE_TTY_TRANSCRIPT_STREAM_INNER_OUT = 2;
-}
-
-// Embedded in TeStreamItem.
-//
-// Raw inner PTY bytes captured for a client-requested tty transcript.
-message TeTtyTranscriptChunk {
-  TeTtyTranscriptStream stream = 1;
-  bytes data = 2;
 }

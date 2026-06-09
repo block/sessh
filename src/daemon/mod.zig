@@ -180,7 +180,7 @@ fn copyClientFrameToDaemon(allocator: std.mem.Allocator, read_fd: c.fd_t, write_
                     defer allocator.free(open_payload);
                     const payload = try session_daemon_handler.sessionOpenPayloadWithCurrentEnvironment(allocator, open_payload);
                     defer allocator.free(payload);
-                    var open = try protocol.decodePayload(pb.TeStreamOpen, allocator, payload);
+                    var open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, payload);
                     defer open.deinit(allocator);
                     try protocol.sendTeStreamPayloadFrame(allocator, write_fd, .{ .open = open });
                     return true;
