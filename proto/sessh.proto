@@ -41,8 +41,8 @@ message EnvironmentEntry {
 }
 
 // Semantic connection-state transition shared by terminal-emulator sessions,
-// proxy streams, and local daemon transport setup. This is not remote process
-// output. Visible clients decide how, where, and whether to render it.
+// proxy byte streams, and local daemon transport setup. This is not remote
+// process output. Visible clients decide how, where, and whether to render it.
 message ConnectionEvent {
   message SshConnecting {
   }
@@ -65,7 +65,7 @@ message ConnectionEvent {
   message DaemonConnecting {
   }
 
-  // Remote sesshd is handshaken; stream payload can flow.
+  // Remote sesshd is handshaken; mux payload can flow.
   message DaemonConnected {
   }
 
@@ -179,13 +179,12 @@ message DaemonTunnelItem {
   message MuxStreamFrame {
     uint64 stream_id = 1;
 
-    // Opens or resumes a mux stream. Stream-specific open details are carried
-    // as typed stream payloads, not in the mux envelope, so this layer only
+    // Opens or resumes a mux stream. Application-specific open details are
+    // carried as typed payload items, not in the mux envelope, so this layer only
     // tracks resume and backpressure state.
     message Open {
-      // First outbound unit this side still needs from the peer. The typed
-      // stream item defines whether this is a byte offset or an ordered item
-      // offset.
+      // First outbound unit this side still needs from the peer. The payload
+      // family defines whether this is a byte offset or an ordered item offset.
       uint64 recv_next_offset = 1;
       // Backpressure credit this side grants the peer. The peer may send units
       // in [recv_next_offset, recv_next_offset + receive_window_bytes) for this
@@ -203,9 +202,9 @@ message DaemonTunnelItem {
       uint32 receive_window_bytes = 2;
     }
 
-    // Ordered durable stream payload carried over a mux stream. The typed item
-    // defines the offset semantics: terminal-emulator streams count ordered
-    // items, while proxy stream data uses byte offsets and treats Open as setup
+    // Ordered durable payload carried over a mux stream. The payload family
+    // defines the offset semantics: terminal-emulator items count ordered
+    // messages, while proxy data uses byte offsets and treats Open as setup
     // that does not consume byte-offset space.
     message Payload {
       uint64 offset = 1;
@@ -234,7 +233,8 @@ message DaemonTunnelItem {
     }
 
     // Abrupt mux-stream termination, analogous to TCP RST or HTTP/2 RST_STREAM.
-    // Graceful terminal session exit is sent as a stream payload before Eof.
+    // Graceful terminal session exit is sent as terminal-emulator payload before
+    // Eof.
     message Reset {
       string code = 1;
       string message = 2;
@@ -251,17 +251,67 @@ message DaemonTunnelItem {
     }
   }
 
+  // Opaque identity for a remote process or resource owner that the remote
+  // daemon can later verify before applying cleanup. `start_time` is a
+  // platform-specific exact-match string; mismatched pid/start_time/socket_path
+  // means the original target is gone and cleanup should report Missing.
+  message RemoteProcessIdentity {
+    uint64 pid = 1;
+    string start_time = 2;
+    string daemon_socket_path = 3;
+  }
+
+  // Remote daemon -> local daemon notice that a mux stream now has a remote
+  // cleanup target. The local side must durably record this before acking with
+  // RemoteProcessRecorded.
+  message RemoteProcessStarted {
+    uint64 stream_id = 1;
+    RemoteProcessIdentity process = 2;
+  }
+
+  // Local daemon -> remote daemon ack that RemoteProcessStarted has been
+  // durably recorded. Until this is received, the remote side should treat
+  // tunnel loss as startup failure and clean up the remote process/resource.
+  message RemoteProcessRecorded {
+    uint64 stream_id = 1;
+  }
+
+  // Local daemon -> remote daemon fallback cleanup request. This is independent
+  // of current mux stream IDs so an hourly sweeper can use a fresh connection.
+  message RemoteProcessCleanupRequest {
+    RemoteProcessIdentity process = 1;
+  }
+
+  message RemoteProcessCleanupResponse {
+    message Cleaned {
+    }
+
+    message Missing {
+    }
+
+    RemoteProcessIdentity process = 1;
+
+    oneof result {
+      Cleaned cleaned = 2;
+      Missing missing = 3;
+    }
+  }
+
   oneof payload {
     Ping ping = 1;
     Pong pong = 2;
     MuxStreamFrame mux_stream = 10;
+    RemoteProcessStarted remote_process_started = 20;
+    RemoteProcessRecorded remote_process_recorded = 21;
+    RemoteProcessCleanupRequest remote_process_cleanup_request = 22;
+    RemoteProcessCleanupResponse remote_process_cleanup_response = 23;
   }
 }
 
-// Ordered terminal-emulator stream item. Direct local IPC can carry this as a
+// Ordered terminal-emulator protocol item. Direct local IPC can carry this as a
 // top-level Frame payload; mux tunnels carry it inside MuxStreamFrame.Payload.
 message TerminalEmulatorItem {
-  // Terminal-emulator stream open details.
+  // Terminal-emulator open details for a direct connection or mux stream.
   message Open {
     // Durable session GUID.
     string session_guid = 1;
@@ -271,16 +321,17 @@ message TerminalEmulatorItem {
     // chunks for this client view. The client still owns archive creation and
     // storage.
     bool capture_tty_transcript = 3;
-    // Present for a new terminal-emulator stream. Absent means resume the
-    // existing stream identified by session_guid.
+    // Present when creating a new remote terminal-emulator session. Absent
+    // means resume the existing session identified by session_guid.
     SessionCreate create = 4;
   }
 
-  // Creates a new interactive PTY session for this terminal-emulator stream.
+  // Creates a new interactive PTY session for this terminal-emulator protocol
+  // connection.
   message SessionCreate {
-  // Portable PTY settings captured from the client-side tty before sessh puts it
-  // into raw mode. This follows SSH's pty-req model: do not send a native
-  // termios struct, because those layouts and flag values are OS-specific.
+    // Portable PTY settings captured from the client-side tty before sessh puts
+    // it into raw mode. This follows SSH's pty-req model: do not send a native
+    // termios struct, because those layouts and flag values are OS-specific.
     message TtySettings {
       message Mode {
         // SSH terminal-mode opcode. Opcodes 1-159 have uint32 values; 128/129
@@ -514,10 +565,10 @@ message TerminalEmulatorItem {
   }
 }
 
-// Ordered proxy stream item. Data is offset-free here; mux offsets live in
+// Ordered proxy byte-stream item. Data is offset-free here; mux offsets live in
 // MuxStreamFrame.Payload, and direct local IPC relies on socket ordering.
 message ProxyStreamItem {
-  // Proxy stream open details. When muxed, this is sent as the first typed
+  // Proxy byte-stream open details. When muxed, this is sent as the first typed
   // proxy payload after MuxStreamFrame.Open and does not consume proxy byte
   // offset space; data may still start at offset 0.
   message Open {
