@@ -49,10 +49,6 @@ const ProxyClientControl = struct {
     fn setControlFd(self: *ProxyClientControl, fd: c.fd_t) void {
         if (self.control_fd >= 0) posix.close(self.control_fd);
         self.control_fd = fd;
-        proxy_control.serverHandshake(std.heap.smp_allocator, fd) catch {
-            self.closeControl();
-            return;
-        };
         setNonBlockingFd(fd) catch {};
     }
 
@@ -90,8 +86,7 @@ const ProxyClientControl = struct {
             .ssh_connecting => self.showUpdate("sessh: connecting..."),
             .ssh_connected => {},
             .ssh_stderr => |stderr| self.showDiagnostic(stderr.data),
-            .bootstrap_started => self.showUpdate("sessh: bootstrapping..."),
-            .bootstrap_finished => self.clearUpdate(),
+            .binary_bootstrapping => self.showUpdate("sessh: bootstrapping..."),
             .daemon_connecting => {
                 self.showUpdate(reconnect_title.reconnectingStatus(.{ .ctrl_r = self.ctrl_r_allowed }));
                 self.intercept_requested = self.ctrl_r_allowed;
@@ -200,46 +195,39 @@ fn copyBytes(dest: []u8, source: []const u8) usize {
 }
 
 const DiagnosticsThreadState = struct {
-    listen_fd: c.fd_t,
+    control_fd: c.fd_t,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 fn diagnosticsThreadMain(state: *DiagnosticsThreadState, allocator: std.mem.Allocator) void {
     var diagnostics = ProxyClientControl.init(allocator, false, true);
+    if (state.control_fd >= 0) diagnostics.setControlFd(state.control_fd);
     defer {
         diagnostics.clear();
         diagnostics.closeControl();
     }
 
     while (!state.done.load(.acquire)) {
-        var pollfds: [2]posix.pollfd = undefined;
+        if (diagnostics.control_fd < 0) {
+            io.sleepMillis(100);
+            continue;
+        }
+        var pollfds: [1]posix.pollfd = undefined;
         var count: usize = 0;
-        pollfds[count] = .{ .fd = state.listen_fd, .events = posix.POLL.IN, .revents = 0 };
+        pollfds[count] = .{ .fd = diagnostics.control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
         count += 1;
-        var control_index: ?usize = null;
-        if (diagnostics.control_fd >= 0) {
-            control_index = count;
-            pollfds[count] = .{ .fd = diagnostics.control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-            count += 1;
-        }
         _ = posix.poll(pollfds[0..count], 100) catch continue;
-        if ((pollfds[0].revents & posix.POLL.IN) != 0) {
-            const fd = c.accept(state.listen_fd, null, null);
-            if (fd >= 0) diagnostics.setControlFd(fd);
-        }
-        if (control_index) |index| {
-            if (pollfds[index].revents != 0) diagnostics.readControl();
-        }
+        if (pollfds[0].revents != 0) diagnostics.readControl();
     }
 }
 
 pub fn runArgvWithDiagnosticsThread(
     allocator: std.mem.Allocator,
     ssh_args: []const []const u8,
-    client_socket_listen_fd: c.fd_t,
+    control_fd: c.fd_t,
     diagnostic_name: []const u8,
 ) !noreturn {
-    var state = DiagnosticsThreadState{ .listen_fd = client_socket_listen_fd };
+    var state = DiagnosticsThreadState{ .control_fd = control_fd };
     const thread_allocator = std.heap.smp_allocator;
     var thread = try std.Thread.spawn(.{}, diagnosticsThreadMain, .{ &state, thread_allocator });
     var joined = false;
@@ -270,7 +258,7 @@ pub fn runArgvWithDiagnosticsThread(
 pub fn runArgvUnderLocalPty(
     allocator: std.mem.Allocator,
     ssh_args: []const []const u8,
-    client_socket_listen_fd: c.fd_t,
+    control_fd: c.fd_t,
     client_ctrl_r: bool,
     diagnostic_name: []const u8,
 ) !noreturn {
@@ -299,6 +287,7 @@ pub fn runArgvUnderLocalPty(
     setNonBlockingFd(child.master_fd) catch {};
 
     var diagnostics = ProxyClientControl.init(allocator, client_ctrl_r, false);
+    if (control_fd >= 0) diagnostics.setControlFd(control_fd);
     defer {
         diagnostics.clear();
         diagnostics.closeControl();
@@ -316,10 +305,11 @@ pub fn runArgvUnderLocalPty(
         pollfds[count] = .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
         count += 1;
         var control_index: ?usize = null;
-        const control_fd = if (diagnostics.control_fd >= 0) diagnostics.control_fd else client_socket_listen_fd;
-        control_index = count;
-        pollfds[count] = .{ .fd = control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-        count += 1;
+        if (diagnostics.control_fd >= 0) {
+            control_index = count;
+            pollfds[count] = .{ .fd = diagnostics.control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+            count += 1;
+        }
 
         _ = posix.poll(pollfds[0..count], -1) catch continue;
         refreshLocalPtySize(child.master_fd, &size);
@@ -360,12 +350,7 @@ pub fn runArgvUnderLocalPty(
 
         if (control_index) |index| {
             if (pollfds[index].revents != 0) {
-                if (diagnostics.control_fd >= 0) {
-                    diagnostics.readControl();
-                } else {
-                    const fd = c.accept(client_socket_listen_fd, null, null);
-                    if (fd >= 0) diagnostics.setControlFd(fd);
-                }
+                diagnostics.readControl();
             }
         }
     }

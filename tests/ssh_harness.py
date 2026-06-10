@@ -20,7 +20,7 @@ import threading
 import time
 from pathlib import Path
 
-from harness_cleanup import cleanup_runtime, sessions_dir
+from harness_cleanup import cleanup_runtime
 from socket_harness import (
     DRAW,
     SESSION_CLIENT_CONTROL_RESPONSE,
@@ -41,8 +41,6 @@ from test_env import isolated_env
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("SESSH_TEST_BIN", str(ROOT / "zig-out" / "bin" / "sessh")))
-GUID_RE = re.compile(r"^s-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-COMPACT_GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
 def sessh_argv(args):
@@ -1300,10 +1298,6 @@ def state_root(env):
     return Path(env["XDG_STATE_HOME"]) / "sessh"
 
 
-def state_sessions_dir(env):
-    return state_root(env) / "guid"
-
-
 def fake_remote_runtime_root(env):
     return Path(env.get("SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR", env["XDG_RUNTIME_DIR"] + ".remote"))
 
@@ -1312,47 +1306,12 @@ def fake_remote_state_root(env):
     return Path(env.get("SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME", env["XDG_STATE_HOME"] + ".remote")) / "sessh"
 
 
-def fake_remote_state_sessions_dir(env):
-    return fake_remote_state_root(env) / "guid"
-
-
 def runtime_root(env):
     return Path(env["XDG_RUNTIME_DIR"])
 
 
-def fake_remote_sessions_dir(env):
-    return fake_remote_runtime_root(env) / "guid"
-
-
-def sessions_dir(env):
-    return fake_remote_sessions_dir(env)
-
-
-def compact_guid(guid):
-    if COMPACT_GUID_RE.match(guid):
-        return guid.lower()
-    if not GUID_RE.match(guid):
-        raise AssertionError(f"invalid guid: {guid}")
-    return guid[2:].replace("-", "").lower()
-
-
-def canonical_guid(guid):
-    if GUID_RE.match(guid):
-        return guid.lower()
-    if COMPACT_GUID_RE.match(guid):
-        compact = guid.lower()
-        return f"s-{compact[0:8]}-{compact[8:12]}-{compact[12:16]}-{compact[16:20]}-{compact[20:32]}"
-    raise AssertionError(f"invalid guid: {guid}")
-
-
 def test_session_guid(index):
     return f"s-{index:08x}-0000-4000-8000-{index:012x}"
-
-
-def session_path(env, session_id=None):
-    if session_id is None:
-        session_id = test_session_guid(1)
-    return sessions_dir(env) / canonical_guid(session_id)
 
 
 def assert_cached_artifact(env, artifact, context):
@@ -1484,10 +1443,6 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(result)
     if f"SESSH_BIN={installed.resolve()}" not in result.stdout:
         raise AssertionError(result)
-    routes = list(state_sessions_dir(env).glob("*/route.json"))
-    if routes:
-        raise AssertionError(f"completed uploaded session left route files: {routes}")
-
     daemon_log_stdout = daemon_log_output.decode("utf-8", "replace")
     for expected in (
         "terminal transport opening host=test-host",
@@ -2129,13 +2084,6 @@ def test_ssh_clean_remote_exit_removes_routes(tmp):
         raise AssertionError(result)
     if marker not in result.stdout:
         raise AssertionError(result)
-
-    local_routes = list(state_sessions_dir(env).glob("*/route.json"))
-    if local_routes:
-        raise AssertionError(f"clean remote exit left local route files: {local_routes}")
-    remote_routes = list((remote_state / "sessh" / "guid").glob("*/route.json"))
-    if remote_routes:
-        raise AssertionError(f"clean remote exit left remote route files: {remote_routes}")
 
 
 def test_ssh_pre_attach_stderr_forwards_immediately(tmp):
@@ -3284,7 +3232,7 @@ def test_ssh_no_terminal_emulator_tty_uses_proxy_with_hygienic_diagnostics(tmp):
         raise AssertionError(log_text)
     if "--filter-level" not in log_text or "hygienic" not in log_text:
         raise AssertionError(log_text)
-    if "--client-socket" not in log_text or "/c/" not in log_text:
+    if "--control-guid" not in log_text or "p-" not in log_text:
         raise AssertionError(log_text)
     if "--client-ctrl-r" not in log_text or ("'1'" not in log_text and " 1" not in log_text):
         raise AssertionError(log_text)
@@ -3522,7 +3470,6 @@ def test_ssh_config_only_cli_options_are_rejected(tmp):
 
     for args in (
         ["--scrollback-limit", "100", "test-host"],
-        ["--initial-scrollback", "0", "test-host"],
         ["--bootstrap", "test-host"],
         ["--no-bootstrap", "test-host"],
         ["--ssh-options", "-F cfg", "test-host"],

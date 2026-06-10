@@ -183,8 +183,7 @@ pub const ConnectionEvent = struct {
         ssh_connecting,
         ssh_connected,
         ssh_stderr,
-        bootstrap_started,
-        bootstrap_finished,
+        binary_bootstrapping,
         daemon_connecting,
         daemon_connected,
         daemon_disconnected,
@@ -194,8 +193,7 @@ pub const ConnectionEvent = struct {
         ssh_connecting: ConnectionEvent.SshConnecting,
         ssh_connected: ConnectionEvent.SshConnected,
         ssh_stderr: ConnectionEvent.SshStderr,
-        bootstrap_started: ConnectionEvent.BootstrapStarted,
-        bootstrap_finished: ConnectionEvent.BootstrapFinished,
+        binary_bootstrapping: ConnectionEvent.BinaryBootstrapping,
         daemon_connecting: ConnectionEvent.DaemonConnecting,
         daemon_connected: ConnectionEvent.DaemonConnected,
         daemon_disconnected: ConnectionEvent.DaemonDisconnected,
@@ -204,12 +202,11 @@ pub const ConnectionEvent = struct {
             .ssh_connecting = fd(1, .submessage),
             .ssh_connected = fd(2, .submessage),
             .ssh_stderr = fd(3, .submessage),
-            .bootstrap_started = fd(4, .submessage),
-            .bootstrap_finished = fd(5, .submessage),
-            .daemon_connecting = fd(6, .submessage),
-            .daemon_connected = fd(7, .submessage),
-            .daemon_disconnected = fd(8, .submessage),
-            .unresponsive = fd(9, .submessage),
+            .binary_bootstrapping = fd(4, .submessage),
+            .daemon_connecting = fd(5, .submessage),
+            .daemon_connected = fd(6, .submessage),
+            .daemon_disconnected = fd(7, .submessage),
+            .unresponsive = fd(8, .submessage),
         };
     };
 
@@ -412,69 +409,7 @@ pub const ConnectionEvent = struct {
         }
     };
 
-    pub const BootstrapStarted = struct {
-        pub const _desc_table = .{};
-
-        /// Encodes the message to the writer
-        /// The allocator is used to generate submessages internally.
-        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-        pub fn encode(
-            self: @This(),
-            writer: *std.Io.Writer,
-            allocator: std.mem.Allocator,
-        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-            return protobuf.encode(writer, allocator, self);
-        }
-
-        /// Decodes the message from the bytes read from the reader.
-        pub fn decode(
-            reader: *std.Io.Reader,
-            allocator: std.mem.Allocator,
-        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-            return protobuf.decode(@This(), reader, allocator);
-        }
-
-        /// Deinitializes and frees the memory associated with the message.
-        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            return protobuf.deinit(allocator, self);
-        }
-
-        /// Duplicates the message.
-        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-            return protobuf.dupe(@This(), self, allocator);
-        }
-
-        /// Decodes the message from the JSON string.
-        pub fn jsonDecode(
-            input: []const u8,
-            options: std.json.ParseOptions,
-            allocator: std.mem.Allocator,
-        ) !std.json.Parsed(@This()) {
-            return protobuf.json.decode(@This(), input, options, allocator);
-        }
-
-        /// Encodes the message to a JSON string.
-        pub fn jsonEncode(
-            self: @This(),
-            options: std.json.Stringify.Options,
-            pb_options: protobuf.json.Options,
-            allocator: std.mem.Allocator,
-        ) ![]const u8 {
-            return protobuf.json.encode(self, options, pb_options, allocator);
-        }
-
-        /// This method is used by std.json
-        /// internally for deserialization. DO NOT RENAME!
-        pub fn jsonParse(
-            allocator: std.mem.Allocator,
-            source: anytype,
-            options: std.json.ParseOptions,
-        ) !@This() {
-            return protobuf.json.parse(@This(), allocator, source, options);
-        }
-    };
-
-    pub const BootstrapFinished = struct {
+    pub const BinaryBootstrapping = struct {
         pub const _desc_table = .{};
 
         /// Encodes the message to the writer
@@ -860,6 +795,7 @@ pub const ClientDaemonItem = struct {
 
     pub const _payload_case = enum {
         ssh_transport_acquire,
+        proxy_control_open,
         log_request,
         log_entry,
         connection_event,
@@ -867,12 +803,14 @@ pub const ClientDaemonItem = struct {
     };
     pub const payload_union = union(_payload_case) {
         ssh_transport_acquire: ClientDaemonItem.SshTransportAcquire,
+        proxy_control_open: ClientDaemonItem.ProxyControlOpen,
         log_request: ClientDaemonItem.DaemonLogRequest,
         log_entry: ClientDaemonItem.DaemonLogEntry,
         connection_event: ConnectionEvent,
         retry_now: ClientDaemonItem.RetryNow,
         pub const _desc_table = .{
             .ssh_transport_acquire = fd(1, .submessage),
+            .proxy_control_open = fd(2, .submessage),
             .log_request = fd(10, .submessage),
             .log_entry = fd(11, .submessage),
             .connection_event = fd(12, .submessage),
@@ -1101,6 +1039,76 @@ pub const ClientDaemonItem = struct {
     /// command; CTRL-R interception policy is not part of the protocol.
     pub const RetryNow = struct {
         pub const _desc_table = .{};
+
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    /// Visible client request to receive/send control messages for a proxy stream.
+    /// The ProxyCommand process does not send this: its normal ProxyStreamItem.Open
+    /// already carries the same p-guid, so sesshd can attach this control channel
+    /// to the in-memory proxy stream.
+    pub const ProxyControlOpen = struct {
+        proxy_guid: []const u8 = &.{},
+
+        pub const _desc_table = .{
+            .proxy_guid = fd(1, .{ .scalar = .string }),
+        };
 
         /// Encodes the message to the writer
         /// The allocator is used to generate submessages internally.
@@ -2822,12 +2830,10 @@ pub const TerminalEmulatorItem = struct {
     pub const RepaintRequest = struct {
         repaint_request_seq: u64 = 0,
         scrollback_cursor: ?[]const u8 = null,
-        initial_scrollback_rows: ?u32 = null,
 
         pub const _desc_table = .{
             .repaint_request_seq = fd(1, .{ .scalar = .uint64 }),
             .scrollback_cursor = fd(2, .{ .scalar = .bytes }),
-            .initial_scrollback_rows = fd(3, .{ .scalar = .uint32 }),
         };
 
         /// Encodes the message to the writer
@@ -2892,11 +2898,9 @@ pub const TerminalEmulatorItem = struct {
     /// Confirms the session selected for this connection.
     pub const SessionAttached = struct {
         session_guid: []const u8 = &.{},
-        session_dir: []const u8 = &.{},
 
         pub const _desc_table = .{
             .session_guid = fd(1, .{ .scalar = .string }),
-            .session_dir = fd(3, .{ .scalar = .string }),
         };
 
         /// Encodes the message to the writer
@@ -3234,7 +3238,7 @@ pub const TerminalEmulatorItem = struct {
             REASON_PROCESS_EXITED = 1,
             REASON_KILLED_BY_REQUEST = 2,
             REASON_DAEMON_SHUTDOWN = 3,
-            REASON_REAPED = 4,
+            REASON_DISCONNECTED_TIMEOUT = 4,
             _,
         };
 

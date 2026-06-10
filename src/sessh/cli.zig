@@ -19,8 +19,6 @@ pub const Invocation = struct {
 pub const CommonSessionOptions = struct {
     scrollback_row_count: u32 = config.default_scrollback_row_count,
     scrollback_row_count_set: bool = false,
-    initial_scrollback_row_count: ?u32 = null,
-    initial_scrollback_row_count_set: bool = false,
     client_log_level: client_log.Level = .warn,
     client_log_level_set: bool = false,
     bootstrap: bool = true,
@@ -144,7 +142,6 @@ fn parseSesshOptionBeforeHost(args: []const []const u8, index: *usize, common: *
 
 fn isSesshLongOption(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--scrollback-limit") or
-        std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
@@ -157,7 +154,6 @@ fn isSesshLongOption(arg: []const u8) bool {
 
 fn isConfigOnlyDirectSesshOption(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--scrollback-limit") or
-        std.mem.eql(u8, arg, "--initial-scrollback") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
         std.mem.eql(u8, arg, "--ssh-options");
@@ -261,12 +257,6 @@ test "parse rejects config-only sessh options on direct ssh transport" {
         "sessh",
         "--scrollback-limit",
         "100",
-        "example.com",
-    }));
-    try std.testing.expectError(error.UnsupportedSesshOption, parse(&scratch, &.{
-        "sessh",
-        "--initial-scrollback",
-        "0",
         "example.com",
     }));
     try std.testing.expectError(error.UnsupportedSesshOption, parse(&scratch, &.{

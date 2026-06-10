@@ -584,20 +584,20 @@ fn startSessionRuntimeAndConnect(allocator: std.mem.Allocator, exe: []const u8, 
     var request = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, session_open_payload);
     defer request.deinit(allocator);
     if (request.create == null) return error.MissingSessionCreate;
-    var allocation = if (request.session_guid.len > 0)
-        try session_registry.allocateSessionDirForGuid(allocator, request.session_guid)
+    const guid = if (request.session_guid.len > 0)
+        try session_registry.canonicalGuid(allocator, request.session_guid)
     else
-        try session_registry.allocateSessionDir(allocator);
-    defer allocation.deinit(allocator);
+        try session_registry.generateGuid(allocator);
+    defer allocator.free(guid);
 
-    daemon_log.infof(allocator, "terminal session creating session={s}", .{allocation.id});
+    daemon_log.infof(allocator, "terminal session creating session={s}", .{guid});
     _ = exe;
-    _ = try session_runtime.startSessionRuntimeThread(allocator, allocation.paths.dir);
-    const runtime_fd = try session_runtime.connectSessionRuntime(allocator, allocation.id);
+    _ = try session_runtime.startSessionRuntimeThread(allocator, guid);
+    const runtime_fd = try session_runtime.connectSessionRuntime(allocator, guid);
     daemon_log.infof(
         allocator,
         "terminal session runtime connected session={s} elapsed_ms={}",
-        .{ allocation.id, elapsedMsSince(started_ms) },
+        .{ guid, elapsedMsSince(started_ms) },
     );
     return runtime_fd;
 }

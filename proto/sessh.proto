@@ -25,9 +25,8 @@ message Frame {
     // Local client <-> local daemon API traffic. These frames are never
     // forwarded to the remote daemon.
     ClientDaemonItem client_daemon = 20;
-    // Logical visible-client <-> remote endpoint traffic. Local client sockets
-    // can carry these directly; daemon-to-daemon tunnels carry them inside mux
-    // payloads.
+    // Logical visible-client <-> remote endpoint traffic. Daemon-to-daemon
+    // tunnels carry these inside mux payloads.
     ClientRemoteItem client_remote = 21;
     // Local daemon <-> remote daemon tunnel traffic.
     DaemonTunnelItem daemon_tunnel = 22;
@@ -60,10 +59,7 @@ message ConnectionEvent {
     bytes data = 1;
   }
 
-  message BootstrapStarted {
-  }
-
-  message BootstrapFinished {
+  message BinaryBootstrapping {
   }
 
   message DaemonConnecting {
@@ -95,12 +91,11 @@ message ConnectionEvent {
     SshConnecting ssh_connecting = 1;
     SshConnected ssh_connected = 2;
     SshStderr ssh_stderr = 3;
-    BootstrapStarted bootstrap_started = 4;
-    BootstrapFinished bootstrap_finished = 5;
-    DaemonConnecting daemon_connecting = 6;
-    DaemonConnected daemon_connected = 7;
-    DaemonDisconnected daemon_disconnected = 8;
-    Unresponsive unresponsive = 9;
+    BinaryBootstrapping binary_bootstrapping = 4;
+    DaemonConnecting daemon_connecting = 5;
+    DaemonConnected daemon_connected = 6;
+    DaemonDisconnected daemon_disconnected = 7;
+    Unresponsive unresponsive = 8;
   }
 }
 
@@ -141,8 +136,17 @@ message ClientDaemonItem {
   message RetryNow {
   }
 
+  // Visible client request to receive/send control messages for a proxy stream.
+  // The ProxyCommand process does not send this: its normal ProxyStreamItem.Open
+  // already carries the same p-guid, so sesshd can attach this control channel
+  // to the in-memory proxy stream.
+  message ProxyControlOpen {
+    string proxy_guid = 1;
+  }
+
   oneof payload {
     SshTransportAcquire ssh_transport_acquire = 1;
+    ProxyControlOpen proxy_control_open = 2;
     DaemonLogRequest log_request = 10;
     DaemonLogEntry log_entry = 11;
     ConnectionEvent connection_event = 12;
@@ -389,17 +393,12 @@ message TerminalEmulatorItem {
     // scrollback available; present non-empty bytes must come from a previous
     // Draw.scrollback_cursor.
     optional bytes scrollback_cursor = 2;
-    // Optional cap for retained scrollback rows included with an initial stream
-    // open repaint. Absent means all available retained scrollback.
-    optional uint32 initial_scrollback_rows = 3;
   }
 
   // Confirms the session selected for this connection.
   message SessionAttached {
     // Canonical session GUID in s-prefixed hyphenated UUID form.
     string session_guid = 1;
-    // Absolute path to this session's GUID directory
-    string session_dir = 3;
   }
 
   // Debug-only request that severs all attached client connections.
@@ -426,7 +425,7 @@ message TerminalEmulatorItem {
       REASON_PROCESS_EXITED = 1;
       REASON_KILLED_BY_REQUEST = 2;
       REASON_DAEMON_SHUTDOWN = 3;
-      REASON_REAPED = 4;
+      REASON_DISCONNECTED_TIMEOUT = 4;
     }
 
     message ExitStatus {

@@ -8,7 +8,6 @@ const transport_bootstrap = @import("bootstrap.zig");
 const client_config = @import("../session/client_config.zig");
 const client_log = @import("../core/client_log.zig");
 const client_ui = @import("../session/client_ui.zig");
-const proxy_control = @import("../stream/proxy_control.zig");
 const sessh_cli = @import("../sessh/cli.zig");
 const config = @import("../core/config.zig");
 const daemon_client = @import("../daemon/client.zig");
@@ -214,9 +213,21 @@ const PooledTerminalClient = struct {
     startup_timing_logged: bool = false,
     session_ended: bool = false,
     done: bool = false,
+    proxy_guid: [session_registry.proxy_guid_len]u8 = [_]u8{0} ** session_registry.proxy_guid_len,
+    proxy_guid_len: usize = 0,
 
     fn deinit(self: *PooledTerminalClient) void {
         self.* = undefined;
+    }
+
+    fn proxyGuidSlice(self: *const PooledTerminalClient) []const u8 {
+        return self.proxy_guid[0..self.proxy_guid_len];
+    }
+
+    fn setProxyGuid(self: *PooledTerminalClient, guid: []const u8) !void {
+        if (guid.len > self.proxy_guid.len) return error.ProxyGuidTooLarge;
+        @memcpy(self.proxy_guid[0..guid.len], guid);
+        self.proxy_guid_len = guid.len;
     }
 };
 
@@ -269,8 +280,163 @@ var terminal_pool_condition = std.Thread.Condition{};
 var terminal_tunnels: std.ArrayList(*TerminalTunnel) = .empty;
 var active_terminal_tunnels: std.atomic.Value(usize) = .init(0);
 
+const ProxyControlRegistration = struct {
+    allocator: std.mem.Allocator,
+    guid: []u8,
+    visible_fd: c.fd_t = -1,
+    stream_fd: c.fd_t = -1,
+
+    fn deinit(self: *ProxyControlRegistration) void {
+        self.allocator.free(self.guid);
+        self.* = undefined;
+    }
+};
+
+var proxy_control_mutex = std.Thread.Mutex{};
+var proxy_control_registrations: std.ArrayList(*ProxyControlRegistration) = .empty;
+
 pub fn activeTerminalTunnelCount() usize {
     return active_terminal_tunnels.load(.acquire);
+}
+
+pub fn serveProxyControlOpen(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    open: pb.ClientDaemonItem.ProxyControlOpen,
+) !void {
+    const guid = try session_registry.canonicalProxyGuid(allocator, open.proxy_guid);
+    defer allocator.free(guid);
+
+    try registerProxyControlVisible(allocator, guid, fd);
+    defer unregisterProxyControlVisible(fd);
+
+    while (true) {
+        var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return err,
+        };
+        defer frame.deinit(allocator);
+        if (!try proxyControlVisibleFrameIsAllowed(allocator, frame)) return error.UnexpectedProxyControlFrame;
+        try forwardProxyControlToStream(guid, frame);
+    }
+}
+
+fn registerProxyControlVisible(allocator: std.mem.Allocator, guid: []const u8, fd: c.fd_t) !void {
+    proxy_control_mutex.lock();
+    defer proxy_control_mutex.unlock();
+    const registration = try findOrCreateProxyControlRegistrationLocked(allocator, guid);
+    if (registration.visible_fd >= 0 and registration.visible_fd != fd) return error.ProxyControlAlreadyOpen;
+    registration.visible_fd = fd;
+}
+
+fn registerProxyControlStream(allocator: std.mem.Allocator, guid: []const u8, fd: c.fd_t) !void {
+    proxy_control_mutex.lock();
+    defer proxy_control_mutex.unlock();
+    const registration = try findOrCreateProxyControlRegistrationLocked(allocator, guid);
+    registration.stream_fd = fd;
+}
+
+fn unregisterProxyControlVisible(fd: c.fd_t) void {
+    proxy_control_mutex.lock();
+    defer proxy_control_mutex.unlock();
+    for (proxy_control_registrations.items) |registration| {
+        if (registration.visible_fd == fd) registration.visible_fd = -1;
+    }
+    removeUnusedProxyControlRegistrationsLocked();
+}
+
+fn unregisterProxyControlStream(fd: c.fd_t) void {
+    proxy_control_mutex.lock();
+    defer proxy_control_mutex.unlock();
+    for (proxy_control_registrations.items) |registration| {
+        if (registration.stream_fd == fd) registration.stream_fd = -1;
+    }
+    removeUnusedProxyControlRegistrationsLocked();
+}
+
+fn findOrCreateProxyControlRegistrationLocked(allocator: std.mem.Allocator, guid: []const u8) !*ProxyControlRegistration {
+    for (proxy_control_registrations.items) |registration| {
+        if (std.mem.eql(u8, registration.guid, guid)) return registration;
+    }
+    const registration = try allocator.create(ProxyControlRegistration);
+    errdefer allocator.destroy(registration);
+    registration.* = .{
+        .allocator = allocator,
+        .guid = try allocator.dupe(u8, guid),
+    };
+    errdefer registration.deinit();
+    try proxy_control_registrations.append(allocator, registration);
+    return registration;
+}
+
+fn removeUnusedProxyControlRegistrationsLocked() void {
+    var index: usize = 0;
+    while (index < proxy_control_registrations.items.len) {
+        const registration = proxy_control_registrations.items[index];
+        if (registration.visible_fd >= 0 or registration.stream_fd >= 0) {
+            index += 1;
+            continue;
+        }
+        _ = proxy_control_registrations.swapRemove(index);
+        const allocator = registration.allocator;
+        registration.deinit();
+        allocator.destroy(registration);
+    }
+}
+
+fn proxyControlVisibleFrameIsAllowed(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !bool {
+    if (frame.message_type != .client_daemon) return false;
+    var item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, frame.payload);
+    defer item.deinit(allocator);
+    return switch (item.payload orelse return false) {
+        .retry_now => true,
+        else => false,
+    };
+}
+
+fn forwardProxyControlToStream(guid: []const u8, frame: protocol.OwnedFrame) !void {
+    const stream_fd = proxyControlStreamFd(guid) orelse return;
+    protocol.sendFrame(stream_fd, frame.message_type, frame.payload) catch |err| {
+        unregisterProxyControlStream(stream_fd);
+        return err;
+    };
+}
+
+fn forwardProxyControlFromStream(allocator: std.mem.Allocator, guid: []const u8, frame: protocol.OwnedFrame) !void {
+    if (!try proxyControlStreamFrameIsAllowed(allocator, frame)) return error.UnexpectedProxyControlFrame;
+    const visible_fd = proxyControlVisibleFd(guid) orelse return;
+    protocol.sendFrame(visible_fd, frame.message_type, frame.payload) catch |err| {
+        unregisterProxyControlVisible(visible_fd);
+        return err;
+    };
+}
+
+fn proxyControlStreamFrameIsAllowed(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !bool {
+    if (frame.message_type != .client_daemon) return false;
+    var item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, frame.payload);
+    defer item.deinit(allocator);
+    return switch (item.payload orelse return false) {
+        .connection_event => true,
+        else => false,
+    };
+}
+
+fn proxyControlVisibleFd(guid: []const u8) ?c.fd_t {
+    proxy_control_mutex.lock();
+    defer proxy_control_mutex.unlock();
+    for (proxy_control_registrations.items) |registration| {
+        if (std.mem.eql(u8, registration.guid, guid) and registration.visible_fd >= 0) return registration.visible_fd;
+    }
+    return null;
+}
+
+fn proxyControlStreamFd(guid: []const u8) ?c.fd_t {
+    proxy_control_mutex.lock();
+    defer proxy_control_mutex.unlock();
+    for (proxy_control_registrations.items) |registration| {
+        if (std.mem.eql(u8, registration.guid, guid) and registration.stream_fd >= 0) return registration.stream_fd;
+    }
+    return null;
 }
 
 fn resolveSshTarget(
@@ -423,9 +589,6 @@ fn remoteSessionConfig(
     if (!result.common.scrollback_row_count_set) {
         if (file_config.scrollback_row_count) |count| result.common.scrollback_row_count = count;
     }
-    if (!result.common.initial_scrollback_row_count_set and file_config.initial_scrollback_row_count_set) {
-        result.common.initial_scrollback_row_count = file_config.initial_scrollback_row_count;
-    }
     if (!result.common.bootstrap_set) {
         if (file_config.bootstrap) |enabled| result.common.bootstrap = enabled;
     }
@@ -469,7 +632,7 @@ fn runRemoteNewSession(
             try io.writeAll(2, "sessh: --capture-tty-transcript is not supported with proxy stream mode\n");
             return process_exit.request(64);
         }
-        try runProxyStreamSsh(allocator, target, runtime_config.common, new);
+        try runProxyStreamSsh(allocator, exe, target, runtime_config.common, new);
     }
 
     const shell_command = try shellCommandFromRemoteArgs(allocator, new.shell_command_args);
@@ -1004,6 +1167,14 @@ fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerm
             defer item.deinit(tunnel.allocator);
             try sendPooledTeMuxPayload(tunnel, client, item);
         },
+        .client_daemon => {
+            if (client.kind != .proxy or client.proxy_guid_len == 0) {
+                try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected proxy control frame", "");
+                finishPooledTerminalClient(tunnel, client, true);
+                return;
+            }
+            try forwardProxyControlFromStream(tunnel.allocator, client.proxyGuidSlice(), frame);
+        },
         else => {
             try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected terminal client frame", "");
             finishPooledTerminalClient(tunnel, client, true);
@@ -1062,8 +1233,36 @@ fn sendPooledProxyMuxFrame(
     var mux_frame = try protocol.decodeDaemonMuxStreamFrame(tunnel.allocator, payload);
     defer mux_frame.deinit(tunnel.allocator);
     if (mux_frame.stream_id != client.local_stream_id) return error.UnexpectedDaemonFrame;
+    try maybeRegisterProxyControlStream(tunnel.allocator, client, mux_frame);
     mux_frame.stream_id = client.stream_id;
     try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, mux_frame);
+}
+
+fn maybeRegisterProxyControlStream(
+    allocator: std.mem.Allocator,
+    client: *PooledTerminalClient,
+    mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
+) !void {
+    if (client.proxy_guid_len != 0) return;
+    const message = mux_frame.message orelse return;
+    const payload = switch (message) {
+        .payload => |payload| payload,
+        else => return,
+    };
+    const item = payload.item orelse return;
+    const proxy = switch (item) {
+        .proxy => |proxy_item| proxy_item,
+        else => return,
+    };
+    const proxy_payload = proxy.payload orelse return;
+    const open = switch (proxy_payload) {
+        .open => |open| open,
+        else => return,
+    };
+    const canonical = try session_registry.canonicalProxyGuid(allocator, open.proxy_guid);
+    defer allocator.free(canonical);
+    try client.setProxyGuid(canonical);
+    try registerProxyControlStream(allocator, canonical, client.fd);
 }
 
 fn sendPooledTeMuxPayload(
@@ -1167,6 +1366,7 @@ fn finishPooledTerminalClient(
     client: *PooledTerminalClient,
     send_hangup: bool,
 ) void {
+    if (client.kind == .proxy) unregisterProxyControlStream(client.fd);
     if (send_hangup and client.state == .active) {
         switch (client.kind) {
             .te => if (!client.session_ended) {
@@ -1842,8 +2042,8 @@ fn bootstrapStatusBytes(status: BootstrapStatus) []const u8 {
 fn sendBootstrapStatus(client_status_fd: c.fd_t, status: BootstrapStatus) !void {
     if (client_status_fd >= 0) {
         switch (status) {
-            .started => try protocol.sendSshTransportBootstrapStartedFrame(app_allocator.allocator(), client_status_fd),
-            .finished => try protocol.sendSshTransportBootstrapFinishedFrame(app_allocator.allocator(), client_status_fd),
+            .started => try protocol.sendSshTransportBinaryBootstrappingFrame(app_allocator.allocator(), client_status_fd),
+            .finished => try protocol.sendSshTransportDaemonConnectingFrame(app_allocator.allocator(), client_status_fd),
         }
     } else {
         try io.writeAll(2, bootstrapStatusBytes(status));
@@ -2224,10 +2424,23 @@ const DaemonStreamClientStarter = struct {
     }
 };
 
-fn proxyStreamReconnectStatusMode(level: config.FilterLevel, has_client_socket: bool) stream_runtime.StreamReconnectStatusMode {
+fn openProxyControl(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    guid: []const u8,
+) !c.fd_t {
+    const fd = try daemon_client.connectOrStart(allocator, exe);
+    errdefer _ = c.close(fd);
+    try protocol.sendClientDaemonPayloadFrame(allocator, fd, .{ .proxy_control_open = .{
+        .proxy_guid = guid,
+    } });
+    return fd;
+}
+
+fn proxyStreamReconnectStatusMode(level: config.FilterLevel, has_daemon_control: bool) stream_runtime.StreamReconnectStatusMode {
     return switch (level) {
         .raw => .disabled,
-        .hygienic, .emulated => if (has_client_socket) .client_control else .stderr_plain,
+        .hygienic, .emulated => if (has_daemon_control) .client_control else .stderr_plain,
     };
 }
 
@@ -2260,6 +2473,7 @@ fn hasRemoteShellCommand(args: []const []const u8) bool {
 // opens a TCP connection to sshd on the remote machine.
 fn runProxyStreamSsh(
     allocator: std.mem.Allocator,
+    exe: []const u8,
     target: SshTarget,
     common: CommonSessionOptions,
     new: RemoteNewSession,
@@ -2272,22 +2486,18 @@ fn runProxyStreamSsh(
         c.isatty(posix.STDIN_FILENO) != 0,
         c.isatty(posix.STDOUT_FILENO) != 0,
     );
-    var client_socket_guid: ?[]u8 = null;
-    defer if (client_socket_guid) |guid| allocator.free(guid);
-    var client_socket_allocation: ?session_registry.SocketPathAllocation = null;
-    defer if (client_socket_allocation) |*allocation| allocation.deinit(allocator);
-    var client_socket_listen_fd: c.fd_t = -1;
-    defer if (client_socket_listen_fd >= 0) posix.close(client_socket_listen_fd);
-    if (diagnostics_plan.use_client_socket) {
-        const runtime_root = try socket_transport.runtimeRoot(allocator);
-        defer allocator.free(runtime_root);
-        client_socket_guid = try session_registry.generateProxyGuid(allocator);
-        client_socket_allocation = try session_registry.allocateClientSocketPathForGuidInRoot(allocator, runtime_root, client_socket_guid.?);
-        client_socket_listen_fd = try socket_transport.listenSocket(client_socket_allocation.?.path);
+    var control_guid: ?[]u8 = null;
+    defer if (control_guid) |guid| allocator.free(guid);
+    var client_control_fd: c.fd_t = -1;
+    defer if (client_control_fd >= 0) posix.close(client_control_fd);
+    if (diagnostics_plan.use_daemon_control) {
+        control_guid = try session_registry.generateProxyGuid(allocator);
+        client_control_fd = try openProxyControl(
+            allocator,
+            exe,
+            control_guid.?,
+        );
     }
-    defer if (client_socket_allocation) |allocation| {
-        std.fs.deleteFileAbsolute(allocation.path) catch {};
-    };
     const daemon_dir_name = try daemon_socket_namespace.defaultDirName(allocator);
     defer allocator.free(daemon_dir_name);
     var runtime_executables = try daemon_executable.runtimeExecutablePaths(allocator, daemon_dir_name);
@@ -2297,7 +2507,7 @@ fn runProxyStreamSsh(
         allocator,
         runtime_executables.proxy,
         target.options,
-        if (client_socket_allocation) |allocation| allocation.path else null,
+        control_guid,
         diagnostics_plan.command_level,
         diagnostics_plan.client_ctrl_r,
         common.bootstrap,
@@ -2322,18 +2532,22 @@ fn runProxyStreamSsh(
     index += 1;
     @memcpy(ssh_args[index..], new.shell_command_args);
 
-    if (diagnostics_plan.wrap_visible_ssh and client_socket_listen_fd >= 0) {
-        try plain_ssh.runArgvUnderLocalPty(allocator, ssh_args, client_socket_listen_fd, diagnostics_plan.client_ctrl_r, "proxy-stream");
+    if (diagnostics_plan.wrap_visible_ssh and client_control_fd >= 0) {
+        const fd = client_control_fd;
+        client_control_fd = -1;
+        try plain_ssh.runArgvUnderLocalPty(allocator, ssh_args, fd, diagnostics_plan.client_ctrl_r, "proxy-stream");
     }
-    if (diagnostics_plan.use_client_socket and client_socket_listen_fd >= 0) {
-        try plain_ssh.runArgvWithDiagnosticsThread(allocator, ssh_args, client_socket_listen_fd, "proxy-stream");
+    if (diagnostics_plan.use_daemon_control and client_control_fd >= 0) {
+        const fd = client_control_fd;
+        client_control_fd = -1;
+        try plain_ssh.runArgvWithDiagnosticsThread(allocator, ssh_args, fd, "proxy-stream");
     }
     try plain_ssh.runArgv(allocator, ssh_args, "proxy-stream");
 }
 
 const ProxyDiagnosticsPlan = struct {
     command_level: config.FilterLevel,
-    use_client_socket: bool,
+    use_daemon_control: bool,
     wrap_visible_ssh: bool,
     client_ctrl_r: bool,
 };
@@ -2349,21 +2563,21 @@ fn proxyDiagnosticsPlan(
     return switch (filter_level) {
         .raw => .{
             .command_level = .raw,
-            .use_client_socket = false,
+            .use_daemon_control = false,
             .wrap_visible_ssh = false,
             .client_ctrl_r = false,
         },
         .hygienic, .emulated => blk: {
             if (!stdin_is_tty or !stdout_is_tty) break :blk .{
                 .command_level = .raw,
-                .use_client_socket = false,
+                .use_daemon_control = false,
                 .wrap_visible_ssh = false,
                 .client_ctrl_r = false,
             };
             const wrap_visible_ssh = outerSshAllocatesTty(ssh_options, tty_request, shell_command_args, stdin_is_tty);
             break :blk .{
                 .command_level = .hygienic,
-                .use_client_socket = true,
+                .use_daemon_control = true,
                 .wrap_visible_ssh = wrap_visible_ssh,
                 .client_ctrl_r = wrap_visible_ssh and stdin_is_tty,
             };
@@ -2447,7 +2661,7 @@ fn proxyCommandOption(
     allocator: std.mem.Allocator,
     exe: []const u8,
     ssh_options: []const []const u8,
-    client_socket: ?[]const u8,
+    control_guid: ?[]const u8,
     filter_level: config.FilterLevel,
     client_ctrl_r: bool,
     bootstrap: bool,
@@ -2467,9 +2681,9 @@ fn proxyCommandOption(
     try appendShellToken(allocator, &command, "--filter-level");
     try appendShellToken(allocator, &command, filter_level.label());
     try appendShellToken(allocator, &command, if (bootstrap) "--bootstrap" else "--no-bootstrap");
-    if (client_socket) |path| {
-        try appendShellToken(allocator, &command, "--client-socket");
-        try appendShellToken(allocator, &command, path);
+    if (control_guid) |guid| {
+        try appendShellToken(allocator, &command, "--control-guid");
+        try appendShellToken(allocator, &command, guid);
         try appendShellToken(allocator, &command, "--client-ctrl-r");
         try appendShellToken(allocator, &command, if (client_ctrl_r) "1" else "0");
     }
@@ -2535,7 +2749,7 @@ const ProxyStreamInvocation = struct {
     host: []const u8,
     port: []const u8,
     user: []const u8 = "",
-    client_socket: ?[]const u8 = null,
+    control_guid: ?[]const u8 = null,
     filter_level: config.FilterLevel = .raw,
     client_ctrl_r: bool = false,
     bootstrap: bool = true,
@@ -2577,24 +2791,9 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .bootstrap = invocation.bootstrap,
     };
 
-    var client_control_fd: c.fd_t = -1;
-    if (invocation.client_socket) |path| {
-        client_control_fd = socket_transport.connectSocket(path) catch |err| blk: {
-            client_log.userDiagnosticInfo("proxy control socket unavailable: {t}", .{err});
-            break :blk -1;
-        };
-        if (client_control_fd >= 0) {
-            proxy_control.clientHandshake(allocator, client_control_fd) catch |err| {
-                client_log.userDiagnosticInfo("proxy control unavailable: {t}", .{err});
-                posix.close(client_control_fd);
-                client_control_fd = -1;
-            };
-        }
-    }
-    defer if (client_control_fd >= 0) posix.close(client_control_fd);
     const status_mode = proxyStreamReconnectStatusMode(
         invocation.filter_level,
-        client_control_fd >= 0,
+        invocation.control_guid != null,
     );
 
     const exit_status = stream_runtime.runLocalStream(allocator, &starter, .{
@@ -2605,8 +2804,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .sink_fd = 1,
         .status_mode = status_mode,
         .intercept_ctrl_r = false,
-        .control_fd = client_control_fd,
-        .ctrl_r_status_enabled = invocation.client_ctrl_r and client_control_fd >= 0,
+        .ctrl_r_status_enabled = invocation.client_ctrl_r and invocation.control_guid != null,
         .title_fallback = invocation.host,
         .reset_on_source_eof = true,
     }) catch |err| {
@@ -2647,10 +2845,11 @@ fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []cons
             if (i >= args.len) return error.MissingSshOptionValue;
             try invocation.ssh_options.append(allocator, args[i]);
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--client-socket")) {
+        } else if (std.mem.eql(u8, arg, "--control-guid")) {
             i += 1;
-            if (i >= args.len or args[i].len == 0) return error.MissingClientSocket;
-            invocation.client_socket = args[i];
+            if (i >= args.len or args[i].len == 0) return error.MissingProxyControlGuid;
+            if (!session_registry.isValidProxyGuid(args[i])) return error.InvalidProxyControlGuid;
+            invocation.control_guid = args[i];
             i += 1;
         } else if (std.mem.eql(u8, arg, "--filter-level")) {
             i += 1;
@@ -2684,7 +2883,8 @@ fn printProxyStreamArgError(err: anyerror) !void {
         error.MissingProxyPort => try io.writeAll(2, "sessh: :internal-proxy-stream: requires --port PORT\n"),
         error.MissingProxyUser => try io.writeAll(2, "sessh: :internal-proxy-stream: --user requires a value\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: :internal-proxy-stream: --ssh-option requires a value\n"),
-        error.MissingClientSocket => try io.writeAll(2, "sessh: :internal-proxy-stream: --client-socket requires a path\n"),
+        error.MissingProxyControlGuid => try io.writeAll(2, "sessh: :internal-proxy-stream: --control-guid requires a p-guid\n"),
+        error.InvalidProxyControlGuid => try io.writeAll(2, "sessh: :internal-proxy-stream: --control-guid requires a valid p-guid\n"),
         error.MissingFilterLevel => try io.writeAll(2, "sessh: :internal-proxy-stream: --filter-level requires a value\n"),
         error.InvalidFilterLevel => try io.writeAll(2, "sessh: :internal-proxy-stream: invalid filter level\n"),
         error.MissingClientCtrlR => try io.writeAll(2, "sessh: :internal-proxy-stream: --client-ctrl-r requires a value\n"),
@@ -2849,7 +3049,6 @@ pub fn printSshArgError(err: anyerror) !void {
     switch (err) {
         error.MissingHost => try io.writeAll(2, "sessh: missing host\n"),
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
-        error.MissingInitialScrollback => try io.writeAll(2, "sessh: --initial-scrollback requires a value\n"),
         error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
         error.MissingFilterLevel => try io.writeAll(2, "sessh: --filter-level requires one of: raw, hygienic, emulated\n"),
         error.MissingTtyTranscriptPath => try io.writeAll(2, "sessh: --capture-tty-transcript requires a path\n"),
@@ -2857,7 +3056,6 @@ pub fn printSshArgError(err: anyerror) !void {
         error.SesshOptionAfterHost => try io.writeAll(2, "sessh: sessh options must appear before HOST\n"),
         error.ConflictingSesshAction => try io.writeAll(2, "sessh: conflicting sessh actions\n"),
         error.InvalidScrollbackRowCount => try io.writeAll(2, "sessh: invalid scrollback row count\n"),
-        error.InvalidInitialScrollback => try io.writeAll(2, "sessh: invalid initial scrollback\n"),
         error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
         error.InvalidFilterLevel => try io.writeAll(2, "sessh: invalid filter level; expected one of: raw, hygienic, emulated\n"),
         error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
@@ -3057,7 +3255,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(shouldUseProxyStreamForTest(parsed, true));
 
-    const option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "/tmp/sessh-test/c/abc", .hygienic, true, true);
+    const option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "p-550e8400-e29b-41d4-a716-446655440000", .hygienic, true, true);
     defer std.testing.allocator.free(option);
 
     try std.testing.expect(std.mem.indexOf(u8, option, "sessh-proxy") != null);
@@ -3068,8 +3266,8 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "--filter-level") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "hygienic") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--bootstrap") != null);
-    try std.testing.expect(std.mem.indexOf(u8, option, "--client-socket") != null);
-    try std.testing.expect(std.mem.indexOf(u8, option, "/tmp/sessh-test/c/abc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "--control-guid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "p-550e8400-e29b-41d4-a716-446655440000") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--client-ctrl-r") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "BatchMode=yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "-v") != null);
@@ -3081,6 +3279,74 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     const no_bootstrap_option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .raw, false, false);
     defer std.testing.allocator.free(no_bootstrap_option);
     try std.testing.expect(std.mem.indexOf(u8, no_bootstrap_option, "--no-bootstrap") != null);
+}
+
+test "proxy control registry routes diagnostics and retry by proxy guid" {
+    const allocator = std.testing.allocator;
+    const guid = "p-550e8400-e29b-41d4-a716-446655440000";
+
+    var visible: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &visible) != 0) return error.SocketPairFailed;
+    defer _ = c.close(visible[0]);
+    defer _ = c.close(visible[1]);
+
+    var stream: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &stream) != 0) return error.SocketPairFailed;
+    defer _ = c.close(stream[0]);
+    defer _ = c.close(stream[1]);
+
+    defer {
+        unregisterProxyControlVisible(visible[0]);
+        unregisterProxyControlStream(stream[0]);
+        proxy_control_registrations.deinit(allocator);
+        proxy_control_registrations = .empty;
+    }
+
+    try registerProxyControlVisible(allocator, guid, visible[0]);
+    try registerProxyControlStream(allocator, guid, stream[0]);
+
+    const stderr_payload = try protocol.encodePayload(allocator, pb.ClientDaemonItem{ .payload = .{
+        .connection_event = .{ .event = .{ .ssh_stderr = .{ .data = "proxy stderr line" } } },
+    } });
+    defer allocator.free(stderr_payload);
+    try forwardProxyControlFromStream(allocator, guid, .{
+        .message_type = .client_daemon,
+        .payload = stderr_payload,
+    });
+
+    var visible_frame = try protocol.readFrameAlloc(allocator, visible[1]);
+    defer visible_frame.deinit(allocator);
+    try std.testing.expectEqual(protocol.MessageType.client_daemon, visible_frame.message_type);
+    var visible_item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, visible_frame.payload);
+    defer visible_item.deinit(allocator);
+    const event = switch (visible_item.payload orelse return error.MissingProxyControlPayload) {
+        .connection_event => |event| event,
+        else => return error.UnexpectedProxyControlFrame,
+    };
+    const stderr = switch (event.event orelse return error.MissingProxyControlPayload) {
+        .ssh_stderr => |stderr| stderr,
+        else => return error.UnexpectedProxyControlFrame,
+    };
+    try std.testing.expectEqualStrings("proxy stderr line", stderr.data);
+
+    const retry_payload = try protocol.encodePayload(allocator, pb.ClientDaemonItem{ .payload = .{
+        .retry_now = .{},
+    } });
+    defer allocator.free(retry_payload);
+    try forwardProxyControlToStream(guid, .{
+        .message_type = .client_daemon,
+        .payload = retry_payload,
+    });
+
+    var stream_frame = try protocol.readFrameAlloc(allocator, stream[1]);
+    defer stream_frame.deinit(allocator);
+    try std.testing.expectEqual(protocol.MessageType.client_daemon, stream_frame.message_type);
+    var stream_item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, stream_frame.payload);
+    defer stream_item.deinit(allocator);
+    switch (stream_item.payload orelse return error.MissingProxyControlPayload) {
+        .retry_now => {},
+        else => return error.UnexpectedProxyControlFrame,
+    }
 }
 
 test "stream routing preserves ssh remote command tty semantics" {
@@ -3243,7 +3509,7 @@ test "proxy stream reconnect status follows filter level" {
     try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.emulated, true));
 }
 
-test "proxy diagnostics plan maps emulated to hygienic client socket" {
+test "proxy diagnostics plan maps emulated to daemon control" {
     var parsed = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
         "--no-terminal-emulator",
@@ -3253,19 +3519,19 @@ test "proxy diagnostics plan maps emulated to hygienic client socket" {
 
     const interactive = proxyDiagnosticsPlanForTest(parsed, true, true);
     try std.testing.expectEqual(config.FilterLevel.hygienic, interactive.command_level);
-    try std.testing.expect(interactive.use_client_socket);
+    try std.testing.expect(interactive.use_daemon_control);
     try std.testing.expect(interactive.wrap_visible_ssh);
     try std.testing.expect(interactive.client_ctrl_r);
 
     const no_stdout = proxyDiagnosticsPlanForTest(parsed, true, false);
     try std.testing.expectEqual(config.FilterLevel.raw, no_stdout.command_level);
-    try std.testing.expect(!no_stdout.use_client_socket);
+    try std.testing.expect(!no_stdout.use_daemon_control);
     try std.testing.expect(!no_stdout.wrap_visible_ssh);
     try std.testing.expect(!no_stdout.client_ctrl_r);
 
     const no_stdin = proxyDiagnosticsPlanForTest(parsed, false, true);
     try std.testing.expectEqual(config.FilterLevel.raw, no_stdin.command_level);
-    try std.testing.expect(!no_stdin.use_client_socket);
+    try std.testing.expect(!no_stdin.use_daemon_control);
     try std.testing.expect(!no_stdin.wrap_visible_ssh);
     try std.testing.expect(!no_stdin.client_ctrl_r);
 }
@@ -3282,7 +3548,7 @@ test "proxy diagnostics plan honors raw level" {
     try std.testing.expectEqual(config.FilterLevel.raw, raw.invocation.common.filter_level);
     const raw_plan = proxyDiagnosticsPlanForTest(raw, true, true);
     try std.testing.expectEqual(config.FilterLevel.raw, raw_plan.command_level);
-    try std.testing.expect(!raw_plan.use_client_socket);
+    try std.testing.expect(!raw_plan.use_daemon_control);
 }
 
 test "proxy diagnostics plan disables ctrl-r when visible ssh is not wrapped" {
@@ -3297,7 +3563,7 @@ test "proxy diagnostics plan disables ctrl-r when visible ssh is not wrapped" {
 
     const plan = proxyDiagnosticsPlanForTest(parsed, true, true);
     try std.testing.expectEqual(config.FilterLevel.hygienic, plan.command_level);
-    try std.testing.expect(plan.use_client_socket);
+    try std.testing.expect(plan.use_daemon_control);
     try std.testing.expect(!plan.wrap_visible_ssh);
     try std.testing.expect(!plan.client_ctrl_r);
 }

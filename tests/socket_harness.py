@@ -53,6 +53,7 @@ SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST = "te_session_client_debug_
 PING = "ping"
 PONG = "pong"
 MUX_STREAM_FRAME = "mux_stream_frame"
+CLIENT_DAEMON = "client_daemon"
 
 _HELLO_FRAME_FIELDS = {
     HELLO_REQUEST: HELLO_REQUEST,
@@ -61,6 +62,7 @@ _HELLO_FRAME_FIELDS = {
 }
 _FRAME_FIELDS = {
     ERROR: ERROR,
+    CLIENT_DAEMON: CLIENT_DAEMON,
 }
 _TE_STREAM_ITEM_FIELDS = {
     TERMINAL_STREAM_OPEN: "open",
@@ -463,7 +465,6 @@ def pack_session_create(
     command_argv=None,
     shell_command=None,
     tty_settings=None,
-    initial_scrollback=None,
 ):
     global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
@@ -479,10 +480,7 @@ def pack_session_create(
     repaint = message.resize.repaint_request
     repaint.repaint_request_seq = _NEXT_REPAINT_REQUEST_SEQ
     _NEXT_REPAINT_REQUEST_SEQ += 1
-    if initial_scrollback != 0:
-        repaint.scrollback_cursor = b""
-    if initial_scrollback is not None:
-        repaint.initial_scrollback_rows = initial_scrollback
+    repaint.scrollback_cursor = b""
     entry = create.environment.add()
     entry.name = "SHELL"
     entry.value = str(shell)
@@ -502,12 +500,11 @@ def pack_session_create(
     return message.SerializeToString()
 
 
-def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_guid="", session_dir_path=""):
+def pack_session_attach(reconnect_cursor=None, session_guid=""):
     global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
     message = pb.TerminalEmulatorItem.Open()
     message.session_guid = session_guid
-    _ = session_dir_path
     rows, cols = _LAST_RESIZE
     message.resize.terminal_rows = rows
     message.resize.terminal_cols = cols
@@ -517,11 +514,6 @@ def pack_session_attach(initial_scrollback=None, reconnect_cursor=None, session_
     if reconnect_cursor is not None:
         epoch, cursor = reconnect_cursor
         repaint.scrollback_cursor = encode_scrollback_cursor(epoch, cursor)
-    else:
-        if initial_scrollback != 0:
-            repaint.scrollback_cursor = b""
-        if initial_scrollback is not None:
-            repaint.initial_scrollback_rows = initial_scrollback
     return message.SerializeToString()
 
 
@@ -584,7 +576,6 @@ def create_and_attach_session(
     fg=0xFFFFFFFF,
     bg=0xFFFFFFFF,
     session_id=None,
-    initial_scrollback=None,
     command_argv=None,
     shell_command=None,
     tty_settings=None,
@@ -601,7 +592,6 @@ def create_and_attach_session(
             command_argv=command_argv,
             shell_command=shell_command,
             tty_settings=tty_settings,
-            initial_scrollback=initial_scrollback,
         ),
     )
 
@@ -852,23 +842,12 @@ def read_until_pipe(pipe, needle, timeout=5.0):
     return data
 
 
-def sessions_dir(env):
-    runtime_dir = env.get("XDG_RUNTIME_DIR")
-    if not runtime_dir:
-        raise AssertionError("socket harness requires XDG_RUNTIME_DIR")
-    return Path(runtime_dir) / "guid"
-
-
 def runtime_root(env):
     return Path(env["XDG_RUNTIME_DIR"])
 
 
 def state_root(env):
     return Path(env["XDG_STATE_HOME"]) / "sessh"
-
-
-def state_sessions_dir(env):
-    return state_root(env) / "guid"
 
 
 def is_guid_ref(value):
@@ -899,12 +878,6 @@ def assert_runtime_dir_symlink(env, expected_runtime_root):
     actual = Path(os.readlink(link))
     if actual != Path(expected_runtime_root):
         raise AssertionError(f"runtime dir pointer target mismatch: expected {expected_runtime_root}, got {actual}")
-
-
-def session_dir(env, session_id=None):
-    if session_id is None:
-        session_id = test_session_guid(1)
-    return sessions_dir(env) / guid_for_ref(session_id)
 
 
 def socket_path(env, session_id=None):
@@ -2495,31 +2468,6 @@ def run_scrollback_attach_draw_protocol_test(base_env):
                     raise AssertionError(f"latest repaint did not include requested retained scrollback: {second_draw!r}")
             finally:
                 conn.close()
-
-            attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            attach.settimeout(5.0)
-            try:
-                attach.connect(str(socket_path(env)))
-                send_hello(attach)
-                send_resize(attach, 3, 40)
-                send_frame(
-                    attach,
-                    SESSION_ATTACH,
-                    pack_session_attach(
-                        session_guid=test_session_guid(1),
-                        session_dir_path=session_dir(env, test_session_guid(1)),
-                    ),
-                )
-
-                message_type, _ = recv_frame(attach)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-
-                draw = recv_draw(attach)
-                if draw["scrollback_cursor"] == 0 or b"history_01" not in draw["draw_bytes"]:
-                    raise AssertionError(f"missing retained scrollback rows in attach DRAW: {draw!r}")
-            finally:
-                attach.close()
         finally:
             cleanup_runtime(env)
 
@@ -2579,7 +2527,6 @@ def run_scrollback_clear_protocol_test(base_env):
                     SESSION_ATTACH,
                     pack_session_attach(
                         session_guid=test_session_guid(1),
-                        session_dir_path=session_dir(env, test_session_guid(1)),
                     ),
                 )
 
@@ -2646,7 +2593,6 @@ def attach_gap_session(env, reconnect_cursor=None):
         SESSION_ATTACH,
         pack_session_attach(
             session_guid=test_session_guid(1),
-            session_dir_path=session_dir(env, test_session_guid(1)),
             reconnect_cursor=reconnect_cursor,
         ),
     )
@@ -2729,17 +2675,6 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
                     raise AssertionError(f"post-reconnect input was not delivered: {post_output!r}")
             finally:
                 attach.close()
-
-            normal = attach_gap_session(env)
-            try:
-                _, attach_draws = recv_draw_until(normal, b"POST:after")
-                output = b"".join(draw["draw_bytes"] for draw in attach_draws)
-                # The post-reconnect command adds more retained history; a
-                # normal attach should report the full omitted prefix.
-                if b"--- sessh scrollback truncated: 21 lines ---" not in output:
-                    raise AssertionError(f"missing normal attach truncation marker: {output!r}")
-            finally:
-                normal.close()
         finally:
             cleanup_runtime(env)
 
@@ -2808,7 +2743,6 @@ def run_resize_epoch_does_not_clear_reconnect_scrollback_test(base_env):
                     SESSION_ATTACH,
                     pack_session_attach(
                         session_guid=test_session_guid(1),
-                        session_dir_path=session_dir(env, test_session_guid(1)),
                         reconnect_cursor=cursor,
                     ),
                 )
@@ -2954,12 +2888,9 @@ def run_broker_starts_daemon_session_test(base_env):
             assert_session_attached(payload)
             recv_draw_until(conn, b"BROKER_READY")
 
-            session_1_guid = test_session_guid(1)
-            session_path = session_dir(env, session_1_guid)
-            for legacy_name in ("meta.json", "compat"):
-                legacy_path = session_path / legacy_name
-                if legacy_path.exists() or legacy_path.is_symlink():
-                    raise AssertionError(f"broker session wrote legacy file {legacy_path}")
+            guid_dir = runtime_root(env) / "guid"
+            if guid_dir.exists():
+                raise AssertionError(f"broker session wrote legacy runtime GUID directory {guid_dir}")
             assert_runtime_dir_symlink(env, Path(env["XDG_RUNTIME_DIR"]))
 
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
@@ -2968,7 +2899,6 @@ def run_broker_starts_daemon_session_test(base_env):
             proc.wait(timeout=5.0)
             if proc.returncode != 0:
                 raise AssertionError(proc.stderr.read().decode("utf-8", "replace"))
-            wait_missing(session_path)
         finally:
             if proc.poll() is None:
                 proc.terminate()

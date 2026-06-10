@@ -6,8 +6,6 @@ const config = @import("../core/config.zig");
 
 pub const FileConfig = struct {
     scrollback_row_count: ?u32 = null,
-    initial_scrollback_row_count: ?u32 = null,
-    initial_scrollback_row_count_set: bool = false,
     client_log_level: ?client_log.Level = null,
     bootstrap: ?bool = null,
     terminal_emulator: ?bool = null,
@@ -65,9 +63,6 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
 
         if (keyMatches(key, "scrollback-limit")) {
             parsed.scrollback_row_count = try parseScrollbackRowCount(value);
-        } else if (keyMatches(key, "initial-scrollback")) {
-            parsed.initial_scrollback_row_count = try parseInitialScrollbackRowCount(value);
-            parsed.initial_scrollback_row_count_set = true;
         } else if (keyMatches(key, "client-log-level")) {
             parsed.client_log_level = try client_log.parseLevel(value);
         } else if (keyMatches(key, "bootstrap")) {
@@ -116,13 +111,6 @@ pub fn parseScrollbackRowCount(value: []const u8) !u32 {
     return parsed;
 }
 
-pub fn parseInitialScrollbackRowCount(value: []const u8) !?u32 {
-    const parsed = std.fmt.parseInt(i64, value, 10) catch return error.InvalidInitialScrollback;
-    if (parsed == -1) return null;
-    if (parsed < 0 or parsed > std.math.maxInt(u32)) return error.InvalidInitialScrollback;
-    return @intCast(parsed);
-}
-
 fn parseHoursMs(value: []const u8, invalid_error: anyerror) !u64 {
     const parsed = std.fmt.parseFloat(f64, value) catch return invalid_error;
     if (parsed != parsed) return invalid_error;
@@ -153,7 +141,6 @@ test "parseEnvConfig accepts sessh env keys" {
     const parsed = try parseEnvConfig(
         \\# comment
         \\scrollback-limit=42
-        \\initial-scrollback=0
         \\client-log-level=debug
         \\bootstrap=false
         \\terminal-emulator=no
@@ -163,20 +150,12 @@ test "parseEnvConfig accepts sessh env keys" {
         \\
     );
     try std.testing.expectEqual(@as(?u32, 42), parsed.scrollback_row_count);
-    try std.testing.expect(parsed.initial_scrollback_row_count_set);
-    try std.testing.expectEqual(@as(?u32, 0), parsed.initial_scrollback_row_count);
     try std.testing.expectEqual(@as(?client_log.Level, .debug), parsed.client_log_level);
     try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
     try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
     try std.testing.expectEqual(@as(?config.FilterLevel, .hygienic), parsed.filter_level);
     try std.testing.expectEqual(@as(?u64, 7_200_000), parsed.cleanup_retry_ms);
     try std.testing.expectEqual(@as(?u64, 5_400_000), parsed.disconnected_reap_ms);
-}
-
-test "parseEnvConfig maps initial scrollback minus one to all retained rows" {
-    const parsed = try parseEnvConfig("INITIAL_SCROLLBACK=-1\n");
-    try std.testing.expect(parsed.initial_scrollback_row_count_set);
-    try std.testing.expectEqual(@as(?u32, null), parsed.initial_scrollback_row_count);
 }
 
 test "parseEnvConfig maps non-positive disconnected reap hours to disabled" {

@@ -480,6 +480,11 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                         try transport_ssh.serveTerminalTransportFromDaemon(allocator, fd, request);
                         return;
                     },
+                    .proxy_control_open => |request| {
+                        daemon_log.infof(allocator, "proxy control requested guid={s}", .{request.proxy_guid});
+                        try transport_ssh.serveProxyControlOpen(allocator, fd, request);
+                        return;
+                    },
                     .log_request => {
                         try serveDaemonLogRequest(allocator, fd);
                         return;

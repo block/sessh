@@ -3,10 +3,8 @@ const c = std.c;
 const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
-const config = @import("../core/config.zig");
 const protocol = @import("../protocol/mod.zig");
 const pb = protocol.pb;
-const hpb = protocol.hpb;
 
 pub const Message = union(enum) {
     connection_event: pb.ConnectionEvent,
@@ -24,32 +22,6 @@ pub const OwnedMessage = struct {
         self.* = undefined;
     }
 };
-
-pub fn clientHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendHelloRequest(fd);
-    try readHelloOk(allocator, fd);
-
-    var peer_hello = try readHelloRequest(allocator, fd, fd);
-    defer peer_hello.deinit(allocator);
-    if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "proxy control client is incompatible with this sessh", "");
-        return error.VersionMismatch;
-    }
-    try sendHelloOk(fd);
-}
-
-pub fn serverHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    var peer_hello = try readHelloRequest(allocator, fd, fd);
-    defer peer_hello.deinit(allocator);
-    if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "proxy control server is incompatible with this sessh", "");
-        return error.VersionMismatch;
-    }
-    try sendHelloOk(fd);
-
-    try sendHelloRequest(fd);
-    try readHelloOk(allocator, fd);
-}
 
 pub fn writeConnectionEvent(fd: c.fd_t, event: pb.ConnectionEvent.event_union) !void {
     try protocol.sendClientDaemonConnectionEventFrame(app_allocator.allocator(), fd, event);
@@ -76,87 +48,11 @@ pub fn readMessage(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
     };
 }
 
-fn sendHelloRequest(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloRequest{
-        .protocol_major = config.protocol_major,
-        .protocol_minor = config.protocol_minor,
-        .version = config.version,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_request, payload);
-}
-
-fn sendHelloOk(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_ok, payload);
-}
-
-fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloError{
-        .code = code,
-        .message = message,
-        .hint = hint,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_error, payload);
-}
-
-fn readHelloOk(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .hello_ok => {
-                var ok = try protocol.decodePayload(hpb.HelloOk, allocator, frame.payload);
-                defer ok.deinit(allocator);
-                return;
-            },
-            .hello_error => {
-                var err = try protocol.decodePayload(hpb.HelloError, allocator, frame.payload);
-                defer err.deinit(allocator);
-                return error.PeerRejectedProxyControlHandshake;
-            },
-            else => return error.UnexpectedProxyControlFrame,
-        }
-    }
-}
-
-fn readHelloRequest(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !hpb.HelloRequest {
-    while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, read_fd);
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
-            .daemon_tunnel => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, write_fd);
-            },
-            else => {
-                try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
-                return error.UnexpectedProxyControlFrame;
-            },
-        }
-    }
-}
-
-fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
-    return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
-}
-
-test "proxy control protocol uses framed protobuf messages" {
+test "proxy control uses client daemon frames" {
     var fds: [2]c.fd_t = undefined;
     if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
-
-    const Server = struct {
-        fn run(fd: c.fd_t) void {
-            serverHandshake(std.testing.allocator, fd) catch @panic("proxy control server handshake failed");
-        }
-    };
-    const thread = try std.Thread.spawn(.{}, Server.run, .{fds[0]});
-    try clientHandshake(std.testing.allocator, fds[1]);
-    thread.join();
 
     try writeConnectionEvent(fds[0], .{ .daemon_disconnected = .{
         .retry_at_local_boot_time_ms = 1234,

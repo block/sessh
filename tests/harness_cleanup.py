@@ -15,13 +15,6 @@ from pathlib import Path
 TEST_ROOT_SENTINEL = ".sessh-test-root"
 
 
-def sessions_dir(env):
-    runtime_dir = env.get("XDG_RUNTIME_DIR")
-    if not runtime_dir:
-        raise AssertionError("test cleanup requires XDG_RUNTIME_DIR")
-    return Path(runtime_dir) / "guid"
-
-
 def state_root(env):
     state_home = env.get("XDG_STATE_HOME")
     if state_home:

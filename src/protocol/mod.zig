@@ -165,12 +165,12 @@ pub fn sendSshTransportClosedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !vo
     try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .daemon_disconnected = .{} });
 }
 
-pub fn sendSshTransportBootstrapStartedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .bootstrap_started = .{} });
+pub fn sendSshTransportBinaryBootstrappingFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .binary_bootstrapping = .{} });
 }
 
-pub fn sendSshTransportBootstrapFinishedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .bootstrap_finished = .{} });
+pub fn sendSshTransportDaemonConnectingFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .daemon_connecting = .{} });
 }
 
 pub fn sendDaemonLogRequestFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.ClientDaemonItem.DaemonLogRequest) !void {

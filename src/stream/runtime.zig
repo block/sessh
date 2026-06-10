@@ -1318,6 +1318,10 @@ pub fn runLocalStream(
                 retrying = true;
                 continue :client_loop;
             };
+            if (options.status_mode == .client_control and options.control_fd < 0 and options.status_fd < 0) {
+                reconnect_status.setFd(transport.writeFd());
+                reconnect_status.clear();
+            }
             var old_unresponsive = false;
             while (true) {
                 attached_client.external_wakeup_fd = if (pending) |*replacement| replacement.notifyFd() else -1;
@@ -1358,6 +1362,9 @@ pub fn runLocalStream(
                     },
                     .transport_closed => {
                         transport.close();
+                        if (options.status_mode == .client_control and options.control_fd < 0 and options.status_fd < 0) {
+                            reconnect_status.setFd(-1);
+                        }
                         break :transport_loop;
                     },
                     .interrupted => {
@@ -1551,6 +1558,18 @@ fn handleFrame(
                 if (hint.len > 0) try io.stderrPrint("{s}\n", .{hint});
             }
             return error.StreamReset;
+        },
+        .client_daemon => {
+            var item = try protocol.decodePayload(pb.ClientDaemonItem, state.allocator, mutable.payload);
+            defer item.deinit(state.allocator);
+            switch (item.payload orelse return error.StreamUnexpectedFrame) {
+                .retry_now => {
+                    if (options.control_input) |control| {
+                        control.reconnect_requested = true;
+                    }
+                },
+                else => return error.StreamUnexpectedFrame,
+            }
         },
         else => return error.StreamUnexpectedFrame,
     }
@@ -2378,6 +2397,10 @@ const StreamReconnectStatus = struct {
 
     fn deinit(self: *StreamReconnectStatus) void {
         self.clear();
+    }
+
+    fn setFd(self: *StreamReconnectStatus, fd: c.fd_t) void {
+        self.fd = fd;
     }
 
     fn showRetry(self: *StreamReconnectStatus, delay_ms: u64) void {

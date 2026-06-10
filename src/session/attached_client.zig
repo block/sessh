@@ -325,8 +325,6 @@ pub const RuntimeSession = struct {
 
     guid: [session_registry.session_guid_len]u8 = [_]u8{0} ** session_registry.session_guid_len,
     guid_len: usize = 0,
-    session_dir: [4096]u8 = [_]u8{0} ** 4096,
-    session_dir_len: usize = 0,
     scrollback_cursor: ScrollbackCursor = .{},
     viewport_offset: i32 = 0,
     /// Latest outstanding RepaintRequest sequence. Older responses are stale.
@@ -398,21 +396,6 @@ pub const RuntimeSession = struct {
     pub fn titleFallbackSlice(self: *const RuntimeSession) []const u8 {
         if (self.title_fallback_len > 0) return self.title_fallback[0..self.title_fallback_len];
         return self.idSlice();
-    }
-
-    pub fn sessionDirSlice(self: *const RuntimeSession) []const u8 {
-        return self.session_dir[0..self.session_dir_len];
-    }
-
-    pub fn setSessionDir(self: *RuntimeSession, session_dir: []const u8) !void {
-        if (session_dir.len == 0) {
-            self.session_dir_len = 0;
-            return;
-        }
-        if (!std.mem.startsWith(u8, session_dir, "/")) return error.InvalidSessionDir;
-        if (session_dir.len > self.session_dir.len) return error.SessionDirTooLarge;
-        @memcpy(self.session_dir[0..session_dir.len], session_dir);
-        self.session_dir_len = session_dir.len;
     }
 
     pub fn setTitleFallback(self: *RuntimeSession, title: []const u8) void {
@@ -1015,7 +998,7 @@ fn attachReconnectRuntimeInner(
     cancelled: ?*const std.atomic.Value(bool),
     wait_for_repaint: bool,
 ) !void {
-    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), null, &session.scrollback_cursor, session.guidSlice());
+    session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), &session.scrollback_cursor, session.guidSlice());
     try readSessionAttachedInner(read_fd, write_fd, cancelled);
     if (wait_for_repaint) try finishReconnectRepaintInner(read_fd, write_fd, session, cancelled);
 }
@@ -1330,7 +1313,6 @@ fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
                 };
                 var session = RuntimeSession{};
                 try session.setIdentity(attached.session_guid);
-                try session.setSessionDir(attached.session_dir);
                 return session;
             },
             .client_daemon => switch (try handleClientDaemonFrame(frame.payload)) {
@@ -1544,7 +1526,6 @@ fn sendSessionAttach(
     conn: c.fd_t,
     size: WindowSize,
     viewport_offset: ?i32,
-    initial_scrollback_row_count: ?u32,
     reconnect_cursor: ?*const ScrollbackCursor,
     session_guid: []const u8,
 ) !u64 {
@@ -1560,11 +1541,6 @@ fn sendSessionAttach(
                 .scrollback_cursor = cursor.slice(),
             } else .{
                 .repaint_request_seq = repaint_request_seq,
-                .scrollback_cursor = if (initial_scrollback_row_count != null and initial_scrollback_row_count.? == 0)
-                    null
-                else
-                    "",
-                .initial_scrollback_rows = initial_scrollback_row_count,
             },
         },
         .capture_tty_transcript = tty_transcript.enabled(),
@@ -2303,12 +2279,11 @@ fn handleClientDaemonFrame(payload: []const u8) !ClientDaemonFrameAction {
 fn handleConnectionEvent(event: pb.ConnectionEvent) !ClientDaemonFrameAction {
     switch (event.event orelse return .unexpected) {
         .ssh_stderr => |stderr| client_log.appendSshStderr(stderr.data),
-        .bootstrap_started => try io_helpers.writeAll(2, "\rsessh: bootstrapping..."),
-        .bootstrap_finished => try io_helpers.writeAll(2, "\r\x1b[K"),
+        .binary_bootstrapping => try io_helpers.writeAll(2, "\rsessh: bootstrapping..."),
+        .daemon_connecting => try io_helpers.writeAll(2, "\r\x1b[K"),
         .daemon_disconnected => return .transport_closed,
         .ssh_connecting,
         .ssh_connected,
-        .daemon_connecting,
         .daemon_connected,
         .unresponsive,
         => {},

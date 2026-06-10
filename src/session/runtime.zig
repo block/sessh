@@ -105,7 +105,6 @@ const SessionRuntime = struct {
     shutting_down: bool = false,
     monotonic_clock: ?std.time.Timer = null,
     fixed_session_id: ?[]const u8 = null,
-    session_paths: ?session_registry.SessionPaths = null,
     started_session: bool = false,
 };
 
@@ -748,7 +747,6 @@ const SessionCreateRequest = struct {
 const RepaintRequest = struct {
     repaint_request_seq: u64,
     scrollback_cursor: ?ScrollbackCursor,
-    initial_scrollback_rows: ?u32 = null,
 };
 
 const ScrollbackCursor = struct {
@@ -1149,8 +1147,8 @@ fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
     };
 }
 
-pub fn startSessionRuntimeThread(allocator: std.mem.Allocator, session_dir: []const u8) !*RuntimeControl {
-    const guid = try allocator.dupe(u8, std.fs.path.basename(session_dir));
+pub fn startSessionRuntimeThread(allocator: std.mem.Allocator, session_guid: []const u8) !*RuntimeControl {
+    const guid = try session_registry.canonicalGuid(allocator, session_guid);
     errdefer allocator.free(guid);
 
     const notify_pipe = try posix.pipe();
@@ -1180,10 +1178,10 @@ pub fn startSessionRuntimeThread(allocator: std.mem.Allocator, session_dir: []co
     errdefer allocator.destroy(context);
     context.* = .{
         .allocator = allocator,
-        .session_dir = try allocator.dupe(u8, session_dir),
+        .session_guid = try allocator.dupe(u8, guid),
         .control = control,
     };
-    errdefer allocator.free(context.session_dir);
+    errdefer allocator.free(context.session_guid);
 
     const thread = try std.Thread.spawn(.{}, sessionRuntimeThreadMain, .{context});
     thread.detach();
@@ -1192,7 +1190,7 @@ pub fn startSessionRuntimeThread(allocator: std.mem.Allocator, session_dir: []co
 
 const SessionRuntimeThreadContext = struct {
     allocator: std.mem.Allocator,
-    session_dir: []u8,
+    session_guid: []u8,
     control: *RuntimeControl,
 };
 
@@ -1203,7 +1201,7 @@ fn sessionRuntimeThreadMain(context: *SessionRuntimeThreadContext) void {
         unregisterRuntime(control);
         control.deinit();
         allocator.destroy(control);
-        allocator.free(context.session_dir);
+        allocator.free(context.session_guid);
         allocator.destroy(context);
     }
     socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
@@ -1212,19 +1210,13 @@ fn sessionRuntimeThreadMain(context: *SessionRuntimeThreadContext) void {
         posix.close(shutdown_pipe[0]);
         posix.close(shutdown_pipe[1]);
     }
-    runSessionRuntimeLoop(context.session_dir, shutdown_pipe[0], control) catch {};
+    runSessionRuntimeLoop(context.session_guid, shutdown_pipe[0], control) catch {};
 }
 
-fn runSessionRuntimeLoop(session_dir: []const u8, shutdown_signal_fd: c.fd_t, control: *RuntimeControl) !void {
-    const paths = try session_registry.pathsForSessionDir(app_allocator.allocator(), session_dir);
-    const fixed_session_id = std.fs.path.basename(paths.dir);
+fn runSessionRuntimeLoop(session_guid: []const u8, shutdown_signal_fd: c.fd_t, control: *RuntimeControl) !void {
     var session_runtime = SessionRuntime{
-        .fixed_session_id = fixed_session_id,
-        .session_paths = paths,
+        .fixed_session_id = session_guid,
     };
-    defer if (session_runtime.session_paths) |*session_paths| session_paths.deinit(app_allocator.allocator());
-
-    defer session_registry.removeSessionDir(session_runtime.session_paths.?) catch {};
 
     defer closeSessionRuntime(&session_runtime);
 
@@ -1779,9 +1771,9 @@ fn flushAttachedClientOutput(session_runtime: *SessionRuntime) void {
 }
 
 fn sendSessionAttachedForSession(session_runtime: *const SessionRuntime, attached_client: *AttachedClient, session: *const Session) !void {
+    _ = session_runtime;
     try queueAttachedClientTeFrame(attached_client, .{ .session_attached = .{
         .session_guid = session.idSlice(),
-        .session_dir = sessionDirSlice(session_runtime),
     } });
 }
 
@@ -1815,10 +1807,6 @@ fn sendClientControlResponse(fd: c.fd_t) !void {
     try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fd, .{ .session_client_control_response = .{} });
 }
 
-fn sessionDirSlice(session_runtime: *const SessionRuntime) []const u8 {
-    return if (session_runtime.session_paths) |paths| paths.dir else "";
-}
-
 fn sendSessionEnded(attached_client: *AttachedClient, reason: u8, exit_info: ExitInfo) !void {
     const exit_status: ?pb.TerminalEmulatorItem.SessionEnded.ExitStatus = switch (exit_info.kind) {
         1 => .{ .kind = .KIND_EXITED, .status = exit_info.status },
@@ -1829,7 +1817,7 @@ fn sendSessionEnded(attached_client: *AttachedClient, reason: u8, exit_info: Exi
         .reason = switch (reason) {
             1 => .REASON_KILLED_BY_REQUEST,
             2 => .REASON_DAEMON_SHUTDOWN,
-            3 => .REASON_REAPED,
+            3 => .REASON_DISCONNECTED_TIMEOUT,
             else => .REASON_PROCESS_EXITED,
         },
         .exit_status = exit_status,
@@ -2207,7 +2195,6 @@ fn queueRepaintResponseDraw(
     session: *Session,
     repaint_request_seq: u64,
     clear_for_replace: bool,
-    clear_visible_for_replace: bool,
     truncated_rows: u64,
     rows: []const vt.RenderedRow,
     screen: *const vt.RenderedScreen,
@@ -2222,12 +2209,6 @@ fn queueRepaintResponseDraw(
     if (clear_for_replace) {
         try attached_client.presentation.preparePrimaryForScrollback(renderer);
         try renderer.clearForReplace();
-        attached_client.presentation.reset();
-    } else if (clear_visible_for_replace) {
-        // initial-scrollback=N replaces the visible screen, not scrollback.
-        // Clear stale viewport cells without sending 3J.
-        try attached_client.presentation.preparePrimaryForScrollback(renderer);
-        try renderer.clearVisible();
         attached_client.presentation.reset();
     }
     var effective_align_viewport = shouldAlignViewportForDraw(attached_client, screen, false);
@@ -2277,7 +2258,7 @@ fn queueRepaintSnapshot(
             0;
         var rows_to_draw = scrollback.rows;
         var truncated_rows_to_report: u64 = 0;
-        if (request.initial_scrollback_rows == null and effective_cursor < scrollback.truncated_rows) {
+        if (effective_cursor < scrollback.truncated_rows) {
             truncated_rows_to_report = scrollback.truncated_rows - effective_cursor;
         } else {
             const skip = effective_cursor -| scrollback.truncated_rows;
@@ -2287,13 +2268,6 @@ fn queueRepaintSnapshot(
                 rows_to_draw = rows_to_draw[@intCast(skip)..];
             }
         }
-        if (request.initial_scrollback_rows) |initial_rows| {
-            const initial_rows_usize: usize = @intCast(initial_rows);
-            if (rows_to_draw.len > initial_rows_usize) {
-                rows_to_draw = rows_to_draw[rows_to_draw.len - initial_rows_usize ..];
-            }
-            truncated_rows_to_report = 0;
-        }
 
         const clear_scrollback_for_stale_clear =
             requested_cursor.epoch != 0 and requested_cursor.epoch < session.last_scrollback_clear_epoch;
@@ -2302,7 +2276,6 @@ fn queueRepaintSnapshot(
             session,
             request.repaint_request_seq,
             clear_for_replace or clear_scrollback_for_stale_clear,
-            request.initial_scrollback_rows != null,
             truncated_rows_to_report,
             rows_to_draw,
             &screen,
@@ -2316,7 +2289,6 @@ fn queueRepaintSnapshot(
             session,
             request.repaint_request_seq,
             clear_for_replace,
-            request.initial_scrollback_rows != null,
             0,
             &.{},
             &screen,
@@ -2536,7 +2508,6 @@ fn repaintRequestFromMessage(message: pb.TerminalEmulatorItem.RepaintRequest) !R
             try decodeScrollbackCursor(cursor)
         else
             null,
-        .initial_scrollback_rows = message.initial_scrollback_rows,
     };
 }
 
@@ -3471,8 +3442,7 @@ fn handleRepaintRequest(session_runtime: *SessionRuntime, request: RepaintReques
 
     const model = session.terminal_model orelse return;
     const clear_for_replace = request.scrollback_cursor != null and
-        request.scrollback_cursor.?.per_epoch_cursor == 0 and
-        request.initial_scrollback_rows == null;
+        request.scrollback_cursor.?.per_epoch_cursor == 0;
     const screen_rows = queueRepaintSnapshot(attached_client, session, request, clear_for_replace) catch {
         disconnectAttachedClient(session_runtime);
         return;
@@ -3643,14 +3613,9 @@ fn endSession(session_runtime: *SessionRuntime, reason: u8, exit_info: ExitInfo)
         model.destroy();
         session.terminal_model = null;
     }
-    removeSessionDir(session_runtime);
     session.deinit();
     session.alive = false;
     session.attached = false;
-}
-
-fn removeSessionDir(session_runtime: *SessionRuntime) void {
-    if (session_runtime.session_paths) |paths| session_registry.removeSessionDir(paths) catch {};
 }
 
 fn stopSessionRuntimeIfComplete(session_runtime: *SessionRuntime) void {

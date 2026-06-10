@@ -18,10 +18,11 @@ The local daemon socket is scoped by compatibility namespace:
 <protocol-major.dev.hash>/sesshd.sock
 ```
 
-Runtime GUID directories live under `guid/<s-guid>/` for terminal-emulator
-sessions and `guid/<p-guid>/` for proxy streams. They are implementation
-details used by the daemon while a stream is live. The public topology is the
-single `sesshd` socket, not one user-addressable socket per GUID.
+Live terminal-emulator sessions and proxy streams are tracked by the daemon in
+memory. If the daemon exits, those live processes are expected to exit too, so
+there is no runtime GUID registry to recover.
+The public topology is the single `sesshd` socket, not one user-addressable
+socket per GUID.
 
 # State
 

@@ -5,12 +5,12 @@ The handshake uses `HelloFrame`, whose `oneof` carries only `HelloRequest`,
 `HelloOk`, or `Error`. Once both sides have accepted the handshake, all
 subsequent frames use the versioned `Frame` envelope from `sessh.proto`.
 
-Local proxy-control sockets under `c/` use the same `HelloFrame` handshake and
-length-prefixed `Frame` envelope. Immediately after the handshake, the visible
-local client sends `ProxyControlCapabilities` so the ProxyCommand process knows
-which diagnostic output shape and CTRL-R behavior are available. The
-ProxyCommand process then sends `ProxyControlDiagnostic` messages, and the
-visible client sends `ProxyControlCtrlR` when it intercepts CTRL-R.
+Proxy-control traffic uses normal local client connections to `sesshd`. The
+visible client sends `ProxyControlOpen` with the stream's `p-` GUID. The
+ProxyCommand process does not open a separate control channel; its normal
+`ProxyStreamItem.Open` carries the same GUID, and the daemon relays
+`ConnectionEvent` and `RetryNow` frames between the visible client connection and
+that proxy stream.
 
 The `HelloFrame`/`Frame` separation is designed to allow us maximum protocol
 flexibility in the future. We could migrate off of protobuf for everything past
