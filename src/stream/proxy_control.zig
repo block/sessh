@@ -8,43 +8,24 @@ const protocol = @import("../protocol/mod.zig");
 const pb = protocol.pb;
 const hpb = protocol.hpb;
 
-pub const OutputMode = enum {
-    none,
-    update,
-    diagnostic_line,
-};
-
-pub const Capabilities = struct {
-    output_mode: OutputMode,
-    ctrl_r_available: bool,
-};
-
-pub const Diagnostic = struct {
-    update: ?[]const u8 = null,
-    diagnostic_line: ?[]const u8 = null,
-    intercept_ctrl_r: bool,
-};
-
 pub const Message = union(enum) {
-    diagnostic: Diagnostic,
-    ctrl_r,
+    connection_event: pb.ConnectionEvent,
+    retry_now,
 };
 
 pub const OwnedMessage = struct {
     message: Message,
-    owned_update: ?[]u8 = null,
-    owned_diagnostic_line: ?[]u8 = null,
 
     pub fn deinit(self: *OwnedMessage, allocator: std.mem.Allocator) void {
-        if (self.owned_update) |owned| allocator.free(owned);
-        if (self.owned_diagnostic_line) |owned| allocator.free(owned);
+        switch (self.message) {
+            .connection_event => |*event| event.deinit(allocator),
+            .retry_now => {},
+        }
         self.* = undefined;
     }
 };
 
-// Establishes the generic compatibility handshake, then reads the visible
-// client's capabilities as the first post-handshake proxy-control frame.
-pub fn clientHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !Capabilities {
+pub fn clientHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     try sendHelloRequest(fd);
     try readHelloOk(allocator, fd);
 
@@ -55,12 +36,9 @@ pub fn clientHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !Capabilities {
         return error.VersionMismatch;
     }
     try sendHelloOk(fd);
-    return readCapabilities(allocator, fd);
 }
 
-// Establishes the generic compatibility handshake, then sends the visible
-// client's capabilities as the first post-handshake proxy-control frame.
-pub fn serverHandshake(allocator: std.mem.Allocator, fd: c.fd_t, capabilities: Capabilities) !void {
+pub fn serverHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     var peer_hello = try readHelloRequest(allocator, fd, fd);
     defer peer_hello.deinit(allocator);
     if (!helloRequestIsCompatible(peer_hello)) {
@@ -71,81 +49,29 @@ pub fn serverHandshake(allocator: std.mem.Allocator, fd: c.fd_t, capabilities: C
 
     try sendHelloRequest(fd);
     try readHelloOk(allocator, fd);
-    try writeCapabilities(fd, capabilities);
 }
 
-fn writeCapabilities(fd: c.fd_t, capabilities: Capabilities) !void {
-    try protocol.sendProxyStreamPayloadFrame(app_allocator.allocator(), fd, .{ .control_capabilities = .{
-        .output_mode = toPbOutputMode(capabilities.output_mode),
-        .ctrl_r_available = capabilities.ctrl_r_available,
-    } });
+pub fn writeConnectionEvent(fd: c.fd_t, event: pb.ConnectionEvent.event_union) !void {
+    try protocol.sendClientDaemonConnectionEventFrame(app_allocator.allocator(), fd, event);
 }
 
-pub fn writeDiagnostic(fd: c.fd_t, diagnostic: Diagnostic) !void {
-    try protocol.sendProxyStreamPayloadFrame(app_allocator.allocator(), fd, .{ .control_diagnostic = .{
-        .update = diagnostic.update,
-        .diagnostic_line = diagnostic.diagnostic_line,
-        .intercept_ctrl_r = diagnostic.intercept_ctrl_r,
-    } });
-}
-
-pub fn writeCtrlR(fd: c.fd_t) !void {
-    try protocol.sendProxyStreamPayloadFrame(app_allocator.allocator(), fd, .{ .control_ctrl_r = .{} });
-}
-
-fn readCapabilities(allocator: std.mem.Allocator, fd: c.fd_t) !Capabilities {
-    while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
-        defer frame.deinit(allocator);
-
-        switch (frame.message_type) {
-            .client_remote => {
-                var item = try protocol.decodeClientRemoteProxyStreamItem(allocator, frame.payload);
-                defer item.deinit(allocator);
-                const item_payload = item.payload orelse return error.UnexpectedProxyControlFrame;
-                const message = switch (item_payload) {
-                    .control_capabilities => |capabilities| capabilities,
-                    else => return error.UnexpectedProxyControlFrame,
-                };
-                return .{
-                    .output_mode = fromPbOutputMode(message.output_mode),
-                    .ctrl_r_available = message.ctrl_r_available,
-                };
-            },
-            .daemon_tunnel => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
-            },
-            else => return error.UnexpectedProxyControlFrame,
-        }
-    }
+pub fn writeRetryNow(fd: c.fd_t) !void {
+    try protocol.sendClientDaemonPayloadFrame(app_allocator.allocator(), fd, .{ .retry_now = .{} });
 }
 
 pub fn readMessage(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
     var frame = try protocol.readFrameAlloc(allocator, fd);
     defer frame.deinit(allocator);
 
-    if (frame.message_type != .client_remote) return error.UnexpectedProxyControlFrame;
-    var item = try protocol.decodeClientRemoteProxyStreamItem(allocator, frame.payload);
+    if (frame.message_type != .client_daemon) return error.UnexpectedProxyControlFrame;
+    var item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, frame.payload);
     defer item.deinit(allocator);
     const item_payload = item.payload orelse return error.UnexpectedProxyControlFrame;
     return switch (item_payload) {
-        .control_diagnostic => |message| blk: {
-            const update = if (message.update) |line| try allocator.dupe(u8, line) else null;
-            errdefer if (update) |owned| allocator.free(owned);
-            const diagnostic_line = if (message.diagnostic_line) |line| try allocator.dupe(u8, line) else null;
-            errdefer if (diagnostic_line) |owned| allocator.free(owned);
-
-            break :blk OwnedMessage{
-                .message = .{ .diagnostic = .{
-                    .update = update,
-                    .diagnostic_line = diagnostic_line,
-                    .intercept_ctrl_r = message.intercept_ctrl_r,
-                } },
-                .owned_update = update,
-                .owned_diagnostic_line = diagnostic_line,
-            };
+        .connection_event => |event| blk: {
+            break :blk OwnedMessage{ .message = .{ .connection_event = try event.dupe(allocator) } };
         },
-        .control_ctrl_r => OwnedMessage{ .message = .ctrl_r },
+        .retry_now => OwnedMessage{ .message = .retry_now },
         else => error.UnexpectedProxyControlFrame,
     };
 }
@@ -217,22 +143,6 @@ fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
 }
 
-fn toPbOutputMode(mode: OutputMode) pb.ProxyStreamItem.ControlCapabilities.OutputMode {
-    return switch (mode) {
-        .none => .OUTPUT_MODE_NONE,
-        .update => .OUTPUT_MODE_UPDATE,
-        .diagnostic_line => .OUTPUT_MODE_DIAGNOSTIC_LINE,
-    };
-}
-
-fn fromPbOutputMode(mode: pb.ProxyStreamItem.ControlCapabilities.OutputMode) OutputMode {
-    return switch (mode) {
-        .OUTPUT_MODE_UPDATE => .update,
-        .OUTPUT_MODE_DIAGNOSTIC_LINE => .diagnostic_line,
-        .OUTPUT_MODE_NONE, _ => .none,
-    };
-}
-
 test "proxy control protocol uses framed protobuf messages" {
     var fds: [2]c.fd_t = undefined;
     if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
@@ -241,40 +151,42 @@ test "proxy control protocol uses framed protobuf messages" {
 
     const Server = struct {
         fn run(fd: c.fd_t) void {
-            serverHandshake(std.testing.allocator, fd, .{
-                .output_mode = .update,
-                .ctrl_r_available = true,
-            }) catch @panic("proxy control server handshake failed");
+            serverHandshake(std.testing.allocator, fd) catch @panic("proxy control server handshake failed");
         }
     };
     const thread = try std.Thread.spawn(.{}, Server.run, .{fds[0]});
-    const capabilities = try clientHandshake(std.testing.allocator, fds[1]);
+    try clientHandshake(std.testing.allocator, fds[1]);
     thread.join();
-    try std.testing.expectEqual(OutputMode.update, capabilities.output_mode);
-    try std.testing.expect(capabilities.ctrl_r_available);
 
-    try writeDiagnostic(fds[0], .{ .update = "hello", .intercept_ctrl_r = true });
-    try writeDiagnostic(fds[0], .{ .diagnostic_line = "ssh: nope", .intercept_ctrl_r = true });
-    try writeDiagnostic(fds[0], .{ .intercept_ctrl_r = false });
-    try writeCtrlR(fds[0]);
+    try writeConnectionEvent(fds[0], .{ .daemon_disconnected = .{
+        .retry_at_local_boot_time_ms = 1234,
+    } });
+    try writeConnectionEvent(fds[0], .{ .ssh_stderr = .{ .data = "ssh: nope" } });
+    try writeConnectionEvent(fds[0], .{ .daemon_connected = .{} });
+    try writeRetryNow(fds[0]);
 
-    var update = try readMessage(std.testing.allocator, fds[1]);
-    defer update.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("hello", update.message.diagnostic.update.?);
-    try std.testing.expect(update.message.diagnostic.intercept_ctrl_r);
+    var disconnected = try readMessage(std.testing.allocator, fds[1]);
+    defer disconnected.deinit(std.testing.allocator);
+    switch (disconnected.message.connection_event.event.?) {
+        .daemon_disconnected => |event| try std.testing.expectEqual(@as(?u64, 1234), event.retry_at_local_boot_time_ms),
+        else => return error.UnexpectedProxyControlFrame,
+    }
 
-    var diagnostic = try readMessage(std.testing.allocator, fds[1]);
-    defer diagnostic.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("ssh: nope", diagnostic.message.diagnostic.diagnostic_line.?);
-    try std.testing.expect(diagnostic.message.diagnostic.intercept_ctrl_r);
+    var stderr = try readMessage(std.testing.allocator, fds[1]);
+    defer stderr.deinit(std.testing.allocator);
+    switch (stderr.message.connection_event.event.?) {
+        .ssh_stderr => |event| try std.testing.expectEqualStrings("ssh: nope", event.data),
+        else => return error.UnexpectedProxyControlFrame,
+    }
 
-    var clear = try readMessage(std.testing.allocator, fds[1]);
-    defer clear.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(?[]const u8, null), clear.message.diagnostic.update);
-    try std.testing.expectEqual(@as(?[]const u8, null), clear.message.diagnostic.diagnostic_line);
-    try std.testing.expect(!clear.message.diagnostic.intercept_ctrl_r);
+    var connected = try readMessage(std.testing.allocator, fds[1]);
+    defer connected.deinit(std.testing.allocator);
+    switch (connected.message.connection_event.event.?) {
+        .daemon_connected => {},
+        else => return error.UnexpectedProxyControlFrame,
+    }
 
-    var ctrl_r = try readMessage(std.testing.allocator, fds[1]);
-    defer ctrl_r.deinit(std.testing.allocator);
-    try std.testing.expectEqual(Message.ctrl_r, ctrl_r.message);
+    var retry_now = try readMessage(std.testing.allocator, fds[1]);
+    defer retry_now.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Message.retry_now, retry_now.message);
 }

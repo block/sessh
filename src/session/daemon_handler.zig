@@ -126,9 +126,14 @@ pub fn isTeMuxOpenFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame
     defer mux_frame.deinit(allocator);
     const message = mux_frame.message orelse return false;
     return switch (message) {
-        .open => |open| switch (open.detail orelse return false) {
-            .terminal_emulator => true,
-            else => false,
+        .payload => |payload| blk: {
+            const item = payload.item orelse break :blk false;
+            const terminal_emulator = switch (item) {
+                .terminal_emulator => |terminal| terminal,
+                else => break :blk false,
+            };
+            const terminal_payload = terminal_emulator.payload orelse break :blk false;
+            break :blk terminal_payload == .open;
         },
         else => false,
     };
@@ -140,31 +145,58 @@ pub fn serveMuxStreamFrameAfterHandshake(
     first_frame: protocol.OwnedFrame,
     fd: c.fd_t,
 ) !void {
+    var initial_frames = [_]protocol.OwnedFrame{first_frame};
+    try serveMuxStreamFramesAfterHandshakeWithInitial(allocator, exe, initial_frames[0..], fd);
+}
+
+pub fn serveMuxStreamFramesAfterHandshake(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    first_frame: protocol.OwnedFrame,
+    second_frame: protocol.OwnedFrame,
+    fd: c.fd_t,
+) !void {
+    var initial_frames = [_]protocol.OwnedFrame{ first_frame, second_frame };
+    try serveMuxStreamFramesAfterHandshakeWithInitial(allocator, exe, initial_frames[0..], fd);
+}
+
+fn serveMuxStreamFramesAfterHandshakeWithInitial(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    initial_frames: []const protocol.OwnedFrame,
+    fd: c.fd_t,
+) !void {
     var sessions: std.ArrayList(TeMuxRuntime) = .empty;
     defer closeTeMuxRuntimes(allocator, &sessions);
 
-    try handleTeMuxFrame(allocator, exe, &sessions, fd, first_frame);
+    for (initial_frames) |frame| {
+        try handleTeMuxFrame(allocator, exe, &sessions, fd, frame);
+    }
 
     while (true) {
         const poll_targets = try allocator.alloc(TeMuxPollTarget, sessions.items.len);
         defer allocator.free(poll_targets);
-        for (sessions.items, 0..) |runtime, index| {
-            poll_targets[index] = .{
+        var poll_target_count: usize = 0;
+        for (sessions.items) |runtime| {
+            if (runtime.runtime_fd < 0) continue;
+            poll_targets[poll_target_count] = .{
                 .stream_id = runtime.stream_id,
                 .runtime_fd = runtime.runtime_fd,
             };
+            poll_target_count += 1;
         }
 
-        const pollfds = try allocator.alloc(posix.pollfd, 1 + poll_targets.len);
+        const active_poll_targets = poll_targets[0..poll_target_count];
+        const pollfds = try allocator.alloc(posix.pollfd, 1 + active_poll_targets.len);
         defer allocator.free(pollfds);
         pollfds[0] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
-        for (poll_targets, 0..) |target, index| {
+        for (active_poll_targets, 0..) |target, index| {
             pollfds[index + 1] = .{ .fd = target.runtime_fd, .events = posix.POLL.IN, .revents = 0 };
         }
 
         _ = try posix.poll(pollfds, -1);
 
-        for (poll_targets, 0..) |target, index| {
+        for (active_poll_targets, 0..) |target, index| {
             const revents = pollfds[index + 1].revents;
             if ((revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) == 0) {
                 continue;
@@ -199,8 +231,8 @@ pub fn serveMuxStreamFrameAfterHandshake(
 
 const TeMuxRuntime = struct {
     stream_id: u64,
-    runtime_fd: c.fd_t,
-    session_guid: []u8,
+    runtime_fd: c.fd_t = -1,
+    session_guid: []u8 = &.{},
     inbound_next_offset: u64 = 0,
     outbound_next_offset: u64 = 0,
     attached_logged: bool = false,
@@ -220,9 +252,11 @@ fn closeTeMuxRuntimes(allocator: std.mem.Allocator, sessions: *std.ArrayList(TeM
 }
 
 fn closeTeMuxRuntime(allocator: std.mem.Allocator, runtime: TeMuxRuntime, send_hangup: bool) void {
-    if (send_hangup) sendTeHangupToRuntime(runtime.runtime_fd) catch {};
-    _ = c.close(runtime.runtime_fd);
-    allocator.free(runtime.session_guid);
+    if (runtime.runtime_fd >= 0) {
+        if (send_hangup) sendTeHangupToRuntime(runtime.runtime_fd) catch {};
+        _ = c.close(runtime.runtime_fd);
+    }
+    if (runtime.session_guid.len != 0) allocator.free(runtime.session_guid);
 }
 
 fn handleTeMuxFrame(
@@ -237,10 +271,10 @@ fn handleTeMuxFrame(
     defer mux_frame.deinit(allocator);
     const message = mux_frame.message orelse return error.UnexpectedFrame;
     switch (message) {
-        .open => |open| handleTeMuxOpen(allocator, exe, sessions, mux_fd, mux_frame.stream_id, open) catch |err| {
+        .open => |open| handleTeMuxOpen(allocator, sessions, mux_frame.stream_id, open) catch |err| {
             try sendTeMuxResetForError(allocator, mux_fd, mux_frame.stream_id, "OPEN_FAILED", err);
         },
-        .payload => |payload| handleTeMuxPayload(allocator, sessions, mux_fd, mux_frame.stream_id, payload) catch |err| {
+        .payload => |payload| handleTeMuxPayload(allocator, exe, sessions, mux_fd, mux_frame.stream_id, payload) catch |err| {
             try sendTeMuxResetForError(allocator, mux_fd, mux_frame.stream_id, "STREAM_FAILED", err);
             try removeTeMuxRuntime(allocator, sessions, mux_frame.stream_id);
         },
@@ -252,17 +286,26 @@ fn handleTeMuxFrame(
 
 fn handleTeMuxOpen(
     allocator: std.mem.Allocator,
+    sessions: *std.ArrayList(TeMuxRuntime),
+    stream_id: u64,
+    open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
+) !void {
+    _ = open;
+    if (findTeMuxRuntimeIndex(sessions, stream_id) != null) return;
+    try sessions.append(allocator, .{ .stream_id = stream_id });
+}
+
+fn handleTeMuxPayloadOpen(
+    allocator: std.mem.Allocator,
     exe: []const u8,
     sessions: *std.ArrayList(TeMuxRuntime),
     mux_fd: c.fd_t,
     stream_id: u64,
-    open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
+    payload_offset: u64,
+    te_open: pb.TerminalEmulatorItem.Open,
 ) !void {
-    const detail = open.detail orelse return error.UnexpectedFrame;
-    const te_open = switch (detail) {
-        .terminal_emulator => |terminal_emulator| terminal_emulator,
-        else => return error.UnexpectedFrame,
-    };
+    const runtime_index = findTeMuxRuntimeIndex(sessions, stream_id) orelse return error.UnexpectedFrame;
+    if (sessions.items[runtime_index].runtime_fd >= 0) return;
     const action = teStreamActionName(te_open);
     const open_started_ms = std.time.milliTimestamp();
     daemon_log.infof(
@@ -270,11 +313,6 @@ fn handleTeMuxOpen(
         "terminal mux stream opening stream_id={} session={s} action={s}",
         .{ stream_id, te_open.session_guid, action },
     );
-    if (findTeMuxRuntimeIndex(sessions, stream_id) != null) {
-        try sendTeMuxReset(allocator, mux_fd, stream_id, "STREAM_EXISTS", "mux stream already exists");
-        return;
-    }
-
     const session_guid = try allocator.dupe(u8, te_open.session_guid);
     var session_guid_owned = true;
     errdefer if (session_guid_owned) allocator.free(session_guid);
@@ -314,11 +352,9 @@ fn handleTeMuxOpen(
     errdefer _ = c.close(runtime_fd);
 
     try sendTeMuxOpenOk(allocator, mux_fd, stream_id);
-    try sessions.append(allocator, .{
-        .stream_id = stream_id,
-        .runtime_fd = runtime_fd,
-        .session_guid = session_guid,
-    });
+    sessions.items[runtime_index].runtime_fd = runtime_fd;
+    sessions.items[runtime_index].session_guid = session_guid;
+    sessions.items[runtime_index].inbound_next_offset = @max(sessions.items[runtime_index].inbound_next_offset, payload_offset +| 1);
     session_guid_owned = false;
     daemon_log.infof(
         allocator,
@@ -374,6 +410,7 @@ fn openTeMuxRuntime(
 
 fn handleTeMuxPayload(
     allocator: std.mem.Allocator,
+    exe: []const u8,
     sessions: *std.ArrayList(TeMuxRuntime),
     mux_fd: c.fd_t,
     stream_id: u64,
@@ -389,6 +426,13 @@ fn handleTeMuxPayload(
         else => return error.UnexpectedFrame,
     };
     var runtime = &sessions.items[index];
+    if (te_item.payload) |te_payload| {
+        if (te_payload == .open) {
+            try handleTeMuxPayloadOpen(allocator, exe, sessions, mux_fd, stream_id, payload.offset, te_payload.open);
+            return;
+        }
+    }
+    if (runtime.runtime_fd < 0) return error.UnexpectedFrame;
     runtime.inbound_next_offset = @max(runtime.inbound_next_offset, payload.offset +| 1);
     if (te_item.payload) |te_payload| {
         if (te_payload == .session_hangup_request) {

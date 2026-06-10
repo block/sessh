@@ -41,44 +41,86 @@ message EnvironmentEntry {
   string value = 2;
 }
 
+// Semantic connection-state transition shared by terminal-emulator sessions,
+// proxy streams, and local daemon transport setup. This is not remote process
+// output. Visible clients decide how, where, and whether to render it.
+message ConnectionEvent {
+  message SshConnecting {
+  }
+
+  // The child ssh transport is connected and running its remote command. The
+  // remote sesshd may still need to be bootstrapped or handshaken.
+  message SshConnected {
+  }
+
+  // Raw bytes written by the child ssh transport to stderr. This is still a
+  // connection event, not remote process stderr: remote process stderr is
+  // carried by the SSH channel itself.
+  message SshStderr {
+    bytes data = 1;
+  }
+
+  message BootstrapStarted {
+  }
+
+  message BootstrapFinished {
+  }
+
+  message DaemonConnecting {
+  }
+
+  // Remote sesshd is handshaken; stream payload can flow.
+  message DaemonConnected {
+  }
+
+  // The daemon-to-daemon tunnel dropped after it had been established. This
+  // usually means the child ssh transport died or the network path broke. It
+  // does not prove the remote sesshd process exited.
+  message DaemonDisconnected {
+    // Deadline on the sender machine's sessh local-boot-time clock, in
+    // milliseconds. The sessh local-boot-time clock is a suspend-inclusive
+    // monotonic boot clock: Linux CLOCK_BOOTTIME, Darwin CLOCK_UPTIME_RAW, and
+    // CLOCK_MONOTONIC elsewhere when no stronger boot-time clock is available.
+    // This field is only meaningful for same-machine client/daemon/control IPC;
+    // do not forward it across machines or compare it with wall time.
+    optional uint64 retry_at_local_boot_time_ms = 1;
+  }
+
+  message Unresponsive {
+    // Same clock and same-machine restriction as Disconnected.
+    optional uint64 retry_at_local_boot_time_ms = 1;
+  }
+
+  oneof event {
+    SshConnecting ssh_connecting = 1;
+    SshConnected ssh_connected = 2;
+    SshStderr ssh_stderr = 3;
+    BootstrapStarted bootstrap_started = 4;
+    BootstrapFinished bootstrap_finished = 5;
+    DaemonConnecting daemon_connecting = 6;
+    DaemonConnected daemon_connected = 7;
+    DaemonDisconnected daemon_disconnected = 8;
+    Unresponsive unresponsive = 9;
+  }
+}
+
 message ClientDaemonItem {
-  // Local visible-client -> local daemon request to open an SSH-backed
+  // Local visible-client -> local daemon request to acquire an SSH-backed
   // transport to a remote sesshd. The client may immediately pipeline stream
   // frames after this request; the local daemon queues them behind tunnel setup
   // and forwards them over ssh when the remote daemon endpoint is ready.
-  message SshTransportOpen {
+  message SshTransportAcquire {
     repeated string ssh_option = 1;
     string host = 2;
     bool bootstrap = 3;
-    bool batch_mode = 4;
-    // Environment for the local daemon when it launches the local ssh
-    // transport. These entries are not part of the remote PTY child
-    // environment.
-    repeated EnvironmentEntry environment = 5;
-  }
-
-  // Local daemon -> visible-client event for the transport the daemon owns.
-  // These are local sessh UI/diagnostic events, not remote process output.
-  message SshTransportEvent {
-    message StderrChunk {
-      bytes chunk = 1;
-    }
-
-    message BootstrapStarted {
-    }
-
-    message BootstrapFinished {
-    }
-
-    message Closed {
-    }
-
-    oneof event {
-      StderrChunk stderr_chunk = 1;
-      BootstrapStarted bootstrap_started = 2;
-      BootstrapFinished bootstrap_finished = 3;
-      Closed closed = 4;
-    }
+    // SSH_AUTH_SOCK to expose to the child ssh process when creating a new
+    // transport. This is not part of pooled-transport identity; a reused
+    // transport keeps the agent environment it was created with.
+    optional string ssh_auth_sock = 4;
+    // Effective resolved IPQoS value for the transport. Unlike ssh_option, this
+    // is part of pooled-transport identity because sessh cannot retag the child
+    // ssh process' TCP socket after creation.
+    string ip_qos = 5;
   }
 
   // Local client -> local daemon request to follow new operational log entries.
@@ -93,11 +135,18 @@ message ClientDaemonItem {
     string message = 2;
   }
 
+  // Visible client request for the reconnect owner to retry immediately. The
+  // visible client decides when to intercept CTRL-R and translate it to this
+  // command; CTRL-R interception policy is not part of the protocol.
+  message RetryNow {
+  }
+
   oneof payload {
-    SshTransportOpen ssh_transport_open = 1;
-    SshTransportEvent ssh_transport_event = 2;
+    SshTransportAcquire ssh_transport_acquire = 1;
     DaemonLogRequest log_request = 10;
     DaemonLogEntry log_entry = 11;
+    ConnectionEvent connection_event = 12;
+    RetryNow retry_now = 13;
   }
 }
 
@@ -126,20 +175,18 @@ message DaemonTunnelItem {
   message MuxStreamFrame {
     uint64 stream_id = 1;
 
-    // Opens or resumes a mux stream. The detail oneof identifies the stream
-    // type; there is no separate stream-kind field to keep in sync.
+    // Opens or resumes a mux stream. Stream-specific open details are carried
+    // as typed stream payloads, not in the mux envelope, so this layer only
+    // tracks resume and backpressure state.
     message Open {
-      // First byte this side still needs from the peer's outbound stream.
+      // First outbound unit this side still needs from the peer. The typed
+      // stream item defines whether this is a byte offset or an ordered item
+      // offset.
       uint64 recv_next_offset = 1;
-      // Backpressure credit this side grants the peer. The peer may send bytes
+      // Backpressure credit this side grants the peer. The peer may send units
       // in [recv_next_offset, recv_next_offset + receive_window_bytes) for this
       // mux stream and must stop when that window is exhausted.
       uint32 receive_window_bytes = 2;
-
-      oneof detail {
-        TerminalEmulatorItem.Open terminal_emulator = 10;
-        ProxyStreamItem.Open proxy = 11;
-      }
     }
 
     // Accepts a mux stream open and reports the acceptor's receive state. This
@@ -152,7 +199,10 @@ message DaemonTunnelItem {
       uint32 receive_window_bytes = 2;
     }
 
-    // Ordered durable stream payload carried over a mux stream.
+    // Ordered durable stream payload carried over a mux stream. The typed item
+    // defines the offset semantics: terminal-emulator streams count ordered
+    // items, while proxy stream data uses byte offsets and treats Open as setup
+    // that does not consume byte-offset space.
     message Payload {
       uint64 offset = 1;
 
@@ -447,40 +497,6 @@ message TerminalEmulatorItem {
     bytes data = 2;
   }
 
-  // Coordinator-injected terminal-emulator diagnostic. This is not remote
-  // process output; the visible client renders it according to its filter
-  // level.
-  message Diagnostic {
-    message Disconnected {
-      optional uint64 next_retry_unix_ms = 1;
-    }
-
-    message Connecting {
-      uint64 attempt = 1;
-    }
-
-    message Reconnected {
-    }
-
-    message Unresponsive {
-      uint64 attempt = 1;
-    }
-
-    message ReconnectFailed {
-      uint64 attempt = 1;
-      string message = 2;
-      optional uint64 next_retry_unix_ms = 3;
-    }
-
-    oneof diagnostic {
-      Disconnected disconnected = 1;
-      Connecting connecting = 2;
-      Reconnected reconnected = 3;
-      Unresponsive unresponsive = 4;
-      ReconnectFailed reconnect_failed = 5;
-    }
-  }
-
   oneof payload {
     Open open = 1;
     Input input = 2;
@@ -492,7 +508,6 @@ message TerminalEmulatorItem {
     Draw draw = 8;
     RepaintResponse repaint_response = 9;
     TtyTranscriptChunk tty_transcript_chunk = 10;
-    Diagnostic diagnostic = 11;
     SessionClientControlResponse session_client_control_response = 12;
     SessionClientDebugSeverConnectionRequest debug_sever_connection_request = 13;
     SessionClientDebugUnresponsiveConnectionRequest debug_unresponsive_connection_request = 14;
@@ -503,51 +518,17 @@ message TerminalEmulatorItem {
 // Ordered proxy stream item. Data is offset-free here; mux offsets live in
 // MuxStreamFrame.Payload, and direct local IPC relies on socket ordering.
 message ProxyStreamItem {
-  // Proxy stream open details carried by MuxStreamFrame.Open.detail.
+  // Proxy stream open details. When muxed, this is sent as the first typed
+  // proxy payload after MuxStreamFrame.Open and does not consume proxy byte
+  // offset space; data may still start at offset 0.
   message Open {
     string proxy_guid = 1;
     string proxy_host = 2;
     uint32 proxy_port = 3;
   }
 
-  // Sent immediately after the local IPC socket's normal HelloFrame handshake
-  // so the ProxyCommand process can choose the right diagnostic stream shape.
-  message ControlCapabilities {
-    enum OutputMode {
-      OUTPUT_MODE_NONE = 0;
-      // Client can render replaceable connection-state updates. The client owns
-      // presentation and may show this in a title, an on-screen status line, or
-      // both.
-      OUTPUT_MODE_UPDATE = 1;
-      // Client can only emit infrequent diagnostic lines. These cannot erase
-      // prior output, so countdown-style status must be collapsed into one line
-      // with an absolute retry time.
-      OUTPUT_MODE_DIAGNOSTIC_LINE = 2;
-    }
-
-    OutputMode output_mode = 1;
-    bool ctrl_r_available = 2;
-  }
-
-  // One diagnostic item in the proxy-control stream. `update` is replaceable
-  // connection state. `diagnostic_line` is append-only and should be emitted
-  // infrequently. When both text fields are absent, the client clears any
-  // previous update.
-  message ControlDiagnostic {
-    optional string update = 1;
-    optional string diagnostic_line = 2;
-    bool intercept_ctrl_r = 3;
-  }
-
-  // Requests an immediate reconnect attempt after the visible client
-  // intercepted CTRL-R.
-  message ControlCtrlR {
-  }
-
   oneof payload {
+    Open open = 1;
     bytes data = 2;
-    ControlCapabilities control_capabilities = 10;
-    ControlDiagnostic control_diagnostic = 11;
-    ControlCtrlR control_ctrl_r = 12;
   }
 }

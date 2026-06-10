@@ -3,8 +3,10 @@ const c = std.c;
 const posix = std.posix;
 
 const io = @import("../core/io.zig");
+const local_boot_time = @import("../core/local_boot_time.zig");
 const process_exit = @import("../core/process_exit.zig");
 const proxy_control = @import("../stream/proxy_control.zig");
+const protocol = @import("../protocol/mod.zig");
 const pty_process = @import("../tty/pty_process.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect_title = @import("../reconnect/title.zig");
@@ -29,7 +31,6 @@ const ProxyClientControl = struct {
     status_visible: bool = false,
     intercept_requested: bool = false,
     ctrl_r_allowed: bool = false,
-    output_mode: proxy_control.OutputMode = .update,
     onscreen_status: bool = false,
 
     fn init(allocator: std.mem.Allocator, ctrl_r_allowed: bool, onscreen_status: bool) ProxyClientControl {
@@ -48,10 +49,7 @@ const ProxyClientControl = struct {
     fn setControlFd(self: *ProxyClientControl, fd: c.fd_t) void {
         if (self.control_fd >= 0) posix.close(self.control_fd);
         self.control_fd = fd;
-        proxy_control.serverHandshake(std.heap.smp_allocator, fd, .{
-            .output_mode = self.output_mode,
-            .ctrl_r_available = self.ctrl_r_allowed,
-        }) catch {
+        proxy_control.serverHandshake(std.heap.smp_allocator, fd) catch {
             self.closeControl();
             return;
         };
@@ -82,19 +80,38 @@ const ProxyClientControl = struct {
 
     fn handleMessage(self: *ProxyClientControl, message: proxy_control.Message) void {
         switch (message) {
-            .diagnostic => |diagnostic| self.handleDiagnostic(diagnostic),
-            .ctrl_r => {},
+            .connection_event => |event| self.handleConnectionEvent(event),
+            .retry_now => {},
         }
     }
 
-    fn handleDiagnostic(self: *ProxyClientControl, diagnostic: proxy_control.Diagnostic) void {
-        if (diagnostic.update) |line| {
-            self.showUpdate(line);
-        } else if (diagnostic.diagnostic_line == null) {
-            self.clearUpdate();
+    fn handleConnectionEvent(self: *ProxyClientControl, event: protocol.pb.ConnectionEvent) void {
+        switch (event.event orelse return) {
+            .ssh_connecting => self.showUpdate("sessh: connecting..."),
+            .ssh_connected => {},
+            .ssh_stderr => |stderr| self.showDiagnostic(stderr.data),
+            .bootstrap_started => self.showUpdate("sessh: bootstrapping..."),
+            .bootstrap_finished => self.clearUpdate(),
+            .daemon_connecting => {
+                self.showUpdate(reconnect_title.reconnectingStatus(.{ .ctrl_r = self.ctrl_r_allowed }));
+                self.intercept_requested = self.ctrl_r_allowed;
+            },
+            .daemon_connected => self.clear(),
+            .daemon_disconnected => |disconnected| {
+                var line: [96]u8 = undefined;
+                const delay_ms = retryDelayFromLocalBootDeadline(disconnected.retry_at_local_boot_time_ms);
+                const message = reconnect_title.retryStatus(&line, delay_ms, .{ .ctrl_r = self.ctrl_r_allowed }) catch return;
+                self.showUpdate(message);
+                self.intercept_requested = self.ctrl_r_allowed;
+            },
+            .unresponsive => |unresponsive| {
+                var line: [96]u8 = undefined;
+                const delay_ms = retryDelayFromLocalBootDeadline(unresponsive.retry_at_local_boot_time_ms);
+                const message = reconnect_title.retryStatus(&line, delay_ms, .{ .ctrl_r = self.ctrl_r_allowed }) catch return;
+                self.showUpdate(message);
+                self.intercept_requested = self.ctrl_r_allowed;
+            },
         }
-        if (diagnostic.diagnostic_line) |line| self.showDiagnostic(line);
-        self.intercept_requested = diagnostic.intercept_ctrl_r;
     }
 
     fn shouldInterceptCtrlR(self: *const ProxyClientControl) bool {
@@ -103,7 +120,7 @@ const ProxyClientControl = struct {
 
     fn sendCtrlR(self: *ProxyClientControl) void {
         if (self.control_fd < 0) return;
-        proxy_control.writeCtrlR(self.control_fd) catch {};
+        proxy_control.writeRetryNow(self.control_fd) catch {};
     }
 
     fn showUpdate(self: *ProxyClientControl, line: []const u8) void {
@@ -169,6 +186,12 @@ const ProxyClientControl = struct {
         io.writeAll(2, self.status_line[0..self.status_line_len]) catch {};
     }
 };
+
+fn retryDelayFromLocalBootDeadline(deadline_ms: ?u64) u64 {
+    const deadline = deadline_ms orelse return 0;
+    const now = local_boot_time.nowMs();
+    return deadline -| now;
+}
 
 fn copyBytes(dest: []u8, source: []const u8) usize {
     const len = @min(dest.len, source.len);

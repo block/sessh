@@ -173,49 +173,184 @@ pub const EnvironmentEntry = struct {
     }
 };
 
-pub const ClientDaemonItem = struct {
-    payload: ?payload_union = null,
+/// Semantic connection-state transition shared by terminal-emulator sessions,
+/// proxy streams, and local daemon transport setup. This is not remote process
+/// output. Visible clients decide how, where, and whether to render it.
+pub const ConnectionEvent = struct {
+    event: ?event_union = null,
 
-    pub const _payload_case = enum {
-        ssh_transport_open,
-        ssh_transport_event,
-        log_request,
-        log_entry,
+    pub const _event_case = enum {
+        ssh_connecting,
+        ssh_connected,
+        ssh_stderr,
+        bootstrap_started,
+        bootstrap_finished,
+        daemon_connecting,
+        daemon_connected,
+        daemon_disconnected,
+        unresponsive,
     };
-    pub const payload_union = union(_payload_case) {
-        ssh_transport_open: ClientDaemonItem.SshTransportOpen,
-        ssh_transport_event: ClientDaemonItem.SshTransportEvent,
-        log_request: ClientDaemonItem.DaemonLogRequest,
-        log_entry: ClientDaemonItem.DaemonLogEntry,
+    pub const event_union = union(_event_case) {
+        ssh_connecting: ConnectionEvent.SshConnecting,
+        ssh_connected: ConnectionEvent.SshConnected,
+        ssh_stderr: ConnectionEvent.SshStderr,
+        bootstrap_started: ConnectionEvent.BootstrapStarted,
+        bootstrap_finished: ConnectionEvent.BootstrapFinished,
+        daemon_connecting: ConnectionEvent.DaemonConnecting,
+        daemon_connected: ConnectionEvent.DaemonConnected,
+        daemon_disconnected: ConnectionEvent.DaemonDisconnected,
+        unresponsive: ConnectionEvent.Unresponsive,
         pub const _desc_table = .{
-            .ssh_transport_open = fd(1, .submessage),
-            .ssh_transport_event = fd(2, .submessage),
-            .log_request = fd(10, .submessage),
-            .log_entry = fd(11, .submessage),
+            .ssh_connecting = fd(1, .submessage),
+            .ssh_connected = fd(2, .submessage),
+            .ssh_stderr = fd(3, .submessage),
+            .bootstrap_started = fd(4, .submessage),
+            .bootstrap_finished = fd(5, .submessage),
+            .daemon_connecting = fd(6, .submessage),
+            .daemon_connected = fd(7, .submessage),
+            .daemon_disconnected = fd(8, .submessage),
+            .unresponsive = fd(9, .submessage),
         };
     };
 
     pub const _desc_table = .{
-        .payload = fd(null, .{ .oneof = payload_union }),
+        .event = fd(null, .{ .oneof = event_union }),
     };
 
-    /// Local visible-client -> local daemon request to open an SSH-backed
-    /// transport to a remote sesshd. The client may immediately pipeline stream
-    /// frames after this request; the local daemon queues them behind tunnel setup
-    /// and forwards them over ssh when the remote daemon endpoint is ready.
-    pub const SshTransportOpen = struct {
-        ssh_option: std.ArrayListUnmanaged([]const u8) = .empty,
-        host: []const u8 = &.{},
-        bootstrap: bool = false,
-        batch_mode: bool = false,
-        environment: std.ArrayListUnmanaged(EnvironmentEntry) = .empty,
+    pub const SshConnecting = struct {
+        pub const _desc_table = .{};
+
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    /// The child ssh transport is connected and running its remote command. The
+    /// remote sesshd may still need to be bootstrapped or handshaken.
+    pub const SshConnected = struct {
+        pub const _desc_table = .{};
+
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    /// Raw bytes written by the child ssh transport to stderr. This is still a
+    /// connection event, not remote process stderr: remote process stderr is
+    /// carried by the SSH channel itself.
+    pub const SshStderr = struct {
+        data: []const u8 = &.{},
 
         pub const _desc_table = .{
-            .ssh_option = fd(1, .{ .repeated = .{ .scalar = .string } }),
-            .host = fd(2, .{ .scalar = .string }),
-            .bootstrap = fd(3, .{ .scalar = .bool }),
-            .batch_mode = fd(4, .{ .scalar = .bool }),
-            .environment = fd(5, .{ .repeated = .submessage }),
+            .data = fd(1, .{ .scalar = .bytes }),
         };
 
         /// Encodes the message to the writer
@@ -277,284 +412,495 @@ pub const ClientDaemonItem = struct {
         }
     };
 
-    /// Local daemon -> visible-client event for the transport the daemon owns.
-    /// These are local sessh UI/diagnostic events, not remote process output.
-    pub const SshTransportEvent = struct {
-        event: ?event_union = null,
+    pub const BootstrapStarted = struct {
+        pub const _desc_table = .{};
 
-        pub const _event_case = enum {
-            stderr_chunk,
-            bootstrap_started,
-            bootstrap_finished,
-            closed,
-        };
-        pub const event_union = union(_event_case) {
-            stderr_chunk: ClientDaemonItem.SshTransportEvent.StderrChunk,
-            bootstrap_started: ClientDaemonItem.SshTransportEvent.BootstrapStarted,
-            bootstrap_finished: ClientDaemonItem.SshTransportEvent.BootstrapFinished,
-            closed: ClientDaemonItem.SshTransportEvent.Closed,
-            pub const _desc_table = .{
-                .stderr_chunk = fd(1, .submessage),
-                .bootstrap_started = fd(2, .submessage),
-                .bootstrap_finished = fd(3, .submessage),
-                .closed = fd(4, .submessage),
-            };
-        };
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    pub const BootstrapFinished = struct {
+        pub const _desc_table = .{};
+
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    pub const DaemonConnecting = struct {
+        pub const _desc_table = .{};
+
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    /// Remote sesshd is handshaken; stream payload can flow.
+    pub const DaemonConnected = struct {
+        pub const _desc_table = .{};
+
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    /// The daemon-to-daemon tunnel dropped after it had been established. This
+    /// usually means the child ssh transport died or the network path broke. It
+    /// does not prove the remote sesshd process exited.
+    pub const DaemonDisconnected = struct {
+        retry_at_local_boot_time_ms: ?u64 = null,
 
         pub const _desc_table = .{
-            .event = fd(null, .{ .oneof = event_union }),
+            .retry_at_local_boot_time_ms = fd(1, .{ .scalar = .uint64 }),
         };
 
-        pub const StderrChunk = struct {
-            chunk: []const u8 = &.{},
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
 
-            pub const _desc_table = .{
-                .chunk = fd(1, .{ .scalar = .bytes }),
-            };
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
 
-            /// Encodes the message to the writer
-            /// The allocator is used to generate submessages internally.
-            /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-            pub fn encode(
-                self: @This(),
-                writer: *std.Io.Writer,
-                allocator: std.mem.Allocator,
-            ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-                return protobuf.encode(writer, allocator, self);
-            }
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
 
-            /// Decodes the message from the bytes read from the reader.
-            pub fn decode(
-                reader: *std.Io.Reader,
-                allocator: std.mem.Allocator,
-            ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-                return protobuf.decode(@This(), reader, allocator);
-            }
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
 
-            /// Deinitializes and frees the memory associated with the message.
-            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-                return protobuf.deinit(allocator, self);
-            }
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
 
-            /// Duplicates the message.
-            pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-                return protobuf.dupe(@This(), self, allocator);
-            }
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
 
-            /// Decodes the message from the JSON string.
-            pub fn jsonDecode(
-                input: []const u8,
-                options: std.json.ParseOptions,
-                allocator: std.mem.Allocator,
-            ) !std.json.Parsed(@This()) {
-                return protobuf.json.decode(@This(), input, options, allocator);
-            }
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
 
-            /// Encodes the message to a JSON string.
-            pub fn jsonEncode(
-                self: @This(),
-                options: std.json.Stringify.Options,
-                pb_options: protobuf.json.Options,
-                allocator: std.mem.Allocator,
-            ) ![]const u8 {
-                return protobuf.json.encode(self, options, pb_options, allocator);
-            }
+    pub const Unresponsive = struct {
+        retry_at_local_boot_time_ms: ?u64 = null,
 
-            /// This method is used by std.json
-            /// internally for deserialization. DO NOT RENAME!
-            pub fn jsonParse(
-                allocator: std.mem.Allocator,
-                source: anytype,
-                options: std.json.ParseOptions,
-            ) !@This() {
-                return protobuf.json.parse(@This(), allocator, source, options);
-            }
+        pub const _desc_table = .{
+            .retry_at_local_boot_time_ms = fd(1, .{ .scalar = .uint64 }),
         };
 
-        pub const BootstrapStarted = struct {
-            pub const _desc_table = .{};
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
 
-            /// Encodes the message to the writer
-            /// The allocator is used to generate submessages internally.
-            /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-            pub fn encode(
-                self: @This(),
-                writer: *std.Io.Writer,
-                allocator: std.mem.Allocator,
-            ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-                return protobuf.encode(writer, allocator, self);
-            }
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
 
-            /// Decodes the message from the bytes read from the reader.
-            pub fn decode(
-                reader: *std.Io.Reader,
-                allocator: std.mem.Allocator,
-            ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-                return protobuf.decode(@This(), reader, allocator);
-            }
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
 
-            /// Deinitializes and frees the memory associated with the message.
-            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-                return protobuf.deinit(allocator, self);
-            }
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
 
-            /// Duplicates the message.
-            pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-                return protobuf.dupe(@This(), self, allocator);
-            }
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
 
-            /// Decodes the message from the JSON string.
-            pub fn jsonDecode(
-                input: []const u8,
-                options: std.json.ParseOptions,
-                allocator: std.mem.Allocator,
-            ) !std.json.Parsed(@This()) {
-                return protobuf.json.decode(@This(), input, options, allocator);
-            }
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
 
-            /// Encodes the message to a JSON string.
-            pub fn jsonEncode(
-                self: @This(),
-                options: std.json.Stringify.Options,
-                pb_options: protobuf.json.Options,
-                allocator: std.mem.Allocator,
-            ) ![]const u8 {
-                return protobuf.json.encode(self, options, pb_options, allocator);
-            }
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
 
-            /// This method is used by std.json
-            /// internally for deserialization. DO NOT RENAME!
-            pub fn jsonParse(
-                allocator: std.mem.Allocator,
-                source: anytype,
-                options: std.json.ParseOptions,
-            ) !@This() {
-                return protobuf.json.parse(@This(), allocator, source, options);
-            }
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+pub const ClientDaemonItem = struct {
+    payload: ?payload_union = null,
+
+    pub const _payload_case = enum {
+        ssh_transport_acquire,
+        log_request,
+        log_entry,
+        connection_event,
+        retry_now,
+    };
+    pub const payload_union = union(_payload_case) {
+        ssh_transport_acquire: ClientDaemonItem.SshTransportAcquire,
+        log_request: ClientDaemonItem.DaemonLogRequest,
+        log_entry: ClientDaemonItem.DaemonLogEntry,
+        connection_event: ConnectionEvent,
+        retry_now: ClientDaemonItem.RetryNow,
+        pub const _desc_table = .{
+            .ssh_transport_acquire = fd(1, .submessage),
+            .log_request = fd(10, .submessage),
+            .log_entry = fd(11, .submessage),
+            .connection_event = fd(12, .submessage),
+            .retry_now = fd(13, .submessage),
         };
+    };
 
-        pub const BootstrapFinished = struct {
-            pub const _desc_table = .{};
+    pub const _desc_table = .{
+        .payload = fd(null, .{ .oneof = payload_union }),
+    };
 
-            /// Encodes the message to the writer
-            /// The allocator is used to generate submessages internally.
-            /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-            pub fn encode(
-                self: @This(),
-                writer: *std.Io.Writer,
-                allocator: std.mem.Allocator,
-            ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-                return protobuf.encode(writer, allocator, self);
-            }
+    /// Local visible-client -> local daemon request to acquire an SSH-backed
+    /// transport to a remote sesshd. The client may immediately pipeline stream
+    /// frames after this request; the local daemon queues them behind tunnel setup
+    /// and forwards them over ssh when the remote daemon endpoint is ready.
+    pub const SshTransportAcquire = struct {
+        ssh_option: std.ArrayListUnmanaged([]const u8) = .empty,
+        host: []const u8 = &.{},
+        bootstrap: bool = false,
+        ssh_auth_sock: ?[]const u8 = null,
+        ip_qos: []const u8 = &.{},
 
-            /// Decodes the message from the bytes read from the reader.
-            pub fn decode(
-                reader: *std.Io.Reader,
-                allocator: std.mem.Allocator,
-            ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-                return protobuf.decode(@This(), reader, allocator);
-            }
-
-            /// Deinitializes and frees the memory associated with the message.
-            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-                return protobuf.deinit(allocator, self);
-            }
-
-            /// Duplicates the message.
-            pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-                return protobuf.dupe(@This(), self, allocator);
-            }
-
-            /// Decodes the message from the JSON string.
-            pub fn jsonDecode(
-                input: []const u8,
-                options: std.json.ParseOptions,
-                allocator: std.mem.Allocator,
-            ) !std.json.Parsed(@This()) {
-                return protobuf.json.decode(@This(), input, options, allocator);
-            }
-
-            /// Encodes the message to a JSON string.
-            pub fn jsonEncode(
-                self: @This(),
-                options: std.json.Stringify.Options,
-                pb_options: protobuf.json.Options,
-                allocator: std.mem.Allocator,
-            ) ![]const u8 {
-                return protobuf.json.encode(self, options, pb_options, allocator);
-            }
-
-            /// This method is used by std.json
-            /// internally for deserialization. DO NOT RENAME!
-            pub fn jsonParse(
-                allocator: std.mem.Allocator,
-                source: anytype,
-                options: std.json.ParseOptions,
-            ) !@This() {
-                return protobuf.json.parse(@This(), allocator, source, options);
-            }
-        };
-
-        pub const Closed = struct {
-            pub const _desc_table = .{};
-
-            /// Encodes the message to the writer
-            /// The allocator is used to generate submessages internally.
-            /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-            pub fn encode(
-                self: @This(),
-                writer: *std.Io.Writer,
-                allocator: std.mem.Allocator,
-            ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-                return protobuf.encode(writer, allocator, self);
-            }
-
-            /// Decodes the message from the bytes read from the reader.
-            pub fn decode(
-                reader: *std.Io.Reader,
-                allocator: std.mem.Allocator,
-            ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-                return protobuf.decode(@This(), reader, allocator);
-            }
-
-            /// Deinitializes and frees the memory associated with the message.
-            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-                return protobuf.deinit(allocator, self);
-            }
-
-            /// Duplicates the message.
-            pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-                return protobuf.dupe(@This(), self, allocator);
-            }
-
-            /// Decodes the message from the JSON string.
-            pub fn jsonDecode(
-                input: []const u8,
-                options: std.json.ParseOptions,
-                allocator: std.mem.Allocator,
-            ) !std.json.Parsed(@This()) {
-                return protobuf.json.decode(@This(), input, options, allocator);
-            }
-
-            /// Encodes the message to a JSON string.
-            pub fn jsonEncode(
-                self: @This(),
-                options: std.json.Stringify.Options,
-                pb_options: protobuf.json.Options,
-                allocator: std.mem.Allocator,
-            ) ![]const u8 {
-                return protobuf.json.encode(self, options, pb_options, allocator);
-            }
-
-            /// This method is used by std.json
-            /// internally for deserialization. DO NOT RENAME!
-            pub fn jsonParse(
-                allocator: std.mem.Allocator,
-                source: anytype,
-                options: std.json.ParseOptions,
-            ) !@This() {
-                return protobuf.json.parse(@This(), allocator, source, options);
-            }
+        pub const _desc_table = .{
+            .ssh_option = fd(1, .{ .repeated = .{ .scalar = .string } }),
+            .host = fd(2, .{ .scalar = .string }),
+            .bootstrap = fd(3, .{ .scalar = .bool }),
+            .ssh_auth_sock = fd(4, .{ .scalar = .string }),
+            .ip_qos = fd(5, .{ .scalar = .string }),
         };
 
         /// Encodes the message to the writer
@@ -690,6 +1036,71 @@ pub const ClientDaemonItem = struct {
             .unix_ms = fd(1, .{ .scalar = .int64 }),
             .message = fd(2, .{ .scalar = .string }),
         };
+
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    /// Visible client request for the reconnect owner to retry immediately. The
+    /// visible client decides when to intercept CTRL-R and translate it to this
+    /// command; CTRL-R interception policy is not part of the protocol.
+    pub const RetryNow = struct {
+        pub const _desc_table = .{};
 
         /// Encodes the message to the writer
         /// The allocator is used to generate submessages internally.
@@ -1077,30 +1488,16 @@ pub const DaemonTunnelItem = struct {
             .message = fd(null, .{ .oneof = message_union }),
         };
 
-        /// Opens or resumes a mux stream. The detail oneof identifies the stream
-        /// type; there is no separate stream-kind field to keep in sync.
+        /// Opens or resumes a mux stream. Stream-specific open details are carried
+        /// as typed stream payloads, not in the mux envelope, so this layer only
+        /// tracks resume and backpressure state.
         pub const Open = struct {
             recv_next_offset: u64 = 0,
             receive_window_bytes: u32 = 0,
-            detail: ?detail_union = null,
-
-            pub const _detail_case = enum {
-                terminal_emulator,
-                proxy,
-            };
-            pub const detail_union = union(_detail_case) {
-                terminal_emulator: TerminalEmulatorItem.Open,
-                proxy: ProxyStreamItem.Open,
-                pub const _desc_table = .{
-                    .terminal_emulator = fd(10, .submessage),
-                    .proxy = fd(11, .submessage),
-                };
-            };
 
             pub const _desc_table = .{
                 .recv_next_offset = fd(1, .{ .scalar = .uint64 }),
                 .receive_window_bytes = fd(2, .{ .scalar = .uint32 }),
-                .detail = fd(null, .{ .oneof = detail_union }),
             };
 
             /// Encodes the message to the writer
@@ -1233,7 +1630,10 @@ pub const DaemonTunnelItem = struct {
             }
         };
 
-        /// Ordered durable stream payload carried over a mux stream.
+        /// Ordered durable stream payload carried over a mux stream. The typed item
+        /// defines the offset semantics: terminal-emulator streams count ordered
+        /// items, while proxy stream data uses byte offsets and treats Open as setup
+        /// that does not consume byte-offset space.
         pub const Payload = struct {
             offset: u64 = 0,
             item: ?item_union = null,
@@ -1658,7 +2058,6 @@ pub const TerminalEmulatorItem = struct {
         draw,
         repaint_response,
         tty_transcript_chunk,
-        diagnostic,
         session_client_control_response,
         debug_sever_connection_request,
         debug_unresponsive_connection_request,
@@ -1675,7 +2074,6 @@ pub const TerminalEmulatorItem = struct {
         draw: TerminalEmulatorItem.Draw,
         repaint_response: TerminalEmulatorItem.RepaintResponse,
         tty_transcript_chunk: TerminalEmulatorItem.TtyTranscriptChunk,
-        diagnostic: TerminalEmulatorItem.Diagnostic,
         session_client_control_response: TerminalEmulatorItem.SessionClientControlResponse,
         debug_sever_connection_request: TerminalEmulatorItem.SessionClientDebugSeverConnectionRequest,
         debug_unresponsive_connection_request: TerminalEmulatorItem.SessionClientDebugUnresponsiveConnectionRequest,
@@ -1691,7 +2089,6 @@ pub const TerminalEmulatorItem = struct {
             .draw = fd(8, .submessage),
             .repaint_response = fd(9, .submessage),
             .tty_transcript_chunk = fd(10, .submessage),
-            .diagnostic = fd(11, .submessage),
             .session_client_control_response = fd(12, .submessage),
             .debug_sever_connection_request = fd(13, .submessage),
             .debug_unresponsive_connection_request = fd(14, .submessage),
@@ -3196,427 +3593,6 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Coordinator-injected terminal-emulator diagnostic. This is not remote
-    /// process output; the visible client renders it according to its filter
-    /// level.
-    pub const Diagnostic = struct {
-        diagnostic: ?diagnostic_union = null,
-
-        pub const _diagnostic_case = enum {
-            disconnected,
-            connecting,
-            reconnected,
-            unresponsive,
-            reconnect_failed,
-        };
-        pub const diagnostic_union = union(_diagnostic_case) {
-            disconnected: TerminalEmulatorItem.Diagnostic.Disconnected,
-            connecting: TerminalEmulatorItem.Diagnostic.Connecting,
-            reconnected: TerminalEmulatorItem.Diagnostic.Reconnected,
-            unresponsive: TerminalEmulatorItem.Diagnostic.Unresponsive,
-            reconnect_failed: TerminalEmulatorItem.Diagnostic.ReconnectFailed,
-            pub const _desc_table = .{
-                .disconnected = fd(1, .submessage),
-                .connecting = fd(2, .submessage),
-                .reconnected = fd(3, .submessage),
-                .unresponsive = fd(4, .submessage),
-                .reconnect_failed = fd(5, .submessage),
-            };
-        };
-
-        pub const _desc_table = .{
-            .diagnostic = fd(null, .{ .oneof = diagnostic_union }),
-        };
-
-        pub const Disconnected = struct {
-            next_retry_unix_ms: ?u64 = null,
-
-            pub const _desc_table = .{
-                .next_retry_unix_ms = fd(1, .{ .scalar = .uint64 }),
-            };
-
-            /// Encodes the message to the writer
-            /// The allocator is used to generate submessages internally.
-            /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-            pub fn encode(
-                self: @This(),
-                writer: *std.Io.Writer,
-                allocator: std.mem.Allocator,
-            ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-                return protobuf.encode(writer, allocator, self);
-            }
-
-            /// Decodes the message from the bytes read from the reader.
-            pub fn decode(
-                reader: *std.Io.Reader,
-                allocator: std.mem.Allocator,
-            ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-                return protobuf.decode(@This(), reader, allocator);
-            }
-
-            /// Deinitializes and frees the memory associated with the message.
-            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-                return protobuf.deinit(allocator, self);
-            }
-
-            /// Duplicates the message.
-            pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-                return protobuf.dupe(@This(), self, allocator);
-            }
-
-            /// Decodes the message from the JSON string.
-            pub fn jsonDecode(
-                input: []const u8,
-                options: std.json.ParseOptions,
-                allocator: std.mem.Allocator,
-            ) !std.json.Parsed(@This()) {
-                return protobuf.json.decode(@This(), input, options, allocator);
-            }
-
-            /// Encodes the message to a JSON string.
-            pub fn jsonEncode(
-                self: @This(),
-                options: std.json.Stringify.Options,
-                pb_options: protobuf.json.Options,
-                allocator: std.mem.Allocator,
-            ) ![]const u8 {
-                return protobuf.json.encode(self, options, pb_options, allocator);
-            }
-
-            /// This method is used by std.json
-            /// internally for deserialization. DO NOT RENAME!
-            pub fn jsonParse(
-                allocator: std.mem.Allocator,
-                source: anytype,
-                options: std.json.ParseOptions,
-            ) !@This() {
-                return protobuf.json.parse(@This(), allocator, source, options);
-            }
-        };
-
-        pub const Connecting = struct {
-            attempt: u64 = 0,
-
-            pub const _desc_table = .{
-                .attempt = fd(1, .{ .scalar = .uint64 }),
-            };
-
-            /// Encodes the message to the writer
-            /// The allocator is used to generate submessages internally.
-            /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-            pub fn encode(
-                self: @This(),
-                writer: *std.Io.Writer,
-                allocator: std.mem.Allocator,
-            ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-                return protobuf.encode(writer, allocator, self);
-            }
-
-            /// Decodes the message from the bytes read from the reader.
-            pub fn decode(
-                reader: *std.Io.Reader,
-                allocator: std.mem.Allocator,
-            ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-                return protobuf.decode(@This(), reader, allocator);
-            }
-
-            /// Deinitializes and frees the memory associated with the message.
-            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-                return protobuf.deinit(allocator, self);
-            }
-
-            /// Duplicates the message.
-            pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-                return protobuf.dupe(@This(), self, allocator);
-            }
-
-            /// Decodes the message from the JSON string.
-            pub fn jsonDecode(
-                input: []const u8,
-                options: std.json.ParseOptions,
-                allocator: std.mem.Allocator,
-            ) !std.json.Parsed(@This()) {
-                return protobuf.json.decode(@This(), input, options, allocator);
-            }
-
-            /// Encodes the message to a JSON string.
-            pub fn jsonEncode(
-                self: @This(),
-                options: std.json.Stringify.Options,
-                pb_options: protobuf.json.Options,
-                allocator: std.mem.Allocator,
-            ) ![]const u8 {
-                return protobuf.json.encode(self, options, pb_options, allocator);
-            }
-
-            /// This method is used by std.json
-            /// internally for deserialization. DO NOT RENAME!
-            pub fn jsonParse(
-                allocator: std.mem.Allocator,
-                source: anytype,
-                options: std.json.ParseOptions,
-            ) !@This() {
-                return protobuf.json.parse(@This(), allocator, source, options);
-            }
-        };
-
-        pub const Reconnected = struct {
-            pub const _desc_table = .{};
-
-            /// Encodes the message to the writer
-            /// The allocator is used to generate submessages internally.
-            /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-            pub fn encode(
-                self: @This(),
-                writer: *std.Io.Writer,
-                allocator: std.mem.Allocator,
-            ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-                return protobuf.encode(writer, allocator, self);
-            }
-
-            /// Decodes the message from the bytes read from the reader.
-            pub fn decode(
-                reader: *std.Io.Reader,
-                allocator: std.mem.Allocator,
-            ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-                return protobuf.decode(@This(), reader, allocator);
-            }
-
-            /// Deinitializes and frees the memory associated with the message.
-            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-                return protobuf.deinit(allocator, self);
-            }
-
-            /// Duplicates the message.
-            pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-                return protobuf.dupe(@This(), self, allocator);
-            }
-
-            /// Decodes the message from the JSON string.
-            pub fn jsonDecode(
-                input: []const u8,
-                options: std.json.ParseOptions,
-                allocator: std.mem.Allocator,
-            ) !std.json.Parsed(@This()) {
-                return protobuf.json.decode(@This(), input, options, allocator);
-            }
-
-            /// Encodes the message to a JSON string.
-            pub fn jsonEncode(
-                self: @This(),
-                options: std.json.Stringify.Options,
-                pb_options: protobuf.json.Options,
-                allocator: std.mem.Allocator,
-            ) ![]const u8 {
-                return protobuf.json.encode(self, options, pb_options, allocator);
-            }
-
-            /// This method is used by std.json
-            /// internally for deserialization. DO NOT RENAME!
-            pub fn jsonParse(
-                allocator: std.mem.Allocator,
-                source: anytype,
-                options: std.json.ParseOptions,
-            ) !@This() {
-                return protobuf.json.parse(@This(), allocator, source, options);
-            }
-        };
-
-        pub const Unresponsive = struct {
-            attempt: u64 = 0,
-
-            pub const _desc_table = .{
-                .attempt = fd(1, .{ .scalar = .uint64 }),
-            };
-
-            /// Encodes the message to the writer
-            /// The allocator is used to generate submessages internally.
-            /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-            pub fn encode(
-                self: @This(),
-                writer: *std.Io.Writer,
-                allocator: std.mem.Allocator,
-            ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-                return protobuf.encode(writer, allocator, self);
-            }
-
-            /// Decodes the message from the bytes read from the reader.
-            pub fn decode(
-                reader: *std.Io.Reader,
-                allocator: std.mem.Allocator,
-            ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-                return protobuf.decode(@This(), reader, allocator);
-            }
-
-            /// Deinitializes and frees the memory associated with the message.
-            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-                return protobuf.deinit(allocator, self);
-            }
-
-            /// Duplicates the message.
-            pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-                return protobuf.dupe(@This(), self, allocator);
-            }
-
-            /// Decodes the message from the JSON string.
-            pub fn jsonDecode(
-                input: []const u8,
-                options: std.json.ParseOptions,
-                allocator: std.mem.Allocator,
-            ) !std.json.Parsed(@This()) {
-                return protobuf.json.decode(@This(), input, options, allocator);
-            }
-
-            /// Encodes the message to a JSON string.
-            pub fn jsonEncode(
-                self: @This(),
-                options: std.json.Stringify.Options,
-                pb_options: protobuf.json.Options,
-                allocator: std.mem.Allocator,
-            ) ![]const u8 {
-                return protobuf.json.encode(self, options, pb_options, allocator);
-            }
-
-            /// This method is used by std.json
-            /// internally for deserialization. DO NOT RENAME!
-            pub fn jsonParse(
-                allocator: std.mem.Allocator,
-                source: anytype,
-                options: std.json.ParseOptions,
-            ) !@This() {
-                return protobuf.json.parse(@This(), allocator, source, options);
-            }
-        };
-
-        pub const ReconnectFailed = struct {
-            attempt: u64 = 0,
-            message: []const u8 = &.{},
-            next_retry_unix_ms: ?u64 = null,
-
-            pub const _desc_table = .{
-                .attempt = fd(1, .{ .scalar = .uint64 }),
-                .message = fd(2, .{ .scalar = .string }),
-                .next_retry_unix_ms = fd(3, .{ .scalar = .uint64 }),
-            };
-
-            /// Encodes the message to the writer
-            /// The allocator is used to generate submessages internally.
-            /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-            pub fn encode(
-                self: @This(),
-                writer: *std.Io.Writer,
-                allocator: std.mem.Allocator,
-            ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-                return protobuf.encode(writer, allocator, self);
-            }
-
-            /// Decodes the message from the bytes read from the reader.
-            pub fn decode(
-                reader: *std.Io.Reader,
-                allocator: std.mem.Allocator,
-            ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-                return protobuf.decode(@This(), reader, allocator);
-            }
-
-            /// Deinitializes and frees the memory associated with the message.
-            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-                return protobuf.deinit(allocator, self);
-            }
-
-            /// Duplicates the message.
-            pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-                return protobuf.dupe(@This(), self, allocator);
-            }
-
-            /// Decodes the message from the JSON string.
-            pub fn jsonDecode(
-                input: []const u8,
-                options: std.json.ParseOptions,
-                allocator: std.mem.Allocator,
-            ) !std.json.Parsed(@This()) {
-                return protobuf.json.decode(@This(), input, options, allocator);
-            }
-
-            /// Encodes the message to a JSON string.
-            pub fn jsonEncode(
-                self: @This(),
-                options: std.json.Stringify.Options,
-                pb_options: protobuf.json.Options,
-                allocator: std.mem.Allocator,
-            ) ![]const u8 {
-                return protobuf.json.encode(self, options, pb_options, allocator);
-            }
-
-            /// This method is used by std.json
-            /// internally for deserialization. DO NOT RENAME!
-            pub fn jsonParse(
-                allocator: std.mem.Allocator,
-                source: anytype,
-                options: std.json.ParseOptions,
-            ) !@This() {
-                return protobuf.json.parse(@This(), allocator, source, options);
-            }
-        };
-
-        /// Encodes the message to the writer
-        /// The allocator is used to generate submessages internally.
-        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-        pub fn encode(
-            self: @This(),
-            writer: *std.Io.Writer,
-            allocator: std.mem.Allocator,
-        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-            return protobuf.encode(writer, allocator, self);
-        }
-
-        /// Decodes the message from the bytes read from the reader.
-        pub fn decode(
-            reader: *std.Io.Reader,
-            allocator: std.mem.Allocator,
-        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-            return protobuf.decode(@This(), reader, allocator);
-        }
-
-        /// Deinitializes and frees the memory associated with the message.
-        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            return protobuf.deinit(allocator, self);
-        }
-
-        /// Duplicates the message.
-        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-            return protobuf.dupe(@This(), self, allocator);
-        }
-
-        /// Decodes the message from the JSON string.
-        pub fn jsonDecode(
-            input: []const u8,
-            options: std.json.ParseOptions,
-            allocator: std.mem.Allocator,
-        ) !std.json.Parsed(@This()) {
-            return protobuf.json.decode(@This(), input, options, allocator);
-        }
-
-        /// Encodes the message to a JSON string.
-        pub fn jsonEncode(
-            self: @This(),
-            options: std.json.Stringify.Options,
-            pb_options: protobuf.json.Options,
-            allocator: std.mem.Allocator,
-        ) ![]const u8 {
-            return protobuf.json.encode(self, options, pb_options, allocator);
-        }
-
-        /// This method is used by std.json
-        /// internally for deserialization. DO NOT RENAME!
-        pub fn jsonParse(
-            allocator: std.mem.Allocator,
-            source: anytype,
-            options: std.json.ParseOptions,
-        ) !@This() {
-            return protobuf.json.parse(@This(), allocator, source, options);
-        }
-    };
-
     /// Encodes the message to the writer
     /// The allocator is used to generate submessages internally.
     /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
@@ -3682,21 +3658,15 @@ pub const ProxyStreamItem = struct {
     payload: ?payload_union = null,
 
     pub const _payload_case = enum {
+        open,
         data,
-        control_capabilities,
-        control_diagnostic,
-        control_ctrl_r,
     };
     pub const payload_union = union(_payload_case) {
+        open: ProxyStreamItem.Open,
         data: []const u8,
-        control_capabilities: ProxyStreamItem.ControlCapabilities,
-        control_diagnostic: ProxyStreamItem.ControlDiagnostic,
-        control_ctrl_r: ProxyStreamItem.ControlCtrlR,
         pub const _desc_table = .{
+            .open = fd(1, .submessage),
             .data = fd(2, .{ .scalar = .bytes }),
-            .control_capabilities = fd(10, .submessage),
-            .control_diagnostic = fd(11, .submessage),
-            .control_ctrl_r = fd(12, .submessage),
         };
     };
 
@@ -3704,7 +3674,9 @@ pub const ProxyStreamItem = struct {
         .payload = fd(null, .{ .oneof = payload_union }),
     };
 
-    /// Proxy stream open details carried by MuxStreamFrame.Open.detail.
+    /// Proxy stream open details. When muxed, this is sent as the first typed
+    /// proxy payload after MuxStreamFrame.Open and does not consume proxy byte
+    /// offset space; data may still start at offset 0.
     pub const Open = struct {
         proxy_guid: []const u8 = &.{},
         proxy_host: []const u8 = &.{},
@@ -3715,221 +3687,6 @@ pub const ProxyStreamItem = struct {
             .proxy_host = fd(2, .{ .scalar = .string }),
             .proxy_port = fd(3, .{ .scalar = .uint32 }),
         };
-
-        /// Encodes the message to the writer
-        /// The allocator is used to generate submessages internally.
-        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-        pub fn encode(
-            self: @This(),
-            writer: *std.Io.Writer,
-            allocator: std.mem.Allocator,
-        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-            return protobuf.encode(writer, allocator, self);
-        }
-
-        /// Decodes the message from the bytes read from the reader.
-        pub fn decode(
-            reader: *std.Io.Reader,
-            allocator: std.mem.Allocator,
-        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-            return protobuf.decode(@This(), reader, allocator);
-        }
-
-        /// Deinitializes and frees the memory associated with the message.
-        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            return protobuf.deinit(allocator, self);
-        }
-
-        /// Duplicates the message.
-        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-            return protobuf.dupe(@This(), self, allocator);
-        }
-
-        /// Decodes the message from the JSON string.
-        pub fn jsonDecode(
-            input: []const u8,
-            options: std.json.ParseOptions,
-            allocator: std.mem.Allocator,
-        ) !std.json.Parsed(@This()) {
-            return protobuf.json.decode(@This(), input, options, allocator);
-        }
-
-        /// Encodes the message to a JSON string.
-        pub fn jsonEncode(
-            self: @This(),
-            options: std.json.Stringify.Options,
-            pb_options: protobuf.json.Options,
-            allocator: std.mem.Allocator,
-        ) ![]const u8 {
-            return protobuf.json.encode(self, options, pb_options, allocator);
-        }
-
-        /// This method is used by std.json
-        /// internally for deserialization. DO NOT RENAME!
-        pub fn jsonParse(
-            allocator: std.mem.Allocator,
-            source: anytype,
-            options: std.json.ParseOptions,
-        ) !@This() {
-            return protobuf.json.parse(@This(), allocator, source, options);
-        }
-    };
-
-    /// Sent immediately after the local IPC socket's normal HelloFrame handshake
-    /// so the ProxyCommand process can choose the right diagnostic stream shape.
-    pub const ControlCapabilities = struct {
-        output_mode: ProxyStreamItem.ControlCapabilities.OutputMode = @enumFromInt(0),
-        ctrl_r_available: bool = false,
-
-        pub const _desc_table = .{
-            .output_mode = fd(1, .@"enum"),
-            .ctrl_r_available = fd(2, .{ .scalar = .bool }),
-        };
-
-        pub const OutputMode = enum(i32) {
-            OUTPUT_MODE_NONE = 0,
-            OUTPUT_MODE_UPDATE = 1,
-            OUTPUT_MODE_DIAGNOSTIC_LINE = 2,
-            _,
-        };
-
-        /// Encodes the message to the writer
-        /// The allocator is used to generate submessages internally.
-        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-        pub fn encode(
-            self: @This(),
-            writer: *std.Io.Writer,
-            allocator: std.mem.Allocator,
-        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-            return protobuf.encode(writer, allocator, self);
-        }
-
-        /// Decodes the message from the bytes read from the reader.
-        pub fn decode(
-            reader: *std.Io.Reader,
-            allocator: std.mem.Allocator,
-        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-            return protobuf.decode(@This(), reader, allocator);
-        }
-
-        /// Deinitializes and frees the memory associated with the message.
-        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            return protobuf.deinit(allocator, self);
-        }
-
-        /// Duplicates the message.
-        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-            return protobuf.dupe(@This(), self, allocator);
-        }
-
-        /// Decodes the message from the JSON string.
-        pub fn jsonDecode(
-            input: []const u8,
-            options: std.json.ParseOptions,
-            allocator: std.mem.Allocator,
-        ) !std.json.Parsed(@This()) {
-            return protobuf.json.decode(@This(), input, options, allocator);
-        }
-
-        /// Encodes the message to a JSON string.
-        pub fn jsonEncode(
-            self: @This(),
-            options: std.json.Stringify.Options,
-            pb_options: protobuf.json.Options,
-            allocator: std.mem.Allocator,
-        ) ![]const u8 {
-            return protobuf.json.encode(self, options, pb_options, allocator);
-        }
-
-        /// This method is used by std.json
-        /// internally for deserialization. DO NOT RENAME!
-        pub fn jsonParse(
-            allocator: std.mem.Allocator,
-            source: anytype,
-            options: std.json.ParseOptions,
-        ) !@This() {
-            return protobuf.json.parse(@This(), allocator, source, options);
-        }
-    };
-
-    /// One diagnostic item in the proxy-control stream. `update` is replaceable
-    /// connection state. `diagnostic_line` is append-only and should be emitted
-    /// infrequently. When both text fields are absent, the client clears any
-    /// previous update.
-    pub const ControlDiagnostic = struct {
-        update: ?[]const u8 = null,
-        diagnostic_line: ?[]const u8 = null,
-        intercept_ctrl_r: bool = false,
-
-        pub const _desc_table = .{
-            .update = fd(1, .{ .scalar = .string }),
-            .diagnostic_line = fd(2, .{ .scalar = .string }),
-            .intercept_ctrl_r = fd(3, .{ .scalar = .bool }),
-        };
-
-        /// Encodes the message to the writer
-        /// The allocator is used to generate submessages internally.
-        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
-        pub fn encode(
-            self: @This(),
-            writer: *std.Io.Writer,
-            allocator: std.mem.Allocator,
-        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-            return protobuf.encode(writer, allocator, self);
-        }
-
-        /// Decodes the message from the bytes read from the reader.
-        pub fn decode(
-            reader: *std.Io.Reader,
-            allocator: std.mem.Allocator,
-        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
-            return protobuf.decode(@This(), reader, allocator);
-        }
-
-        /// Deinitializes and frees the memory associated with the message.
-        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            return protobuf.deinit(allocator, self);
-        }
-
-        /// Duplicates the message.
-        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-            return protobuf.dupe(@This(), self, allocator);
-        }
-
-        /// Decodes the message from the JSON string.
-        pub fn jsonDecode(
-            input: []const u8,
-            options: std.json.ParseOptions,
-            allocator: std.mem.Allocator,
-        ) !std.json.Parsed(@This()) {
-            return protobuf.json.decode(@This(), input, options, allocator);
-        }
-
-        /// Encodes the message to a JSON string.
-        pub fn jsonEncode(
-            self: @This(),
-            options: std.json.Stringify.Options,
-            pb_options: protobuf.json.Options,
-            allocator: std.mem.Allocator,
-        ) ![]const u8 {
-            return protobuf.json.encode(self, options, pb_options, allocator);
-        }
-
-        /// This method is used by std.json
-        /// internally for deserialization. DO NOT RENAME!
-        pub fn jsonParse(
-            allocator: std.mem.Allocator,
-            source: anytype,
-            options: std.json.ParseOptions,
-        ) !@This() {
-            return protobuf.json.parse(@This(), allocator, source, options);
-        }
-    };
-
-    /// Requests an immediate reconnect attempt after the visible client
-    /// intercepted CTRL-R.
-    pub const ControlCtrlR = struct {
-        pub const _desc_table = .{};
 
         /// Encodes the message to the writer
         /// The allocator is used to generate submessages internally.

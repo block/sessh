@@ -710,8 +710,11 @@ def send_mux_te_open(conn, shell, stream_id=1, session_id=None):
     mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=stream_id)
     mux.open.recv_next_offset = 0
     mux.open.receive_window_bytes = 0
-    mux.open.terminal_emulator.CopyFrom(te_open)
     send_frame(conn, MUX_STREAM_FRAME, mux.SerializeToString())
+    payload = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=stream_id)
+    payload.payload.offset = 0
+    payload.payload.terminal_emulator.open.CopyFrom(te_open)
+    send_frame(conn, MUX_STREAM_FRAME, payload.SerializeToString())
 
 
 def recv_mux_te_payload_frame(conn, expected_payload, timeout=5.0):

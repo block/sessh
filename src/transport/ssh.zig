@@ -490,7 +490,6 @@ fn runRemoteNewSession(
         exe,
         target,
         runtime_config.common,
-        false,
     );
 
     var local_terminal = local_terminal_probe.finish();
@@ -542,25 +541,29 @@ fn runRemoteNewSession(
 pub fn serveTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
-    request: pb.ClientDaemonItem.SshTransportOpen,
+    request: pb.ClientDaemonItem.SshTransportAcquire,
 ) !void {
     var resolved_target = try resolveSshTarget(allocator, request.ssh_option.items, request.host);
     defer resolved_target.deinit(allocator);
+    var acquire_request = request;
+    if (acquire_request.ip_qos.len == 0) {
+        if (resolved_target.config.ipqos) |ip_qos| acquire_request.ip_qos = ip_qos;
+    }
     const target = resolved_target.target;
     daemon_log.infof(
         allocator,
         "terminal transport opening host={s} resolved={s}@{s}:{s} bootstrap={}",
-        .{ target.host, target.resolved_user, target.resolved_host, target.resolved_port, request.bootstrap },
+        .{ target.host, target.resolved_user, target.resolved_host, target.resolved_port, acquire_request.bootstrap },
     );
 
-    try servePooledTerminalTransportFromDaemon(allocator, client_fd, target, request);
+    try servePooledTerminalTransportFromDaemon(allocator, client_fd, target, acquire_request);
 }
 
 fn startTerminalTransportForDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.ClientDaemonItem.SshTransportOpen,
+    request: pb.ClientDaemonItem.SshTransportAcquire,
 ) !TerminalTransportStart {
     var artifacts_storage: ?ArtifactSet = if (request.bootstrap) try loadArtifactSet(allocator) else null;
     defer if (artifacts_storage) |*artifacts| artifacts.deinit();
@@ -595,8 +598,8 @@ fn startTerminalTransportForDaemon(
     socket_transport.setCloseOnExec(diagnostic_pipe[0]) catch {};
     socket_transport.setCloseOnExec(diagnostic_pipe[1]) catch {};
 
-    var client_environment = try envMapFromSshTransportOpen(allocator, request);
-    defer client_environment.deinit();
+    var ssh_launch_environment = try envMapFromSshTransportAcquire(allocator, request);
+    defer ssh_launch_environment.deinit();
 
     var bootstrap_failure_term: ?std.process.Child.Term = null;
     const child = startRuntimeConnection(
@@ -606,13 +609,12 @@ fn startTerminalTransportForDaemon(
         remote_command,
         .broker,
         broker_args,
-        request.batch_mode,
         null,
         false,
         .pipe,
         diagnostic_pipe[1],
         client_fd,
-        &client_environment,
+        &ssh_launch_environment,
         &bootstrap_failure_term,
         .{
             .unsupported_action = "start a persistent sessh session",
@@ -654,7 +656,7 @@ fn servePooledTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.ClientDaemonItem.SshTransportOpen,
+    request: pb.ClientDaemonItem.SshTransportAcquire,
 ) !void {
     const client = try allocator.create(PooledTerminalClient);
     errdefer allocator.destroy(client);
@@ -664,7 +666,7 @@ fn servePooledTerminalTransportFromDaemon(
     };
     errdefer client.deinit();
 
-    const acquire = try acquireTerminalTunnel(allocator, target, client);
+    const acquire = try acquireTerminalTunnel(allocator, target, request, client);
     if (acquire.created) {
         startNewTerminalTunnel(allocator, acquire.tunnel, client_fd, target, request) catch |err| {
             failStartingTerminalTunnel(allocator, acquire.tunnel, client, err);
@@ -679,9 +681,10 @@ fn servePooledTerminalTransportFromDaemon(
 fn acquireTerminalTunnel(
     allocator: std.mem.Allocator,
     target: SshTarget,
+    request: pb.ClientDaemonItem.SshTransportAcquire,
     client: *PooledTerminalClient,
 ) !TerminalTunnelAcquire {
-    const key = try terminalTunnelKey(allocator, target);
+    const key = try terminalTunnelKey(allocator, target, request);
     errdefer allocator.free(key);
 
     terminal_pool_mutex.lock();
@@ -734,12 +737,26 @@ fn acquireTerminalTunnel(
     return .{ .tunnel = tunnel, .created = true };
 }
 
-fn terminalTunnelKey(allocator: std.mem.Allocator, target: SshTarget) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}@{s}:{s}",
-        .{ target.resolved_user, target.resolved_host, target.resolved_port },
-    );
+fn terminalTunnelKey(
+    allocator: std.mem.Allocator,
+    target: SshTarget,
+    request: pb.ClientDaemonItem.SshTransportAcquire,
+) ![]u8 {
+    var key = std.ArrayList(u8).empty;
+    errdefer key.deinit(allocator);
+    try appendPoolKeyPart(allocator, &key, target.resolved_user);
+    try appendPoolKeyPart(allocator, &key, target.resolved_host);
+    try appendPoolKeyPart(allocator, &key, target.resolved_port);
+    try key.writer(allocator).print("bootstrap={}|", .{request.bootstrap});
+    try key.appendSlice(allocator, "ipqos=");
+    try appendPoolKeyPart(allocator, &key, request.ip_qos);
+    return key.toOwnedSlice(allocator);
+}
+
+fn appendPoolKeyPart(allocator: std.mem.Allocator, key: *std.ArrayList(u8), value: []const u8) !void {
+    try key.writer(allocator).print("{}:", .{value.len});
+    try key.appendSlice(allocator, value);
+    try key.append(allocator, '|');
 }
 
 fn startNewTerminalTunnel(
@@ -747,7 +764,7 @@ fn startNewTerminalTunnel(
     tunnel: *TerminalTunnel,
     client_fd: c.fd_t,
     target: SshTarget,
-    request: pb.ClientDaemonItem.SshTransportOpen,
+    request: pb.ClientDaemonItem.SshTransportAcquire,
 ) !void {
     var started = try startTerminalTransportForDaemon(allocator, client_fd, target, request);
     errdefer {
@@ -1004,9 +1021,16 @@ fn sendPooledTeMuxOpen(
         .message = .{ .open = .{
             .recv_next_offset = client.inbound_next_offset,
             .receive_window_bytes = 0,
-            .detail = .{ .terminal_emulator = request },
         } },
     });
+    try sendPooledMuxFrame(tunnel.allocator, tunnel.connection.?.child.stdin.?.handle, .{
+        .stream_id = client.stream_id,
+        .message = .{ .payload = .{
+            .offset = client.outbound_next_offset,
+            .item = .{ .terminal_emulator = .{ .payload = .{ .open = request } } },
+        } },
+    });
+    client.outbound_next_offset +|= 1;
     client.mux_open_sent_ms = nowUnixMs();
 }
 
@@ -1022,11 +1046,7 @@ fn sendPooledProxyMuxOpen(
         .open => |open| open,
         else => return error.UnexpectedDaemonFrame,
     };
-    const detail = open.detail orelse return error.UnexpectedDaemonFrame;
-    switch (detail) {
-        .proxy => {},
-        else => return error.UnexpectedDaemonFrame,
-    }
+    _ = open;
     client.kind = .proxy;
     client.local_stream_id = mux_frame.stream_id;
     mux_frame.stream_id = client.stream_id;
@@ -1398,22 +1418,20 @@ fn openTerminalDaemonTransport(
     exe: []const u8,
     target: SshTarget,
     common: CommonSessionOptions,
-    batch_mode: bool,
 ) !TerminalTransport {
     const fd = try daemon_client.connectOrStart(allocator, exe);
     errdefer _ = c.close(fd);
 
-    var request = pb.ClientDaemonItem.SshTransportOpen{
+    var request = pb.ClientDaemonItem.SshTransportAcquire{
         .host = target.host,
         .bootstrap = common.bootstrap,
-        .batch_mode = batch_mode,
     };
     defer request.ssh_option.deinit(allocator);
-    defer deinitSshTransportOpenEnvironment(allocator, &request);
+    defer deinitSshTransportAcquireOwnedFields(allocator, &request);
     try request.ssh_option.appendSlice(allocator, target.options);
-    try appendCurrentEnvironmentToSshTransportOpen(allocator, &request);
+    try appendCurrentSshAgentToSshTransportAcquire(allocator, &request);
 
-    try protocol.sendSshTransportOpenFrame(allocator, fd, request);
+    try protocol.sendSshTransportAcquireFrame(allocator, fd, request);
     return .{ .fd = fd };
 }
 
@@ -1454,34 +1472,34 @@ fn sendDaemonSshFailure(
     }
 }
 
-fn appendCurrentEnvironmentToSshTransportOpen(allocator: std.mem.Allocator, request: *pb.ClientDaemonItem.SshTransportOpen) !void {
-    var index: usize = 0;
-    while (c.environ[index]) |entry_z| : (index += 1) {
-        const entry = std.mem.span(entry_z);
-        const equals = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        if (equals == 0) continue;
-        const name = try allocator.dupe(u8, entry[0..equals]);
-        errdefer allocator.free(name);
-        const value = try allocator.dupe(u8, entry[equals + 1 ..]);
-        errdefer allocator.free(value);
-        try request.environment.append(allocator, .{ .name = name, .value = value });
-    }
+fn appendCurrentSshAgentToSshTransportAcquire(
+    allocator: std.mem.Allocator,
+    request: *pb.ClientDaemonItem.SshTransportAcquire,
+) !void {
+    request.ssh_auth_sock = std.process.getEnvVarOwned(allocator, "SSH_AUTH_SOCK") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
 }
 
-fn deinitSshTransportOpenEnvironment(allocator: std.mem.Allocator, request: *pb.ClientDaemonItem.SshTransportOpen) void {
-    for (request.environment.items) |entry| {
-        allocator.free(entry.name);
-        allocator.free(entry.value);
-    }
-    request.environment.deinit(allocator);
+fn deinitSshTransportAcquireOwnedFields(
+    allocator: std.mem.Allocator,
+    request: *pb.ClientDaemonItem.SshTransportAcquire,
+) void {
+    if (request.ssh_auth_sock) |path| allocator.free(path);
+    request.ssh_auth_sock = null;
 }
 
-fn envMapFromSshTransportOpen(allocator: std.mem.Allocator, request: pb.ClientDaemonItem.SshTransportOpen) !std.process.EnvMap {
-    var env = std.process.EnvMap.init(allocator);
+fn envMapFromSshTransportAcquire(
+    allocator: std.mem.Allocator,
+    request: pb.ClientDaemonItem.SshTransportAcquire,
+) !std.process.EnvMap {
+    var env = try std.process.getEnvMap(allocator);
     errdefer env.deinit();
-    for (request.environment.items) |entry| {
-        if (entry.name.len == 0) continue;
-        try env.put(entry.name, entry.value);
+    if (request.ssh_auth_sock) |path| {
+        try env.put("SSH_AUTH_SOCK", path);
+    } else {
+        env.remove("SSH_AUTH_SOCK");
     }
     return env;
 }
@@ -1614,7 +1632,6 @@ fn reconnectRemoteSessionClient(
             exe,
             target,
             runtime_config.common,
-            true,
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
@@ -1917,7 +1934,6 @@ fn startRuntimeConnection(
     remote_command: []const u8,
     bootstrap_entrypoint: ?BootstrapEntrypoint,
     exec_args: []const []const u8,
-    batch_mode: bool,
     reconnect_ui: ?*client_ui.ReconnectUi,
     poll_reconnect_input: bool,
     stderr_mode_override: ?SshStderrMode,
@@ -1928,20 +1944,18 @@ fn startRuntimeConnection(
     failure_policy: BootstrapFailurePolicy,
 ) !RuntimeConnection {
     if (bootstrap_failure_term) |term| term.* = null;
-    const reconnect_options: usize = if (batch_mode) 1 else 0;
+    const batch_mode_options: usize = 1;
     const default_options = defaultSshOptionsLen(target);
     const transport_options = transportSshOptionsLen(target.options);
-    const ssh_argv = try allocator.alloc([]const u8, transport_options + reconnect_options + default_options + 4);
+    const ssh_argv = try allocator.alloc([]const u8, transport_options + batch_mode_options + default_options + 4);
     defer allocator.free(ssh_argv);
     ssh_argv[0] = "ssh";
     var arg_index: usize = 1;
-    if (batch_mode) {
-        // Reconnect must fail cleanly instead of letting ssh prompt on stdio.
-        // Put this before user/config options because OpenSSH uses the first
-        // value it sees for many config keys.
-        ssh_argv[arg_index] = "-oBatchMode=yes";
-        arg_index += 1;
-    }
+    // Daemon-owned ssh transports must fail cleanly instead of prompting on
+    // stdio. Put this before user/config options because OpenSSH uses the first
+    // value it sees for many config keys.
+    ssh_argv[arg_index] = "-oBatchMode=yes";
+    arg_index += 1;
     appendDefaultSshOptions(ssh_argv, &arg_index, target.default_ipqos_option);
     appendTransportSshOptions(ssh_argv, &arg_index, target.options);
     ssh_argv[arg_index] = "-T";
@@ -2004,9 +2018,6 @@ fn startRuntimeConnection(
         }
         const term = connection.wait() catch null;
         if (bootstrap_failure_term) |term_out| term_out.* = term;
-        if (batch_mode) {
-            return err;
-        }
         if (failure_policy.return_bootstrap_error) {
             daemon_log.infof(allocator, "bootstrap failed before response host={s} error={t}", .{ target.host, err });
             return error.SshBootstrapFailed;
@@ -2033,7 +2044,7 @@ fn startRuntimeConnection(
             if (failure_policy.return_unsupported_error and artifactFilenameForPlatform(remote_platform) == null) {
                 return error.UnsupportedRemotePlatform;
             }
-            if (artifactFilenameForPlatform(remote_platform) == null and canUsePlainSshFallback(failure_policy, batch_mode, reconnect_ui)) {
+            if (artifactFilenameForPlatform(remote_platform) == null and canUsePlainSshFallback(failure_policy, reconnect_ui)) {
                 try runPlainSshFallback(allocator, target, remote_platform);
             }
             if (artifactFilenameForPlatform(remote_platform) == null) {
@@ -2083,9 +2094,6 @@ fn startRuntimeConnection(
             }
             const term = connection.wait() catch null;
             if (bootstrap_failure_term) |term_out| term_out.* = term;
-            if (batch_mode) {
-                return err;
-            }
             if (failure_policy.return_bootstrap_error) {
                 daemon_log.infof(allocator, "bootstrap failed after upload host={s} error={t}", .{ target.host, err });
                 return error.SshBootstrapFailed;
@@ -2110,7 +2118,7 @@ fn startRuntimeConnection(
         if (isUnsupportedPlatformBootstrapError(line) and failure_policy.return_unsupported_error) {
             return error.UnsupportedRemotePlatform;
         }
-        if (isUnsupportedPlatformBootstrapError(line) and canUsePlainSshFallback(failure_policy, batch_mode, reconnect_ui)) {
+        if (isUnsupportedPlatformBootstrapError(line) and canUsePlainSshFallback(failure_policy, reconnect_ui)) {
             try runPlainSshFallback(allocator, target, null);
         }
         if (isUnsupportedPlatformBootstrapError(line)) {
@@ -2140,11 +2148,9 @@ fn isUnsupportedPlatformBootstrapError(line: []const u8) bool {
 
 fn canUsePlainSshFallback(
     policy: BootstrapFailurePolicy,
-    batch_mode: bool,
     reconnect_ui: ?*client_ui.ReconnectUi,
 ) bool {
     return policy.allow_plain_ssh_fallback and
-        !batch_mode and
         reconnect_ui == null;
 }
 
@@ -2199,17 +2205,16 @@ const DaemonStreamClientStarter = struct {
         const fd = try daemon_client.connectOrStart(self.allocator, self.exe);
         errdefer _ = c.close(fd);
 
-        var request = pb.ClientDaemonItem.SshTransportOpen{
+        var request = pb.ClientDaemonItem.SshTransportAcquire{
             .host = self.target.host,
             .bootstrap = self.bootstrap,
-            .batch_mode = true,
         };
         defer request.ssh_option.deinit(self.allocator);
-        defer deinitSshTransportOpenEnvironment(self.allocator, &request);
+        defer deinitSshTransportAcquireOwnedFields(self.allocator, &request);
         try request.ssh_option.appendSlice(self.allocator, self.target.options);
-        try appendCurrentEnvironmentToSshTransportOpen(self.allocator, &request);
+        try appendCurrentSshAgentToSshTransportAcquire(self.allocator, &request);
 
-        try protocol.sendSshTransportOpenFrame(self.allocator, fd, request);
+        try protocol.sendSshTransportAcquireFrame(self.allocator, fd, request);
         return .{ .fd = fd };
     }
 
@@ -2573,30 +2578,23 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
     };
 
     var client_control_fd: c.fd_t = -1;
-    var proxy_control_output_mode: proxy_control.OutputMode = .none;
-    var proxy_control_ctrl_r_available = false;
     if (invocation.client_socket) |path| {
         client_control_fd = socket_transport.connectSocket(path) catch |err| blk: {
             client_log.userDiagnosticInfo("proxy control socket unavailable: {t}", .{err});
             break :blk -1;
         };
         if (client_control_fd >= 0) {
-            const capabilities = proxy_control.clientHandshake(allocator, client_control_fd) catch |err| blk: {
+            proxy_control.clientHandshake(allocator, client_control_fd) catch |err| {
                 client_log.userDiagnosticInfo("proxy control unavailable: {t}", .{err});
                 posix.close(client_control_fd);
                 client_control_fd = -1;
-                break :blk null;
             };
-            if (capabilities) |payload| {
-                proxy_control_output_mode = payload.output_mode;
-                proxy_control_ctrl_r_available = payload.ctrl_r_available;
-            }
         }
     }
     defer if (client_control_fd >= 0) posix.close(client_control_fd);
     const status_mode = proxyStreamReconnectStatusMode(
         invocation.filter_level,
-        client_control_fd >= 0 and proxy_control_output_mode != .none,
+        client_control_fd >= 0,
     );
 
     const exit_status = stream_runtime.runLocalStream(allocator, &starter, .{
@@ -2608,8 +2606,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .status_mode = status_mode,
         .intercept_ctrl_r = false,
         .control_fd = client_control_fd,
-        .ctrl_r_status_enabled = proxy_control_ctrl_r_available and client_control_fd >= 0,
-        .proxy_control_output_mode = proxy_control_output_mode,
+        .ctrl_r_status_enabled = invocation.client_ctrl_r and client_control_fd >= 0,
         .title_fallback = invocation.host,
         .reset_on_source_eof = true,
     }) catch |err| {

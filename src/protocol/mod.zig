@@ -145,32 +145,32 @@ pub fn sendProxyStreamPayloadFrame(
     try sendClientRemotePayloadFrame(allocator, fd, .{ .proxy = .{ .payload = payload } });
 }
 
-pub fn sendSshTransportOpenFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.ClientDaemonItem.SshTransportOpen) !void {
-    try sendClientDaemonPayloadFrame(allocator, fd, .{ .ssh_transport_open = request });
+pub fn sendSshTransportAcquireFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.ClientDaemonItem.SshTransportAcquire) !void {
+    try sendClientDaemonPayloadFrame(allocator, fd, .{ .ssh_transport_acquire = request });
 }
 
-pub fn sendSshTransportEventFrame(
+pub fn sendClientDaemonConnectionEventFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    payload: pb.ClientDaemonItem.SshTransportEvent.event_union,
+    event: pb.ConnectionEvent.event_union,
 ) !void {
-    try sendClientDaemonPayloadFrame(allocator, fd, .{ .ssh_transport_event = .{ .event = payload } });
+    try sendClientDaemonPayloadFrame(allocator, fd, .{ .connection_event = .{ .event = event } });
 }
 
 pub fn sendSshTransportStderrFrame(allocator: std.mem.Allocator, fd: c.fd_t, chunk: []const u8) !void {
-    try sendSshTransportEventFrame(allocator, fd, .{ .stderr_chunk = .{ .chunk = chunk } });
+    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .ssh_stderr = .{ .data = chunk } });
 }
 
 pub fn sendSshTransportClosedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendSshTransportEventFrame(allocator, fd, .{ .closed = .{} });
+    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .daemon_disconnected = .{} });
 }
 
 pub fn sendSshTransportBootstrapStartedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendSshTransportEventFrame(allocator, fd, .{ .bootstrap_started = .{} });
+    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .bootstrap_started = .{} });
 }
 
 pub fn sendSshTransportBootstrapFinishedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendSshTransportEventFrame(allocator, fd, .{ .bootstrap_finished = .{} });
+    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .bootstrap_finished = .{} });
 }
 
 pub fn sendDaemonLogRequestFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.ClientDaemonItem.DaemonLogRequest) !void {
@@ -232,32 +232,15 @@ pub fn decodeDaemonMuxStreamFrame(allocator: std.mem.Allocator, payload: []const
     }
 }
 
-pub fn decodeClientDaemonSshTransportOpen(allocator: std.mem.Allocator, payload: []const u8) !pb.ClientDaemonItem.SshTransportOpen {
+pub fn decodeClientDaemonSshTransportAcquire(allocator: std.mem.Allocator, payload: []const u8) !pb.ClientDaemonItem.SshTransportAcquire {
     var item = try decodePayload(pb.ClientDaemonItem, allocator, payload);
     switch (item.payload orelse {
         item.deinit(allocator);
         return error.UnexpectedFrame;
     }) {
-        .ssh_transport_open => |open| {
+        .ssh_transport_acquire => |open| {
             item.payload = null;
             return open;
-        },
-        else => {
-            item.deinit(allocator);
-            return error.UnexpectedFrame;
-        },
-    }
-}
-
-pub fn decodeClientDaemonSshTransportEvent(allocator: std.mem.Allocator, payload: []const u8) !pb.ClientDaemonItem.SshTransportEvent {
-    var item = try decodePayload(pb.ClientDaemonItem, allocator, payload);
-    switch (item.payload orelse {
-        item.deinit(allocator);
-        return error.UnexpectedFrame;
-    }) {
-        .ssh_transport_event => |event| {
-            item.payload = null;
-            return event;
         },
         else => {
             item.deinit(allocator);

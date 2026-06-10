@@ -448,10 +448,22 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
             },
             .daemon_tunnel => {
                 if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd)) continue;
-                if (session_daemon_handler.isTeMuxOpenFrame(allocator, frame)) {
+                if (isMuxOpenFrame(allocator, frame)) {
+                    var typed_open_frame = try readMuxTypedOpenFrame(allocator, fd);
+                    defer typed_open_frame.deinit(allocator);
+                    if (session_daemon_handler.isTeMuxOpenFrame(allocator, typed_open_frame)) {
+                        try session_daemon_handler.serveMuxStreamFramesAfterHandshake(allocator, exe, frame, typed_open_frame, fd);
+                    } else if (stream_runtime.isProxyMuxOpenFrame(allocator, typed_open_frame)) {
+                        try stream_runtime.serveMuxStreamFramesAfterHandshake(allocator, exe, frame, typed_open_frame, fd);
+                    } else {
+                        try sendError(fd, "PROTOCOL_ERROR", "expected typed mux stream open payload", "");
+                    }
+                } else if (session_daemon_handler.isTeMuxOpenFrame(allocator, frame)) {
                     try session_daemon_handler.serveMuxStreamFrameAfterHandshake(allocator, exe, frame, fd);
-                } else {
+                } else if (stream_runtime.isProxyMuxOpenFrame(allocator, frame)) {
                     try stream_runtime.serveMuxStreamFrameAfterHandshake(allocator, exe, frame, fd);
+                } else {
+                    try sendError(fd, "PROTOCOL_ERROR", "expected mux stream open", "");
                 }
                 return;
             },
@@ -463,7 +475,7 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                     return;
                 };
                 switch (item_payload) {
-                    .ssh_transport_open => |request| {
+                    .ssh_transport_acquire => |request| {
                         daemon_log.infof(allocator, "terminal transport requested", .{});
                         try transport_ssh.serveTerminalTransportFromDaemon(allocator, fd, request);
                         return;
@@ -483,6 +495,26 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                 return;
             },
         }
+    }
+}
+
+fn isMuxOpenFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) bool {
+    if (frame.message_type != .daemon_tunnel) return false;
+    var mux_frame = protocol.decodeDaemonMuxStreamFrame(allocator, frame.payload) catch return false;
+    defer mux_frame.deinit(allocator);
+    const message = mux_frame.message orelse return false;
+    return message == .open;
+}
+
+fn readMuxTypedOpenFrame(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+    while (true) {
+        var frame = try protocol.readFrameAlloc(allocator, fd);
+        errdefer frame.deinit(allocator);
+        if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd)) {
+            frame.deinit(allocator);
+            continue;
+        }
+        return frame;
     }
 }
 

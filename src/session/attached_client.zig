@@ -2295,18 +2295,23 @@ fn handleClientDaemonFrame(payload: []const u8) !ClientDaemonFrameAction {
 
     const item_payload = item.payload orelse return .unexpected;
     return switch (item_payload) {
-        .ssh_transport_event => |event| handleSshTransportEvent(event),
+        .connection_event => |event| handleConnectionEvent(event),
         else => .unexpected,
     };
 }
 
-fn handleSshTransportEvent(event: pb.ClientDaemonItem.SshTransportEvent) !ClientDaemonFrameAction {
-    const payload = event.event orelse return .unexpected;
-    switch (payload) {
-        .stderr_chunk => |diagnostic| client_log.appendSshStderr(diagnostic.chunk),
+fn handleConnectionEvent(event: pb.ConnectionEvent) !ClientDaemonFrameAction {
+    switch (event.event orelse return .unexpected) {
+        .ssh_stderr => |stderr| client_log.appendSshStderr(stderr.data),
         .bootstrap_started => try io_helpers.writeAll(2, "\rsessh: bootstrapping..."),
         .bootstrap_finished => try io_helpers.writeAll(2, "\r\x1b[K"),
-        .closed => return .transport_closed,
+        .daemon_disconnected => return .transport_closed,
+        .ssh_connecting,
+        .ssh_connected,
+        .daemon_connecting,
+        .daemon_connected,
+        .unresponsive,
+        => {},
     }
     return .handled;
 }

@@ -1440,7 +1440,7 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
 
     if not fake_log.exists():
         raise AssertionError(ssh_failure_diagnostics("fake ssh was not invoked", result, fake_log, fake_trace))
-    expected_log = f"invoked=1\nconfig={fake_config}\n"
+    expected_log = f"invoked=1\nconfig={fake_config}\nbatch_mode=1\n"
     if fake_log.read_text() != expected_log:
         raise AssertionError(
             ssh_failure_diagnostics(
@@ -1572,14 +1572,10 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
     env["SESSH_FAKE_SSH_G_HOSTNAME"] = "pool-host"
     env["SESSH_FAKE_SSH_G_PORT"] = "2222"
 
-    def send_ssh_transport_open(conn):
-        request = sessh_pb().ClientDaemonItem.SshTransportOpen(host="test-host", bootstrap=True, batch_mode=False)
-        for name, value in env.items():
-            entry = request.environment.add()
-            entry.name = str(name)
-            entry.value = str(value)
+    def send_ssh_transport_acquire(conn):
+        request = sessh_pb().ClientDaemonItem.SshTransportAcquire(host="test-host", bootstrap=True)
         frame = sessh_pb().Frame()
-        frame.client_daemon.ssh_transport_open.CopyFrom(request)
+        frame.client_daemon.ssh_transport_acquire.CopyFrom(request)
         body = frame.SerializeToString()
         conn.sendall(struct.pack(">I", len(body)) + body)
 
@@ -1588,7 +1584,7 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
         conn.settimeout(30.0)
         conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
         send_hello(conn)
-        send_ssh_transport_open(conn)
+        send_ssh_transport_acquire(conn)
         command = f"printf '{marker}\\n'; sleep 2"
         send_frame(
             conn,
@@ -1650,6 +1646,158 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
             raise AssertionError(f"daemon log missing {expected!r}: {daemon_log_text}")
 
 
+def test_ssh_transport_pool_key_ignores_agent_socket_identity(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    agent1_path = tmp / "agent-one.sock"
+    agent2_path = tmp / "agent-two.sock"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SESSH_FAKE_SSH_G_USER"] = "pool-user"
+    env["SESSH_FAKE_SSH_G_HOSTNAME"] = "pool-host"
+    env["SESSH_FAKE_SSH_G_PORT"] = "2222"
+    seed_remote_artifact_cache(env)
+
+    def send_ssh_transport_acquire(conn, ssh_auth_sock):
+        request = sessh_pb().ClientDaemonItem.SshTransportAcquire(host="test-host", bootstrap=True)
+        request.ssh_auth_sock = ssh_auth_sock
+        frame = sessh_pb().Frame()
+        frame.client_daemon.ssh_transport_acquire.CopyFrom(request)
+        body = frame.SerializeToString()
+        conn.sendall(struct.pack(">I", len(body)) + body)
+
+    def open_terminal_stream(marker, session_index, ssh_auth_sock):
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(30.0)
+        conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
+        send_hello(conn)
+        send_ssh_transport_acquire(conn, ssh_auth_sock)
+        command = f"printf '{marker}\\n'; sleep 2"
+        send_frame(
+            conn,
+            TERMINAL_STREAM_OPEN,
+            pack_session_create(
+                "/bin/sh",
+                session_id=f"s-{session_index:08x}-0000-4000-8000-{session_index:012x}",
+                shell_command=command,
+            ),
+        )
+        recv_until_message(conn, SESSION_ATTACHED, timeout=30.0)
+        recv_draw_until(conn, marker.encode("utf-8"), timeout=30.0)
+        return conn
+
+    log_proc = subprocess.Popen(
+        sessh_argv(["--daemon-log"]),
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    daemon_log_output = b""
+    conn1 = conn2 = None
+    try:
+        daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
+        conn1 = open_terminal_stream("SSH_AGENT_POOL_1", 1, str(agent1_path))
+        conn2 = open_terminal_stream("SSH_AGENT_POOL_2", 2, str(agent2_path))
+        daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
+    finally:
+        if conn2 is not None:
+            conn2.close()
+        if conn1 is not None:
+            conn1.close()
+        terminate_process(log_proc)
+
+    if ssh_invocation_count(fake_log) != 1:
+        raise AssertionError(
+            "expected agent socket identity change to reuse the pooled ssh transport"
+            f"\nlog:\n{optional_text(fake_log)}"
+            f"\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
+            f"\ntrace:\n{optional_text(fake_trace)}"
+        )
+
+
+def test_ssh_transport_pool_key_includes_ipqos(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SESSH_FAKE_SSH_LOG_IPQOS"] = "1"
+    env["SESSH_FAKE_SSH_G_USER"] = "pool-user"
+    env["SESSH_FAKE_SSH_G_HOSTNAME"] = "pool-host"
+    env["SESSH_FAKE_SSH_G_PORT"] = "2222"
+    seed_remote_artifact_cache(env)
+
+    def send_ssh_transport_acquire(conn, ipqos):
+        request = sessh_pb().ClientDaemonItem.SshTransportAcquire(host="test-host", bootstrap=True)
+        request.ssh_option.append(f"-oIPQoS={ipqos}")
+        frame = sessh_pb().Frame()
+        frame.client_daemon.ssh_transport_acquire.CopyFrom(request)
+        body = frame.SerializeToString()
+        conn.sendall(struct.pack(">I", len(body)) + body)
+
+    def open_terminal_stream(marker, session_index, ipqos):
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(30.0)
+        conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
+        send_hello(conn)
+        send_ssh_transport_acquire(conn, ipqos)
+        command = f"printf '{marker}\\n'; sleep 2"
+        send_frame(
+            conn,
+            TERMINAL_STREAM_OPEN,
+            pack_session_create(
+                "/bin/sh",
+                session_id=f"s-{session_index:08x}-0000-4000-8000-{session_index:012x}",
+                shell_command=command,
+            ),
+        )
+        recv_until_message(conn, SESSION_ATTACHED, timeout=30.0)
+        recv_draw_until(conn, marker.encode("utf-8"), timeout=30.0)
+        return conn
+
+    log_proc = subprocess.Popen(
+        sessh_argv(["--daemon-log"]),
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    daemon_log_output = b""
+    conn1 = conn2 = None
+    try:
+        daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
+        conn1 = open_terminal_stream("SSH_IPQOS_POOL_1", 1, "none")
+        conn2 = open_terminal_stream("SSH_IPQOS_POOL_2", 2, "ef")
+        daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
+    finally:
+        if conn2 is not None:
+            conn2.close()
+        if conn1 is not None:
+            conn1.close()
+        terminate_process(log_proc)
+
+    log_text = optional_text(fake_log)
+    if ssh_invocation_count(fake_log) != 2:
+        raise AssertionError(
+            "expected effective IPQoS change to create a second ssh transport"
+            f"\nlog:\n{log_text}"
+            f"\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
+            f"\ntrace:\n{optional_text(fake_trace)}"
+        )
+    if "ipqos=none" not in log_text or "ipqos=ef" not in log_text:
+        raise AssertionError(log_text)
+
+
 def test_ssh_proxy_streams_pool_tcp_connection(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -1693,14 +1841,10 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
     server_thread = threading.Thread(target=echo_server, daemon=True)
     server_thread.start()
 
-    def send_ssh_transport_open(conn):
-        request = sessh_pb().ClientDaemonItem.SshTransportOpen(host="test-host", bootstrap=True, batch_mode=True)
-        for name, value in env.items():
-            entry = request.environment.add()
-            entry.name = str(name)
-            entry.value = str(value)
+    def send_ssh_transport_acquire(conn):
+        request = sessh_pb().ClientDaemonItem.SshTransportAcquire(host="test-host", bootstrap=True)
         frame = sessh_pb().Frame()
-        frame.client_daemon.ssh_transport_open.CopyFrom(request)
+        frame.client_daemon.ssh_transport_acquire.CopyFrom(request)
         body = frame.SerializeToString()
         conn.sendall(struct.pack(">I", len(body)) + body)
 
@@ -1728,10 +1872,13 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
         mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=1)
         mux.open.recv_next_offset = 0
         mux.open.receive_window_bytes = 65536
-        mux.open.proxy.proxy_guid = f"p-{session_index:08x}-0000-4000-8000-{session_index:012x}"
-        mux.open.proxy.proxy_host = "localhost"
-        mux.open.proxy.proxy_port = server_port
         send_mux_frame(conn, mux)
+        payload = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=1)
+        payload.payload.offset = 0
+        payload.payload.proxy.open.proxy_guid = f"p-{session_index:08x}-0000-4000-8000-{session_index:012x}"
+        payload.payload.proxy.open.proxy_host = "localhost"
+        payload.payload.proxy.open.proxy_port = server_port
+        send_mux_frame(conn, payload)
 
     def send_proxy_data(conn, data):
         mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=1)
@@ -1760,7 +1907,7 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
         conn.settimeout(30.0)
         conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
         send_hello(conn)
-        send_ssh_transport_open(conn)
+        send_ssh_transport_acquire(conn)
         send_proxy_open(conn, session_index)
         while recv_mux_frame(conn).WhichOneof("message") != "open_ok":
             pass
@@ -2805,7 +2952,7 @@ def test_ssh_terminal_emulator_cli_overrides_disabled_config(tmp):
     if result.returncode != 0:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "plain_ssh=1" in log_text or "batch_mode=1" in log_text:
+    if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
 
@@ -3984,43 +4131,30 @@ done
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["test-host"])
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    try:
-        stdout = read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
-        proc.stdin.write(b"slow-no-output\n")
-        proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, b"REMOTE:old-recovered", 10.0)
-        proc.stdin.write(b"after-recovery\n")
-        proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, b"REMOTE:after-recovery", 10.0)
-        proc.stdin.close()
-        returncode = proc.wait(timeout=10.0)
-        stdout += proc.stdout.read()
-        stderr = proc.stderr.read()
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5.0)
+    before_batch_count = [None]
 
-    result = subprocess.CompletedProcess(
-        argv,
-        returncode,
-        stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
+    def send_slow_no_output(fd):
+        count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
+        before_batch_count[0] = count
+        os.write(fd, b"slow-no-output\r")
+
+    result = run_sessh_in_pty(
+        ["test-host"],
+        env,
+        (
+            (marker.encode("utf-8"), send_slow_no_output),
+            (b"REMOTE:old-recovered", b"after-recovery\r"),
+            (b"REMOTE:after-recovery", None),
+        ),
+        timeout=15.0,
     )
     if result.returncode != 0:
         raise AssertionError(result)
     if "sessh: disconnected: Unresponsive" in result.stdout:
         raise AssertionError(result)
-    if "batch_mode=1" in fake_log.read_text():
+    if before_batch_count[0] is None:
+        raise AssertionError(result)
+    if fake_log.read_text().count("batch_mode=1") != before_batch_count[0]:
         raise AssertionError("false unresponsive detection started a parallel reconnect attempt")
 
 
@@ -4443,6 +4577,14 @@ def main(argv=None):
         (
             "ssh terminal transports pool tcp connection",
             test_ssh_terminal_transports_pool_tcp_connection,
+        ),
+        (
+            "ssh transport pool key ignores agent socket identity",
+            test_ssh_transport_pool_key_ignores_agent_socket_identity,
+        ),
+        (
+            "ssh transport pool key includes ipqos",
+            test_ssh_transport_pool_key_includes_ipqos,
         ),
         (
             "ssh proxy streams pool tcp connection",
