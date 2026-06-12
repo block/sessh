@@ -1493,7 +1493,7 @@ def test_ssh_daemon_log_records_client_hangup_cleanup(tmp):
         )
         daemon_log_output += read_until_pipe(
             log_proc.stdout,
-            b"terminal client disconnected; requesting remote hangup host=test-host",
+            b"client disconnected; requesting remote cleanup host=test-host guid=s-",
             timeout=5.0,
         )
         daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
@@ -1504,7 +1504,7 @@ def test_ssh_daemon_log_records_client_hangup_cleanup(tmp):
         raise AssertionError(ssh_failure_diagnostics("sessh returned non-zero", result, fake_log, fake_trace))
     daemon_log_stdout = daemon_log_output.decode("utf-8", "replace")
     for expected in (
-        "terminal client disconnected; requesting remote hangup host=test-host",
+        "client disconnected; requesting remote cleanup host=test-host guid=s-",
     ):
         if expected not in daemon_log_stdout:
             raise AssertionError(

@@ -116,6 +116,11 @@ message ClientDaemonItem {
     // is part of pooled-transport identity because sessh cannot retag the child
     // ssh process' TCP socket after creation.
     string ip_qos = 5;
+    // The local process whose lifetime owns remote cleanup records created via
+    // this transport. `local_start_time` is an opaque exact-match process start
+    // string from the local platform.
+    uint64 local_pid = 6;
+    string local_start_time = 7;
   }
 
   // Local client -> local daemon request to follow new operational log entries.
@@ -259,6 +264,7 @@ message DaemonTunnelItem {
     uint64 pid = 1;
     string start_time = 2;
     string daemon_socket_path = 3;
+    string guid = 4;
   }
 
   // Remote daemon -> local daemon notice that a mux stream now has a remote

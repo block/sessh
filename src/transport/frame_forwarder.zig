@@ -8,7 +8,6 @@ const protocol = @import("../protocol/mod.zig");
 
 pub const ClientCloseAction = enum {
     none,
-    te_session_hangup,
 };
 
 pub const ClientDiagnosticForwarding = struct {
@@ -130,16 +129,10 @@ fn copyOneFrame(read_fd: c.fd_t, write_fd: c.fd_t) !bool {
 }
 
 fn handleClientClose(runtime_write_fd: c.fd_t, action: ClientCloseAction, log_context: LogContext) !void {
+    _ = runtime_write_fd;
+    _ = log_context;
     switch (action) {
         .none => {},
-        .te_session_hangup => {
-            logDaemonEvent(log_context, "terminal client disconnected; requesting remote hangup");
-            protocol.sendTeStreamPayloadFrame(std.heap.page_allocator, runtime_write_fd, .{ .session_hangup_request = .{} }) catch |err| {
-                logDaemonEventFmt(log_context, "remote terminal hangup request failed error={t}", .{err});
-                return err;
-            };
-            logDaemonEvent(log_context, "remote terminal hangup requested");
-        },
     }
 }
 

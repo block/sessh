@@ -832,6 +832,8 @@ pub const ClientDaemonItem = struct {
         bootstrap: bool = false,
         ssh_auth_sock: ?[]const u8 = null,
         ip_qos: []const u8 = &.{},
+        local_pid: u64 = 0,
+        local_start_time: []const u8 = &.{},
 
         pub const _desc_table = .{
             .ssh_option = fd(1, .{ .repeated = .{ .scalar = .string } }),
@@ -839,6 +841,8 @@ pub const ClientDaemonItem = struct {
             .bootstrap = fd(3, .{ .scalar = .bool }),
             .ssh_auth_sock = fd(4, .{ .scalar = .string }),
             .ip_qos = fd(5, .{ .scalar = .string }),
+            .local_pid = fd(6, .{ .scalar = .uint64 }),
+            .local_start_time = fd(7, .{ .scalar = .string }),
         };
 
         /// Encodes the message to the writer
@@ -2012,11 +2016,13 @@ pub const DaemonTunnelItem = struct {
         pid: u64 = 0,
         start_time: []const u8 = &.{},
         daemon_socket_path: []const u8 = &.{},
+        guid: []const u8 = &.{},
 
         pub const _desc_table = .{
             .pid = fd(1, .{ .scalar = .uint64 }),
             .start_time = fd(2, .{ .scalar = .string }),
             .daemon_socket_path = fd(3, .{ .scalar = .string }),
+            .guid = fd(4, .{ .scalar = .string }),
         };
 
         /// Encodes the message to the writer

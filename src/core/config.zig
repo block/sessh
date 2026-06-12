@@ -6,7 +6,8 @@ pub const default_scrollback_row_count = 2000;
 pub const default_debug_unresponsive_seconds = 10;
 pub const default_filter_level: FilterLevel = .emulated;
 pub const hour_ms: u64 = 60 * 60 * 1000;
-pub const default_cleanup_retry_ms: u64 = 168 * hour_ms;
+pub const default_cleanup_wakeup_interval_ms: u64 = hour_ms;
+pub const default_cleanup_retry_limit_ms: u64 = 168 * hour_ms;
 pub const default_disconnected_reap_ms: u64 = 168 * hour_ms;
 
 pub const session_guid_env = "SESSH_GUID";

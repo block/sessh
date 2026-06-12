@@ -38,7 +38,7 @@ the wrapper, and that complexity is not worth carrying into the daemon design.
 # Cleanup
 
 The client-side daemon owns cleanup records and retries remote cleanup until
-`cleanup-retry-hours` is reached. Remote `sesshd` owns
+`cleanup-retry-limit-hours` is reached. Remote `sesshd` owns
 `disconnected-reap-hours`, which bounds how long disconnected remote work may
 remain alive without client input.
 

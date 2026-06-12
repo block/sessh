@@ -7,9 +7,12 @@ const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
+const client_config = @import("../session/client_config.zig");
 const session_daemon_handler = @import("../session/daemon_handler.zig");
 const session_runtime = @import("../session/runtime.zig");
+const daemon_cleanup = @import("cleanup.zig");
 const daemon_executable = @import("executable.zig");
+const daemon_identity = @import("identity.zig");
 const daemon_log = @import("log.zig");
 const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
@@ -220,6 +223,8 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
     const path = try socketPathForDirName(allocator, dir_name);
     defer allocator.free(path);
+    const identity = try daemon_identity.current(allocator, path);
+    defer allocator.free(identity.start_time);
 
     var daemon_lock = try acquireDaemonSocketLock(allocator, dir_name, path);
     defer daemon_lock.deinit();
@@ -237,11 +242,19 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     var accept_context = DaemonAcceptContext{
         .allocator = allocator,
         .exe = daemon_exe,
+        .identity = identity,
         .listen_fd = listen_fd,
+    };
+    const file_config = client_config.loadFileConfig(allocator) catch client_config.FileConfig{};
+    var cleanup_context = DaemonCleanupContext{
+        .allocator = allocator,
+        .cleanup_wakeup_interval_ms = file_config.cleanup_wakeup_interval_ms orelse config.default_cleanup_wakeup_interval_ms,
+        .cleanup_retry_limit_ms = file_config.cleanup_retry_limit_ms orelse config.default_cleanup_retry_limit_ms,
     };
     var idle_context = DaemonIdleContext{
         .allocator = allocator,
         .last_live_work_ms = daemon_dispatcher.nowMs(),
+        .cleanup_enabled = cleanup_context.cleanup_wakeup_interval_ms > 0,
     };
     _ = try daemon_dispatcher.watchFd(listen_fd, .{ .readable = true }, .{
         .ctx = &accept_context,
@@ -251,12 +264,19 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
         .ctx = &idle_context,
         .callback = checkDaemonIdle,
     });
+    if (cleanup_context.cleanup_wakeup_interval_ms > 0) {
+        _ = try daemon_dispatcher.watchTimerAfter(@min(cleanup_context.cleanup_wakeup_interval_ms, @as(u64, 1_000)), .{
+            .ctx = &cleanup_context,
+            .callback = checkDaemonCleanup,
+        });
+    }
     try daemon_dispatcher.run();
 }
 
 const DaemonAcceptContext = struct {
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     listen_fd: c.fd_t,
 };
 
@@ -286,6 +306,7 @@ fn acceptDaemonClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher
     context.* = .{
         .allocator = accept_context.allocator,
         .exe = accept_context.exe,
+        .identity = accept_context.identity,
         .fd = client_fd,
     };
     _ = active_client_threads.fetchAdd(1, .acq_rel);
@@ -301,22 +322,31 @@ fn acceptDaemonClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher
 const ClientContext = struct {
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     fd: c.fd_t,
 };
 
 fn clientThread(context: *ClientContext) void {
     const allocator = context.allocator;
     const exe = context.exe;
+    const identity = context.identity;
     const fd = context.fd;
     defer allocator.destroy(context);
     defer _ = c.close(fd);
     defer _ = active_client_threads.fetchSub(1, .acq_rel);
-    handleClient(allocator, exe, fd) catch {};
+    handleClient(allocator, exe, identity, fd) catch {};
 }
 
 const DaemonIdleContext = struct {
     allocator: std.mem.Allocator,
     last_live_work_ms: u64,
+    cleanup_enabled: bool,
+};
+
+const DaemonCleanupContext = struct {
+    allocator: std.mem.Allocator,
+    cleanup_wakeup_interval_ms: u64,
+    cleanup_retry_limit_ms: u64,
 };
 
 fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
@@ -328,7 +358,7 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
     }
 
     const now_ms = daemon_dispatcher.nowMs();
-    if (daemonHasLiveWork()) {
+    if (daemonHasLiveWork(idle_context.allocator, idle_context.cleanup_enabled)) {
         idle_context.last_live_work_ms = now_ms;
     } else if (now_ms -| idle_context.last_live_work_ms >= daemon_idle_shutdown_ms) {
         daemon_log.infof(idle_context.allocator, "daemon idle; shutting down", .{});
@@ -342,11 +372,61 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
     });
 }
 
-fn daemonHasLiveWork() bool {
+fn daemonHasLiveWork(allocator: std.mem.Allocator, cleanup_enabled: bool) bool {
     return active_client_threads.load(.acquire) != 0 or
         transport_ssh.activeTerminalTunnelCount() != 0 or
         session_runtime.activeRuntimeCount() != 0 or
-        stream_runtime.activeProxyRuntimeCount() != 0;
+        stream_runtime.activeProxyRuntimeCount() != 0 or
+        (cleanup_enabled and daemon_cleanup.hasRecords(allocator));
+}
+
+fn checkDaemonCleanup(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+    _ = id;
+    const cleanup_context: *DaemonCleanupContext = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .timer => {},
+        .fd => return error.UnexpectedDaemonFdEvent,
+    }
+
+    var maybe_lock = try daemon_cleanup.tryAcquireSweepLock(cleanup_context.allocator, cleanup_context.cleanup_wakeup_interval_ms);
+    if (maybe_lock) |*lock| {
+        defer lock.deinit();
+        daemon_log.infof(cleanup_context.allocator, "cleanup sweep started", .{});
+        try daemon_cleanup.sweepRecords(
+            cleanup_context.allocator,
+            cleanup_context.cleanup_retry_limit_ms,
+            cleanup_context,
+            cleanupRecordViaRemote,
+        );
+        daemon_log.infof(cleanup_context.allocator, "cleanup sweep finished", .{});
+    }
+
+    if (cleanup_context.cleanup_wakeup_interval_ms > 0) {
+        _ = try daemon_dispatcher.watchTimerAfter(cleanup_context.cleanup_wakeup_interval_ms, .{
+            .ctx = cleanup_context,
+            .callback = checkDaemonCleanup,
+        });
+    }
+}
+
+fn cleanupRecordViaRemote(
+    ctx: *anyopaque,
+    allocator: std.mem.Allocator,
+    record: daemon_cleanup.Record,
+) !daemon_cleanup.CleanupResult {
+    _ = ctx;
+    daemon_log.infof(
+        allocator,
+        "cleanup record attempting remote cleanup guid={s} host={s}@{s}:{s}",
+        .{ record.guid, record.remote_user, record.remote_host, record.remote_port },
+    );
+    const result = try transport_ssh.sendCleanupRequestToRemote(allocator, record);
+    daemon_log.infof(
+        allocator,
+        "cleanup record remote cleanup finished guid={s} result={s}",
+        .{ record.guid, @tagName(result) },
+    );
+    return result;
 }
 
 const DaemonSocketLock = struct {
@@ -406,7 +486,12 @@ fn daemonSocketLockPath(allocator: std.mem.Allocator, socket_path: []const u8) !
     return std.fmt.allocPrint(allocator, "{s}/sesshd.lock", .{socket_path[0..slash]});
 }
 
-fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void {
+fn handleClient(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
+    fd: c.fd_t,
+) !void {
     const handshake_result = try acceptHandshake(allocator, fd);
     if (handshake_result == .mismatch) return;
     daemon_log.infof(allocator, "client hello completed", .{});
@@ -448,20 +533,21 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
             },
             .daemon_tunnel => {
                 if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd)) continue;
+                if (try handleDaemonTunnelControlFrame(allocator, identity, frame, fd)) continue;
                 if (isMuxOpenFrame(allocator, frame)) {
                     var typed_open_frame = try readMuxTypedOpenFrame(allocator, fd);
                     defer typed_open_frame.deinit(allocator);
                     if (session_daemon_handler.isTeMuxOpenFrame(allocator, typed_open_frame)) {
-                        try session_daemon_handler.serveMuxStreamFramesAfterHandshake(allocator, exe, frame, typed_open_frame, fd);
+                        try session_daemon_handler.serveMuxStreamFramesAfterHandshake(allocator, exe, identity, frame, typed_open_frame, fd);
                     } else if (stream_runtime.isProxyMuxOpenFrame(allocator, typed_open_frame)) {
-                        try stream_runtime.serveMuxStreamFramesAfterHandshake(allocator, exe, frame, typed_open_frame, fd);
+                        try stream_runtime.serveMuxStreamFramesAfterHandshake(allocator, exe, identity, frame, typed_open_frame, fd);
                     } else {
                         try sendError(fd, "PROTOCOL_ERROR", "expected typed mux stream open payload", "");
                     }
                 } else if (session_daemon_handler.isTeMuxOpenFrame(allocator, frame)) {
-                    try session_daemon_handler.serveMuxStreamFrameAfterHandshake(allocator, exe, frame, fd);
+                    try session_daemon_handler.serveMuxStreamFrameAfterHandshake(allocator, exe, identity, frame, fd);
                 } else if (stream_runtime.isProxyMuxOpenFrame(allocator, frame)) {
-                    try stream_runtime.serveMuxStreamFrameAfterHandshake(allocator, exe, frame, fd);
+                    try stream_runtime.serveMuxStreamFrameAfterHandshake(allocator, exe, identity, frame, fd);
                 } else {
                     try sendError(fd, "PROTOCOL_ERROR", "expected mux stream open", "");
                 }
@@ -500,6 +586,25 @@ fn handleClient(allocator: std.mem.Allocator, exe: []const u8, fd: c.fd_t) !void
                 return;
             },
         }
+    }
+}
+
+fn handleDaemonTunnelControlFrame(
+    allocator: std.mem.Allocator,
+    identity: daemon_identity.DaemonIdentity,
+    frame: protocol.OwnedFrame,
+    fd: c.fd_t,
+) !bool {
+    if (frame.message_type != .daemon_tunnel) return false;
+    var item = try protocol.decodePayload(pb.DaemonTunnelItem, allocator, frame.payload);
+    defer item.deinit(allocator);
+    const payload = item.payload orelse return false;
+    switch (payload) {
+        .remote_process_cleanup_request => |request| {
+            try daemon_cleanup.handleRemoteProcessCleanupRequest(allocator, fd, identity, request);
+            return true;
+        },
+        else => return false,
     }
 }
 

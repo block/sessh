@@ -54,15 +54,17 @@ client-log-level=warn
 bootstrap=true
 terminal-emulator=true
 filter-level=emulated
-cleanup-retry-hours=168
+cleanup-wakeup-interval-hours=1
+cleanup-retry-limit-hours=168
 disconnected-reap-hours=168
 ```
 
-`cleanup-retry-hours` controls how long the client-side daemon retries remote
-cleanup after a local client disappears. `disconnected-reap-hours` controls how
-long a remote session or proxy stream may remain disconnected before the remote
-daemon hangs it up. Values less than or equal to zero disable the relevant
-timeout.
+`cleanup-wakeup-interval-hours` controls how often local daemons coordinate a
+fallback cleanup scan. `cleanup-retry-limit-hours` controls how long the local
+side keeps trying to clean up stale remote work after a local client
+disappears. `disconnected-reap-hours` controls how long a remote session or
+proxy stream may remain disconnected before the remote daemon hangs it up.
+Values less than or equal to zero disable the relevant timeout.
 
 # Sessions
 

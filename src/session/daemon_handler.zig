@@ -7,6 +7,8 @@ const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const frame_forwarder = @import("../transport/frame_forwarder.zig");
+const daemon_cleanup = @import("../daemon/cleanup.zig");
+const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
 const session_runtime = @import("runtime.zig");
 const session_registry = @import("../runtime/session_registry.zig");
@@ -142,27 +144,30 @@ pub fn isTeMuxOpenFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame
 pub fn serveMuxStreamFrameAfterHandshake(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     first_frame: protocol.OwnedFrame,
     fd: c.fd_t,
 ) !void {
     var initial_frames = [_]protocol.OwnedFrame{first_frame};
-    try serveMuxStreamFramesAfterHandshakeWithInitial(allocator, exe, initial_frames[0..], fd);
+    try serveMuxStreamFramesAfterHandshakeWithInitial(allocator, exe, identity, initial_frames[0..], fd);
 }
 
 pub fn serveMuxStreamFramesAfterHandshake(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     first_frame: protocol.OwnedFrame,
     second_frame: protocol.OwnedFrame,
     fd: c.fd_t,
 ) !void {
     var initial_frames = [_]protocol.OwnedFrame{ first_frame, second_frame };
-    try serveMuxStreamFramesAfterHandshakeWithInitial(allocator, exe, initial_frames[0..], fd);
+    try serveMuxStreamFramesAfterHandshakeWithInitial(allocator, exe, identity, initial_frames[0..], fd);
 }
 
 fn serveMuxStreamFramesAfterHandshakeWithInitial(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     initial_frames: []const protocol.OwnedFrame,
     fd: c.fd_t,
 ) !void {
@@ -170,7 +175,7 @@ fn serveMuxStreamFramesAfterHandshakeWithInitial(
     defer closeTeMuxRuntimes(allocator, &sessions);
 
     for (initial_frames) |frame| {
-        try handleTeMuxFrame(allocator, exe, &sessions, fd, frame);
+        try handleTeMuxFrame(allocator, exe, identity, &sessions, fd, frame);
     }
 
     while (true) {
@@ -224,7 +229,7 @@ fn serveMuxStreamFramesAfterHandshakeWithInitial(
                 else => return err,
             };
             defer frame.deinit(allocator);
-            try handleTeMuxFrame(allocator, exe, &sessions, fd, frame);
+            try handleTeMuxFrame(allocator, exe, identity, &sessions, fd, frame);
         }
     }
 }
@@ -237,6 +242,7 @@ const TeMuxRuntime = struct {
     outbound_next_offset: u64 = 0,
     attached_logged: bool = false,
     ended: bool = false,
+    cleanup_recorded: bool = false,
 };
 
 const TeMuxPollTarget = struct {
@@ -253,7 +259,7 @@ fn closeTeMuxRuntimes(allocator: std.mem.Allocator, sessions: *std.ArrayList(TeM
 
 fn closeTeMuxRuntime(allocator: std.mem.Allocator, runtime: TeMuxRuntime, send_hangup: bool) void {
     if (runtime.runtime_fd >= 0) {
-        if (send_hangup) sendTeHangupToRuntime(runtime.runtime_fd) catch {};
+        if (send_hangup and !runtime.cleanup_recorded) sendTeHangupToRuntime(runtime.runtime_fd) catch {};
         _ = c.close(runtime.runtime_fd);
     }
     if (runtime.session_guid.len != 0) allocator.free(runtime.session_guid);
@@ -262,25 +268,56 @@ fn closeTeMuxRuntime(allocator: std.mem.Allocator, runtime: TeMuxRuntime, send_h
 fn handleTeMuxFrame(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     sessions: *std.ArrayList(TeMuxRuntime),
     mux_fd: c.fd_t,
     frame: protocol.OwnedFrame,
 ) !void {
     if (frame.message_type != .daemon_tunnel) return error.UnexpectedFrame;
-    var mux_frame = try protocol.decodeDaemonMuxStreamFrame(allocator, frame.payload);
-    defer mux_frame.deinit(allocator);
-    const message = mux_frame.message orelse return error.UnexpectedFrame;
-    switch (message) {
-        .open => |open| handleTeMuxOpen(allocator, sessions, mux_frame.stream_id, open) catch |err| {
-            try sendTeMuxResetForError(allocator, mux_fd, mux_frame.stream_id, "OPEN_FAILED", err);
+    var daemon_item = try protocol.decodePayload(pb.DaemonTunnelItem, allocator, frame.payload);
+    defer daemon_item.deinit(allocator);
+    const daemon_payload = daemon_item.payload orelse return error.UnexpectedFrame;
+    switch (daemon_payload) {
+        .remote_process_recorded => |recorded| {
+            if (findTeMuxRuntimeIndex(sessions, recorded.stream_id)) |index| {
+                sessions.items[index].cleanup_recorded = true;
+            }
+            return;
         },
-        .payload => |payload| handleTeMuxPayload(allocator, exe, sessions, mux_fd, mux_frame.stream_id, payload) catch |err| {
-            try sendTeMuxResetForError(allocator, mux_fd, mux_frame.stream_id, "STREAM_FAILED", err);
-            try removeTeMuxRuntime(allocator, sessions, mux_frame.stream_id);
+        .remote_process_cleanup_request => |request| {
+            try daemon_cleanup.handleRemoteProcessCleanupRequest(allocator, mux_fd, identity, request);
+            return;
+        },
+        .mux_stream => |mux| {
+            daemon_item.payload = null;
+            return handleTeMuxStreamFrame(allocator, exe, identity, sessions, mux_fd, mux);
+        },
+        else => return error.UnexpectedFrame,
+    }
+}
+
+fn handleTeMuxStreamFrame(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
+    sessions: *std.ArrayList(TeMuxRuntime),
+    mux_fd: c.fd_t,
+    mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
+) !void {
+    var owned_mux_frame = mux_frame;
+    defer owned_mux_frame.deinit(allocator);
+    const message = owned_mux_frame.message orelse return error.UnexpectedFrame;
+    switch (message) {
+        .open => |open| handleTeMuxOpen(allocator, sessions, owned_mux_frame.stream_id, open) catch |err| {
+            try sendTeMuxResetForError(allocator, mux_fd, owned_mux_frame.stream_id, "OPEN_FAILED", err);
+        },
+        .payload => |payload| handleTeMuxPayload(allocator, exe, identity, sessions, mux_fd, owned_mux_frame.stream_id, payload) catch |err| {
+            try sendTeMuxResetForError(allocator, mux_fd, owned_mux_frame.stream_id, "STREAM_FAILED", err);
+            try removeTeMuxRuntime(allocator, sessions, owned_mux_frame.stream_id);
         },
         .ack, .open_ok => {},
-        .eof => try removeTeMuxRuntime(allocator, sessions, mux_frame.stream_id),
-        .reset => try removeTeMuxRuntime(allocator, sessions, mux_frame.stream_id),
+        .eof => try removeTeMuxRuntime(allocator, sessions, owned_mux_frame.stream_id),
+        .reset => try removeTeMuxRuntime(allocator, sessions, owned_mux_frame.stream_id),
     }
 }
 
@@ -298,6 +335,7 @@ fn handleTeMuxOpen(
 fn handleTeMuxPayloadOpen(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     sessions: *std.ArrayList(TeMuxRuntime),
     mux_fd: c.fd_t,
     stream_id: u64,
@@ -351,6 +389,12 @@ fn handleTeMuxPayloadOpen(
     };
     errdefer _ = c.close(runtime_fd);
 
+    try daemon_cleanup.sendRemoteProcessStarted(
+        allocator,
+        mux_fd,
+        stream_id,
+        daemon_cleanup.makeRemoteProcessIdentity(identity, te_open.session_guid),
+    );
     try sendTeMuxOpenOk(allocator, mux_fd, stream_id);
     sessions.items[runtime_index].runtime_fd = runtime_fd;
     sessions.items[runtime_index].session_guid = session_guid;
@@ -411,6 +455,7 @@ fn openTeMuxRuntime(
 fn handleTeMuxPayload(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     sessions: *std.ArrayList(TeMuxRuntime),
     mux_fd: c.fd_t,
     stream_id: u64,
@@ -428,7 +473,7 @@ fn handleTeMuxPayload(
     var runtime = &sessions.items[index];
     if (te_item.payload) |te_payload| {
         if (te_payload == .open) {
-            try handleTeMuxPayloadOpen(allocator, exe, sessions, mux_fd, stream_id, payload.offset, te_payload.open);
+            try handleTeMuxPayloadOpen(allocator, exe, identity, sessions, mux_fd, stream_id, payload.offset, te_payload.open);
             return;
         }
     }

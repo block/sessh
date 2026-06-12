@@ -4,6 +4,8 @@ const posix = std.posix;
 
 const io = @import("../core/io.zig");
 const app_allocator = @import("../core/app_allocator.zig");
+const daemon_cleanup = @import("../daemon/cleanup.zig");
+const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
 const local_boot_time = @import("../core/local_boot_time.zig");
 const protocol = @import("../protocol/mod.zig");
@@ -874,27 +876,30 @@ const ProxyEndpoint = struct {
 pub fn serveMuxStreamFrameAfterHandshake(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     frame: protocol.OwnedFrame,
     fd: c.fd_t,
 ) !void {
     var initial_frames = [_]protocol.OwnedFrame{frame};
-    try serveMuxStreamFramesAfterHandshakeWithInitial(allocator, exe, initial_frames[0..], fd);
+    try serveMuxStreamFramesAfterHandshakeWithInitial(allocator, exe, identity, initial_frames[0..], fd);
 }
 
 pub fn serveMuxStreamFramesAfterHandshake(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     first_frame: protocol.OwnedFrame,
     second_frame: protocol.OwnedFrame,
     fd: c.fd_t,
 ) !void {
     var initial_frames = [_]protocol.OwnedFrame{ first_frame, second_frame };
-    try serveMuxStreamFramesAfterHandshakeWithInitial(allocator, exe, initial_frames[0..], fd);
+    try serveMuxStreamFramesAfterHandshakeWithInitial(allocator, exe, identity, initial_frames[0..], fd);
 }
 
 fn serveMuxStreamFramesAfterHandshakeWithInitial(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     initial_frames: []const protocol.OwnedFrame,
     fd: c.fd_t,
 ) !void {
@@ -902,7 +907,7 @@ fn serveMuxStreamFramesAfterHandshakeWithInitial(
     defer closeProxyMuxRuntimes(allocator, &streams);
 
     for (initial_frames) |initial_frame| {
-        try handleProxyMuxFrame(allocator, exe, &streams, fd, initial_frame);
+        try handleProxyMuxFrame(allocator, exe, identity, &streams, fd, initial_frame);
     }
 
     while (true) {
@@ -947,7 +952,7 @@ fn serveMuxStreamFramesAfterHandshakeWithInitial(
                 else => return err,
             };
             defer next.deinit(allocator);
-            try handleProxyMuxFrame(allocator, exe, &streams, fd, next);
+            try handleProxyMuxFrame(allocator, exe, identity, &streams, fd, next);
         }
     }
 }
@@ -975,6 +980,19 @@ const ProxyMuxRuntime = struct {
     stream_id: u64,
     runtime_fd: c.fd_t = -1,
     open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
+    proxy_guid: [session_registry.proxy_guid_len]u8 = [_]u8{0} ** session_registry.proxy_guid_len,
+    proxy_guid_len: usize = 0,
+    cleanup_recorded: bool = false,
+
+    fn proxyGuidSlice(self: *const ProxyMuxRuntime) []const u8 {
+        return self.proxy_guid[0..self.proxy_guid_len];
+    }
+
+    fn setProxyGuid(self: *ProxyMuxRuntime, guid: []const u8) !void {
+        if (guid.len > self.proxy_guid.len) return error.ProxyGuidTooLarge;
+        @memcpy(self.proxy_guid[0..guid.len], guid);
+        self.proxy_guid_len = guid.len;
+    }
 };
 
 const ProxyMuxPollTarget = struct {
@@ -984,6 +1002,9 @@ const ProxyMuxPollTarget = struct {
 
 fn closeProxyMuxRuntimes(allocator: std.mem.Allocator, streams: *std.ArrayList(ProxyMuxRuntime)) void {
     for (streams.items) |stream| {
+        if (stream.runtime_fd >= 0 and !stream.cleanup_recorded) {
+            sendProxyMuxReset(allocator, stream.runtime_fd, proxy_mux_stream_id, "STARTUP_FAILED", "proxy cleanup record was not acknowledged") catch {};
+        }
         if (stream.runtime_fd >= 0) _ = c.close(stream.runtime_fd);
     }
     streams.deinit(allocator);
@@ -992,21 +1013,52 @@ fn closeProxyMuxRuntimes(allocator: std.mem.Allocator, streams: *std.ArrayList(P
 fn handleProxyMuxFrame(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     streams: *std.ArrayList(ProxyMuxRuntime),
     mux_fd: c.fd_t,
     frame: protocol.OwnedFrame,
 ) !void {
     if (frame.message_type != .daemon_tunnel) return error.StreamUnexpectedFrame;
-    var mux_frame = try protocol.decodeDaemonMuxStreamFrame(allocator, frame.payload);
-    defer mux_frame.deinit(allocator);
-    const message = mux_frame.message orelse return error.StreamUnexpectedFrame;
+    var daemon_item = try protocol.decodePayload(pb.DaemonTunnelItem, allocator, frame.payload);
+    defer daemon_item.deinit(allocator);
+    const daemon_payload = daemon_item.payload orelse return error.StreamUnexpectedFrame;
+    switch (daemon_payload) {
+        .remote_process_recorded => |recorded| {
+            if (findProxyMuxRuntimeIndex(streams, recorded.stream_id)) |index| {
+                streams.items[index].cleanup_recorded = true;
+            }
+            return;
+        },
+        .remote_process_cleanup_request => |request| {
+            try daemon_cleanup.handleRemoteProcessCleanupRequest(allocator, mux_fd, identity, request);
+            return;
+        },
+        .mux_stream => |mux| {
+            daemon_item.payload = null;
+            return handleProxyMuxStreamFrame(allocator, exe, identity, streams, mux_fd, mux);
+        },
+        else => return error.StreamUnexpectedFrame,
+    }
+}
+
+fn handleProxyMuxStreamFrame(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
+    streams: *std.ArrayList(ProxyMuxRuntime),
+    mux_fd: c.fd_t,
+    mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
+) !void {
+    var owned_mux_frame = mux_frame;
+    defer owned_mux_frame.deinit(allocator);
+    const message = owned_mux_frame.message orelse return error.StreamUnexpectedFrame;
     switch (message) {
-        .open => |open| try handleProxyMuxOpen(allocator, streams, mux_frame.stream_id, open),
-        .payload => |payload| try handleProxyMuxPayload(allocator, exe, streams, mux_fd, mux_frame.stream_id, payload, mux_frame),
-        .open_ok, .ack, .eof => try forwardProxyMuxFrameToRuntime(allocator, streams, mux_frame),
+        .open => |open| try handleProxyMuxOpen(allocator, streams, owned_mux_frame.stream_id, open),
+        .payload => |payload| try handleProxyMuxPayload(allocator, exe, identity, streams, mux_fd, owned_mux_frame.stream_id, payload, owned_mux_frame),
+        .open_ok, .ack, .eof => try forwardProxyMuxFrameToRuntime(allocator, streams, owned_mux_frame),
         .reset => {
-            forwardProxyMuxFrameToRuntime(allocator, streams, mux_frame) catch {};
-            try removeProxyMuxRuntime(streams, mux_frame.stream_id);
+            forwardProxyMuxFrameToRuntime(allocator, streams, owned_mux_frame) catch {};
+            try removeProxyMuxRuntime(streams, owned_mux_frame.stream_id);
         },
     }
 }
@@ -1036,6 +1088,7 @@ fn handleProxyMuxOpen(
 fn handleProxyMuxPayload(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     streams: *std.ArrayList(ProxyMuxRuntime),
     mux_fd: c.fd_t,
     stream_id: u64,
@@ -1049,7 +1102,7 @@ fn handleProxyMuxPayload(
     };
     const proxy_payload = proxy_item.payload orelse return error.StreamUnexpectedFrame;
     switch (proxy_payload) {
-        .open => |request| try handleProxyMuxPayloadOpen(allocator, exe, streams, mux_fd, stream_id, request),
+        .open => |request| try handleProxyMuxPayloadOpen(allocator, exe, identity, streams, mux_fd, stream_id, request),
         .data => try forwardProxyMuxFrameToRuntime(allocator, streams, mux_frame),
     }
 }
@@ -1057,6 +1110,7 @@ fn handleProxyMuxPayload(
 fn handleProxyMuxPayloadOpen(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    identity: daemon_identity.DaemonIdentity,
     streams: *std.ArrayList(ProxyMuxRuntime),
     mux_fd: c.fd_t,
     stream_id: u64,
@@ -1082,7 +1136,15 @@ fn handleProxyMuxPayloadOpen(
         .message = .{ .open = streams.items[index].open },
     });
     streams.items[index].runtime_fd = runtime_fd;
-    _ = mux_fd;
+    const canonical = try session_registry.canonicalProxyGuid(allocator, request.proxy_guid);
+    defer allocator.free(canonical);
+    try streams.items[index].setProxyGuid(canonical);
+    try daemon_cleanup.sendRemoteProcessStarted(
+        allocator,
+        mux_fd,
+        stream_id,
+        daemon_cleanup.makeRemoteProcessIdentity(identity, canonical),
+    );
 }
 
 fn forwardProxyMuxFrameToRuntime(
@@ -1953,6 +2015,21 @@ fn connectProxyRuntime(control: *ProxyRuntimeControl) !c.fd_t {
     try setCloseOnExec(fds[1]);
     try control.enqueue(fds[1]);
     return fds[0];
+}
+
+pub fn requestProxyRuntimeCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
+    const canonical = try session_registry.canonicalProxyGuid(allocator, guid);
+    defer allocator.free(canonical);
+    const control = lookupProxyRuntime(canonical) orelse return error.StreamNotFound;
+    const fd = try connectProxyRuntime(control);
+    defer _ = c.close(fd);
+    try sendMuxStreamFrame(allocator, fd, .{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .reset = .{
+            .code = "CLEANUP_REQUESTED",
+            .message = "remote cleanup requested",
+        } },
+    });
 }
 
 const ProxyRuntimeThreadContext = struct {

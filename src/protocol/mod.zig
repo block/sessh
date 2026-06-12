@@ -463,6 +463,36 @@ test "mux stream frame preserves stream id offset and proxy payload" {
     }
 }
 
+test "remote process started preserves stream id and cleanup identity" {
+    const payload = try encodePayload(std.testing.allocator, pb.DaemonTunnelItem{
+        .payload = .{ .remote_process_started = .{
+            .stream_id = 9,
+            .process = .{
+                .pid = 1234,
+                .start_time = "opaque-start",
+                .daemon_socket_path = "/tmp/sessh/sesshd.sock",
+                .guid = "s-550e8400-e29b-41d4-a716-446655440000",
+            },
+        } },
+    });
+    defer std.testing.allocator.free(payload);
+
+    var item = try decodePayload(pb.DaemonTunnelItem, std.testing.allocator, payload);
+    defer item.deinit(std.testing.allocator);
+    const item_payload = item.payload orelse return error.MissingDaemonTunnelPayload;
+    switch (item_payload) {
+        .remote_process_started => |started| {
+            try std.testing.expectEqual(@as(u64, 9), started.stream_id);
+            const process = started.process orelse return error.MissingRemoteProcessIdentity;
+            try std.testing.expectEqual(@as(u64, 1234), process.pid);
+            try std.testing.expectEqualStrings("opaque-start", process.start_time);
+            try std.testing.expectEqualStrings("/tmp/sessh/sesshd.sock", process.daemon_socket_path);
+            try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", process.guid);
+        },
+        else => return error.UnexpectedDaemonTunnelPayload,
+    }
+}
+
 test "hello compatibility accepts peer max protocol when it satisfies local minimum" {
     try std.testing.expect(helloRequestIsCompatible(.{
         .protocol_major = 3,

@@ -10,7 +10,8 @@ pub const FileConfig = struct {
     bootstrap: ?bool = null,
     terminal_emulator: ?bool = null,
     filter_level: ?config.FilterLevel = null,
-    cleanup_retry_ms: ?u64 = null,
+    cleanup_wakeup_interval_ms: ?u64 = null,
+    cleanup_retry_limit_ms: ?u64 = null,
     disconnected_reap_ms: ?u64 = null,
 };
 
@@ -71,8 +72,10 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
             parsed.terminal_emulator = try parseBool(value);
         } else if (keyMatches(key, "filter-level")) {
             parsed.filter_level = try config.parseFilterLevel(value);
-        } else if (keyMatches(key, "cleanup-retry-hours")) {
-            parsed.cleanup_retry_ms = try parseHoursMs(value, error.InvalidCleanupRetryHours);
+        } else if (keyMatches(key, "cleanup-wakeup-interval-hours")) {
+            parsed.cleanup_wakeup_interval_ms = try parseHoursMs(value, error.InvalidCleanupWakeupIntervalHours);
+        } else if (keyMatches(key, "cleanup-retry-limit-hours")) {
+            parsed.cleanup_retry_limit_ms = try parseHoursMs(value, error.InvalidCleanupRetryLimitHours);
         } else if (keyMatches(key, "disconnected-reap-hours")) {
             parsed.disconnected_reap_ms = try parseHoursMs(value, error.InvalidDisconnectedReapHours);
         } else {
@@ -145,7 +148,8 @@ test "parseEnvConfig accepts sessh env keys" {
         \\bootstrap=false
         \\terminal-emulator=no
         \\filter-level=hygienic
-        \\cleanup-retry-hours=2
+        \\cleanup-wakeup-interval-hours=0.25
+        \\cleanup-retry-limit-hours=2
         \\disconnected-reap-hours=1.5
         \\
     );
@@ -154,7 +158,8 @@ test "parseEnvConfig accepts sessh env keys" {
     try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
     try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
     try std.testing.expectEqual(@as(?config.FilterLevel, .hygienic), parsed.filter_level);
-    try std.testing.expectEqual(@as(?u64, 7_200_000), parsed.cleanup_retry_ms);
+    try std.testing.expectEqual(@as(?u64, 900_000), parsed.cleanup_wakeup_interval_ms);
+    try std.testing.expectEqual(@as(?u64, 7_200_000), parsed.cleanup_retry_limit_ms);
     try std.testing.expectEqual(@as(?u64, 5_400_000), parsed.disconnected_reap_ms);
 }
 

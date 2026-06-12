@@ -20,7 +20,9 @@ timestamp so that only one does the work. Records older than
 and stops trying to clean up that remote process.
 
 Cleaning up means scanning the global `state/procs/` dir. Each file within the
-procs dir is JSON, named by GUID. The files are created atomically and are never
+procs dir is JSON, named `<guid>.json`; the filename is the resource identity.
+The file mtime is the recorded-at timestamp used for
+`cleanup-retry-limit-hours`. The files are created atomically and are never
 mutated other than being deleted. Each contains:
 
 1. `local_pid`

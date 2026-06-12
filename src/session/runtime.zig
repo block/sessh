@@ -1243,6 +1243,24 @@ pub fn connectSessionRuntime(allocator: std.mem.Allocator, guid: []const u8) !c.
     return fds[0];
 }
 
+pub fn requestSessionCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
+    const fd = try connectSessionRuntime(allocator, guid);
+    defer _ = c.close(fd);
+
+    try sendHelloRequest(fd);
+    var hello_error = try readHelloReply(fd);
+    defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
+    if (hello_error) |_| return error.VersionMismatch;
+    var peer_hello = try readHelloRequest(fd);
+    defer peer_hello.deinit(app_allocator.allocator());
+    if (!helloRequestIsCompatible(peer_hello)) {
+        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote session runtime is incompatible with this client", "Start a fresh sessh connection with matching binaries");
+        return error.VersionMismatch;
+    }
+    try sendHelloOk(fd);
+    try protocol.sendTeStreamPayloadFrame(allocator, fd, .{ .session_hangup_request = .{} });
+}
+
 pub fn connectSingleLiveSessionRuntime(allocator: std.mem.Allocator) !c.fd_t {
     runtime_registry_mutex.lock();
     var found_guid: ?[]u8 = null;
