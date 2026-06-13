@@ -168,7 +168,6 @@ pub fn handleRemoteProcessCleanupResponse(
 
 pub fn tryAcquireSweepLock(
     allocator: std.mem.Allocator,
-    wakeup_interval_ms: u64,
 ) !?SweepLock {
     const path = try sweepLockPath(allocator);
     defer allocator.free(path);
@@ -191,20 +190,33 @@ pub fn tryAcquireSweepLock(
     };
     errdefer posix.flock(file.handle, posix.LOCK.UN) catch {};
 
-    const now_ms = nowUnixMs();
-    const last_ms = readSweepTimestampMs(allocator, &file) catch 0;
+    return .{ .file = file };
+}
+
+pub fn sweepDueAndMark(
+    lock: *SweepLock,
+    wakeup_interval_ms: u64,
+    now_ms: u64,
+) !bool {
+    const stat = try lock.file.stat();
+    const last_ms = if (stat.size == 0) 0 else fileMtimeUnixMs(stat);
     if (wakeup_interval_ms > 0 and last_ms > 0 and now_ms -| last_ms < wakeup_interval_ms) {
-        posix.flock(file.handle, posix.LOCK.UN) catch {};
-        file.close();
-        return null;
+        return false;
     }
-    try file.setEndPos(0);
-    try file.seekTo(0);
+    try markSweepStarted(lock, now_ms);
+    return true;
+}
+
+pub fn markSweepStarted(
+    lock: *SweepLock,
+    now_ms: u64,
+) !void {
+    try lock.file.setEndPos(0);
+    try lock.file.seekTo(0);
     var line: [32]u8 = undefined;
     const len = try std.fmt.bufPrint(&line, "{}\n", .{now_ms});
-    try file.writeAll(len);
-    try file.sync();
-    return .{ .file = file };
+    try lock.file.writeAll(len);
+    try lock.file.sync();
 }
 
 pub fn sweepRecords(
@@ -407,10 +419,20 @@ fn recordJsonFromRecord(record: Record) RecordJson {
 }
 
 fn ensureProcsDir(allocator: std.mem.Allocator) ![]u8 {
+    const root = try socket_transport.stateRoot(allocator);
+    defer allocator.free(root);
+    try ensurePrivateDir(allocator, root);
+
     const procs_dir = try procsDir(allocator);
     errdefer allocator.free(procs_dir);
-    try std.fs.cwd().makePath(procs_dir);
+    try ensurePrivateDir(allocator, procs_dir);
     return procs_dir;
+}
+
+fn ensurePrivateDir(allocator: std.mem.Allocator, dir: []const u8) !void {
+    const marker = try std.fmt.allocPrint(allocator, "{s}/.dir", .{dir});
+    defer allocator.free(marker);
+    try socket_transport.ensureSocketDir(allocator, marker);
 }
 
 fn procsDir(allocator: std.mem.Allocator) ![]u8 {
@@ -510,15 +532,6 @@ fn sweepLockPath(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/cleanup-sweep", .{root});
 }
 
-fn readSweepTimestampMs(allocator: std.mem.Allocator, file: *std.fs.File) !u64 {
-    try file.seekTo(0);
-    const bytes = try file.readToEndAlloc(allocator, 128);
-    defer allocator.free(bytes);
-    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
-    if (trimmed.len == 0) return 0;
-    return std.fmt.parseInt(u64, trimmed, 10);
-}
-
 test "record path rejects path separators" {
     try std.testing.expectError(error.InvalidGuid, validateGuidForFile("s-nope/nope"));
 }
@@ -530,4 +543,46 @@ test "record filename provides cleanup guid" {
     );
     try std.testing.expectError(error.InvalidGuid, guidFromRecordFilename("s-nope/nope.json"));
     try std.testing.expectError(error.InvalidGuid, guidFromRecordFilename("s-550e8400-e29b-41d4-a716-446655440000"));
+}
+
+test "cleanup record JSON omits filename-owned identity and age fields" {
+    var json_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_writer.deinit();
+    try std.json.Stringify.value(recordJsonFromRecord(.{
+        .guid = "s-550e8400-e29b-41d4-a716-446655440000",
+        .local_pid = 12,
+        .local_start_time = "local-start",
+        .remote_user = "user",
+        .remote_host = "host",
+        .remote_port = "22",
+        .remote_pid = 34,
+        .remote_start_time = "remote-start",
+        .remote_socket_path = "/tmp/sesshd.sock",
+    }), .{}, &json_writer.writer);
+    const bytes = try json_writer.toOwnedSlice();
+    defer std.testing.allocator.free(bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "guid") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "recorded_at_unix_ms") == null);
+    var parsed = try std.json.parseFromSlice(RecordJson, std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 12), parsed.value.local_pid);
+    try std.testing.expectEqualStrings("/tmp/sesshd.sock", parsed.value.remote_socket_path);
+}
+
+test "cleanup sweep lock mtime throttles repeated sweeps" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("cleanup-sweep", .{
+        .read = true,
+        .truncate = false,
+        .mode = 0o600,
+    });
+    var lock = SweepLock{ .file = file };
+    defer lock.deinit();
+
+    const now_ms = nowUnixMs();
+    try std.testing.expect(try sweepDueAndMark(&lock, 60_000, now_ms));
+    try std.testing.expect(!(try sweepDueAndMark(&lock, 60_000, now_ms + 1)));
 }

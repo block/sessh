@@ -53,6 +53,10 @@ SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST = "te_session_client_debug_
 PING = "ping"
 PONG = "pong"
 MUX_STREAM_FRAME = "mux_stream_frame"
+REMOTE_PROCESS_STARTED = "remote_process_started"
+REMOTE_PROCESS_RECORDED = "remote_process_recorded"
+REMOTE_PROCESS_CLEANUP_REQUEST = "remote_process_cleanup_request"
+REMOTE_PROCESS_CLEANUP_RESPONSE = "remote_process_cleanup_response"
 CLIENT_DAEMON = "client_daemon"
 
 _HELLO_FRAME_FIELDS = {
@@ -809,7 +813,14 @@ def recv_frame(conn):
             raise AssertionError(f"missing daemon tunnel payload: {body!r}")
         if tunnel_field == "mux_stream":
             return MUX_STREAM_FRAME, frame.daemon_tunnel.mux_stream.SerializeToString()
-        if tunnel_field in (PING, PONG):
+        if tunnel_field in (
+            PING,
+            PONG,
+            REMOTE_PROCESS_STARTED,
+            REMOTE_PROCESS_RECORDED,
+            REMOTE_PROCESS_CLEANUP_REQUEST,
+            REMOTE_PROCESS_CLEANUP_RESPONSE,
+        ):
             return tunnel_field, getattr(frame.daemon_tunnel, tunnel_field).SerializeToString()
         raise AssertionError(f"unknown daemon tunnel payload: {tunnel_field}")
     return field, getattr(frame, field).SerializeToString()
@@ -1246,6 +1257,54 @@ def run_daemon_concurrent_start_test(_base_env):
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait(timeout=2.0)
+            cleanup_runtime(env)
+
+
+def run_daemon_exits_after_stale_cleanup_record_test(_base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-cleanup-idle-", dir="/tmp") as tmp:
+        env = isolated_env(tmp)
+        procs_dir = state_root(env) / "procs"
+        procs_dir.mkdir(parents=True, exist_ok=True)
+        state_root(env).chmod(0o700)
+        procs_dir.chmod(0o700)
+        record_path = procs_dir / f"{test_session_guid(77)}.json"
+        record_path.write_text(
+            json.dumps(
+                {
+                    "local_pid": 99999999,
+                    "local_start_time": "missing-local-process",
+                    "remote_user": "user",
+                    "remote_host": "host",
+                    "remote_port": "22",
+                    "remote_pid": 99999998,
+                    "remote_start_time": "missing-remote-process",
+                    "remote_socket_path": "/tmp/missing-sesshd.sock",
+                }
+            )
+            + "\n"
+        )
+        old = time.time() - 9 * 24 * 60 * 60
+        os.utime(record_path, (old, old))
+
+        proc = None
+        try:
+            proc = start_daemon(env)
+            proc.wait(timeout=5.0)
+            if proc.returncode != 0:
+                raise AssertionError(f"sesshd exited with {proc.returncode}")
+            wait_missing(socket_path(env))
+            if record_path.exists():
+                raise AssertionError(f"stale cleanup record was not deleted: {record_path}")
+        except subprocess.TimeoutExpired:
+            raise AssertionError("sesshd did not exit after stale cleanup record was abandoned")
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
             cleanup_runtime(env)
 
 
@@ -3091,6 +3150,7 @@ def main():
             run_login_shell_profile_test(env)
             run_daemon_ping_test(env)
             run_daemon_concurrent_start_test(env)
+            run_daemon_exits_after_stale_cleanup_record_test(env)
             run_daemon_log_test(env)
             run_daemon_log_namespace_env_test(env)
             run_daemon_log_session_lifecycle_test(env)

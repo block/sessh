@@ -251,10 +251,11 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
         .cleanup_wakeup_interval_ms = file_config.cleanup_wakeup_interval_ms orelse config.default_cleanup_wakeup_interval_ms,
         .cleanup_retry_limit_ms = file_config.cleanup_retry_limit_ms orelse config.default_cleanup_retry_limit_ms,
     };
+    defer cleanup_context.deinit();
     var idle_context = DaemonIdleContext{
         .allocator = allocator,
+        .cleanup_context = &cleanup_context,
         .last_live_work_ms = daemon_dispatcher.nowMs(),
-        .cleanup_enabled = cleanup_context.cleanup_wakeup_interval_ms > 0,
     };
     _ = try daemon_dispatcher.watchFd(listen_fd, .{ .readable = true }, .{
         .ctx = &accept_context,
@@ -264,12 +265,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
         .ctx = &idle_context,
         .callback = checkDaemonIdle,
     });
-    if (cleanup_context.cleanup_wakeup_interval_ms > 0) {
-        _ = try daemon_dispatcher.watchTimerAfter(@min(cleanup_context.cleanup_wakeup_interval_ms, @as(u64, 1_000)), .{
-            .ctx = &cleanup_context,
-            .callback = checkDaemonCleanup,
-        });
-    }
     try daemon_dispatcher.run();
 }
 
@@ -339,14 +334,29 @@ fn clientThread(context: *ClientContext) void {
 
 const DaemonIdleContext = struct {
     allocator: std.mem.Allocator,
+    cleanup_context: *DaemonCleanupContext,
     last_live_work_ms: u64,
-    cleanup_enabled: bool,
 };
 
 const DaemonCleanupContext = struct {
     allocator: std.mem.Allocator,
     cleanup_wakeup_interval_ms: u64,
     cleanup_retry_limit_ms: u64,
+    sweep_lock: ?daemon_cleanup.SweepLock = null,
+    shutdown_satisfied: bool = false,
+
+    fn deinit(self: *DaemonCleanupContext) void {
+        self.releaseSweepLock();
+    }
+
+    fn enabled(self: *const DaemonCleanupContext) bool {
+        return self.cleanup_wakeup_interval_ms > 0;
+    }
+
+    fn releaseSweepLock(self: *DaemonCleanupContext) void {
+        if (self.sweep_lock) |*lock| lock.deinit();
+        self.sweep_lock = null;
+    }
 };
 
 fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
@@ -358,7 +368,9 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
     }
 
     const now_ms = daemon_dispatcher.nowMs();
-    if (daemonHasLiveWork(idle_context.allocator, idle_context.cleanup_enabled)) {
+    const has_local_client = active_client_threads.load(.acquire) != 0;
+    const cleanup_keeps_daemon_alive = try maintainDaemonCleanup(idle_context.cleanup_context, now_ms, has_local_client);
+    if (daemonHasLiveWork() or cleanup_keeps_daemon_alive) {
         idle_context.last_live_work_ms = now_ms;
     } else if (now_ms -| idle_context.last_live_work_ms >= daemon_idle_shutdown_ms) {
         daemon_log.infof(idle_context.allocator, "daemon idle; shutting down", .{});
@@ -372,41 +384,123 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
     });
 }
 
-fn daemonHasLiveWork(allocator: std.mem.Allocator, cleanup_enabled: bool) bool {
+fn daemonHasLiveWork() bool {
     return active_client_threads.load(.acquire) != 0 or
         transport_ssh.activeTerminalTunnelCount() != 0 or
         session_runtime.activeRuntimeCount() != 0 or
-        stream_runtime.activeProxyRuntimeCount() != 0 or
-        (cleanup_enabled and daemon_cleanup.hasRecords(allocator));
+        stream_runtime.activeProxyRuntimeCount() != 0;
 }
 
-fn checkDaemonCleanup(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
-    _ = id;
-    const cleanup_context: *DaemonCleanupContext = @ptrCast(@alignCast(ctx));
-    switch (event) {
-        .timer => {},
-        .fd => return error.UnexpectedDaemonFdEvent,
+fn maintainDaemonCleanup(cleanup_context: *DaemonCleanupContext, now_ms: u64, has_local_client: bool) !bool {
+    if (!cleanup_context.enabled()) {
+        cleanup_context.releaseSweepLock();
+        cleanup_context.shutdown_satisfied = true;
+        return false;
     }
 
-    var maybe_lock = try daemon_cleanup.tryAcquireSweepLock(cleanup_context.allocator, cleanup_context.cleanup_wakeup_interval_ms);
-    if (maybe_lock) |*lock| {
-        defer lock.deinit();
-        daemon_log.infof(cleanup_context.allocator, "cleanup sweep started", .{});
-        try daemon_cleanup.sweepRecords(
-            cleanup_context.allocator,
-            cleanup_context.cleanup_retry_limit_ms,
-            cleanup_context,
-            cleanupRecordViaRemote,
-        );
-        daemon_log.infof(cleanup_context.allocator, "cleanup sweep finished", .{});
-    }
+    const decision = cleanupMaintenanceDecision(.{
+        .has_records = daemon_cleanup.hasRecords(cleanup_context.allocator),
+        .has_local_client = has_local_client,
+        .has_lock = cleanup_context.sweep_lock != null,
+        .shutdown_satisfied = cleanup_context.shutdown_satisfied,
+    });
 
-    if (cleanup_context.cleanup_wakeup_interval_ms > 0) {
-        _ = try daemon_dispatcher.watchTimerAfter(cleanup_context.cleanup_wakeup_interval_ms, .{
-            .ctx = cleanup_context,
-            .callback = checkDaemonCleanup,
-        });
+    if (decision.release_without_sweep) {
+        cleanup_context.releaseSweepLock();
     }
+    cleanup_context.shutdown_satisfied = decision.shutdown_satisfied;
+    if (decision.acquire) {
+        const acquired = try daemon_cleanup.tryAcquireSweepLock(cleanup_context.allocator);
+        if (acquired) |lock| {
+            cleanup_context.sweep_lock = lock;
+        } else {
+            cleanup_context.shutdown_satisfied = decision.shutdown_satisfied_on_acquire_failure;
+            return decision.keeps_daemon_alive;
+        }
+    }
+    if (decision.sweep == .if_due) {
+        if (cleanup_context.sweep_lock == null) {
+            return decision.keeps_daemon_alive;
+        }
+        if (cleanup_context.sweep_lock) |*lock| {
+            if (try daemon_cleanup.sweepDueAndMark(
+                lock,
+                cleanup_context.cleanup_wakeup_interval_ms,
+                now_ms,
+            )) {
+                try runCleanupSweep(cleanup_context);
+            }
+        }
+    } else if (decision.sweep == .always) {
+        if (cleanup_context.sweep_lock) |*lock| try daemon_cleanup.markSweepStarted(lock, now_ms);
+        try runCleanupSweep(cleanup_context);
+    }
+    if (decision.release_after_sweep) cleanup_context.releaseSweepLock();
+    return decision.keeps_daemon_alive;
+}
+
+fn runCleanupSweep(cleanup_context: *DaemonCleanupContext) !void {
+    daemon_log.infof(cleanup_context.allocator, "cleanup sweep started", .{});
+    try daemon_cleanup.sweepRecords(
+        cleanup_context.allocator,
+        cleanup_context.cleanup_retry_limit_ms,
+        cleanup_context,
+        cleanupRecordViaRemote,
+    );
+    daemon_log.infof(cleanup_context.allocator, "cleanup sweep finished", .{});
+}
+
+const CleanupSweepMode = enum {
+    none,
+    if_due,
+    always,
+};
+
+const CleanupMaintenanceInput = struct {
+    has_records: bool,
+    has_local_client: bool,
+    has_lock: bool,
+    shutdown_satisfied: bool,
+};
+
+const CleanupMaintenanceDecision = struct {
+    acquire: bool = false,
+    sweep: CleanupSweepMode = .none,
+    release_without_sweep: bool = false,
+    release_after_sweep: bool = false,
+    keeps_daemon_alive: bool = false,
+    shutdown_satisfied: bool = false,
+    shutdown_satisfied_on_acquire_failure: bool = false,
+};
+
+fn cleanupMaintenanceDecision(input: CleanupMaintenanceInput) CleanupMaintenanceDecision {
+    if (!input.has_records) {
+        return .{
+            .release_without_sweep = input.has_lock,
+            .shutdown_satisfied = true,
+        };
+    }
+    if (input.has_local_client) {
+        return .{
+            .acquire = !input.has_lock,
+            .sweep = .if_due,
+            .keeps_daemon_alive = true,
+            .shutdown_satisfied = false,
+            .shutdown_satisfied_on_acquire_failure = false,
+        };
+    }
+    if (input.shutdown_satisfied) {
+        return .{
+            .shutdown_satisfied = true,
+        };
+    }
+    return .{
+        .acquire = !input.has_lock,
+        .sweep = .always,
+        .release_after_sweep = true,
+        .shutdown_satisfied = true,
+        .shutdown_satisfied_on_acquire_failure = true,
+    };
 }
 
 fn cleanupRecordViaRemote(
@@ -763,4 +857,56 @@ test "daemon socket path uses runtime root" {
     const path = try socketPathForDirName(allocator, "1.dev.abcdef12");
     defer allocator.free(path);
     try std.testing.expect(std.mem.endsWith(u8, path, "/1.dev.abcdef12/sesshd.sock"));
+}
+
+test "cleanup maintenance decisions hold lock for live clients" {
+    const decision = cleanupMaintenanceDecision(.{
+        .has_records = true,
+        .has_local_client = true,
+        .has_lock = false,
+        .shutdown_satisfied = true,
+    });
+    try std.testing.expect(decision.acquire);
+    try std.testing.expectEqual(CleanupSweepMode.if_due, decision.sweep);
+    try std.testing.expect(decision.keeps_daemon_alive);
+    try std.testing.expect(!decision.release_after_sweep);
+    try std.testing.expect(!decision.shutdown_satisfied);
+}
+
+test "cleanup maintenance decisions let idle daemon exit after one attempt" {
+    const needs_attempt = cleanupMaintenanceDecision(.{
+        .has_records = true,
+        .has_local_client = false,
+        .has_lock = false,
+        .shutdown_satisfied = false,
+    });
+    try std.testing.expect(needs_attempt.acquire);
+    try std.testing.expectEqual(CleanupSweepMode.always, needs_attempt.sweep);
+    try std.testing.expect(needs_attempt.release_after_sweep);
+    try std.testing.expect(needs_attempt.shutdown_satisfied);
+    try std.testing.expect(needs_attempt.shutdown_satisfied_on_acquire_failure);
+    try std.testing.expect(!needs_attempt.keeps_daemon_alive);
+
+    const already_attempted = cleanupMaintenanceDecision(.{
+        .has_records = true,
+        .has_local_client = false,
+        .has_lock = false,
+        .shutdown_satisfied = true,
+    });
+    try std.testing.expect(!already_attempted.acquire);
+    try std.testing.expectEqual(CleanupSweepMode.none, already_attempted.sweep);
+    try std.testing.expect(already_attempted.shutdown_satisfied);
+}
+
+test "cleanup maintenance decisions release stale idle locks when no records remain" {
+    const decision = cleanupMaintenanceDecision(.{
+        .has_records = false,
+        .has_local_client = false,
+        .has_lock = true,
+        .shutdown_satisfied = false,
+    });
+    try std.testing.expect(decision.release_without_sweep);
+    try std.testing.expectEqual(CleanupSweepMode.none, decision.sweep);
+    try std.testing.expect(decision.shutdown_satisfied);
+    try std.testing.expect(!decision.keeps_daemon_alive);
 }

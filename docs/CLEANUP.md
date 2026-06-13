@@ -14,14 +14,12 @@ the remote process.
 ## Periodic scan
 
 Daemons wake up every `cleanup-wakeup-interval-hours` to check if there are
-stale remote processes. Daemons acquire a global flock and update the file
-timestamp so that only one does the work. Records older than
-`cleanup-retry-limit-hours` are abandoned: the local side deletes the record
-and stops trying to clean up that remote process.
+stale remote processes, attempting to connect to each host and send a
+`RemoteProcessCleanupRequest` for each stale remote process.
 
-Cleaning up means scanning the global `state/procs/` dir. Each file within the
-procs dir is JSON, named `<guid>.json`; the filename is the resource identity.
-The file mtime is the recorded-at timestamp used for
+During cleanup the daemon scans the global `state/procs/` dir. Each file within
+the procs dir is JSON, named `<guid>.json`; the filename is the resource
+identity.  The file mtime is the recorded-at timestamp used for
 `cleanup-retry-limit-hours`. The files are created atomically and are never
 mutated other than being deleted. Each contains:
 
@@ -50,6 +48,28 @@ perform a more ssh-shaped cleanup.
 Once the process is signaled, or if it no longer exists,
 `RemoteProcessCleanupResponse` is sent back, and the local side deletes the
 file.
+
+### Avoiding duplicate work
+
+Daemons acquire a global flock and update the file timestamp so that only one
+does the work. Records older than `cleanup-retry-limit-hours` are abandoned:
+the local side deletes the record and stops trying to clean up that remote
+process.
+
+As long as cleanup is required, at least one daemon must stay alive. A daemon
+will shutdown when the following are satisfied:
+
+1. It has no local client, and
+2. Either:
+   a) It has attempted, and failed, to acquire the global cleanup flock, or
+   b) It has acquired the global cleanup flock and finished cleanup work
+
+We'd prefer that we don't keep a daemon alive unnecessarily. If there is a
+daemon that has local clients, it's better for it to acquire the global cleanup
+flock. To achieve this, daemons with local client will attempt to acquire and
+hold the global cleanup flock as long as they have a live local client. Daemons
+without a live local client will give up the global cleanup flock as soon as
+they finish a round of cleanup attempts.
 
 ## Disconnected Timeout
 
