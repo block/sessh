@@ -1445,13 +1445,13 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(result)
     daemon_log_stdout = daemon_log_output.decode("utf-8", "replace")
     for expected in (
-        "terminal transport opening host=test-host",
+        "ssh transport opening host=test-host",
         "ssh transport starting host=test-host bootstrap=true",
         "remote daemon namespace host=test-host namespace=",
         "env=SESSH_DAEMON_NAMESPACE",
         "bootstrap upload required host=test-host",
         "bootstrap completed host=test-host uploaded=true",
-        "terminal transport ready host=test-host remote_namespace=",
+        "ssh transport ready host=test-host remote_namespace=",
     ):
         if expected not in daemon_log_stdout:
             raise AssertionError(
@@ -1512,7 +1512,7 @@ def test_ssh_daemon_log_records_client_hangup_cleanup(tmp):
             )
 
 
-def test_ssh_terminal_transports_pool_tcp_connection(tmp):
+def test_ssh_transports_pool_terminal_tcp_connection(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -1584,13 +1584,13 @@ def test_ssh_terminal_transports_pool_tcp_connection(tmp):
 
     if ssh_invocation_count(fake_log) != 1:
         raise AssertionError(
-            "expected pooled terminal transports to use one ssh invocation"
+            "expected pooled ssh transports to use one ssh invocation"
             f"\nlog:\n{optional_text(fake_log)}"
             f"\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
         )
     daemon_log_text = daemon_log_output.decode("utf-8", "replace")
     for expected in (
-        "terminal pooled client startup host=test-host",
+        "pooled ssh transport client startup host=test-host",
         "kind=te",
         "request_to_open_ms=",
         "open_to_open_ok_ms=",
@@ -1908,7 +1908,7 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
         )
     daemon_log_text = daemon_log_output.decode("utf-8", "replace")
     for expected in (
-        "terminal pooled client startup host=test-host",
+        "pooled ssh transport client startup host=test-host",
         "kind=proxy",
         "request_to_open_ms=",
         "open_to_open_ok_ms=",
@@ -2324,7 +2324,7 @@ def test_ssh_failure_uses_ssh_exit_status_and_visible_args(tmp):
     try:
         daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
         result = run_sessh(["-vvv", "test-host"], env, timeout=5.0)
-        daemon_log_output += read_until_pipe(log_proc.stdout, b"terminal transport failed host=test-host", timeout=5.0)
+        daemon_log_output += read_until_pipe(log_proc.stdout, b"ssh transport failed host=test-host", timeout=5.0)
     finally:
         terminate_process(log_proc)
 
@@ -2339,7 +2339,7 @@ def test_ssh_failure_uses_ssh_exit_status_and_visible_args(tmp):
     daemon_log_stdout = daemon_log_output.decode("utf-8", "replace")
     for expected in (
         "bootstrap failed before response host=test-host error=EndOfStream",
-        "terminal transport failed host=test-host error=SshBootstrapFailed",
+        "ssh transport failed host=test-host error=SshBootstrapFailed",
     ):
         if expected not in daemon_log_stdout:
             raise AssertionError(f"daemon log missing {expected!r}: {daemon_log_stdout!r}")
@@ -4522,8 +4522,8 @@ def main(argv=None):
             test_ssh_daemon_log_records_client_hangup_cleanup,
         ),
         (
-            "ssh terminal transports pool tcp connection",
-            test_ssh_terminal_transports_pool_tcp_connection,
+            "ssh transports pool terminal tcp connection",
+            test_ssh_transports_pool_terminal_tcp_connection,
         ),
         (
             "ssh transport pool key ignores agent socket identity",

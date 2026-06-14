@@ -513,9 +513,9 @@ fn transferInitialRequestToDispatcherOwner(
     const item_payload = item.payload orelse return false;
     switch (item_payload) {
         .ssh_transport_acquire => |request| {
-            daemon_log.infof(context.allocator, "terminal transport requested", .{});
+            daemon_log.infof(context.allocator, "ssh transport requested", .{});
             daemon_dispatcher.cancel(id);
-            try transport_ssh.registerTerminalTransportFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
+            try transport_ssh.registerPooledSshTransportFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
             context.fd = -1;
             return true;
         },
@@ -583,7 +583,7 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
 
 fn daemonHasLiveWork() bool {
     return active_local_clients.load(.acquire) != 0 or
-        transport_ssh.activeTerminalTunnelCount() != 0 or
+        transport_ssh.activePooledSshTransportCount() != 0 or
         session_runtime.activeRuntimeCount() != 0 or
         stream_runtime.activeProxyRuntimeCount() != 0;
 }
@@ -843,7 +843,7 @@ fn handleClientFrameAfterHandshake(
             switch (item_payload) {
                 .ssh_transport_acquire => |request| {
                     _ = request;
-                    try sendError(fd, "PROTOCOL_ERROR", "terminal transport must be dispatcher-owned", "");
+                    try sendError(fd, "PROTOCOL_ERROR", "ssh transport must be dispatcher-owned", "");
                     return false;
                 },
                 .proxy_control_open => |request| {
