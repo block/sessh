@@ -451,7 +451,7 @@ fn decodeMessageEnvelopeAlloc(allocator: std.mem.Allocator, message_bytes: []con
 
     var frame = try decodePayload(pb.Frame, allocator, message_bytes);
     defer frame.deinit(allocator);
-    const attached_bytes_len: usize = @intCast(frame.attached_bytes_len);
+    const attached_bytes_len: usize = @intCast(frame.attached_bytes_len orelse 0);
 
     return switch (frame.payload orelse return error.UnknownFrame) {
         .@"error" => |message| .{
@@ -551,7 +551,7 @@ fn encodeMessagePayload(
             var message = try decodePayload(hpb.Error, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{
-                .attached_bytes_len = @intCast(attached_bytes_len),
+                .attached_bytes_len = optionalAttachedBytesLen(attached_bytes_len),
                 .payload = .{ .@"error" = message },
             });
         },
@@ -559,7 +559,7 @@ fn encodeMessagePayload(
             var message = try decodePayload(pb.ClientDaemonItem, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{
-                .attached_bytes_len = @intCast(attached_bytes_len),
+                .attached_bytes_len = optionalAttachedBytesLen(attached_bytes_len),
                 .payload = .{ .client_daemon = message },
             });
         },
@@ -567,7 +567,7 @@ fn encodeMessagePayload(
             var message = try decodePayload(pb.ClientRemoteItem, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{
-                .attached_bytes_len = @intCast(attached_bytes_len),
+                .attached_bytes_len = optionalAttachedBytesLen(attached_bytes_len),
                 .payload = .{ .client_remote = message },
             });
         },
@@ -575,11 +575,15 @@ fn encodeMessagePayload(
             var message = try decodePayload(pb.DaemonTunnelItem, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{
-                .attached_bytes_len = @intCast(attached_bytes_len),
+                .attached_bytes_len = optionalAttachedBytesLen(attached_bytes_len),
                 .payload = .{ .daemon_tunnel = message },
             });
         },
     };
+}
+
+fn optionalAttachedBytesLen(attached_bytes_len: usize) ?u32 {
+    return if (attached_bytes_len == 0) null else @intCast(attached_bytes_len);
 }
 
 fn readU32(bytes: []const u8) u32 {

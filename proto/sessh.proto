@@ -18,9 +18,8 @@ import "sessh_handshake.proto";
 //
 message Frame {
   // Number of uninterpreted bytes attached immediately after this protobuf
-  // frame message on the wire. This is zero for structured-only frames and is
-  // omitted by proto3 encoding in that common case.
-  uint32 attached_bytes_len = 1;
+  // frame message on the wire. Missing means there are no attached bytes.
+  optional uint32 attached_bytes_len = 1;
 
   reserved 2 to 9;
 

@@ -19,7 +19,7 @@ const sessh_handshake_v1 = @import("../handshake/v1.pb.zig");
 /// it must reject the handshake. Each side rejects peers whose maximum protocol
 /// is older than the oldest protocol it still supports.
 pub const Frame = struct {
-    attached_bytes_len: u32 = 0,
+    attached_bytes_len: ?u32 = null,
     payload: ?payload_union = null,
 
     pub const _payload_case = enum {
