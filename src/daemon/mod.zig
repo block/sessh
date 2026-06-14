@@ -456,7 +456,11 @@ fn handleDaemonClientFrame(
         },
         .waiting_request => {
             if (try dispatcherConsumesInitialRequest(context, frame)) return .consumed;
-            if (try transferInitialRequestToDispatcherOwner(context, daemon_dispatcher, id, frame)) return .transferred;
+            switch (try transferInitialRequestToDispatcherOwner(context, daemon_dispatcher, id, frame)) {
+                .not_transferred => {},
+                .transferred => return .transferred,
+                .close => return .close,
+            }
             return if (try handleClientFrameAfterHandshake(context.allocator, context.exe, context.identity, context.fd, frame.*))
                 .consumed
             else
@@ -501,25 +505,99 @@ fn dispatcherConsumesInitialRequest(context: *ClientContext, frame: *protocol.Ow
     }
 }
 
+const TransferInitialRequestResult = enum {
+    not_transferred,
+    transferred,
+    close,
+};
+
 fn transferInitialRequestToDispatcherOwner(
     context: *ClientContext,
     daemon_dispatcher: *dispatcher.Dispatcher,
     id: dispatcher.WatchId,
     frame: *protocol.OwnedFrame,
-) !bool {
-    if (frame.message_type != .client_daemon) return false;
+) !TransferInitialRequestResult {
+    if (frame.message_type == .daemon_tunnel) {
+        if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, context.fd)) return .not_transferred;
+        if (try handleDaemonTunnelControlFrame(context.allocator, context.identity, frame.*, context.fd)) return .not_transferred;
+        if (isMuxOpenFrame(context.allocator, frame.*)) {
+            var typed_open_frame = try readMuxTypedOpenFrame(context.allocator, context.fd);
+            defer typed_open_frame.deinit(context.allocator);
+            if (session_daemon_handler.isTeMuxOpenFrame(context.allocator, typed_open_frame)) {
+                var initial_frames = [_]protocol.OwnedFrame{ frame.*, typed_open_frame };
+                daemon_dispatcher.cancel(id);
+                try session_daemon_handler.registerTeMuxConnectionFromDaemon(
+                    context.allocator,
+                    daemon_dispatcher,
+                    context.exe,
+                    context.identity,
+                    initial_frames[0..],
+                    context.fd,
+                );
+                context.fd = -1;
+                return .transferred;
+            }
+            if (stream_runtime.isProxyMuxOpenFrame(context.allocator, typed_open_frame)) {
+                var initial_frames = [_]protocol.OwnedFrame{ frame.*, typed_open_frame };
+                daemon_dispatcher.cancel(id);
+                try stream_runtime.registerProxyMuxConnectionFromDaemon(
+                    context.allocator,
+                    daemon_dispatcher,
+                    context.exe,
+                    context.identity,
+                    initial_frames[0..],
+                    context.fd,
+                );
+                context.fd = -1;
+                return .transferred;
+            }
+            try sendError(context.fd, "PROTOCOL_ERROR", "expected typed mux stream open payload", "");
+            return .close;
+        }
+        if (session_daemon_handler.isTeMuxOpenFrame(context.allocator, frame.*)) {
+            var initial_frames = [_]protocol.OwnedFrame{frame.*};
+            daemon_dispatcher.cancel(id);
+            try session_daemon_handler.registerTeMuxConnectionFromDaemon(
+                context.allocator,
+                daemon_dispatcher,
+                context.exe,
+                context.identity,
+                initial_frames[0..],
+                context.fd,
+            );
+            context.fd = -1;
+            return .transferred;
+        }
+        if (stream_runtime.isProxyMuxOpenFrame(context.allocator, frame.*)) {
+            var initial_frames = [_]protocol.OwnedFrame{frame.*};
+            daemon_dispatcher.cancel(id);
+            try stream_runtime.registerProxyMuxConnectionFromDaemon(
+                context.allocator,
+                daemon_dispatcher,
+                context.exe,
+                context.identity,
+                initial_frames[0..],
+                context.fd,
+            );
+            context.fd = -1;
+            return .transferred;
+        }
+        return .not_transferred;
+    }
+
+    if (frame.message_type != .client_daemon) return .not_transferred;
     var item = try protocol.decodePayload(pb.ClientDaemonItem, context.allocator, frame.payload);
     defer item.deinit(context.allocator);
-    const item_payload = item.payload orelse return false;
+    const item_payload = item.payload orelse return .not_transferred;
     switch (item_payload) {
         .ssh_transport_acquire => |request| {
             daemon_log.infof(context.allocator, "ssh transport requested", .{});
             daemon_dispatcher.cancel(id);
             try transport_ssh.registerPooledSshTransportFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
             context.fd = -1;
-            return true;
+            return .transferred;
         },
-        else => return false,
+        else => return .not_transferred,
     }
 }
 

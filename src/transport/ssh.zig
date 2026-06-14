@@ -16,7 +16,6 @@ const daemon_executable = @import("../daemon/executable.zig");
 const daemon_log = @import("../daemon/log.zig");
 const daemon_socket_namespace = @import("../daemon/socket_namespace.zig");
 const dispatcher = @import("../core/dispatcher.zig");
-const frame_forwarder = @import("frame_forwarder.zig");
 const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
 const protocol = @import("../protocol/mod.zig");
@@ -61,11 +60,11 @@ const shellQuote = remote_shell.shellQuote;
 const shCommand = remote_shell.shCommand;
 
 const ArtifactSet = transport_bootstrap.ArtifactSet;
+const ArtifactEntry = transport_bootstrap.ArtifactEntry;
 const Platform = transport_bootstrap.Platform;
 const artifactFilenameForPlatform = transport_bootstrap.artifactFilenameForPlatform;
 const loadArtifactSet = transport_bootstrap.loadArtifactSet;
 const parseMissingPlatform = transport_bootstrap.parseMissingPlatform;
-const readBootstrapLine = transport_bootstrap.readBootstrapLine;
 const sendUpload = transport_bootstrap.sendUpload;
 
 const SshTarget = struct {
@@ -110,23 +109,21 @@ const BootstrapFailurePolicy = struct {
 
 const RuntimeConnection = struct {
     child: std.process.Child,
-    stderr_pump: ?SshStderrPump = null,
-
-    fn suppressSshStderr(self: *RuntimeConnection) void {
-        if (self.stderr_pump) |*pump| pump.suppress();
-    }
+    stderr_fd: c.fd_t = -1,
 
     fn closeStdin(self: *RuntimeConnection) void {
         closeChildStdin(&self.child);
     }
 
+    fn closeStderr(self: *RuntimeConnection) void {
+        if (self.stderr_fd >= 0) {
+            posix.close(self.stderr_fd);
+            self.stderr_fd = -1;
+        }
+    }
+
     fn wait(self: *RuntimeConnection) !std.process.Child.Term {
-        const term = self.child.wait() catch |err| {
-            self.joinStderrPump();
-            return err;
-        };
-        self.joinStderrPump();
-        return term;
+        return self.child.wait();
     }
 
     fn terminate(self: *RuntimeConnection) void {
@@ -134,14 +131,7 @@ const RuntimeConnection = struct {
         _ = self.child.kill() catch {
             _ = self.child.wait() catch {};
         };
-        self.joinStderrPump();
-    }
-
-    fn joinStderrPump(self: *RuntimeConnection) void {
-        if (self.stderr_pump) |*pump| {
-            pump.join();
-            self.stderr_pump = null;
-        }
+        self.closeStderr();
     }
 };
 
@@ -174,8 +164,6 @@ const TerminalTransport = struct {
 
 const TerminalTransportStart = struct {
     connection: RuntimeConnection,
-    diagnostic_fd: c.fd_t,
-    diagnostic_write_fd: c.fd_t,
 
     remote_daemon_namespace: ?[]u8 = null,
 
@@ -198,6 +186,26 @@ const PooledSshTransportClientKind = enum {
     unknown,
     te,
     proxy,
+};
+
+const PooledSshTransportStdinWriteKind = enum {
+    bootstrap_exec,
+    bootstrap_upload,
+};
+
+const PooledSshTransportStdinWrite = struct {
+    bytes: []u8,
+    offset: usize = 0,
+    kind: PooledSshTransportStdinWriteKind,
+
+    fn remaining(self: *const PooledSshTransportStdinWrite) []const u8 {
+        return self.bytes[self.offset..];
+    }
+
+    fn deinit(self: *PooledSshTransportStdinWrite, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
 };
 
 const RemoteCleanupIdentity = struct {
@@ -280,6 +288,11 @@ const PooledSshTransportClient = struct {
 
 const PooledSshTransportState = enum {
     starting,
+    bootstrap_writing_exec,
+    bootstrap_wait_line,
+    bootstrap_writing_upload,
+    handshake_wait_hello_ok,
+    handshake_wait_peer_hello,
     ready,
     closed,
 };
@@ -291,25 +304,33 @@ const PooledSshTransport = struct {
     resolved_user: []u8,
     resolved_host: []u8,
     resolved_port: []u8,
+    ssh_options: []const []const u8 = &.{},
     state: PooledSshTransportState = .starting,
     clients: std.ArrayList(*PooledSshTransportClient) = .empty,
     remote_reader: protocol.FrameReader = undefined,
     remote_watch_id: ?dispatcher.FdWatchId = null,
-    diagnostic_watch_id: ?dispatcher.FdWatchId = null,
+    stderr_watch_id: ?dispatcher.FdWatchId = null,
+    stdin_watch_id: ?dispatcher.FdWatchId = null,
     idle_timer_id: ?dispatcher.TimerWatchId = null,
     connection: ?RuntimeConnection = null,
-    diagnostic_fd: c.fd_t = -1,
-    diagnostic_write_fd: c.fd_t = -1,
+    stderr_fd: c.fd_t = -1,
     remote_daemon_namespace: ?[]u8 = null,
     next_stream_id: u64 = 1,
+    bootstrap_artifacts: ?ArtifactSet = null,
+    bootstrap_line: std.ArrayList(u8) = .empty,
+    stdin_write: ?PooledSshTransportStdinWrite = null,
+    uploaded_bootstrap_artifact: bool = false,
 
     fn deinit(self: *PooledSshTransport) void {
         if (self.connection) |*connection| connection.terminate();
         self.remote_reader.deinit();
         if (self.remote_daemon_namespace) |namespace| self.allocator.free(namespace);
-        if (self.diagnostic_fd >= 0) posix.close(self.diagnostic_fd);
-        if (self.diagnostic_write_fd >= 0) posix.close(self.diagnostic_write_fd);
+        if (self.stderr_fd >= 0) posix.close(self.stderr_fd);
+        if (self.stdin_write) |*write| write.deinit(self.allocator);
+        if (self.bootstrap_artifacts) |*artifacts| artifacts.deinit();
+        self.bootstrap_line.deinit(self.allocator);
         self.clients.deinit(self.allocator);
+        freeStringList(self.allocator, self.ssh_options);
         self.allocator.free(self.resolved_port);
         self.allocator.free(self.resolved_host);
         self.allocator.free(self.resolved_user);
@@ -509,80 +530,7 @@ fn resolveSshTarget(
     };
 }
 
-const SshStderrMode = enum(u8) {
-    forward,
-    diagnostics,
-    pipe,
-    discard,
-};
-
 const reconnect_ready_switch_delay_ms: u64 = 10_000;
-
-const SshStderrPump = struct {
-    allocator: std.mem.Allocator,
-    state: *State,
-    thread: std.Thread,
-
-    const State = struct {
-        fd: c.fd_t,
-        diagnostic_fd: c.fd_t,
-        mode: std.atomic.Value(u8),
-        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    };
-
-    fn start(allocator: std.mem.Allocator, file: std.fs.File, mode: SshStderrMode, diagnostic_fd: c.fd_t) !SshStderrPump {
-        errdefer file.close();
-        const state = try allocator.create(State);
-        errdefer allocator.destroy(state);
-        state.* = .{
-            .fd = file.handle,
-            .diagnostic_fd = diagnostic_fd,
-            .mode = std.atomic.Value(u8).init(@intFromEnum(mode)),
-        };
-
-        const thread = try std.Thread.spawn(.{}, stderrPumpMain, .{state});
-        return .{ .allocator = allocator, .state = state, .thread = thread };
-    }
-
-    fn suppress(self: *SshStderrPump) void {
-        const current: SshStderrMode = @enumFromInt(self.state.mode.load(.acquire));
-        if (current == .pipe) return;
-        self.state.mode.store(@intFromEnum(SshStderrMode.diagnostics), .release);
-    }
-
-    fn join(self: *SshStderrPump) void {
-        self.state.stop.store(true, .release);
-        self.thread.join();
-        self.allocator.destroy(self.state);
-    }
-};
-
-fn stderrPumpMain(state: *SshStderrPump.State) void {
-    defer posix.close(state.fd);
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        if (state.stop.load(.acquire)) return;
-        var pollfds = [_]posix.pollfd{.{
-            .fd = state.fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&pollfds, 100) catch return;
-        if (state.stop.load(.acquire)) return;
-        if (ready == 0) continue;
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) return;
-        const n = c.read(state.fd, &buf, buf.len);
-        if (n <= 0) return;
-        const bytes = buf[0..@intCast(n)];
-        const mode: SshStderrMode = @enumFromInt(state.mode.load(.acquire));
-        switch (mode) {
-            .forward => io.writeAll(2, bytes) catch {},
-            .diagnostics => client_log.appendSshStderr(bytes),
-            .pipe => if (state.diagnostic_fd >= 0) io.writeAll(state.diagnostic_fd, bytes) catch {},
-            .discard => {},
-        }
-    }
-}
 
 /// Start the ssh transport by running the bootstrapper as the remote command.
 ///
@@ -801,14 +749,6 @@ fn startTerminalTransportForDaemon(
         try directBrokerCommand(allocator, broker_args);
     defer allocator.free(remote_command);
 
-    const diagnostic_pipe = try posix.pipe();
-    errdefer posix.close(diagnostic_pipe[0]);
-    errdefer posix.close(diagnostic_pipe[1]);
-    setNonBlockingFd(diagnostic_pipe[0]) catch {};
-    setNonBlockingFd(diagnostic_pipe[1]) catch {};
-    socket_transport.setCloseOnExec(diagnostic_pipe[0]) catch {};
-    socket_transport.setCloseOnExec(diagnostic_pipe[1]) catch {};
-
     var ssh_launch_environment = try envMapFromSshTransportAcquire(allocator, request);
     defer ssh_launch_environment.deinit();
 
@@ -822,8 +762,6 @@ fn startTerminalTransportForDaemon(
         broker_args,
         null,
         false,
-        .pipe,
-        diagnostic_pipe[1],
         client_fd,
         &ssh_launch_environment,
         &bootstrap_failure_term,
@@ -845,22 +783,70 @@ fn startTerminalTransportForDaemon(
         },
         else => {
             daemon_log.infof(allocator, "ssh transport failed host={s} error={t}", .{ target.host, err });
-            try frame_forwarder.forwardRawTransportDiagnostics(client_fd, diagnostic_pipe[0]);
             if (try sendDaemonSshFailure(client_fd, allocator, target, bootstrap_failure_term)) return error.TerminalTransportStartReported;
             try sendDaemonTransportError(client_fd, "SSH_TRANSPORT_FAILED", "ssh transport failed", "");
             return err;
         },
     };
 
-    try frame_forwarder.forwardRawTransportDiagnostics(client_fd, diagnostic_pipe[0]);
     const remote_daemon_namespace = broker_socket_dir;
     broker_socket_dir = null;
     return .{
         .connection = child,
-        .diagnostic_fd = diagnostic_pipe[0],
-        .diagnostic_write_fd = diagnostic_pipe[1],
         .remote_daemon_namespace = remote_daemon_namespace,
     };
+}
+
+fn startPooledSshTransportProcessForDaemon(
+    allocator: std.mem.Allocator,
+    transport: *PooledSshTransport,
+    target: SshTarget,
+    request: pb.ClientDaemonItem.SshTransportAcquire,
+) !void {
+    var broker_socket_dir: ?[]u8 = null;
+    errdefer if (broker_socket_dir) |dir| allocator.free(dir);
+    var broker_arg_storage: [1][]const u8 = undefined;
+    var broker_args: []const []const u8 = broker_arg_storage[0..0];
+    if (request.bootstrap) {
+        transport.bootstrap_artifacts = try loadArtifactSet(allocator);
+        broker_socket_dir = try daemon_socket_namespace.defaultDirName(allocator);
+        broker_arg_storage[0] = broker_socket_dir.?;
+        broker_args = broker_arg_storage[0..1];
+        daemon_log.infof(
+            allocator,
+            "remote daemon namespace host={s} namespace={s} env={s}",
+            .{ target.host, broker_socket_dir.?, daemon_socket_namespace.namespace_env },
+        );
+    }
+
+    const remote_command = if (request.bootstrap)
+        try bootstrapCommand(allocator)
+    else
+        try directBrokerCommand(allocator, broker_args);
+    defer allocator.free(remote_command);
+
+    var ssh_launch_environment = try envMapFromSshTransportAcquire(allocator, request);
+    defer ssh_launch_environment.deinit();
+
+    transport.connection = try spawnSshRuntimeConnection(
+        allocator,
+        target,
+        remote_command,
+        &ssh_launch_environment,
+        request.bootstrap,
+    );
+    errdefer {
+        if (transport.connection) |*connection| connection.terminate();
+        transport.connection = null;
+    }
+
+    const remote_read_fd = transport.connection.?.child.stdout.?.handle;
+    try setNonBlockingFd(remote_read_fd);
+    try setNonBlockingFd(transport.connection.?.child.stdin.?.handle);
+    transport.stderr_fd = transport.connection.?.stderr_fd;
+    transport.connection.?.stderr_fd = -1;
+    transport.remote_daemon_namespace = broker_socket_dir;
+    broker_socket_dir = null;
 }
 
 fn registerPooledSshTransportClientFromDaemon(
@@ -923,6 +909,7 @@ fn acquirePooledSshTransport(
         .resolved_user = try allocator.dupe(u8, target.resolved_user),
         .resolved_host = try allocator.dupe(u8, target.resolved_host),
         .resolved_port = try allocator.dupe(u8, target.resolved_port),
+        .ssh_options = try cloneStringList(allocator, target.options),
     };
     transport.remote_reader = protocol.FrameReader.init(allocator);
     errdefer transport.deinit();
@@ -959,6 +946,101 @@ fn appendPoolKeyPart(allocator: std.mem.Allocator, key: *std.ArrayList(u8), valu
     try key.append(allocator, '|');
 }
 
+fn cloneStringList(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    const result = try allocator.alloc([]const u8, values.len);
+    errdefer allocator.free(result);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |value| allocator.free(value);
+    }
+    for (values, 0..) |value, i| {
+        result[i] = try allocator.dupe(u8, value);
+        initialized += 1;
+    }
+    return result;
+}
+
+fn freeStringList(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
+}
+
+fn pooledTransportTarget(transport: *const PooledSshTransport) SshTarget {
+    return .{
+        .options = transport.ssh_options,
+        .host = transport.display_host,
+        .resolved_user = transport.resolved_user,
+        .resolved_host = transport.resolved_host,
+        .resolved_port = transport.resolved_port,
+    };
+}
+
+fn buildBootstrapExecBytes(
+    allocator: std.mem.Allocator,
+    artifacts: *const ArtifactSet,
+    entrypoint: BootstrapEntrypoint,
+    entrypoint_args: []const []const u8,
+) ![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, "EXEC ");
+    try bytes.appendSlice(allocator, artifacts.artifact_set_id);
+    for (artifacts.entries) |entry| {
+        try bytes.append(allocator, ' ');
+        try bytes.appendSlice(allocator, &entry.hash_hex);
+    }
+    try bytes.appendSlice(allocator, " -- ");
+    try bytes.appendSlice(allocator, entrypoint.arg());
+    for (entrypoint_args) |arg| {
+        try bytes.append(allocator, ' ');
+        try appendBootstrapExecArg(allocator, &bytes, arg);
+    }
+    try bytes.append(allocator, '\n');
+    return bytes.toOwnedSlice(allocator);
+}
+
+fn appendBootstrapExecArg(allocator: std.mem.Allocator, bytes: *std.ArrayList(u8), arg: []const u8) !void {
+    if (!remote_shell.needsEncodedExecArg(arg)) {
+        try bytes.appendSlice(allocator, arg);
+        return;
+    }
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(arg.len));
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, arg);
+    try bytes.appendSlice(allocator, remote_shell.bootstrap_exec_encoded_arg_prefix);
+    try bytes.appendSlice(allocator, encoded);
+}
+
+fn buildBootstrapUploadBytes(
+    allocator: std.mem.Allocator,
+    artifact: *const ArtifactEntry,
+) ![]u8 {
+    const file = try std.fs.openFileAbsolute(artifact.path, .{});
+    defer file.close();
+    const file_bytes = try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+    defer allocator.free(file_bytes);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(file_bytes, &digest, .{});
+    const actual_hash = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual_hash, &artifact.hash_hex)) return error.ArtifactHashMismatch;
+
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(file_bytes.len));
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, file_bytes);
+
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, "UPLOAD ");
+    try bytes.appendSlice(allocator, artifact.id);
+    try bytes.append(allocator, ' ');
+    try bytes.appendSlice(allocator, &artifact.hash_hex);
+    try bytes.append(allocator, ' ');
+    try bytes.appendSlice(allocator, encoded);
+    try bytes.append(allocator, '\n');
+    return bytes.toOwnedSlice(allocator);
+}
+
 fn startNewPooledSshTransport(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -967,53 +1049,40 @@ fn startNewPooledSshTransport(
     target: SshTarget,
     request: pb.ClientDaemonItem.SshTransportAcquire,
 ) !void {
-    var started = try startTerminalTransportForDaemon(allocator, client_fd, target, request);
-    errdefer {
-        started.connection.terminate();
-        posix.close(started.diagnostic_fd);
-        posix.close(started.diagnostic_write_fd);
-        started.deinitNamespace(allocator);
-    }
-
-    try initiatePooledRemoteDaemonHandshake(
-        allocator,
-        started.connection.child.stdout.?.handle,
-        started.connection.child.stdin.?.handle,
-    );
-    const remote_read_fd = started.connection.child.stdout.?.handle;
-    try setNonBlockingFd(remote_read_fd);
-
-    transport.connection = started.connection;
-    transport.diagnostic_fd = started.diagnostic_fd;
-    transport.diagnostic_write_fd = started.diagnostic_write_fd;
-    transport.remote_daemon_namespace = started.remote_daemon_namespace;
-    started.remote_daemon_namespace = null;
-    transport.state = .ready;
+    _ = client_fd;
+    try startPooledSshTransportProcessForDaemon(allocator, transport, target, request);
     errdefer {
         if (transport.remote_watch_id) |watch_id| {
             daemon_dispatcher.cancel(.{ .fd = watch_id });
             transport.remote_watch_id = null;
         }
-        if (transport.diagnostic_watch_id) |watch_id| {
+        if (transport.stderr_watch_id) |watch_id| {
             daemon_dispatcher.cancel(.{ .fd = watch_id });
-            transport.diagnostic_watch_id = null;
+            transport.stderr_watch_id = null;
+        }
+        if (transport.stdin_watch_id) |watch_id| {
+            daemon_dispatcher.cancel(.{ .fd = watch_id });
+            transport.stdin_watch_id = null;
         }
     }
+    const remote_read_fd = transport.connection.?.child.stdout.?.handle;
     transport.remote_watch_id = try daemon_dispatcher.watchFd(remote_read_fd, .{ .readable = true }, .{
         .ctx = transport,
         .callback = readPooledSshTransportRemote,
     });
-    transport.diagnostic_watch_id = try daemon_dispatcher.watchFd(transport.diagnostic_fd, .{ .readable = true }, .{
+    transport.stderr_watch_id = try daemon_dispatcher.watchFd(transport.stderr_fd, .{ .readable = true }, .{
         .ctx = transport,
-        .callback = readPooledSshTransportDiagnostics,
+        .callback = readPooledSshTransportStderr,
     });
 
-    daemon_log.infof(
-        allocator,
-        "ssh transport ready host={s} remote_namespace={s}",
-        .{ target.host, transport.remote_daemon_namespace orelse "remote-default" },
-    );
-    activatePendingPooledSshTransportClients(daemon_dispatcher, transport);
+    if (request.bootstrap) {
+        const artifacts = if (transport.bootstrap_artifacts) |*value| value else return error.MissingBootstrapArtifacts;
+        const exec_bytes = try buildBootstrapExecBytes(allocator, artifacts, .broker, if (transport.remote_daemon_namespace) |namespace| &[_][]const u8{namespace} else &.{});
+        try queuePooledSshTransportStdinWrite(transport, daemon_dispatcher, .bootstrap_exec, exec_bytes);
+        transport.state = .bootstrap_writing_exec;
+    } else {
+        try startPooledSshTransportHandshake(transport);
+    }
 }
 
 fn failStartingPooledSshTransport(
@@ -1065,8 +1134,6 @@ pub fn sendCleanupRequestToRemote(
     var started = try startTerminalTransportForDaemon(allocator, dummy[1], target, request);
     defer {
         started.connection.terminate();
-        if (started.diagnostic_fd >= 0) posix.close(started.diagnostic_fd);
-        if (started.diagnostic_write_fd >= 0) posix.close(started.diagnostic_write_fd);
         started.deinitNamespace(allocator);
     }
 
@@ -1147,6 +1214,19 @@ fn readPooledSshTransportRemoteInner(
     }
 
     const remote_read_fd = transport.connection.?.child.stdout.?.handle;
+    switch (transport.state) {
+        .bootstrap_writing_exec, .bootstrap_writing_upload => return,
+        .bootstrap_wait_line => {
+            try readPooledSshTransportBootstrapLine(daemon_dispatcher, transport, remote_read_fd);
+            return;
+        },
+        .handshake_wait_hello_ok, .handshake_wait_peer_hello => {
+            try readPooledSshTransportHandshake(daemon_dispatcher, transport, remote_read_fd);
+            return;
+        },
+        .starting, .ready, .closed => {},
+    }
+
     while (true) {
         switch (try transport.remote_reader.readReady(remote_read_fd)) {
             .blocked => return,
@@ -1169,7 +1249,234 @@ fn readPooledSshTransportRemoteInner(
     }
 }
 
-fn readPooledSshTransportDiagnostics(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+fn readPooledSshTransportBootstrapLine(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    fd: c.fd_t,
+) !void {
+    while (transport.bootstrap_line.items.len < 4096) {
+        var byte: [1]u8 = undefined;
+        const n = c.read(fd, &byte, 1);
+        if (n < 0) switch (posix.errno(n)) {
+            .AGAIN => return,
+            .INTR => continue,
+            else => return error.ReadFailed,
+        };
+        if (n == 0) {
+            failPooledSshTransportBootstrapRead(daemon_dispatcher, transport, error.EndOfStream);
+            return;
+        }
+        if (byte[0] == '\n') {
+            const line = try transport.bootstrap_line.toOwnedSlice(transport.allocator);
+            defer transport.allocator.free(line);
+            transport.bootstrap_line = .empty;
+            try handlePooledSshTransportBootstrapLine(daemon_dispatcher, transport, line);
+            return;
+        }
+        try transport.bootstrap_line.append(transport.allocator, byte[0]);
+    }
+    failPooledSshTransportBootstrapRead(daemon_dispatcher, transport, error.BootstrapLineTooLong);
+}
+
+fn handlePooledSshTransportBootstrapLine(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    line: []const u8,
+) !void {
+    if (std.mem.eql(u8, line, "OK")) {
+        if (transport.uploaded_bootstrap_artifact) {
+            daemon_log.infof(transport.allocator, "bootstrap completed host={s} uploaded=true", .{transport.display_host});
+        } else {
+            daemon_log.infof(transport.allocator, "bootstrap skipped host={s} reason=remote_artifact_present", .{transport.display_host});
+        }
+        try startPooledSshTransportHandshake(transport);
+        return;
+    }
+
+    if (std.mem.startsWith(u8, line, "MISSING ")) {
+        const remote_platform = parseMissingPlatform(line) catch {
+            failPooledSshTransportStartup(daemon_dispatcher, transport, error.SshBootstrapInvalidResponse, null);
+            return;
+        };
+        const artifacts = if (transport.bootstrap_artifacts) |*value| value else {
+            failPooledSshTransportStartup(daemon_dispatcher, transport, error.SshBootstrapFailed, null);
+            return;
+        };
+        const artifact = artifacts.find(remote_platform) orelse {
+            if (artifactFilenameForPlatform(remote_platform) == null) {
+                for (transport.clients.items) |client| {
+                    sendDaemonTransportError(
+                        client.fd,
+                        "UNSUPPORTED_REMOTE_PLATFORM",
+                        "remote platform is unsupported and no matching sessh binary is available",
+                        "",
+                    ) catch {};
+                }
+                failPooledSshTransportStartup(daemon_dispatcher, transport, error.UnsupportedRemotePlatform, null);
+                return;
+            }
+            failPooledSshTransportStartup(daemon_dispatcher, transport, error.SshBootstrapFailed, null);
+            return;
+        };
+        daemon_log.infof(
+            transport.allocator,
+            "bootstrap upload required host={s} platform={s}/{s}",
+            .{ transport.display_host, remote_platform.os, remote_platform.arch },
+        );
+        sendPooledSshTransportConnectionEvent(transport, .{ .binary_bootstrapping = .{} });
+        const upload = try buildBootstrapUploadBytes(transport.allocator, artifact);
+        try queuePooledSshTransportStdinWrite(transport, daemon_dispatcher, .bootstrap_upload, upload);
+        transport.state = .bootstrap_writing_upload;
+        transport.uploaded_bootstrap_artifact = true;
+        return;
+    }
+
+    if (std.mem.startsWith(u8, line, "ERR UNSUPPORTED_PLATFORM ")) {
+        for (transport.clients.items) |client| {
+            sendDaemonTransportError(
+                client.fd,
+                "UNSUPPORTED_REMOTE_PLATFORM",
+                "remote platform is unsupported and no matching sessh binary is available",
+                "",
+            ) catch {};
+        }
+        failPooledSshTransportStartup(daemon_dispatcher, transport, error.UnsupportedRemotePlatform, null);
+        return;
+    }
+
+    if (std.mem.startsWith(u8, line, "ERR ")) {
+        daemon_log.infof(transport.allocator, "remote bootstrap failed host={s} line={s}", .{ transport.display_host, line });
+        failPooledSshTransportStartup(daemon_dispatcher, transport, error.SshBootstrapFailed, null);
+        return;
+    }
+
+    daemon_log.infof(transport.allocator, "unexpected bootstrap response host={s} line={s}", .{ transport.display_host, line });
+    failPooledSshTransportStartup(daemon_dispatcher, transport, error.SshBootstrapInvalidResponse, null);
+}
+
+fn startPooledSshTransportHandshake(transport: *PooledSshTransport) !void {
+    sendPooledSshTransportConnectionEvent(transport, .{ .daemon_connecting = .{} });
+    try sendPooledHelloRequest(transport.connection.?.child.stdin.?.handle);
+    transport.state = .handshake_wait_hello_ok;
+}
+
+fn readPooledSshTransportHandshake(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    fd: c.fd_t,
+) !void {
+    while (true) {
+        switch (try transport.remote_reader.readReady(fd)) {
+            .blocked, .progress => return,
+            .eof, .truncated_frame => {
+                failPooledSshTransportStartup(daemon_dispatcher, transport, error.EndOfStream, null);
+                return;
+            },
+            .frame => |frame_value| {
+                var frame = frame_value;
+                defer frame.deinit(transport.allocator);
+                try handlePooledSshTransportHandshakeFrame(daemon_dispatcher, transport, &frame);
+                if (transport.state == .ready or transport.state == .closed) return;
+            },
+        }
+    }
+}
+
+fn handlePooledSshTransportHandshakeFrame(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    frame: *const protocol.OwnedFrame,
+) !void {
+    switch (transport.state) {
+        .handshake_wait_hello_ok => switch (frame.message_type) {
+            .hello_ok => {
+                var ok = try protocol.decodePayload(protocol.hpb.HelloOk, transport.allocator, frame.payload);
+                defer ok.deinit(transport.allocator);
+                transport.state = .handshake_wait_peer_hello;
+            },
+            .hello_error => {
+                failPooledSshTransportStartup(daemon_dispatcher, transport, error.VersionMismatch, null);
+            },
+            .daemon_tunnel => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, transport.connection.?.child.stdin.?.handle);
+            },
+            else => return error.UnexpectedDaemonFrame,
+        },
+        .handshake_wait_peer_hello => switch (frame.message_type) {
+            .hello_request => {
+                var peer_hello = try protocol.decodePayload(protocol.hpb.HelloRequest, transport.allocator, frame.payload);
+                defer peer_hello.deinit(transport.allocator);
+                if (!protocol.helloRequestIsCompatible(peer_hello, config.min_protocol_major, config.min_protocol_minor)) {
+                    try sendPooledHelloError(transport.connection.?.child.stdin.?.handle, "VERSION_MISMATCH", "sesshd is incompatible with this client", "");
+                    failPooledSshTransportStartup(daemon_dispatcher, transport, error.VersionMismatch, null);
+                    return;
+                }
+                try sendPooledHelloOk(transport.connection.?.child.stdin.?.handle);
+                completePooledSshTransportStartup(daemon_dispatcher, transport);
+            },
+            .daemon_tunnel => {
+                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, transport.connection.?.child.stdin.?.handle);
+            },
+            else => return error.UnexpectedDaemonFrame,
+        },
+        else => return error.UnexpectedDaemonFrame,
+    }
+}
+
+fn completePooledSshTransportStartup(daemon_dispatcher: *dispatcher.Dispatcher, transport: *PooledSshTransport) void {
+    transport.state = .ready;
+    daemon_log.infof(
+        transport.allocator,
+        "ssh transport ready host={s} remote_namespace={s}",
+        .{ transport.display_host, transport.remote_daemon_namespace orelse "remote-default" },
+    );
+    sendPooledSshTransportConnectionEvent(transport, .{ .daemon_connected = .{} });
+    activatePendingPooledSshTransportClients(daemon_dispatcher, transport);
+}
+
+fn failPooledSshTransportStartup(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    err: anyerror,
+    term: ?std.process.Child.Term,
+) void {
+    daemon_log.infof(transport.allocator, "ssh transport failed host={s} error={t}", .{ transport.display_host, err });
+    const target = pooledTransportTarget(transport);
+    for (transport.clients.items) |client| {
+        const reported = sendDaemonSshFailure(client.fd, transport.allocator, target, term) catch false;
+        if (!reported and err != error.UnsupportedRemotePlatform) {
+            sendDaemonTransportError(client.fd, "SSH_TRANSPORT_FAILED", "ssh transport failed", "") catch {};
+        }
+    }
+    finishPooledSshTransport(daemon_dispatcher, transport);
+}
+
+fn failPooledSshTransportBootstrapRead(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    err: anyerror,
+) void {
+    const stage: []const u8 = if (transport.uploaded_bootstrap_artifact) "after upload" else "before response";
+    daemon_log.infof(
+        transport.allocator,
+        "bootstrap failed {s} host={s} error={t}",
+        .{ stage, transport.display_host, err },
+    );
+    if (transport.connection) |*connection| connection.closeStdin();
+    _ = forwardPooledSshTransportStderr(transport) catch {};
+    const term = if (transport.connection) |*connection| connection.wait() catch null else null;
+    _ = forwardPooledSshTransportStderr(transport) catch {};
+    failPooledSshTransportStartup(daemon_dispatcher, transport, error.SshBootstrapFailed, term);
+}
+
+fn sendPooledSshTransportConnectionEvent(transport: *PooledSshTransport, event: pb.ConnectionEvent.event_union) void {
+    for (transport.clients.items) |client| {
+        if (client.state == .done) continue;
+        protocol.sendClientDaemonConnectionEventFrame(transport.allocator, client.fd, event) catch {};
+    }
+}
+
+fn readPooledSshTransportStderr(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
     _ = id;
     const transport: *PooledSshTransport = @ptrCast(@alignCast(ctx));
     const fd_event = switch (event) {
@@ -1177,22 +1484,93 @@ fn readPooledSshTransportDiagnostics(ctx: *anyopaque, daemon_dispatcher: *dispat
         .timer => return error.UnexpectedPooledSshTransportTimer,
     };
     if (!fd_event.readable and !fd_event.hangup and !fd_event.error_event and !fd_event.invalid) return;
-    forwardPooledSshTransportDiagnostics(transport) catch |err| {
+    forwardPooledSshTransportStderr(transport) catch |err| {
         daemon_log.infof(
             transport.allocator,
-            "pooled ssh transport diagnostics failed host={s} pool={s} error={t}",
+            "pooled ssh transport stderr failed host={s} pool={s} error={t}",
             .{ transport.display_host, transport.key, err },
         );
-        if (transport.diagnostic_watch_id) |watch_id| {
+        if (transport.stderr_watch_id) |watch_id| {
             daemon_dispatcher.cancel(.{ .fd = watch_id });
-            transport.diagnostic_watch_id = null;
+            transport.stderr_watch_id = null;
         }
     };
     if (fd_event.hangup or fd_event.error_event or fd_event.invalid) {
-        if (transport.diagnostic_watch_id) |watch_id| {
+        if (transport.stderr_watch_id) |watch_id| {
             daemon_dispatcher.cancel(.{ .fd = watch_id });
-            transport.diagnostic_watch_id = null;
+            transport.stderr_watch_id = null;
         }
+    }
+}
+
+fn writePooledSshTransportStdin(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+    _ = id;
+    const transport: *PooledSshTransport = @ptrCast(@alignCast(ctx));
+    writePooledSshTransportStdinInner(transport, daemon_dispatcher, event) catch |err| {
+        daemon_log.infof(
+            transport.allocator,
+            "pooled ssh transport stdin failed host={s} pool={s} error={t}",
+            .{ transport.display_host, transport.key, err },
+        );
+        failPooledSshTransportStartup(daemon_dispatcher, transport, err, null);
+    };
+}
+
+fn writePooledSshTransportStdinInner(
+    transport: *PooledSshTransport,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    event: dispatcher.Event,
+) !void {
+    const fd_event = switch (event) {
+        .fd => |fd| fd,
+        .timer => return error.UnexpectedPooledSshTransportTimer,
+    };
+    if (fd_event.error_event or fd_event.invalid or fd_event.hangup) return error.SshTransportWriteClosed;
+    if (!fd_event.writable) return;
+    var write = if (transport.stdin_write) |*value| value else return;
+    const fd = transport.connection.?.child.stdin.?.handle;
+    while (write.remaining().len != 0) {
+        const chunk = write.remaining();
+        const n = c.write(fd, chunk.ptr, chunk.len);
+        if (n < 0) switch (posix.errno(n)) {
+            .AGAIN => return,
+            .INTR => continue,
+            else => return error.WriteFailed,
+        };
+        if (n == 0) return error.WriteFailed;
+        write.offset += @intCast(n);
+    }
+
+    const kind = write.kind;
+    write.deinit(transport.allocator);
+    transport.stdin_write = null;
+    if (transport.stdin_watch_id) |watch_id| {
+        daemon_dispatcher.cancel(.{ .fd = watch_id });
+        transport.stdin_watch_id = null;
+    }
+
+    switch (kind) {
+        .bootstrap_exec, .bootstrap_upload => transport.state = .bootstrap_wait_line,
+    }
+}
+
+fn queuePooledSshTransportStdinWrite(
+    transport: *PooledSshTransport,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    kind: PooledSshTransportStdinWriteKind,
+    bytes: []u8,
+) !void {
+    if (transport.stdin_write != null) return error.PooledSshTransportWriteAlreadyQueued;
+    errdefer transport.allocator.free(bytes);
+    transport.stdin_write = .{
+        .bytes = bytes,
+        .kind = kind,
+    };
+    if (transport.stdin_watch_id == null) {
+        transport.stdin_watch_id = try daemon_dispatcher.watchFd(transport.connection.?.child.stdin.?.handle, .{ .writable = true }, .{
+            .ctx = transport,
+            .callback = writePooledSshTransportStdin,
+        });
     }
 }
 
@@ -1686,10 +2064,10 @@ fn notifyPooledSshTransportRemoteClosed(daemon_dispatcher: *dispatcher.Dispatche
     }
 }
 
-fn forwardPooledSshTransportDiagnostics(transport: *PooledSshTransport) !void {
+fn forwardPooledSshTransportStderr(transport: *PooledSshTransport) !void {
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = c.read(transport.diagnostic_fd, &buf, buf.len);
+        const n = c.read(transport.stderr_fd, &buf, buf.len);
         if (n < 0) {
             const errno = std.posix.errno(n);
             if (errno == .AGAIN) return;
@@ -1725,9 +2103,13 @@ fn finishPooledSshTransport(daemon_dispatcher: *dispatcher.Dispatcher, transport
         daemon_dispatcher.cancel(.{ .fd = watch_id });
         transport.remote_watch_id = null;
     }
-    if (transport.diagnostic_watch_id) |watch_id| {
+    if (transport.stderr_watch_id) |watch_id| {
         daemon_dispatcher.cancel(.{ .fd = watch_id });
-        transport.diagnostic_watch_id = null;
+        transport.stderr_watch_id = null;
+    }
+    if (transport.stdin_watch_id) |watch_id| {
+        daemon_dispatcher.cancel(.{ .fd = watch_id });
+        transport.stdin_watch_id = null;
     }
     if (transport.idle_timer_id) |timer_id| {
         daemon_dispatcher.cancel(.{ .timer = timer_id });
@@ -2423,6 +2805,85 @@ fn appendDefaultSshOptions(ssh_argv: [][]const u8, arg_index: *usize, default_ip
     }
 }
 
+fn readBootstrapLineWithSshStderr(
+    allocator: std.mem.Allocator,
+    stdout_fd: c.fd_t,
+    stderr_fd: c.fd_t,
+    client_fd: c.fd_t,
+    reconnect_ui: ?*client_ui.ReconnectUi,
+    poll_reconnect_input: bool,
+) ![]u8 {
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(allocator);
+    var stderr_open = stderr_fd >= 0;
+
+    while (line.items.len < 4096) {
+        var pollfds = [_]posix.pollfd{
+            .{
+                .fd = stdout_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = if (stderr_open) stderr_fd else -1,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+        const ready = try posix.poll(&pollfds, if (reconnect_ui == null) -1 else 50);
+        if (reconnect_ui) |ui| {
+            if (try reconnectShouldCancelForBootstrap(ui, poll_reconnect_input)) return error.ReconnectCancelled;
+        }
+        if (ready == 0) continue;
+
+        if (stderr_open and pollfds[1].revents != 0) {
+            stderr_open = try forwardSshStderrFromFd(stderr_fd, client_fd);
+        }
+
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfds[0].revents & posix.POLL.IN) == 0)
+        {
+            if (line.items.len == 0) return error.EndOfStream;
+            return try line.toOwnedSlice(allocator);
+        }
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
+
+        var byte: [1]u8 = undefined;
+        const n = c.read(stdout_fd, &byte, 1);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) {
+            if (line.items.len == 0) return error.EndOfStream;
+            return try line.toOwnedSlice(allocator);
+        }
+        if (byte[0] == '\n') return try line.toOwnedSlice(allocator);
+        try line.append(allocator, byte[0]);
+    }
+
+    return error.BootstrapLineTooLong;
+}
+
+fn reconnectShouldCancelForBootstrap(reconnect_ui: *client_ui.ReconnectUi, poll_reconnect_input: bool) !bool {
+    if (!poll_reconnect_input) return reconnect_ui.isCancelled();
+    return reconnect_ui.pollClientHangup(0);
+}
+
+fn forwardSshStderrFromFd(fd: c.fd_t, client_fd: c.fd_t) !bool {
+    if (fd < 0) return false;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = c.read(fd, &buf, buf.len);
+        if (n < 0) switch (posix.errno(n)) {
+            .AGAIN => return true,
+            .INTR => continue,
+            else => return error.ReadFailed,
+        };
+        if (n == 0) return false;
+        if (client_fd >= 0) {
+            sendSshTransportDiagnostic(client_fd, buf[0..@intCast(n)]) catch {};
+        }
+    }
+}
+
 fn startRuntimeConnection(
     allocator: std.mem.Allocator,
     target: SshTarget,
@@ -2432,52 +2893,21 @@ fn startRuntimeConnection(
     exec_args: []const []const u8,
     reconnect_ui: ?*client_ui.ReconnectUi,
     poll_reconnect_input: bool,
-    stderr_mode_override: ?SshStderrMode,
-    stderr_diagnostic_fd: c.fd_t,
     bootstrap_status_client_fd: c.fd_t,
     env_map: ?*const std.process.EnvMap,
     bootstrap_failure_term: ?*?std.process.Child.Term,
     failure_policy: BootstrapFailurePolicy,
 ) !RuntimeConnection {
     if (bootstrap_failure_term) |term| term.* = null;
-    const batch_mode_options: usize = 1;
-    const default_options = defaultSshOptionsLen(target);
-    const transport_options = transportSshOptionsLen(target.options);
-    const ssh_argv = try allocator.alloc([]const u8, transport_options + batch_mode_options + default_options + 4);
-    defer allocator.free(ssh_argv);
-    ssh_argv[0] = "ssh";
-    var arg_index: usize = 1;
-    // Daemon-owned ssh transports must fail cleanly instead of prompting on
-    // stdio. Put this before user/config options because OpenSSH uses the first
-    // value it sees for many config keys.
-    ssh_argv[arg_index] = "-oBatchMode=yes";
-    arg_index += 1;
-    appendDefaultSshOptions(ssh_argv, &arg_index, target.default_ipqos_option);
-    appendTransportSshOptions(ssh_argv, &arg_index, target.options);
-    ssh_argv[arg_index] = "-T";
-    ssh_argv[arg_index + 1] = target.host;
-    ssh_argv[ssh_argv.len - 1] = remote_command;
-    daemon_log.infof(allocator, "ssh transport starting host={s} bootstrap={}", .{ target.host, artifacts != null });
+    var connection = try spawnSshRuntimeConnection(allocator, target, remote_command, env_map, artifacts != null);
+    errdefer connection.terminate();
 
-    var child = std.process.Child.init(ssh_argv, allocator);
-    child.expand_arg0 = .expand;
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.env_map = env_map;
-    try child.spawn();
-    daemon_log.infof(allocator, "ssh transport started host={s}", .{target.host});
-    var connection = RuntimeConnection{ .child = child };
-    const stderr_file = connection.child.stderr.?;
-    connection.child.stderr = null;
-    const stderr_mode = stderr_mode_override orelse if (reconnect_ui == null) SshStderrMode.forward else SshStderrMode.diagnostics;
-    connection.stderr_pump = SshStderrPump.start(allocator, stderr_file, stderr_mode, stderr_diagnostic_fd) catch |err| {
-        connection.terminate();
-        return err;
-    };
+    var connection_returned = false;
+    defer if (!connection_returned) connection.closeStderr();
 
     const artifact_set = artifacts orelse {
         daemon_log.infof(allocator, "bootstrap skipped host={s} reason=disabled", .{target.host});
+        connection_returned = true;
         return connection;
     };
 
@@ -2506,7 +2936,7 @@ fn startRuntimeConnection(
         };
     }
 
-    var line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
+    var line = readBootstrapLineWithSshStderr(allocator, connection.child.stdout.?.handle, connection.stderr_fd, bootstrap_status_client_fd, reconnect_ui, poll_reconnect_input) catch |err| {
         connection.closeStdin();
         if (err == error.ReconnectCancelled) {
             connection.terminate();
@@ -2514,6 +2944,7 @@ fn startRuntimeConnection(
         }
         const term = connection.wait() catch null;
         if (bootstrap_failure_term) |term_out| term_out.* = term;
+        _ = forwardSshStderrFromFd(connection.stderr_fd, bootstrap_status_client_fd) catch {};
         if (failure_policy.return_bootstrap_error) {
             daemon_log.infof(allocator, "bootstrap failed before response host={s} error={t}", .{ target.host, err });
             return error.SshBootstrapFailed;
@@ -2582,7 +3013,7 @@ fn startRuntimeConnection(
         uploaded_bootstrap_artifact = true;
 
         allocator.free(line);
-        line = readBootstrapLine(allocator, connection.child.stdout.?.handle, reconnect_ui, poll_reconnect_input) catch |err| {
+        line = readBootstrapLineWithSshStderr(allocator, connection.child.stdout.?.handle, connection.stderr_fd, bootstrap_status_client_fd, reconnect_ui, poll_reconnect_input) catch |err| {
             connection.closeStdin();
             if (err == error.ReconnectCancelled) {
                 connection.terminate();
@@ -2590,6 +3021,7 @@ fn startRuntimeConnection(
             }
             const term = connection.wait() catch null;
             if (bootstrap_failure_term) |term_out| term_out.* = term;
+            _ = forwardSshStderrFromFd(connection.stderr_fd, bootstrap_status_client_fd) catch {};
             if (failure_policy.return_bootstrap_error) {
                 daemon_log.infof(allocator, "bootstrap failed after upload host={s} error={t}", .{ target.host, err });
                 return error.SshBootstrapFailed;
@@ -2604,7 +3036,7 @@ fn startRuntimeConnection(
         } else {
             daemon_log.infof(allocator, "bootstrap skipped host={s} reason=remote_artifact_present", .{target.host});
         }
-        if (exec_args.len == 0) connection.suppressSshStderr();
+        connection_returned = true;
         return connection;
     }
 
@@ -2636,6 +3068,49 @@ fn startRuntimeConnection(
     }
     try io.stderrPrint("sessh: unexpected bootstrap response: {s}\n", .{line});
     return process_exit.request(1);
+}
+
+fn spawnSshRuntimeConnection(
+    allocator: std.mem.Allocator,
+    target: SshTarget,
+    remote_command: []const u8,
+    env_map: ?*const std.process.EnvMap,
+    bootstrap: bool,
+) !RuntimeConnection {
+    const batch_mode_options: usize = 1;
+    const default_options = defaultSshOptionsLen(target);
+    const transport_options = transportSshOptionsLen(target.options);
+    const ssh_argv = try allocator.alloc([]const u8, transport_options + batch_mode_options + default_options + 4);
+    defer allocator.free(ssh_argv);
+    ssh_argv[0] = "ssh";
+    var arg_index: usize = 1;
+    // Daemon-owned ssh transports must fail cleanly instead of prompting on
+    // stdio. Put this before user/config options because OpenSSH uses the first
+    // value it sees for many config keys.
+    ssh_argv[arg_index] = "-oBatchMode=yes";
+    arg_index += 1;
+    appendDefaultSshOptions(ssh_argv, &arg_index, target.default_ipqos_option);
+    appendTransportSshOptions(ssh_argv, &arg_index, target.options);
+    ssh_argv[arg_index] = "-T";
+    ssh_argv[arg_index + 1] = target.host;
+    ssh_argv[ssh_argv.len - 1] = remote_command;
+    daemon_log.infof(allocator, "ssh transport starting host={s} bootstrap={}", .{ target.host, bootstrap });
+
+    var child = std.process.Child.init(ssh_argv, allocator);
+    child.expand_arg0 = .expand;
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.env_map = env_map;
+    try child.spawn();
+    daemon_log.infof(allocator, "ssh transport started host={s}", .{target.host});
+    var connection = RuntimeConnection{ .child = child };
+    errdefer connection.terminate();
+    const stderr_file = connection.child.stderr.?;
+    connection.child.stderr = null;
+    connection.stderr_fd = stderr_file.handle;
+    try setNonBlockingFd(connection.stderr_fd);
+    return connection;
 }
 
 fn isUnsupportedPlatformBootstrapError(line: []const u8) bool {

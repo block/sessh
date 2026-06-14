@@ -1600,6 +1600,7 @@ fn transportExitCode(code: []const u8) ?u8 {
 
 fn printParsedError(parsed: ErrorPayload) !void {
     defer freeErrorPayload(parsed);
+    client_log.flush(2);
     try printBorrowedError(parsed);
 }
 

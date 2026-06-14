@@ -22,6 +22,7 @@ from pathlib import Path
 
 from harness_cleanup import cleanup_runtime
 from socket_harness import (
+    CLIENT_DAEMON,
     DRAW,
     SESSION_CLIENT_CONTROL_RESPONSE,
     SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
@@ -725,6 +726,36 @@ def run_sessh_until_stdout(args, env, needle, timeout=10.0):
     )
 
 
+def send_ssh_transport_acquire(conn, host="test-host", bootstrap=True):
+    request = sessh_pb().ClientDaemonItem.SshTransportAcquire(host=host, bootstrap=bootstrap)
+    frame = sessh_pb().Frame()
+    frame.client_daemon.ssh_transport_acquire.CopyFrom(request)
+    body = frame.SerializeToString()
+    conn.sendall(struct.pack(">I", len(body)) + body)
+
+
+def recv_client_daemon_ssh_stderr(conn, timeout=30.0):
+    old_timeout = conn.gettimeout()
+    conn.settimeout(timeout)
+    end = time.monotonic() + timeout
+    try:
+        while time.monotonic() < end:
+            conn.settimeout(max(0.1, end - time.monotonic()))
+            message_type, payload = recv_frame(conn)
+            if message_type != CLIENT_DAEMON:
+                continue
+            item = sessh_pb().ClientDaemonItem()
+            item.ParseFromString(payload)
+            if item.WhichOneof("payload") != "connection_event":
+                continue
+            event = item.connection_event
+            if event.WhichOneof("event") == "ssh_stderr":
+                return event.ssh_stderr.data
+        raise AssertionError("timed out waiting for ssh stderr connection event")
+    finally:
+        conn.settimeout(old_timeout)
+
+
 def read_pty_until(fd, output, needle, timeout=10.0):
     deadline = time.monotonic() + timeout
     while needle not in output:
@@ -1026,6 +1057,7 @@ UI_MESSAGE_RE = re.compile(r"(?:---\s*)?(?:ssh|sessh): [^\r\n]+")
 def normalized_ui_messages(text):
     stripped = OSC_RE.sub("", text)
     stripped = CSI_RE.sub("", stripped)
+    stripped = re.sub(r"ssh ts_ms=\d+: ", "ssh: ", stripped)
     messages = []
     for match in UI_MESSAGE_RE.finditer(stripped):
         message = re.sub(r"\s+", " ", match.group(0).strip())
@@ -2101,16 +2133,30 @@ def test_ssh_pre_attach_stderr_forwards_immediately(tmp):
     env["SESSH_FAKE_SSH_STDERR_BEFORE_COMMAND"] = raw_ssh_error
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["test-host"], env, timeout=30.0)
+    log_proc = subprocess.Popen(
+        sessh_argv(["--daemon-log"]),
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    conn = None
+    try:
+        read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(30.0)
+        conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
+        send_hello(conn)
+        send_ssh_transport_acquire(conn)
+        stderr_chunk = recv_client_daemon_ssh_stderr(conn)
+    finally:
+        if conn is not None:
+            conn.close()
+        terminate_process(log_proc)
 
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if marker not in result.stdout:
-        raise AssertionError(result)
-    if raw_ssh_error not in result.stderr:
-        raise AssertionError(result)
-    if "ssh ts_ms=" in result.stderr:
-        raise AssertionError(result)
+    if raw_ssh_error.encode("utf-8") not in stderr_chunk:
+        raise AssertionError(stderr_chunk)
 
 
 def test_ssh_transport_pins_ipqos_to_interactive_config_value(tmp):
@@ -2323,19 +2369,19 @@ def test_ssh_failure_uses_ssh_exit_status_and_visible_args(tmp):
     )
     try:
         daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
-        result = run_sessh(["-vvv", "test-host"], env, timeout=5.0)
+        result = run_sessh_in_pty(["-vvv", "test-host"], env, [], timeout=5.0)
         daemon_log_output += read_until_pipe(log_proc.stdout, b"ssh transport failed host=test-host", timeout=5.0)
     finally:
         terminate_process(log_proc)
 
     if result.returncode != 255:
         raise AssertionError(result)
-    if "fake ssh failed before remote command" not in result.stderr:
+    if "fake ssh failed before remote command" not in result.stdout:
         raise AssertionError(result)
-    if "sessh: `ssh -vvv test-host` failed (exitcode=255)" not in result.stderr:
+    if "ERROR `ssh -vvv test-host` failed (exitcode=255)" not in result.stdout:
         raise AssertionError(result)
-    if "EndOfStream" in result.stderr or "ssh bootstrap failed before response" in result.stderr:
-        raise AssertionError(result.stderr)
+    if "EndOfStream" in result.stdout or "ssh bootstrap failed before response" in result.stdout:
+        raise AssertionError(result.stdout)
     daemon_log_stdout = daemon_log_output.decode("utf-8", "replace")
     for expected in (
         "bootstrap failed before response host=test-host error=EndOfStream",
@@ -4143,10 +4189,10 @@ def test_ssh_reconnect_displays_live_ssh_stderr_in_banner(tmp):
         raise AssertionError(result)
     expected_messages = [
         "--- sessh: disconnected: Retry connecting 10sec. CTRL-R now ---",
-        "--- sessh: disconnected: Reconnecting... ---",
         "ssh: Connection to test-host closed by remote host.",
         "ssh: client_loop: send disconnect: Broken pipe",
         "ssh: control sequence: ?[31mred",
+        "--- sessh: disconnected: Reconnecting... ---",
     ]
     actual_messages = " ".join(normalized_ui_messages(result.stdout))
     search_from = 0
@@ -4321,44 +4367,24 @@ def test_ssh_session_buffers_and_displays_stderr_after_attach(tmp):
     env["SESSH_FAKE_SSH_STDERR_DONE_FILE"] = str(done_file)
     env["SHELL"] = str(remote_shell)
 
-    argv = sessh_argv(["test-host"])
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    try:
-        stdout = read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
+    def trigger_stderr_and_close(fd):
         signal_file.write_text("")
         wait_for_path(done_file, 10.0)
-        proc.stdin.write(b"~.")
-        proc.stdin.flush()
-        proc.stdin.close()
-        returncode = proc.wait(timeout=30.0)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            returncode = proc.wait(timeout=30.0)
-    stdout += proc.stdout.read()
-    stderr = proc.stderr.read()
-    result = subprocess.CompletedProcess(
-        argv,
-        returncode,
-        stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
+        os.write(fd, b"~.")
+
+    result = run_sessh_in_pty(
+        ["test-host"],
+        env,
+        [(marker.encode("utf-8"), trigger_stderr_and_close)],
+        timeout=30.0,
     )
 
     if result.returncode != 0:
         raise AssertionError(result)
-    if raw_ssh_error in result.stdout:
-        raise AssertionError(result)
     expected = f"ssh ts_ms="
-    if expected not in result.stderr or f": {raw_ssh_error}" not in result.stderr:
+    if expected not in result.stdout or f": {raw_ssh_error}" not in result.stdout:
         raise AssertionError(result)
-    if "ssh stderr:" in result.stderr or "sessh: log" in result.stderr or "level=warn" in result.stderr:
+    if "ssh stderr:" in result.stdout or "sessh: log" in result.stdout or "level=warn" in result.stdout:
         raise AssertionError(result)
     if (Path(env["XDG_CACHE_HOME"]) / "sessh" / "clients").exists():
         raise AssertionError("client logs were written to persistent cache")
