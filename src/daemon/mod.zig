@@ -354,14 +354,6 @@ const ClientContext = struct {
     }
 };
 
-const LegacyClientContext = struct {
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    identity: daemon_identity.DaemonIdentity,
-    fd: c.fd_t,
-    initial_frame: protocol.OwnedFrame,
-};
-
 fn readDaemonClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
     const context: *ClientContext = @ptrCast(@alignCast(ctx));
     readDaemonClientInner(context, daemon_dispatcher, id, event) catch |err| {
@@ -401,7 +393,7 @@ fn readDaemonClientInner(context: *ClientContext, daemon_dispatcher: *dispatcher
             },
             .frame => |frame_value| {
                 var frame = frame_value;
-                const action = try handleDaemonClientFrame(context, &frame);
+                const action = try handleDaemonClientFrame(context, daemon_dispatcher, id, &frame);
                 switch (action) {
                     .consumed => frame.deinit(context.allocator),
                     .close => {
@@ -409,8 +401,9 @@ fn readDaemonClientInner(context: *ClientContext, daemon_dispatcher: *dispatcher
                         closeDaemonClient(context, daemon_dispatcher, id);
                         return;
                     },
-                    .handoff_to_legacy => {
-                        try handoffDaemonClientToLegacyThread(context, daemon_dispatcher, id, frame);
+                    .transferred => {
+                        frame.deinit(context.allocator);
+                        context.deinit();
                         return;
                     },
                 }
@@ -422,10 +415,15 @@ fn readDaemonClientInner(context: *ClientContext, daemon_dispatcher: *dispatcher
 const DaemonClientFrameAction = enum {
     consumed,
     close,
-    handoff_to_legacy,
+    transferred,
 };
 
-fn handleDaemonClientFrame(context: *ClientContext, frame: *protocol.OwnedFrame) !DaemonClientFrameAction {
+fn handleDaemonClientFrame(
+    context: *ClientContext,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    id: dispatcher.WatchId,
+    frame: *protocol.OwnedFrame,
+) !DaemonClientFrameAction {
     switch (context.stage) {
         .waiting_peer_hello => {
             if (frame.message_type != .hello_request) {
@@ -458,7 +456,11 @@ fn handleDaemonClientFrame(context: *ClientContext, frame: *protocol.OwnedFrame)
         },
         .waiting_request => {
             if (try dispatcherConsumesInitialRequest(context, frame)) return .consumed;
-            return .handoff_to_legacy;
+            if (try transferInitialRequestToDispatcherOwner(context, daemon_dispatcher, id, frame)) return .transferred;
+            return if (try handleClientFrameAfterHandshake(context.allocator, context.exe, context.identity, context.fd, frame.*))
+                .consumed
+            else
+                .close;
         },
         .daemon_log => return .close,
     }
@@ -499,50 +501,32 @@ fn dispatcherConsumesInitialRequest(context: *ClientContext, frame: *protocol.Ow
     }
 }
 
-fn handoffDaemonClientToLegacyThread(
+fn transferInitialRequestToDispatcherOwner(
     context: *ClientContext,
     daemon_dispatcher: *dispatcher.Dispatcher,
     id: dispatcher.WatchId,
-    frame: protocol.OwnedFrame,
-) !void {
-    daemon_dispatcher.cancel(id);
-    const legacy = try context.allocator.create(LegacyClientContext);
-    errdefer context.allocator.destroy(legacy);
-    legacy.* = .{
-        .allocator = context.allocator,
-        .exe = context.exe,
-        .identity = context.identity,
-        .fd = context.fd,
-        .initial_frame = frame,
-    };
-    const thread = std.Thread.spawn(.{}, legacyClientThread, .{legacy}) catch |err| {
-        legacy.initial_frame.deinit(context.allocator);
-        context.allocator.destroy(legacy);
-        return err;
-    };
-    context.fd = -1;
-    context.owns_active_count = false;
-    thread.detach();
-    context.deinit();
+    frame: *protocol.OwnedFrame,
+) !bool {
+    if (frame.message_type != .client_daemon) return false;
+    var item = try protocol.decodePayload(pb.ClientDaemonItem, context.allocator, frame.payload);
+    defer item.deinit(context.allocator);
+    const item_payload = item.payload orelse return false;
+    switch (item_payload) {
+        .ssh_transport_acquire => |request| {
+            daemon_log.infof(context.allocator, "terminal transport requested", .{});
+            daemon_dispatcher.cancel(id);
+            try transport_ssh.registerTerminalTransportFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
+            context.fd = -1;
+            return true;
+        },
+        else => return false,
+    }
 }
 
 fn closeDaemonClient(context: *ClientContext, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId) void {
     daemon_dispatcher.cancel(id);
     if (context.stage == .daemon_log and context.fd >= 0) daemon_log.unsubscribe(context.fd);
     context.deinit();
-}
-
-fn legacyClientThread(context: *LegacyClientContext) void {
-    const allocator = context.allocator;
-    const exe = context.exe;
-    const identity = context.identity;
-    const fd = context.fd;
-    var initial_frame = context.initial_frame;
-    defer allocator.destroy(context);
-    defer initial_frame.deinit(allocator);
-    defer _ = c.close(fd);
-    defer _ = active_local_clients.fetchSub(1, .acq_rel);
-    handleClientAfterHandshakeWithInitialFrame(allocator, exe, identity, fd, &initial_frame) catch {};
 }
 
 const DaemonIdleContext = struct {
@@ -794,36 +778,6 @@ fn daemonSocketLockPath(allocator: std.mem.Allocator, socket_path: []const u8) !
     return std.fmt.allocPrint(allocator, "{s}/sesshd.lock", .{socket_path[0..slash]});
 }
 
-fn handleClientAfterHandshake(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    identity: daemon_identity.DaemonIdentity,
-    fd: c.fd_t,
-) !void {
-    while (true) {
-        var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
-            error.EndOfStream => {
-                daemon_log.infof(allocator, "client disconnected from daemon", .{});
-                return;
-            },
-            else => return err,
-        };
-        defer frame.deinit(allocator);
-        if (!try handleClientFrameAfterHandshake(allocator, exe, identity, fd, frame)) return;
-    }
-}
-
-fn handleClientAfterHandshakeWithInitialFrame(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    identity: daemon_identity.DaemonIdentity,
-    fd: c.fd_t,
-    initial_frame: *protocol.OwnedFrame,
-) !void {
-    if (!try handleClientFrameAfterHandshake(allocator, exe, identity, fd, initial_frame.*)) return;
-    try handleClientAfterHandshake(allocator, exe, identity, fd);
-}
-
 fn handleClientFrameAfterHandshake(
     allocator: std.mem.Allocator,
     exe: []const u8,
@@ -888,8 +842,8 @@ fn handleClientFrameAfterHandshake(
             };
             switch (item_payload) {
                 .ssh_transport_acquire => |request| {
-                    daemon_log.infof(allocator, "terminal transport requested", .{});
-                    try transport_ssh.serveTerminalTransportFromDaemon(allocator, fd, request);
+                    _ = request;
+                    try sendError(fd, "PROTOCOL_ERROR", "terminal transport must be dispatcher-owned", "");
                     return false;
                 },
                 .proxy_control_open => |request| {

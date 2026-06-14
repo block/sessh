@@ -15,6 +15,7 @@ const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_executable = @import("../daemon/executable.zig");
 const daemon_log = @import("../daemon/log.zig");
 const daemon_socket_namespace = @import("../daemon/socket_namespace.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const frame_forwarder = @import("frame_forwarder.zig");
 const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
@@ -233,6 +234,9 @@ const RemoteCleanupIdentity = struct {
 
 const PooledTerminalClient = struct {
     fd: c.fd_t,
+    tunnel: *TerminalTunnel = undefined,
+    watch_id: ?dispatcher.FdWatchId = null,
+    reader: protocol.FrameReader = undefined,
     stream_id: u64 = 0,
     local_stream_id: u64 = 0,
     kind: PooledTerminalClientKind = .unknown,
@@ -252,7 +256,12 @@ const PooledTerminalClient = struct {
     proxy_guid: [session_registry.proxy_guid_len]u8 = [_]u8{0} ** session_registry.proxy_guid_len,
     proxy_guid_len: usize = 0,
 
+    fn initReader(self: *PooledTerminalClient, allocator: std.mem.Allocator) void {
+        self.reader = protocol.FrameReader.init(allocator);
+    }
+
     fn deinit(self: *PooledTerminalClient, allocator: std.mem.Allocator) void {
+        self.reader.deinit();
         if (self.local_start_time) |start_time| allocator.free(start_time);
         if (self.remote_cleanup) |*remote| remote.deinit(allocator);
         self.* = undefined;
@@ -284,7 +293,10 @@ const TerminalTunnel = struct {
     resolved_port: []u8,
     state: TerminalTunnelState = .starting,
     clients: std.ArrayList(*PooledTerminalClient) = .empty,
-    wake_pipe: [2]c.fd_t,
+    remote_reader: protocol.FrameReader = undefined,
+    remote_watch_id: ?dispatcher.FdWatchId = null,
+    diagnostic_watch_id: ?dispatcher.FdWatchId = null,
+    idle_timer_id: ?dispatcher.TimerWatchId = null,
     connection: ?RuntimeConnection = null,
     diagnostic_fd: c.fd_t = -1,
     diagnostic_write_fd: c.fd_t = -1,
@@ -293,11 +305,10 @@ const TerminalTunnel = struct {
 
     fn deinit(self: *TerminalTunnel) void {
         if (self.connection) |*connection| connection.terminate();
+        self.remote_reader.deinit();
         if (self.remote_daemon_namespace) |namespace| self.allocator.free(namespace);
         if (self.diagnostic_fd >= 0) posix.close(self.diagnostic_fd);
         if (self.diagnostic_write_fd >= 0) posix.close(self.diagnostic_write_fd);
-        posix.close(self.wake_pipe[0]);
-        posix.close(self.wake_pipe[1]);
         self.clients.deinit(self.allocator);
         self.allocator.free(self.resolved_port);
         self.allocator.free(self.resolved_host);
@@ -313,8 +324,6 @@ const TerminalTunnelAcquire = struct {
     created: bool,
 };
 
-var terminal_pool_mutex = std.Thread.Mutex{};
-var terminal_pool_condition = std.Thread.Condition{};
 var terminal_tunnels: std.ArrayList(*TerminalTunnel) = .empty;
 var active_terminal_tunnels: std.atomic.Value(usize) = .init(0);
 
@@ -739,8 +748,9 @@ fn runRemoteNewSession(
     );
 }
 
-pub fn serveTerminalTransportFromDaemon(
+pub fn registerTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
     client_fd: c.fd_t,
     request: pb.ClientDaemonItem.SshTransportAcquire,
 ) !void {
@@ -757,7 +767,7 @@ pub fn serveTerminalTransportFromDaemon(
         .{ target.host, target.resolved_user, target.resolved_host, target.resolved_port, acquire_request.bootstrap },
     );
 
-    try servePooledTerminalTransportFromDaemon(allocator, client_fd, target, acquire_request);
+    try registerPooledTerminalTransportFromDaemon(allocator, daemon_dispatcher, client_fd, target, acquire_request);
 }
 
 fn startTerminalTransportForDaemon(
@@ -853,8 +863,9 @@ fn startTerminalTransportForDaemon(
     };
 }
 
-fn servePooledTerminalTransportFromDaemon(
+fn registerPooledTerminalTransportFromDaemon(
     allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
     client_fd: c.fd_t,
     target: SshTarget,
     request: pb.ClientDaemonItem.SshTransportAcquire,
@@ -867,18 +878,18 @@ fn servePooledTerminalTransportFromDaemon(
         .local_pid = request.local_pid,
         .local_start_time = if (request.local_start_time.len == 0) null else try allocator.dupe(u8, request.local_start_time),
     };
+    client.initReader(allocator);
     errdefer client.deinit(allocator);
 
     const acquire = try acquireTerminalTunnel(allocator, target, request, client);
+    client.tunnel = acquire.tunnel;
     if (acquire.created) {
-        startNewTerminalTunnel(allocator, acquire.tunnel, client_fd, target, request) catch |err| {
+        startNewTerminalTunnel(allocator, daemon_dispatcher, acquire.tunnel, client_fd, target, request) catch |err| {
             failStartingTerminalTunnel(allocator, acquire.tunnel, client, err);
         };
+    } else if (acquire.tunnel.state == .ready) {
+        activatePendingTerminalClients(daemon_dispatcher, acquire.tunnel);
     }
-
-    waitForPooledTerminalClientDone(client);
-    client.deinit(allocator);
-    allocator.destroy(client);
 }
 
 fn acquireTerminalTunnel(
@@ -890,9 +901,6 @@ fn acquireTerminalTunnel(
     const key = try terminalTunnelKey(allocator, target, request);
     errdefer allocator.free(key);
 
-    terminal_pool_mutex.lock();
-    defer terminal_pool_mutex.unlock();
-
     for (terminal_tunnels.items) |tunnel| {
         if (tunnel.state == .closed) continue;
         if (!std.mem.eql(u8, tunnel.key, key)) continue;
@@ -903,22 +911,11 @@ fn acquireTerminalTunnel(
             "terminal transport reusing pooled ssh transport host={s} pool={s} remote_namespace={s}",
             .{ target.host, tunnel.key, tunnel.remote_daemon_namespace orelse "remote-default" },
         );
-        wakeTerminalTunnel(tunnel);
         return .{ .tunnel = tunnel, .created = false };
     }
 
     const tunnel = try allocator.create(TerminalTunnel);
     errdefer allocator.destroy(tunnel);
-    const wake_pipe = try posix.pipe();
-    errdefer {
-        posix.close(wake_pipe[0]);
-        posix.close(wake_pipe[1]);
-    }
-    setNonBlockingFd(wake_pipe[0]) catch {};
-    setNonBlockingFd(wake_pipe[1]) catch {};
-    socket_transport.setCloseOnExec(wake_pipe[0]) catch {};
-    socket_transport.setCloseOnExec(wake_pipe[1]) catch {};
-
     tunnel.* = .{
         .allocator = allocator,
         .key = key,
@@ -926,8 +923,8 @@ fn acquireTerminalTunnel(
         .resolved_user = try allocator.dupe(u8, target.resolved_user),
         .resolved_host = try allocator.dupe(u8, target.resolved_host),
         .resolved_port = try allocator.dupe(u8, target.resolved_port),
-        .wake_pipe = wake_pipe,
     };
+    tunnel.remote_reader = protocol.FrameReader.init(allocator);
     errdefer tunnel.deinit();
     try tunnel.clients.append(allocator, client);
     try terminal_tunnels.append(allocator, tunnel);
@@ -964,6 +961,7 @@ fn appendPoolKeyPart(allocator: std.mem.Allocator, key: *std.ArrayList(u8), valu
 
 fn startNewTerminalTunnel(
     allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
     tunnel: *TerminalTunnel,
     client_fd: c.fd_t,
     target: SshTarget,
@@ -982,25 +980,40 @@ fn startNewTerminalTunnel(
         started.connection.child.stdout.?.handle,
         started.connection.child.stdin.?.handle,
     );
+    const remote_read_fd = started.connection.child.stdout.?.handle;
+    try setNonBlockingFd(remote_read_fd);
 
-    terminal_pool_mutex.lock();
     tunnel.connection = started.connection;
     tunnel.diagnostic_fd = started.diagnostic_fd;
     tunnel.diagnostic_write_fd = started.diagnostic_write_fd;
     tunnel.remote_daemon_namespace = started.remote_daemon_namespace;
     started.remote_daemon_namespace = null;
     tunnel.state = .ready;
-    terminal_pool_condition.broadcast();
-    terminal_pool_mutex.unlock();
+    errdefer {
+        if (tunnel.remote_watch_id) |watch_id| {
+            daemon_dispatcher.cancel(.{ .fd = watch_id });
+            tunnel.remote_watch_id = null;
+        }
+        if (tunnel.diagnostic_watch_id) |watch_id| {
+            daemon_dispatcher.cancel(.{ .fd = watch_id });
+            tunnel.diagnostic_watch_id = null;
+        }
+    }
+    tunnel.remote_watch_id = try daemon_dispatcher.watchFd(remote_read_fd, .{ .readable = true }, .{
+        .ctx = tunnel,
+        .callback = readTerminalTunnelRemote,
+    });
+    tunnel.diagnostic_watch_id = try daemon_dispatcher.watchFd(tunnel.diagnostic_fd, .{ .readable = true }, .{
+        .ctx = tunnel,
+        .callback = readTerminalTunnelDiagnostics,
+    });
 
     daemon_log.infof(
         allocator,
         "terminal transport ready host={s} remote_namespace={s}",
         .{ target.host, tunnel.remote_daemon_namespace orelse "remote-default" },
     );
-    const thread = try std.Thread.spawn(.{}, terminalTunnelThreadMain, .{tunnel});
-    thread.detach();
-    wakeTerminalTunnel(tunnel);
+    activatePendingTerminalClients(daemon_dispatcher, tunnel);
 }
 
 fn failStartingTerminalTunnel(
@@ -1009,7 +1022,6 @@ fn failStartingTerminalTunnel(
     starter: *PooledTerminalClient,
     err: anyerror,
 ) void {
-    terminal_pool_mutex.lock();
     tunnel.state = .closed;
     removeTerminalTunnelLocked(tunnel);
     while (tunnel.clients.items.len > 0) {
@@ -1017,21 +1029,11 @@ fn failStartingTerminalTunnel(
         if (client != starter or err != error.TerminalTransportStartReported) {
             sendDaemonTransportError(client.fd, "SSH_TRANSPORT_FAILED", "ssh transport failed", "") catch {};
         }
-        markPooledTerminalClientDoneLocked(tunnel, client);
+        destroyPooledTerminalClient(null, tunnel, client);
     }
     _ = active_terminal_tunnels.fetchSub(1, .acq_rel);
-    terminal_pool_condition.broadcast();
-    terminal_pool_mutex.unlock();
     tunnel.deinit();
     allocator.destroy(tunnel);
-}
-
-fn waitForPooledTerminalClientDone(client: *PooledTerminalClient) void {
-    terminal_pool_mutex.lock();
-    defer terminal_pool_mutex.unlock();
-    while (!client.done) {
-        terminal_pool_condition.wait(&terminal_pool_mutex);
-    }
 }
 
 pub fn sendCleanupRequestToRemote(
@@ -1108,174 +1110,269 @@ fn readCleanupResponseForGuid(
     }
 }
 
-fn terminalTunnelThreadMain(tunnel: *TerminalTunnel) void {
-    runTerminalTunnel(tunnel) catch |err| {
+fn readTerminalTunnelRemote(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+    _ = id;
+    const tunnel: *TerminalTunnel = @ptrCast(@alignCast(ctx));
+    readTerminalTunnelRemoteInner(tunnel, daemon_dispatcher, event) catch |err| {
         daemon_log.infof(
             tunnel.allocator,
             "terminal pooled ssh transport failed host={s} pool={s} error={t}",
             .{ tunnel.display_host, tunnel.key, err },
         );
+        notifyPooledTerminalRemoteClosed(daemon_dispatcher, tunnel);
+        finishTerminalTunnel(daemon_dispatcher, tunnel);
     };
-    finishTerminalTunnel(tunnel);
 }
 
-fn runTerminalTunnel(tunnel: *TerminalTunnel) !void {
-    try activatePendingTerminalClients(tunnel);
+fn readTerminalTunnelRemoteInner(
+    tunnel: *TerminalTunnel,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    event: dispatcher.Event,
+) !void {
+    const fd_event = switch (event) {
+        .fd => |fd| fd,
+        .timer => return error.UnexpectedTerminalTunnelTimer,
+    };
+    if (fd_event.error_event or fd_event.invalid) {
+        notifyPooledTerminalRemoteClosed(daemon_dispatcher, tunnel);
+        finishTerminalTunnel(daemon_dispatcher, tunnel);
+        return;
+    }
+    if (!fd_event.readable) {
+        if (fd_event.hangup) {
+            notifyPooledTerminalRemoteClosed(daemon_dispatcher, tunnel);
+            finishTerminalTunnel(daemon_dispatcher, tunnel);
+        }
+        return;
+    }
 
+    const remote_read_fd = tunnel.connection.?.child.stdout.?.handle;
     while (true) {
-        var poll_clients: std.ArrayList(*PooledTerminalClient) = .empty;
-        defer poll_clients.deinit(tunnel.allocator);
-        {
-            terminal_pool_mutex.lock();
-            defer terminal_pool_mutex.unlock();
-            for (tunnel.clients.items) |client| {
-                if (client.state != .done and client.state != .pending_tunnel) {
-                    try poll_clients.append(tunnel.allocator, client);
-                }
-            }
-        }
-
-        const remote_read_fd = tunnel.connection.?.child.stdout.?.handle;
-        const poll_count = 3 + poll_clients.items.len;
-        const pollfds = try tunnel.allocator.alloc(posix.pollfd, poll_count);
-        defer tunnel.allocator.free(pollfds);
-        pollfds[0] = .{ .fd = remote_read_fd, .events = posix.POLL.IN, .revents = 0 };
-        pollfds[1] = .{ .fd = tunnel.wake_pipe[0], .events = posix.POLL.IN, .revents = 0 };
-        pollfds[2] = .{ .fd = tunnel.diagnostic_fd, .events = posix.POLL.IN, .revents = 0 };
-        var index: usize = 3;
-        for (poll_clients.items) |client| {
-            pollfds[index] = .{ .fd = client.fd, .events = posix.POLL.IN, .revents = 0 };
-            index += 1;
-        }
-
-        const poll_timeout_ms: i32 = if (poll_clients.items.len == 0) terminal_tunnel_idle_close_ms else -1;
-        const ready = try posix.poll(pollfds, poll_timeout_ms);
-        if (ready == 0 and tryCloseIdleTerminalTunnel(tunnel)) {
-            daemon_log.infof(
-                tunnel.allocator,
-                "terminal pooled ssh transport idle host={s} pool={s}",
-                .{ tunnel.display_host, tunnel.key },
-            );
-            return;
-        }
-
-        if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            drainTerminalTunnelWake(tunnel);
-            try activatePendingTerminalClients(tunnel);
-        }
-
-        if ((pollfds[2].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            try forwardPooledTerminalDiagnostics(tunnel);
-        }
-
-        if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (!try readPooledRemoteMuxFrame(tunnel)) {
-                notifyPooledTerminalRemoteClosed(tunnel);
+        switch (try tunnel.remote_reader.readReady(remote_read_fd)) {
+            .blocked => return,
+            .progress => continue,
+            .eof, .truncated_frame => {
+                notifyPooledTerminalRemoteClosed(daemon_dispatcher, tunnel);
+                finishTerminalTunnel(daemon_dispatcher, tunnel);
                 return;
-            }
-        }
-
-        index = 3;
-        for (poll_clients.items) |client| {
-            const revents = pollfds[index].revents;
-            index += 1;
-            if ((revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) == 0) continue;
-            try handlePooledTerminalClientReadable(tunnel, client);
+            },
+            .frame => |frame_value| {
+                var frame = frame_value;
+                defer frame.deinit(tunnel.allocator);
+                if (!try handlePooledRemoteFrame(daemon_dispatcher, tunnel, frame)) {
+                    notifyPooledTerminalRemoteClosed(daemon_dispatcher, tunnel);
+                    finishTerminalTunnel(daemon_dispatcher, tunnel);
+                    return;
+                }
+            },
         }
     }
 }
 
-fn tryCloseIdleTerminalTunnel(tunnel: *TerminalTunnel) bool {
-    terminal_pool_mutex.lock();
-    defer terminal_pool_mutex.unlock();
-    if (tunnel.clients.items.len != 0) return false;
-    tunnel.state = .closed;
-    removeTerminalTunnelLocked(tunnel);
-    return true;
+fn readTerminalTunnelDiagnostics(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+    _ = id;
+    const tunnel: *TerminalTunnel = @ptrCast(@alignCast(ctx));
+    const fd_event = switch (event) {
+        .fd => |fd| fd,
+        .timer => return error.UnexpectedTerminalTunnelTimer,
+    };
+    if (!fd_event.readable and !fd_event.hangup and !fd_event.error_event and !fd_event.invalid) return;
+    forwardPooledTerminalDiagnostics(tunnel) catch |err| {
+        daemon_log.infof(
+            tunnel.allocator,
+            "terminal pooled ssh diagnostics failed host={s} pool={s} error={t}",
+            .{ tunnel.display_host, tunnel.key, err },
+        );
+        if (tunnel.diagnostic_watch_id) |watch_id| {
+            daemon_dispatcher.cancel(.{ .fd = watch_id });
+            tunnel.diagnostic_watch_id = null;
+        }
+    };
+    if (fd_event.hangup or fd_event.error_event or fd_event.invalid) {
+        if (tunnel.diagnostic_watch_id) |watch_id| {
+            daemon_dispatcher.cancel(.{ .fd = watch_id });
+            tunnel.diagnostic_watch_id = null;
+        }
+    }
 }
 
-fn activatePendingTerminalClients(tunnel: *TerminalTunnel) !void {
-    terminal_pool_mutex.lock();
-    defer terminal_pool_mutex.unlock();
-    for (tunnel.clients.items) |client| {
-        if (client.state != .pending_tunnel) continue;
+fn readPooledTerminalClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+    _ = id;
+    const client: *PooledTerminalClient = @ptrCast(@alignCast(ctx));
+    const tunnel = client.tunnel;
+    readPooledTerminalClientInner(client, daemon_dispatcher, event) catch |err| {
+        daemon_log.infof(
+            tunnel.allocator,
+            "terminal pooled client failed host={s} pool={s} stream_id={} error={t}",
+            .{ tunnel.display_host, tunnel.key, client.stream_id, err },
+        );
+        finishPooledTerminalClient(daemon_dispatcher, tunnel, client, true);
+    };
+}
+
+fn readPooledTerminalClientInner(
+    client: *PooledTerminalClient,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    event: dispatcher.Event,
+) !void {
+    const tunnel = client.tunnel;
+    const fd_event = switch (event) {
+        .fd => |fd| fd,
+        .timer => return error.UnexpectedTerminalTunnelTimer,
+    };
+    if (fd_event.error_event or fd_event.invalid) {
+        finishPooledTerminalClient(daemon_dispatcher, tunnel, client, true);
+        return;
+    }
+    if (!fd_event.readable) {
+        if (fd_event.hangup) finishPooledTerminalClient(daemon_dispatcher, tunnel, client, true);
+        return;
+    }
+
+    while (true) {
+        switch (try client.reader.readReady(client.fd)) {
+            .blocked => return,
+            .progress => continue,
+            .eof, .truncated_frame => {
+                finishPooledTerminalClient(daemon_dispatcher, tunnel, client, true);
+                return;
+            },
+            .frame => |frame_value| {
+                var frame = frame_value;
+                const alive = try handlePooledTerminalClientFrame(daemon_dispatcher, tunnel, client, &frame);
+                frame.deinit(tunnel.allocator);
+                if (!alive) return;
+            },
+        }
+    }
+}
+
+fn closeIdleTerminalTunnel(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+    _ = id;
+    const tunnel: *TerminalTunnel = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .timer => {},
+        .fd => return error.UnexpectedTerminalTunnelFd,
+    }
+    tunnel.idle_timer_id = null;
+    if (tunnel.clients.items.len != 0 or tunnel.state == .closed) return;
+    daemon_log.infof(
+        tunnel.allocator,
+        "terminal pooled ssh transport idle host={s} pool={s}",
+        .{ tunnel.display_host, tunnel.key },
+    );
+    finishTerminalTunnel(daemon_dispatcher, tunnel);
+}
+
+fn activatePendingTerminalClients(daemon_dispatcher: *dispatcher.Dispatcher, tunnel: *TerminalTunnel) void {
+    if (tunnel.idle_timer_id) |timer_id| {
+        daemon_dispatcher.cancel(.{ .timer = timer_id });
+        tunnel.idle_timer_id = null;
+    }
+    var index: usize = 0;
+    while (index < tunnel.clients.items.len) {
+        const client = tunnel.clients.items[index];
+        if (client.state != .pending_tunnel) {
+            index += 1;
+            continue;
+        }
         client.stream_id = tunnel.next_stream_id;
         tunnel.next_stream_id += 1;
         client.state = .opening_stream;
+        client.watch_id = daemon_dispatcher.watchFd(client.fd, .{ .readable = true }, .{
+            .ctx = client,
+            .callback = readPooledTerminalClient,
+        }) catch {
+            sendDaemonTransportError(client.fd, "INTERNAL_ERROR", "failed to watch terminal transport client", "") catch {};
+            destroyPooledTerminalClient(daemon_dispatcher, tunnel, client);
+            continue;
+        };
+        index += 1;
     }
-    terminal_pool_condition.broadcast();
 }
 
-fn handlePooledTerminalClientReadable(tunnel: *TerminalTunnel, client: *PooledTerminalClient) !void {
-    switch (client.state) {
-        .opening_stream => try openPooledTerminalClientStream(tunnel, client),
-        .active => try forwardPooledTerminalClientFrame(tunnel, client),
-        .pending_tunnel, .done => {},
-    }
-}
-
-fn openPooledTerminalClientStream(tunnel: *TerminalTunnel, client: *PooledTerminalClient) !void {
-    var frame = protocol.readFrameAlloc(tunnel.allocator, client.fd) catch |err| switch (err) {
-        error.EndOfStream => {
-            finishPooledTerminalClient(tunnel, client, true);
-            return;
-        },
-        else => return err,
+fn scheduleTerminalTunnelIdleClose(daemon_dispatcher: *dispatcher.Dispatcher, tunnel: *TerminalTunnel) void {
+    if (tunnel.state == .closed or tunnel.clients.items.len != 0 or tunnel.idle_timer_id != null) return;
+    tunnel.idle_timer_id = daemon_dispatcher.watchTimerAfter(@intCast(terminal_tunnel_idle_close_ms), .{
+        .ctx = tunnel,
+        .callback = closeIdleTerminalTunnel,
+    }) catch {
+        finishTerminalTunnel(daemon_dispatcher, tunnel);
+        return;
     };
-    defer frame.deinit(tunnel.allocator);
+}
+
+fn handlePooledTerminalClientFrame(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    tunnel: *TerminalTunnel,
+    client: *PooledTerminalClient,
+    frame: *const protocol.OwnedFrame,
+) !bool {
+    return switch (client.state) {
+        .opening_stream => try openPooledTerminalClientStream(daemon_dispatcher, tunnel, client, frame),
+        .active => try forwardPooledTerminalClientFrame(daemon_dispatcher, tunnel, client, frame),
+        .pending_tunnel => true,
+        .done => false,
+    };
+}
+
+fn openPooledTerminalClientStream(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    tunnel: *TerminalTunnel,
+    client: *PooledTerminalClient,
+    frame: *const protocol.OwnedFrame,
+) !bool {
     if (frame.message_type == .daemon_tunnel) {
         try sendPooledProxyMuxOpen(tunnel, client, frame.payload);
         client.state = .active;
-        return;
+        return true;
     }
     if (frame.message_type != .client_remote) {
         try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal or proxy stream open", "");
-        finishPooledTerminalClient(tunnel, client, false);
-        return;
+        finishPooledTerminalClient(daemon_dispatcher, tunnel, client, false);
+        return false;
     }
     var item = try protocol.decodeClientRemoteTerminalEmulatorItem(tunnel.allocator, frame.payload);
     defer item.deinit(tunnel.allocator);
     const item_payload = item.payload orelse {
         try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal stream open", "");
-        finishPooledTerminalClient(tunnel, client, false);
-        return;
+        finishPooledTerminalClient(daemon_dispatcher, tunnel, client, false);
+        return false;
     };
     const open = switch (item_payload) {
         .open => |request| request,
         else => {
             try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "expected terminal stream open", "");
-            finishPooledTerminalClient(tunnel, client, false);
-            return;
+            finishPooledTerminalClient(daemon_dispatcher, tunnel, client, false);
+            return false;
         },
     };
     try sendPooledTeMuxOpen(tunnel, client, open);
     client.kind = .te;
     client.state = .active;
+    return true;
 }
 
-fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerminalClient) !void {
-    var frame = protocol.readFrameAlloc(tunnel.allocator, client.fd) catch |err| switch (err) {
-        error.EndOfStream => {
-            finishPooledTerminalClient(tunnel, client, true);
-            return;
-        },
-        else => return err,
-    };
-    defer frame.deinit(tunnel.allocator);
+fn forwardPooledTerminalClientFrame(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    tunnel: *TerminalTunnel,
+    client: *PooledTerminalClient,
+    frame: *const protocol.OwnedFrame,
+) !bool {
     switch (frame.message_type) {
         .daemon_tunnel => {
             if (client.kind != .proxy) {
                 try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected proxy stream frame", "");
-                finishPooledTerminalClient(tunnel, client, true);
-                return;
+                finishPooledTerminalClient(daemon_dispatcher, tunnel, client, true);
+                return false;
             }
             try sendPooledProxyMuxFrame(tunnel, client, frame.payload);
         },
         .client_remote => {
             if (client.kind != .te) {
                 try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected terminal stream frame", "");
-                finishPooledTerminalClient(tunnel, client, true);
-                return;
+                finishPooledTerminalClient(daemon_dispatcher, tunnel, client, true);
+                return false;
             }
             var item = try protocol.decodeClientRemoteTerminalEmulatorItem(tunnel.allocator, frame.payload);
             defer item.deinit(tunnel.allocator);
@@ -1284,16 +1381,18 @@ fn forwardPooledTerminalClientFrame(tunnel: *TerminalTunnel, client: *PooledTerm
         .client_daemon => {
             if (client.kind != .proxy or client.proxy_guid_len == 0) {
                 try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected proxy control frame", "");
-                finishPooledTerminalClient(tunnel, client, true);
-                return;
+                finishPooledTerminalClient(daemon_dispatcher, tunnel, client, true);
+                return false;
             }
-            try forwardProxyControlFromStream(tunnel.allocator, client.proxyGuidSlice(), frame);
+            try forwardProxyControlFromStream(tunnel.allocator, client.proxyGuidSlice(), frame.*);
         },
         else => {
             try sendDaemonTransportError(client.fd, "PROTOCOL_ERROR", "unexpected terminal client frame", "");
-            finishPooledTerminalClient(tunnel, client, true);
+            finishPooledTerminalClient(daemon_dispatcher, tunnel, client, true);
+            return false;
         },
     }
+    return true;
 }
 
 fn sendPooledTeMuxOpen(
@@ -1394,12 +1493,11 @@ fn sendPooledTeMuxPayload(
     client.outbound_next_offset +|= 1;
 }
 
-fn readPooledRemoteMuxFrame(tunnel: *TerminalTunnel) !bool {
-    var frame = protocol.readFrameAlloc(tunnel.allocator, tunnel.connection.?.child.stdout.?.handle) catch |err| switch (err) {
-        error.EndOfStream => return false,
-        else => return err,
-    };
-    defer frame.deinit(tunnel.allocator);
+fn handlePooledRemoteFrame(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    tunnel: *TerminalTunnel,
+    frame: protocol.OwnedFrame,
+) !bool {
     if (frame.message_type != .daemon_tunnel) return error.UnexpectedDaemonFrame;
     var item = try protocol.decodePayload(pb.DaemonTunnelItem, tunnel.allocator, frame.payload);
     defer item.deinit(tunnel.allocator);
@@ -1415,7 +1513,7 @@ fn readPooledRemoteMuxFrame(tunnel: *TerminalTunnel) !bool {
         },
         .mux_stream => |mux| {
             item.payload = null;
-            return handlePooledRemoteMuxStreamFrame(tunnel, mux);
+            return handlePooledRemoteMuxStreamFrame(daemon_dispatcher, tunnel, mux);
         },
         .ping, .pong => return true,
         else => return error.UnexpectedDaemonFrame,
@@ -1423,6 +1521,7 @@ fn readPooledRemoteMuxFrame(tunnel: *TerminalTunnel) !bool {
 }
 
 fn handlePooledRemoteMuxStreamFrame(
+    daemon_dispatcher: *dispatcher.Dispatcher,
     tunnel: *TerminalTunnel,
     mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !bool {
@@ -1477,14 +1576,14 @@ fn handlePooledRemoteMuxStreamFrame(
         },
         .reset => |reset| {
             try sendDaemonTransportError(client.fd, reset.code, reset.message, reset.hint orelse "");
-            finishPooledTerminalClient(tunnel, client, false);
+            finishPooledTerminalClient(daemon_dispatcher, tunnel, client, false);
         },
         .eof => {
             if (client.first_payload_ms == 0) {
                 client.first_payload_ms = nowUnixMs();
                 logPooledTerminalClientStartupTiming(tunnel, client);
             }
-            finishPooledTerminalClient(tunnel, client, false);
+            finishPooledTerminalClient(daemon_dispatcher, tunnel, client, false);
         },
         .open => return error.UnexpectedDaemonFrame,
     }
@@ -1535,8 +1634,6 @@ fn handlePooledRemoteProcessStarted(
 }
 
 fn findPooledTerminalClient(tunnel: *TerminalTunnel, stream_id: u64) ?*PooledTerminalClient {
-    terminal_pool_mutex.lock();
-    defer terminal_pool_mutex.unlock();
     for (tunnel.clients.items) |client| {
         if (client.stream_id == stream_id and client.state != .done) return client;
     }
@@ -1544,6 +1641,7 @@ fn findPooledTerminalClient(tunnel: *TerminalTunnel, stream_id: u64) ?*PooledTer
 }
 
 fn finishPooledTerminalClient(
+    daemon_dispatcher: *dispatcher.Dispatcher,
     tunnel: *TerminalTunnel,
     client: *PooledTerminalClient,
     send_hangup: bool,
@@ -1571,22 +1669,17 @@ fn finishPooledTerminalClient(
             }
         }
     }
-    terminal_pool_mutex.lock();
-    markPooledTerminalClientDoneLocked(tunnel, client);
-    terminal_pool_condition.broadcast();
-    terminal_pool_mutex.unlock();
+    destroyPooledTerminalClient(daemon_dispatcher, tunnel, client);
+    scheduleTerminalTunnelIdleClose(daemon_dispatcher, tunnel);
 }
 
-fn notifyPooledTerminalRemoteClosed(tunnel: *TerminalTunnel) void {
+fn notifyPooledTerminalRemoteClosed(daemon_dispatcher: *dispatcher.Dispatcher, tunnel: *TerminalTunnel) void {
     daemon_log.infof(tunnel.allocator, "ssh transport disconnected from daemon host={s}", .{tunnel.display_host});
-    terminal_pool_mutex.lock();
     while (tunnel.clients.items.len > 0) {
         const client = tunnel.clients.items[0];
         sendSshTransportClosed(client.fd) catch {};
-        markPooledTerminalClientDoneLocked(tunnel, client);
+        destroyPooledTerminalClient(daemon_dispatcher, tunnel, client);
     }
-    terminal_pool_condition.broadcast();
-    terminal_pool_mutex.unlock();
 }
 
 fn forwardPooledTerminalDiagnostics(tunnel: *TerminalTunnel) !void {
@@ -1600,12 +1693,10 @@ fn forwardPooledTerminalDiagnostics(tunnel: *TerminalTunnel) !void {
         }
         if (n == 0) return;
         const bytes = buf[0..@intCast(n)];
-        terminal_pool_mutex.lock();
         for (tunnel.clients.items) |client| {
             if (client.state == .done) continue;
             sendSshTransportDiagnostic(client.fd, bytes) catch {};
         }
-        terminal_pool_mutex.unlock();
         if (@as(usize, @intCast(n)) < buf.len) return;
     }
 }
@@ -1618,27 +1709,41 @@ fn sendSshTransportClosed(fd: c.fd_t) !void {
     try protocol.sendSshTransportClosedFrame(app_allocator.allocator(), fd);
 }
 
-fn finishTerminalTunnel(tunnel: *TerminalTunnel) void {
+fn finishTerminalTunnel(daemon_dispatcher: *dispatcher.Dispatcher, tunnel: *TerminalTunnel) void {
+    if (tunnel.state == .closed) return;
     daemon_log.infof(
         tunnel.allocator,
         "terminal pooled ssh transport closed host={s} pool={s}",
         .{ tunnel.display_host, tunnel.key },
     );
-    terminal_pool_mutex.lock();
     tunnel.state = .closed;
+    if (tunnel.remote_watch_id) |watch_id| {
+        daemon_dispatcher.cancel(.{ .fd = watch_id });
+        tunnel.remote_watch_id = null;
+    }
+    if (tunnel.diagnostic_watch_id) |watch_id| {
+        daemon_dispatcher.cancel(.{ .fd = watch_id });
+        tunnel.diagnostic_watch_id = null;
+    }
+    if (tunnel.idle_timer_id) |timer_id| {
+        daemon_dispatcher.cancel(.{ .timer = timer_id });
+        tunnel.idle_timer_id = null;
+    }
     removeTerminalTunnelLocked(tunnel);
     while (tunnel.clients.items.len > 0) {
         const client = tunnel.clients.items[0];
-        markPooledTerminalClientDoneLocked(tunnel, client);
+        destroyPooledTerminalClient(daemon_dispatcher, tunnel, client);
     }
     _ = active_terminal_tunnels.fetchSub(1, .acq_rel);
-    terminal_pool_condition.broadcast();
-    terminal_pool_mutex.unlock();
     tunnel.deinit();
     tunnel.allocator.destroy(tunnel);
 }
 
-fn markPooledTerminalClientDoneLocked(tunnel: *TerminalTunnel, client: *PooledTerminalClient) void {
+fn destroyPooledTerminalClient(
+    daemon_dispatcher: ?*dispatcher.Dispatcher,
+    tunnel: *TerminalTunnel,
+    client: *PooledTerminalClient,
+) void {
     if (client.done) return;
     logPooledTerminalClientStartupTiming(tunnel, client);
     daemon_log.infof(
@@ -1648,12 +1753,25 @@ fn markPooledTerminalClientDoneLocked(tunnel: *TerminalTunnel, client: *PooledTe
     );
     client.state = .done;
     client.done = true;
+    if (client.watch_id) |watch_id| {
+        // The dispatcher may already be dispatching this watch. Cancelling it is
+        // still useful because it prevents future events for the same fd slot.
+        // The current callback returns immediately after destroying the client.
+        if (daemon_dispatcher) |d| d.cancel(.{ .fd = watch_id });
+        client.watch_id = null;
+    }
     var index: usize = 0;
     while (index < tunnel.clients.items.len) : (index += 1) {
         if (tunnel.clients.items[index] != client) continue;
         _ = tunnel.clients.swapRemove(index);
         break;
     }
+    if (client.fd >= 0) {
+        _ = c.close(client.fd);
+        client.fd = -1;
+    }
+    client.deinit(tunnel.allocator);
+    tunnel.allocator.destroy(client);
 }
 
 fn logPooledTerminalClientStartupTiming(tunnel: *TerminalTunnel, client: *PooledTerminalClient) void {
@@ -1694,20 +1812,6 @@ fn removeTerminalTunnelLocked(tunnel: *TerminalTunnel) void {
         if (terminal_tunnels.items[index] != tunnel) continue;
         _ = terminal_tunnels.swapRemove(index);
         break;
-    }
-}
-
-fn wakeTerminalTunnel(tunnel: *TerminalTunnel) void {
-    const byte = [_]u8{1};
-    _ = c.write(tunnel.wake_pipe[1], &byte, 1);
-}
-
-fn drainTerminalTunnelWake(tunnel: *TerminalTunnel) void {
-    var buf: [64]u8 = undefined;
-    while (true) {
-        const n = c.read(tunnel.wake_pipe[0], &buf, buf.len);
-        if (n <= 0) return;
-        if (@as(usize, @intCast(n)) < buf.len) return;
     }
 }
 
