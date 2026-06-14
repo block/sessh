@@ -33,6 +33,115 @@ pub const OwnedFrame = struct {
     }
 };
 
+pub const FrameReadStatus = union(enum) {
+    blocked,
+    progress,
+    frame: OwnedFrame,
+    eof,
+    truncated_frame,
+};
+
+pub const FrameReader = struct {
+    allocator: std.mem.Allocator,
+    header: [frame_header_len]u8 = undefined,
+    header_filled: usize = 0,
+    message: []u8 = &.{},
+    message_filled: usize = 0,
+    decoded_frame: ?OwnedFrame = null,
+    attached_filled: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator) FrameReader {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *FrameReader) void {
+        self.reset();
+        self.* = undefined;
+    }
+
+    pub fn readReady(self: *FrameReader, fd: c.fd_t) !FrameReadStatus {
+        if (self.header_filled < frame_header_len) {
+            switch (try readSome(fd, self.header[self.header_filled..])) {
+                .blocked => return .blocked,
+                .eof => return if (self.header_filled == 0) .eof else .truncated_frame,
+                .bytes => |bytes| {
+                    self.header_filled += bytes.len;
+                    io.noteRead(fd, bytes);
+                    if (self.header_filled < frame_header_len) return .progress;
+                },
+            }
+        }
+
+        if (self.message.len == 0 and self.header_filled == frame_header_len) {
+            const message_len = messageLenFromHeader(&self.header);
+            if (message_len == 0) return error.UnknownFrame;
+            self.message = try self.allocator.alloc(u8, message_len);
+            self.message_filled = 0;
+        }
+
+        if (self.message_filled < self.message.len) {
+            switch (try readSome(fd, self.message[self.message_filled..])) {
+                .blocked => return .blocked,
+                .eof => return .truncated_frame,
+                .bytes => |bytes| {
+                    self.message_filled += bytes.len;
+                    io.noteRead(fd, bytes);
+                    if (self.message_filled < self.message.len) return .progress;
+                },
+            }
+        }
+
+        if (self.decoded_frame == null) {
+            var decoded = try decodeMessageEnvelopeAlloc(self.allocator, self.message);
+            errdefer decoded.frame.deinit(self.allocator);
+            if (decoded.attached_bytes_len == 0) {
+                const frame = decoded.frame;
+                self.resetFrameStorageOnly();
+                return .{ .frame = frame };
+            }
+
+            var frame = decoded.frame;
+            frame.attached_bytes = try self.allocator.alloc(u8, decoded.attached_bytes_len);
+            self.decoded_frame = frame;
+            self.attached_filled = 0;
+        }
+
+        var frame = &(self.decoded_frame.?);
+        if (self.attached_filled < frame.attached_bytes.len) {
+            switch (try readSome(fd, frame.attached_bytes[self.attached_filled..])) {
+                .blocked => return .blocked,
+                .eof => return .truncated_frame,
+                .bytes => |bytes| {
+                    self.attached_filled += bytes.len;
+                    io.noteRead(fd, bytes);
+                    if (self.attached_filled < frame.attached_bytes.len) return .progress;
+                },
+            }
+        }
+
+        const result = self.decoded_frame.?;
+        self.decoded_frame = null;
+        self.resetFrameStorageOnly();
+        return .{ .frame = result };
+    }
+
+    fn reset(self: *FrameReader) void {
+        self.resetFrameStorageOnly();
+        if (self.decoded_frame) |*frame| {
+            frame.deinit(self.allocator);
+            self.decoded_frame = null;
+        }
+    }
+
+    fn resetFrameStorageOnly(self: *FrameReader) void {
+        self.allocator.free(self.message);
+        self.message = &.{};
+        self.header_filled = 0;
+        self.message_filled = 0;
+        self.attached_filled = 0;
+    }
+};
+
 pub fn encodePayload(allocator: std.mem.Allocator, message: anytype) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -319,19 +428,48 @@ fn readFrameMessageAlloc(allocator: std.mem.Allocator, fd: c.fd_t) ![]u8 {
 }
 
 fn decodeMessageAlloc(allocator: std.mem.Allocator, fd: c.fd_t, message_bytes: []const u8) !OwnedFrame {
+    var decoded = try decodeMessageEnvelopeAlloc(allocator, message_bytes);
+    errdefer decoded.frame.deinit(allocator);
+    const attached_bytes = try readAttachedBytesAlloc(allocator, fd, decoded.attached_bytes_len);
+    errdefer allocator.free(attached_bytes);
+
+    var frame = decoded.frame;
+    frame.attached_bytes = attached_bytes;
+    return frame;
+}
+
+const DecodedMessageEnvelope = struct {
+    frame: OwnedFrame,
+    attached_bytes_len: usize = 0,
+};
+
+fn decodeMessageEnvelopeAlloc(allocator: std.mem.Allocator, message_bytes: []const u8) !DecodedMessageEnvelope {
     if (message_bytes.len == 0) return error.UnknownFrame;
-    if (isHelloFrameEnvelope(message_bytes)) return decodeHelloMessageAlloc(allocator, message_bytes);
+    if (isHelloFrameEnvelope(message_bytes)) return .{
+        .frame = try decodeHelloMessageAlloc(allocator, message_bytes),
+    };
 
     var frame = try decodePayload(pb.Frame, allocator, message_bytes);
     defer frame.deinit(allocator);
-    const attached_bytes = try readAttachedBytesAlloc(allocator, fd, frame.attached_bytes_len);
-    errdefer allocator.free(attached_bytes);
+    const attached_bytes_len: usize = @intCast(frame.attached_bytes_len);
 
     return switch (frame.payload orelse return error.UnknownFrame) {
-        .@"error" => |message| ownedFrameFromMessageWithAttachedBytes(allocator, .error_message, message, attached_bytes),
-        .client_daemon => |message| ownedFrameFromMessageWithAttachedBytes(allocator, .client_daemon, message, attached_bytes),
-        .client_remote => |message| ownedFrameFromMessageWithAttachedBytes(allocator, .client_remote, message, attached_bytes),
-        .daemon_tunnel => |message| ownedFrameFromMessageWithAttachedBytes(allocator, .daemon_tunnel, message, attached_bytes),
+        .@"error" => |message| .{
+            .frame = try ownedFrameFromMessage(allocator, .error_message, message),
+            .attached_bytes_len = attached_bytes_len,
+        },
+        .client_daemon => |message| .{
+            .frame = try ownedFrameFromMessage(allocator, .client_daemon, message),
+            .attached_bytes_len = attached_bytes_len,
+        },
+        .client_remote => |message| .{
+            .frame = try ownedFrameFromMessage(allocator, .client_remote, message),
+            .attached_bytes_len = attached_bytes_len,
+        },
+        .daemon_tunnel => |message| .{
+            .frame = try ownedFrameFromMessage(allocator, .daemon_tunnel, message),
+            .attached_bytes_len = attached_bytes_len,
+        },
     };
 }
 
@@ -357,24 +495,31 @@ fn ownedFrameFromMessage(allocator: std.mem.Allocator, message_type: MessageType
     };
 }
 
-fn ownedFrameFromMessageWithAttachedBytes(
-    allocator: std.mem.Allocator,
-    message_type: MessageType,
-    message: anytype,
-    attached_bytes: []u8,
-) !OwnedFrame {
-    return .{
-        .message_type = message_type,
-        .payload = try encodePayload(allocator, message),
-        .attached_bytes = attached_bytes,
-    };
-}
-
-fn readAttachedBytesAlloc(allocator: std.mem.Allocator, fd: c.fd_t, len: u32) ![]u8 {
+fn readAttachedBytesAlloc(allocator: std.mem.Allocator, fd: c.fd_t, len: usize) ![]u8 {
     const bytes = try allocator.alloc(u8, len);
     errdefer allocator.free(bytes);
     try io.readExact(fd, bytes);
     return bytes;
+}
+
+const ReadSomeResult = union(enum) {
+    blocked,
+    eof,
+    bytes: []const u8,
+};
+
+fn readSome(fd: c.fd_t, buf: []u8) !ReadSomeResult {
+    if (buf.len == 0) return .{ .bytes = buf };
+    while (true) {
+        const n = c.read(fd, buf.ptr, buf.len);
+        if (n > 0) return .{ .bytes = buf[0..@intCast(n)] };
+        if (n == 0) return .eof;
+        switch (posix.errno(n)) {
+            .AGAIN => return .blocked,
+            .INTR => continue,
+            else => return error.ReadFailed,
+        }
+    }
 }
 
 fn encodeMessagePayload(
@@ -571,6 +716,78 @@ test "frame envelope preserves attached bytes appendix" {
     }
 }
 
+test "frame reader returns complete frame after incremental nonblocking reads" {
+    const payload = try encodePayload(std.testing.allocator, pb.ClientDaemonItem{
+        .payload = .{ .log_request = .{} },
+    });
+    defer std.testing.allocator.free(payload);
+    const frame_bytes = try encodeFrameWithAttachedBytes(std.testing.allocator, .client_daemon, payload, "attached-bytes");
+    defer std.testing.allocator.free(frame_bytes);
+
+    const pipe = try posix.pipe();
+    defer _ = c.close(pipe[0]);
+    defer _ = c.close(pipe[1]);
+    try setNonBlockingFdForTest(pipe[0]);
+
+    var reader = FrameReader.init(std.testing.allocator);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(FrameReadStatus.blocked, try reader.readReady(pipe[0]));
+    try io.writeAll(pipe[1], frame_bytes[0..2]);
+    try std.testing.expectEqual(FrameReadStatus.progress, try reader.readReady(pipe[0]));
+    try std.testing.expectEqual(FrameReadStatus.blocked, try reader.readReady(pipe[0]));
+
+    try io.writeAll(pipe[1], frame_bytes[2 .. frame_bytes.len - 3]);
+    while (true) {
+        switch (try reader.readReady(pipe[0])) {
+            .progress => continue,
+            .blocked => break,
+            else => return error.UnexpectedFrameReadStatus,
+        }
+    }
+
+    try io.writeAll(pipe[1], frame_bytes[frame_bytes.len - 3 ..]);
+    while (true) {
+        switch (try reader.readReady(pipe[0])) {
+            .progress => continue,
+            .frame => |frame_value| {
+                var frame = frame_value;
+                defer frame.deinit(std.testing.allocator);
+                try std.testing.expectEqual(MessageType.client_daemon, frame.message_type);
+                try std.testing.expectEqualStrings("attached-bytes", frame.attached_bytes);
+                var item = try decodePayload(pb.ClientDaemonItem, std.testing.allocator, frame.payload);
+                defer item.deinit(std.testing.allocator);
+                switch (item.payload orelse return error.MissingClientDaemonPayload) {
+                    .log_request => {},
+                    else => return error.UnexpectedClientDaemonPayload,
+                }
+                break;
+            },
+            else => return error.UnexpectedFrameReadStatus,
+        }
+    }
+}
+
+test "frame reader reports eof shape for empty and partial streams" {
+    const clean_pipe = try posix.pipe();
+    defer _ = c.close(clean_pipe[0]);
+    try setNonBlockingFdForTest(clean_pipe[0]);
+    _ = c.close(clean_pipe[1]);
+    var clean = FrameReader.init(std.testing.allocator);
+    defer clean.deinit();
+    try std.testing.expectEqual(FrameReadStatus.eof, try clean.readReady(clean_pipe[0]));
+
+    const partial_pipe = try posix.pipe();
+    defer _ = c.close(partial_pipe[0]);
+    try setNonBlockingFdForTest(partial_pipe[0]);
+    try io.writeAll(partial_pipe[1], "\x00\x00");
+    _ = c.close(partial_pipe[1]);
+    var partial = FrameReader.init(std.testing.allocator);
+    defer partial.deinit();
+    try std.testing.expectEqual(FrameReadStatus.progress, try partial.readReady(partial_pipe[0]));
+    try std.testing.expectEqual(FrameReadStatus.truncated_frame, try partial.readReady(partial_pipe[0]));
+}
+
 test "remote process started preserves stream id and cleanup identity" {
     const payload = try encodePayload(std.testing.allocator, pb.DaemonTunnelItem{
         .payload = .{ .remote_process_started = .{
@@ -599,6 +816,14 @@ test "remote process started preserves stream id and cleanup identity" {
         },
         else => return error.UnexpectedDaemonTunnelPayload,
     }
+}
+
+fn setNonBlockingFdForTest(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
+    if ((flags & nonblocking_flag) != 0) return;
+    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
 }
 
 test "hello compatibility accepts peer max protocol when it satisfies local minimum" {
