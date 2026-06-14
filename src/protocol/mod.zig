@@ -1,6 +1,7 @@
 const std = @import("std");
 const app_allocator = @import("../core/app_allocator.zig");
 const c = std.c;
+const posix = std.posix;
 
 const io = @import("../core/io.zig");
 pub const pb = @import("../proto/sessh/protocol/v1.pb.zig");
@@ -20,10 +21,14 @@ pub const frame_header_len = 4;
 
 pub const OwnedFrame = struct {
     message_type: MessageType,
+    // Structured protobuf message bytes for `message_type`. Attached bytes are
+    // uninterpreted bytes that follow the protobuf Frame message on the wire.
     payload: []u8,
+    attached_bytes: []u8 = &.{},
 
     pub fn deinit(self: *OwnedFrame, allocator: std.mem.Allocator) void {
         allocator.free(self.payload);
+        allocator.free(self.attached_bytes);
         self.* = undefined;
     }
 };
@@ -50,15 +55,25 @@ pub fn helloRequestIsCompatible(
 }
 
 pub fn readFrameAlloc(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedFrame {
-    const envelope = try readEnvelopeAlloc(allocator, fd);
-    defer allocator.free(envelope);
-    return decodeEnvelopeAlloc(allocator, envelope);
+    const message = try readFrameMessageAlloc(allocator, fd);
+    defer allocator.free(message);
+    return decodeMessageAlloc(allocator, fd, message);
 }
 
 pub fn sendFrame(fd: c.fd_t, message_type: MessageType, payload: []const u8) !void {
     const frame = try encodeFrame(app_allocator.allocator(), message_type, payload);
     defer app_allocator.allocator().free(frame);
     try io.writeAll(fd, frame);
+}
+
+pub fn sendFrameWithAttachedBytes(fd: c.fd_t, message_type: MessageType, payload: []const u8, attached_bytes: []const u8) !void {
+    const frame = try encodeFrameWithAttachedBytes(app_allocator.allocator(), message_type, payload, attached_bytes);
+    defer app_allocator.allocator().free(frame);
+    try io.writeAll(fd, frame);
+}
+
+pub fn sendOwnedFrame(fd: c.fd_t, frame: OwnedFrame) !void {
+    try sendFrameWithAttachedBytes(fd, frame.message_type, frame.payload, frame.attached_bytes);
 }
 
 pub fn sendPing(fd: c.fd_t) !void {
@@ -267,48 +282,61 @@ pub fn decodeClientDaemonLogEntry(allocator: std.mem.Allocator, payload: []const
 }
 
 pub fn encodeFrame(allocator: std.mem.Allocator, message_type: MessageType, payload: []const u8) ![]u8 {
-    const envelope = try encodeEnvelopePayload(allocator, message_type, payload);
-    defer allocator.free(envelope);
-    if (envelope.len > std.math.maxInt(u32)) return error.FrameTooLarge;
+    return encodeFrameWithAttachedBytes(allocator, message_type, payload, &.{});
+}
 
-    const frame = try allocator.alloc(u8, frame_header_len + envelope.len);
-    writeU32(frame[0..frame_header_len], @intCast(envelope.len));
-    @memcpy(frame[frame_header_len..], envelope);
+pub fn encodeFrameWithAttachedBytes(
+    allocator: std.mem.Allocator,
+    message_type: MessageType,
+    payload: []const u8,
+    attached_bytes: []const u8,
+) ![]u8 {
+    const message = try encodeMessagePayload(allocator, message_type, payload, attached_bytes.len);
+    defer allocator.free(message);
+    if (message.len > std.math.maxInt(u32)) return error.FrameTooLarge;
+    if (attached_bytes.len > std.math.maxInt(u32)) return error.FrameTooLarge;
+
+    const frame = try allocator.alloc(u8, frame_header_len + message.len + attached_bytes.len);
+    writeU32(frame[0..frame_header_len], @intCast(message.len));
+    @memcpy(frame[frame_header_len..][0..message.len], message);
+    @memcpy(frame[frame_header_len + message.len ..], attached_bytes);
     return frame;
 }
 
-pub fn payloadLenFromHeader(header: *const [frame_header_len]u8) usize {
+pub fn messageLenFromHeader(header: *const [frame_header_len]u8) usize {
     return @intCast(readU32(header));
 }
 
-fn readEnvelopeAlloc(allocator: std.mem.Allocator, fd: c.fd_t) ![]u8 {
+fn readFrameMessageAlloc(allocator: std.mem.Allocator, fd: c.fd_t) ![]u8 {
     var length_bytes: [frame_header_len]u8 = undefined;
     try io.readExact(fd, &length_bytes);
 
-    const payload_len: usize = @intCast(readU32(&length_bytes));
-    const payload = try allocator.alloc(u8, payload_len);
-    errdefer allocator.free(payload);
-    try io.readExact(fd, payload);
-    return payload;
+    const message_len = messageLenFromHeader(&length_bytes);
+    const message = try allocator.alloc(u8, message_len);
+    errdefer allocator.free(message);
+    try io.readExact(fd, message);
+    return message;
 }
 
-fn decodeEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !OwnedFrame {
-    if (envelope.len == 0) return error.UnknownFrame;
-    if (isHelloFrameEnvelope(envelope)) return decodeHelloEnvelopeAlloc(allocator, envelope);
+fn decodeMessageAlloc(allocator: std.mem.Allocator, fd: c.fd_t, message_bytes: []const u8) !OwnedFrame {
+    if (message_bytes.len == 0) return error.UnknownFrame;
+    if (isHelloFrameEnvelope(message_bytes)) return decodeHelloMessageAlloc(allocator, message_bytes);
 
-    var frame = try decodePayload(pb.Frame, allocator, envelope);
+    var frame = try decodePayload(pb.Frame, allocator, message_bytes);
     defer frame.deinit(allocator);
+    const attached_bytes = try readAttachedBytesAlloc(allocator, fd, frame.attached_bytes_len);
+    errdefer allocator.free(attached_bytes);
 
     return switch (frame.payload orelse return error.UnknownFrame) {
-        .@"error" => |message| ownedFrameFromMessage(allocator, .error_message, message),
-        .client_daemon => |message| ownedFrameFromMessage(allocator, .client_daemon, message),
-        .client_remote => |message| ownedFrameFromMessage(allocator, .client_remote, message),
-        .daemon_tunnel => |message| ownedFrameFromMessage(allocator, .daemon_tunnel, message),
+        .@"error" => |message| ownedFrameFromMessageWithAttachedBytes(allocator, .error_message, message, attached_bytes),
+        .client_daemon => |message| ownedFrameFromMessageWithAttachedBytes(allocator, .client_daemon, message, attached_bytes),
+        .client_remote => |message| ownedFrameFromMessageWithAttachedBytes(allocator, .client_remote, message, attached_bytes),
+        .daemon_tunnel => |message| ownedFrameFromMessageWithAttachedBytes(allocator, .daemon_tunnel, message, attached_bytes),
     };
 }
 
-fn decodeHelloEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) !OwnedFrame {
-    var hello_frame = try decodePayload(hpb.HelloFrame, allocator, envelope);
+fn decodeHelloMessageAlloc(allocator: std.mem.Allocator, message_bytes: []const u8) !OwnedFrame {
+    var hello_frame = try decodePayload(hpb.HelloFrame, allocator, message_bytes);
     defer hello_frame.deinit(allocator);
 
     return switch (hello_frame.payload orelse return error.UnknownFrame) {
@@ -318,8 +346,8 @@ fn decodeHelloEnvelopeAlloc(allocator: std.mem.Allocator, envelope: []const u8) 
     };
 }
 
-fn isHelloFrameEnvelope(envelope: []const u8) bool {
-    return envelope[0] == 0x0a or envelope[0] == 0x12 or envelope[0] == 0x1a;
+fn isHelloFrameEnvelope(message: []const u8) bool {
+    return message[0] == 0x0a or message[0] == 0x12 or message[0] == 0x1a;
 }
 
 fn ownedFrameFromMessage(allocator: std.mem.Allocator, message_type: MessageType, message: anytype) !OwnedFrame {
@@ -329,19 +357,47 @@ fn ownedFrameFromMessage(allocator: std.mem.Allocator, message_type: MessageType
     };
 }
 
-fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType, payload: []const u8) ![]u8 {
+fn ownedFrameFromMessageWithAttachedBytes(
+    allocator: std.mem.Allocator,
+    message_type: MessageType,
+    message: anytype,
+    attached_bytes: []u8,
+) !OwnedFrame {
+    return .{
+        .message_type = message_type,
+        .payload = try encodePayload(allocator, message),
+        .attached_bytes = attached_bytes,
+    };
+}
+
+fn readAttachedBytesAlloc(allocator: std.mem.Allocator, fd: c.fd_t, len: u32) ![]u8 {
+    const bytes = try allocator.alloc(u8, len);
+    errdefer allocator.free(bytes);
+    try io.readExact(fd, bytes);
+    return bytes;
+}
+
+fn encodeMessagePayload(
+    allocator: std.mem.Allocator,
+    message_type: MessageType,
+    payload: []const u8,
+    attached_bytes_len: usize,
+) ![]u8 {
     return switch (message_type) {
         .hello_request => blk: {
+            if (attached_bytes_len != 0) return error.AttachedBytesUnsupported;
             var message = try decodePayload(hpb.HelloRequest, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, hpb.HelloFrame{ .payload = .{ .hello_request = message } });
         },
         .hello_ok => blk: {
+            if (attached_bytes_len != 0) return error.AttachedBytesUnsupported;
             var message = try decodePayload(hpb.HelloOk, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, hpb.HelloFrame{ .payload = .{ .hello_ok = message } });
         },
         .hello_error => blk: {
+            if (attached_bytes_len != 0) return error.AttachedBytesUnsupported;
             var message = try decodePayload(hpb.HelloError, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, hpb.HelloFrame{ .payload = .{ .hello_error = message } });
@@ -349,22 +405,34 @@ fn encodeEnvelopePayload(allocator: std.mem.Allocator, message_type: MessageType
         .error_message => blk: {
             var message = try decodePayload(hpb.Error, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .@"error" = message } });
+            break :blk encodePayload(allocator, pb.Frame{
+                .attached_bytes_len = @intCast(attached_bytes_len),
+                .payload = .{ .@"error" = message },
+            });
         },
         .client_daemon => blk: {
             var message = try decodePayload(pb.ClientDaemonItem, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_daemon = message } });
+            break :blk encodePayload(allocator, pb.Frame{
+                .attached_bytes_len = @intCast(attached_bytes_len),
+                .payload = .{ .client_daemon = message },
+            });
         },
         .client_remote => blk: {
             var message = try decodePayload(pb.ClientRemoteItem, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .client_remote = message } });
+            break :blk encodePayload(allocator, pb.Frame{
+                .attached_bytes_len = @intCast(attached_bytes_len),
+                .payload = .{ .client_remote = message },
+            });
         },
         .daemon_tunnel => blk: {
             var message = try decodePayload(pb.DaemonTunnelItem, allocator, payload);
             defer message.deinit(allocator);
-            break :blk encodePayload(allocator, pb.Frame{ .payload = .{ .daemon_tunnel = message } });
+            break :blk encodePayload(allocator, pb.Frame{
+                .attached_bytes_len = @intCast(attached_bytes_len),
+                .payload = .{ .daemon_tunnel = message },
+            });
         },
     };
 }
@@ -407,9 +475,14 @@ test "frame envelope round trip" {
     const frame_bytes = try encodeFrame(std.testing.allocator, .client_remote, payload);
     defer std.testing.allocator.free(frame_bytes);
 
-    var frame = try decodeEnvelopeAlloc(std.testing.allocator, frame_bytes[frame_header_len..]);
+    const pipe = try posix.pipe();
+    defer _ = c.close(pipe[0]);
+    defer _ = c.close(pipe[1]);
+    try io.writeAll(pipe[1], frame_bytes);
+    var frame = try readFrameAlloc(std.testing.allocator, pipe[0]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(MessageType.client_remote, frame.message_type);
+    try std.testing.expectEqual(@as(usize, 0), frame.attached_bytes.len);
 
     var item = try decodeClientRemoteTerminalEmulatorItem(std.testing.allocator, frame.payload);
     defer item.deinit(std.testing.allocator);
@@ -435,9 +508,14 @@ test "mux stream frame preserves stream id offset and proxy payload" {
     const frame_bytes = try encodeFrame(std.testing.allocator, .daemon_tunnel, payload);
     defer std.testing.allocator.free(frame_bytes);
 
-    var frame = try decodeEnvelopeAlloc(std.testing.allocator, frame_bytes[frame_header_len..]);
+    const pipe = try posix.pipe();
+    defer _ = c.close(pipe[0]);
+    defer _ = c.close(pipe[1]);
+    try io.writeAll(pipe[1], frame_bytes);
+    var frame = try readFrameAlloc(std.testing.allocator, pipe[0]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(MessageType.daemon_tunnel, frame.message_type);
+    try std.testing.expectEqual(@as(usize, 0), frame.attached_bytes.len);
 
     var decoded = try decodeDaemonMuxStreamFrame(std.testing.allocator, frame.payload);
     defer decoded.deinit(std.testing.allocator);
@@ -460,6 +538,36 @@ test "mux stream frame preserves stream id offset and proxy payload" {
             }
         },
         else => return error.UnexpectedMuxMessage,
+    }
+}
+
+test "frame envelope preserves attached bytes appendix" {
+    const payload = try encodePayload(std.testing.allocator, pb.ClientDaemonItem{
+        .payload = .{ .log_request = .{} },
+    });
+    defer std.testing.allocator.free(payload);
+    const frame_bytes = try encodeFrameWithAttachedBytes(std.testing.allocator, .client_daemon, payload, "attached-bytes");
+    defer std.testing.allocator.free(frame_bytes);
+
+    var header: [frame_header_len]u8 = undefined;
+    @memcpy(&header, frame_bytes[0..frame_header_len]);
+    const message_len = messageLenFromHeader(&header);
+    try std.testing.expectEqual(frame_bytes.len, frame_header_len + message_len + "attached-bytes".len);
+
+    const pipe = try posix.pipe();
+    defer _ = c.close(pipe[0]);
+    defer _ = c.close(pipe[1]);
+    try io.writeAll(pipe[1], frame_bytes);
+    var frame = try readFrameAlloc(std.testing.allocator, pipe[0]);
+    defer frame.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(MessageType.client_daemon, frame.message_type);
+    try std.testing.expectEqualStrings("attached-bytes", frame.attached_bytes);
+    var item = try decodePayload(pb.ClientDaemonItem, std.testing.allocator, frame.payload);
+    defer item.deinit(std.testing.allocator);
+    switch (item.payload orelse return error.MissingClientDaemonPayload) {
+        .log_request => {},
+        else => return error.UnexpectedClientDaemonPayload,
     }
 }
 

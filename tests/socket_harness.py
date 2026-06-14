@@ -783,8 +783,8 @@ def set_submessage(frame, field_name, payload):
 
 def recv_frame(conn):
     header = recv_exact(conn, _FRAME_HEADER_LEN)
-    (payload_len,) = struct.unpack(">I", header)
-    body = recv_exact(conn, payload_len)
+    (message_len,) = struct.unpack(">I", header)
+    body = recv_exact(conn, message_len)
     hello_frame = sessh_hpb().HelloFrame()
     hello_frame.ParseFromString(body)
     hello_field = hello_frame.WhichOneof("payload")
@@ -793,6 +793,9 @@ def recv_frame(conn):
 
     frame = sessh_pb().Frame()
     frame.ParseFromString(body)
+    if frame.attached_bytes_len:
+        attached = recv_exact(conn, frame.attached_bytes_len)
+        raise AssertionError(f"unexpected attached bytes in socket harness: {attached!r}")
     field = frame.WhichOneof("payload")
     if field is None:
         raise AssertionError(f"missing frame payload: {body!r}")

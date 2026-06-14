@@ -17,7 +17,12 @@ import "sessh_handshake.proto";
 // is older than the oldest protocol it still supports.
 //
 message Frame {
-  reserved 1 to 9;
+  // Number of uninterpreted bytes attached immediately after this protobuf
+  // frame message on the wire. This is zero for structured-only frames and is
+  // omitted by proto3 encoding in that common case.
+  uint32 attached_bytes_len = 1;
+
+  reserved 2 to 9;
 
   oneof payload {
     sessh.handshake.v1.Error error = 10;
