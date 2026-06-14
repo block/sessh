@@ -8,8 +8,16 @@ const posix = std.posix;
 /// one-shot: the dispatcher folds the nearest deadline into the next poll timeout,
 /// then dispatches expired timers after poll returns. That keeps the
 /// implementation portable without timerfd/kqueue-specific code. The pollfd
-/// storage is cached and rebuilt only when fd watches change.
-pub const WatchId = u64;
+/// storage is kept dense for `poll(2)`, while watch handles point at stable
+/// slots in `watches`.
+///
+/// `WatchId` uses a slot index plus a generation. The index gives O(1) lookup;
+/// the generation rejects stale handles after a slot has been canceled and
+/// reused for another watch.
+pub const WatchId = struct {
+    index: usize,
+    generation: u64,
+};
 
 pub const FdEvents = struct {
     readable: bool = false,
@@ -55,10 +63,11 @@ pub const Handler = struct {
 };
 
 const Watch = struct {
-    id: WatchId,
-    source: WatchSource,
-    handler: Handler,
-    active: bool = true,
+    generation: u64 = 0,
+    active: bool = false,
+    source: WatchSource = undefined,
+    handler: Handler = undefined,
+    poll_index: ?usize = null,
 };
 
 const PendingEvent = struct {
@@ -70,12 +79,12 @@ pub const Dispatcher = struct {
     allocator: std.mem.Allocator,
     clock: std.time.Timer,
     watches: std.ArrayList(Watch) = .empty,
+    free_watches: std.ArrayList(usize) = .empty,
     pollfds: std.ArrayList(posix.pollfd) = .empty,
     poll_watch_ids: std.ArrayList(WatchId) = .empty,
     pending_events: std.ArrayList(PendingEvent) = .empty,
-    next_id: WatchId = 1,
+    active_count: usize = 0,
     running: bool = false,
-    poll_cache_dirty: bool = true,
 
     pub fn init(allocator: std.mem.Allocator) !Dispatcher {
         return .{
@@ -88,6 +97,7 @@ pub const Dispatcher = struct {
         self.pending_events.deinit(self.allocator);
         self.poll_watch_ids.deinit(self.allocator);
         self.pollfds.deinit(self.allocator);
+        self.free_watches.deinit(self.allocator);
         self.watches.deinit(self.allocator);
         self.* = undefined;
     }
@@ -97,17 +107,47 @@ pub const Dispatcher = struct {
     }
 
     pub fn watch(self: *Dispatcher, source: WatchSource, handler: Handler) !WatchId {
-        const id = self.next_id;
-        self.next_id += 1;
-        try self.watches.append(self.allocator, .{
-            .id = id,
-            .source = source,
-            .handler = handler,
-        });
+        const reused = self.free_watches.items.len != 0;
+        const index = if (reused) self.free_watches.items[self.free_watches.items.len - 1] else self.watches.items.len;
+        if (!reused) {
+            try self.free_watches.ensureTotalCapacity(self.allocator, index + 1);
+        }
+        const generation = if (reused) self.watches.items[index].generation else 0;
+        const id: WatchId = .{
+            .index = index,
+            .generation = generation,
+        };
+
+        var poll_index: ?usize = null;
         switch (source) {
-            .fd => self.poll_cache_dirty = true,
+            .fd => |fd_watch| {
+                poll_index = self.pollfds.items.len;
+                try self.pollfds.append(self.allocator, .{
+                    .fd = fd_watch.fd,
+                    .events = pollEvents(fd_watch.events),
+                    .revents = 0,
+                });
+                errdefer _ = self.pollfds.pop();
+                try self.poll_watch_ids.append(self.allocator, id);
+                errdefer _ = self.poll_watch_ids.pop();
+            },
             .timer => {},
         }
+
+        if (reused) {
+            _ = self.free_watches.pop();
+        } else {
+            try self.watches.append(self.allocator, .{});
+        }
+
+        self.watches.items[index] = .{
+            .generation = generation,
+            .active = true,
+            .source = source,
+            .handler = handler,
+            .poll_index = poll_index,
+        };
+        self.active_count += 1;
         return id;
     }
 
@@ -137,14 +177,34 @@ pub const Dispatcher = struct {
     }
 
     pub fn cancel(self: *Dispatcher, id: WatchId) void {
-        if (self.findWatchIndex(id)) |index| {
-            const watch_entry = &self.watches.items[index];
-            if (!watch_entry.active) return;
-            switch (watch_entry.source) {
-                .fd => self.poll_cache_dirty = true,
-                .timer => {},
-            }
-            watch_entry.active = false;
+        const index = self.indexForId(id) orelse return;
+        const poll_index = switch (self.watches.items[index].source) {
+            .fd => self.watches.items[index].poll_index.?,
+            .timer => null,
+        };
+        if (poll_index) |fd_poll_index| {
+            self.removePollIndex(fd_poll_index);
+        }
+
+        const watch_entry = &self.watches.items[index];
+        watch_entry.active = false;
+        watch_entry.generation += 1;
+        watch_entry.poll_index = null;
+        self.active_count -= 1;
+        self.free_watches.appendAssumeCapacity(index);
+    }
+
+    pub fn updateFdEvents(self: *Dispatcher, id: WatchId, events: FdEvents) !void {
+        const watch_entry = self.watchForId(id) orelse return error.UnknownWatch;
+
+        switch (watch_entry.source) {
+            .fd => |*fd_watch| {
+                fd_watch.events = events;
+                const poll_index = watch_entry.poll_index.?;
+                self.pollfds.items[poll_index].events = pollEvents(events);
+                self.pollfds.items[poll_index].revents = 0;
+            },
+            .timer => return error.NotFdWatch,
         }
     }
 
@@ -154,17 +214,15 @@ pub const Dispatcher = struct {
 
     pub fn run(self: *Dispatcher) !void {
         self.running = true;
-        while (self.running and self.activeWatchCount() != 0) {
+        while (self.running and self.active_count != 0) {
             _ = try self.runOnce();
         }
     }
 
     pub fn runOnce(self: *Dispatcher) !usize {
-        self.compactInactive();
-        if (self.watches.items.len == 0) return 0;
+        if (self.active_count == 0) return 0;
 
         const now_before_poll = self.nowMs();
-        try self.ensurePollCache();
 
         var nearest_deadline: ?u64 = null;
         for (self.watches.items) |watch_entry| {
@@ -199,13 +257,13 @@ pub const Dispatcher = struct {
             }
         }
 
-        for (self.watches.items) |*watch_entry| {
+        for (self.watches.items, 0..) |*watch_entry, index| {
             if (!watch_entry.active) continue;
             switch (watch_entry.source) {
                 .timer => |timer| {
                     if (timer.deadline_ms <= now_after_poll) {
                         try self.pending_events.append(self.allocator, .{
-                            .id = watch_entry.id,
+                            .id = self.watchIdForIndex(index),
                             .event = .{ .timer = .{
                                 .deadline_ms = timer.deadline_ms,
                                 .fired_at_ms = now_after_poll,
@@ -227,72 +285,59 @@ pub const Dispatcher = struct {
             }
             dispatched += 1;
         }
-        self.compactInactive();
         return dispatched;
     }
 
-    fn ensurePollCache(self: *Dispatcher) !void {
-        if (!self.poll_cache_dirty) return;
-
-        self.pollfds.clearRetainingCapacity();
-        self.poll_watch_ids.clearRetainingCapacity();
-        for (self.watches.items) |watch_entry| {
-            if (!watch_entry.active) continue;
-            switch (watch_entry.source) {
-                .fd => |fd_watch| {
-                    try self.pollfds.append(self.allocator, .{
-                        .fd = fd_watch.fd,
-                        .events = pollEvents(fd_watch.events),
-                        .revents = 0,
-                    });
-                    try self.poll_watch_ids.append(self.allocator, watch_entry.id);
-                },
-                .timer => {},
-            }
-        }
-        self.poll_cache_dirty = false;
-    }
-
-    fn findWatchIndex(self: *const Dispatcher, id: WatchId) ?usize {
-        for (self.watches.items, 0..) |watch_entry, index| {
-            if (watch_entry.id == id) return index;
-        }
-        return null;
+    fn watchIdForIndex(self: *const Dispatcher, index: usize) WatchId {
+        const watch_entry = self.watches.items[index];
+        return .{
+            .index = index,
+            .generation = watch_entry.generation,
+        };
     }
 
     fn handlerForId(self: *const Dispatcher, id: WatchId) ?Handler {
-        const index = self.findWatchIndex(id) orelse return null;
-        const watch_entry = self.watches.items[index];
-        if (!watch_entry.active) return null;
+        const watch_entry = self.watchForIdConst(id) orelse return null;
         return watch_entry.handler;
     }
 
     fn fdWatchForId(self: *const Dispatcher, id: WatchId) ?FdWatch {
-        const index = self.findWatchIndex(id) orelse return null;
-        const watch_entry = self.watches.items[index];
-        if (!watch_entry.active) return null;
+        const watch_entry = self.watchForIdConst(id) orelse return null;
         return switch (watch_entry.source) {
             .fd => |fd_watch| fd_watch,
             .timer => null,
         };
     }
 
-    fn activeWatchCount(self: *const Dispatcher) usize {
-        var count: usize = 0;
-        for (self.watches.items) |watch_entry| {
-            if (watch_entry.active) count += 1;
-        }
-        return count;
+    fn indexForId(self: *const Dispatcher, id: WatchId) ?usize {
+        if (id.index >= self.watches.items.len) return null;
+        const watch_entry = self.watches.items[id.index];
+        if (!watch_entry.active) return null;
+        if (watch_entry.generation != id.generation) return null;
+        return id.index;
     }
 
-    fn compactInactive(self: *Dispatcher) void {
-        var write_index: usize = 0;
-        for (self.watches.items) |watch_entry| {
-            if (!watch_entry.active) continue;
-            self.watches.items[write_index] = watch_entry;
-            write_index += 1;
+    fn watchForId(self: *Dispatcher, id: WatchId) ?*Watch {
+        const index = self.indexForId(id) orelse return null;
+        return &self.watches.items[index];
+    }
+
+    fn watchForIdConst(self: *const Dispatcher, id: WatchId) ?*const Watch {
+        const index = self.indexForId(id) orelse return null;
+        return &self.watches.items[index];
+    }
+
+    fn removePollIndex(self: *Dispatcher, poll_index: usize) void {
+        const last_index = self.pollfds.items.len - 1;
+        if (poll_index != last_index) {
+            self.pollfds.items[poll_index] = self.pollfds.items[last_index];
+            const moved_id = self.poll_watch_ids.items[last_index];
+            self.poll_watch_ids.items[poll_index] = moved_id;
+            const moved_watch = self.watchForId(moved_id).?;
+            moved_watch.poll_index = poll_index;
         }
-        self.watches.shrinkRetainingCapacity(write_index);
+        _ = self.pollfds.pop();
+        _ = self.poll_watch_ids.pop();
     }
 };
 
@@ -376,10 +421,12 @@ test "dispatcher dispatches fd readability and supports cancellation" {
     try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], "x"));
     try dispatcher.run();
     try std.testing.expectEqual(@as(u8, 'x'), context.read_byte);
-    try std.testing.expectEqual(@as(usize, 0), dispatcher.watches.items.len);
+    try std.testing.expectEqual(@as(usize, 0), dispatcher.active_count);
+    try std.testing.expectEqual(@as(usize, 0), dispatcher.pollfds.items.len);
+    try std.testing.expectEqual(@as(usize, 1), dispatcher.free_watches.items.len);
 }
 
-test "dispatcher keeps fd poll cache stable until fd watches change" {
+test "dispatcher keeps dense poll storage stable until fd watch is cancelled" {
     const Context = struct {
         fd: c.fd_t,
         count: usize = 0,
@@ -409,10 +456,9 @@ test "dispatcher keeps fd poll cache stable until fd watches change" {
     var context = Context{ .fd = fds[0] };
     _ = try dispatcher.watchFd(fds[0], .{ .readable = true }, .{ .ctx = &context, .callback = Context.onReadable });
 
-    try std.testing.expect(dispatcher.poll_cache_dirty);
+    try std.testing.expectEqual(@as(usize, 1), dispatcher.pollfds.items.len);
     try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], "x"));
     try std.testing.expectEqual(@as(usize, 1), try dispatcher.runOnce());
-    try std.testing.expect(!dispatcher.poll_cache_dirty);
 
     const pollfds_capacity = dispatcher.pollfds.capacity;
     const poll_watch_ids_capacity = dispatcher.poll_watch_ids.capacity;
@@ -420,8 +466,117 @@ test "dispatcher keeps fd poll cache stable until fd watches change" {
     try std.testing.expectEqual(@as(usize, 1), try dispatcher.runOnce());
     try std.testing.expectEqual(pollfds_capacity, dispatcher.pollfds.capacity);
     try std.testing.expectEqual(poll_watch_ids_capacity, dispatcher.poll_watch_ids.capacity);
-    try std.testing.expect(dispatcher.poll_cache_dirty);
+    try std.testing.expectEqual(@as(usize, 0), dispatcher.pollfds.items.len);
+    try std.testing.expectEqual(@as(usize, 0), dispatcher.poll_watch_ids.items.len);
     try std.testing.expectEqual(@as(usize, 2), context.count);
+}
+
+test "dispatcher updates fd events in-place" {
+    const Context = struct {
+        fd: c.fd_t,
+        read_byte: u8 = 0,
+
+        fn onReadable(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+            _ = id;
+            _ = dispatcher;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .fd => |fd_event| {
+                    if (!fd_event.readable) return error.ExpectedReadable;
+                    var buf: [1]u8 = undefined;
+                    const n = c.read(self.fd, &buf, 1);
+                    if (n != 1) return error.ReadFailed;
+                    self.read_byte = buf[0];
+                },
+                .timer => return error.UnexpectedTimerEvent,
+            }
+        }
+    };
+
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var dispatcher = try Dispatcher.init(std.testing.allocator);
+    defer dispatcher.deinit();
+    var context = Context{ .fd = fds[0] };
+    const id = try dispatcher.watchFd(fds[0], .{}, .{ .ctx = &context, .callback = Context.onReadable });
+
+    try std.testing.expectEqual(@as(i16, 0), dispatcher.pollfds.items[0].events);
+    const pollfds_capacity = dispatcher.pollfds.capacity;
+    const poll_watch_ids_capacity = dispatcher.poll_watch_ids.capacity;
+
+    try dispatcher.updateFdEvents(id, .{ .readable = true });
+    try std.testing.expectEqual(pollEvents(.{ .readable = true }), dispatcher.pollfds.items[0].events);
+    try std.testing.expectEqual(pollfds_capacity, dispatcher.pollfds.capacity);
+    try std.testing.expectEqual(poll_watch_ids_capacity, dispatcher.poll_watch_ids.capacity);
+
+    try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], "z"));
+    try std.testing.expectEqual(@as(usize, 1), try dispatcher.runOnce());
+    try std.testing.expectEqual(@as(u8, 'z'), context.read_byte);
+}
+
+test "dispatcher rejects stale watch ids after slot reuse" {
+    const Context = struct {
+        fn onReadable(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+            _ = ctx;
+            _ = dispatcher;
+            _ = id;
+            _ = event;
+        }
+    };
+
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var dispatcher = try Dispatcher.init(std.testing.allocator);
+    defer dispatcher.deinit();
+    var context = Context{};
+
+    const old_id = try dispatcher.watchFd(fds[0], .{}, .{ .ctx = &context, .callback = Context.onReadable });
+    dispatcher.cancel(old_id);
+    const new_id = try dispatcher.watchFd(fds[0], .{}, .{ .ctx = &context, .callback = Context.onReadable });
+
+    try std.testing.expectEqual(old_id.index, new_id.index);
+    try std.testing.expect(old_id.generation != new_id.generation);
+    try std.testing.expectError(error.UnknownWatch, dispatcher.updateFdEvents(old_id, .{ .readable = true }));
+    try std.testing.expectEqual(@as(i16, 0), dispatcher.pollfds.items[0].events);
+
+    try dispatcher.updateFdEvents(new_id, .{ .readable = true });
+    try std.testing.expectEqual(pollEvents(.{ .readable = true }), dispatcher.pollfds.items[0].events);
+}
+
+test "dispatcher fd cancel updates moved poll index" {
+    const Context = struct {
+        fn onReadable(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+            _ = ctx;
+            _ = dispatcher;
+            _ = id;
+            _ = event;
+        }
+    };
+
+    const first = try posix.pipe();
+    defer posix.close(first[0]);
+    defer posix.close(first[1]);
+    const second = try posix.pipe();
+    defer posix.close(second[0]);
+    defer posix.close(second[1]);
+
+    var dispatcher = try Dispatcher.init(std.testing.allocator);
+    defer dispatcher.deinit();
+    var context = Context{};
+
+    const first_id = try dispatcher.watchFd(first[0], .{}, .{ .ctx = &context, .callback = Context.onReadable });
+    const second_id = try dispatcher.watchFd(second[0], .{}, .{ .ctx = &context, .callback = Context.onReadable });
+
+    dispatcher.cancel(first_id);
+    try std.testing.expectEqual(@as(usize, 1), dispatcher.pollfds.items.len);
+    try std.testing.expectEqual(second[0], dispatcher.pollfds.items[0].fd);
+
+    try dispatcher.updateFdEvents(second_id, .{ .readable = true });
+    try std.testing.expectEqual(pollEvents(.{ .readable = true }), dispatcher.pollfds.items[0].events);
 }
 
 test "dispatcher cancelled timer does not fire" {
