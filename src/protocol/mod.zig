@@ -41,6 +41,67 @@ pub const FrameReadStatus = union(enum) {
     truncated_frame,
 };
 
+pub const FrameWriteStatus = enum {
+    blocked,
+    progress,
+    done,
+};
+
+pub const FrameWriteState = struct {
+    allocator: std.mem.Allocator,
+    bytes: []u8 = &.{},
+    written: usize = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        message_type: MessageType,
+        payload: []const u8,
+    ) !FrameWriteState {
+        return initWithAttachedBytes(allocator, message_type, payload, &.{});
+    }
+
+    pub fn initWithAttachedBytes(
+        allocator: std.mem.Allocator,
+        message_type: MessageType,
+        payload: []const u8,
+        attached_bytes: []const u8,
+    ) !FrameWriteState {
+        return .{
+            .allocator = allocator,
+            .bytes = try encodeFrameWithAttachedBytes(allocator, message_type, payload, attached_bytes),
+        };
+    }
+
+    pub fn initOwnedFrame(allocator: std.mem.Allocator, frame: OwnedFrame) !FrameWriteState {
+        return initWithAttachedBytes(allocator, frame.message_type, frame.payload, frame.attached_bytes);
+    }
+
+    pub fn deinit(self: *FrameWriteState) void {
+        self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+
+    pub fn writeReady(self: *FrameWriteState, fd: c.fd_t) !FrameWriteStatus {
+        if (self.written == self.bytes.len) return .done;
+        while (true) {
+            const remaining = self.bytes[self.written..];
+            const n = c.write(fd, remaining.ptr, remaining.len);
+            if (n > 0) {
+                const written_len: usize = @intCast(n);
+                io.noteWrite(fd, remaining[0..written_len]);
+                self.written += written_len;
+                return if (self.written == self.bytes.len) .done else .progress;
+            }
+            if (n == 0) return .blocked;
+            switch (posix.errno(n)) {
+                .AGAIN => return .blocked,
+                .INTR => continue,
+                else => return error.WriteFailed,
+            }
+        }
+    }
+};
+
 pub const FrameReader = struct {
     allocator: std.mem.Allocator,
     header: [frame_header_len]u8 = undefined,
@@ -792,6 +853,47 @@ test "frame reader reports eof shape for empty and partial streams" {
     try std.testing.expectEqual(FrameReadStatus.truncated_frame, try partial.readReady(partial_pipe[0]));
 }
 
+test "frame writer completes frame through incremental nonblocking writes" {
+    const payload = try encodePayload(std.testing.allocator, pb.ClientDaemonItem{
+        .payload = .{ .log_request = .{} },
+    });
+    defer std.testing.allocator.free(payload);
+
+    const attached_bytes = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(attached_bytes);
+    @memset(attached_bytes, 'x');
+
+    const expected = try encodeFrameWithAttachedBytes(std.testing.allocator, .client_daemon, payload, attached_bytes);
+    defer std.testing.allocator.free(expected);
+
+    const pipe = try posix.pipe();
+    defer _ = c.close(pipe[0]);
+    defer _ = c.close(pipe[1]);
+    try setNonBlockingFdForTest(pipe[0]);
+    try setNonBlockingFdForTest(pipe[1]);
+
+    var writer = try FrameWriteState.initWithAttachedBytes(std.testing.allocator, .client_daemon, payload, attached_bytes);
+    defer writer.deinit();
+    var actual: std.ArrayList(u8) = .empty;
+    defer actual.deinit(std.testing.allocator);
+
+    var saw_progress = false;
+    while (true) {
+        switch (try writer.writeReady(pipe[1])) {
+            .blocked => {},
+            .progress => saw_progress = true,
+            .done => {
+                try drainPipeForTest(pipe[0], &actual);
+                break;
+            },
+        }
+        try drainPipeForTest(pipe[0], &actual);
+    }
+
+    try std.testing.expect(saw_progress);
+    try std.testing.expectEqualSlices(u8, expected, actual.items);
+}
+
 test "remote process started preserves stream id and cleanup identity" {
     const payload = try encodePayload(std.testing.allocator, pb.DaemonTunnelItem{
         .payload = .{ .remote_process_started = .{
@@ -828,6 +930,20 @@ fn setNonBlockingFdForTest(fd: c.fd_t) !void {
     const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
     if ((flags & nonblocking_flag) != 0) return;
     if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
+}
+
+fn drainPipeForTest(fd: c.fd_t, actual: *std.ArrayList(u8)) !void {
+    var buffer: [8192]u8 = undefined;
+    while (true) {
+        const n = c.read(fd, &buffer, buffer.len);
+        if (n < 0) switch (posix.errno(n)) {
+            .AGAIN => return,
+            .INTR => continue,
+            else => return error.ReadFailed,
+        };
+        if (n == 0) return;
+        try actual.appendSlice(std.testing.allocator, buffer[0..@intCast(n)]);
+    }
 }
 
 test "hello compatibility accepts peer max protocol when it satisfies local minimum" {

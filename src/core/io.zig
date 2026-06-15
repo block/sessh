@@ -20,6 +20,10 @@ pub fn noteRead(fd: c.fd_t, bytes: []const u8) void {
     if (read_hook) |hook| hook(fd, bytes);
 }
 
+pub fn noteWrite(fd: c.fd_t, bytes: []const u8) void {
+    if (write_hook) |hook| hook(fd, bytes);
+}
+
 // Some callers hand us fds whose blocking mode we did not choose. Keep these
 // helpers blocking-style by waiting and retrying when the kernel reports "try
 // again".
@@ -56,7 +60,7 @@ pub fn writeAll(fd: c.fd_t, bytes: []const u8) !void {
         if (n == 0) return error.WriteFailed;
         offset += @intCast(n);
     }
-    if (write_hook) |hook| hook(fd, bytes);
+    noteWrite(fd, bytes);
 }
 
 pub const WriteSomeResult = union(enum) {
