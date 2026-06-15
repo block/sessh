@@ -30,10 +30,9 @@ handshake concern, not a socket-name concern.
 when a tty is available, so sessh can still show replaceable diagnostics and
 intercept reconnect controls at safe times.
 
-`raw` lets OpenSSH own the stream without sessh diagnostics.
-
-`unhygienic` has been removed. Its value was best-effort diagnostics without
-the wrapper, and that complexity is not worth carrying into the daemon design.
+`unhygienic` lets OpenSSH own the stream without sessh filtering. Any diagnostic
+output shares the user's tty with the ordinary ssh stream, so it can interleave
+with remote output.
 
 # Cleanup
 
