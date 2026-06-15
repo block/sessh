@@ -1985,6 +1985,184 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
             raise AssertionError(f"daemon log missing {expected!r}: {daemon_log_text}")
 
 
+def test_ssh_terminal_and_proxy_streams_share_tcp_connection(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    terminal_marker = "SSH_MIXED_POOL_TERMINAL"
+    proxy_marker = b"SSH_MIXED_POOL_PROXY\n"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SESSH_FAKE_SSH_G_USER"] = "pool-user"
+    env["SESSH_FAKE_SSH_G_HOSTNAME"] = "pool-host"
+    env["SESSH_FAKE_SSH_G_PORT"] = "2222"
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    server_port = server.getsockname()[1]
+    server_stop = threading.Event()
+
+    def echo_server():
+        while not server_stop.is_set():
+            try:
+                server.settimeout(0.1)
+                conn, _ = server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=echo_connection, args=(conn,), daemon=True).start()
+
+    def echo_connection(conn):
+        with conn:
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    return
+                conn.sendall(data)
+
+    threading.Thread(target=echo_server, daemon=True).start()
+
+    def send_ssh_transport_acquire(conn):
+        request = sessh_pb().ClientDaemonItem.SshTransportAcquire(host="test-host", bootstrap=True)
+        frame = sessh_pb().Frame()
+        frame.client_daemon.ssh_transport_acquire.CopyFrom(request)
+        body = frame.SerializeToString()
+        conn.sendall(struct.pack(">I", len(body)) + body)
+
+    def open_terminal_stream():
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(30.0)
+        conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
+        send_hello(conn)
+        send_ssh_transport_acquire(conn)
+        command = f"printf '{terminal_marker}\\n'; sleep 2"
+        send_frame(
+            conn,
+            TERMINAL_STREAM_OPEN,
+            pack_session_create(
+                "/bin/sh",
+                session_id="s-00000001-0000-4000-8000-000000000001",
+                shell_command=command,
+            ),
+        )
+        recv_until_message(conn, SESSION_ATTACHED, timeout=30.0)
+        recv_draw_until(conn, terminal_marker.encode("utf-8"), timeout=30.0)
+        return conn
+
+    def recv_mux_frame(conn, timeout=30.0):
+        old_timeout = conn.gettimeout()
+        conn.settimeout(timeout)
+        try:
+            while True:
+                message_type, payload = recv_frame(conn)
+                if message_type != "mux_stream_frame":
+                    continue
+                mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame()
+                mux.ParseFromString(payload)
+                return mux
+        finally:
+            conn.settimeout(old_timeout)
+
+    def send_mux_frame(conn, mux):
+        frame = sessh_pb().Frame()
+        frame.daemon_tunnel.mux_stream.CopyFrom(mux)
+        body = frame.SerializeToString()
+        conn.sendall(struct.pack(">I", len(body)) + body)
+
+    def send_proxy_open(conn):
+        mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=1)
+        mux.open.recv_next_offset = 0
+        mux.open.receive_window_bytes = 65536
+        send_mux_frame(conn, mux)
+        payload = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=1)
+        payload.payload.offset = 0
+        payload.payload.proxy.open.proxy_guid = "p-00000002-0000-4000-8000-000000000002"
+        payload.payload.proxy.open.proxy_host = "localhost"
+        payload.payload.proxy.open.proxy_port = server_port
+        send_mux_frame(conn, payload)
+
+    def send_proxy_data(conn, data):
+        mux = sessh_pb().DaemonTunnelItem.MuxStreamFrame(stream_id=1)
+        mux.payload.offset = 0
+        mux.payload.proxy.data = data
+        send_mux_frame(conn, mux)
+
+    def recv_proxy_data_until(conn, needle):
+        end = time.monotonic() + 30.0
+        chunks = []
+        while time.monotonic() < end:
+            mux = recv_mux_frame(conn, timeout=max(0.1, end - time.monotonic()))
+            if mux.WhichOneof("message") != "payload":
+                continue
+            if mux.payload.WhichOneof("item") != "proxy":
+                continue
+            if mux.payload.proxy.WhichOneof("payload") != "data":
+                continue
+            chunks.append(mux.payload.proxy.data)
+            if needle in b"".join(chunks):
+                return
+        raise AssertionError(f"did not receive proxy data {needle!r}: {chunks!r}")
+
+    def open_proxy_stream():
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(30.0)
+        conn.connect(str(daemon_socket_path(Path(env["XDG_RUNTIME_DIR"]))))
+        send_hello(conn)
+        send_ssh_transport_acquire(conn)
+        send_proxy_open(conn)
+        while recv_mux_frame(conn).WhichOneof("message") != "open_ok":
+            pass
+        send_proxy_data(conn, proxy_marker)
+        recv_proxy_data_until(conn, proxy_marker)
+        return conn
+
+    log_proc = subprocess.Popen(
+        sessh_argv(["--daemon-log"]),
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    terminal_conn = proxy_conn = None
+    daemon_log_output = b""
+    try:
+        daemon_log_output = read_until_pipe(log_proc.stdout, b"daemon log subscribed", timeout=5.0)
+        try:
+            terminal_conn = open_terminal_stream()
+            proxy_conn = open_proxy_stream()
+            daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
+        except Exception as exc:
+            daemon_log_output += read_available_pipe(log_proc.stdout, timeout=0.5)
+            raise AssertionError(
+                f"{exc}\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
+            ) from exc
+    finally:
+        if proxy_conn is not None:
+            proxy_conn.close()
+        if terminal_conn is not None:
+            terminal_conn.close()
+        terminate_process(log_proc)
+        server_stop.set()
+        server.close()
+
+    if ssh_invocation_count(fake_log) != 1:
+        raise AssertionError(
+            "expected terminal and proxy streams to share one pooled ssh transport"
+            f"\nlog:\n{optional_text(fake_log)}"
+            f"\ndaemon log:\n{daemon_log_output.decode('utf-8', 'replace')}"
+            f"\ntrace:\n{optional_text(fake_trace)}"
+        )
+    daemon_log_text = daemon_log_output.decode("utf-8", "replace")
+    if "kind=te" not in daemon_log_text or "kind=proxy" not in daemon_log_text:
+        raise AssertionError(f"daemon log missing mixed stream startup kinds: {daemon_log_text}")
+
+
 def test_ssh_local_daemon_death_tty_error_starts_on_new_line(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -4292,6 +4470,10 @@ def main(argv=None):
         (
             "ssh proxy streams pool tcp connection",
             test_ssh_proxy_streams_pool_tcp_connection,
+        ),
+        (
+            "ssh terminal and proxy streams share tcp connection",
+            test_ssh_terminal_and_proxy_streams_share_tcp_connection,
         ),
         (
             "ssh local daemon death tty error starts on new line",

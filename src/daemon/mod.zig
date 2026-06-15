@@ -14,6 +14,7 @@ const daemon_cleanup = @import("cleanup.zig");
 const daemon_executable = @import("executable.zig");
 const daemon_identity = @import("identity.zig");
 const daemon_log = @import("log.zig");
+const daemon_tunnel = @import("tunnel.zig");
 const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
 const stream_runtime = @import("../stream/runtime.zig");
@@ -522,69 +523,18 @@ fn transferInitialRequestToDispatcherOwner(
     if (frame.message_type == .daemon_tunnel) {
         if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, context.fd)) return .consumed;
         if (try handleDaemonTunnelControlFrame(context.allocator, context.identity, frame.*, context.fd)) return .consumed;
-        if (isMuxOpenFrame(context.allocator, frame.*)) {
-            var typed_open_frame = try readMuxTypedOpenFrame(context.allocator, context.fd);
-            defer typed_open_frame.deinit(context.allocator);
-            if (session_daemon_handler.isTeMuxOpenFrame(context.allocator, typed_open_frame)) {
-                var initial_frames = [_]protocol.OwnedFrame{ frame.*, typed_open_frame };
-                daemon_dispatcher.cancel(id);
-                try session_daemon_handler.registerTeMuxConnectionFromDaemon(
-                    context.allocator,
-                    daemon_dispatcher,
-                    context.exe,
-                    context.identity,
-                    initial_frames[0..],
-                    context.fd,
-                );
-                context.fd = -1;
-                return .transferred;
-            }
-            if (stream_runtime.isProxyMuxOpenFrame(context.allocator, typed_open_frame)) {
-                var initial_frames = [_]protocol.OwnedFrame{ frame.*, typed_open_frame };
-                daemon_dispatcher.cancel(id);
-                try stream_runtime.registerProxyMuxConnectionFromDaemon(
-                    context.allocator,
-                    daemon_dispatcher,
-                    context.exe,
-                    context.identity,
-                    initial_frames[0..],
-                    context.fd,
-                );
-                context.fd = -1;
-                return .transferred;
-            }
-            try sendError(context.fd, "PROTOCOL_ERROR", "expected typed mux stream open payload", "");
-            return .close;
-        }
-        if (session_daemon_handler.isTeMuxOpenFrame(context.allocator, frame.*)) {
-            var initial_frames = [_]protocol.OwnedFrame{frame.*};
-            daemon_dispatcher.cancel(id);
-            try session_daemon_handler.registerTeMuxConnectionFromDaemon(
-                context.allocator,
-                daemon_dispatcher,
-                context.exe,
-                context.identity,
-                initial_frames[0..],
-                context.fd,
-            );
-            context.fd = -1;
-            return .transferred;
-        }
-        if (stream_runtime.isProxyMuxOpenFrame(context.allocator, frame.*)) {
-            var initial_frames = [_]protocol.OwnedFrame{frame.*};
-            daemon_dispatcher.cancel(id);
-            try stream_runtime.registerProxyMuxConnectionFromDaemon(
-                context.allocator,
-                daemon_dispatcher,
-                context.exe,
-                context.identity,
-                initial_frames[0..],
-                context.fd,
-            );
-            context.fd = -1;
-            return .transferred;
-        }
-        return .not_transferred;
+        var initial_frames = [_]protocol.OwnedFrame{frame.*};
+        daemon_dispatcher.cancel(id);
+        try daemon_tunnel.registerMuxConnectionFromDaemon(
+            context.allocator,
+            daemon_dispatcher,
+            context.exe,
+            context.identity,
+            initial_frames[0..],
+            context.fd,
+        );
+        context.fd = -1;
+        return .transferred;
     }
 
     if (frame.message_type != .client_daemon) return .not_transferred;
@@ -901,23 +851,7 @@ fn handleClientFrameAfterHandshake(
         .daemon_tunnel => {
             if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd)) return true;
             if (try handleDaemonTunnelControlFrame(allocator, identity, frame, fd)) return true;
-            if (isMuxOpenFrame(allocator, frame)) {
-                var typed_open_frame = try readMuxTypedOpenFrame(allocator, fd);
-                defer typed_open_frame.deinit(allocator);
-                if (session_daemon_handler.isTeMuxOpenFrame(allocator, typed_open_frame)) {
-                    try session_daemon_handler.serveMuxStreamFramesAfterHandshake(allocator, exe, identity, frame, typed_open_frame, fd);
-                } else if (stream_runtime.isProxyMuxOpenFrame(allocator, typed_open_frame)) {
-                    try stream_runtime.serveMuxStreamFramesAfterHandshake(allocator, exe, identity, frame, typed_open_frame, fd);
-                } else {
-                    try sendError(fd, "PROTOCOL_ERROR", "expected typed mux stream open payload", "");
-                }
-            } else if (session_daemon_handler.isTeMuxOpenFrame(allocator, frame)) {
-                try session_daemon_handler.serveMuxStreamFrameAfterHandshake(allocator, exe, identity, frame, fd);
-            } else if (stream_runtime.isProxyMuxOpenFrame(allocator, frame)) {
-                try stream_runtime.serveMuxStreamFrameAfterHandshake(allocator, exe, identity, frame, fd);
-            } else {
-                try sendError(fd, "PROTOCOL_ERROR", "expected mux stream open", "");
-            }
+            try sendError(fd, "PROTOCOL_ERROR", "daemon tunnel must be dispatcher-owned", "");
             return false;
         },
         .client_daemon => {
@@ -971,26 +905,6 @@ fn handleDaemonTunnelControlFrame(
             return true;
         },
         else => return false,
-    }
-}
-
-fn isMuxOpenFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) bool {
-    if (frame.message_type != .daemon_tunnel) return false;
-    var mux_frame = protocol.decodeDaemonMuxStreamFrame(allocator, frame.payload) catch return false;
-    defer mux_frame.deinit(allocator);
-    const message = mux_frame.message orelse return false;
-    return message == .open;
-}
-
-fn readMuxTypedOpenFrame(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
-    while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
-        errdefer frame.deinit(allocator);
-        if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd)) {
-            frame.deinit(allocator);
-            continue;
-        }
-        return frame;
     }
 }
 

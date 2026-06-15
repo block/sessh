@@ -1152,7 +1152,6 @@ fn pooledSshTransportKey(
     try appendPoolKeyPart(allocator, &key, target.resolved_user);
     try appendPoolKeyPart(allocator, &key, target.resolved_host);
     try appendPoolKeyPart(allocator, &key, target.resolved_port);
-    try key.writer(allocator).print("kind={s}|", .{@tagName(request.kind)});
     try key.writer(allocator).print("bootstrap={}|", .{request.bootstrap});
     try key.appendSlice(allocator, "ipqos=");
     try appendPoolKeyPart(allocator, &key, request.ip_qos);
@@ -3092,7 +3091,6 @@ fn openTerminalDaemonTransport(
     var request = pb.ClientDaemonItem.SshTransportAcquire{
         .host = target.host,
         .bootstrap = common.bootstrap,
-        .kind = .KIND_TERMINAL,
     };
     defer request.ssh_option.deinit(allocator);
     defer deinitSshTransportAcquireOwnedFields(allocator, &request);
@@ -4053,7 +4051,6 @@ const DaemonStreamClientStarter = struct {
         var request = pb.ClientDaemonItem.SshTransportAcquire{
             .host = self.target.host,
             .bootstrap = self.bootstrap,
-            .kind = .KIND_PROXY,
         };
         defer request.ssh_option.deinit(self.allocator);
         defer deinitSshTransportAcquireOwnedFields(self.allocator, &request);

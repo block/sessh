@@ -836,7 +836,6 @@ pub const ClientDaemonItem = struct {
         ip_qos: []const u8 = &.{},
         local_pid: u64 = 0,
         local_start_time: []const u8 = &.{},
-        kind: ClientDaemonItem.SshTransportAcquire.Kind = @enumFromInt(0),
         client_environment: std.ArrayListUnmanaged(EnvironmentEntry) = .empty,
 
         pub const _desc_table = .{
@@ -847,15 +846,7 @@ pub const ClientDaemonItem = struct {
             .ip_qos = fd(5, .{ .scalar = .string }),
             .local_pid = fd(6, .{ .scalar = .uint64 }),
             .local_start_time = fd(7, .{ .scalar = .string }),
-            .kind = fd(8, .@"enum"),
             .client_environment = fd(9, .{ .repeated = .submessage }),
-        };
-
-        pub const Kind = enum(i32) {
-            KIND_UNSPECIFIED = 0,
-            KIND_PROXY = 1,
-            KIND_TERMINAL = 2,
-            _,
         };
 
         /// Encodes the message to the writer
