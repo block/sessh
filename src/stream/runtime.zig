@@ -9,6 +9,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
+const socket_transport = @import("../transport/socket.zig");
 const local_boot_time = @import("../core/local_boot_time.zig");
 const protocol = @import("../protocol/mod.zig");
 const client_log = @import("../core/client_log.zig");
@@ -180,57 +181,21 @@ const StreamSink = struct {
     shutdown_on_eof: bool = false,
 };
 
-const ProxyRuntimeControl = struct {
+const ProxyRemoteProcess = struct {
     allocator: std.mem.Allocator,
     guid: []u8,
-    notify_read_fd: c.fd_t,
-    notify_write_fd: c.fd_t,
-    pending_mutex: std.Thread.Mutex = .{},
-    pending_clients: std.ArrayList(c.fd_t) = .empty,
-    closed: bool = false,
+    socket_path: []u8,
+    pid: c.pid_t = 0,
 
-    fn enqueue(self: *ProxyRuntimeControl, fd: c.fd_t) !void {
-        self.pending_mutex.lock();
-        defer self.pending_mutex.unlock();
-        if (self.closed) return error.StreamNotFound;
-        try self.pending_clients.append(self.allocator, fd);
-        var byte = [_]u8{1};
-        const n = c.write(self.notify_write_fd, &byte, byte.len);
-        if (n < 0 or @as(usize, @intCast(n)) != byte.len) {
-            _ = self.pending_clients.pop();
-            return error.RuntimeNotifyFailed;
-        }
-    }
-
-    fn takePending(self: *ProxyRuntimeControl) ?c.fd_t {
-        self.pending_mutex.lock();
-        defer self.pending_mutex.unlock();
-        if (self.pending_clients.items.len == 0) return null;
-        return self.pending_clients.orderedRemove(0);
-    }
-
-    fn close(self: *ProxyRuntimeControl) void {
-        self.pending_mutex.lock();
-        self.closed = true;
-        while (self.pending_clients.items.len > 0) {
-            const fd = self.pending_clients.pop().?;
-            _ = c.close(fd);
-        }
-        self.pending_mutex.unlock();
-    }
-
-    fn deinit(self: *ProxyRuntimeControl) void {
-        self.close();
-        self.pending_clients.deinit(self.allocator);
-        if (self.notify_read_fd >= 0) _ = c.close(self.notify_read_fd);
-        if (self.notify_write_fd >= 0) _ = c.close(self.notify_write_fd);
+    fn deinit(self: *ProxyRemoteProcess) void {
         self.allocator.free(self.guid);
+        self.allocator.free(self.socket_path);
         self.* = undefined;
     }
 };
 
-var proxy_runtime_registry_mutex = std.Thread.Mutex{};
-var proxy_runtime_registry: std.ArrayList(*ProxyRuntimeControl) = .empty;
+var proxy_remote_processes: std.ArrayList(*ProxyRemoteProcess) = .empty;
+var proxy_remote_socket_sequence: u64 = 0;
 
 fn sinkWithFd(stdin_fd: c.fd_t, close_fd_on_eof: ?*c.fd_t) StreamSink {
     return .{
@@ -245,7 +210,7 @@ const StreamAttachedClientOptions = struct {
     reconnect_status: ?*StreamReconnectStatus = null,
     control_fd: c.fd_t = -1,
     control_input: ?*StreamInputControl = null,
-    replacement_control: ?*ProxyRuntimeControl = null,
+    replacement_listen_fd: c.fd_t = -1,
     close_outbound_on_inbound_eof: bool = false,
     reset_on_source_eof: bool = false,
     send_proxy_open: bool = false,
@@ -411,9 +376,9 @@ const StreamAttachedClient = struct {
         }
 
         var replacement_index: ?usize = null;
-        if (self.options.replacement_control) |control| {
+        if (self.options.replacement_listen_fd >= 0) {
             replacement_index = count;
-            pollfds[count] = .{ .fd = control.notify_read_fd, .events = posix.POLL.IN, .revents = 0 };
+            pollfds[count] = .{ .fd = self.options.replacement_listen_fd, .events = posix.POLL.IN, .revents = 0 };
             count += 1;
         }
 
@@ -451,10 +416,7 @@ const StreamAttachedClient = struct {
 
         if (replacement_index) |index| {
             if ((pollfds[index].revents & posix.POLL.IN) != 0) {
-                if (self.options.replacement_control) |control| {
-                    drainNotify(control.notify_read_fd);
-                    if (control.takePending()) |fd| return .{ .replacement = fd };
-                }
+                if (acceptRuntimeClient(self.options.replacement_listen_fd)) |fd| return .{ .replacement = fd };
             }
         }
         if (interrupt_index) |index| {
@@ -856,14 +818,14 @@ const ProxyEndpoint = struct {
         };
     }
 
-    fn attachedClientOptions(self: *ProxyEndpoint, control: *ProxyRuntimeControl) StreamAttachedClientOptions {
+    fn attachedClientOptions(self: *ProxyEndpoint, replacement_listen_fd: c.fd_t) StreamAttachedClientOptions {
         return .{
             .source = .{ .fd = self.fd },
             .sink = .{
                 .fd = self.fd,
                 .shutdown_on_eof = true,
             },
-            .replacement_control = control,
+            .replacement_listen_fd = replacement_listen_fd,
         };
     }
 
@@ -887,7 +849,7 @@ pub const ProxyMuxRuntime = struct {
     proxy_guid_len: usize = 0,
     cleanup_recorded: bool = false,
 
-    fn proxyGuidSlice(self: *const ProxyMuxRuntime) []const u8 {
+    pub fn proxyGuidSlice(self: *const ProxyMuxRuntime) []const u8 {
         return self.proxy_guid[0..self.proxy_guid_len];
     }
 
@@ -1012,14 +974,14 @@ fn handleProxyMuxPayloadOpen(
     if (!session_registry.isValidProxyGuid(request.proxy_guid)) return error.InvalidStreamGuid;
     if (request.proxy_port == 0 or request.proxy_port > std.math.maxInt(u16)) return error.InvalidStreamArgs;
 
-    const runtime = try connectOrStartProxyRuntime(
+    const runtime = try connectOrStartProxyRemote(
         allocator,
         exe,
         request.proxy_guid,
         request.proxy_host,
         @intCast(request.proxy_port),
     );
-    const runtime_fd = try connectProxyRuntime(runtime);
+    const runtime_fd = try connectStartedProxyRemote(runtime);
     errdefer _ = c.close(runtime_fd);
     if (daemon_dispatcher != null) {
         try core_fds.setNonBlocking(runtime_fd);
@@ -1122,11 +1084,11 @@ fn sendProxyRuntimeMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: p
     try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
 
-fn runProxyRuntime(allocator: std.mem.Allocator, control: *ProxyRuntimeControl, proxy_host: []const u8, proxy_port: u16) !void {
+fn runProxyRemote(allocator: std.mem.Allocator, guid: []const u8, replacement_listen_fd: c.fd_t, proxy_host: []const u8, proxy_port: u16) !void {
     var endpoint = try ProxyEndpoint.connect(allocator, proxy_host, proxy_port);
     defer endpoint.deinit();
 
-    var state = StreamState.init(allocator, control.guid, "", 0);
+    var state = StreamState.init(allocator, guid, "", 0);
     defer state.deinit();
 
     var attach_fd: c.fd_t = -1;
@@ -1135,15 +1097,15 @@ fn runProxyRuntime(allocator: std.mem.Allocator, control: *ProxyRuntimeControl, 
     }
     while (true) {
         if (attach_fd < 0) {
-            var disconnected_options = endpoint.attachedClientOptions(control);
-            attach_fd = try waitForReplacementWhileDisconnected(&state, control, &disconnected_options);
+            var disconnected_options = endpoint.attachedClientOptions(replacement_listen_fd);
+            attach_fd = try waitForReplacementWhileDisconnected(&state, replacement_listen_fd, &disconnected_options);
         }
 
         const outcome = try runAttachedStream(
             &state,
             attach_fd,
             attach_fd,
-            endpoint.attachedClientOptions(control),
+            endpoint.attachedClientOptions(replacement_listen_fd),
         );
         switch (outcome) {
             .complete => return,
@@ -1161,7 +1123,7 @@ fn runProxyRuntime(allocator: std.mem.Allocator, control: *ProxyRuntimeControl, 
 
 fn waitForReplacementWhileDisconnected(
     state: *StreamState,
-    control: *ProxyRuntimeControl,
+    replacement_listen_fd: c.fd_t,
     options: *const StreamAttachedClientOptions,
 ) !c.fd_t {
     while (true) {
@@ -1172,7 +1134,7 @@ fn waitForReplacementWhileDisconnected(
         var pollfds: [1 + 1]posix.pollfd = undefined;
         var count: usize = 0;
         const replacement_index = count;
-        pollfds[count] = .{ .fd = control.notify_read_fd, .events = posix.POLL.IN, .revents = 0 };
+        pollfds[count] = .{ .fd = replacement_listen_fd, .events = posix.POLL.IN, .revents = 0 };
         count += 1;
 
         var source_poll_index: ?usize = null;
@@ -1185,8 +1147,7 @@ fn waitForReplacementWhileDisconnected(
 
         _ = try posix.poll(pollfds[0..count], -1);
         if ((pollfds[replacement_index].revents & posix.POLL.IN) != 0) {
-            drainNotify(control.notify_read_fd);
-            if (control.takePending()) |fd| return fd;
+            if (acceptRuntimeClient(replacement_listen_fd)) |fd| return fd;
         }
 
         if (source_poll_index) |poll_index| {
@@ -1196,6 +1157,16 @@ fn waitForReplacementWhileDisconnected(
         }
         try drainStreamSourcesNonBlocking(state, options);
     }
+}
+
+fn acceptRuntimeClient(listen_fd: c.fd_t) ?c.fd_t {
+    const fd = c.accept(listen_fd, null, null);
+    if (fd < 0) return null;
+    setCloseOnExec(fd) catch {
+        _ = c.close(fd);
+        return null;
+    };
+    return fd;
 }
 
 /// Runs in the local `sessh` process. `start_transport` creates ssh transports
@@ -1905,40 +1876,55 @@ fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) !ReadSomeResult {
     return readSome(fd, buf);
 }
 
-fn connectOrStartProxyRuntime(
+fn connectOrStartProxyRemote(
     allocator: std.mem.Allocator,
     exe: []const u8,
     guid: []const u8,
     proxy_host: []const u8,
     proxy_port: u16,
-) !*ProxyRuntimeControl {
-    _ = exe;
+) !*ProxyRemoteProcess {
     const canonical = try session_registry.canonicalProxyGuid(allocator, guid);
     defer allocator.free(canonical);
 
-    if (lookupProxyRuntime(canonical)) |control| return control;
+    if (lookupProxyRemote(canonical)) |control| return control;
 
-    return startProxyRuntimeThread(allocator, canonical, proxy_host, proxy_port);
+    return startProxyRemoteProcess(allocator, exe, canonical, proxy_host, proxy_port);
 }
 
-fn connectProxyRuntime(control: *ProxyRuntimeControl) !c.fd_t {
-    var fds: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
-    errdefer {
-        _ = c.close(fds[0]);
-        _ = c.close(fds[1]);
+fn connectProxyRemote(control: *ProxyRemoteProcess) !c.fd_t {
+    return connectProxyRemoteProcess(control) catch |err| switch (err) {
+        error.SocketPathMissing, error.ConnectFailed => {
+            forgetProxyRemote(control.guid);
+            return error.StreamNotFound;
+        },
+        else => return err,
+    };
+}
+
+fn connectStartedProxyRemote(control: *ProxyRemoteProcess) !c.fd_t {
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        return connectProxyRemoteProcess(control) catch |err| switch (err) {
+            error.SocketPathMissing, error.ConnectFailed => {
+                io.sleepMillis(5);
+                continue;
+            },
+            else => return err,
+        };
     }
-    try setCloseOnExec(fds[0]);
-    try setCloseOnExec(fds[1]);
-    try control.enqueue(fds[1]);
-    return fds[0];
+    forgetProxyRemote(control.guid);
+    return error.StreamNotFound;
 }
 
-pub fn requestProxyRuntimeCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
+fn connectProxyRemoteProcess(control: *const ProxyRemoteProcess) !c.fd_t {
+    return socket_transport.connectSocket(control.socket_path);
+}
+
+pub fn requestProxyRemoteCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
     const canonical = try session_registry.canonicalProxyGuid(allocator, guid);
     defer allocator.free(canonical);
-    const control = lookupProxyRuntime(canonical) orelse return error.StreamNotFound;
-    const fd = try connectProxyRuntime(control);
+    const control = lookupProxyRemote(canonical) orelse return error.StreamNotFound;
+    const fd = try connectProxyRemote(control);
     defer _ = c.close(fd);
     try sendMuxStreamFrame(allocator, fd, .{
         .stream_id = proxy_mux_stream_id,
@@ -1949,108 +1935,130 @@ pub fn requestProxyRuntimeCleanup(allocator: std.mem.Allocator, guid: []const u8
     });
 }
 
-const ProxyRuntimeThreadContext = struct {
-    allocator: std.mem.Allocator,
-    control: *ProxyRuntimeControl,
-    proxy_host: []u8,
-    proxy_port: u16,
-};
+pub fn runProxyRemoteProcess(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len != 4) return error.InvalidProxyRuntimeArgs;
+    core_fds.closeInheritedNonStdioFileDescriptors();
+    const socket_path = args[0];
+    const guid = args[1];
+    const proxy_host = args[2];
+    const proxy_port = try std.fmt.parseInt(u16, args[3], 10);
+    const listen_fd = try socket_transport.listenSocket(socket_path);
+    defer _ = c.close(listen_fd);
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
 
-fn startProxyRuntimeThread(
+    try runProxyRemote(allocator, guid, listen_fd, proxy_host, proxy_port);
+}
+
+fn startProxyRemoteProcess(
     allocator: std.mem.Allocator,
+    exe: []const u8,
     guid: []const u8,
     proxy_host: []const u8,
     proxy_port: u16,
-) !*ProxyRuntimeControl {
+) !*ProxyRemoteProcess {
     const canonical = try session_registry.canonicalProxyGuid(allocator, guid);
     errdefer allocator.free(canonical);
 
-    const notify_pipe = try posix.pipe();
-    errdefer {
-        posix.close(notify_pipe[0]);
-        posix.close(notify_pipe[1]);
-    }
-    try setNonBlockingFd(notify_pipe[0]);
-    try setNonBlockingFd(notify_pipe[1]);
-    try setCloseOnExec(notify_pipe[0]);
-    try setCloseOnExec(notify_pipe[1]);
+    const socket_path = try proxyRemoteSocketPath(allocator, exe);
+    errdefer allocator.free(socket_path);
 
-    const control = try allocator.create(ProxyRuntimeControl);
+    const control = try allocator.create(ProxyRemoteProcess);
     errdefer allocator.destroy(control);
     control.* = .{
         .allocator = allocator,
         .guid = canonical,
-        .notify_read_fd = notify_pipe[0],
-        .notify_write_fd = notify_pipe[1],
+        .socket_path = socket_path,
     };
     errdefer control.deinit();
 
-    try registerProxyRuntime(control);
-    errdefer unregisterProxyRuntime(control);
+    try registerProxyRemote(control);
+    errdefer unregisterProxyRemote(control);
 
-    const context = try allocator.create(ProxyRuntimeThreadContext);
-    errdefer allocator.destroy(context);
-    context.* = .{
-        .allocator = allocator,
-        .control = control,
-        .proxy_host = undefined,
-        .proxy_port = proxy_port,
-    };
-    context.proxy_host = try allocator.dupe(u8, proxy_host);
-    errdefer allocator.free(context.proxy_host);
-
-    const thread = try std.Thread.spawn(.{}, proxyRuntimeThreadMain, .{context});
-    thread.detach();
+    const port_arg = try std.fmt.allocPrint(allocator, "{}", .{proxy_port});
+    defer allocator.free(port_arg);
+    const argv = [_][]const u8{ exe, socket_path, canonical, proxy_host, port_arg };
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    control.pid = @intCast(child.id);
     return control;
 }
 
-fn proxyRuntimeThreadMain(context: *ProxyRuntimeThreadContext) void {
-    const allocator = context.allocator;
-    const control = context.control;
-    defer {
-        unregisterProxyRuntime(control);
-        control.deinit();
-        allocator.destroy(control);
-        allocator.free(context.proxy_host);
-        allocator.destroy(context);
-    }
-
-    runProxyRuntime(allocator, control, context.proxy_host, context.proxy_port) catch {};
+fn proxyRemoteSocketPath(allocator: std.mem.Allocator, exe: []const u8) ![]u8 {
+    const dir = std.fs.path.dirname(exe) orelse return error.InvalidRuntimeExecutablePath;
+    const sequence = proxy_remote_socket_sequence;
+    proxy_remote_socket_sequence +%= 1;
+    return std.fmt.allocPrint(allocator, "{s}/proxy-{}-{}.sock", .{ dir, c.getpid(), sequence });
 }
 
-fn registerProxyRuntime(control: *ProxyRuntimeControl) !void {
-    proxy_runtime_registry_mutex.lock();
-    defer proxy_runtime_registry_mutex.unlock();
-    for (proxy_runtime_registry.items) |existing| {
+fn registerProxyRemote(control: *ProxyRemoteProcess) !void {
+    for (proxy_remote_processes.items) |existing| {
         if (std.mem.eql(u8, existing.guid, control.guid)) return error.StreamExists;
     }
-    try proxy_runtime_registry.append(app_allocator.allocator(), control);
+    try proxy_remote_processes.append(app_allocator.allocator(), control);
 }
 
-fn unregisterProxyRuntime(control: *ProxyRuntimeControl) void {
-    proxy_runtime_registry_mutex.lock();
-    defer proxy_runtime_registry_mutex.unlock();
-    for (proxy_runtime_registry.items, 0..) |existing, index| {
+fn unregisterProxyRemote(control: *ProxyRemoteProcess) void {
+    for (proxy_remote_processes.items, 0..) |existing, index| {
         if (existing == control) {
-            _ = proxy_runtime_registry.orderedRemove(index);
+            _ = proxy_remote_processes.orderedRemove(index);
             return;
         }
     }
 }
 
-pub fn activeProxyRuntimeCount() usize {
-    proxy_runtime_registry_mutex.lock();
-    defer proxy_runtime_registry_mutex.unlock();
-    return proxy_runtime_registry.items.len;
+pub fn forgetProxyRemote(guid: []const u8) void {
+    for (proxy_remote_processes.items, 0..) |control, index| {
+        if (std.mem.eql(u8, control.guid, guid)) {
+            _ = proxy_remote_processes.orderedRemove(index);
+            _ = reapProxyRemote(control.pid);
+            const allocator = control.allocator;
+            control.deinit();
+            allocator.destroy(control);
+            return;
+        }
+    }
 }
 
-fn lookupProxyRuntime(guid: []const u8) ?*ProxyRuntimeControl {
-    proxy_runtime_registry_mutex.lock();
-    defer proxy_runtime_registry_mutex.unlock();
-    for (proxy_runtime_registry.items) |control| {
+pub fn activeProxyRemoteProcessCount() usize {
+    pruneExitedProxyRemotes();
+    return proxy_remote_processes.items.len;
+}
+
+fn lookupProxyRemote(guid: []const u8) ?*ProxyRemoteProcess {
+    for (proxy_remote_processes.items) |control| {
         if (std.mem.eql(u8, control.guid, guid)) return control;
     }
     return null;
+}
+
+fn pruneExitedProxyRemotes() void {
+    var index: usize = 0;
+    while (index < proxy_remote_processes.items.len) {
+        const control = proxy_remote_processes.items[index];
+        if (reapProxyRemote(control.pid)) {
+            _ = proxy_remote_processes.orderedRemove(index);
+            const allocator = control.allocator;
+            control.deinit();
+            allocator.destroy(control);
+            continue;
+        }
+        index += 1;
+    }
+}
+
+fn reapProxyRemote(pid: c.pid_t) bool {
+    if (pid <= 0) return true;
+    var status: c_int = 0;
+    const result = c.waitpid(pid, &status, 1);
+    if (result == pid) return true;
+    if (result < 0) return switch (posix.errno(result)) {
+        .CHILD => true,
+        else => false,
+    };
+    return false;
 }
 
 fn nowMillis() u64 {

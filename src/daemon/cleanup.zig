@@ -294,7 +294,7 @@ fn cleanupGuidOnCurrentDaemon(allocator: std.mem.Allocator, guid: []const u8) !C
         return .cleaned;
     }
     if (std.mem.startsWith(u8, guid, "p-")) {
-        stream_runtime.requestProxyRuntimeCleanup(allocator, guid) catch |err| switch (err) {
+        stream_runtime.requestProxyRemoteCleanup(allocator, guid) catch |err| switch (err) {
             error.StreamNotFound, error.InvalidProxyId => return .missing,
             else => return err,
         };

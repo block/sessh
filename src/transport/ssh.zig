@@ -4188,7 +4188,7 @@ fn runProxyStreamSsh(
     if (diagnostics_plan.use_daemon_control and client_control_fd >= 0) {
         const fd = client_control_fd;
         client_control_fd = -1;
-        try plain_ssh.runArgvWithDiagnosticsThread(allocator, ssh_args, fd, "proxy-stream");
+        try plain_ssh.runArgvWithDiagnostics(allocator, ssh_args, fd, "proxy-stream");
     }
     try plain_ssh.runArgv(allocator, ssh_args, "proxy-stream");
 }

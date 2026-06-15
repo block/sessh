@@ -533,9 +533,8 @@ fn startSessionRuntimeAndConnect(allocator: std.mem.Allocator, exe: []const u8, 
     defer allocator.free(guid);
 
     daemon_log.infof(allocator, "terminal session creating session={s}", .{guid});
-    _ = exe;
-    _ = try session_runtime.startSessionRuntimeThread(allocator, guid);
-    const runtime_fd = try session_runtime.connectSessionRuntime(allocator, guid);
+    const control = try session_runtime.startSessionRuntimeProcess(allocator, exe, guid);
+    const runtime_fd = try session_runtime.connectStartedSessionRuntime(control);
     daemon_log.infof(
         allocator,
         "terminal session runtime connected session={s} elapsed_ms={}",

@@ -81,46 +81,24 @@ pub const LocalTerminalState = struct {
     }
 };
 
-const LocalTerminalProbeContext = struct {
-    state: LocalTerminalState = .{},
-};
-
 pub const LocalTerminalProbe = struct {
-    allocator: std.mem.Allocator,
-    context: ?*LocalTerminalProbeContext = null,
-    thread: ?std.Thread = null,
+    state: ?LocalTerminalState = null,
 
     pub fn start(allocator: std.mem.Allocator) LocalTerminalProbe {
-        const context = allocator.create(LocalTerminalProbeContext) catch return .{ .allocator = allocator };
-        context.* = .{};
-        const thread = std.Thread.spawn(.{}, captureLocalTerminalStateThread, .{context}) catch {
-            allocator.destroy(context);
-            return .{ .allocator = allocator };
-        };
+        _ = allocator;
         return .{
-            .allocator = allocator,
-            .context = context,
-            .thread = thread,
+            .state = captureLocalTerminalState(),
         };
     }
 
     pub fn finish(self: *LocalTerminalProbe) LocalTerminalState {
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
-        }
-        const context = self.context orelse return captureLocalTerminalState();
-        defer {
-            self.allocator.destroy(context);
-            self.context = null;
-        }
-        const state = context.state;
-        context.state = .{};
+        const state = self.state orelse return captureLocalTerminalState();
+        self.state = null;
         return state;
     }
 
     pub fn deinit(self: *LocalTerminalProbe) void {
-        if (self.context == null) return;
+        if (self.state == null) return;
         var state = self.finish();
         state.deinit();
     }
@@ -1476,10 +1454,6 @@ const ProtocolDefaultColors = struct {
     foreground_color: u32 = 0xffffffff,
     background_color: u32 = 0xffffffff,
 };
-
-fn captureLocalTerminalStateThread(context: *LocalTerminalProbeContext) void {
-    context.state = captureLocalTerminalState();
-}
 
 pub fn captureLocalTerminalState() LocalTerminalState {
     var state = LocalTerminalState{

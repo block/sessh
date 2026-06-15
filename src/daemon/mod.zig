@@ -218,9 +218,6 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
     defer if (args.len == 0) allocator.free(dir_name);
 
-    const daemon_exe = try socket_namespace.executablePath(allocator, dir_name, daemon_executable.daemon_name);
-    defer allocator.free(daemon_exe);
-
     socket_transport.publishRuntimeRootSymlinkOnce(allocator);
     const path = try socketPathForDirName(allocator, dir_name);
     defer allocator.free(path);
@@ -242,7 +239,8 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 
     var accept_context = DaemonAcceptContext{
         .allocator = allocator,
-        .exe = daemon_exe,
+        .terminal_runtime_exe = locked_runtime_executables.terminal_runtime,
+        .proxy_remote_exe = locked_runtime_executables.proxy_remote,
         .identity = identity,
         .listen_fd = listen_fd,
     };
@@ -271,7 +269,8 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 
 const DaemonAcceptContext = struct {
     allocator: std.mem.Allocator,
-    exe: []const u8,
+    terminal_runtime_exe: []const u8,
+    proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     listen_fd: c.fd_t,
 };
@@ -304,7 +303,8 @@ fn acceptDaemonClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher
     };
     context.* = .{
         .allocator = accept_context.allocator,
-        .exe = accept_context.exe,
+        .terminal_runtime_exe = accept_context.terminal_runtime_exe,
+        .proxy_remote_exe = accept_context.proxy_remote_exe,
         .identity = accept_context.identity,
         .fd = client_fd,
     };
@@ -330,7 +330,8 @@ const ClientStage = enum {
 
 const ClientContext = struct {
     allocator: std.mem.Allocator,
-    exe: []const u8,
+    terminal_runtime_exe: []const u8,
+    proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     fd: c.fd_t,
     reader: protocol.FrameReader = undefined,
@@ -463,7 +464,7 @@ fn handleDaemonClientFrame(
                 .transferred => return .transferred,
                 .close => return .close,
             }
-            return if (try handleClientFrameAfterHandshake(context.allocator, context.exe, context.identity, context.fd, frame.*))
+            return if (try handleClientFrameAfterHandshake(context.allocator, context.terminal_runtime_exe, context.identity, context.fd, frame.*))
                 .consumed
             else
                 .close;
@@ -528,7 +529,8 @@ fn transferInitialRequestToDispatcherOwner(
         try daemon_tunnel.registerMuxConnectionFromDaemon(
             context.allocator,
             daemon_dispatcher,
-            context.exe,
+            context.terminal_runtime_exe,
+            context.proxy_remote_exe,
             context.identity,
             initial_frames[0..],
             context.fd,
@@ -622,7 +624,7 @@ fn daemonHasLiveWork() bool {
     return active_local_clients.load(.acquire) != 0 or
         transport_ssh.activePooledSshTransportCount() != 0 or
         session_runtime.activeRuntimeCount() != 0 or
-        stream_runtime.activeProxyRuntimeCount() != 0;
+        stream_runtime.activeProxyRemoteProcessCount() != 0;
 }
 
 fn maintainDaemonCleanup(cleanup_context: *DaemonCleanupContext, now_ms: u64, has_local_client: bool) !bool {

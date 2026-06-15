@@ -4,6 +4,7 @@ const c = std.c;
 const posix = std.posix;
 
 const config = @import("../core/config.zig");
+const core_fds = @import("../core/fds.zig");
 const client_renderer = @import("renderer.zig");
 const io = @import("../core/io.zig");
 const pty_process = @import("../tty/pty_process.zig");
@@ -102,68 +103,29 @@ const SessionRuntime = struct {
     session: Session = .{},
     attached_client: AttachedClient = .{},
     running: bool = true,
-    shutting_down: bool = false,
     monotonic_clock: ?std.time.Timer = null,
     fixed_session_id: ?[]const u8 = null,
     started_session: bool = false,
 };
 
-const RuntimeControl = struct {
+const RuntimeProcessControl = struct {
     allocator: std.mem.Allocator,
     guid: []u8,
-    notify_read_fd: c.fd_t,
-    notify_write_fd: c.fd_t,
-    pending_mutex: std.Thread.Mutex = .{},
-    pending_clients: std.ArrayList(c.fd_t) = .empty,
-    closed: bool = false,
+    socket_path: []u8,
+    pid: c.pid_t = 0,
 
-    fn enqueue(self: *RuntimeControl, fd: c.fd_t) !void {
-        self.pending_mutex.lock();
-        defer self.pending_mutex.unlock();
-        if (self.closed) return error.SessionNotFound;
-        try self.pending_clients.append(self.allocator, fd);
-        var byte = [_]u8{1};
-        const n = c.write(self.notify_write_fd, &byte, byte.len);
-        if (n < 0 or @as(usize, @intCast(n)) != byte.len) {
-            _ = self.pending_clients.pop();
-            return error.RuntimeNotifyFailed;
-        }
-    }
-
-    fn takePending(self: *RuntimeControl) ?c.fd_t {
-        self.pending_mutex.lock();
-        defer self.pending_mutex.unlock();
-        if (self.pending_clients.items.len == 0) return null;
-        return self.pending_clients.orderedRemove(0);
-    }
-
-    fn close(self: *RuntimeControl) void {
-        self.pending_mutex.lock();
-        self.closed = true;
-        while (self.pending_clients.items.len > 0) {
-            const fd = self.pending_clients.pop().?;
-            _ = c.close(fd);
-        }
-        self.pending_mutex.unlock();
-    }
-
-    fn deinit(self: *RuntimeControl) void {
-        self.close();
-        self.pending_clients.deinit(self.allocator);
-        if (self.notify_read_fd >= 0) _ = c.close(self.notify_read_fd);
-        if (self.notify_write_fd >= 0) _ = c.close(self.notify_write_fd);
+    fn deinit(self: *RuntimeProcessControl) void {
         self.allocator.free(self.guid);
+        self.allocator.free(self.socket_path);
         self.* = undefined;
     }
 };
 
-var runtime_registry_mutex = std.Thread.Mutex{};
-var runtime_registry: std.ArrayList(*RuntimeControl) = .empty;
+var runtime_registry: std.ArrayList(*RuntimeProcessControl) = .empty;
+var runtime_socket_sequence: u64 = 0;
 
 const PollKind = union(enum) {
     listen,
-    shutdown_signal,
-    runtime_repair,
     session,
     attached_client,
 };
@@ -1147,73 +1109,57 @@ fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
     };
 }
 
-pub fn startSessionRuntimeThread(allocator: std.mem.Allocator, session_guid: []const u8) !*RuntimeControl {
+pub fn runRuntimeProcess(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    _ = allocator;
+    if (args.len != 2) return error.InvalidSessionRuntimeArgs;
+    core_fds.closeInheritedNonStdioFileDescriptors();
+    socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
+    const socket_path = args[0];
+    const session_guid = args[1];
+    const listen_fd = try socket_transport.listenSocket(socket_path);
+    defer _ = c.close(listen_fd);
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    try runSessionRuntimeLoop(session_guid, listen_fd);
+}
+
+pub fn startSessionRuntimeProcess(allocator: std.mem.Allocator, exe: []const u8, session_guid: []const u8) !*RuntimeProcessControl {
     const guid = try session_registry.canonicalGuid(allocator, session_guid);
     errdefer allocator.free(guid);
 
-    const notify_pipe = try posix.pipe();
-    errdefer {
-        posix.close(notify_pipe[0]);
-        posix.close(notify_pipe[1]);
-    }
-    setNonBlockingFd(notify_pipe[0]) catch {};
-    setNonBlockingFd(notify_pipe[1]) catch {};
-    socket_transport.setCloseOnExec(notify_pipe[0]) catch {};
-    socket_transport.setCloseOnExec(notify_pipe[1]) catch {};
+    const socket_path = try runtimeSocketPath(allocator, exe, "terminal");
+    errdefer allocator.free(socket_path);
 
-    const control = try allocator.create(RuntimeControl);
+    const control = try allocator.create(RuntimeProcessControl);
     errdefer allocator.destroy(control);
     control.* = .{
         .allocator = allocator,
         .guid = guid,
-        .notify_read_fd = notify_pipe[0],
-        .notify_write_fd = notify_pipe[1],
+        .socket_path = socket_path,
     };
     errdefer control.deinit();
 
     try registerRuntime(control);
     errdefer unregisterRuntime(control);
 
-    const context = try allocator.create(SessionRuntimeThreadContext);
-    errdefer allocator.destroy(context);
-    context.* = .{
-        .allocator = allocator,
-        .session_guid = try allocator.dupe(u8, guid),
-        .control = control,
-    };
-    errdefer allocator.free(context.session_guid);
-
-    const thread = try std.Thread.spawn(.{}, sessionRuntimeThreadMain, .{context});
-    thread.detach();
+    const argv = [_][]const u8{ exe, socket_path, guid };
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    control.pid = @intCast(child.id);
     return control;
 }
 
-const SessionRuntimeThreadContext = struct {
-    allocator: std.mem.Allocator,
-    session_guid: []u8,
-    control: *RuntimeControl,
-};
-
-fn sessionRuntimeThreadMain(context: *SessionRuntimeThreadContext) void {
-    const allocator = context.allocator;
-    const control = context.control;
-    defer {
-        unregisterRuntime(control);
-        control.deinit();
-        allocator.destroy(control);
-        allocator.free(context.session_guid);
-        allocator.destroy(context);
-    }
-    socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
-    const shutdown_pipe = posix.pipe() catch return;
-    defer {
-        posix.close(shutdown_pipe[0]);
-        posix.close(shutdown_pipe[1]);
-    }
-    runSessionRuntimeLoop(context.session_guid, shutdown_pipe[0], control) catch {};
+fn runtimeSocketPath(allocator: std.mem.Allocator, exe: []const u8, prefix: []const u8) ![]u8 {
+    const dir = std.fs.path.dirname(exe) orelse return error.InvalidRuntimeExecutablePath;
+    const sequence = runtime_socket_sequence;
+    runtime_socket_sequence +%= 1;
+    return std.fmt.allocPrint(allocator, "{s}/{s}-{}-{}.sock", .{ dir, prefix, c.getpid(), sequence });
 }
 
-fn runSessionRuntimeLoop(session_guid: []const u8, shutdown_signal_fd: c.fd_t, control: *RuntimeControl) !void {
+fn runSessionRuntimeLoop(session_guid: []const u8, listen_fd: c.fd_t) !void {
     var session_runtime = SessionRuntime{
         .fixed_session_id = session_guid,
     };
@@ -1221,7 +1167,7 @@ fn runSessionRuntimeLoop(session_guid: []const u8, shutdown_signal_fd: c.fd_t, c
     defer closeSessionRuntime(&session_runtime);
 
     while (session_runtime.running) {
-        try sessionRuntimePollOnce(&session_runtime, control, shutdown_signal_fd);
+        try sessionRuntimePollOnce(&session_runtime, listen_fd);
         stopSessionRuntimeIfComplete(&session_runtime);
     }
 }
@@ -1231,16 +1177,32 @@ pub fn connectSessionRuntime(allocator: std.mem.Allocator, guid: []const u8) !c.
     defer allocator.free(canonical);
 
     const control = lookupRuntime(canonical) orelse return error.SessionNotFound;
-    var fds: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
-    errdefer {
-        _ = c.close(fds[0]);
-        _ = c.close(fds[1]);
+    return connectRuntimeControl(control) catch |err| switch (err) {
+        error.SocketPathMissing, error.ConnectFailed => {
+            forgetSessionRuntime(canonical);
+            return error.SessionNotFound;
+        },
+        else => return err,
+    };
+}
+
+pub fn connectStartedSessionRuntime(control: *RuntimeProcessControl) !c.fd_t {
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        return connectRuntimeControl(control) catch |err| switch (err) {
+            error.SocketPathMissing, error.ConnectFailed => {
+                io.sleepMillis(5);
+                continue;
+            },
+            else => return err,
+        };
     }
-    try socket_transport.setCloseOnExec(fds[0]);
-    try socket_transport.setCloseOnExec(fds[1]);
-    try control.enqueue(fds[1]);
-    return fds[0];
+    forgetSessionRuntime(control.guid);
+    return error.SessionNotFound;
+}
+
+fn connectRuntimeControl(control: *const RuntimeProcessControl) !c.fd_t {
+    return socket_transport.connectSocket(control.socket_path);
 }
 
 pub fn requestSessionCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
@@ -1262,36 +1224,25 @@ pub fn requestSessionCleanup(allocator: std.mem.Allocator, guid: []const u8) !vo
 }
 
 pub fn connectSingleLiveSessionRuntime(allocator: std.mem.Allocator) !c.fd_t {
-    runtime_registry_mutex.lock();
     var found_guid: ?[]u8 = null;
     for (runtime_registry.items) |control| {
-        control.pending_mutex.lock();
-        const live = !control.closed;
-        control.pending_mutex.unlock();
-        if (!live) continue;
         if (found_guid != null) {
-            runtime_registry_mutex.unlock();
             return error.AmbiguousSession;
         }
         found_guid = try allocator.dupe(u8, control.guid);
     }
-    runtime_registry_mutex.unlock();
     defer if (found_guid) |guid| allocator.free(guid);
     return connectSessionRuntime(allocator, found_guid orelse return error.SessionNotFound);
 }
 
-fn registerRuntime(control: *RuntimeControl) !void {
-    runtime_registry_mutex.lock();
-    defer runtime_registry_mutex.unlock();
+fn registerRuntime(control: *RuntimeProcessControl) !void {
     for (runtime_registry.items) |existing| {
         if (std.mem.eql(u8, existing.guid, control.guid)) return error.SessionExists;
     }
     try runtime_registry.append(app_allocator.allocator(), control);
 }
 
-fn unregisterRuntime(control: *RuntimeControl) void {
-    runtime_registry_mutex.lock();
-    defer runtime_registry_mutex.unlock();
+fn unregisterRuntime(control: *RuntimeProcessControl) void {
     for (runtime_registry.items, 0..) |existing, index| {
         if (existing == control) {
             _ = runtime_registry.orderedRemove(index);
@@ -1300,41 +1251,72 @@ fn unregisterRuntime(control: *RuntimeControl) void {
     }
 }
 
+pub fn forgetSessionRuntime(guid: []const u8) void {
+    for (runtime_registry.items, 0..) |control, index| {
+        if (std.mem.eql(u8, control.guid, guid)) {
+            _ = runtime_registry.orderedRemove(index);
+            _ = reapRuntimeProcess(control.pid);
+            const allocator = control.allocator;
+            control.deinit();
+            allocator.destroy(control);
+            return;
+        }
+    }
+}
+
 pub fn activeRuntimeCount() usize {
-    runtime_registry_mutex.lock();
-    defer runtime_registry_mutex.unlock();
+    pruneExitedRuntimes();
     return runtime_registry.items.len;
 }
 
-fn lookupRuntime(guid: []const u8) ?*RuntimeControl {
-    runtime_registry_mutex.lock();
-    defer runtime_registry_mutex.unlock();
+fn lookupRuntime(guid: []const u8) ?*RuntimeProcessControl {
     for (runtime_registry.items) |control| {
         if (std.mem.eql(u8, control.guid, guid)) return control;
     }
     return null;
 }
 
-fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, control: *RuntimeControl, shutdown_signal_fd: c.fd_t) !void {
+fn pruneExitedRuntimes() void {
+    var index: usize = 0;
+    while (index < runtime_registry.items.len) {
+        const control = runtime_registry.items[index];
+        if (reapRuntimeProcess(control.pid)) {
+            _ = runtime_registry.orderedRemove(index);
+            const allocator = control.allocator;
+            control.deinit();
+            allocator.destroy(control);
+            continue;
+        }
+        index += 1;
+    }
+}
+
+fn reapRuntimeProcess(pid: c.pid_t) bool {
+    if (pid <= 0) return true;
+    var status: c_int = 0;
+    const result = c.waitpid(pid, &status, 1);
+    if (result == pid) return true;
+    if (result < 0) return switch (posix.errno(result)) {
+        .CHILD => true,
+        else => false,
+    };
+    return false;
+}
+
+fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, listen_fd: c.fd_t) !void {
     const now_ms = sessionRuntimeMonotonicMs(session_runtime);
     const now_unix_ms = nowUnixMs();
     clearExpiredDebugUnresponsiveAttachedClients(session_runtime, now_ms);
     if (reapPtyHangupSessionIfExited(session_runtime)) return;
     if (endReapedSessions(session_runtime, now_unix_ms)) return;
 
-    var pollfds: [5]posix.pollfd = undefined;
-    var kinds: [5]PollKind = undefined;
+    var pollfds: [4]posix.pollfd = undefined;
+    var kinds: [4]PollKind = undefined;
     var count: usize = 0;
 
-    pollfds[count] = .{ .fd = shutdown_signal_fd, .events = posix.POLL.IN, .revents = 0 };
-    kinds[count] = .shutdown_signal;
+    pollfds[count] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
+    kinds[count] = .listen;
     count += 1;
-
-    if (!session_runtime.shutting_down) {
-        pollfds[count] = .{ .fd = control.notify_read_fd, .events = posix.POLL.IN, .revents = 0 };
-        kinds[count] = .listen;
-        count += 1;
-    }
 
     if (session_runtime.session.alive and session_runtime.session.pty_fd >= 0) {
         const session = &session_runtime.session;
@@ -1363,9 +1345,7 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, control: *RuntimeCon
     for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
         if (pollfd.revents == 0) continue;
         switch (kind) {
-            .listen => handleRuntimeHandoffEvent(session_runtime, control),
-            .shutdown_signal => handleShutdownSignalEvent(session_runtime, shutdown_signal_fd),
-            .runtime_repair => {},
+            .listen => handleRuntimeHandoffEvent(session_runtime, listen_fd),
             .session => drainSessionOutput(session_runtime),
             .attached_client => handleAttachedClientEvents(session_runtime, pollfd.revents),
         }
@@ -1473,25 +1453,6 @@ fn flushExpiredSynchronizedOutputSessions(session_runtime: *SessionRuntime, now_
     }
 }
 
-fn drainSignalPipe(fd: c.fd_t) void {
-    var buf: [64]u8 = undefined;
-    _ = c.read(fd, &buf, buf.len);
-}
-
-fn setNonBlockingFd(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    if ((flags & nonblocking_flag) != 0) return;
-    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-}
-
-fn handleShutdownSignalEvent(session_runtime: *SessionRuntime, shutdown_signal_fd: c.fd_t) void {
-    var buf: [32]u8 = undefined;
-    _ = c.read(shutdown_signal_fd, &buf, buf.len);
-    requestGracefulShutdown(session_runtime);
-}
-
 fn handleAttachedClientEvents(session_runtime: *SessionRuntime, revents: i16) void {
     if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
         disconnectAttachedClient(session_runtime);
@@ -1507,16 +1468,18 @@ fn handleAttachedClientEvents(session_runtime: *SessionRuntime, revents: i16) vo
     }
 }
 
-fn handleRuntimeHandoffEvent(session_runtime: *SessionRuntime, control: *RuntimeControl) void {
-    drainSignalPipe(control.notify_read_fd);
-
-    while (control.takePending()) |client_fd| {
-        const keep_open = handleSessionRuntimeClient(session_runtime, client_fd) catch |err| blk: {
-            io.stderrPrint("sessh remote session runtime: client error: {t}\n", .{err}) catch {};
-            break :blk false;
-        };
-        if (!keep_open) _ = c.close(client_fd);
-    }
+fn handleRuntimeHandoffEvent(session_runtime: *SessionRuntime, listen_fd: c.fd_t) void {
+    const client_fd = c.accept(listen_fd, null, null);
+    if (client_fd < 0) return;
+    socket_transport.setCloseOnExec(client_fd) catch {
+        _ = c.close(client_fd);
+        return;
+    };
+    const keep_open = handleSessionRuntimeClient(session_runtime, client_fd) catch |err| blk: {
+        io.stderrPrint("sessh remote session runtime: client error: {t}\n", .{err}) catch {};
+        break :blk false;
+    };
+    if (!keep_open) _ = c.close(client_fd);
 }
 
 fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !bool {
@@ -1601,12 +1564,6 @@ fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !boo
             },
         }
     }
-}
-
-fn requestGracefulShutdown(session_runtime: *SessionRuntime) void {
-    if (session_runtime.shutting_down) return;
-    session_runtime.shutting_down = true;
-    if (session_runtime.session.alive) endSession(session_runtime, 1, .{ .ended_at_unix_ms = nowUnixMs() });
 }
 
 fn acceptRemoteHandshake(session_runtime: *SessionRuntime, fd: c.fd_t) !HandshakeResult {
@@ -3636,11 +3593,6 @@ fn endSession(session_runtime: *SessionRuntime, reason: u8, exit_info: ExitInfo)
 }
 
 fn stopSessionRuntimeIfComplete(session_runtime: *SessionRuntime) void {
-    if (session_runtime.shutting_down) {
-        if (session_runtime.attached_client.active) return;
-        session_runtime.running = false;
-        return;
-    }
     if (session_runtime.fixed_session_id == null or !session_runtime.started_session) return;
     if (session_runtime.session.alive) return;
     if (session_runtime.attached_client.active) return;

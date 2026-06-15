@@ -26,7 +26,8 @@ const StreamEntry = struct {
 
 const MuxConnection = struct {
     allocator: std.mem.Allocator,
-    exe: []const u8,
+    terminal_runtime_exe: []const u8,
+    proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     mux_fd: c.fd_t = -1,
     mux_watch_id: ?dispatcher.FdWatchId = null,
@@ -57,7 +58,8 @@ const MuxConnection = struct {
 pub fn registerMuxConnectionFromDaemon(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    exe: []const u8,
+    terminal_runtime_exe: []const u8,
+    proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     initial_frames: []const protocol.OwnedFrame,
     fd: c.fd_t,
@@ -66,7 +68,8 @@ pub fn registerMuxConnectionFromDaemon(
     errdefer allocator.destroy(connection);
     connection.* = .{
         .allocator = allocator,
-        .exe = exe,
+        .terminal_runtime_exe = terminal_runtime_exe,
+        .proxy_remote_exe = proxy_remote_exe,
         .identity = identity,
         .mux_fd = fd,
         .mux_reader = protocol.FrameReader.init(allocator),
@@ -169,7 +172,7 @@ fn handleMuxStreamFrame(
             switch (streamKind(connection, stream_id)) {
                 .terminal => try session_daemon_handler.handleTeMuxStreamFrame(
                     connection.allocator,
-                    connection.exe,
+                    connection.terminal_runtime_exe,
                     connection.identity,
                     &connection.terminal_sessions,
                     connection.mux_fd,
@@ -179,7 +182,7 @@ fn handleMuxStreamFrame(
                 ),
                 .proxy => try stream_runtime.handleProxyMuxStreamFrame(
                     connection.allocator,
-                    connection.exe,
+                    connection.proxy_remote_exe,
                     connection.identity,
                     &connection.proxy_streams,
                     connection.mux_fd,
@@ -198,7 +201,7 @@ fn handleMuxStreamFrame(
             if (kind == .terminal) {
                 try session_daemon_handler.handleTeMuxStreamFrame(
                     connection.allocator,
-                    connection.exe,
+                    connection.terminal_runtime_exe,
                     connection.identity,
                     &connection.terminal_sessions,
                     connection.mux_fd,
@@ -209,7 +212,7 @@ fn handleMuxStreamFrame(
             } else {
                 try stream_runtime.handleProxyMuxStreamFrame(
                     connection.allocator,
-                    connection.exe,
+                    connection.proxy_remote_exe,
                     connection.identity,
                     &connection.proxy_streams,
                     connection.mux_fd,
@@ -226,7 +229,7 @@ fn handleMuxStreamFrame(
             switch (kind) {
                 .terminal => try session_daemon_handler.handleTeMuxStreamFrame(
                     connection.allocator,
-                    connection.exe,
+                    connection.terminal_runtime_exe,
                     connection.identity,
                     &connection.terminal_sessions,
                     connection.mux_fd,
@@ -236,7 +239,7 @@ fn handleMuxStreamFrame(
                 ),
                 .proxy => try stream_runtime.handleProxyMuxStreamFrame(
                     connection.allocator,
-                    connection.exe,
+                    connection.proxy_remote_exe,
                     connection.identity,
                     &connection.proxy_streams,
                     connection.mux_fd,

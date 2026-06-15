@@ -194,48 +194,12 @@ fn copyBytes(dest: []u8, source: []const u8) usize {
     return len;
 }
 
-const DiagnosticsThreadState = struct {
-    control_fd: c.fd_t,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-};
-
-fn diagnosticsThreadMain(state: *DiagnosticsThreadState, allocator: std.mem.Allocator) void {
-    var diagnostics = ProxyClientControl.init(allocator, false, true);
-    if (state.control_fd >= 0) diagnostics.setControlFd(state.control_fd);
-    defer {
-        diagnostics.clear();
-        diagnostics.closeControl();
-    }
-
-    while (!state.done.load(.acquire)) {
-        if (diagnostics.control_fd < 0) {
-            io.sleepMillis(100);
-            continue;
-        }
-        var pollfds: [1]posix.pollfd = undefined;
-        var count: usize = 0;
-        pollfds[count] = .{ .fd = diagnostics.control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-        count += 1;
-        _ = posix.poll(pollfds[0..count], 100) catch continue;
-        if (pollfds[0].revents != 0) diagnostics.readControl();
-    }
-}
-
-pub fn runArgvWithDiagnosticsThread(
+pub fn runArgvWithDiagnostics(
     allocator: std.mem.Allocator,
     ssh_args: []const []const u8,
     control_fd: c.fd_t,
     diagnostic_name: []const u8,
 ) !noreturn {
-    var state = DiagnosticsThreadState{ .control_fd = control_fd };
-    const thread_allocator = std.heap.smp_allocator;
-    var thread = try std.Thread.spawn(.{}, diagnosticsThreadMain, .{ &state, thread_allocator });
-    var joined = false;
-    defer if (!joined) {
-        state.done.store(true, .release);
-        thread.join();
-    };
-
     const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
     defer allocator.free(ssh_argv);
     ssh_argv[0] = "ssh";
@@ -248,11 +212,40 @@ pub fn runArgvWithDiagnosticsThread(
     child.stderr_behavior = .Inherit;
     try child.spawn();
 
-    const term = try child.wait();
-    state.done.store(true, .release);
-    thread.join();
-    joined = true;
+    var diagnostics = ProxyClientControl.init(allocator, false, true);
+    if (control_fd >= 0) diagnostics.setControlFd(control_fd);
+    defer {
+        diagnostics.clear();
+        diagnostics.closeControl();
+    }
+
+    const child_pid: c.pid_t = @intCast(child.id);
+    const term = waitForChildAndDiagnostics(child_pid, &diagnostics);
     return exitAfterTerm(term, diagnostic_name);
+}
+
+fn waitForChildAndDiagnostics(pid: c.pid_t, diagnostics: *ProxyClientControl) std.process.Child.Term {
+    while (true) {
+        var status: c_int = 0;
+        const result = c.waitpid(pid, &status, 1);
+        if (result == pid) return pty_process.waitStatusToTerm(@bitCast(status));
+        if (result < 0) switch (posix.errno(result)) {
+            .INTR => {},
+            else => return .{ .Unknown = 0 },
+        };
+
+        if (diagnostics.control_fd < 0) {
+            io.sleepMillis(100);
+            continue;
+        }
+        var pollfds = [_]posix.pollfd{.{
+            .fd = diagnostics.control_fd,
+            .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR,
+            .revents = 0,
+        }};
+        _ = posix.poll(&pollfds, 100) catch continue;
+        if (pollfds[0].revents != 0) diagnostics.readControl();
+    }
 }
 
 pub fn runArgvUnderLocalPty(
