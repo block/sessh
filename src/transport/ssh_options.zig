@@ -17,9 +17,11 @@ pub const ResolvedSshConfig = struct {
     hostname: []u8,
     port: []u8,
     ipqos: ?[]u8 = null,
+    send_env: []const []const u8 = &.{},
 
     pub fn deinit(self: *ResolvedSshConfig, allocator: std.mem.Allocator) void {
         if (self.ipqos) |value| allocator.free(value);
+        freeStringList(allocator, self.send_env);
         allocator.free(self.port);
         allocator.free(self.hostname);
         allocator.free(self.user);
@@ -62,6 +64,7 @@ fn fallbackResolvedSshConfig(allocator: std.mem.Allocator, ssh_options: []const 
         .hostname = try allocator.dupe(u8, host),
         .port = try allocator.dupe(u8, explicit_port),
         .ipqos = null,
+        .send_env = &.{},
     };
 }
 
@@ -103,11 +106,14 @@ pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_opti
     var hostname: ?[]u8 = null;
     var port: ?[]u8 = null;
     var ipqos: ?[]u8 = null;
+    var send_env = std.ArrayList([]const u8).empty;
     errdefer {
         if (user) |value| allocator.free(value);
         if (hostname) |value| allocator.free(value);
         if (port) |value| allocator.free(value);
         if (ipqos) |value| allocator.free(value);
+        freeStrings(allocator, send_env.items);
+        send_env.deinit(allocator);
     }
 
     var lines = std.mem.splitScalar(u8, output, '\n');
@@ -131,6 +137,10 @@ pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_opti
             const interactive = fields.next() orelse continue;
             if (ipqos) |old| allocator.free(old);
             ipqos = try allocator.dupe(u8, interactive);
+        } else if (std.ascii.eqlIgnoreCase(key, "sendenv")) {
+            while (fields.next()) |pattern| {
+                try send_env.append(allocator, try allocator.dupe(u8, pattern));
+            }
         }
     }
     if (user == null) user = try fallbackSshUser(allocator);
@@ -144,7 +154,17 @@ pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_opti
         .hostname = hostname.?,
         .port = port.?,
         .ipqos = ipqos,
+        .send_env = try send_env.toOwnedSlice(allocator),
     };
+}
+
+fn freeStringList(allocator: std.mem.Allocator, values: []const []const u8) void {
+    freeStrings(allocator, values);
+    if (values.len != 0) allocator.free(values);
+}
+
+fn freeStrings(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| allocator.free(value);
 }
 
 pub fn explicitSshPort(ssh_options: []const []const u8) ?[]const u8 {
@@ -455,6 +475,7 @@ test "parseSshConfig returns resolved endpoint and first configured ipqos value"
         \\hostname example.com
         \\port 2200
         \\ipqos ef cs0
+        \\sendenv LANG LC_* SESSH_TEST_SENDENV
         \\user tomm
         \\
     , &.{}, "alias");
@@ -462,6 +483,7 @@ test "parseSshConfig returns resolved endpoint and first configured ipqos value"
     try std.testing.expectEqualStrings("example.com", resolved.hostname);
     try std.testing.expectEqualStrings("2200", resolved.port);
     try std.testing.expectEqualStrings("ef", resolved.ipqos.?);
+    try expectArgvEqual(&.{ "LANG", "LC_*", "SESSH_TEST_SENDENV" }, resolved.send_env);
 }
 
 test "parseSshConfig defaults endpoint fields" {

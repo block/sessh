@@ -109,6 +109,12 @@ message ClientDaemonItem {
   // frames after this request; the local daemon queues them behind tunnel setup
   // and forwards them over ssh when the remote daemon endpoint is ready.
   message SshTransportAcquire {
+    enum Kind {
+      KIND_UNSPECIFIED = 0;
+      KIND_PROXY = 1;
+      KIND_TERMINAL = 2;
+    }
+
     repeated string ssh_option = 1;
     string host = 2;
     bool bootstrap = 3;
@@ -125,6 +131,14 @@ message ClientDaemonItem {
     // string from the local platform.
     uint64 local_pid = 6;
     string local_start_time = 7;
+    // The current remote mux handlers own stream-kind-specific runtime state.
+    // Keep pooled tunnels kind-homogeneous until the remote mux dispatcher owns
+    // both proxy and terminal-emulator runtimes in one connection.
+    Kind kind = 8;
+    // Candidate environment from the visible client. The local daemon filters
+    // this through the resolved ssh SendEnv rules before forwarding anything to
+    // the remote daemon.
+    repeated EnvironmentEntry client_environment = 9;
   }
 
   // Local client -> local daemon request to follow new operational log entries.

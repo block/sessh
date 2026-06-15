@@ -65,6 +65,11 @@ while [ "$#" -gt 0 ]; do
       saw_t=1
       shift
       ;;
+    -l|-p)
+      shift
+      [ "$#" -gt 0 ] || exit 97
+      shift
+      ;;
     -*)
       printf 'fake ssh: unsupported option: %s\\n' "$1" >&2
       exit 97
@@ -241,9 +246,15 @@ def main():
         env = isolated_env(tmp)
         fake_bin = tmp / "fake-bin"
         fake_ssh = fake_bin / "ssh"
+        fake_sessh = fake_bin / "sessh"
         fail_batch_count_file = tmp / "fail-batch-count"
-        remote_shell = Path(env["HOME"]) / "remote-shell"
+        remote_shell = tmp / "remote-shell"
         write_fake_ssh(fake_ssh)
+        fake_sessh.write_text(
+            "#!/bin/sh\n"
+            f"exec {shlex.quote(str(BIN if BIN.is_absolute() else ROOT / BIN))} \"$@\"\n"
+        )
+        fake_sessh.chmod(0o700)
         remote_shell.write_text(
             "#!/bin/sh\n"
             "printf 'REMOTE_TOP\\nREMOTE_PROMPT$ '\n"
@@ -273,8 +284,16 @@ def main():
         child_env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "1"
         child_env["SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR"] = env["XDG_RUNTIME_DIR"] + ".remote"
         config_dir = Path(env["XDG_CONFIG_HOME"]) / "sessh"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        (config_dir / "sessh.env").write_text("scrollback-limit=321\n")
+
+        def write_config():
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "sessh.env").write_text("bootstrap=false\nscrollback-limit=321\n")
+
+        def reset_runtime():
+            cleanup_runtime(env)
+            write_config()
+
+        write_config()
         sessh_wrapper = tmp / "run-sessh"
         sessh_wrapper.write_text(
             "#!/bin/sh\n"
@@ -293,7 +312,7 @@ def main():
         )
         sessh_wrapper.chmod(sessh_wrapper.stat().st_mode | stat.S_IXUSR)
 
-        cleanup_runtime(env)
+        reset_runtime()
         try:
             new_tmux_session(env, session, 80, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", session, "remain-on-exit", "on"])
@@ -348,7 +367,7 @@ def main():
             if "OUTER_BEFORE_1" not in final or "OUTER_BEFORE_2" not in final:
                 raise AssertionError(f"reconnect damaged outer scrollback:\n{final}")
 
-            cleanup_runtime(env)
+            reset_runtime()
             new_tmux_session(env, reconnect_close_session, 100, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", reconnect_close_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_close_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
@@ -361,7 +380,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_close_session, "printf 'OUTER_RECONNECT_CLOSED\\n'", "Enter"])
             wait_capture(env, reconnect_close_session, "OUTER_RECONNECT_CLOSED")
 
-            cleanup_runtime(env)
+            reset_runtime()
             new_tmux_session(env, bottom_session, 100, 8)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", bottom_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
@@ -404,7 +423,7 @@ def main():
                     f"after:\n{bottom_after}"
                 )
 
-            cleanup_runtime(env)
+            reset_runtime()
             new_tmux_session(env, bottom_failure_session, 100, 8)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", bottom_failure_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
@@ -441,7 +460,7 @@ def main():
             if "sessh: disconnected" in bottom_failure_after:
                 raise AssertionError(f"bottom reconnect after failed attempt leaked banner:\n{bottom_failure_after}")
 
-            cleanup_runtime(env)
+            reset_runtime()
             idle_close_session = f"{close_session}-idle"
             new_tmux_session(env, idle_close_session, 140, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", idle_close_session, "remain-on-exit", "on"])
@@ -457,7 +476,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", idle_close_session, "printf 'OUTER_IDLE_CLOSED\\n'", "Enter"])
             wait_capture(env, idle_close_session, "OUTER_IDLE_CLOSED")
 
-            cleanup_runtime(env)
+            reset_runtime()
             new_tmux_session(env, close_session, 80, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", close_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", close_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
@@ -479,7 +498,7 @@ def main():
             if "REMOTE_SPAM_" not in closed:
                 raise AssertionError(f"close lost flowing output from scrollback:\n{closed}")
 
-            cleanup_runtime(env)
+            reset_runtime()
             new_tmux_session(env, alt_close_session, 80, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", alt_close_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_close_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])
@@ -496,7 +515,7 @@ def main():
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_close_session, "printf 'OUTER_ALT_CLOSED\\n'", "Enter"])
             wait_capture(env, alt_close_session, "OUTER_ALT_CLOSED")
 
-            cleanup_runtime(env)
+            reset_runtime()
             new_tmux_session(env, alt_reconnect_close_session, 140, 24)
             run(env, [*TMUX_ARGS, "set-window-option", "-t", alt_reconnect_close_session, "remain-on-exit", "on"])
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_close_session, f"PS1={shlex.quote(PROMPT)} exec /bin/sh", "Enter"])

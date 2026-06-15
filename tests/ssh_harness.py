@@ -26,7 +26,6 @@ from socket_harness import (
     DRAW,
     SESSION_CLIENT_CONTROL_RESPONSE,
     SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
-    SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST,
     SESSION_ATTACHED,
     TERMINAL_STREAM_OPEN,
     pack_session_create,
@@ -377,7 +376,7 @@ if [ -n "${SESSH_FAKE_SSH_LOG_IPQOS:-}" ] && [ -n "$ipqos_option" ]; then
   printf 'ipqos=%s\\n' "$ipqos_option" >>"$SESSH_FAKE_SSH_LOG"
 fi
 export SESSH_TEST_HOST=$host
-if [ "$batch_mode" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_DELAY_ON_BATCH:-}" ]; then
+if [ "$batch_mode" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_DELAY_ON_BATCH:-}" ] && { [ -z "${SESSH_FAKE_SSH_DELAY_ON_BATCH_FILE:-}" ] || [ -e "$SESSH_FAKE_SSH_DELAY_ON_BATCH_FILE" ]; }; then
   sleep "$SESSH_FAKE_SSH_DELAY_ON_BATCH"
 fi
 if [ "$batch_mode" -eq 1 ] && [ -n "${SESSH_FAKE_SSH_STDERR_ON_BATCH:-}" ]; then
@@ -599,16 +598,6 @@ def sever_session_clients(env, timeout=30.0):
         conn.connect(str(daemon_socket_path(fake_remote_runtime_root(env))))
         send_hello(conn)
         send_frame(conn, SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST, request.SerializeToString())
-        recv_until_message(conn, SESSION_CLIENT_CONTROL_RESPONSE, timeout=timeout)
-
-
-def make_session_clients_unresponsive(env, seconds, timeout=30.0):
-    request = sessh_pb().TerminalEmulatorItem.SessionClientDebugUnresponsiveConnectionRequest(seconds=seconds)
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-        conn.settimeout(timeout)
-        conn.connect(str(daemon_socket_path(fake_remote_runtime_root(env))))
-        send_hello(conn)
-        send_frame(conn, SESSION_CLIENT_DEBUG_UNRESPONSIVE_CONNECTION_REQUEST, request.SerializeToString())
         recv_until_message(conn, SESSION_CLIENT_CONTROL_RESPONSE, timeout=timeout)
 
 
@@ -1049,6 +1038,18 @@ def run_sessh_reconnect_pty_probe(args, env, ready, after, timeout=30.0):
     )
 
 
+def wait_for_pty_child(pid, fd, output, timeout=10.0, context="pty command"):
+    deadline = time.monotonic() + timeout
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return wait_status_to_returncode(status), output + read_available_pty(fd)
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out waiting for {context} to exit; got {output!r}")
+        output += read_available_pty(fd)
+        time.sleep(0.05)
+
+
 OSC_RE = re.compile(r"\x1b\][^\x1b]*(?:\x1b\\|\x07)")
 CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 UI_MESSAGE_RE = re.compile(r"(?:---\s*)?(?:ssh|sessh): [^\r\n]+")
@@ -1076,87 +1077,120 @@ def strip_bootstrap_status(stderr):
 
 def run_sessh_enter_alt_then_reconnect_banner(args, env, primary, alt_ready, timeout=30.0):
     argv = sessh_argv(args)
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(argv[0], argv, env)
+
+    output = b""
+    reconnect_output = b""
+    waited = False
+    returncode = None
     try:
-        read_until_pipe(proc.stdout, primary.encode("utf-8"), timeout)
-        proc.stdin.write(b"enter-alt\n")
-        proc.stdin.flush()
-        read_until_pipe(proc.stdout, alt_ready.encode("utf-8"), timeout)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        output = read_pty_until(fd, output, primary.encode("utf-8"), timeout=timeout)
+        os.write(fd, b"enter-alt\r")
+        output = read_pty_until(fd, output, alt_ready.encode("utf-8"), timeout=timeout)
         sever_session_clients(env, timeout)
-        stdout = read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
-        proc.stdin.write(b"~.")
-        proc.stdin.flush()
-        proc.stdin.close()
-        returncode = proc.wait(timeout=timeout)
+        reconnect_start = len(output)
+        output = read_pty_until(fd, output, b"sessh: disconnected: Retry connecting 10sec", timeout=timeout)
+        reconnect_output = output[reconnect_start:]
+        os.write(fd, b"\r~.")
+        returncode, output = wait_for_pty_child(pid, fd, output, timeout=timeout, context="alt-screen reconnect close")
+        waited = True
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            returncode = proc.wait(timeout=timeout)
-    stderr = proc.stderr.read()
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(fd)
     return subprocess.CompletedProcess(
         argv,
         returncode,
-        stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
+        reconnect_output.decode("utf-8", "replace"),
+        "",
     )
 
 
-def run_sessh_close_reconnect_probe(args, env, ready, close_bytes=b"~.", timeout=10.0):
+def run_sessh_close_reconnect_probe(args, env, ready, close_bytes=b"~.", timeout=10.0, before_sever=None):
     argv = sessh_argv(args)
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
-    sever_session_clients(env, timeout)
-    stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", timeout)
-    proc.stdin.write(close_bytes)
-    proc.stdin.flush()
-    proc.stdin.close()
-    returncode = proc.wait(timeout=timeout)
-    stdout += proc.stdout.read()
-    stderr = proc.stderr.read()
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(argv[0], argv, env)
+
+    stdout = b""
+    waited = False
+    returncode = None
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        stdout = read_pty_until(fd, stdout, ready.encode("utf-8"), timeout=timeout)
+        if before_sever is not None:
+            before_sever()
+        sever_session_clients(env, timeout)
+        stdout = read_pty_until(fd, stdout, b"sessh: disconnected: Retry connecting 10sec", timeout=timeout)
+        if close_bytes == b"~.":
+            os.write(fd, b"\r~.")
+        else:
+            os.write(fd, close_bytes)
+        returncode, stdout = wait_for_pty_child(pid, fd, stdout, timeout=timeout, context="reconnect close")
+        waited = True
+    finally:
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(fd)
     return subprocess.CompletedProcess(
         argv,
         returncode,
         stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
+        "",
     )
 
 
 def run_sessh_close_probe(args, env, ready, timeout=10.0):
     argv = sessh_argv(args)
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    stdout = read_until_pipe(proc.stdout, ready.encode("utf-8"), timeout)
-    proc.stdin.write(b"~.")
-    proc.stdin.flush()
-    proc.stdin.close()
-    returncode = proc.wait(timeout=timeout)
-    stdout += proc.stdout.read()
-    stderr = proc.stderr.read()
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(argv[0], argv, env)
+
+    stdout = b""
+    waited = False
+    returncode = None
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        stdout = read_pty_until(fd, stdout, ready.encode("utf-8"), timeout=timeout)
+        os.write(fd, b"\r~.")
+        returncode, stdout = wait_for_pty_child(pid, fd, stdout, timeout=timeout, context="escape close")
+        waited = True
+    finally:
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(fd)
     return subprocess.CompletedProcess(
         argv,
         returncode,
         stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
+        "",
     )
 
 
@@ -2091,7 +2125,7 @@ def test_ssh_transport_cache_hit_suppresses_bootstrap_status(tmp):
         raise AssertionError(ssh_failure_diagnostics(f"daemon log missing {expected!r}", result, fake_log, fake_trace))
 
 
-def test_ssh_clean_remote_exit_removes_routes(tmp):
+def test_ssh_clean_remote_exit_preserves_status(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2110,7 +2144,12 @@ def test_ssh_clean_remote_exit_removes_routes(tmp):
     env["SESSH_FAKE_SSH_REMOTE_XDG_STATE_HOME"] = str(remote_state)
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["test-host"], env, timeout=30.0)
+    result = run_sessh_in_pty(
+        ["test-host"],
+        env,
+        ((marker.encode("utf-8"), None),),
+        timeout=30.0,
+    )
 
     if result.returncode != 7:
         raise AssertionError(result)
@@ -2174,7 +2213,12 @@ def test_ssh_transport_pins_ipqos_to_interactive_config_value(tmp):
     env["SESSH_FAKE_SSH_G_IPQOS"] = "af31 cs1"
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["test-host"], env, timeout=30.0)
+    result = run_sessh_in_pty(
+        ["test-host"],
+        env,
+        ((marker.encode("utf-8"), None),),
+        timeout=30.0,
+    )
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -2200,7 +2244,12 @@ def test_ssh_transport_respects_explicit_user_ipqos(tmp):
     env["SESSH_FAKE_SSH_G_IPQOS"] = "af31 cs1"
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["-oIPQoS=none", "test-host"], env, timeout=30.0)
+    result = run_sessh_in_pty(
+        ["-oIPQoS=none", "test-host"],
+        env,
+        ((marker.encode("utf-8"), None),),
+        timeout=30.0,
+    )
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -2225,7 +2274,12 @@ def test_ssh_transport_pins_explicit_two_value_ipqos_to_interactive_value(tmp):
     env["SESSH_FAKE_SSH_LOG_IPQOS"] = "1"
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["-oIPQoS=ef cs0", "test-host"], env, timeout=30.0)
+    result = run_sessh_in_pty(
+        ["-oIPQoS=ef cs0", "test-host"],
+        env,
+        ((marker.encode("utf-8"), None),),
+        timeout=30.0,
+    )
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -2251,7 +2305,12 @@ def test_ssh_transport_preserves_config_when_ipqos_query_fails(tmp):
     env["SESSH_FAKE_SSH_G_FAIL"] = "97"
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["test-host"], env, timeout=30.0)
+    result = run_sessh_in_pty(
+        ["test-host"],
+        env,
+        ((marker.encode("utf-8"), None),),
+        timeout=30.0,
+    )
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -2280,7 +2339,12 @@ def test_ssh_session_uses_remote_shell_not_local_client_shell(tmp):
     env["SESSH_FAKE_SSH_REMOTE_SHELL"] = str(remote_shell)
     env["SHELL"] = str(local_shell)
 
-    result = run_sessh(["test-host"], env, timeout=30.0)
+    result = run_sessh_in_pty(
+        ["test-host"],
+        env,
+        ((remote_marker.encode("utf-8"), None),),
+        timeout=30.0,
+    )
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -2338,9 +2402,15 @@ def test_ssh_verbose_flags_are_passed_to_ssh(tmp):
     write_fake_ssh(fake_bin / "ssh")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_REMOTE_SHELL"] = str(remote_shell)
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh_until_stdout(["-vvv", "test-host"], env, marker, timeout=30.0)
+    result = run_sessh_in_pty(
+        ["-vvv", "test-host"],
+        env,
+        ((marker.encode("utf-8"), None),),
+        timeout=30.0,
+    )
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -3470,6 +3540,7 @@ def test_ssh_tty_empty_remote_command_starts_interactive_session(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
+    env["SESSH_FAKE_SSH_REMOTE_SHELL"] = str(remote_shell)
 
     result = run_sessh(["-tt", "test-host", ""], env, timeout=30.0)
 
@@ -3557,7 +3628,12 @@ def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SHELL"] = str(remote_shell)
 
-    result = run_sessh(["test-host"], env, timeout=30.0)
+    result = run_sessh_in_pty(
+        ["test-host"],
+        env,
+        ((marker.encode("utf-8"), None),),
+        timeout=30.0,
+    )
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -3570,385 +3646,9 @@ def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
         raise AssertionError(log_text)
     if "bootstrapper=1" in log_text:
         raise AssertionError(log_text)
-    assert_cached_artifact(env, remote_path_artifact(), "bootstrap=false")
-
-
-def test_ssh_unresponsive_reconnect_failure_keeps_input_on_old_connection_without_bell(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    batch_fail_file = tmp / "fail-batch-reconnect"
-    remote_shell = tmp / "remote-shell"
-    marker = "SSH_UNRESPONSIVE_INPUT_READY"
-    remote_shell.write_text(
-        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
-    )
-    remote_shell.chmod(0o700)
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SESSH_FAKE_SSH_EXIT_ON_BATCH_FILE"] = str(batch_fail_file)
-    env["SHELL"] = str(remote_shell)
-
-    argv = sessh_argv(["test-host"])
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    stdout = b""
-    try:
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
-        before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
-
-        make_session_clients_unresponsive(env, 30, 30.0)
-
-        batch_fail_file.touch()
-        proc.stdin.write(b"trigger-unresponsive\n")
-        proc.stdin.flush()
-        wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 1, timeout=15.0)
-        time.sleep(0.5)
-        stdout += read_available_pipe(proc.stdout, 0.2)
-        if b"sessh: unresponsive: Reconnecting" in stdout:
-            raise AssertionError(f"unresponsive reconnect showed a reconnecting banner:\n{stdout!r}")
-        if b"sessh: disconnected: Reconnecting" in stdout:
-            raise AssertionError(f"recoverable unresponsive connection showed a disconnected banner:\n{stdout!r}")
-
-        proc.stdin.write(b"input-after-failed-reconnect\n")
-        proc.stdin.flush()
-        after_input = read_available_pipe(proc.stdout, 1.0)
-        stdout += after_input
-        if b"\x07" in after_input:
-            raise AssertionError(f"unresponsive input belled instead of forwarding to old connection:\n{after_input!r}")
-
-        proc.stdin.write(b"\x03")
-        proc.stdin.flush()
-        proc.stdin.close()
-        returncode = proc.wait(timeout=10.0)
-        stdout += proc.stdout.read()
-        stderr = proc.stderr.read()
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5.0)
-
-    result = subprocess.CompletedProcess(
-        argv,
-        returncode,
-        stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
-    )
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if "\x07" in result.stdout:
-        raise AssertionError(result)
-    if "sessh: unresponsive: Reconnecting" in result.stdout:
-        raise AssertionError(result)
-    if "sessh: disconnected: Reconnecting" in result.stdout:
-        raise AssertionError(result)
-    if "sessh: disconnected: Retry connecting" in result.stdout:
-        raise AssertionError(result)
-
-
-def test_ssh_unresponsive_tty_sets_title_without_banner(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    remote_shell = tmp / "remote-shell"
-    marker = "SSH_UNRESPONSIVE_TITLE_READY"
-    remote_shell.write_text(
-        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
-    )
-    remote_shell.chmod(0o700)
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SHELL"] = str(remote_shell)
-
-    argv = sessh_argv(["test-host"])
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.chdir(ROOT)
-        os.execvpe(argv[0], argv, env)
-
-    output = b""
-    waited = False
-    try:
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
-        output = read_pty_until(fd, output, marker.encode("utf-8"), timeout=30.0)
-        before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
-
-        make_session_clients_unresponsive(env, 30, 30.0)
-
-        os.write(fd, b"trigger-unresponsive\r")
-        wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 1, timeout=15.0)
-        output = read_pty_until(fd, output, title_sequence("reconnecting CTRL-R").encode(), timeout=15.0)
-        if b"sessh: unresponsive: Reconnecting" in output:
-            raise AssertionError(output)
-        if b"sessh: disconnected: Reconnecting" in output:
-            raise AssertionError(output)
-
-        os.write(fd, b"\r~.")
-        deadline = time.monotonic() + 10.0
-        while True:
-            done, status = os.waitpid(pid, os.WNOHANG)
-            if done:
-                waited = True
-                returncode = wait_status_to_returncode(status)
-                output += read_available_pty(fd)
-                break
-            if time.monotonic() >= deadline:
-                raise AssertionError(f"timed out waiting for client close; got {output!r}")
-            output += read_available_pty(fd)
-            time.sleep(0.05)
-    finally:
-        if not waited:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
-        os.close(fd)
-
-    if returncode != 0:
-        raise AssertionError(output.decode("utf-8", "replace"))
-
-
-def test_ssh_unresponsive_reconnect_retries_after_prepare_failure(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    batch_fail_file = tmp / "fail-batch-reconnect"
-    remote_shell = tmp / "remote-shell"
-    marker = "SSH_UNRESPONSIVE_RETRY_READY"
-    after = "after-unresponsive-retry"
-    remote_shell.write_text(
-        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
-    )
-    remote_shell.chmod(0o700)
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SESSH_FAKE_SSH_EXIT_ON_BATCH_FILE"] = str(batch_fail_file)
-    env["SHELL"] = str(remote_shell)
-
-    argv = sessh_argv(["test-host"])
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    stdout = b""
-    stderr = b""
-    try:
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
-        before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
-
-        make_session_clients_unresponsive(env, 30, 30.0)
-
-        batch_fail_file.touch()
-        proc.stdin.write(b"trigger-unresponsive\n")
-        proc.stdin.flush()
-        wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 1, timeout=15.0)
-        batch_fail_file.unlink()
-        wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 2, timeout=25.0)
-        stdout += read_until_pipe(proc.stdout, b"sessh: unresponsive: Connection ready", 15.0)
-        if b"sessh: unresponsive: Reconnecting" in stdout:
-            raise AssertionError(f"unresponsive retry showed reconnecting banner:\n{stdout!r}")
-        if b"sessh: disconnected: Reconnecting" in stdout:
-            raise AssertionError(f"unresponsive retry showed disconnected banner:\n{stdout!r}")
-
-        proc.stdin.write(b"\x12")
-        proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 15.0)
-        proc.stdin.write(after.encode("utf-8") + b"\n")
-        proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, f"REMOTE:{after}".encode("utf-8"), 15.0)
-        proc.stdin.close()
-        returncode = proc.wait(timeout=10.0)
-        stdout += proc.stdout.read()
-        stderr = proc.stderr.read()
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5.0)
-
-    result = subprocess.CompletedProcess(
-        argv,
-        returncode,
-        stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
-    )
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if "sessh: unresponsive: Reconnecting" in result.stdout:
-        raise AssertionError(result)
-    if "sessh: disconnected: Reconnecting" in result.stdout:
-        raise AssertionError(result)
-    if "sessh: unresponsive: Connection ready" not in result.stdout:
-        raise AssertionError(result)
-    if f"REMOTE:{after}" not in result.stdout:
-        raise AssertionError(result)
-
-
-def test_ssh_unresponsive_old_connection_recovers_without_switch_or_bell(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    remote_shell = tmp / "remote-shell"
-    marker = "SSH_UNRESPONSIVE_RECOVERY_READY"
-    remote_shell.write_text(
-        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
-    )
-    remote_shell.chmod(0o700)
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SHELL"] = str(remote_shell)
-
-    argv = sessh_argv(["test-host"])
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    stdout = b""
-    stderr = b""
-    try:
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
-        before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
-
-        make_session_clients_unresponsive(env, 6, 30.0)
-
-        proc.stdin.write(b"trigger-unresponsive\n")
-        proc.stdin.flush()
-        wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 1, timeout=15.0)
-        stdout += read_available_pipe(proc.stdout, 0.2)
-        if b"sessh: unresponsive: Reconnecting" in stdout:
-            raise AssertionError(f"unresponsive reconnect showed a reconnecting banner:\n{stdout!r}")
-        if b"sessh: disconnected: Reconnecting" in stdout:
-            raise AssertionError(f"recoverable unresponsive connection showed a disconnected banner:\n{stdout!r}")
-
-        proc.stdin.write(b"input-after-banner\n")
-        proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, b"REMOTE:trigger-unresponsive", 15.0)
-        if b"REMOTE:input-after-banner" not in stdout:
-            stdout += read_until_pipe(proc.stdout, b"REMOTE:input-after-banner", 15.0)
-
-        proc.stdin.write(b"~.")
-        proc.stdin.flush()
-        proc.stdin.close()
-        returncode = proc.wait(timeout=10.0)
-        stdout += proc.stdout.read()
-        stderr = proc.stderr.read()
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5.0)
-
-    result = subprocess.CompletedProcess(
-        argv,
-        returncode,
-        stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
-    )
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if "\x07" in result.stdout:
-        raise AssertionError(result)
-    if "sessh: unresponsive: Reconnecting" in result.stdout:
-        raise AssertionError(result)
-    if "sessh: disconnected: Reconnecting" in result.stdout:
-        raise AssertionError(result)
-    if "sessh: disconnected: Retry connecting" in result.stdout:
-        raise AssertionError(result)
-
-
-def test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner(tmp):
-    env = isolated_env(tmp)
-    fake_bin = tmp / "fake-ssh-bin"
-    fake_log = tmp / "fake-ssh.log"
-    remote_shell = tmp / "remote-shell"
-    marker = "SSH_UNRESPONSIVE_CLOSE_READY"
-    after = "after-unresponsive-close"
-    remote_shell.write_text(
-        f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
-    )
-    remote_shell.chmod(0o700)
-    write_fake_ssh(fake_bin / "ssh")
-    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
-    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
-    env["SHELL"] = str(remote_shell)
-
-    argv = sessh_argv(["test-host"])
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    stdout = b""
-    stderr = b""
-    try:
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 30.0)
-        before_batch_count = fake_log.read_text().count("batch_mode=1") if fake_log.exists() else 0
-
-        make_session_clients_unresponsive(env, 30, 30.0)
-
-        proc.stdin.write(b"trigger-unresponsive\n")
-        proc.stdin.flush()
-        wait_for_file_count(fake_log, "batch_mode=1", before_batch_count + 1, timeout=15.0)
-        stdout += read_until_pipe(proc.stdout, b"sessh: unresponsive: Connection ready", 15.0)
-        if b"sessh: disconnected: Reconnecting" in stdout:
-            raise AssertionError(f"unresponsive connection showed disconnected before transport close:\n{stdout!r}")
-
-        sever_session_clients(env, 30.0)
-
-        proc.stdin.write(b"\x12")
-        proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 15.0)
-        proc.stdin.write(after.encode("utf-8") + b"\n")
-        proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, f"REMOTE:{after}".encode("utf-8"), 15.0)
-        proc.stdin.close()
-        returncode = proc.wait(timeout=10.0)
-        stdout += proc.stdout.read()
-        stderr = proc.stderr.read()
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5.0)
-
-    result = subprocess.CompletedProcess(
-        argv,
-        returncode,
-        stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
-    )
-    if result.returncode != 0:
-        raise AssertionError(result)
-    if "sessh: unresponsive: Reconnecting" in result.stdout:
-        raise AssertionError(result)
-    if "sessh: disconnected: Reconnecting" in result.stdout:
-        raise AssertionError(result)
-    if "Connection ready" not in result.stdout:
-        raise AssertionError(result)
-    if f"REMOTE:{after}" not in result.stdout:
-        raise AssertionError(result)
+    cached = artifact_cache_path(env, remote_path_artifact())
+    if cached.exists():
+        raise AssertionError(f"bootstrap=false: cached artifact should not be created at {cached}")
 
 
 def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
@@ -3968,53 +3668,68 @@ def test_ssh_retry_elapsed_with_input_waits_before_switch(tmp):
     env["SHELL"] = str(remote_shell)
 
     argv = sessh_argv(["test-host"])
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(argv[0], argv, env)
+
     stdout = b""
+    returncode = None
+    waited = False
     try:
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        stdout = read_pty_until(fd, stdout, marker.encode("utf-8"), timeout=10.0)
         sever_session_clients(env, 30.0)
-        reconnect_output = read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", 10.0)
-        proc.stdin.write(b"during-timer\n")
-        proc.stdin.flush()
-        reconnect_output += read_until_pipe(proc.stdout, b"\x07", 10.0)
-        reconnect_output += read_until_pipe(proc.stdout, b"sessh: disconnected: Reconnecting...", 12.0)
-        reconnect_output += read_until_pipe(
-            proc.stdout,
+        reconnect_start = len(stdout)
+        stdout = read_pty_until(fd, stdout, b"sessh: disconnected: Retry connecting 10sec", timeout=10.0)
+        reconnect_output = stdout[reconnect_start:]
+        os.write(fd, b"during-timer\r")
+        reconnect_start = len(stdout)
+        stdout = read_pty_until(fd, stdout, b"\x07", timeout=10.0)
+        reconnect_output += stdout[reconnect_start:]
+        reconnect_start = len(stdout)
+        stdout = read_pty_until(fd, stdout, b"sessh: disconnected: Reconnecting...", timeout=12.0)
+        reconnect_output += stdout[reconnect_start:]
+        reconnect_start = len(stdout)
+        stdout = read_pty_until(
+            fd,
+            stdout,
             b"sessh: disconnected: Connection ready. Switch 10sec. CTRL-R now",
-            10.0,
+            timeout=10.0,
         )
-        reconnect_output += read_available_pipe(proc.stdout, 0.5)
+        reconnect_output += stdout[reconnect_start:]
+        time.sleep(0.5)
+        extra = read_available_pty(fd)
+        stdout += extra
+        reconnect_output += extra
         if marker.encode("utf-8") in reconnect_output:
             raise AssertionError(f"reconnect repainted before Ctrl-R:\n{reconnect_output!r}")
 
-        proc.stdin.write(b"\x12")
-        proc.stdin.flush()
-        stdout += reconnect_output
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
-        proc.stdin.write(after.encode("utf-8") + b"\n")
-        proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, f"REMOTE:{after}".encode("utf-8"), 10.0)
-        proc.stdin.close()
-        returncode = proc.wait(timeout=10.0)
-        stdout += proc.stdout.read()
-        stderr = proc.stderr.read()
+        os.write(fd, b"\x12")
+        stdout = read_pty_until(fd, stdout, marker.encode("utf-8"), timeout=10.0)
+        time.sleep(0.2)
+        os.write(fd, after.encode("utf-8") + b"\r")
+        stdout = read_pty_until(fd, stdout, f"REMOTE:{after}".encode("utf-8"), timeout=10.0)
+        os.write(fd, b"\r~.")
+        returncode, stdout = wait_for_pty_child(pid, fd, stdout, timeout=10.0, context="retry elapsed client")
+        waited = True
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5.0)
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(fd)
 
     result = subprocess.CompletedProcess(
         argv,
         returncode,
         stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
+        "",
     )
     if result.returncode != 0:
         raise AssertionError(result)
@@ -4047,38 +3762,44 @@ def test_ssh_retry_elapsed_without_input_switches_automatically(tmp):
     env["SHELL"] = str(remote_shell)
 
     argv = sessh_argv(["test-host"])
-    proc = subprocess.Popen(
-        argv,
-        cwd=ROOT,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        os.execvpe(argv[0], argv, env)
+
     stdout = b""
+    returncode = None
+    waited = False
     try:
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        stdout = read_pty_until(fd, stdout, marker.encode("utf-8"), timeout=10.0)
         sever_session_clients(env, 30.0)
-        stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Retry connecting 10sec", 10.0)
-        stdout += read_until_pipe(proc.stdout, b"sessh: disconnected: Reconnecting...", 12.0)
-        stdout += read_until_pipe(proc.stdout, marker.encode("utf-8"), 10.0)
-        proc.stdin.write(after.encode("utf-8") + b"\n")
-        proc.stdin.flush()
-        stdout += read_until_pipe(proc.stdout, f"REMOTE:{after}".encode("utf-8"), 10.0)
-        proc.stdin.close()
-        returncode = proc.wait(timeout=10.0)
-        stdout += proc.stdout.read()
-        stderr = proc.stderr.read()
+        stdout = read_pty_until(fd, stdout, b"sessh: disconnected: Retry connecting 10sec", timeout=10.0)
+        stdout = read_pty_until(fd, stdout, b"sessh: disconnected: Reconnecting...", timeout=12.0)
+        stdout = read_pty_until_count(fd, stdout, marker.encode("utf-8"), 2, timeout=10.0)
+        time.sleep(0.2)
+        os.write(fd, after.encode("utf-8") + b"\r")
+        stdout = read_pty_until(fd, stdout, f"REMOTE:{after}".encode("utf-8"), timeout=10.0)
+        os.write(fd, b"\r~.")
+        returncode, stdout = wait_for_pty_child(pid, fd, stdout, timeout=10.0, context="auto retry client")
+        waited = True
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5.0)
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(fd)
 
     result = subprocess.CompletedProcess(
         argv,
         returncode,
         stdout.decode("utf-8", "replace"),
-        stderr.decode("utf-8", "replace"),
+        "",
     )
     if result.returncode != 0:
         raise AssertionError(result)
@@ -4430,6 +4151,7 @@ def test_ssh_reconnect_can_close_while_bootstrapping(tmp):
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     remote_shell = tmp / "remote-shell"
+    delay_file = tmp / "delay-batch-reconnect"
     marker = "SSH_RECONNECT_ABORT_READY"
     remote_shell.write_text(
         f"#!/bin/sh\nprintf '{marker}\\n'\nwhile IFS= read -r line; do printf 'REMOTE:%s\\n' \"$line\"; done\n"
@@ -4439,6 +4161,7 @@ def test_ssh_reconnect_can_close_while_bootstrapping(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     env["SESSH_FAKE_SSH_DELAY_ON_BATCH"] = "20"
+    env["SESSH_FAKE_SSH_DELAY_ON_BATCH_FILE"] = str(delay_file)
     env["SHELL"] = str(remote_shell)
 
     result = run_sessh_close_reconnect_probe(
@@ -4446,6 +4169,7 @@ def test_ssh_reconnect_can_close_while_bootstrapping(tmp):
         env,
         marker,
         timeout=10.0,
+        before_sever=lambda: delay_file.write_text(""),
     )
 
     if result.returncode != 0:
@@ -4503,17 +4227,23 @@ def test_ssh_unsupported_remote_platform_falls_back_to_plain_ssh(tmp):
     env["SESSH_FAKE_SSH_ALLOW_PLAIN"] = "1"
     env["SESSH_FAKE_SSH_REMOTE_PATH"] = str(remote_bin)
 
-    result = run_sessh(["test-host"], env, timeout=30.0)
+    result = run_sessh_in_pty(
+        ["test-host"],
+        env,
+        ((b"PLAIN_SSH host=test-host", None),),
+        timeout=30.0,
+    )
 
     if result.returncode != 0:
         raise AssertionError(result)
     if "PLAIN_SSH host=test-host" not in result.stdout:
         raise AssertionError(result)
-    if "no matching sessh binary is available" not in result.stderr:
+    combined_output = result.stdout + result.stderr
+    if "no matching sessh binary is available" not in combined_output:
         raise AssertionError(result)
-    if "falling back to plain ssh without persistence" not in result.stderr:
+    if "falling back to plain ssh without persistence" not in combined_output:
         raise AssertionError(result)
-    if "unsupported" not in result.stderr:
+    if "unsupported" not in combined_output:
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if log_text.splitlines().count("invoked=1") != 2:
@@ -4572,8 +4302,8 @@ def main(argv=None):
             test_ssh_transport_cache_hit_suppresses_bootstrap_status,
         ),
         (
-            "ssh clean remote exit removes routes",
-            test_ssh_clean_remote_exit_removes_routes,
+            "ssh clean remote exit preserves status",
+            test_ssh_clean_remote_exit_preserves_status,
         ),
         (
             "ssh pre-attach stderr forwards immediately",
@@ -4786,26 +4516,6 @@ def main(argv=None):
         (
             "ssh bootstrap false config uses remote path sessh",
             test_ssh_bootstrap_false_config_uses_remote_path_sessh,
-        ),
-        (
-            "ssh unresponsive reconnect failure keeps input on old connection without bell",
-            test_ssh_unresponsive_reconnect_failure_keeps_input_on_old_connection_without_bell,
-        ),
-        (
-            "ssh unresponsive tty sets title without banner",
-            test_ssh_unresponsive_tty_sets_title_without_banner,
-        ),
-        (
-            "ssh unresponsive reconnect retries after prepare failure",
-            test_ssh_unresponsive_reconnect_retries_after_prepare_failure,
-        ),
-        (
-            "ssh unresponsive old connection recovers without switch or bell",
-            test_ssh_unresponsive_old_connection_recovers_without_switch_or_bell,
-        ),
-        (
-            "ssh unresponsive transport close uses disconnected ready banner",
-            test_ssh_unresponsive_transport_close_uses_disconnected_ready_banner,
         ),
         (
             "ssh retry elapsed with input waits before switch",

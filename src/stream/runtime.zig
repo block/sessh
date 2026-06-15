@@ -248,6 +248,7 @@ const StreamAttachedClientOptions = struct {
     replacement_control: ?*ProxyRuntimeControl = null,
     close_outbound_on_inbound_eof: bool = false,
     reset_on_source_eof: bool = false,
+    send_proxy_open: bool = false,
 };
 
 const StreamInputControl = struct {
@@ -379,7 +380,7 @@ const StreamAttachedClient = struct {
     ) !StreamAttachedClient {
         state.peer_ready = false;
         state.outbound.outbound_eof_sent = false;
-        sendResumeMessage(state, transport_write_fd) catch return error.StreamTransportClosed;
+        sendResumeMessage(state, transport_write_fd, options.send_proxy_open) catch return error.StreamTransportClosed;
         const now_ms = nowMillis();
         return .{
             .state = state,
@@ -1605,6 +1606,7 @@ pub fn runLocalStream(
                     // outbound side too.
                     .close_outbound_on_inbound_eof = true,
                     .reset_on_source_eof = options.reset_on_source_eof,
+                    .send_proxy_open = true,
                 },
             ) catch {
                 transport.close();
@@ -1856,6 +1858,9 @@ fn handleFrame(
             var item = try protocol.decodePayload(pb.ClientDaemonItem, state.allocator, mutable.payload);
             defer item.deinit(state.allocator);
             switch (item.payload orelse return error.StreamUnexpectedFrame) {
+                .connection_event => |event| {
+                    if (options.reconnect_status) |status| status.handleConnectionEvent(event);
+                },
                 .retry_now => {
                     if (options.control_input) |control| {
                         control.reconnect_requested = true;
@@ -2014,7 +2019,7 @@ fn deliverInboundData(options: *const StreamAttachedClientOptions, sink_fd: c.fd
     try io.writeAll(sink_fd, bytes);
 }
 
-fn sendResumeMessage(state: *StreamState, fd: c.fd_t) !void {
+fn sendResumeMessage(state: *StreamState, fd: c.fd_t, send_proxy_open: bool) !void {
     try sendMuxStreamFrame(state.allocator, fd, .{
         .stream_id = proxy_mux_stream_id,
         .message = .{ .open = .{
@@ -2022,6 +2027,7 @@ fn sendResumeMessage(state: *StreamState, fd: c.fd_t) !void {
             .receive_window_bytes = max_buffered_bytes,
         } },
     });
+    if (!send_proxy_open) return;
     try sendMuxStreamFrame(state.allocator, fd, .{
         .stream_id = proxy_mux_stream_id,
         .message = .{ .payload = .{
@@ -2678,7 +2684,11 @@ const StreamReconnectStatus = struct {
     ) StreamReconnectStatus {
         const displayed = client_log.displayedUserDiagnosticSeq();
         var status = StreamReconnectStatus{
-            .fd = if (status_fd >= 0) status_fd else if (mode == .title) 1 else 2,
+            .fd = if (status_fd >= 0) status_fd else switch (mode) {
+                .title => 1,
+                .stderr_plain => 2,
+                .client_control, .disabled => -1,
+            },
             .mode = mode,
             .ctrl_r_enabled = ctrl_r_enabled,
             .diagnostic_cursor = displayed,
@@ -2759,6 +2769,30 @@ const StreamReconnectStatus = struct {
             .stderr_plain => self.writeEscapeHelpText(),
             .client_control => {},
             .disabled => {},
+        }
+    }
+
+    fn handleConnectionEvent(self: *StreamReconnectStatus, event: pb.ConnectionEvent) void {
+        switch (event.event orelse return) {
+            .ssh_stderr => |stderr| {
+                client_log.appendSshStderr(stderr.data);
+                self.refreshDiagnostics();
+            },
+            .binary_bootstrapping => switch (self.mode) {
+                .stderr_plain => {
+                    io.writeAll(self.fd, "sessh: bootstrapping...") catch return;
+                    io.writeAll(self.fd, "\r\n") catch return;
+                },
+                .client_control => proxy_control.writeConnectionEvent(self.fd, .{ .binary_bootstrapping = .{} }) catch return,
+                .title, .disabled => {},
+            },
+            .daemon_connecting => self.showReconnecting(),
+            .daemon_connected => self.clear(),
+            .daemon_disconnected => |disconnected| self.showRetry(retryDelayFromLocalBootDeadline(disconnected.retry_at_local_boot_time_ms)),
+            .unresponsive => |unresponsive| self.showRetry(retryDelayFromLocalBootDeadline(unresponsive.retry_at_local_boot_time_ms)),
+            .ssh_connecting,
+            .ssh_connected,
+            => {},
         }
     }
 
@@ -2871,6 +2905,12 @@ const StreamReconnectStatus = struct {
         }
     }
 };
+
+fn retryDelayFromLocalBootDeadline(deadline_ms: ?u64) u64 {
+    const deadline = deadline_ms orelse return 0;
+    const now = local_boot_time.nowMs();
+    return deadline -| now;
+}
 
 fn copyTitle(dest: []u8, title: []const u8) usize {
     const len = @min(dest.len, title.len);

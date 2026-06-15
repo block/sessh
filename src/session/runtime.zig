@@ -2461,7 +2461,6 @@ fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.Envi
     });
 
     if (std.mem.eql(u8, entry.name, "SHELL") and entry.value.len > 0 and environment.shell == null) {
-        if (environment.shell) |shell| app_allocator.allocator().free(shell);
         environment.shell = try app_allocator.allocator().dupe(u8, entry.value);
     }
 }

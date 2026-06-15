@@ -1431,7 +1431,6 @@ fn sendSessionCreate(
         .scrollback_row_limit = scrollback_row_count,
         .reap_ms = reap_ms,
     };
-    defer create.environment.deinit(app_allocator.allocator());
     var protocol_tty_settings = pb.TerminalEmulatorItem.SessionCreate.TtySettings{};
     defer protocol_tty_settings.tty_mode.deinit(app_allocator.allocator());
     if (local_terminal.tty_settings) |settings| {

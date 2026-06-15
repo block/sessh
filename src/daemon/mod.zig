@@ -458,6 +458,7 @@ fn handleDaemonClientFrame(
             if (try dispatcherConsumesInitialRequest(context, frame)) return .consumed;
             switch (try transferInitialRequestToDispatcherOwner(context, daemon_dispatcher, id, frame)) {
                 .not_transferred => {},
+                .consumed => return .consumed,
                 .transferred => return .transferred,
                 .close => return .close,
             }
@@ -507,6 +508,7 @@ fn dispatcherConsumesInitialRequest(context: *ClientContext, frame: *protocol.Ow
 
 const TransferInitialRequestResult = enum {
     not_transferred,
+    consumed,
     transferred,
     close,
 };
@@ -518,8 +520,8 @@ fn transferInitialRequestToDispatcherOwner(
     frame: *protocol.OwnedFrame,
 ) !TransferInitialRequestResult {
     if (frame.message_type == .daemon_tunnel) {
-        if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, context.fd)) return .not_transferred;
-        if (try handleDaemonTunnelControlFrame(context.allocator, context.identity, frame.*, context.fd)) return .not_transferred;
+        if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, context.fd)) return .consumed;
+        if (try handleDaemonTunnelControlFrame(context.allocator, context.identity, frame.*, context.fd)) return .consumed;
         if (isMuxOpenFrame(context.allocator, frame.*)) {
             var typed_open_frame = try readMuxTypedOpenFrame(context.allocator, context.fd);
             defer typed_open_frame.deinit(context.allocator);
@@ -594,6 +596,13 @@ fn transferInitialRequestToDispatcherOwner(
             daemon_log.infof(context.allocator, "ssh transport requested", .{});
             daemon_dispatcher.cancel(id);
             try transport_ssh.registerPooledSshTransportFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
+            context.fd = -1;
+            return .transferred;
+        },
+        .proxy_control_open => |request| {
+            daemon_log.infof(context.allocator, "proxy control requested guid={s}", .{request.proxy_guid});
+            daemon_dispatcher.cancel(id);
+            try transport_ssh.registerProxyControlOpenFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
             context.fd = -1;
             return .transferred;
         },
