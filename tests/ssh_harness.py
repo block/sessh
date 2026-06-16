@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import array
 import hashlib
 import fcntl
 import json
@@ -1983,6 +1984,128 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
     ):
         if expected not in daemon_log_text:
             raise AssertionError(f"daemon log missing {expected!r}: {daemon_log_text}")
+
+
+def recv_fd(sock, timeout=10.0):
+    sock.settimeout(timeout)
+    fds = array.array("i")
+    msg, ancdata, flags, _ = sock.recvmsg(1024, socket.CMSG_SPACE(fds.itemsize))
+    if flags & getattr(socket, "MSG_CTRUNC", 0):
+        raise AssertionError("fd control message was truncated")
+    for level, kind, data in ancdata:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            fds.frombytes(data[: fds.itemsize])
+            return msg, fds[0]
+    raise AssertionError(f"no fd received; msg={msg!r} ancdata={ancdata!r}")
+
+
+def test_ssh_proxy_fd_pass_process_exits_and_raw_fd_streams(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    fake_trace = tmp / "fake-ssh.trace"
+    marker = b"SSH_PROXY_FD_PASS\n"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin:/bin:/usr/sbin:/sbin"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+    env["SESSH_FAKE_SSH_TRACE"] = str(fake_trace)
+    env["SESSH_FAKE_SSH_G_USER"] = "fdpass-user"
+    env["SESSH_FAKE_SSH_G_HOSTNAME"] = "fdpass-host"
+    env["SESSH_FAKE_SSH_G_PORT"] = "2222"
+    seed_remote_artifact_cache(env)
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    server_port = server.getsockname()[1]
+    server_stop = threading.Event()
+
+    def echo_server():
+        while not server_stop.is_set():
+            try:
+                server.settimeout(0.1)
+                conn, _ = server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=echo_connection, args=(conn,), daemon=True).start()
+
+    def echo_connection(conn):
+        with conn:
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    return
+                conn.sendall(data)
+
+    server_thread = threading.Thread(target=echo_server, daemon=True)
+    server_thread.start()
+
+    open_ssh_sock, proxy_stdout_sock = socket.socketpair()
+    proxy_proc = None
+    raw_sock = None
+    try:
+        proxy_proc = subprocess.Popen(
+            sessh_argv(
+                [
+                    ":internal-proxy-stream:",
+                    "--host",
+                    "test-host",
+                    "--port",
+                    str(server_port),
+                    "--filter-level",
+                    "unhygienic",
+                    "--bootstrap",
+                    "--use-fd-pass",
+                ]
+            ),
+            cwd=ROOT,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=proxy_stdout_sock.fileno(),
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+        proxy_stdout_sock.close()
+        proxy_stdout_sock = None
+
+        msg, raw_fd = recv_fd(open_ssh_sock, timeout=30.0)
+        if b"sessh-proxy-fd" not in msg:
+            raise AssertionError(f"unexpected fd-pass payload: {msg!r}")
+        open_ssh_sock.close()
+        open_ssh_sock = None
+
+        returncode = proxy_proc.wait(timeout=10.0)
+        stderr = proxy_proc.stderr.read().decode("utf-8", "replace")
+        if returncode != 0:
+            raise AssertionError(
+                f"sessh-proxy fd-pass exited {returncode}\nstderr:\n{stderr}\n"
+                f"fake ssh log:\n{optional_text(fake_log)}\n"
+                f"fake ssh trace:\n{optional_text(fake_trace)}"
+            )
+
+        raw_sock = socket.socket(fileno=raw_fd)
+        raw_sock.settimeout(30.0)
+        raw_sock.sendall(marker)
+        data = raw_sock.recv(4096)
+        if marker not in data:
+            raise AssertionError(f"raw fd did not echo marker; got {data!r}")
+    finally:
+        if raw_sock is not None:
+            raw_sock.close()
+        if proxy_proc is not None and proxy_proc.poll() is None:
+            terminate_process(proxy_proc)
+        if proxy_stdout_sock is not None:
+            proxy_stdout_sock.close()
+        if open_ssh_sock is not None:
+            open_ssh_sock.close()
+        server_stop.set()
+        server.close()
+
+    log_text = optional_text(fake_log)
+    if ssh_invocation_count(fake_log) != 1:
+        raise AssertionError(f"expected one pooled ssh transport invocation, got log:\n{log_text}")
 
 
 def test_ssh_terminal_and_proxy_streams_share_tcp_connection(tmp):
@@ -4495,6 +4618,10 @@ def main(argv=None):
         (
             "ssh proxy streams pool tcp connection",
             test_ssh_proxy_streams_pool_tcp_connection,
+        ),
+        (
+            "ssh proxy fd-pass process exits and raw fd streams",
+            test_ssh_proxy_fd_pass_process_exits_and_raw_fd_streams,
         ),
         (
             "ssh terminal and proxy streams share tcp connection",

@@ -157,9 +157,27 @@ message ClientDaemonItem {
     string proxy_guid = 1;
   }
 
+  // ProxyCommand setup for isolation-mode=none. The framed request is sent over
+  // normal local daemon IPC, while the raw OpenSSH byte-stream fd is attached to
+  // the same Unix-domain-socket message with SCM_RIGHTS. After accepting this
+  // request, sesshd owns the fd and bridges it through ProxyStreamItem mux
+  // payloads; the ProxyCommand process can hand the other socketpair end to
+  // OpenSSH via ProxyUseFdPass and exit.
+  message ProxyFdPassOpen {
+    SshTransportAcquire transport = 1;
+    ProxyStreamItem.Open proxy = 2;
+  }
+
+  // Ack for ProxyFdPassOpen. Receipt means sesshd has received and registered
+  // the raw proxy fd. It does not mean the remote daemon is connected yet.
+  message ProxyFdPassAccepted {
+  }
+
   oneof payload {
     SshTransportAcquire ssh_transport_acquire = 1;
     ProxyControlOpen proxy_control_open = 2;
+    ProxyFdPassOpen proxy_fd_pass_open = 3;
+    ProxyFdPassAccepted proxy_fd_pass_accepted = 4;
     DaemonLogRequest log_request = 10;
     DaemonLogEntry log_entry = 11;
     ConnectionEvent connection_event = 12;

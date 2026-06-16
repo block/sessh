@@ -5,6 +5,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const config = @import("../core/config.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
+const fd_passing = @import("../core/fd_passing.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const client_config = @import("../session/client_config.zig");
@@ -334,12 +335,12 @@ const ClientContext = struct {
     proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     fd: c.fd_t,
-    reader: protocol.FrameReader = undefined,
+    reader: fd_passing.FrameReader = undefined,
     stage: ClientStage = .waiting_peer_hello,
     owns_active_count: bool = true,
 
     fn initReader(self: *ClientContext) void {
-        self.reader = protocol.FrameReader.init(self.allocator);
+        self.reader = fd_passing.FrameReader.init(self.allocator);
     }
 
     fn deinit(self: *ClientContext) void {
@@ -395,7 +396,7 @@ fn readDaemonClientInner(context: *ClientContext, daemon_dispatcher: *dispatcher
             },
             .frame => |frame_value| {
                 var frame = frame_value;
-                const action = try handleDaemonClientFrame(context, daemon_dispatcher, id, &frame);
+                const action = try handleDaemonClientFrame(context, daemon_dispatcher, id, &frame.frame, &frame.fd);
                 switch (action) {
                     .consumed => frame.deinit(context.allocator),
                     .close => {
@@ -425,6 +426,7 @@ fn handleDaemonClientFrame(
     daemon_dispatcher: *dispatcher.Dispatcher,
     id: dispatcher.WatchId,
     frame: *protocol.OwnedFrame,
+    frame_fd: *?c.fd_t,
 ) !DaemonClientFrameAction {
     switch (context.stage) {
         .waiting_peer_hello => {
@@ -458,11 +460,17 @@ fn handleDaemonClientFrame(
         },
         .waiting_request => {
             if (try dispatcherConsumesInitialRequest(context, frame)) return .consumed;
-            switch (try transferInitialRequestToDispatcherOwner(context, daemon_dispatcher, id, frame)) {
+            switch (try transferInitialRequestToDispatcherOwner(context, daemon_dispatcher, id, frame, frame_fd)) {
                 .not_transferred => {},
                 .consumed => return .consumed,
                 .transferred => return .transferred,
                 .close => return .close,
+            }
+            if (frame_fd.*) |passed_fd| {
+                frame_fd.* = null;
+                _ = c.close(passed_fd);
+                try sendError(context.fd, "PROTOCOL_ERROR", "unexpected passed file descriptor", "");
+                return .close;
             }
             return if (try handleClientFrameAfterHandshake(context.allocator, context.terminal_remote_exe, context.identity, context.fd, frame.*))
                 .consumed
@@ -520,6 +528,7 @@ fn transferInitialRequestToDispatcherOwner(
     daemon_dispatcher: *dispatcher.Dispatcher,
     id: dispatcher.WatchId,
     frame: *protocol.OwnedFrame,
+    frame_fd: *?c.fd_t,
 ) !TransferInitialRequestResult {
     if (frame.message_type == .client_remote) {
         var item = try protocol.decodeClientRemoteTerminalEmulatorItem(context.allocator, frame.payload);
@@ -575,6 +584,29 @@ fn transferInitialRequestToDispatcherOwner(
             daemon_log.infof(context.allocator, "proxy control requested guid={s}", .{request.proxy_guid});
             daemon_dispatcher.cancel(id);
             try transport_ssh.registerProxyControlOpenFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
+            context.fd = -1;
+            return .transferred;
+        },
+        .proxy_fd_pass_open => |request| {
+            const passed_fd = frame_fd.* orelse {
+                try sendError(context.fd, "PROTOCOL_ERROR", "proxy fd-pass open requires a passed file descriptor", "");
+                return .close;
+            };
+            frame_fd.* = null;
+            errdefer _ = c.close(passed_fd);
+            daemon_log.infof(
+                context.allocator,
+                "proxy fd-pass requested guid={s} host={s}:{d}",
+                .{ request.proxy.?.proxy_guid, request.proxy.?.proxy_host, request.proxy.?.proxy_port },
+            );
+            daemon_dispatcher.cancel(id);
+            try transport_ssh.registerProxyFdPassOpenFromDaemon(
+                context.allocator,
+                daemon_dispatcher,
+                context.fd,
+                passed_fd,
+                request,
+            );
             context.fd = -1;
             return .transferred;
         },
@@ -893,6 +925,10 @@ fn handleClientFrameAfterHandshake(
                 .proxy_control_open => |request| {
                     daemon_log.infof(allocator, "proxy control requested guid={s}", .{request.proxy_guid});
                     try transport_ssh.serveProxyControlOpen(allocator, fd, request);
+                    return false;
+                },
+                .proxy_fd_pass_open => {
+                    try sendError(fd, "PROTOCOL_ERROR", "proxy fd-pass open must be dispatcher-owned", "");
                     return false;
                 },
                 .log_request => {

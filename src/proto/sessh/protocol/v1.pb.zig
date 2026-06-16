@@ -798,6 +798,8 @@ pub const ClientDaemonItem = struct {
     pub const _payload_case = enum {
         ssh_transport_acquire,
         proxy_control_open,
+        proxy_fd_pass_open,
+        proxy_fd_pass_accepted,
         log_request,
         log_entry,
         connection_event,
@@ -806,6 +808,8 @@ pub const ClientDaemonItem = struct {
     pub const payload_union = union(_payload_case) {
         ssh_transport_acquire: ClientDaemonItem.SshTransportAcquire,
         proxy_control_open: ClientDaemonItem.ProxyControlOpen,
+        proxy_fd_pass_open: ClientDaemonItem.ProxyFdPassOpen,
+        proxy_fd_pass_accepted: ClientDaemonItem.ProxyFdPassAccepted,
         log_request: ClientDaemonItem.DaemonLogRequest,
         log_entry: ClientDaemonItem.DaemonLogEntry,
         connection_event: ConnectionEvent,
@@ -813,6 +817,8 @@ pub const ClientDaemonItem = struct {
         pub const _desc_table = .{
             .ssh_transport_acquire = fd(1, .submessage),
             .proxy_control_open = fd(2, .submessage),
+            .proxy_fd_pass_open = fd(3, .submessage),
+            .proxy_fd_pass_accepted = fd(4, .submessage),
             .log_request = fd(10, .submessage),
             .log_entry = fd(11, .submessage),
             .connection_event = fd(12, .submessage),
@@ -1117,6 +1123,144 @@ pub const ClientDaemonItem = struct {
         pub const _desc_table = .{
             .proxy_guid = fd(1, .{ .scalar = .string }),
         };
+
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    /// ProxyCommand setup for isolation-mode=none. The framed request is sent over
+    /// normal local daemon IPC, while the raw OpenSSH byte-stream fd is attached to
+    /// the same Unix-domain-socket message with SCM_RIGHTS. After accepting this
+    /// request, sesshd owns the fd and bridges it through ProxyStreamItem mux
+    /// payloads; the ProxyCommand process can hand the other socketpair end to
+    /// OpenSSH via ProxyUseFdPass and exit.
+    pub const ProxyFdPassOpen = struct {
+        transport: ?ClientDaemonItem.SshTransportAcquire = null,
+        proxy: ?ProxyStreamItem.Open = null,
+
+        pub const _desc_table = .{
+            .transport = fd(1, .submessage),
+            .proxy = fd(2, .submessage),
+        };
+
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    /// Ack for ProxyFdPassOpen. Receipt means sesshd has received and registered
+    /// the raw proxy fd. It does not mean the remote daemon is connected yet.
+    pub const ProxyFdPassAccepted = struct {
+        pub const _desc_table = .{};
 
         /// Encodes the message to the writer
         /// The allocator is used to generate submessages internally.

@@ -11,9 +11,11 @@ const client_ui = @import("../session/client_ui.zig");
 const sessh_cli = @import("../sessh/cli.zig");
 const config = @import("../core/config.zig");
 const core_fds = @import("../core/fds.zig");
+const fd_passing = @import("../core/fd_passing.zig");
 const daemon_client = @import("../daemon/client.zig");
 const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_executable = @import("../daemon/executable.zig");
+const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
 const daemon_socket_namespace = @import("../daemon/socket_namespace.zig");
 const dispatcher = @import("../core/dispatcher.zig");
@@ -32,6 +34,9 @@ const pb = protocol.pb;
 
 const CommonSessionOptions = sessh_cli.CommonSessionOptions;
 const pooled_ssh_transport_idle_close_ms: i32 = 60_000;
+const proxy_mux_stream_id: u64 = 1;
+const proxy_stream_window_bytes: u32 = 1024 * 1024;
+const raw_proxy_read_buffer_len: usize = 16 * 1024;
 
 pub const SshTtyRequest = ssh_opts.SshTtyRequest;
 pub const ResolvedSshConfig = ssh_opts.ResolvedSshConfig;
@@ -228,6 +233,7 @@ const PooledSshTransportFrameWriteKind = union(enum) {
         typed_open_bytes: []u8,
     },
     client_to_daemon: *PooledSshTransportClient,
+    proxy_ack,
     remote_process_recorded,
     cleanup_request,
 };
@@ -268,12 +274,54 @@ const PooledSshTransportClientWriteKind = union(enum) {
     },
 };
 
-const PooledSshTransportClientWrite = struct {
+const PooledSshTransportClientFrameWrite = struct {
     frame: protocol.FrameWriteState,
     kind: PooledSshTransportClientWriteKind,
 
-    fn deinit(self: *PooledSshTransportClientWrite) void {
+    fn deinit(self: *PooledSshTransportClientFrameWrite) void {
         self.frame.deinit();
+        self.* = undefined;
+    }
+};
+
+const PooledSshTransportClientRawWrite = struct {
+    bytes: []u8,
+    offset: usize = 0,
+    kind: PooledSshTransportClientWriteKind,
+
+    fn remaining(self: *const PooledSshTransportClientRawWrite) []const u8 {
+        return self.bytes[self.offset..];
+    }
+
+    fn deinit(self: *PooledSshTransportClientRawWrite, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+const PooledSshTransportClientWrite = union(enum) {
+    frame: PooledSshTransportClientFrameWrite,
+    raw: PooledSshTransportClientRawWrite,
+
+    fn kind(self: *const PooledSshTransportClientWrite) PooledSshTransportClientWriteKind {
+        return switch (self.*) {
+            .frame => |frame| frame.kind,
+            .raw => |raw| raw.kind,
+        };
+    }
+
+    fn setKind(self: *PooledSshTransportClientWrite, kind_value: PooledSshTransportClientWriteKind) void {
+        switch (self.*) {
+            .frame => |*frame| frame.kind = kind_value,
+            .raw => |*raw| raw.kind = kind_value,
+        }
+    }
+
+    fn deinit(self: *PooledSshTransportClientWrite, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .frame => |*frame| frame.deinit(),
+            .raw => |*raw| raw.deinit(allocator),
+        }
         self.* = undefined;
     }
 };
@@ -355,6 +403,9 @@ const PooledSshTransportClient = struct {
     state: PooledSshTransportClientState = .pending_transport,
     outbound_next_offset: u64 = 0,
     inbound_next_offset: u64 = 0,
+    raw_proxy: bool = false,
+    raw_proxy_host: ?[]u8 = null,
+    raw_proxy_port: u32 = 0,
     request_started_ms: u64 = 0,
     mux_open_sent_ms: u64 = 0,
     mux_open_ok_ms: u64 = 0,
@@ -376,11 +427,12 @@ const PooledSshTransportClient = struct {
 
     fn deinit(self: *PooledSshTransportClient, allocator: std.mem.Allocator) void {
         self.reader.deinit();
-        if (self.write) |*write| write.deinit();
+        if (self.write) |*write| write.deinit(allocator);
         if (self.local_start_time) |start_time| allocator.free(start_time);
         freeStringList(allocator, self.send_env);
         freeEnvironmentEntries(allocator, &self.client_environment);
         if (self.remote_cleanup) |*remote| remote.deinit(allocator);
+        if (self.raw_proxy_host) |host| allocator.free(host);
         self.* = undefined;
     }
 
@@ -925,6 +977,60 @@ pub fn registerPooledSshTransportFromDaemon(
     );
 }
 
+pub fn registerProxyFdPassOpenFromDaemon(
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    setup_fd: c.fd_t,
+    raw_fd: c.fd_t,
+    request: pb.ClientDaemonItem.ProxyFdPassOpen,
+) !void {
+    const transport_request = request.transport orelse {
+        try sendDaemonTransportError(setup_fd, "PROTOCOL_ERROR", "proxy fd-pass open missing transport", "");
+        return error.InvalidProxyFdPassOpen;
+    };
+    const proxy_open = request.proxy orelse {
+        try sendDaemonTransportError(setup_fd, "PROTOCOL_ERROR", "proxy fd-pass open missing proxy details", "");
+        return error.InvalidProxyFdPassOpen;
+    };
+    if (!session_registry.isValidProxyGuid(proxy_open.proxy_guid)) {
+        try sendDaemonTransportError(setup_fd, "PROTOCOL_ERROR", "proxy fd-pass open has invalid proxy guid", "");
+        return error.InvalidProxyFdPassOpen;
+    }
+    if (proxy_open.proxy_port == 0 or proxy_open.proxy_port > std.math.maxInt(u16)) {
+        try sendDaemonTransportError(setup_fd, "PROTOCOL_ERROR", "proxy fd-pass open has invalid proxy port", "");
+        return error.InvalidProxyFdPassOpen;
+    }
+
+    var resolved_target = try resolveSshTarget(allocator, transport_request.ssh_option.items, transport_request.host);
+    defer resolved_target.deinit(allocator);
+    var acquire_request = transport_request;
+    if (acquire_request.ip_qos.len == 0) {
+        if (resolved_target.config.ipqos) |ip_qos| acquire_request.ip_qos = ip_qos;
+    }
+    const target = resolved_target.target;
+    daemon_log.infof(
+        allocator,
+        "proxy fd-pass opening host={s} resolved={s}@{s}:{s} guid={s}",
+        .{ target.host, target.resolved_user, target.resolved_host, target.resolved_port, proxy_open.proxy_guid },
+    );
+
+    try core_fds.setNonBlocking(raw_fd);
+    try registerPooledRawProxyClientFromDaemon(
+        allocator,
+        daemon_dispatcher,
+        raw_fd,
+        target,
+        acquire_request,
+        resolved_target.config.send_env,
+        proxy_open,
+    );
+
+    protocol.sendClientDaemonPayloadFrame(allocator, setup_fd, .{ .proxy_fd_pass_accepted = .{} }) catch |err| {
+        daemon_log.infof(allocator, "proxy fd-pass setup ack failed guid={s} error={t}", .{ proxy_open.proxy_guid, err });
+    };
+    _ = c.close(setup_fd);
+}
+
 fn startTerminalTransportForDaemon(
     allocator: std.mem.Allocator,
     client_fd: c.fd_t,
@@ -1090,6 +1196,57 @@ fn registerPooledSshTransportClientFromDaemon(
     client.transport = acquire.transport;
     if (acquire.created) {
         startNewPooledSshTransport(allocator, daemon_dispatcher, acquire.transport, client_fd, target, request) catch |err| {
+            failStartingPooledSshTransport(allocator, daemon_dispatcher, acquire.transport, client, err);
+        };
+    } else if (acquire.transport.state == .ready) {
+        activatePendingPooledSshTransportClients(daemon_dispatcher, acquire.transport);
+    }
+}
+
+fn registerPooledRawProxyClientFromDaemon(
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    raw_fd: c.fd_t,
+    target: SshTarget,
+    request: pb.ClientDaemonItem.SshTransportAcquire,
+    send_env: []const []const u8,
+    proxy_open: pb.ProxyStreamItem.Open,
+) !void {
+    const client = try allocator.create(PooledSshTransportClient);
+    errdefer allocator.destroy(client);
+    var local_start_time = if (request.local_start_time.len == 0) null else try allocator.dupe(u8, request.local_start_time);
+    errdefer if (local_start_time) |start_time| allocator.free(start_time);
+    var send_env_copy = try cloneStringList(allocator, send_env);
+    errdefer freeStringList(allocator, send_env_copy);
+    var client_environment = try cloneEnvironmentEntries(allocator, request.client_environment.items);
+    errdefer freeEnvironmentEntries(allocator, &client_environment);
+    var raw_proxy_host: ?[]u8 = try allocator.dupe(u8, proxy_open.proxy_host);
+    errdefer if (raw_proxy_host) |host| allocator.free(host);
+    client.* = .{
+        .fd = raw_fd,
+        .request_started_ms = nowUnixMs(),
+        .local_pid = request.local_pid,
+        .local_start_time = local_start_time,
+        .send_env = send_env_copy,
+        .client_environment = client_environment,
+        .raw_proxy = true,
+        .raw_proxy_host = raw_proxy_host.?,
+        .raw_proxy_port = proxy_open.proxy_port,
+        .kind = .proxy,
+        .local_stream_id = proxy_mux_stream_id,
+    };
+    local_start_time = null;
+    send_env_copy = &.{};
+    client_environment = .empty;
+    raw_proxy_host = null;
+    client.initReader(allocator);
+    errdefer client.deinit(allocator);
+    try client.setProxyGuid(proxy_open.proxy_guid);
+
+    const acquire = try acquirePooledSshTransport(allocator, target, request, client);
+    client.transport = acquire.transport;
+    if (acquire.created) {
+        startNewPooledSshTransport(allocator, daemon_dispatcher, acquire.transport, raw_fd, target, request) catch |err| {
             failStartingPooledSshTransport(allocator, daemon_dispatcher, acquire.transport, client, err);
         };
     } else if (acquire.transport.state == .ready) {
@@ -1722,6 +1879,7 @@ fn sendPooledSshTransportConnectionEvent(
     var started_write = false;
     for (transport.clients.items) |client| {
         if (client.state == .done) continue;
+        if (client.raw_proxy) continue;
         if (client.write != null) continue;
         startPooledClientConnectionEvent(daemon_dispatcher, client, event, .forwarded_from_daemon) catch |err| {
             daemon_log.infof(
@@ -1883,7 +2041,7 @@ fn completePooledSshTransportRemoteFrameWrite(
             if (client.state == .opening_stream) client.state = .active;
             try resumePooledSshTransportClientReads(daemon_dispatcher, transport);
         },
-        .remote_process_recorded, .cleanup_request => {
+        .proxy_ack, .remote_process_recorded, .cleanup_request => {
             frame.frame.deinit();
             try resumePooledSshTransportClientReads(daemon_dispatcher, transport);
             try resumePooledSshTransportRemoteRead(daemon_dispatcher, transport);
@@ -2011,6 +2169,11 @@ fn readPooledSshTransportClientInner(
         return;
     }
 
+    if (client.raw_proxy) {
+        try readPooledRawProxyClient(daemon_dispatcher, transport, client);
+        return;
+    }
+
     while (true) {
         switch (try client.reader.readReady(client.fd)) {
             .blocked => return,
@@ -2035,21 +2198,33 @@ fn writePooledSshTransportClient(
     transport: *PooledSshTransport,
     client: *PooledSshTransportClient,
 ) !void {
-    var write = if (client.write) |*value| value else return;
-    const done = switch (try write.frame.writeReady(client.fd)) {
-        .blocked, .progress => false,
-        .done => true,
+    const write = if (client.write) |*value| value else return;
+    const done = switch (write.*) {
+        .frame => |*frame| switch (try frame.frame.writeReady(client.fd)) {
+            .blocked, .progress => false,
+            .done => true,
+        },
+        .raw => |*raw| try writePooledSshTransportClientRaw(client.fd, raw),
     };
     if (!done) return;
 
-    const kind = write.kind;
-    write.kind = .forwarded_from_daemon;
-    write.deinit();
+    var completed = client.write.?;
     client.write = null;
+    const kind = completed.kind();
+    completed.setKind(.forwarded_from_daemon);
+    const completed_raw = switch (completed) {
+        .raw => true,
+        .frame => false,
+    };
+    completed.deinit(transport.allocator);
     try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
 
     if (!pooledSshTransportHasClientWrites(transport)) {
-        try resumePooledSshTransportRemoteRead(daemon_dispatcher, transport);
+        if (completed_raw and client.raw_proxy and client.state != .done) {
+            try sendPooledRawProxyAck(daemon_dispatcher, transport, client);
+        } else {
+            try resumePooledSshTransportRemoteRead(daemon_dispatcher, transport);
+        }
     }
     switch (kind) {
         .forwarded_from_daemon => {},
@@ -2059,11 +2234,101 @@ fn writePooledSshTransportClient(
     }
 }
 
+fn writePooledSshTransportClientRaw(
+    fd: c.fd_t,
+    raw: *PooledSshTransportClientRawWrite,
+) !bool {
+    while (raw.remaining().len != 0) {
+        const chunk = raw.remaining();
+        const n = c.write(fd, chunk.ptr, chunk.len);
+        if (n < 0) switch (posix.errno(n)) {
+            .AGAIN => return false,
+            .INTR => continue,
+            else => return error.WriteFailed,
+        };
+        if (n == 0) return error.WriteFailed;
+        const written: usize = @intCast(n);
+        io.noteWrite(fd, chunk[0..written]);
+        raw.offset += written;
+    }
+    return true;
+}
+
 fn pooledSshTransportHasClientWrites(transport: *const PooledSshTransport) bool {
     for (transport.clients.items) |client| {
         if (client.state != .done and client.write != null) return true;
     }
     return false;
+}
+
+fn readPooledRawProxyClient(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    client: *PooledSshTransportClient,
+) !void {
+    var buf: [raw_proxy_read_buffer_len]u8 = undefined;
+    while (true) {
+        const n = c.read(client.fd, &buf, buf.len);
+        if (n < 0) switch (posix.errno(n)) {
+            .AGAIN => return,
+            .INTR => continue,
+            else => return error.ReadFailed,
+        };
+        if (n == 0) {
+            finishPooledSshTransportClient(daemon_dispatcher, transport, client, true);
+            return;
+        }
+
+        const bytes = buf[0..@as(usize, @intCast(n))];
+        io.noteRead(client.fd, bytes);
+        const offset = client.outbound_next_offset;
+        const frame_bytes = try encodeMuxFrameBytes(transport.allocator, .{
+            .stream_id = client.stream_id,
+            .message = .{ .payload = .{
+                .offset = offset,
+                .item = .{ .proxy = .{ .payload = .{ .data = bytes } } },
+            } },
+        });
+        errdefer transport.allocator.free(frame_bytes);
+        client.outbound_next_offset +|= bytes.len;
+        client.read_paused = true;
+        try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+        try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
+        try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, frame_bytes, .{ .client_to_daemon = client });
+        return;
+    }
+}
+
+fn sendPooledRawProxyAck(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    client: *PooledSshTransportClient,
+) !void {
+    const payload = try encodeDaemonTunnelFramePayload(transport.allocator, .{ .mux_stream = .{
+        .stream_id = client.stream_id,
+        .message = .{ .ack = .{
+            .recv_next_offset = client.inbound_next_offset,
+            .receive_window_bytes = proxy_stream_window_bytes,
+        } },
+    } });
+    defer transport.allocator.free(payload);
+    try startPooledSshTransportRemoteFrameWrite(transport, daemon_dispatcher, .daemon_tunnel, payload, .proxy_ack);
+}
+
+fn sendPooledRawProxyOpenOk(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    client: *PooledSshTransportClient,
+) !void {
+    const payload = try encodeDaemonTunnelFramePayload(transport.allocator, .{ .mux_stream = .{
+        .stream_id = client.stream_id,
+        .message = .{ .open_ok = .{
+            .recv_next_offset = client.inbound_next_offset,
+            .receive_window_bytes = proxy_stream_window_bytes,
+        } },
+    } });
+    defer transport.allocator.free(payload);
+    try startPooledSshTransportRemoteFrameWrite(transport, daemon_dispatcher, .daemon_tunnel, payload, .proxy_ack);
 }
 
 fn startPooledSshTransportClientFrameWrite(
@@ -2076,7 +2341,19 @@ fn startPooledSshTransportClientFrameWrite(
     if (client.write != null) return error.PooledSshTransportClientWriteAlreadyQueued;
     var frame = try protocol.FrameWriteState.init(client.transport.allocator, message_type, payload);
     errdefer frame.deinit();
-    client.write = .{ .frame = frame, .kind = kind };
+    client.write = .{ .frame = .{ .frame = frame, .kind = kind } };
+    try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
+}
+
+fn startPooledSshTransportClientRawWrite(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    client: *PooledSshTransportClient,
+    bytes: []u8,
+    kind: PooledSshTransportClientWriteKind,
+) !void {
+    if (client.write != null) return error.PooledSshTransportClientWriteAlreadyQueued;
+    errdefer client.transport.allocator.free(bytes);
+    client.write = .{ .raw = .{ .bytes = bytes, .kind = kind } };
     try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
 }
 
@@ -2112,7 +2389,7 @@ fn startPooledClientTransportError(
 
 fn finishPooledClientAfterCurrentWrite(client: *PooledSshTransportClient, send_hangup: bool) bool {
     if (client.write) |*write| {
-        write.kind = .{ .finish_after_write = .{ .send_hangup = send_hangup } };
+        write.setKind(.{ .finish_after_write = .{ .send_hangup = send_hangup } });
         return true;
     }
     return false;
@@ -2189,7 +2466,12 @@ fn activatePendingPooledSshTransportClients(daemon_dispatcher: *dispatcher.Dispa
         client.stream_id = transport.next_stream_id;
         transport.next_stream_id += 1;
         client.state = .opening_stream;
-        ensurePooledSshTransportClientWatch(daemon_dispatcher, client) catch {
+        if (client.raw_proxy) {
+            sendPooledRawProxyMuxOpen(daemon_dispatcher, transport, client) catch {
+                destroyPooledSshTransportClient(daemon_dispatcher, transport, client);
+                continue;
+            };
+        } else ensurePooledSshTransportClientWatch(daemon_dispatcher, client) catch {
             destroyPooledSshTransportClient(daemon_dispatcher, transport, client);
             continue;
         };
@@ -2505,7 +2787,7 @@ fn sendPooledTerminalMuxOpen(
     });
     errdefer transport.allocator.free(envelope_bytes);
     client.read_paused = true;
-    try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
     try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
     try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, envelope_bytes, .{ .client_mux_open_envelope = .{
         .client = client,
@@ -2538,6 +2820,42 @@ fn sendPooledProxyMuxOpen(
     try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
     try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
     try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, bytes, .{ .client_to_daemon = client });
+    client.mux_open_sent_ms = nowUnixMs();
+}
+
+fn sendPooledRawProxyMuxOpen(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    client: *PooledSshTransportClient,
+) !void {
+    const proxy_host = client.raw_proxy_host orelse return error.MissingProxyHost;
+    const typed_open_bytes = try encodeMuxFrameBytes(transport.allocator, .{
+        .stream_id = client.stream_id,
+        .message = .{ .payload = .{
+            .offset = 0,
+            .item = .{ .proxy = .{ .payload = .{ .open = .{
+                .proxy_guid = client.proxyGuidSlice(),
+                .proxy_host = proxy_host,
+                .proxy_port = client.raw_proxy_port,
+            } } } },
+        } },
+    });
+    errdefer transport.allocator.free(typed_open_bytes);
+    const envelope_bytes = try encodeMuxFrameBytes(transport.allocator, .{
+        .stream_id = client.stream_id,
+        .message = .{ .open = .{
+            .recv_next_offset = client.inbound_next_offset,
+            .receive_window_bytes = proxy_stream_window_bytes,
+        } },
+    });
+    errdefer transport.allocator.free(envelope_bytes);
+    client.read_paused = true;
+    try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
+    try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, envelope_bytes, .{ .client_mux_open_envelope = .{
+        .client = client,
+        .typed_open_bytes = typed_open_bytes,
+    } });
     client.mux_open_sent_ms = nowUnixMs();
 }
 
@@ -2638,7 +2956,14 @@ fn handlePooledRemoteFrame(
             return true;
         },
         .pong => return true,
-        else => return error.UnexpectedDaemonFrame,
+        else => {
+            daemon_log.infof(
+                transport.allocator,
+                "unexpected daemon tunnel payload host={s} payload={s}",
+                .{ transport.display_host, @tagName(std.meta.activeTag(payload)) },
+            );
+            return error.UnexpectedDaemonFrame;
+        },
     }
 }
 
@@ -2673,6 +2998,9 @@ fn handlePooledRemoteMuxStreamFrame(
     const client = findPooledSshTransportClient(transport, owned_mux_frame.stream_id) orelse return true;
     const message = owned_mux_frame.message orelse return error.UnexpectedDaemonFrame;
     if (client.kind == .proxy) {
+        if (client.raw_proxy) {
+            return handlePooledRemoteRawProxyMuxStreamFrame(daemon_dispatcher, transport, client, message);
+        }
         switch (message) {
             .open_ok => {
                 if (client.mux_open_ok_ms == 0) client.mux_open_ok_ms = nowUnixMs();
@@ -2742,6 +3070,90 @@ fn handlePooledRemoteMuxStreamFrame(
             finishPooledSshTransportClient(daemon_dispatcher, transport, client, false);
         },
         .open => return error.UnexpectedDaemonFrame,
+    }
+    return true;
+}
+
+fn handlePooledRemoteRawProxyMuxStreamFrame(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    client: *PooledSshTransportClient,
+    message: pb.DaemonTunnelItem.MuxStreamFrame.message_union,
+) !bool {
+    switch (message) {
+        .open_ok => {
+            if (client.mux_open_ok_ms == 0) client.mux_open_ok_ms = nowUnixMs();
+        },
+        .ack => {},
+        .payload => |payload| {
+            if (client.first_payload_ms == 0) {
+                client.first_payload_ms = nowUnixMs();
+                logPooledSshTransportClientStartupTiming(transport, client);
+            }
+            const item = payload.item orelse {
+                daemon_log.infof(transport.allocator, "raw proxy mux payload missing item host={s} stream_id={}", .{ transport.display_host, client.stream_id });
+                return error.UnexpectedDaemonFrame;
+            };
+            const proxy_item = switch (item) {
+                .proxy => |proxy| proxy,
+                else => {
+                    daemon_log.infof(transport.allocator, "raw proxy mux payload has non-proxy item host={s} stream_id={}", .{ transport.display_host, client.stream_id });
+                    return error.UnexpectedDaemonFrame;
+                },
+            };
+            const proxy_payload = proxy_item.payload orelse {
+                daemon_log.infof(transport.allocator, "raw proxy mux payload missing proxy payload host={s} stream_id={}", .{ transport.display_host, client.stream_id });
+                return error.UnexpectedDaemonFrame;
+            };
+            const data = switch (proxy_payload) {
+                .data => |bytes| bytes,
+                else => {
+                    daemon_log.infof(
+                        transport.allocator,
+                        "raw proxy mux payload has non-data proxy item host={s} stream_id={} item={s}",
+                        .{ transport.display_host, client.stream_id, @tagName(std.meta.activeTag(proxy_payload)) },
+                    );
+                    return error.UnexpectedDaemonFrame;
+                },
+            };
+
+            var new_data = data;
+            if (payload.offset < client.inbound_next_offset) {
+                const already_received: usize = @intCast(client.inbound_next_offset - payload.offset);
+                if (already_received >= data.len) {
+                    try pausePooledSshTransportRemoteRead(daemon_dispatcher, transport);
+                    try sendPooledRawProxyAck(daemon_dispatcher, transport, client);
+                    return true;
+                }
+                new_data = data[already_received..];
+            } else if (payload.offset > client.inbound_next_offset) {
+                return error.StreamOffsetGap;
+            }
+
+            const owned_data = try transport.allocator.dupe(u8, new_data);
+            errdefer transport.allocator.free(owned_data);
+            client.inbound_next_offset +|= new_data.len;
+            try pausePooledSshTransportRemoteRead(daemon_dispatcher, transport);
+            try startPooledSshTransportClientRawWrite(daemon_dispatcher, client, owned_data, .forwarded_from_daemon);
+        },
+        .reset => {
+            if (client.first_payload_ms == 0) {
+                client.first_payload_ms = nowUnixMs();
+                logPooledSshTransportClientStartupTiming(transport, client);
+            }
+            finishPooledSshTransportClient(daemon_dispatcher, transport, client, false);
+        },
+        .eof => {
+            if (client.first_payload_ms == 0) {
+                client.first_payload_ms = nowUnixMs();
+                logPooledSshTransportClientStartupTiming(transport, client);
+            }
+            finishPooledSshTransportClient(daemon_dispatcher, transport, client, false);
+        },
+        .open => {
+            try pausePooledSshTransportRemoteRead(daemon_dispatcher, transport);
+            try sendPooledRawProxyOpenOk(daemon_dispatcher, transport, client);
+        },
     }
     return true;
 }
@@ -2855,6 +3267,10 @@ fn notifyPooledSshTransportRemoteClosed(daemon_dispatcher: *dispatcher.Dispatche
     var index: usize = 0;
     while (index < transport.clients.items.len) {
         const client = transport.clients.items[index];
+        if (client.raw_proxy) {
+            finishPooledSshTransportClient(daemon_dispatcher, transport, client, false);
+            continue;
+        }
         if (finishPooledClientAfterCurrentWrite(client, false)) {
             index += 1;
             continue;
@@ -2890,6 +3306,7 @@ fn forwardPooledSshTransportStderr(
         var started_write = false;
         for (transport.clients.items) |client| {
             if (client.state == .done) continue;
+            if (client.raw_proxy) continue;
             if (client.write != null) continue;
             try startPooledClientConnectionEvent(daemon_dispatcher, client, .{ .ssh_stderr = .{ .data = bytes } }, .forwarded_from_daemon);
             started_write = true;
@@ -3205,6 +3622,16 @@ fn appendCurrentProcessToSshTransportAcquire(
     const local = try daemon_cleanup.currentLocalProcessIdentity(allocator);
     request.local_pid = local.pid;
     request.local_start_time = local.start_time;
+}
+
+fn appendParentProcessToSshTransportAcquire(
+    allocator: std.mem.Allocator,
+    request: *pb.ClientDaemonItem.SshTransportAcquire,
+) !void {
+    const parent_pid = c.getppid();
+    if (parent_pid <= 0) return error.ProcessStartTimeUnavailable;
+    request.local_pid = @intCast(parent_pid);
+    request.local_start_time = try daemon_identity.processStartTime(allocator, request.local_pid);
 }
 
 fn appendCurrentEnvironmentToSshTransportAcquire(
@@ -4143,7 +4570,13 @@ fn runProxyStreamSsh(
         new.shell_command_args
     else
         &.{};
-    const diagnostics_plan = proxyDiagnosticsPlan(
+    const use_fd_pass = common.isolation_mode == .none;
+    const diagnostics_plan = if (use_fd_pass) ProxyDiagnosticsPlan{
+        .command_level = .unhygienic,
+        .use_daemon_control = false,
+        .wrap_visible_ssh = false,
+        .client_ctrl_r = false,
+    } else proxyDiagnosticsPlan(
         target.options,
         common.filter_level,
         new.tty_request,
@@ -4179,11 +4612,12 @@ fn runProxyStreamSsh(
         diagnostics_plan.client_ctrl_r,
         common.bootstrap,
         daemon_dir_name,
+        use_fd_pass,
     );
     defer allocator.free(proxy_command_option);
 
     const default_options = defaultSshOptionsLen(target);
-    const ssh_arg_count = 1 + default_options + target.options.len + 1 + remote_command_args.len;
+    const ssh_arg_count = 1 + @as(usize, if (use_fd_pass) 1 else 0) + default_options + target.options.len + 1 + remote_command_args.len;
     const ssh_args = try allocator.alloc([]const u8, ssh_arg_count);
     defer allocator.free(ssh_args);
 
@@ -4193,6 +4627,10 @@ fn runProxyStreamSsh(
     // inner bootstrap ssh while ensuring the outer ssh talks over our stream.
     ssh_args[index] = proxy_command_option;
     index += 1;
+    if (use_fd_pass) {
+        ssh_args[index] = "-oProxyUseFdPass=yes";
+        index += 1;
+    }
     appendDefaultSshOptions(ssh_args, &index, target.default_ipqos_option);
     @memcpy(ssh_args[index .. index + target.options.len], target.options);
     index += target.options.len;
@@ -4334,6 +4772,7 @@ fn proxyCommandOption(
     client_ctrl_r: bool,
     bootstrap: bool,
     daemon_dir_name: ?[]const u8,
+    use_fd_pass: bool,
 ) ![]u8 {
     var command: std.ArrayList(u8) = .empty;
     defer command.deinit(allocator);
@@ -4349,6 +4788,7 @@ fn proxyCommandOption(
     try appendShellToken(allocator, &command, "%r");
     try appendShellToken(allocator, &command, "--filter-level");
     try appendShellToken(allocator, &command, filter_level.label());
+    if (use_fd_pass) try appendShellToken(allocator, &command, "--use-fd-pass");
     try appendShellToken(allocator, &command, if (bootstrap) "--bootstrap" else "--no-bootstrap");
     if (daemon_dir_name) |dir_name| {
         try appendShellToken(allocator, &command, "--daemon-namespace");
@@ -4427,6 +4867,7 @@ const ProxyStreamInvocation = struct {
     filter_level: config.FilterLevel = .unhygienic,
     client_ctrl_r: bool = false,
     bootstrap: bool = true,
+    use_fd_pass: bool = false,
     ssh_options: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *ProxyStreamInvocation, allocator: std.mem.Allocator) void {
@@ -4458,6 +4899,17 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .options = invocation.ssh_options.items,
         .host = invocation.host,
     };
+    if (invocation.use_fd_pass) {
+        try runProxyStreamFdPass(
+            allocator,
+            exe,
+            invocation,
+            stream_target,
+            proxy_guid,
+            proxy_port,
+        );
+        return process_exit.request(0);
+    }
     var starter = DaemonStreamClientStarter{
         .allocator = allocator,
         .exe = exe,
@@ -4487,6 +4939,99 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         return;
     };
     return process_exit.request(exit_status);
+}
+
+fn runProxyStreamFdPass(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    invocation: ProxyStreamInvocation,
+    stream_target: SshTarget,
+    proxy_guid: []const u8,
+    proxy_port: u16,
+) !void {
+    const daemon_fd = if (invocation.daemon_dir_name) |dir_name|
+        try daemon_client.connectOrStartForDirName(allocator, exe, dir_name)
+    else
+        try daemon_client.connectOrStart(allocator, exe);
+    defer _ = c.close(daemon_fd);
+
+    var raw_pair: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &raw_pair) != 0) return error.SocketPairFailed;
+    var daemon_raw_fd: c.fd_t = raw_pair[0];
+    var ssh_raw_fd: c.fd_t = raw_pair[1];
+    defer {
+        if (daemon_raw_fd >= 0) _ = c.close(daemon_raw_fd);
+    }
+    defer {
+        if (ssh_raw_fd >= 0) _ = c.close(ssh_raw_fd);
+    }
+
+    var transport = pb.ClientDaemonItem.SshTransportAcquire{
+        .host = stream_target.host,
+        .bootstrap = invocation.bootstrap,
+    };
+    defer transport.ssh_option.deinit(allocator);
+    defer deinitSshTransportAcquireOwnedFields(allocator, &transport);
+    try transport.ssh_option.appendSlice(allocator, stream_target.options);
+    try appendCurrentSshAgentToSshTransportAcquire(allocator, &transport);
+    try appendParentProcessToSshTransportAcquire(allocator, &transport);
+
+    const payload = try protocol.encodePayload(allocator, pb.ClientDaemonItem{ .payload = .{ .proxy_fd_pass_open = .{
+        .transport = transport,
+        .proxy = .{
+            .proxy_guid = proxy_guid,
+            .proxy_host = "localhost",
+            .proxy_port = proxy_port,
+        },
+    } } });
+    defer allocator.free(payload);
+    const frame_bytes = try protocol.encodeFrame(allocator, .client_daemon, payload);
+    defer allocator.free(frame_bytes);
+
+    const daemon_fd_to_pass = daemon_raw_fd;
+    daemon_raw_fd = -1;
+    try sendFdBufferImmediate(daemon_fd, frame_bytes, daemon_fd_to_pass);
+
+    try waitProxyFdPassAccepted(allocator, daemon_fd);
+
+    const ssh_fd_to_pass = ssh_raw_fd;
+    ssh_raw_fd = -1;
+    try sendFdBufferImmediate(posix.STDOUT_FILENO, "sessh-proxy-fd", ssh_fd_to_pass);
+}
+
+fn sendFdBufferImmediate(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t) !void {
+    var progress = try fd_passing.FrameWriteWithFdProgress.init(bytes, passed_fd);
+    defer progress.deinit();
+    while (true) {
+        switch (try progress.writeReady(sock_fd)) {
+            .complete => return,
+            .progress => continue,
+            .blocked => return error.WouldBlock,
+            .eof => unreachable,
+        }
+    }
+}
+
+fn waitProxyFdPassAccepted(allocator: std.mem.Allocator, daemon_fd: c.fd_t) !void {
+    var frame = try protocol.readFrameAlloc(allocator, daemon_fd);
+    defer frame.deinit(allocator);
+    switch (frame.message_type) {
+        .client_daemon => {
+            var item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, frame.payload);
+            defer item.deinit(allocator);
+            switch (item.payload orelse return error.UnexpectedDaemonFrame) {
+                .proxy_fd_pass_accepted => return,
+                else => return error.UnexpectedDaemonFrame,
+            }
+        },
+        .error_message => {
+            var message = try protocol.decodePayload(protocol.hpb.Error, allocator, frame.payload);
+            defer message.deinit(allocator);
+            try io.stderrPrint("sessh-proxy: daemon rejected fd-pass proxy: {s}\n", .{message.message});
+            return error.ProxyFdPassRejected;
+        },
+        else => return error.UnexpectedDaemonFrame,
+    }
 }
 
 fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []const u8) !ProxyStreamInvocation {
@@ -4536,6 +5081,9 @@ fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []cons
             i += 1;
             if (i >= args.len or args[i].len == 0) return error.MissingFilterLevel;
             invocation.filter_level = try config.parseFilterLevel(args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--use-fd-pass")) {
+            invocation.use_fd_pass = true;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--client-ctrl-r")) {
             i += 1;
@@ -4940,7 +5488,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(shouldUseProxyStreamForTest(parsed, true));
 
-    const option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "p-550e8400-e29b-41d4-a716-446655440000", .hygienic, true, true, "3.conn.test");
+    const option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "p-550e8400-e29b-41d4-a716-446655440000", .hygienic, true, true, "3.conn.test", false);
     defer std.testing.allocator.free(option);
 
     try std.testing.expect(std.mem.indexOf(u8, option, "sessh-proxy") != null);
@@ -4950,6 +5498,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "%r") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--filter-level") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "hygienic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "--use-fd-pass") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--bootstrap") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--daemon-namespace") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "3.conn.test") != null);
@@ -4963,9 +5512,13 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "'-X'") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "'-tt'") == null);
 
-    const no_bootstrap_option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, false, null);
+    const no_bootstrap_option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, false, null, false);
     defer std.testing.allocator.free(no_bootstrap_option);
     try std.testing.expect(std.mem.indexOf(u8, no_bootstrap_option, "--no-bootstrap") != null);
+
+    const fd_pass_option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, true, null, true);
+    defer std.testing.allocator.free(fd_pass_option);
+    try std.testing.expect(std.mem.indexOf(u8, fd_pass_option, "--use-fd-pass") != null);
 }
 
 test "proxy control registry routes diagnostics and retry by proxy guid" {

@@ -177,6 +177,7 @@ test {
     _ = @import("core/client_log.zig");
     _ = @import("core/config.zig");
     _ = @import("core/dispatcher.zig");
+    _ = @import("core/fd_passing.zig");
     _ = @import("core/io.zig");
     _ = @import("core/local_boot_time.zig");
     _ = @import("core/non_suspending_timer.zig");

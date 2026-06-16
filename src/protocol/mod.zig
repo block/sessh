@@ -499,12 +499,12 @@ fn decodeMessageAlloc(allocator: std.mem.Allocator, fd: c.fd_t, message_bytes: [
     return frame;
 }
 
-const DecodedMessageEnvelope = struct {
+pub const DecodedMessageEnvelope = struct {
     frame: OwnedFrame,
     attached_bytes_len: usize = 0,
 };
 
-fn decodeMessageEnvelopeAlloc(allocator: std.mem.Allocator, message_bytes: []const u8) !DecodedMessageEnvelope {
+pub fn decodeMessageEnvelopeAlloc(allocator: std.mem.Allocator, message_bytes: []const u8) !DecodedMessageEnvelope {
     if (message_bytes.len == 0) return error.UnknownFrame;
     if (isHelloFrameEnvelope(message_bytes)) return .{
         .frame = try decodeHelloMessageAlloc(allocator, message_bytes),
