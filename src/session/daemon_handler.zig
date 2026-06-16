@@ -17,71 +17,91 @@ const session_registry = @import("../runtime/session_registry.zig");
 const pb = protocol.pb;
 const hpb = protocol.hpb;
 
-pub fn serveFrameAfterHandshake(
+pub fn registerFrameAfterHandshakeFromDaemon(
     allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
     exe: []const u8,
     frame: protocol.OwnedFrame,
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
+    client_fd: c.fd_t,
 ) !void {
-    switch (frame.message_type) {
-        .client_remote => {
-            var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
-            defer item.deinit(allocator);
-            const item_payload = item.payload orelse return error.UnexpectedFrame;
-            const request = switch (item_payload) {
-                .resize => return,
-                .open => |open| open,
-                else => {
-                    try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports terminal stream open in this mode", "");
-                    return;
-                },
-            };
-            const action = teStreamActionName(request);
-            daemon_log.infof(
-                allocator,
-                "terminal stream opening session={s} action={s}",
-                .{ request.session_guid, action },
-            );
-            const request_payload = try protocol.encodePayload(allocator, request);
-            defer allocator.free(request_payload);
-            if (request.create == null) {
-                const process_fd = connectTerminalRemoteForOpen(allocator, request) catch |err| switch (err) {
-                    error.InvalidSessionGuid, error.SessionNotFound => {
-                        try sendError(write_fd, "SESSION_NOT_FOUND", "session not found", "");
-                        return;
-                    },
-                    else => return err,
-                };
-                defer _ = c.close(process_fd);
-                daemon_log.infof(
-                    allocator,
-                    "terminal stream remote connected session={s} action={s}",
-                    .{ request.session_guid, action },
-                );
-                try openTerminalRemoteAndForwardFrames(allocator, process_fd, request_payload, read_fd, write_fd);
-                return;
-            }
-
-            const open_payload = try sessionOpenPayloadWithCurrentEnvironment(allocator, request_payload);
-            defer allocator.free(open_payload);
-            const process_fd = startTerminalRemoteAndConnect(allocator, exe, open_payload) catch |err| switch (err) {
-                else => return err,
-            };
-            defer _ = c.close(process_fd);
-            daemon_log.infof(
-                allocator,
-                "terminal stream remote connected session={s} action={s}",
-                .{ request.session_guid, action },
-            );
-            try openTerminalRemoteAndForwardFrames(allocator, process_fd, open_payload, read_fd, write_fd);
-            return;
-        },
-        else => {
-            try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports terminal stream open in this mode", "");
-            return;
-        },
+    var owns_client_fd = true;
+    defer {
+        if (owns_client_fd) _ = c.close(client_fd);
     }
+
+    if (frame.message_type != .client_remote) {
+        try sendError(client_fd, "PROTOCOL_ERROR", "session handler only supports terminal stream open in this mode", "");
+        return;
+    }
+    var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
+    defer item.deinit(allocator);
+    const item_payload = item.payload orelse {
+        try sendError(client_fd, "PROTOCOL_ERROR", "empty terminal stream item", "");
+        return;
+    };
+    const request = switch (item_payload) {
+        .resize => return,
+        .open => |open| open,
+        else => {
+            try sendError(client_fd, "PROTOCOL_ERROR", "session handler only supports terminal stream open in this mode", "");
+            return;
+        },
+    };
+
+    const action = teStreamActionName(request);
+    daemon_log.infof(
+        allocator,
+        "terminal stream opening session={s} action={s}",
+        .{ request.session_guid, action },
+    );
+
+    const request_payload = try protocol.encodePayload(allocator, request);
+    defer allocator.free(request_payload);
+
+    const process_fd = if (request.create == null) blk: {
+        break :blk connectTerminalRemoteForOpen(allocator, request) catch |err| switch (err) {
+            error.InvalidSessionGuid, error.SessionNotFound => {
+                try sendError(client_fd, "SESSION_NOT_FOUND", "session not found", "");
+                return;
+            },
+            else => return err,
+        };
+    } else blk: {
+        const open_payload = try sessionOpenPayloadWithCurrentEnvironment(allocator, request_payload);
+        defer allocator.free(open_payload);
+        break :blk try startTerminalRemoteAndConnect(allocator, exe, open_payload);
+    };
+    var owns_process_fd = true;
+    defer {
+        if (owns_process_fd) _ = c.close(process_fd);
+    }
+
+    daemon_log.infof(
+        allocator,
+        "terminal stream remote connected session={s} action={s}",
+        .{ request.session_guid, action },
+    );
+
+    const open_payload = if (request.create == null)
+        request_payload
+    else
+        try sessionOpenPayloadWithCurrentEnvironment(allocator, request_payload);
+    defer if (request.create != null) allocator.free(open_payload);
+
+    initiateTerminalRemoteHandshake(allocator, process_fd) catch |err| switch (err) {
+        error.VersionMismatch => {
+            try sendError(client_fd, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client", "Start a fresh sessh connection with matching binaries");
+            return;
+        },
+        else => return err,
+    };
+    var session_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, open_payload);
+    defer session_open.deinit(allocator);
+    try protocol.sendTeStreamPayloadFrame(allocator, process_fd, .{ .open = session_open });
+
+    try frame_forwarder.registerFrameRelay(allocator, daemon_dispatcher, client_fd, process_fd);
+    owns_client_fd = false;
+    owns_process_fd = false;
 }
 
 pub fn serveDebugFrameAfterHandshake(
@@ -590,26 +610,6 @@ fn appendEnvironmentEntry(
         .name = name,
         .value = value,
     });
-}
-
-fn openTerminalRemoteAndForwardFrames(
-    allocator: std.mem.Allocator,
-    process_fd: c.fd_t,
-    session_open_payload: []const u8,
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-) !void {
-    initiateTerminalRemoteHandshake(allocator, process_fd) catch |err| switch (err) {
-        error.VersionMismatch => {
-            try sendError(write_fd, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client", "Start a fresh sessh connection with matching binaries");
-            return;
-        },
-        else => return err,
-    };
-    var session_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, session_open_payload);
-    defer session_open.deinit(allocator);
-    try protocol.sendTeStreamPayloadFrame(allocator, process_fd, .{ .open = session_open });
-    try frame_forwarder.forwardFrames(read_fd, write_fd, process_fd);
 }
 
 fn forwardTerminalRemoteFramesToClient(allocator: std.mem.Allocator, process_fd: c.fd_t, write_fd: c.fd_t) !void {

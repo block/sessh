@@ -2717,7 +2717,7 @@ def test_ssh_forwarding_uses_proxy_stream(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_filter_level_raw_uses_proxy_stream(tmp):
+def test_ssh_filter_level_unhygienic_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2725,7 +2725,7 @@ def test_ssh_filter_level_raw_uses_proxy_stream(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
-    result = run_sessh(["--filter-level", "raw", "test-host"], env, timeout=5.0)
+    result = run_sessh(["--filter-level", "unhygienic", "test-host"], env, timeout=5.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -2745,7 +2745,7 @@ def test_ssh_filter_level_config_uses_proxy_stream(tmp):
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     write_fake_ssh(fake_bin / "ssh")
-    write_sessh_config(env, "filter-level=raw\n")
+    write_sessh_config(env, "filter-level=unhygienic\n")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
@@ -2767,7 +2767,7 @@ def test_ssh_filter_level_cli_overrides_config(tmp):
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     write_fake_ssh(fake_bin / "ssh")
-    write_sessh_config(env, "filter-level=raw\n")
+    write_sessh_config(env, "filter-level=unhygienic\n")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
@@ -2777,6 +2777,31 @@ def test_ssh_filter_level_cli_overrides_config(tmp):
         raise AssertionError(result)
     log_text = fake_log.read_text()
     if "proxy_ssh=1" not in log_text or "sessh-proxy" not in log_text:
+        raise AssertionError(log_text)
+    if "plain_ssh=1" in log_text:
+        raise AssertionError(log_text)
+
+
+def test_ssh_isolation_mode_connection_uses_private_proxy_namespace(tmp):
+    env = isolated_env(tmp)
+    fake_bin = tmp / "fake-ssh-bin"
+    fake_log = tmp / "fake-ssh.log"
+    write_fake_ssh(fake_bin / "ssh")
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
+
+    result = run_sessh(
+        ["--isolation-mode", "connection", "--filter-level", "unhygienic", "test-host"],
+        env,
+        timeout=5.0,
+    )
+
+    if result.returncode != 0:
+        raise AssertionError(result)
+    log_text = fake_log.read_text()
+    if "proxy_ssh=1" not in log_text or "sessh-proxy" not in log_text:
+        raise AssertionError(log_text)
+    if "--daemon-namespace" not in log_text or "3.conn." not in log_text:
         raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
@@ -3487,7 +3512,7 @@ def test_ssh_requested_tty_with_piped_stdout_does_not_emit_local_cleanup(tmp):
     log_text = fake_log.read_text()
     if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
-    if "--filter-level" not in log_text or "raw" not in log_text:
+    if "--filter-level" not in log_text or "unhygienic" not in log_text:
         raise AssertionError(log_text)
 
 
@@ -4536,8 +4561,8 @@ def main(argv=None):
             test_ssh_forwarding_uses_proxy_stream,
         ),
         (
-            "ssh filter-level raw uses proxy stream",
-            test_ssh_filter_level_raw_uses_proxy_stream,
+            "ssh filter-level unhygienic uses proxy stream",
+            test_ssh_filter_level_unhygienic_uses_proxy_stream,
         ),
         (
             "ssh filter-level config uses proxy stream",
@@ -4546,6 +4571,10 @@ def main(argv=None):
         (
             "ssh filter-level cli overrides config",
             test_ssh_filter_level_cli_overrides_config,
+        ),
+        (
+            "ssh isolation-mode connection uses private proxy namespace",
+            test_ssh_isolation_mode_connection_uses_private_proxy_namespace,
         ),
         (
             "ssh remote command uses proxy stream",

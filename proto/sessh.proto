@@ -79,7 +79,7 @@ message ConnectionEvent {
   message DaemonDisconnected {
     // Deadline on the sender machine's sessh local-boot-time clock, in
     // milliseconds. The sessh local-boot-time clock is a suspend-inclusive
-    // monotonic boot clock: Linux CLOCK_BOOTTIME, Darwin CLOCK_UPTIME_RAW, and
+    // monotonic boot clock: Linux CLOCK_BOOTTIME, Darwin CLOCK_MONOTONIC, and
     // CLOCK_MONOTONIC elsewhere when no stronger boot-time clock is available.
     // This field is only meaningful for same-machine client/daemon/control IPC;
     // do not forward it across machines or compare it with wall time.

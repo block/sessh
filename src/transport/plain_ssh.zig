@@ -235,7 +235,7 @@ fn waitForChildAndDiagnostics(pid: c.pid_t, diagnostics: *ProxyClientControl) st
         };
 
         if (diagnostics.control_fd < 0) {
-            io.sleepMillis(100);
+            io.waitMillis(100);
             continue;
         }
         var pollfds = [_]posix.pollfd{.{

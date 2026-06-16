@@ -6,20 +6,13 @@ const protocol = @import("../protocol/mod.zig");
 
 const pb = protocol.pb;
 
-var mutex: std.Thread.Mutex = .{};
 var subscribers: std.ArrayList(c.fd_t) = .empty;
 
 pub fn subscribe(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    mutex.lock();
-    defer mutex.unlock();
-
     try subscribers.append(allocator, fd);
 }
 
 pub fn unsubscribe(fd: c.fd_t) void {
-    mutex.lock();
-    defer mutex.unlock();
-
     var index: usize = 0;
     while (index < subscribers.items.len) {
         if (subscribers.items[index] == fd) {
@@ -48,9 +41,6 @@ fn sendEntry(allocator: std.mem.Allocator, entry: pb.ClientDaemonItem.DaemonLogE
     const frame = try protocol.encodeFrame(allocator, .client_daemon, item_payload);
     defer allocator.free(frame);
 
-    mutex.lock();
-    defer mutex.unlock();
-
     var index: usize = 0;
     while (index < subscribers.items.len) {
         io.writeAll(subscribers.items[index], frame) catch {
@@ -62,8 +52,6 @@ fn sendEntry(allocator: std.mem.Allocator, entry: pb.ClientDaemonItem.DaemonLogE
 }
 
 fn clearForTest(allocator: std.mem.Allocator) void {
-    mutex.lock();
-    defer mutex.unlock();
     subscribers.deinit(allocator);
     subscribers = .empty;
 }

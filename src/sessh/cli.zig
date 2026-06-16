@@ -27,6 +27,8 @@ pub const CommonSessionOptions = struct {
     terminal_emulator_set: bool = false,
     filter_level: config.FilterLevel = config.default_filter_level,
     filter_level_set: bool = false,
+    isolation_mode: config.IsolationMode = config.default_isolation_mode,
+    isolation_mode_set: bool = false,
     capture_tty_transcript: ?[]const u8 = null,
 };
 
@@ -130,6 +132,12 @@ fn parseSesshOptionBeforeHost(args: []const []const u8, index: *usize, common: *
         common.filter_level = try config.parseFilterLevel(args[index.*]);
         common.filter_level_set = true;
         index.* += 1;
+    } else if (std.mem.eql(u8, arg, "--isolation-mode")) {
+        index.* += 1;
+        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingIsolationMode;
+        common.isolation_mode = try config.parseIsolationMode(args[index.*]);
+        common.isolation_mode_set = true;
+        index.* += 1;
     } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
         index.* += 1;
         if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingTtyTranscriptPath;
@@ -148,6 +156,7 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--terminal-emulator") or
         std.mem.eql(u8, arg, "--no-terminal-emulator") or
         std.mem.eql(u8, arg, "--filter-level") or
+        std.mem.eql(u8, arg, "--isolation-mode") or
         std.mem.eql(u8, arg, "--ssh-options") or
         std.mem.eql(u8, arg, "--capture-tty-transcript");
 }
@@ -351,14 +360,30 @@ test "parse preserves lower filter levels" {
     const parsed = try parse(&scratch, &.{
         "sessh",
         "--filter-level",
-        "raw",
+        "unhygienic",
         "-L",
         "8080:localhost:80",
         "example.com",
     });
 
     try std.testing.expectEqualStrings("example.com", parsed.host);
-    try std.testing.expectEqual(config.FilterLevel.raw, parsed.common.filter_level);
+    try std.testing.expectEqual(config.FilterLevel.unhygienic, parsed.common.filter_level);
     try std.testing.expect(parsed.common.filter_level_set);
     try std.testing.expect(parsed.proxy_required);
+}
+
+test "parse preserves isolation mode" {
+    var scratch = Scratch{ .allocator = std.testing.allocator };
+    defer scratch.deinit();
+
+    const parsed = try parse(&scratch, &.{
+        "sessh",
+        "--isolation-mode",
+        "connection",
+        "example.com",
+    });
+
+    try std.testing.expectEqualStrings("example.com", parsed.host);
+    try std.testing.expectEqual(config.IsolationMode.connection, parsed.common.isolation_mode);
+    try std.testing.expect(parsed.common.isolation_mode_set);
 }

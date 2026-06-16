@@ -6,6 +6,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const client_log = @import("../core/client_log.zig");
 const client_renderer = @import("renderer.zig");
 const io_helpers = @import("../core/io.zig");
+const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect_title = @import("../reconnect/title.zig");
 const terminal = @import("../tty/terminal.zig");
@@ -42,6 +43,7 @@ pub const ReconnectUi = struct {
     const max_diagnostic_overlay_lines = 3;
     const max_overlay_message_bytes = 256;
     const max_title_fallback_bytes = 512;
+    const disconnected_input_flash_ms = 35;
 
     mode_guard: terminal.TerminalModeGuard,
     viewport_offset: u16 = 0,
@@ -50,6 +52,7 @@ pub const ReconnectUi = struct {
     overlay_message_len: usize = 0,
     diagnostic_notify_read_fd: c.fd_t = -1,
     diagnostic_notify_write_fd: c.fd_t = -1,
+    clock: NonSuspendingTimer = undefined,
     diagnostic_cursor: u64 = 0,
     live_diagnostic_start_seq: u64 = 0,
     rendered_diagnostic_seq: u64 = 0,
@@ -59,7 +62,7 @@ pub const ReconnectUi = struct {
     reconnect_acknowledged: bool = false,
     input_during_disconnect: bool = false,
     escape_filter: terminal.EscapeFilter = .{},
-    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancelled: bool = false,
     title_enabled: bool = false,
     title_fd: c.fd_t = posix.STDOUT_FILENO,
     title_visible: bool = false,
@@ -69,6 +72,7 @@ pub const ReconnectUi = struct {
     last_size: WindowSize = .{},
     resize_generation: u64 = 0,
     forwarded_resize_generation: u64 = 0,
+    disconnected_input_flash_until_ms: u64 = 0,
 
     pub fn begin(viewport_offset: i32) !ReconnectUi {
         return beginWithPresentation(viewport_offset, .overlay);
@@ -77,6 +81,7 @@ pub const ReconnectUi = struct {
     pub fn beginWithPresentation(viewport_offset: i32, presentation: ReconnectPresentation) !ReconnectUi {
         var ui = ReconnectUi{
             .mode_guard = try terminal.TerminalModeGuard.enable(posix.STDIN_FILENO),
+            .clock = try NonSuspendingTimer.start(),
             .title_enabled = (presentation == .overlay or presentation == .title) and c.isatty(posix.STDOUT_FILENO) != 0,
             .presentation = presentation,
             .last_size = terminal.currentWindowSize(),
@@ -110,6 +115,7 @@ pub const ReconnectUi = struct {
     }
 
     pub fn deinit(self: *ReconnectUi) void {
+        self.clearDisconnectedInputFlash() catch {};
         self.restoreTitleForEnd();
         if (self.diagnostic_notify_write_fd >= 0) {
             client_log.unregisterUserDiagnosticNotifier(self.diagnostic_notify_write_fd);
@@ -126,7 +132,7 @@ pub const ReconnectUi = struct {
 
     pub fn waitForReconnect(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
         try self.drawReconnectOverlay(delay_ms);
-        var timer = try std.time.Timer.start();
+        var timer = try NonSuspendingTimer.start();
         var next_overlay_update_ms = nextOverlayUpdateDelayMs(delay_ms);
 
         while (true) {
@@ -212,7 +218,7 @@ pub const ReconnectUi = struct {
     pub fn waitForReconnectSwitchOrTimeout(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
         if (self.hasReconnectAcknowledgement()) return .reconnect_now;
         try self.drawReconnectReadyOverlay(.delayed, delay_ms);
-        var timer = try std.time.Timer.start();
+        var timer = try NonSuspendingTimer.start();
         var next_overlay_update_ms = nextOverlayUpdateDelayMs(delay_ms);
 
         while (true) {
@@ -246,23 +252,25 @@ pub const ReconnectUi = struct {
 
     pub fn pollDecision(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
         if (self.isCancelled()) return .client_hangup;
+        try self.refreshDisconnectedInputFlash();
         try self.refreshForResize();
         try self.refreshOverlayIfDiagnosticsChanged();
         const decision = try self.pollInput(timeout_ms);
+        try self.refreshDisconnectedInputFlash();
         try self.refreshForResize();
         try self.refreshOverlayIfDiagnosticsChanged();
         return decision;
     }
 
     pub fn cancel(self: *ReconnectUi) void {
-        self.cancelled.store(true, .release);
+        self.cancelled = true;
     }
 
     pub fn isCancelled(self: *ReconnectUi) bool {
-        return self.cancelled.load(.acquire);
+        return self.cancelled;
     }
 
-    pub fn cancellationFlag(self: *const ReconnectUi) *const std.atomic.Value(bool) {
+    pub fn cancellationFlag(self: *const ReconnectUi) *const bool {
         return &self.cancelled;
     }
 
@@ -272,10 +280,16 @@ pub const ReconnectUi = struct {
         return true;
     }
 
-    fn effectivePollTimeout(self: *const ReconnectUi, timeout_ms: i32) i32 {
-        if (timeout_ms >= 0) return timeout_ms;
-        if (self.presentation != .overlay) return timeout_ms;
-        return 250;
+    fn effectivePollTimeout(self: *ReconnectUi, timeout_ms: i32) i32 {
+        var effective_timeout = timeout_ms;
+        if (effective_timeout < 0 and self.presentation == .overlay) effective_timeout = 250;
+        if (self.disconnected_input_flash_until_ms <= 0) return effective_timeout;
+        const now_ms = self.nowMs();
+        if (now_ms >= self.disconnected_input_flash_until_ms) return 0;
+        const remaining_ms = self.disconnected_input_flash_until_ms - now_ms;
+        const flash_timeout: i32 = @intCast(@min(remaining_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
+        if (effective_timeout < 0) return flash_timeout;
+        return @min(effective_timeout, flash_timeout);
     }
 
     pub fn refreshForResize(self: *ReconnectUi) !void {
@@ -344,12 +358,28 @@ pub const ReconnectUi = struct {
     }
 
     fn alertDisconnectedInput(self: *ReconnectUi) !void {
-        _ = self;
         try io_helpers.writeAll(posix.STDOUT_FILENO, "\x07");
         if (c.isatty(posix.STDOUT_FILENO) == 0) return;
-        try io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?5h");
-        defer io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?5l") catch {};
-        std.Thread.sleep(35 * std.time.ns_per_ms);
+        if (self.disconnected_input_flash_until_ms <= 0) {
+            try io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?5h");
+        }
+        self.disconnected_input_flash_until_ms = self.nowMs() +| disconnected_input_flash_ms;
+    }
+
+    fn refreshDisconnectedInputFlash(self: *ReconnectUi) !void {
+        if (self.disconnected_input_flash_until_ms <= 0) return;
+        if (self.nowMs() < self.disconnected_input_flash_until_ms) return;
+        try self.clearDisconnectedInputFlash();
+    }
+
+    fn clearDisconnectedInputFlash(self: *ReconnectUi) !void {
+        if (self.disconnected_input_flash_until_ms <= 0) return;
+        self.disconnected_input_flash_until_ms = 0;
+        if (c.isatty(posix.STDOUT_FILENO) != 0) try io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?5l");
+    }
+
+    fn nowMs(self: *ReconnectUi) u64 {
+        return self.clock.read() / std.time.ns_per_ms;
     }
 
     pub fn clearOverlay(self: *ReconnectUi) !i32 {
@@ -974,7 +1004,7 @@ fn nextOverlayUpdateDelayMs(remaining_ms: u64) u64 {
     return @min(remaining_ms - 59_000, 60_000);
 }
 
-fn elapsedTimerMs(timer: *std.time.Timer) u64 {
+fn elapsedTimerMs(timer: *NonSuspendingTimer) u64 {
     return timer.read() / std.time.ns_per_ms;
 }
 test "formatDelay uses compact reconnect labels" {

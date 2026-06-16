@@ -5,6 +5,7 @@ pub const version = "0.7.0-dev";
 pub const default_scrollback_row_count = 2000;
 pub const default_debug_unresponsive_seconds = 10;
 pub const default_filter_level: FilterLevel = .emulated;
+pub const default_isolation_mode: IsolationMode = .daemon;
 pub const hour_ms: u64 = 60 * 60 * 1000;
 pub const default_cleanup_wakeup_interval_ms: u64 = hour_ms;
 pub const default_cleanup_retry_limit_ms: u64 = 168 * hour_ms;
@@ -20,13 +21,13 @@ pub const min_protocol_major = 3;
 pub const min_protocol_minor = 0;
 
 pub const FilterLevel = enum {
-    raw,
+    unhygienic,
     hygienic,
     emulated,
 
     pub fn label(self: FilterLevel) []const u8 {
         return switch (self) {
-            .raw => "raw",
+            .unhygienic => "unhygienic",
             .hygienic => "hygienic",
             .emulated => "emulated",
         };
@@ -34,8 +35,29 @@ pub const FilterLevel = enum {
 };
 
 pub fn parseFilterLevel(value: []const u8) !FilterLevel {
-    if (std.ascii.eqlIgnoreCase(value, "raw")) return .raw;
+    if (std.ascii.eqlIgnoreCase(value, "unhygienic")) return .unhygienic;
     if (std.ascii.eqlIgnoreCase(value, "hygienic")) return .hygienic;
     if (std.ascii.eqlIgnoreCase(value, "emulated")) return .emulated;
     return error.InvalidFilterLevel;
+}
+
+pub const IsolationMode = enum {
+    connection,
+    daemon,
+    none,
+
+    pub fn label(self: IsolationMode) []const u8 {
+        return switch (self) {
+            .connection => "connection",
+            .daemon => "daemon",
+            .none => "none",
+        };
+    }
+};
+
+pub fn parseIsolationMode(value: []const u8) !IsolationMode {
+    if (std.ascii.eqlIgnoreCase(value, "connection")) return .connection;
+    if (std.ascii.eqlIgnoreCase(value, "daemon")) return .daemon;
+    if (std.ascii.eqlIgnoreCase(value, "none")) return .none;
+    return error.InvalidIsolationMode;
 }

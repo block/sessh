@@ -106,12 +106,9 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) !void {
     try writeAll(2, text);
 }
 
-pub fn sleepMillis(ms: u64) void {
-    const ts = c.timespec{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * 1_000_000),
-    };
-    _ = c.nanosleep(&ts, null);
+pub fn waitMillis(ms: u64) void {
+    var pollfds: [0]posix.pollfd = .{};
+    _ = posix.poll(&pollfds, @intCast(@min(ms, @as(u64, @intCast(std.math.maxInt(i32)))))) catch {};
 }
 
 fn waitReadable(fd: c.fd_t) !void {

@@ -84,7 +84,6 @@ fn runMain() !void {
     }
     if (topLevelArgIs(args, &.{"--daemon-log"})) return daemon_client.printDaemonLog(allocator, args[0]);
 
-    try daemon_client.ensureStarted(allocator, args[0]);
     return transport_ssh.run(allocator, args);
 }
 
@@ -164,6 +163,7 @@ fn sesshLongOptionConsumesValue(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--filter-level") or
+        std.mem.eql(u8, arg, "--isolation-mode") or
         std.mem.eql(u8, arg, "--ssh-options") or
         std.mem.eql(u8, arg, "--capture-tty-transcript");
 }
@@ -178,6 +178,8 @@ test {
     _ = @import("core/config.zig");
     _ = @import("core/dispatcher.zig");
     _ = @import("core/io.zig");
+    _ = @import("core/local_boot_time.zig");
+    _ = @import("core/non_suspending_timer.zig");
     _ = @import("core/process_exit.zig");
     _ = @import("core/shell.zig");
     _ = @import("daemon/client.zig");

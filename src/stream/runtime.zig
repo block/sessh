@@ -1625,18 +1625,13 @@ fn connectProxyRemote(control: *ProxyRemoteProcess) !c.fd_t {
 }
 
 fn connectStartedProxyRemote(control: *ProxyRemoteProcess) !c.fd_t {
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        return connectProxyRemoteProcess(control) catch |err| switch (err) {
-            error.SocketPathMissing, error.ConnectFailed => {
-                io.sleepMillis(5);
-                continue;
-            },
-            else => return err,
-        };
-    }
-    forgetProxyRemote(control.guid);
-    return error.StreamNotFound;
+    return connectProxyRemoteProcess(control) catch |err| switch (err) {
+        error.SocketPathMissing, error.ConnectFailed => {
+            forgetProxyRemote(control.guid);
+            return error.StreamNotFound;
+        },
+        else => return err,
+    };
 }
 
 fn connectProxyRemoteProcess(control: *const ProxyRemoteProcess) !c.fd_t {
@@ -1659,13 +1654,13 @@ pub fn requestProxyRemoteCleanup(allocator: std.mem.Allocator, guid: []const u8)
 }
 
 pub fn runProxyRemoteProcess(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len != 4) return error.InvalidProxyRemoteArgs;
-    core_fds.closeInheritedNonStdioFileDescriptors();
-    const socket_path = args[0];
-    const guid = args[1];
-    const proxy_host = args[2];
-    const proxy_port = try std.fmt.parseInt(u16, args[3], 10);
-    const listen_fd = try socket_transport.listenSocket(socket_path);
+    if (args.len != 5) return error.InvalidProxyRemoteArgs;
+    const listen_fd = try std.fmt.parseInt(c.fd_t, args[0], 10);
+    const socket_path = args[1];
+    const guid = args[2];
+    const proxy_host = args[3];
+    const proxy_port = try std.fmt.parseInt(u16, args[4], 10);
+    core_fds.closeInheritedNonStdioFileDescriptorsExcept(listen_fd);
     defer _ = c.close(listen_fd);
     defer std.fs.deleteFileAbsolute(socket_path) catch {};
 
@@ -1684,6 +1679,10 @@ fn startProxyRemoteProcess(
 
     const socket_path = try proxyRemoteSocketPath(allocator, exe);
     errdefer allocator.free(socket_path);
+    try socket_transport.ensureSocketDir(allocator, socket_path);
+    const listen_fd = try socket_transport.listenSocket(socket_path);
+    errdefer _ = c.close(listen_fd);
+    try socket_transport.clearCloseOnExec(listen_fd);
 
     const control = try allocator.create(ProxyRemoteProcess);
     errdefer allocator.destroy(control);
@@ -1699,21 +1698,27 @@ fn startProxyRemoteProcess(
 
     const port_arg = try std.fmt.allocPrint(allocator, "{}", .{proxy_port});
     defer allocator.free(port_arg);
-    const argv = [_][]const u8{ exe, socket_path, canonical, proxy_host, port_arg };
+    const listen_fd_arg = try std.fmt.allocPrint(allocator, "{}", .{listen_fd});
+    defer allocator.free(listen_fd_arg);
+    const argv = [_][]const u8{ exe, listen_fd_arg, socket_path, canonical, proxy_host, port_arg };
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     try child.spawn();
+    _ = c.close(listen_fd);
     control.pid = @intCast(child.id);
     return control;
 }
 
 fn proxyRemoteSocketPath(allocator: std.mem.Allocator, exe: []const u8) ![]u8 {
-    const dir = std.fs.path.dirname(exe) orelse return error.InvalidRemoteProcessExecutablePath;
+    const exe_dir = std.fs.path.dirname(exe) orelse return error.InvalidRemoteProcessExecutablePath;
+    const namespace = std.fs.path.basename(exe_dir);
+    const root = try socket_transport.shortRuntimeRoot(allocator);
+    defer allocator.free(root);
     const sequence = proxy_remote_socket_sequence;
     proxy_remote_socket_sequence +%= 1;
-    return std.fmt.allocPrint(allocator, "{s}/proxy-{}-{}.sock", .{ dir, c.getpid(), sequence });
+    return std.fmt.allocPrint(allocator, "{s}/{s}/proxy-{}-{}.sock", .{ root, namespace, c.getpid(), sequence });
 }
 
 fn registerProxyRemote(control: *ProxyRemoteProcess) !void {
@@ -1861,7 +1866,7 @@ fn pollReconnectInput(
     }
 
     if (count == 0) {
-        if (timeout_ms > 0) io.sleepMillis(@intCast(timeout_ms));
+        if (timeout_ms > 0) io.waitMillis(@intCast(timeout_ms));
         return input_control.consumeAction();
     }
     const ready = posix.poll(pollfds[0..count], timeout_ms) catch return input_control.consumeAction();

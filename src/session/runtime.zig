@@ -7,6 +7,7 @@ const config = @import("../core/config.zig");
 const core_fds = @import("../core/fds.zig");
 const client_renderer = @import("renderer.zig");
 const io = @import("../core/io.zig");
+const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
 const pty_process = @import("../tty/pty_process.zig");
 const protocol = @import("../protocol/mod.zig");
 const session_registry = @import("../runtime/session_registry.zig");
@@ -103,7 +104,7 @@ const SessionRuntime = struct {
     session: Session = .{},
     attached_client: AttachedClient = .{},
     running: bool = true,
-    monotonic_clock: ?std.time.Timer = null,
+    monotonic_clock: ?NonSuspendingTimer = null,
     fixed_session_id: ?[]const u8 = null,
     started_session: bool = false,
 };
@@ -1111,12 +1112,12 @@ fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
 
 pub fn runTerminalRemoteProcess(allocator: std.mem.Allocator, args: []const []const u8) !void {
     _ = allocator;
-    if (args.len != 2) return error.InvalidTerminalRemoteArgs;
-    core_fds.closeInheritedNonStdioFileDescriptors();
+    if (args.len != 3) return error.InvalidTerminalRemoteArgs;
+    const listen_fd = try std.fmt.parseInt(c.fd_t, args[0], 10);
+    const socket_path = args[1];
+    const session_guid = args[2];
+    core_fds.closeInheritedNonStdioFileDescriptorsExcept(listen_fd);
     socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
-    const socket_path = args[0];
-    const session_guid = args[1];
-    const listen_fd = try socket_transport.listenSocket(socket_path);
     defer _ = c.close(listen_fd);
     defer std.fs.deleteFileAbsolute(socket_path) catch {};
 
@@ -1130,6 +1131,9 @@ pub fn startTerminalRemoteProcess(allocator: std.mem.Allocator, exe: []const u8,
     const socket_path = try terminalRemoteSocketPath(allocator, exe, "terminal");
     errdefer allocator.free(socket_path);
     try socket_transport.ensureSocketDir(allocator, socket_path);
+    const listen_fd = try socket_transport.listenSocket(socket_path);
+    errdefer _ = c.close(listen_fd);
+    try socket_transport.clearCloseOnExec(listen_fd);
 
     const control = try allocator.create(TerminalRemoteProcess);
     errdefer allocator.destroy(control);
@@ -1143,12 +1147,15 @@ pub fn startTerminalRemoteProcess(allocator: std.mem.Allocator, exe: []const u8,
     try registerTerminalRemote(control);
     errdefer unregisterTerminalRemote(control);
 
-    const argv = [_][]const u8{ exe, socket_path, guid };
+    const listen_fd_arg = try std.fmt.allocPrint(allocator, "{}", .{listen_fd});
+    defer allocator.free(listen_fd_arg);
+    const argv = [_][]const u8{ exe, listen_fd_arg, socket_path, guid };
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     try child.spawn();
+    _ = c.close(listen_fd);
     control.pid = @intCast(child.id);
     return control;
 }
@@ -1191,18 +1198,13 @@ pub fn connectTerminalRemoteProcess(allocator: std.mem.Allocator, guid: []const 
 }
 
 pub fn connectStartedTerminalRemoteProcess(control: *TerminalRemoteProcess) !c.fd_t {
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        return connectTerminalRemoteProcessSocket(control) catch |err| switch (err) {
-            error.SocketPathMissing, error.ConnectFailed => {
-                io.sleepMillis(5);
-                continue;
-            },
-            else => return err,
-        };
-    }
-    forgetTerminalRemote(control.guid);
-    return error.SessionNotFound;
+    return connectTerminalRemoteProcessSocket(control) catch |err| switch (err) {
+        error.SocketPathMissing, error.ConnectFailed => {
+            forgetTerminalRemote(control.guid);
+            return error.SessionNotFound;
+        },
+        else => return err,
+    };
 }
 
 fn connectTerminalRemoteProcessSocket(control: *const TerminalRemoteProcess) !c.fd_t {
@@ -1358,7 +1360,7 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, listen_fd: c.fd_t) !
 
 fn sessionRuntimeMonotonicMs(session_runtime: *SessionRuntime) i64 {
     if (session_runtime.monotonic_clock == null) {
-        session_runtime.monotonic_clock = std.time.Timer.start() catch return std.time.milliTimestamp();
+        session_runtime.monotonic_clock = NonSuspendingTimer.start() catch return std.time.milliTimestamp();
     }
     return if (session_runtime.monotonic_clock) |*timer|
         @intCast(timer.read() / std.time.ns_per_ms)
@@ -3630,14 +3632,9 @@ fn endSessionFromPtyEof(session_runtime: *SessionRuntime) void {
 }
 
 fn waitForSessionExitInfo(pid: c.pid_t) ?ExitInfo {
-    var attempts: usize = 0;
-    while (attempts < 20) : (attempts += 1) {
-        var status: c_int = 0;
-        const result = c.waitpid(pid, &status, 1);
-        if (result == pid) return exitInfoFromWaitStatus(status);
-        if (result < 0) return null;
-        io.sleepMillis(5);
-    }
+    var status: c_int = 0;
+    const result = c.waitpid(pid, &status, 1);
+    if (result == pid) return exitInfoFromWaitStatus(status);
     return null;
 }
 

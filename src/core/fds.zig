@@ -3,9 +3,14 @@ const c = std.c;
 const posix = std.posix;
 
 pub fn closeInheritedNonStdioFileDescriptors() void {
+    closeInheritedNonStdioFileDescriptorsExcept(-1);
+}
+
+pub fn closeInheritedNonStdioFileDescriptorsExcept(except_fd: c.fd_t) void {
     const limit = inheritedFdCloseLimit();
     var fd: c.fd_t = 3;
     while (fd < limit) : (fd += 1) {
+        if (fd == except_fd) continue;
         _ = c.close(fd);
     }
 }

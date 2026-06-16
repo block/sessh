@@ -33,6 +33,16 @@ pub fn defaultDirName(allocator: std.mem.Allocator) ![]u8 {
     return value;
 }
 
+pub fn privateConnectionDirName(allocator: std.mem.Allocator) ![]u8 {
+    var random_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes);
+    const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
+    const value = try std.fmt.allocPrint(allocator, "{d}.conn.{s}", .{ config.protocol_major, random_hex[0..] });
+    errdefer allocator.free(value);
+    try validateDirName(value);
+    return value;
+}
+
 fn envDirName(allocator: std.mem.Allocator) !?[]u8 {
     const value = std.process.getEnvVarOwned(allocator, namespace_env) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return null,

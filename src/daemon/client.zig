@@ -34,6 +34,11 @@ pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
     defer _ = c.close(fd);
 }
 
+pub fn ensureStartedForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !void {
+    const fd = try connectOrStartForDirName(allocator, exe, dir_name);
+    defer _ = c.close(fd);
+}
+
 pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
     const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
@@ -48,7 +53,7 @@ pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, d
             spawned = try spawnDaemonIfNamespaceUnlocked(allocator, exe, dir_name);
         }
         if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
-        io.sleepMillis(20);
+        io.waitMillis(20);
     }
     return error.DaemonDidNotStart;
 }

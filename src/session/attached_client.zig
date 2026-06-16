@@ -9,6 +9,7 @@ const client_log = @import("../core/client_log.zig");
 const client_renderer = @import("renderer.zig");
 const client_ui = @import("client_ui.zig");
 const io_helpers = @import("../core/io.zig");
+const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
 const protocol = @import("../protocol/mod.zig");
 const process_exit = @import("../core/process_exit.zig");
 const reconnect_title = @import("../reconnect/title.zig");
@@ -110,7 +111,7 @@ const ConnectionMonitor = struct {
     smoothed_rtt_ms: ?i64 = null,
     rtt_variance_ms: i64 = 0,
     responsiveness_timeout_floor_ms: i64 = default_responsiveness_timeout_ms,
-    clock: ?std.time.Timer = null,
+    clock: ?NonSuspendingTimer = null,
 
     fn afterInput(self: *ConnectionMonitor) void {
         if (!self.enabled) return;
@@ -179,7 +180,7 @@ const ConnectionMonitor = struct {
 
     fn nowMs(self: *ConnectionMonitor) i64 {
         if (self.clock == null) {
-            self.clock = std.time.Timer.start() catch return std.time.milliTimestamp();
+            self.clock = NonSuspendingTimer.start() catch return std.time.milliTimestamp();
         }
         return if (self.clock) |*timer|
             @intCast(timer.read() / std.time.ns_per_ms)
@@ -191,7 +192,7 @@ const ConnectionMonitor = struct {
 const PasteLikeInputClassifier = struct {
     window_started_ms: ?i64 = null,
     window_bytes: usize = 0,
-    clock: ?std.time.Timer = null,
+    clock: ?NonSuspendingTimer = null,
 
     fn classify(self: *PasteLikeInputClassifier, forwarded_bytes: usize) bool {
         if (forwarded_bytes == 0) return false;
@@ -217,7 +218,7 @@ const PasteLikeInputClassifier = struct {
 
     fn nowMs(self: *PasteLikeInputClassifier) i64 {
         if (self.clock == null) {
-            self.clock = std.time.Timer.start() catch return std.time.milliTimestamp();
+            self.clock = NonSuspendingTimer.start() catch return std.time.milliTimestamp();
         }
         return if (self.clock) |*timer|
             @intCast(timer.read() / std.time.ns_per_ms)
@@ -699,7 +700,7 @@ test "cancelled reconnect frame read returns without input" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var cancelled = std.atomic.Value(bool).init(true);
+    var cancelled = true;
     try std.testing.expectError(error.ReconnectCancelled, readFrameAllocMaybeCancelled(fds[0], &cancelled));
 }
 
@@ -954,7 +955,7 @@ pub fn reconnectSessionOnRuntimeCancellable(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     session: *RuntimeSession,
-    cancelled: *const std.atomic.Value(bool),
+    cancelled: *const bool,
 ) !void {
     try reconnectSessionOnRuntimeInner(read_fd, write_fd, session, cancelled, false);
 }
@@ -963,7 +964,7 @@ fn reconnectSessionOnRuntimeInner(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     session: *RuntimeSession,
-    cancelled: ?*const std.atomic.Value(bool),
+    cancelled: ?*const bool,
     wait_for_repaint: bool,
 ) !void {
     try attachReconnectRuntimeInner(read_fd, write_fd, session, cancelled, wait_for_repaint);
@@ -973,7 +974,7 @@ fn attachReconnectRuntimeInner(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     session: *RuntimeSession,
-    cancelled: ?*const std.atomic.Value(bool),
+    cancelled: ?*const bool,
     wait_for_repaint: bool,
 ) !void {
     session.pending_repaint.repaint_request_seq = try sendSessionAttach(write_fd, terminal.currentWindowSize(), nonZeroViewportOffset(session.viewport_offset), &session.scrollback_cursor, session.guidSlice());
@@ -1002,7 +1003,7 @@ fn finishReconnectRepaintInner(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     session: *RuntimeSession,
-    cancelled: ?*const std.atomic.Value(bool),
+    cancelled: ?*const bool,
 ) !void {
     _ = write_fd;
     while (session.pending_repaint.active()) {
@@ -1083,7 +1084,7 @@ pub fn runAttachedClient(
 }
 
 pub fn drainLocalTransportDiagnostics(read_fd: c.fd_t, timeout_ms: u64) void {
-    var timer = std.time.Timer.start() catch return;
+    var timer = NonSuspendingTimer.start() catch return;
     while (true) {
         const elapsed_ms = @divTrunc(timer.read(), std.time.ns_per_ms);
         if (elapsed_ms >= timeout_ms) return;
@@ -1323,7 +1324,7 @@ fn readSessionAttached(conn: c.fd_t) !void {
 fn readSessionAttachedInner(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
-    cancelled: ?*const std.atomic.Value(bool),
+    cancelled: ?*const bool,
 ) !void {
     _ = write_fd;
     while (true) {
@@ -1372,18 +1373,18 @@ fn readSessionAttachedInner(
 
 fn readFrameAllocMaybeCancelled(
     fd: c.fd_t,
-    cancelled: ?*const std.atomic.Value(bool),
+    cancelled: ?*const bool,
 ) !protocol.OwnedFrame {
     const flag = cancelled orelse return protocol.readFrameAlloc(app_allocator.allocator(), fd);
     while (true) {
-        if (flag.load(.acquire)) return error.ReconnectCancelled;
+        if (flag.*) return error.ReconnectCancelled;
         var pollfds = [_]posix.pollfd{.{
             .fd = fd,
             .events = posix.POLL.IN,
             .revents = 0,
         }};
         const ready = try posix.poll(&pollfds, 50);
-        if (flag.load(.acquire)) return error.ReconnectCancelled;
+        if (flag.*) return error.ReconnectCancelled;
         if (ready == 0) continue;
         if ((pollfds[0].revents & posix.POLL.IN) != 0) {
             return protocol.readFrameAlloc(app_allocator.allocator(), fd);

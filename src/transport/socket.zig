@@ -145,6 +145,14 @@ pub fn setCloseOnExec(fd: c.fd_t) !void {
     if (c.fcntl(fd, c.F.SETFD, flags | close_on_exec_flag) < 0) return error.FcntlFailed;
 }
 
+pub fn clearCloseOnExec(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFD, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const close_on_exec_flag = @as(c_int, @intCast(c.FD_CLOEXEC));
+    if ((flags & close_on_exec_flag) == 0) return;
+    if (c.fcntl(fd, c.F.SETFD, flags & ~close_on_exec_flag) < 0) return error.FcntlFailed;
+}
+
 pub fn ensureSocketDir(allocator: std.mem.Allocator, socket_path: []const u8) !void {
     const slash = std.mem.lastIndexOfScalar(u8, socket_path, '/') orelse return;
     const dir = socket_path[0..slash];

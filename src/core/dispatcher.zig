@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
+const NonSuspendingTimer = @import("non_suspending_timer.zig").NonSuspendingTimer;
 
 /// A small single-threaded event dispatcher built on `poll(2)`.
 ///
@@ -90,7 +91,7 @@ const PendingEvent = struct {
 
 pub const Dispatcher = struct {
     allocator: std.mem.Allocator,
-    clock: std.time.Timer,
+    clock: NonSuspendingTimer,
     fd_watches: std.ArrayList(FdWatchSlot) = .empty,
     free_fd_watches: std.ArrayList(usize) = .empty,
     pollfds: std.ArrayList(posix.pollfd) = .empty,
@@ -104,7 +105,7 @@ pub const Dispatcher = struct {
     pub fn init(allocator: std.mem.Allocator) !Dispatcher {
         return .{
             .allocator = allocator,
-            .clock = try std.time.Timer.start(),
+            .clock = try NonSuspendingTimer.start(),
         };
     }
 

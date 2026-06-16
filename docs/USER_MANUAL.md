@@ -29,6 +29,7 @@ Sessh accepts normal ssh options, plus a small set of sessh-specific options:
 - `--log-level quiet|error|warn|info|debug|verbose`
 - `--terminal-emulator` / `--no-terminal-emulator`
 - `--filter-level unhygienic|hygienic|emulated`
+- `--isolation-mode connection|daemon|none`
 - `--capture-tty-transcript PATH.tar.gz`
 - `--daemon-log`
 
@@ -38,6 +39,11 @@ filtering, and `hygienic` uses the side-channel path when the visible client can
 support it.
 
 `--daemon-log` follows new local daemon log entries on stdout until stopped.
+
+`--isolation-mode daemon` is the default. `connection` uses a private local
+daemon namespace for that invocation, so it does not pool TCP connections with
+other sessh clients. `none` is the shared-daemon placement described in
+`docs/ARCHITECTURE.md`.
 
 # Config File
 

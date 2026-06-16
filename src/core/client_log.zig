@@ -60,7 +60,6 @@ pub const UserDiagnosticLine = struct {
     }
 };
 
-var mutex: std.Thread.Mutex = .{};
 var configured_level: Level = .warn;
 var entries: [max_entries]Entry = undefined;
 var next_entry: usize = 0;
@@ -73,8 +72,6 @@ var displayed_diagnostic_seq: u64 = 0;
 var diagnostic_notify_fd: c.fd_t = -1;
 
 pub fn setLevel(level: Level) void {
-    mutex.lock();
-    defer mutex.unlock();
     configured_level = level;
 }
 
@@ -124,14 +121,10 @@ fn append(level: Level, comptime fmt: []const u8, args: anytype) void {
     var body_buf: [max_entry_bytes]u8 = undefined;
     const body = std.fmt.bufPrint(&body_buf, fmt, args) catch return;
 
-    mutex.lock();
-    defer mutex.unlock();
     appendMessageLocked(level, body);
 }
 
 pub fn appendSshStderr(bytes: []const u8) void {
-    mutex.lock();
-    defer mutex.unlock();
 
     var line_start: usize = 0;
     while (line_start < bytes.len) {
@@ -144,8 +137,6 @@ pub fn appendSshStderr(bytes: []const u8) void {
 }
 
 pub fn flush(fd: c.fd_t) void {
-    mutex.lock();
-    defer mutex.unlock();
     flushUserDiagnosticsLocked(fd, true) catch {};
     flushLocked(fd) catch {};
 }
@@ -162,32 +153,22 @@ fn userDiagnosticLevel(level: Level, comptime fmt: []const u8, args: anytype) vo
     var body_buf: [max_entry_bytes]u8 = undefined;
     const body = std.fmt.bufPrint(&body_buf, fmt, args) catch return;
 
-    mutex.lock();
-    defer mutex.unlock();
     appendUserDiagnosticLocked(level, .sessh, body);
 }
 
 pub fn currentUserDiagnosticSeq() u64 {
-    mutex.lock();
-    defer mutex.unlock();
     return next_diagnostic_seq;
 }
 
 pub fn displayedUserDiagnosticSeq() u64 {
-    mutex.lock();
-    defer mutex.unlock();
     return displayed_diagnostic_seq;
 }
 
 pub fn markUserDiagnosticsDisplayedThrough(seq: u64) void {
-    mutex.lock();
-    defer mutex.unlock();
     displayed_diagnostic_seq = @max(displayed_diagnostic_seq, seq);
 }
 
 pub fn copyUserDiagnosticsSince(since_seq: u64, out: []UserDiagnosticLine) u64 {
-    mutex.lock();
-    defer mutex.unlock();
 
     var count: usize = 0;
     const oldest = oldestDiagnosticIndex();
@@ -215,14 +196,10 @@ pub fn copyUserDiagnosticsSince(since_seq: u64, out: []UserDiagnosticLine) u64 {
 }
 
 pub fn registerUserDiagnosticNotifier(fd: c.fd_t) void {
-    mutex.lock();
-    defer mutex.unlock();
     diagnostic_notify_fd = fd;
 }
 
 pub fn unregisterUserDiagnosticNotifier(fd: c.fd_t) void {
-    mutex.lock();
-    defer mutex.unlock();
     if (diagnostic_notify_fd == fd) diagnostic_notify_fd = -1;
 }
 
@@ -386,8 +363,6 @@ test "level ordering follows conventional severity order" {
 }
 
 fn resetForTest() void {
-    mutex.lock();
-    defer mutex.unlock();
     configured_level = .warn;
     next_entry = 0;
     entry_count = 0;

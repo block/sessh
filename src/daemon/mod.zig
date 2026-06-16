@@ -31,7 +31,7 @@ const daemon_spawn_every_attempts: usize = 10;
 const daemon_lock_attempts: usize = 100;
 const daemon_lock_sleep_ms: u64 = 20;
 
-var active_local_clients: std.atomic.Value(usize) = .init(0);
+var active_local_clients: usize = 0;
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
     const dir_name = try socket_namespace.selectedDirName(allocator);
@@ -107,7 +107,7 @@ fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_n
             _ = try spawnDaemon(allocator, exe, dir_name);
         }
         if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
-        io.sleepMillis(daemon_start_sleep_ms);
+        io.waitMillis(daemon_start_sleep_ms);
     }
     return error.DaemonDidNotStart;
 }
@@ -309,12 +309,12 @@ fn acceptDaemonClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher
         .fd = client_fd,
     };
     context.initReader();
-    _ = active_local_clients.fetchAdd(1, .acq_rel);
+    active_local_clients += 1;
     _ = daemon_dispatcher.watchFd(client_fd, .{ .readable = true }, .{
         .ctx = context,
         .callback = readDaemonClient,
     }) catch {
-        _ = active_local_clients.fetchSub(1, .acq_rel);
+        active_local_clients -= 1;
         accept_context.allocator.destroy(context);
         _ = c.close(client_fd);
         return;
@@ -349,7 +349,7 @@ const ClientContext = struct {
             self.fd = -1;
         }
         if (self.owns_active_count) {
-            _ = active_local_clients.fetchSub(1, .acq_rel);
+            active_local_clients -= 1;
             self.owns_active_count = false;
         }
         self.allocator.destroy(self);
@@ -521,6 +521,26 @@ fn transferInitialRequestToDispatcherOwner(
     id: dispatcher.WatchId,
     frame: *protocol.OwnedFrame,
 ) !TransferInitialRequestResult {
+    if (frame.message_type == .client_remote) {
+        var item = try protocol.decodeClientRemoteTerminalEmulatorItem(context.allocator, frame.payload);
+        defer item.deinit(context.allocator);
+        const item_payload = item.payload orelse return .not_transferred;
+        if (item_payload == .open) {
+            daemon_dispatcher.cancel(id);
+            const client_fd = context.fd;
+            context.fd = -1;
+            try session_daemon_handler.registerFrameAfterHandshakeFromDaemon(
+                context.allocator,
+                daemon_dispatcher,
+                context.terminal_remote_exe,
+                frame.*,
+                client_fd,
+            );
+            return .transferred;
+        }
+        return .not_transferred;
+    }
+
     if (frame.message_type == .daemon_tunnel) {
         if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, context.fd)) return .consumed;
         if (try handleDaemonTunnelControlFrame(context.allocator, context.identity, frame.*, context.fd)) return .consumed;
@@ -604,7 +624,7 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
     }
 
     const now_ms = daemon_dispatcher.nowMs();
-    const has_local_client = active_local_clients.load(.acquire) != 0;
+    const has_local_client = active_local_clients != 0;
     const cleanup_keeps_daemon_alive = try maintainDaemonCleanup(idle_context.cleanup_context, now_ms, has_local_client);
     if (daemonHasLiveWork() or cleanup_keeps_daemon_alive) {
         idle_context.last_live_work_ms = now_ms;
@@ -621,7 +641,7 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
 }
 
 fn daemonHasLiveWork() bool {
-    return active_local_clients.load(.acquire) != 0 or
+    return active_local_clients != 0 or
         transport_ssh.activePooledSshTransportCount() != 0 or
         session_runtime.activeTerminalRemoteProcessCount() != 0 or
         stream_runtime.activeProxyRemoteProcessCount() != 0;
@@ -788,7 +808,7 @@ fn acquireDaemonSocketLock(allocator: std.mem.Allocator, dir_name: []const u8, s
             return error.DaemonAlreadyRunning;
         } else |_| {}
 
-        io.sleepMillis(daemon_lock_sleep_ms);
+        io.waitMillis(daemon_lock_sleep_ms);
     }
     return error.DaemonLockBusy;
 }
@@ -835,7 +855,8 @@ fn handleClientFrameAfterHandshake(
             switch (item_payload) {
                 .resize => return true,
                 .open => {
-                    try session_daemon_handler.serveFrameAfterHandshake(allocator, exe, frame, fd, fd);
+                    _ = exe;
+                    try sendError(fd, "PROTOCOL_ERROR", "terminal stream open must be dispatcher-owned", "");
                     return false;
                 },
                 .debug_sever_connection_request,

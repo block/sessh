@@ -2,23 +2,10 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_fds = @import("../core/fds.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const io = @import("../core/io.zig");
-const daemon_log = @import("../daemon/log.zig");
 const protocol = @import("../protocol/mod.zig");
-
-pub const ClientCloseAction = enum {
-    none,
-};
-
-pub const ClientDiagnosticForwarding = struct {
-    notify_read_fd: c.fd_t = -1,
-    notify_remote_close: bool = false,
-    log_context: LogContext = .{},
-};
-
-pub const LogContext = struct {
-    host: []const u8 = "",
-};
 
 pub const ReadStatus = enum {
     blocked,
@@ -232,6 +219,238 @@ pub const FrameForwarder = struct {
     }
 };
 
+pub const DispatcherFrameRelay = struct {
+    allocator: std.mem.Allocator,
+    left_fd: c.fd_t,
+    right_fd: c.fd_t,
+    left_watch_id: ?dispatcher.FdWatchId = null,
+    right_watch_id: ?dispatcher.FdWatchId = null,
+    left_to_right: FramePipe,
+    right_to_left: FramePipe,
+    closing: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator, left_fd: c.fd_t, right_fd: c.fd_t) DispatcherFrameRelay {
+        return .{
+            .allocator = allocator,
+            .left_fd = left_fd,
+            .right_fd = right_fd,
+            .left_to_right = FramePipe.init(allocator),
+            .right_to_left = FramePipe.init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *DispatcherFrameRelay, d: *dispatcher.Dispatcher) void {
+        if (self.left_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
+        if (self.right_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
+        if (self.left_fd >= 0) {
+            _ = c.close(self.left_fd);
+            self.left_fd = -1;
+        }
+        if (self.right_fd >= 0) {
+            _ = c.close(self.right_fd);
+            self.right_fd = -1;
+        }
+        self.left_to_right.deinit();
+        self.right_to_left.deinit();
+        self.allocator.destroy(self);
+    }
+
+    fn updateWatches(self: *DispatcherFrameRelay, d: *dispatcher.Dispatcher) !void {
+        if (self.left_watch_id) |watch_id| {
+            try d.updateFdEvents(watch_id, .{
+                .readable = self.left_to_right.wantsRead(),
+                .writable = self.right_to_left.wantsWrite(),
+            });
+        }
+        if (self.right_watch_id) |watch_id| {
+            try d.updateFdEvents(watch_id, .{
+                .readable = self.right_to_left.wantsRead(),
+                .writable = self.left_to_right.wantsWrite(),
+            });
+        }
+    }
+
+    fn handleEvent(self: *DispatcherFrameRelay, d: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+        const fd_event = switch (event) {
+            .fd => |fd| fd,
+            .timer => return error.UnexpectedFrameRelayTimer,
+        };
+        if (fd_event.error_event or fd_event.invalid) {
+            self.close(d);
+            return;
+        }
+
+        if (self.isLeftWatch(id)) {
+            if (fd_event.writable) try self.drainPipeToFd(&self.right_to_left, self.left_fd);
+            if (fd_event.readable or fd_event.hangup) try self.readPipeFromFd(&self.left_to_right, self.left_fd);
+        } else if (self.isRightWatch(id)) {
+            if (fd_event.writable) try self.drainPipeToFd(&self.left_to_right, self.right_fd);
+            if (fd_event.readable or fd_event.hangup) try self.readPipeFromFd(&self.right_to_left, self.right_fd);
+        }
+
+        if (self.closing) {
+            self.deinit(d);
+            return;
+        }
+        try self.updateWatches(d);
+    }
+
+    fn readPipeFromFd(self: *DispatcherFrameRelay, pipe: *FramePipe, fd: c.fd_t) !void {
+        while (pipe.wantsRead()) {
+            switch (try pipe.readReady(fd)) {
+                .blocked => return,
+                .progress => continue,
+                .eof, .truncated_frame => {
+                    self.closing = true;
+                    return;
+                },
+            }
+        }
+    }
+
+    fn drainPipeToFd(self: *DispatcherFrameRelay, pipe: *FramePipe, fd: c.fd_t) !void {
+        _ = self;
+        while (pipe.wantsWrite()) {
+            switch (try pipe.writeReady(fd)) {
+                .blocked => return,
+                .progress => continue,
+                .drained => continue,
+            }
+        }
+    }
+
+    fn close(self: *DispatcherFrameRelay, d: *dispatcher.Dispatcher) void {
+        self.closing = true;
+        self.deinit(d);
+    }
+
+    fn isLeftWatch(self: *const DispatcherFrameRelay, id: dispatcher.WatchId) bool {
+        const left_id = self.left_watch_id orelse return false;
+        const fd_id = switch (id) {
+            .fd => |watch_id| watch_id,
+            .timer => return false,
+        };
+        return watchIdsEqual(left_id, fd_id);
+    }
+
+    fn isRightWatch(self: *const DispatcherFrameRelay, id: dispatcher.WatchId) bool {
+        const right_id = self.right_watch_id orelse return false;
+        const fd_id = switch (id) {
+            .fd => |watch_id| watch_id,
+            .timer => return false,
+        };
+        return watchIdsEqual(right_id, fd_id);
+    }
+
+    fn onFd(ctx: *anyopaque, d: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+        const self: *DispatcherFrameRelay = @ptrCast(@alignCast(ctx));
+        self.handleEvent(d, id, event) catch {
+            self.close(d);
+        };
+    }
+};
+
+const FramePipeReadStatus = enum {
+    blocked,
+    progress,
+    eof,
+    truncated_frame,
+};
+
+const FramePipeWriteStatus = enum {
+    blocked,
+    progress,
+    drained,
+};
+
+const FramePipe = struct {
+    allocator: std.mem.Allocator,
+    reader: protocol.FrameReader,
+    writer: ?protocol.FrameWriteState = null,
+
+    fn init(allocator: std.mem.Allocator) FramePipe {
+        return .{
+            .allocator = allocator,
+            .reader = protocol.FrameReader.init(allocator),
+        };
+    }
+
+    fn deinit(self: *FramePipe) void {
+        self.reader.deinit();
+        if (self.writer) |*writer| writer.deinit();
+        self.writer = null;
+    }
+
+    fn wantsRead(self: *const FramePipe) bool {
+        return self.writer == null;
+    }
+
+    fn wantsWrite(self: *const FramePipe) bool {
+        return self.writer != null;
+    }
+
+    fn readReady(self: *FramePipe, fd: c.fd_t) !FramePipeReadStatus {
+        if (self.writer != null) return .blocked;
+        switch (try self.reader.readReady(fd)) {
+            .blocked => return .blocked,
+            .progress => return .progress,
+            .eof => return .eof,
+            .truncated_frame => return .truncated_frame,
+            .frame => |frame_value| {
+                var frame = frame_value;
+                defer frame.deinit(self.allocator);
+                self.writer = try protocol.FrameWriteState.initOwnedFrame(self.allocator, frame);
+                return .progress;
+            },
+        }
+    }
+
+    fn writeReady(self: *FramePipe, fd: c.fd_t) !FramePipeWriteStatus {
+        var writer = if (self.writer) |*value| value else return .drained;
+        switch (try writer.writeReady(fd)) {
+            .blocked => return .blocked,
+            .progress => return .progress,
+            .done => {
+                writer.deinit();
+                self.writer = null;
+                return .drained;
+            },
+        }
+    }
+};
+
+pub fn registerFrameRelay(
+    allocator: std.mem.Allocator,
+    d: *dispatcher.Dispatcher,
+    left_fd: c.fd_t,
+    right_fd: c.fd_t,
+) !void {
+    try core_fds.setNonBlocking(left_fd);
+    try core_fds.setNonBlocking(right_fd);
+
+    const relay = try allocator.create(DispatcherFrameRelay);
+    errdefer allocator.destroy(relay);
+    relay.* = DispatcherFrameRelay.init(allocator, left_fd, right_fd);
+    errdefer {
+        relay.left_to_right.deinit();
+        relay.right_to_left.deinit();
+    }
+
+    const handler: dispatcher.Handler = .{
+        .ctx = relay,
+        .callback = DispatcherFrameRelay.onFd,
+    };
+    relay.left_watch_id = try d.watchFd(left_fd, .{}, handler);
+    errdefer if (relay.left_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
+    relay.right_watch_id = try d.watchFd(right_fd, .{}, handler);
+    errdefer if (relay.right_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
+    try relay.updateWatches(d);
+}
+
+fn watchIdsEqual(a: dispatcher.FdWatchId, b: dispatcher.FdWatchId) bool {
+    return a.index == b.index and a.generation == b.generation;
+}
+
 const CircularBuffer = struct {
     storage: []u8,
     read_pos: usize = 0,
@@ -293,154 +512,6 @@ const CircularBuffer = struct {
     }
 };
 
-pub fn forwardFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, peer_fd: c.fd_t) !void {
-    return forwardFramesBetween(stdin_fd, stdout_fd, peer_fd, peer_fd);
-}
-
-pub fn forwardFramesBetween(
-    client_read_fd: c.fd_t,
-    client_write_fd: c.fd_t,
-    peer_read_fd: c.fd_t,
-    peer_write_fd: c.fd_t,
-) !void {
-    return forwardFramesBetweenWithClientCloseAction(
-        client_read_fd,
-        client_write_fd,
-        peer_read_fd,
-        peer_write_fd,
-        .none,
-    );
-}
-
-pub fn forwardFramesBetweenWithClientCloseAction(
-    client_read_fd: c.fd_t,
-    client_write_fd: c.fd_t,
-    peer_read_fd: c.fd_t,
-    peer_write_fd: c.fd_t,
-    client_close_action: ClientCloseAction,
-) !void {
-    return forwardFramesBetweenWithClientCloseActionAndDiagnostics(
-        client_read_fd,
-        client_write_fd,
-        peer_read_fd,
-        peer_write_fd,
-        client_close_action,
-        .{},
-    );
-}
-
-pub fn forwardFramesBetweenWithClientCloseActionAndDiagnostics(
-    client_read_fd: c.fd_t,
-    client_write_fd: c.fd_t,
-    peer_read_fd: c.fd_t,
-    peer_write_fd: c.fd_t,
-    client_close_action: ClientCloseAction,
-    diagnostics: ClientDiagnosticForwarding,
-) !void {
-    defer {
-        _ = c.shutdown(client_read_fd, c.SHUT.WR);
-        if (client_write_fd != client_read_fd) _ = c.shutdown(client_write_fd, c.SHUT.WR);
-        _ = c.shutdown(peer_write_fd, c.SHUT.WR);
-    }
-
-    while (true) {
-        var pollfds: [3]posix.pollfd = undefined;
-        var count: usize = 0;
-        const client_index = count;
-        pollfds[count] = .{ .fd = client_read_fd, .events = posix.POLL.IN, .revents = 0 };
-        count += 1;
-        const peer_index = count;
-        pollfds[count] = .{ .fd = peer_read_fd, .events = posix.POLL.IN, .revents = 0 };
-        count += 1;
-        var diagnostic_index: ?usize = null;
-        if (diagnostics.notify_read_fd >= 0) {
-            diagnostic_index = count;
-            pollfds[count] = .{ .fd = diagnostics.notify_read_fd, .events = posix.POLL.IN, .revents = 0 };
-            count += 1;
-        }
-
-        _ = try posix.poll(pollfds[0..count], -1);
-
-        if (diagnostic_index) |index| {
-            if ((pollfds[index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-                try forwardRawTransportDiagnostics(client_write_fd, diagnostics.notify_read_fd);
-            }
-        }
-        if ((pollfds[client_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (!try copyOneFrame(client_read_fd, peer_write_fd)) {
-                try handleClientClose(peer_write_fd, client_close_action, diagnostics.log_context);
-                return;
-            }
-        }
-        if ((pollfds[peer_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (!try copyOneFrame(peer_read_fd, client_write_fd)) {
-                logDaemonEvent(diagnostics.log_context, "ssh transport disconnected from daemon");
-                if (diagnostics.notify_remote_close) try sendSshTransportClosed(client_write_fd);
-                return;
-            }
-        }
-    }
-}
-
-fn copyOneFrame(read_fd: c.fd_t, write_fd: c.fd_t) !bool {
-    var frame = protocol.readFrameAlloc(std.heap.page_allocator, read_fd) catch |err| switch (err) {
-        error.EndOfStream => return false,
-        else => return err,
-    };
-    defer frame.deinit(std.heap.page_allocator);
-    try protocol.sendOwnedFrame(write_fd, frame);
-    return true;
-}
-
-fn handleClientClose(peer_write_fd: c.fd_t, action: ClientCloseAction, log_context: LogContext) !void {
-    _ = peer_write_fd;
-    _ = log_context;
-    switch (action) {
-        .none => {},
-    }
-}
-
-fn logDaemonEvent(log_context: LogContext, message: []const u8) void {
-    if (log_context.host.len == 0) {
-        daemon_log.infof(std.heap.page_allocator, "{s}", .{message});
-    } else {
-        daemon_log.infof(std.heap.page_allocator, "{s} host={s}", .{ message, log_context.host });
-    }
-}
-
-fn logDaemonEventFmt(log_context: LogContext, comptime fmt: []const u8, args: anytype) void {
-    if (log_context.host.len == 0) {
-        daemon_log.infof(std.heap.page_allocator, fmt, args);
-    } else {
-        const message = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
-        defer std.heap.page_allocator.free(message);
-        daemon_log.infof(std.heap.page_allocator, "{s} host={s}", .{ message, log_context.host });
-    }
-}
-
-pub fn forwardRawTransportDiagnostics(fd: c.fd_t, diagnostic_read_fd: c.fd_t) !void {
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = diagnostic_read_fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, 0);
-        if (ready == 0 or (pollfds[0].revents & posix.POLL.IN) == 0) return;
-
-        const n = c.read(diagnostic_read_fd, &buf, buf.len);
-        if (n <= 0) return;
-        const chunk = buf[0..@intCast(n)];
-        try protocol.sendSshTransportStderrFrame(std.heap.page_allocator, fd, chunk);
-        if (chunk.len < buf.len) return;
-    }
-}
-
-fn sendSshTransportClosed(fd: c.fd_t) !void {
-    try protocol.sendSshTransportClosedFrame(std.heap.page_allocator, fd);
-}
-
 fn setNonBlockingFdForTest(fd: c.fd_t) !void {
     const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
     if (flags < 0) return error.FcntlFailed;
@@ -451,6 +522,12 @@ fn setNonBlockingFdForTest(fd: c.fd_t) !void {
 fn closePipeForTest(pipe: [2]c.fd_t) void {
     _ = c.close(pipe[0]);
     _ = c.close(pipe[1]);
+}
+
+fn socketPairForTest() ![2]c.fd_t {
+    var fds: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    return fds;
 }
 
 fn readAvailableForTest(fd: c.fd_t, out: *std.ArrayList(u8)) !void {
@@ -631,6 +708,55 @@ test "FrameForwarder applies output backpressure before reading frame body" {
     try std.testing.expectEqual(FrameForwarderReadStatus.progress, try forwarder.readReady());
 }
 
+test "dispatcher frame relay forwards attached-byte frames in both directions" {
+    const left = try socketPairForTest();
+    const right = try socketPairForTest();
+    var left_external_open = true;
+    var right_external_open = true;
+    defer {
+        if (left_external_open) _ = c.close(left[0]);
+    }
+    defer {
+        if (right_external_open) _ = c.close(right[0]);
+    }
+
+    try core_fds.setNonBlocking(left[0]);
+    try core_fds.setNonBlocking(right[0]);
+
+    var d = try dispatcher.Dispatcher.init(std.testing.allocator);
+    defer d.deinit();
+    try registerFrameRelay(std.testing.allocator, &d, left[1], right[1]);
+
+    const payload = try protocol.encodePayload(std.testing.allocator, protocol.pb.ClientDaemonItem{
+        .payload = .{ .log_request = .{} },
+    });
+    defer std.testing.allocator.free(payload);
+
+    try protocol.sendFrameWithAttachedBytes(left[0], .client_daemon, payload, "left-to-right");
+    var first = try readRelayedFrameForTest(&d, right[0]);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.client_daemon, first.message_type);
+    try std.testing.expectEqualStrings(payload, first.payload);
+    try std.testing.expectEqualStrings("left-to-right", first.attached_bytes);
+
+    try protocol.sendFrameWithAttachedBytes(right[0], .client_daemon, payload, "right-to-left");
+    var second = try readRelayedFrameForTest(&d, left[0]);
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.client_daemon, second.message_type);
+    try std.testing.expectEqualStrings(payload, second.payload);
+    try std.testing.expectEqualStrings("right-to-left", second.attached_bytes);
+
+    _ = c.close(left[0]);
+    left_external_open = false;
+    _ = c.close(right[0]);
+    right_external_open = false;
+    var iterations: usize = 0;
+    while (d.active_count != 0 and iterations < 10) : (iterations += 1) {
+        _ = try d.runOnce();
+    }
+    try std.testing.expectEqual(@as(usize, 0), d.active_count);
+}
+
 test "FrameForwarder reports truncated frame bodies" {
     const source = try posix.pipe();
     defer _ = c.close(source[0]);
@@ -650,4 +776,23 @@ test "FrameForwarder reports truncated frame bodies" {
     try std.testing.expectEqual(FrameForwarderReadStatus.progress, try forwarder.readReady());
     try std.testing.expectEqual(FrameForwarderReadStatus.progress, try forwarder.readReady());
     try std.testing.expectEqual(FrameForwarderReadStatus.truncated_frame, try forwarder.readReady());
+}
+
+fn readRelayedFrameForTest(d: *dispatcher.Dispatcher, fd: c.fd_t) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(std.testing.allocator);
+    defer reader.deinit();
+    var iterations: usize = 0;
+    while (iterations < 100) : (iterations += 1) {
+        while (true) {
+            switch (try reader.readReady(fd)) {
+                .blocked => break,
+                .progress => continue,
+                .frame => |frame| return frame,
+                .eof => return error.UnexpectedEof,
+                .truncated_frame => return error.UnexpectedTruncatedFrame,
+            }
+        }
+        _ = try d.runOnce();
+    }
+    return error.TimedOut;
 }
