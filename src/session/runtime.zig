@@ -25,6 +25,10 @@ const pty_hangup_reap_poll_ms: i64 = 50;
 const pb = protocol.pb;
 const hpb = protocol.hpb;
 
+// POSIX WNOHANG. Zig 0.15 does not expose a portable constant, and our
+// supported Unix targets use the stable POSIX value.
+const wait_nohang: c_int = 1;
+
 const Session = struct {
     id: [64]u8 = [_]u8{0} ** 64,
     id_len: usize = 0,
@@ -1318,7 +1322,7 @@ fn pruneExitedTerminalRemotes() void {
 fn reapTerminalRemote(pid: c.pid_t) bool {
     if (pid <= 0) return true;
     var status: c_int = 0;
-    const result = c.waitpid(pid, &status, 1);
+    const result = c.waitpid(pid, &status, wait_nohang);
     if (result == pid) return true;
     if (result < 0) return switch (posix.errno(result)) {
         .CHILD => true,
@@ -1328,6 +1332,9 @@ fn reapTerminalRemote(pid: c.pid_t) bool {
 }
 
 fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, listen_fd: c.fd_t) !void {
+    // PROCESS_EVENT_LOOP: terminal remote runtime process. It directly polls
+    // its PTY, client connection, and control fds; it is not a daemon helper
+    // constructing a private Dispatcher.
     const now_ms = sessionRuntimeMonotonicMs(session_runtime);
     const now_unix_ms = nowUnixMs();
     clearExpiredDebugUnresponsiveAttachedClients(session_runtime, now_ms);
@@ -2934,7 +2941,7 @@ fn reapPtyHangupSessionIfExited(session_runtime: *SessionRuntime) bool {
     }
 
     var status: c_int = 0;
-    const result = c.waitpid(session.pid, &status, 1);
+    const result = c.waitpid(session.pid, &status, wait_nohang);
     if (result == session.pid) {
         endSession(session_runtime, session.end_reason, exitInfoFromWaitStatus(status));
         return true;
@@ -3660,7 +3667,7 @@ fn endSessionFromPtyEof(session_runtime: *SessionRuntime) void {
 
 fn waitForSessionExitInfo(pid: c.pid_t) ?ExitInfo {
     var status: c_int = 0;
-    const result = c.waitpid(pid, &status, 1);
+    const result = c.waitpid(pid, &status, wait_nohang);
     if (result == pid) return exitInfoFromWaitStatus(status);
     return null;
 }

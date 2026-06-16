@@ -1742,6 +1742,9 @@ fn runAttachedTerminal(
     defer runtime_reader.deinit();
     _ = presentation_guard;
 
+    // PROCESS_EVENT_LOOP: the visible terminal client owns this foreground poll
+    // loop. Dispatcher ownership is a sesshd rule; this process directly
+    // arbitrates stdin, terminal runtime frames, and local responsiveness state.
     while (true) {
         _ = try posix.poll(&pollfds, connection_monitor.pollTimeoutMs());
 

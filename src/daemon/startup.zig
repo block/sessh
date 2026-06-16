@@ -86,6 +86,10 @@ pub fn tryAcquireStartupLock(allocator: std.mem.Allocator, dir_name: []const u8)
 /// process finish creating the daemon and wait briefly for the lock to clear.
 /// A one-second wait is intentionally strict; longer means the startup owner
 /// died or wedged before the daemon became ready.
+///
+/// BLOCKING_WAIT: this runs before the caller has a daemon connection or any
+/// process event loop work to service. A simple bounded sleep loop is more
+/// direct than pretending this foreground startup path has a Dispatcher.
 pub fn waitForStartupLockRelease(allocator: std.mem.Allocator, dir_name: []const u8) !void {
     var timer = try NonSuspendingTimer.start();
     while (true) {
@@ -104,6 +108,9 @@ pub fn waitForStartupLockRelease(allocator: std.mem.Allocator, dir_name: []const
     }
 }
 
+/// BLOCKING_POLL: foreground daemon startup waits for one byte on the inherited
+/// ready pipe. This is not daemon runtime work; it is the caller waiting for the
+/// daemon process it just spawned to begin listening.
 pub fn waitForReady(read_fd: c.fd_t) !WaitResult {
     var pollfds = [_]posix.pollfd{.{
         .fd = read_fd,

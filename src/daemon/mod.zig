@@ -11,11 +11,13 @@ const protocol = @import("../protocol/mod.zig");
 const client_config = @import("../session/client_config.zig");
 const session_daemon_handler = @import("../session/daemon_handler.zig");
 const session_runtime = @import("../session/runtime.zig");
+const daemon_client = @import("client.zig");
 const daemon_cleanup = @import("cleanup.zig");
 const daemon_executable = @import("executable.zig");
+const daemon_handshake = @import("handshake.zig");
 const daemon_identity = @import("identity.zig");
 const daemon_log = @import("log.zig");
-const startup_notify = @import("startup_notify.zig");
+const daemon_startup = @import("startup.zig");
 const daemon_tunnel = @import("tunnel.zig");
 const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
@@ -31,30 +33,23 @@ const daemon_idle_shutdown_ms: u64 = 1_000;
 var active_local_clients: usize = 0;
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
-    const dir_name = try socket_namespace.selectedDirName(allocator);
-    defer allocator.free(dir_name);
-    return socketPathForDirName(allocator, dir_name);
+    return daemon_client.socketPath(allocator);
 }
 
 pub fn socketPathForDirName(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
-    return socket_namespace.socketPath(allocator, dir_name);
+    return daemon_client.socketPathForDirName(allocator, dir_name);
 }
 
 pub fn connect(allocator: std.mem.Allocator) !c.fd_t {
-    const path = try socketPath(allocator);
-    defer allocator.free(path);
-    return socket_transport.connectSocket(path);
+    return daemon_client.connect(allocator);
 }
 
 pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
-    const dir_name = try socket_namespace.selectedDirName(allocator);
-    defer allocator.free(dir_name);
-    return ensureStartedForDirName(allocator, exe, dir_name);
+    return daemon_client.ensureStarted(allocator, exe);
 }
 
 fn ensureStartedForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !void {
-    const fd = try connectOrStartForDirName(allocator, exe, dir_name);
-    defer _ = c.close(fd);
+    return daemon_client.ensureStartedForDirName(allocator, exe, dir_name);
 }
 
 pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
@@ -66,7 +61,7 @@ pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args
     defer if (args.len == 0) allocator.free(dir_name);
 
     try ensureStartedForDirName(allocator, exe, dir_name);
-    const fd = try connectForDirName(allocator, dir_name);
+    const fd = try daemon_client.connectForDirName(allocator, dir_name);
     defer _ = c.close(fd);
     try forwardBrokerFramesToDaemon(allocator, std.posix.STDIN_FILENO, std.posix.STDOUT_FILENO, fd);
 }
@@ -97,67 +92,6 @@ pub fn reexecDaemonOrRun(allocator: std.mem.Allocator, exe: []const u8, args: []
     return daemon_executable.reexec(allocator, runtime_executables.daemon, args);
 }
 
-fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
-    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
-
-    var startup_lock = (try startup_notify.tryAcquireStartupLock(allocator, dir_name)) orelse {
-        try startup_notify.waitForStartupLockRelease(allocator, dir_name);
-        return connectAndHandshakeForDirName(allocator, dir_name);
-    };
-    defer startup_lock.deinit();
-
-    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
-
-    var pipe = try startup_notify.ReadyPipe.init();
-    defer pipe.deinit();
-    if (!try spawnDaemon(allocator, exe, dir_name, pipe.write_fd, startup_lock.file.handle)) {
-        return error.DaemonDidNotStart;
-    }
-    pipe.closeWrite();
-    switch (try startup_notify.waitForReady(pipe.read_fd)) {
-        .ready => return connectAndHandshakeForDirName(allocator, dir_name),
-        .closed, .timed_out => return error.DaemonDidNotStart,
-    }
-}
-
-fn spawnDaemon(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    dir_name: []const u8,
-    ready_fd: c.fd_t,
-    startup_lock_fd: c.fd_t,
-) !bool {
-    var runtime_executables = (try daemon_executable.installRuntimeExecutablesForDaemonStart(allocator, exe, dir_name)) orelse return false;
-    defer runtime_executables.deinit();
-    const argv = [_][]const u8{ runtime_executables.daemon, dir_name };
-    var env_map = try std.process.getEnvMap(allocator);
-    defer env_map.deinit();
-    try startup_notify.addReadyFdToEnvMap(allocator, &env_map, ready_fd);
-    try startup_notify.addStartupLockFdToEnvMap(allocator, &env_map, startup_lock_fd);
-    try socket_transport.clearCloseOnExec(startup_lock_fd);
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.env_map = &env_map;
-    child.pgid = 0;
-    try child.spawn();
-    return true;
-}
-
-fn connectForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
-    const path = try socketPathForDirName(allocator, dir_name);
-    defer allocator.free(path);
-    return socket_transport.connectSocket(path);
-}
-
-fn connectAndHandshakeForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
-    const fd = try connectForDirName(allocator, dir_name);
-    errdefer _ = c.close(fd);
-    try initiateHandshake(allocator, fd);
-    return fd;
-}
-
 fn forwardBrokerFramesToDaemon(
     allocator: std.mem.Allocator,
     stdin_fd: c.fd_t,
@@ -179,6 +113,9 @@ fn forwardBrokerFramesToDaemon(
     var daemon_to_client = BrokerFramePipe.init(allocator, .none);
     defer daemon_to_client.deinit();
 
+    // PROCESS_EVENT_LOOP: sessh-broker is a foreground bridge process whose
+    // whole job is relaying frames between stdin/stdout and the local daemon.
+    // It is intentionally a direct poll loop, not a helper-owned Dispatcher.
     while (true) {
         var pollfds = [_]std.posix.pollfd{
             .{ .fd = stdin_fd, .events = if (client_to_daemon.wantsRead()) std.posix.POLL.IN else 0, .revents = 0 },
@@ -332,11 +269,11 @@ const BrokerFramePipe = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
-    var ready_fd = startup_notify.inheritedReadyFd();
-    var startup_lock_fd = startup_notify.inheritedStartupLockFd();
+    var ready_fd = daemon_startup.inheritedReadyFd();
+    var startup_lock_fd = daemon_startup.inheritedStartupLockFd();
     defer {
         if (ready_fd >= 0) _ = c.close(ready_fd);
-        startup_notify.closeStartupLockFd(&startup_lock_fd);
+        daemon_startup.closeStartupLockFd(&startup_lock_fd);
     }
     core_fds.closeInheritedNonStdioFileDescriptorsExceptList(&.{ ready_fd, startup_lock_fd });
 
@@ -361,10 +298,13 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     const listen_fd = try socket_transport.listenSocket(path);
     defer _ = c.close(listen_fd);
     defer std.fs.deleteFileAbsolute(path) catch {};
-    startup_notify.signalReady(&ready_fd);
-    startup_notify.closeStartupLockFd(&startup_lock_fd);
+    daemon_startup.signalReady(&ready_fd);
+    daemon_startup.closeStartupLockFd(&startup_lock_fd);
     daemon_log.infof(allocator, "daemon started socket={s}", .{path});
 
+    // PROCESS_DISPATCHER: sesshd has exactly one Dispatcher. Daemon helpers
+    // receive this pointer when they need fd/timer events; they should not
+    // construct nested dispatchers.
     var daemon_dispatcher = try dispatcher.Dispatcher.init(allocator);
     defer daemon_dispatcher.deinit();
 
@@ -562,17 +502,17 @@ fn handleDaemonClientFrame(
     switch (context.stage) {
         .waiting_peer_hello => {
             if (frame.message_type != .hello_request) {
-                try sendHelloError(context.fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
+                try daemon_handshake.sendHelloError(context.fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
                 return .close;
             }
             var peer_hello = try protocol.decodePayload(hpb.HelloRequest, context.allocator, frame.payload);
             defer peer_hello.deinit(context.allocator);
-            if (!helloRequestIsCompatible(peer_hello)) {
-                try sendHelloError(context.fd, "VERSION_MISMATCH", "sesshd is incompatible with this client", "");
+            if (!daemon_handshake.helloRequestIsCompatible(peer_hello)) {
+                try daemon_handshake.sendHelloError(context.fd, "VERSION_MISMATCH", "sesshd is incompatible with this client", "");
                 return .close;
             }
-            try sendHelloOk(context.fd);
-            try sendHelloRequest(context.fd);
+            try daemon_handshake.sendHelloOk(context.fd);
+            try daemon_handshake.sendHelloRequest(context.fd);
             context.stage = .waiting_peer_reply;
             return .consumed;
         },
@@ -1007,7 +947,7 @@ fn acquireDaemonSocketLock(allocator: std.mem.Allocator, dir_name: []const u8, s
 
     return tryAcquireDaemonSocketLock(allocator, socket_path) catch |err| switch (err) {
         error.DaemonLockBusy => lock_busy: {
-            if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| {
+            if (daemon_client.connectAndHandshakeForDirName(allocator, dir_name)) |fd| {
                 _ = c.close(fd);
                 return error.DaemonAlreadyRunning;
             } else |_| {}
@@ -1136,104 +1076,6 @@ fn handleDaemonTunnelControlFrame(
         },
         else => return false,
     }
-}
-
-fn initiateHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendHelloRequest(fd);
-    var hello_error = try readHelloReply(allocator, fd);
-    defer if (hello_error) |*err| err.deinit(allocator);
-    if (hello_error) |err| {
-        if (std.mem.eql(u8, err.code, "VERSION_MISMATCH")) return error.VersionMismatch;
-        return error.DaemonHandshakeFailed;
-    }
-    var peer_hello = try readHelloRequest(allocator, fd);
-    defer peer_hello.deinit(allocator);
-    if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "sesshd is incompatible with this client", "");
-        return error.VersionMismatch;
-    }
-    try sendHelloOk(fd);
-}
-
-fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest {
-    while (true) {
-        var frame = try readFrameForForegroundDaemonHandshake(allocator, fd);
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
-            else => {
-                try sendHelloError(fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
-                return error.UnexpectedFrame;
-            },
-        }
-    }
-}
-
-fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
-    while (true) {
-        var frame = try readFrameForForegroundDaemonHandshake(allocator, fd);
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .hello_ok => {
-                var ok = try protocol.decodePayload(hpb.HelloOk, allocator, frame.payload);
-                defer ok.deinit(allocator);
-                return null;
-            },
-            .hello_error => {
-                const err = try protocol.decodePayload(hpb.HelloError, allocator, frame.payload);
-                return err;
-            },
-            else => return error.UnexpectedFrame,
-        }
-    }
-}
-
-fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
-    return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
-}
-
-// BLOCKING_FRAME_READ: local daemon startup/probe handshakes happen before a
-// connection is transferred to dispatcher-owned code. This foreground startup
-// path intentionally blocks; daemon-owned paths must keep FrameReader state in
-// the dispatcher instead.
-fn readFrameForForegroundDaemonHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
-    var reader = protocol.FrameReader.init(allocator);
-    defer reader.deinit();
-    while (true) {
-        switch (try reader.readBlocking(fd)) {
-            .blocked => return error.WouldBlock,
-            .progress => continue,
-            .frame => |frame| return frame,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
-        }
-    }
-}
-
-fn sendHelloRequest(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloRequest{
-        .protocol_major = config.protocol_major,
-        .protocol_minor = config.protocol_minor,
-        .version = config.version,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_request, payload);
-}
-
-fn sendHelloOk(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_ok, payload);
-}
-
-fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloError{
-        .code = code,
-        .message = message,
-        .hint = hint,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_error, payload);
 }
 
 fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {

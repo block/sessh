@@ -10,6 +10,10 @@ const NonSuspendingTimer = @import("non_suspending_timer.zig").NonSuspendingTime
 /// cancellation and interest updates are direct slot writes. Timer watches live
 /// in a deadline min-heap, so finding the next timeout is O(1) and cancellation
 /// is O(log n) without making `poll(2)` scan timer-only entries.
+///
+/// Production code should treat a Dispatcher as the process event loop, owned
+/// by the process entrypoint and passed to helpers. Helpers should not allocate
+/// short-lived Dispatchers to emulate sleeps, timeouts, or one-off polling.
 pub const FdWatchId = struct {
     index: usize,
     generation: u64,

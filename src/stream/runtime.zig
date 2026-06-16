@@ -27,6 +27,10 @@ const transport_ping_interval_ms: u64 = 1_000;
 const stream_unresponsive_after_ms: u64 = 10_000;
 const proxy_mux_stream_id: u64 = 1;
 
+// POSIX WNOHANG. Zig 0.15 does not expose a portable constant, and our
+// supported Unix targets use the stable POSIX value.
+const wait_nohang: c_int = 1;
+
 const StreamOutcome = union(enum) {
     complete,
     transport_closed,
@@ -971,6 +975,9 @@ fn waitForReplacementWhileDisconnected(
     replacement_listen_fd: c.fd_t,
     options: *const StreamAttachedClientOptions,
 ) !c.fd_t {
+    // PROCESS_EVENT_LOOP: remote proxy runtime while detached from a transport.
+    // It must keep draining its remote fd and accepting a replacement transport;
+    // this is the process's main loop, not a helper-owned Dispatcher.
     while (true) {
         // The remote proxy process is durable even when no ssh transport is currently
         // attached. It must keep draining remote fds into the offset-tracked
@@ -1540,6 +1547,8 @@ fn abortTransport(transport: anytype) void {
 pub fn forwardRawDuplex(left_read_fd: c.fd_t, left_write_fd: c.fd_t, right_fd: c.fd_t) !void {
     var left_open = true;
     var right_open = true;
+    // PROCESS_EVENT_LOOP: foreground raw proxy bridge. This process exists only
+    // to relay bytes between two fds, so a direct poll loop is the event loop.
     while (left_open or right_open) {
         var pollfds: [2]posix.pollfd = undefined;
         var count: usize = 0;
@@ -1800,7 +1809,7 @@ fn pruneExitedProxyRemotes() void {
 fn reapProxyRemote(pid: c.pid_t) bool {
     if (pid <= 0) return true;
     var status: c_int = 0;
-    const result = c.waitpid(pid, &status, 1);
+    const result = c.waitpid(pid, &status, wait_nohang);
     if (result == pid) return true;
     if (result < 0) return switch (posix.errno(result)) {
         .CHILD => true,
@@ -1889,6 +1898,9 @@ fn pollReconnectInput(
     }
 
     if (count == 0) {
+        // BLOCKING_POLL: no reconnect/control fds are currently active, so this
+        // foreground stream process has nothing else to service until the next
+        // scheduled input-control check.
         if (timeout_ms > 0) _ = posix.poll(pollfds[0..0], timeout_ms) catch 0;
         return input_control.consumeAction();
     }

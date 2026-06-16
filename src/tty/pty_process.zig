@@ -39,6 +39,8 @@ pub const Child = struct {
 
     pub fn wait(self: *Child) std.process.Child.Term {
         if (self.pid == 0) return .{ .Unknown = 0 };
+        // BLOCKING_WAIT: process cleanup after the PTY master has been closed
+        // and SIGTERM has been sent. This is not daemon event-loop work.
         const result = posix.waitpid(self.pid, 0);
         self.pid = 0;
         return waitStatusToTerm(result.status);

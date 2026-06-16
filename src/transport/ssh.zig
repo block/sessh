@@ -4099,6 +4099,9 @@ fn readBootstrapLineWithSshStderr(
     defer line.deinit(allocator);
     var stderr_open = stderr_fd >= 0;
 
+    // BLOCKING_POLL: foreground SSH bootstrap read that also drains ssh
+    // stderr. With reconnect UI active, the finite timeout lets local
+    // cancellation interleave with pipe reads.
     while (line.items.len < 4096) {
         var pollfds = [_]posix.pollfd{
             .{

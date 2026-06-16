@@ -248,6 +248,10 @@ pub fn runArgvWithDiagnostics(
 }
 
 fn waitForChildAndDiagnostics(pid: c.pid_t, diagnostics: *ProxyClientControl) std.process.Child.Term {
+    // BLOCKING_POLL: plain-ssh compatibility mode is a foreground process
+    // waiting for its only child while optionally draining diagnostics. It has
+    // no process Dispatcher; sesshd-owned SSH transports use the daemon
+    // dispatcher instead.
     while (true) {
         if (checkChildExit(pid)) |term| return term;
 
@@ -320,6 +324,9 @@ pub fn runArgvUnderLocalPty(
         diagnostics.deinit();
     }
 
+    // PROCESS_EVENT_LOOP: this is the visible foreground tty wrapper around a
+    // child ssh process. It is intentionally a direct poll loop rather than a
+    // daemon Dispatcher helper.
     while (true) {
         refreshLocalPtySize(child.master_fd, &size);
 
