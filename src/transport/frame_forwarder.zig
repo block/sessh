@@ -141,7 +141,7 @@ pub const FrameForwarder = struct {
     /// header names the protobuf message length, while any attached byte
     /// appendix is described inside that protobuf message. Paths that can carry
     /// attached bytes must use a decoded frame reader or teach this forwarder to
-    /// scan `Frame.attached_bytes_len`.
+    /// scan `Frame.attached`.
     pub fn readReady(self: *FrameForwarder) !FrameForwarderReadStatus {
         if (self.read_closed) return .eof;
 

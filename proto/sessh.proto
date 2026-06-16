@@ -17,23 +17,38 @@ import "sessh_handshake.proto";
 // is older than the oldest protocol it still supports.
 //
 message Frame {
-  // Number of uninterpreted bytes attached immediately after this protobuf
-  // frame message on the wire. Missing means there are no attached bytes.
-  optional uint32 attached_bytes_len = 1;
+  message Attached {
+    enum Kind {
+      RAW = 0;
+      SCM_RIGHTS = 1;
+    }
 
-  reserved 2 to 9;
+    // Number of bytes attached immediately after this protobuf frame message
+    // on the wire. RAW bytes are preserved as frame data. SCM_RIGHTS
+    // bytes are marker bytes read with recvmsg so the decoder can collect the
+    // SCM_RIGHTS descriptor attached to them; those marker bytes are discarded.
+    uint32 attached_bytes_len = 1;
+    Kind kind = 2;
+  }
+
+  optional Attached attached = 20;
+
+  // Field numbers 1-9 belong to the stable HelloFrame schema. Field numbers
+  // 10-19 are intentionally left unused so post-handshake Frame fields start in
+  // a visibly separate range.
+  reserved 1 to 19;
 
   oneof payload {
-    sessh.handshake.v1.Error error = 10;
+    sessh.handshake.v1.Error error = 30;
 
     // Local client <-> local daemon API traffic. These frames are never
     // forwarded to the remote daemon.
-    ClientDaemonItem client_daemon = 20;
+    ClientDaemonItem client_daemon = 40;
     // Logical visible-client <-> remote endpoint traffic. Daemon-to-daemon
     // tunnels carry these inside mux payloads.
-    ClientRemoteItem client_remote = 21;
+    ClientRemoteItem client_remote = 41;
     // Local daemon <-> remote daemon tunnel traffic.
-    DaemonTunnelItem daemon_tunnel = 22;
+    DaemonTunnelItem daemon_tunnel = 42;
   }
 }
 
@@ -157,12 +172,9 @@ message ClientDaemonItem {
     string proxy_guid = 1;
   }
 
-  // ProxyCommand setup for isolation-mode=none. The framed request is sent over
-  // normal local daemon IPC, while the raw OpenSSH byte-stream fd is attached to
-  // the same Unix-domain-socket message with SCM_RIGHTS. After accepting this
-  // request, sesshd owns the fd and bridges it through ProxyStreamItem mux
-  // payloads; the ProxyCommand process can hand the other socketpair end to
-  // OpenSSH via ProxyUseFdPass and exit.
+  // ProxyCommand setup for isolation-mode=none. This frame must also include
+  // Attached.SCM_RIGHTS and one attached marker byte carrying the raw OpenSSH
+  // byte-stream fd via SCM_RIGHTS.
   message ProxyFdPassOpen {
     SshTransportAcquire transport = 1;
     ProxyStreamItem.Open proxy = 2;

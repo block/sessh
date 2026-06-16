@@ -5,7 +5,6 @@ const app_allocator = @import("../core/app_allocator.zig");
 const config = @import("../core/config.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
-const fd_passing = @import("../core/fd_passing.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const client_config = @import("../session/client_config.zig");
@@ -335,12 +334,12 @@ const ClientContext = struct {
     proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     fd: c.fd_t,
-    reader: fd_passing.FrameReader = undefined,
+    reader: protocol.FrameReader = undefined,
     stage: ClientStage = .waiting_peer_hello,
     owns_active_count: bool = true,
 
     fn initReader(self: *ClientContext) void {
-        self.reader = fd_passing.FrameReader.init(self.allocator);
+        self.reader = protocol.FrameReader.init(self.allocator);
     }
 
     fn deinit(self: *ClientContext) void {
@@ -396,7 +395,7 @@ fn readDaemonClientInner(context: *ClientContext, daemon_dispatcher: *dispatcher
             },
             .frame => |frame_value| {
                 var frame = frame_value;
-                const action = try handleDaemonClientFrame(context, daemon_dispatcher, id, &frame.frame, &frame.fd);
+                const action = try handleDaemonClientFrame(context, daemon_dispatcher, id, &frame, &frame.fd);
                 switch (action) {
                     .consumed => frame.deinit(context.allocator),
                     .close => {
@@ -531,6 +530,12 @@ fn transferInitialRequestToDispatcherOwner(
     frame_fd: *?c.fd_t,
 ) !TransferInitialRequestResult {
     if (frame.message_type == .client_remote) {
+        if (frame_fd.*) |passed_fd| {
+            frame_fd.* = null;
+            _ = c.close(passed_fd);
+            try sendError(context.fd, "PROTOCOL_ERROR", "passed file descriptor is only valid for proxy fd-pass open", "");
+            return .close;
+        }
         var item = try protocol.decodeClientRemoteTerminalEmulatorItem(context.allocator, frame.payload);
         defer item.deinit(context.allocator);
         const item_payload = item.payload orelse return .not_transferred;
@@ -551,6 +556,12 @@ fn transferInitialRequestToDispatcherOwner(
     }
 
     if (frame.message_type == .daemon_tunnel) {
+        if (frame_fd.*) |passed_fd| {
+            frame_fd.* = null;
+            _ = c.close(passed_fd);
+            try sendError(context.fd, "PROTOCOL_ERROR", "passed file descriptor is only valid for proxy fd-pass open", "");
+            return .close;
+        }
         if (try protocol.handleTransportControlFrame(frame.message_type, frame.payload, context.fd)) return .consumed;
         if (try handleDaemonTunnelControlFrame(context.allocator, context.identity, frame.*, context.fd)) return .consumed;
         var initial_frames = [_]protocol.OwnedFrame{frame.*};
@@ -574,6 +585,12 @@ fn transferInitialRequestToDispatcherOwner(
     const item_payload = item.payload orelse return .not_transferred;
     switch (item_payload) {
         .ssh_transport_acquire => |request| {
+            if (frame_fd.*) |passed_fd| {
+                frame_fd.* = null;
+                _ = c.close(passed_fd);
+                try sendError(context.fd, "PROTOCOL_ERROR", "passed file descriptor is only valid for proxy fd-pass open", "");
+                return .close;
+            }
             daemon_log.infof(context.allocator, "ssh transport requested", .{});
             daemon_dispatcher.cancel(id);
             try transport_ssh.registerPooledSshTransportFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
@@ -581,6 +598,12 @@ fn transferInitialRequestToDispatcherOwner(
             return .transferred;
         },
         .proxy_control_open => |request| {
+            if (frame_fd.*) |passed_fd| {
+                frame_fd.* = null;
+                _ = c.close(passed_fd);
+                try sendError(context.fd, "PROTOCOL_ERROR", "passed file descriptor is only valid for proxy fd-pass open", "");
+                return .close;
+            }
             daemon_log.infof(context.allocator, "proxy control requested guid={s}", .{request.proxy_guid});
             daemon_dispatcher.cancel(id);
             try transport_ssh.registerProxyControlOpenFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
@@ -589,16 +612,20 @@ fn transferInitialRequestToDispatcherOwner(
         },
         .proxy_fd_pass_open => |request| {
             const passed_fd = frame_fd.* orelse {
-                try sendError(context.fd, "PROTOCOL_ERROR", "proxy fd-pass open requires a passed file descriptor", "");
+                try sendError(context.fd, "PROTOCOL_ERROR", "proxy fd-pass open missing SCM_RIGHTS fd", "");
                 return .close;
             };
             frame_fd.* = null;
             errdefer _ = c.close(passed_fd);
-            daemon_log.infof(
-                context.allocator,
-                "proxy fd-pass requested guid={s} host={s}:{d}",
-                .{ request.proxy.?.proxy_guid, request.proxy.?.proxy_host, request.proxy.?.proxy_port },
-            );
+            if (request.proxy) |proxy| {
+                daemon_log.infof(
+                    context.allocator,
+                    "proxy fd-pass requested guid={s} host={s}:{d}",
+                    .{ proxy.proxy_guid, proxy.proxy_host, proxy.proxy_port },
+                );
+            } else {
+                daemon_log.infof(context.allocator, "proxy fd-pass requested without proxy details", .{});
+            }
             daemon_dispatcher.cancel(id);
             try transport_ssh.registerProxyFdPassOpenFromDaemon(
                 context.allocator,

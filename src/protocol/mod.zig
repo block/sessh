@@ -3,6 +3,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const c = std.c;
 const posix = std.posix;
 
+const fd_passing = @import("../core/fd_passing.zig");
 const io = @import("../core/io.zig");
 pub const pb = @import("../proto/sessh/protocol/v1.pb.zig");
 pub const hpb = @import("../proto/sessh/handshake/v1.pb.zig");
@@ -25,10 +26,21 @@ pub const OwnedFrame = struct {
     // uninterpreted bytes that follow the protobuf Frame message on the wire.
     payload: []u8,
     attached_bytes: []u8 = &.{},
+    fd: ?c.fd_t = null,
+
+    pub fn takeFd(self: *OwnedFrame) ?c.fd_t {
+        const fd = self.fd;
+        self.fd = null;
+        return fd;
+    }
 
     pub fn deinit(self: *OwnedFrame, allocator: std.mem.Allocator) void {
         allocator.free(self.payload);
         allocator.free(self.attached_bytes);
+        if (self.fd) |fd| {
+            _ = c.close(fd);
+            self.fd = null;
+        }
         self.* = undefined;
     }
 };
@@ -66,13 +78,24 @@ pub const FrameWriteState = struct {
         payload: []const u8,
         attached_bytes: []const u8,
     ) !FrameWriteState {
+        return initWithAttachedKindAndBytes(allocator, message_type, payload, .RAW, attached_bytes);
+    }
+
+    pub fn initWithAttachedKindAndBytes(
+        allocator: std.mem.Allocator,
+        message_type: MessageType,
+        payload: []const u8,
+        attached_kind: pb.Frame.Attached.Kind,
+        attached_bytes: []const u8,
+    ) !FrameWriteState {
         return .{
             .allocator = allocator,
-            .bytes = try encodeFrameWithAttachedBytes(allocator, message_type, payload, attached_bytes),
+            .bytes = try encodeFrameWithAttachedKindAndBytes(allocator, message_type, payload, attached_kind, attached_bytes),
         };
     }
 
     pub fn initOwnedFrame(allocator: std.mem.Allocator, frame: OwnedFrame) !FrameWriteState {
+        if (frame.fd != null) return error.FdSendUnsupported;
         return initWithAttachedBytes(allocator, frame.message_type, frame.payload, frame.attached_bytes);
     }
 
@@ -110,6 +133,9 @@ pub const FrameReader = struct {
     message_filled: usize = 0,
     decoded_frame: ?OwnedFrame = null,
     attached_filled: usize = 0,
+    attached_kind: pb.Frame.Attached.Kind = .RAW,
+    scm_rights_progress: fd_passing.RecvBufferWithFdProgress = .{},
+    scm_rights_storage: [1]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator) FrameReader {
         return .{ .allocator = allocator };
@@ -162,22 +188,48 @@ pub const FrameReader = struct {
             }
 
             var frame = decoded.frame;
-            frame.attached_bytes = try self.allocator.alloc(u8, decoded.attached_bytes_len);
+            self.attached_kind = decoded.attached_kind;
+            switch (decoded.attached_kind) {
+                .RAW => {
+                    frame.attached_bytes = try self.allocator.alloc(u8, decoded.attached_bytes_len);
+                },
+                .SCM_RIGHTS => {
+                    if (decoded.attached_bytes_len != 1) return error.InvalidFileDescriptorCarrierFrame;
+                    self.scm_rights_progress = fd_passing.RecvBufferWithFdProgress.init(self.scm_rights_storage[0..1], null);
+                },
+                _ => return error.InvalidFrame,
+            }
             self.decoded_frame = frame;
             self.attached_filled = 0;
         }
 
         var frame = &(self.decoded_frame.?);
-        if (self.attached_filled < frame.attached_bytes.len) {
-            switch (try readSome(fd, frame.attached_bytes[self.attached_filled..])) {
-                .blocked => return .blocked,
-                .eof => return .truncated_frame,
-                .bytes => |bytes| {
-                    self.attached_filled += bytes.len;
-                    io.noteRead(fd, bytes);
-                    if (self.attached_filled < frame.attached_bytes.len) return .progress;
-                },
-            }
+        switch (self.attached_kind) {
+            .RAW => {
+                if (self.attached_filled < frame.attached_bytes.len) {
+                    switch (try readSome(fd, frame.attached_bytes[self.attached_filled..])) {
+                        .blocked => return .blocked,
+                        .eof => return .truncated_frame,
+                        .bytes => |bytes| {
+                            self.attached_filled += bytes.len;
+                            io.noteRead(fd, bytes);
+                            if (self.attached_filled < frame.attached_bytes.len) return .progress;
+                        },
+                    }
+                }
+            },
+            .SCM_RIGHTS => {
+                if (!self.scm_rights_progress.complete()) {
+                    switch (try fd_passing.recvBufferWithFdProgress(fd, &self.scm_rights_progress)) {
+                        .blocked => return .blocked,
+                        .eof => return .truncated_frame,
+                        .progress => return .progress,
+                        .complete => {},
+                    }
+                }
+                frame.fd = self.scm_rights_progress.takeFd() orelse return error.MissingFileDescriptor;
+            },
+            _ => return error.InvalidFrame,
         }
 
         const result = self.decoded_frame.?;
@@ -200,6 +252,9 @@ pub const FrameReader = struct {
         self.header_filled = 0;
         self.message_filled = 0;
         self.attached_filled = 0;
+        self.scm_rights_progress.deinit();
+        self.scm_rights_progress = .{};
+        self.attached_kind = .RAW;
     }
 };
 
@@ -243,7 +298,20 @@ pub fn sendFrameWithAttachedBytes(fd: c.fd_t, message_type: MessageType, payload
 }
 
 pub fn sendOwnedFrame(fd: c.fd_t, frame: OwnedFrame) !void {
+    if (frame.fd != null) return error.FdSendUnsupported;
     try sendFrameWithAttachedBytes(fd, frame.message_type, frame.payload, frame.attached_bytes);
+}
+
+pub fn sendFrameWithAttachedKindAndBytes(
+    fd: c.fd_t,
+    message_type: MessageType,
+    payload: []const u8,
+    attached_kind: pb.Frame.Attached.Kind,
+    attached_bytes: []const u8,
+) !void {
+    const frame = try encodeFrameWithAttachedKindAndBytes(app_allocator.allocator(), message_type, payload, attached_kind, attached_bytes);
+    defer app_allocator.allocator().free(frame);
+    try io.writeAll(fd, frame);
 }
 
 pub fn sendPing(fd: c.fd_t) !void {
@@ -461,7 +529,17 @@ pub fn encodeFrameWithAttachedBytes(
     payload: []const u8,
     attached_bytes: []const u8,
 ) ![]u8 {
-    const message = try encodeMessagePayload(allocator, message_type, payload, attached_bytes.len);
+    return encodeFrameWithAttachedKindAndBytes(allocator, message_type, payload, .RAW, attached_bytes);
+}
+
+pub fn encodeFrameWithAttachedKindAndBytes(
+    allocator: std.mem.Allocator,
+    message_type: MessageType,
+    payload: []const u8,
+    attached_kind: pb.Frame.Attached.Kind,
+    attached_bytes: []const u8,
+) ![]u8 {
+    const message = try encodeMessagePayload(allocator, message_type, payload, attached_bytes.len, attached_kind);
     defer allocator.free(message);
     if (message.len > std.math.maxInt(u32)) return error.FrameTooLarge;
     if (attached_bytes.len > std.math.maxInt(u32)) return error.FrameTooLarge;
@@ -491,6 +569,7 @@ fn readFrameMessageAlloc(allocator: std.mem.Allocator, fd: c.fd_t) ![]u8 {
 fn decodeMessageAlloc(allocator: std.mem.Allocator, fd: c.fd_t, message_bytes: []const u8) !OwnedFrame {
     var decoded = try decodeMessageEnvelopeAlloc(allocator, message_bytes);
     errdefer decoded.frame.deinit(allocator);
+    if (decoded.attached_kind != .RAW) return error.ScmUnsupported;
     const attached_bytes = try readAttachedBytesAlloc(allocator, fd, decoded.attached_bytes_len);
     errdefer allocator.free(attached_bytes);
 
@@ -502,6 +581,7 @@ fn decodeMessageAlloc(allocator: std.mem.Allocator, fd: c.fd_t, message_bytes: [
 pub const DecodedMessageEnvelope = struct {
     frame: OwnedFrame,
     attached_bytes_len: usize = 0,
+    attached_kind: pb.Frame.Attached.Kind = .RAW,
 };
 
 pub fn decodeMessageEnvelopeAlloc(allocator: std.mem.Allocator, message_bytes: []const u8) !DecodedMessageEnvelope {
@@ -512,26 +592,33 @@ pub fn decodeMessageEnvelopeAlloc(allocator: std.mem.Allocator, message_bytes: [
 
     var frame = try decodePayload(pb.Frame, allocator, message_bytes);
     defer frame.deinit(allocator);
-    const attached_bytes_len: usize = @intCast(frame.attached_bytes_len orelse 0);
+    const attached = frame.attached orelse pb.Frame.Attached{};
+    const attached_bytes_len: usize = @intCast(attached.attached_bytes_len);
+    if (attached_bytes_len == 0 and attached.kind != .RAW) return error.InvalidFrame;
 
-    return switch (frame.payload orelse return error.UnknownFrame) {
-        .@"error" => |message| .{
+    const decoded = switch (frame.payload orelse return error.UnknownFrame) {
+        .@"error" => |message| DecodedMessageEnvelope{
             .frame = try ownedFrameFromMessage(allocator, .error_message, message),
             .attached_bytes_len = attached_bytes_len,
+            .attached_kind = attached.kind,
         },
-        .client_daemon => |message| .{
+        .client_daemon => |message| DecodedMessageEnvelope{
             .frame = try ownedFrameFromMessage(allocator, .client_daemon, message),
             .attached_bytes_len = attached_bytes_len,
+            .attached_kind = attached.kind,
         },
-        .client_remote => |message| .{
+        .client_remote => |message| DecodedMessageEnvelope{
             .frame = try ownedFrameFromMessage(allocator, .client_remote, message),
             .attached_bytes_len = attached_bytes_len,
+            .attached_kind = attached.kind,
         },
-        .daemon_tunnel => |message| .{
+        .daemon_tunnel => |message| DecodedMessageEnvelope{
             .frame = try ownedFrameFromMessage(allocator, .daemon_tunnel, message),
             .attached_bytes_len = attached_bytes_len,
+            .attached_kind = attached.kind,
         },
     };
+    return decoded;
 }
 
 fn decodeHelloMessageAlloc(allocator: std.mem.Allocator, message_bytes: []const u8) !OwnedFrame {
@@ -588,22 +675,26 @@ fn encodeMessagePayload(
     message_type: MessageType,
     payload: []const u8,
     attached_bytes_len: usize,
+    attached_kind: pb.Frame.Attached.Kind,
 ) ![]u8 {
     return switch (message_type) {
         .hello_request => blk: {
             if (attached_bytes_len != 0) return error.AttachedBytesUnsupported;
+            if (attached_kind != .RAW) return error.ScmUnsupported;
             var message = try decodePayload(hpb.HelloRequest, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, hpb.HelloFrame{ .payload = .{ .hello_request = message } });
         },
         .hello_ok => blk: {
             if (attached_bytes_len != 0) return error.AttachedBytesUnsupported;
+            if (attached_kind != .RAW) return error.ScmUnsupported;
             var message = try decodePayload(hpb.HelloOk, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, hpb.HelloFrame{ .payload = .{ .hello_ok = message } });
         },
         .hello_error => blk: {
             if (attached_bytes_len != 0) return error.AttachedBytesUnsupported;
+            if (attached_kind != .RAW) return error.ScmUnsupported;
             var message = try decodePayload(hpb.HelloError, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, hpb.HelloFrame{ .payload = .{ .hello_error = message } });
@@ -612,7 +703,7 @@ fn encodeMessagePayload(
             var message = try decodePayload(hpb.Error, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{
-                .attached_bytes_len = optionalAttachedBytesLen(attached_bytes_len),
+                .attached = try optionalAttached(attached_bytes_len, attached_kind),
                 .payload = .{ .@"error" = message },
             });
         },
@@ -620,7 +711,7 @@ fn encodeMessagePayload(
             var message = try decodePayload(pb.ClientDaemonItem, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{
-                .attached_bytes_len = optionalAttachedBytesLen(attached_bytes_len),
+                .attached = try optionalAttached(attached_bytes_len, attached_kind),
                 .payload = .{ .client_daemon = message },
             });
         },
@@ -628,7 +719,7 @@ fn encodeMessagePayload(
             var message = try decodePayload(pb.ClientRemoteItem, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{
-                .attached_bytes_len = optionalAttachedBytesLen(attached_bytes_len),
+                .attached = try optionalAttached(attached_bytes_len, attached_kind),
                 .payload = .{ .client_remote = message },
             });
         },
@@ -636,15 +727,22 @@ fn encodeMessagePayload(
             var message = try decodePayload(pb.DaemonTunnelItem, allocator, payload);
             defer message.deinit(allocator);
             break :blk encodePayload(allocator, pb.Frame{
-                .attached_bytes_len = optionalAttachedBytesLen(attached_bytes_len),
+                .attached = try optionalAttached(attached_bytes_len, attached_kind),
                 .payload = .{ .daemon_tunnel = message },
             });
         },
     };
 }
 
-fn optionalAttachedBytesLen(attached_bytes_len: usize) ?u32 {
-    return if (attached_bytes_len == 0) null else @intCast(attached_bytes_len);
+fn optionalAttached(attached_bytes_len: usize, attached_kind: pb.Frame.Attached.Kind) !?pb.Frame.Attached {
+    if (attached_bytes_len == 0) {
+        if (attached_kind != .RAW) return error.InvalidFrame;
+        return null;
+    }
+    return .{
+        .attached_bytes_len = @intCast(attached_bytes_len),
+        .kind = attached_kind,
+    };
 }
 
 fn readU32(bytes: []const u8) u32 {
@@ -831,6 +929,80 @@ test "frame reader returns complete frame after incremental nonblocking reads" {
             else => return error.UnexpectedFrameReadStatus,
         }
     }
+}
+
+test "frame reader returns fd from SCM_RIGHTS marker byte" {
+    const payload = try encodePayload(std.testing.allocator, pb.ClientDaemonItem{
+        .payload = .{ .proxy_fd_pass_open = .{} },
+    });
+    defer std.testing.allocator.free(payload);
+    const marker = [_]u8{0};
+    const frame_bytes = try encodeFrameWithAttachedKindAndBytes(
+        std.testing.allocator,
+        .client_daemon,
+        payload,
+        .SCM_RIGHTS,
+        &marker,
+    );
+    defer std.testing.allocator.free(frame_bytes);
+
+    var header: [frame_header_len]u8 = undefined;
+    @memcpy(&header, frame_bytes[0..frame_header_len]);
+    const message_len = messageLenFromHeader(&header);
+    const attached_start = frame_header_len + message_len;
+    try std.testing.expectEqual(frame_bytes.len, attached_start + marker.len);
+
+    var control: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &control) != 0) return error.SocketPairFailed;
+    defer _ = c.close(control[0]);
+    defer _ = c.close(control[1]);
+
+    var raw: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &raw) != 0) return error.SocketPairFailed;
+    defer _ = c.close(raw[1]);
+
+    var header_and_message_progress = fd_passing.SendByteProgress.init(frame_bytes[0..attached_start]);
+    while (true) {
+        switch (try fd_passing.sendByteProgress(control[0], &header_and_message_progress)) {
+            .blocked, .progress => continue,
+            .complete => break,
+            .eof => unreachable,
+        }
+    }
+    var send_progress = fd_passing.SendBufferWithFdProgress.init(frame_bytes[attached_start..], raw[0]);
+    defer send_progress.deinit();
+    while (true) {
+        switch (try fd_passing.sendBufferWithFdProgress(control[0], &send_progress)) {
+            .blocked, .progress => continue,
+            .complete => break,
+            .eof => unreachable,
+        }
+    }
+
+    var reader = FrameReader.init(std.testing.allocator);
+    defer reader.deinit();
+    var received_fd: ?c.fd_t = null;
+    while (true) {
+        switch (try reader.readReady(control[1])) {
+            .blocked, .progress => continue,
+            .eof, .truncated_frame => return error.UnexpectedEndOfStream,
+            .frame => |frame_value| {
+                var frame = frame_value;
+                defer frame.deinit(std.testing.allocator);
+                try std.testing.expectEqual(MessageType.client_daemon, frame.message_type);
+                try std.testing.expectEqual(@as(usize, 0), frame.attached_bytes.len);
+                received_fd = frame.takeFd();
+                break;
+            },
+        }
+    }
+    const fd = received_fd orelse return error.MissingFileDescriptor;
+    defer _ = c.close(fd);
+    try io.writeAll(fd, "through-fd");
+    var raw_buf: [32]u8 = undefined;
+    const n = c.read(raw[1], &raw_buf, raw_buf.len);
+    if (n < 0) return error.ReadFailed;
+    try std.testing.expectEqualStrings("through-fd", raw_buf[0..@intCast(n)]);
 }
 
 test "frame reader reports eof shape for empty and partial streams" {

@@ -793,8 +793,8 @@ def recv_frame(conn):
 
     frame = sessh_pb().Frame()
     frame.ParseFromString(body)
-    if frame.attached_bytes_len:
-        attached = recv_exact(conn, frame.attached_bytes_len)
+    if frame.HasField("attached") and frame.attached.attached_bytes_len:
+        attached = recv_exact(conn, frame.attached.attached_bytes_len)
         raise AssertionError(f"unexpected attached bytes in socket harness: {attached!r}")
     field = frame.WhichOneof("payload")
     if field is None:

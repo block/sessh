@@ -1015,19 +1015,20 @@ pub fn registerProxyFdPassOpenFromDaemon(
     );
 
     try core_fds.setNonBlocking(raw_fd);
-    try registerPooledRawProxyClientFromDaemon(
+    registerPooledRawProxyClientFromDaemon(
         allocator,
         daemon_dispatcher,
         raw_fd,
+        setup_fd,
         target,
         acquire_request,
         resolved_target.config.send_env,
         proxy_open,
-    );
-
-    protocol.sendClientDaemonPayloadFrame(allocator, setup_fd, .{ .proxy_fd_pass_accepted = .{} }) catch |err| {
-        daemon_log.infof(allocator, "proxy fd-pass setup ack failed guid={s} error={t}", .{ proxy_open.proxy_guid, err });
+    ) catch |err| {
+        daemon_log.infof(allocator, "proxy fd-pass setup failed guid={s} error={t}", .{ proxy_open.proxy_guid, err });
+        return err;
     };
+
     _ = c.close(setup_fd);
 }
 
@@ -1207,6 +1208,7 @@ fn registerPooledRawProxyClientFromDaemon(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
     raw_fd: c.fd_t,
+    setup_fd: c.fd_t,
     target: SshTarget,
     request: pb.ClientDaemonItem.SshTransportAcquire,
     send_env: []const []const u8,
@@ -1245,6 +1247,10 @@ fn registerPooledRawProxyClientFromDaemon(
 
     const acquire = try acquirePooledSshTransport(allocator, target, request, client);
     client.transport = acquire.transport;
+    daemon_log.infof(allocator, "proxy fd-pass setup accepted guid={s}", .{proxy_open.proxy_guid});
+    protocol.sendClientDaemonPayloadFrame(allocator, setup_fd, .{ .proxy_fd_pass_accepted = .{} }) catch |err| {
+        daemon_log.infof(allocator, "proxy fd-pass setup ack failed guid={s} error={t}", .{ proxy_open.proxy_guid, err });
+    };
     if (acquire.created) {
         startNewPooledSshTransport(allocator, daemon_dispatcher, acquire.transport, raw_fd, target, request) catch |err| {
             failStartingPooledSshTransport(allocator, daemon_dispatcher, acquire.transport, client, err);
@@ -4985,25 +4991,71 @@ fn runProxyStreamFdPass(
         },
     } } });
     defer allocator.free(payload);
-    const frame_bytes = try protocol.encodeFrame(allocator, .client_daemon, payload);
+    const marker = [_]u8{0};
+    const frame_bytes = try protocol.encodeFrameWithAttachedKindAndBytes(
+        allocator,
+        .client_daemon,
+        payload,
+        .SCM_RIGHTS,
+        &marker,
+    );
     defer allocator.free(frame_bytes);
 
     const daemon_fd_to_pass = daemon_raw_fd;
     daemon_raw_fd = -1;
-    try sendFdBufferImmediate(daemon_fd, frame_bytes, daemon_fd_to_pass);
+    try sendFrameWithAttachedFdImmediate(daemon_fd, frame_bytes, daemon_fd_to_pass);
 
     try waitProxyFdPassAccepted(allocator, daemon_fd);
 
     const ssh_fd_to_pass = ssh_raw_fd;
     ssh_raw_fd = -1;
-    try sendFdBufferImmediate(posix.STDOUT_FILENO, "sessh-proxy-fd", ssh_fd_to_pass);
+    try sendRawFdMessageImmediate(posix.STDOUT_FILENO, "sessh-proxy-fd", ssh_fd_to_pass);
 }
 
-fn sendFdBufferImmediate(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t) !void {
-    var progress = try fd_passing.FrameWriteWithFdProgress.init(bytes, passed_fd);
+fn sendBytesImmediate(sock_fd: c.fd_t, bytes: []const u8) !void {
+    var progress = fd_passing.SendByteProgress.init(bytes);
+    while (true) {
+        switch (try fd_passing.sendByteProgress(sock_fd, &progress)) {
+            .complete => return,
+            .progress => continue,
+            .blocked => return error.WouldBlock,
+            .eof => unreachable,
+        }
+    }
+}
+
+fn sendFrameWithAttachedFdImmediate(sock_fd: c.fd_t, frame_bytes: []const u8, passed_fd: c.fd_t) !void {
+    var owned_fd = passed_fd;
+    errdefer {
+        if (owned_fd >= 0) _ = c.close(owned_fd);
+    }
+
+    var header: [protocol.frame_header_len]u8 = undefined;
+    @memcpy(&header, frame_bytes[0..protocol.frame_header_len]);
+    const message_len = protocol.messageLenFromHeader(&header);
+    const attached_start = protocol.frame_header_len + message_len;
+    if (frame_bytes.len != attached_start + 1) return error.InvalidFileDescriptorCarrierFrame;
+
+    try sendBytesImmediate(sock_fd, frame_bytes[0..attached_start]);
+
+    var progress = fd_passing.SendBufferWithFdProgress.init(frame_bytes[attached_start..], owned_fd);
+    owned_fd = -1;
     defer progress.deinit();
     while (true) {
-        switch (try progress.writeReady(sock_fd)) {
+        switch (try fd_passing.sendBufferWithFdProgress(sock_fd, &progress)) {
+            .complete => return,
+            .progress => continue,
+            .blocked => return error.WouldBlock,
+            .eof => unreachable,
+        }
+    }
+}
+
+fn sendRawFdMessageImmediate(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t) !void {
+    var progress = fd_passing.SendBufferWithFdProgress.init(bytes, passed_fd);
+    defer progress.deinit();
+    while (true) {
+        switch (try fd_passing.sendBufferWithFdProgress(sock_fd, &progress)) {
             .complete => return,
             .progress => continue,
             .blocked => return error.WouldBlock,
