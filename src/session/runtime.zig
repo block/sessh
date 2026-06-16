@@ -21,7 +21,6 @@ const preferred_live_output_batch_bytes = 1024;
 const max_live_output_reads_per_batch = 64;
 const synchronized_output_max_hold_ms: i64 = 1000;
 const pty_hangup_reap_poll_ms: i64 = 50;
-const runtime_handoff_frame_timeout_ms: i32 = 5_000;
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
@@ -106,10 +105,42 @@ const AttachedClient = struct {
 const SessionRuntime = struct {
     session: Session = .{},
     attached_client: AttachedClient = .{},
+    pending_client: PendingRuntimeClient = .{},
     running: bool = true,
     monotonic_clock: ?NonSuspendingTimer = null,
     fixed_session_id: ?[]const u8 = null,
     started_session: bool = false,
+};
+
+const PendingRuntimeClient = struct {
+    fd: c.fd_t = -1,
+    active: bool = false,
+    reader: protocol.FrameReader = undefined,
+    reader_initialized: bool = false,
+
+    fn start(self: *PendingRuntimeClient, fd: c.fd_t) void {
+        self.close();
+        self.* = .{
+            .fd = fd,
+            .active = true,
+            .reader = protocol.FrameReader.init(app_allocator.allocator()),
+            .reader_initialized = true,
+        };
+    }
+
+    fn close(self: *PendingRuntimeClient) void {
+        if (self.fd >= 0) {
+            _ = c.close(self.fd);
+        }
+        if (self.reader_initialized) self.reader.deinit();
+        self.* = .{};
+    }
+
+    fn takeFd(self: *PendingRuntimeClient) c.fd_t {
+        const fd = self.fd;
+        self.fd = -1;
+        return fd;
+    }
 };
 
 const TerminalRemoteProcess = struct {
@@ -132,11 +163,7 @@ const PollKind = union(enum) {
     listen,
     session,
     attached_client,
-};
-
-const HandshakeResult = enum {
-    accepted,
-    mismatch,
+    pending_client,
 };
 
 const ExitInfo = struct {
@@ -1217,18 +1244,6 @@ fn connectTerminalRemoteProcessSocket(control: *const TerminalRemoteProcess) !c.
 pub fn requestTerminalRemoteCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
     const fd = try connectTerminalRemoteProcess(allocator, guid);
     defer _ = c.close(fd);
-
-    try sendHelloRequest(fd);
-    var hello_error = try readHelloReply(fd);
-    defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
-    if (hello_error) |_| return error.VersionMismatch;
-    var peer_hello = try readHelloRequest(fd);
-    defer peer_hello.deinit(app_allocator.allocator());
-    if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client", "Start a fresh sessh connection with matching binaries");
-        return error.VersionMismatch;
-    }
-    try sendHelloOk(fd);
     try protocol.sendTeStreamPayloadFrame(allocator, fd, .{ .session_hangup_request = .{} });
 }
 
@@ -1344,6 +1359,13 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, listen_fd: c.fd_t) !
         count += 1;
     }
 
+    if (session_runtime.pending_client.active) {
+        const pending_client = &session_runtime.pending_client;
+        pollfds[count] = .{ .fd = pending_client.fd, .events = posix.POLL.IN, .revents = 0 };
+        kinds[count] = .pending_client;
+        count += 1;
+    }
+
     _ = try posix.poll(pollfds[0..count], sessionRuntimePollTimeoutMs(session_runtime, now_ms, now_unix_ms));
     const after_poll_ms = sessionRuntimeMonotonicMs(session_runtime);
     clearExpiredDebugUnresponsiveAttachedClients(session_runtime, after_poll_ms);
@@ -1357,6 +1379,7 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, listen_fd: c.fd_t) !
             .listen => handleRuntimeHandoffEvent(session_runtime, listen_fd),
             .session => drainSessionOutput(session_runtime),
             .attached_client => handleAttachedClientEvents(session_runtime, pollfd.revents),
+            .pending_client => handlePendingRuntimeClientEvents(session_runtime, pollfd.revents),
         }
     }
 }
@@ -1484,207 +1507,164 @@ fn handleRuntimeHandoffEvent(session_runtime: *SessionRuntime, listen_fd: c.fd_t
         _ = c.close(client_fd);
         return;
     };
-    const keep_open = handleSessionRuntimeClient(session_runtime, client_fd) catch |err| blk: {
-        io.stderrPrint("sessh remote terminal process: client error: {t}\n", .{err}) catch {};
-        break :blk false;
+    core_fds.setNonBlocking(client_fd) catch {
+        _ = c.close(client_fd);
+        return;
     };
-    if (!keep_open) _ = c.close(client_fd);
+    if (session_runtime.pending_client.active) {
+        _ = c.close(client_fd);
+        return;
+    }
+    session_runtime.pending_client.start(client_fd);
+    drainPendingRuntimeClient(session_runtime);
 }
 
-fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !bool {
-    const handshake_result = try acceptRemoteHandshake(session_runtime, fd);
-    if (handshake_result == .mismatch) return false;
+fn handlePendingRuntimeClientEvents(session_runtime: *SessionRuntime, revents: i16) void {
+    if (!session_runtime.pending_client.active) return;
+    if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
+        session_runtime.pending_client.close();
+        return;
+    }
+    if ((revents & posix.POLL.IN) != 0) drainPendingRuntimeClient(session_runtime);
+}
 
+fn drainPendingRuntimeClient(session_runtime: *SessionRuntime) void {
+    const pending_client = &session_runtime.pending_client;
+    if (!pending_client.active) return;
     while (true) {
-        var frame = readFrameWithHandoffTimeout(fd) catch |err| switch (err) {
-            error.EndOfStream => return false,
-            else => return err,
+        var frame = switch (pending_client.reader.readReady(pending_client.fd) catch |err| {
+            io.stderrPrint("sessh remote terminal process: client error: {t}\n", .{err}) catch {};
+            pending_client.close();
+            return;
+        }) {
+            .blocked, .progress => return,
+            .eof, .truncated_frame => {
+                pending_client.close();
+                return;
+            },
+            .frame => |frame_value| frame_value,
         };
         defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .daemon_tunnel => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
-                continue;
+        switch (handlePendingRuntimeClientFrame(session_runtime, pending_client, &frame) catch |err| {
+            io.stderrPrint("sessh remote terminal process: client error: {t}\n", .{err}) catch {};
+            pending_client.close();
+            return;
+        }) {
+            .continue_reading => continue,
+            .close => {
+                pending_client.close();
+                return;
             },
-            .client_remote => {
-                var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
-                defer item.deinit(app_allocator.allocator());
-                const item_payload = item.payload orelse {
-                    try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected empty terminal stream item", "");
-                    return false;
-                };
-                switch (item_payload) {
-                    .resize => continue,
-                    .open => |open| {
-                        if (open.create == null) {
-                            var request = try attachRequestFromOpen(open);
-                            defer request.deinit();
-                            if (request.session_guid.len == 0) return error.MissingSessionGuid;
-                            const session = findSession(session_runtime, request.session_guid);
-                            const resolved_session = session orelse {
-                                try sendError(session_runtime, fd, "SESSION_NOT_FOUND", "session not found", "");
-                                return false;
-                            };
-                            updateSessionSize(resolved_session, request.resize.rows, request.resize.cols);
-                            try attachSession(session_runtime, fd, request.resize, request.capture_tty_transcript);
-                            return true;
-                        }
-
-                        const open_payload = try protocol.encodePayload(app_allocator.allocator(), open);
-                        defer app_allocator.allocator().free(open_payload);
-                        var request = readSessionCreateRequest(open_payload) catch {
-                            try sendError(session_runtime, fd, "PROTOCOL_ERROR", "invalid terminal stream open payload", "");
-                            return false;
-                        };
-                        defer request.deinit();
-                        _ = try createSession(
-                            session_runtime,
-                            request.resize.rows,
-                            request.resize.cols,
-                            request.scrollback_row_count,
-                            request.environment,
-                            request.query_default_colors,
-                            request.session_guid,
-                            request.command_argv,
-                            request.shell_command,
-                            request.tty_settings,
-                            request.reap_ms,
-                        );
-                        try attachSession(session_runtime, fd, request.resize, request.capture_tty_transcript);
-                        return true;
-                    },
-                    .debug_sever_connection_request => |request| {
-                        try handleSessionClientDebugSeverConnectionRequest(session_runtime, fd, request);
-                        return false;
-                    },
-                    .debug_unresponsive_connection_request => |request| {
-                        try handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime, fd, request);
-                        return false;
-                    },
-                    else => {
-                        try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected first terminal stream item", "");
-                        return false;
-                    },
-                }
-            },
-            else => {
-                try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected first action", "");
-                return false;
-            },
+            .transferred_to_attached_client => return,
         }
     }
 }
 
-fn acceptRemoteHandshake(session_runtime: *SessionRuntime, fd: c.fd_t) !HandshakeResult {
-    _ = session_runtime;
-    var peer_hello = try readHelloRequest(fd);
-    defer peer_hello.deinit(app_allocator.allocator());
-    if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client", "Start a fresh sessh connection with matching binaries");
-        return .mismatch;
-    }
-    try sendHelloOk(fd);
-    try sendHelloRequest(fd);
-    var hello_error = try readHelloReply(fd);
-    defer if (hello_error) |*err| err.deinit(app_allocator.allocator());
-    if (hello_error) |_| {
-        return .mismatch;
-    }
-    return .accepted;
-}
+const PendingRuntimeFrameResult = enum {
+    continue_reading,
+    close,
+    transferred_to_attached_client,
+};
 
-fn readHelloRequest(fd: c.fd_t) !hpb.HelloRequest {
-    while (true) {
-        var frame = try readFrameWithHandoffTimeout(fd);
-        defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .hello_request => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
-            else => {
-                try sendHelloError(fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
-                return error.UnexpectedFrame;
-            },
-        }
-    }
-}
-
-fn readHelloReply(fd: c.fd_t) !?hpb.HelloError {
-    while (true) {
-        var frame = try readFrameWithHandoffTimeout(fd);
-        defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .hello_ok => {
-                var ok = try protocol.decodePayload(hpb.HelloOk, app_allocator.allocator(), frame.payload);
-                defer ok.deinit(app_allocator.allocator());
-                return null;
-            },
-            .hello_error => {
-                const err = try protocol.decodePayload(hpb.HelloError, app_allocator.allocator(), frame.payload);
-                return err;
-            },
-            else => return error.UnexpectedFrame,
-        }
-    }
-}
-
-fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
-    return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
-}
-
-// BLOCKING_FRAME_READ: remote terminal handoff is a private local socket from
-// sesshd to this one-session runtime process. The wait is bounded so a stalled
-// handoff cannot freeze PTY processing indefinitely; attached clients use
-// persistent FrameReader state after attachSession.
-fn readFrameWithHandoffTimeout(fd: c.fd_t) !protocol.OwnedFrame {
-    var reader = protocol.FrameReader.init(app_allocator.allocator());
-    defer reader.deinit();
-    while (true) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, runtime_handoff_frame_timeout_ms);
-        if (ready == 0) return error.RuntimeHandoffTimedOut;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[0].revents & posix.POLL.IN) == 0)
-        {
-            return error.EndOfStream;
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
-        switch (try reader.readReady(fd)) {
-            .blocked => continue,
-            .progress => continue,
-            .frame => |frame| return frame,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
-        }
+fn handlePendingRuntimeClientFrame(
+    session_runtime: *SessionRuntime,
+    pending_client: *PendingRuntimeClient,
+    frame: *protocol.OwnedFrame,
+) !PendingRuntimeFrameResult {
+    const fd = pending_client.fd;
+    switch (frame.message_type) {
+        .daemon_tunnel => {
+            _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
+            return .continue_reading;
+        },
+        .client_remote => {
+            var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
+            defer item.deinit(app_allocator.allocator());
+            const item_payload = item.payload orelse {
+                try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected empty terminal stream item", "");
+                return .close;
+            };
+            switch (item_payload) {
+                .resize => return .continue_reading,
+                .open => |open| return try handlePendingRuntimeOpen(session_runtime, pending_client, open),
+                .debug_sever_connection_request => |request| {
+                    try handleSessionClientDebugSeverConnectionRequest(session_runtime, fd, request);
+                    return .close;
+                },
+                .debug_unresponsive_connection_request => |request| {
+                    try handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime, fd, request);
+                    return .close;
+                },
+                .session_hangup_request => {
+                    handleSessionHangupRequest(session_runtime);
+                    return .close;
+                },
+                else => {
+                    try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected first terminal stream item", "");
+                    return .close;
+                },
+            }
+        },
+        else => {
+            try sendError(session_runtime, fd, "PROTOCOL_ERROR", "unexpected first action", "");
+            return .close;
+        },
     }
 }
 
-fn sendHelloRequest(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloRequest{
-        .protocol_major = config.protocol_major,
-        .protocol_minor = config.protocol_minor,
-        .version = config.version,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_request, payload);
+fn handlePendingRuntimeOpen(
+    session_runtime: *SessionRuntime,
+    pending_client: *PendingRuntimeClient,
+    open: pb.TerminalEmulatorItem.Open,
+) !PendingRuntimeFrameResult {
+    if (open.create == null) {
+        var request = try attachRequestFromOpen(open);
+        defer request.deinit();
+        if (request.session_guid.len == 0) return error.MissingSessionGuid;
+        const session = findSession(session_runtime, request.session_guid);
+        const resolved_session = session orelse {
+            try sendError(session_runtime, pending_client.fd, "SESSION_NOT_FOUND", "session not found", "");
+            return .close;
+        };
+        updateSessionSize(resolved_session, request.resize.rows, request.resize.cols);
+        return try attachPendingRuntimeClient(session_runtime, pending_client, request.resize, request.capture_tty_transcript);
+    }
+
+    const open_payload = try protocol.encodePayload(app_allocator.allocator(), open);
+    defer app_allocator.allocator().free(open_payload);
+    var request = readSessionCreateRequest(open_payload) catch {
+        try sendError(session_runtime, pending_client.fd, "PROTOCOL_ERROR", "invalid terminal stream open payload", "");
+        return .close;
+    };
+    defer request.deinit();
+    _ = try createSession(
+        session_runtime,
+        request.resize.rows,
+        request.resize.cols,
+        request.scrollback_row_count,
+        request.environment,
+        request.query_default_colors,
+        request.session_guid,
+        request.command_argv,
+        request.shell_command,
+        request.tty_settings,
+        request.reap_ms,
+    );
+    return try attachPendingRuntimeClient(session_runtime, pending_client, request.resize, request.capture_tty_transcript);
 }
 
-fn sendHelloOk(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_ok, payload);
-}
-
-fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloError{
-        .code = code,
-        .message = message,
-        .hint = hint,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_error, payload);
+fn attachPendingRuntimeClient(
+    session_runtime: *SessionRuntime,
+    pending_client: *PendingRuntimeClient,
+    resize: ResizePayload,
+    capture_tty_transcript: bool,
+) !PendingRuntimeFrameResult {
+    var fd = pending_client.takeFd();
+    errdefer _ = c.close(fd);
+    pending_client.close();
+    try attachSession(session_runtime, fd, resize, capture_tty_transcript);
+    fd = -1;
+    return .transferred_to_attached_client;
 }
 
 fn sendError(session_runtime: *SessionRuntime, fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
@@ -3652,6 +3632,7 @@ fn stopSessionRuntimeIfComplete(session_runtime: *SessionRuntime) void {
 }
 
 fn closeSessionRuntime(session_runtime: *SessionRuntime) void {
+    session_runtime.pending_client.close();
     disconnectAttachedClient(session_runtime);
     endSession(session_runtime, 2, .{});
 }

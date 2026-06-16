@@ -14,8 +14,8 @@ the remote process.
 ## Periodic scan
 
 Daemons wake up every `cleanup-wakeup-interval-hours` to check if there are
-stale remote processes, attempting to connect to each host and send a
-`RemoteProcessCleanupRequest` for each stale remote process.
+stale remote processes, enqueueing `RemoteProcessCleanupRequest` messages onto
+the same pooled transport machinery used by live sessh clients.
 
 During cleanup the daemon scans the global `state/procs/` dir. Each file within
 the procs dir is JSON, named `<guid>.json`; the filename is the resource
@@ -33,17 +33,15 @@ mutated other than being deleted. Each contains:
 8. `remote_socket_path`
 
 The cleaner reads each file one by one. If the local process still exists, it
-skips ahead. Otherwise it attempts to connect to the remote host and
-create/connect to a daemon to send `RemoteProcessCleanupRequest`.
+skips ahead. Otherwise it makes sure there is a pooled transport for the remote
+host and queues a cleanup request. The file stays in place until the remote
+daemon replies; if the transport dies first, the next periodic scan retries.
 
-If the receiving remote daemon's socket path matches the socket path specified
-in the request, it will hang up the process directly. Otherwise it will first
-attempt to connect to the specified socket and send the
-`RemoteProcessCleanupRequest` there. If that does not work, for example because
-it is a different protocol version, then it falls back to sending `SIGHUP`
-directly after verifying the remote pid and start time. This is intentionally a
-last-resort compatibility path; normally the daemon that owns the process can
-perform a more ssh-shaped cleanup.
+If the receiving remote daemon owns the socket path specified in the request,
+it will hang up the process directly. Otherwise it falls back to sending
+`SIGHUP` directly after verifying the remote pid and start time. This is
+intentionally a last-resort compatibility path; normally the daemon that owns
+the process can perform a more ssh-shaped cleanup.
 
 Once the process is signaled, or if it no longer exists,
 `RemoteProcessCleanupResponse` is sent back, and the local side deletes the

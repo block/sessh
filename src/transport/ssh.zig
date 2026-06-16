@@ -34,8 +34,6 @@ const pb = protocol.pb;
 
 const CommonSessionOptions = sessh_cli.CommonSessionOptions;
 
-const cleanup_remote_frame_timeout_ms: i32 = 30_000;
-const proxy_fd_pass_ack_timeout_ms: i32 = 5_000;
 const pooled_ssh_transport_idle_close_ms: i32 = 60_000;
 const proxy_mux_stream_id: u64 = 1;
 const proxy_stream_window_bytes: u32 = 1024 * 1024;
@@ -361,6 +359,30 @@ const RemoteCleanupIdentity = struct {
     }
 };
 
+const PendingCleanupRequest = struct {
+    remote: RemoteCleanupIdentity,
+
+    fn fromRecord(allocator: std.mem.Allocator, record: daemon_cleanup.Record) !PendingCleanupRequest {
+        const start_time = try allocator.dupe(u8, record.remote_start_time);
+        errdefer allocator.free(start_time);
+        const daemon_socket_path = try allocator.dupe(u8, record.remote_socket_path);
+        errdefer allocator.free(daemon_socket_path);
+        const guid = try allocator.dupe(u8, record.guid);
+        errdefer allocator.free(guid);
+        return .{ .remote = .{
+            .pid = record.remote_pid,
+            .start_time = start_time,
+            .daemon_socket_path = daemon_socket_path,
+            .guid = guid,
+        } };
+    }
+
+    fn deinit(self: *PendingCleanupRequest, allocator: std.mem.Allocator) void {
+        self.remote.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const OwnedEnvironmentEntry = struct {
     name: []u8,
     value: []u8,
@@ -486,6 +508,8 @@ const PooledSshTransport = struct {
     remote_write: ?PooledSshTransportRemoteWrite = null,
     remote_read_paused: bool = false,
     uploaded_bootstrap_artifact: bool = false,
+    pending_cleanup_requests: std.ArrayList(PendingCleanupRequest) = .empty,
+    cleanup_requests_in_flight: usize = 0,
 
     fn deinit(self: *PooledSshTransport) void {
         if (self.connection) |*connection| connection.terminate();
@@ -493,6 +517,8 @@ const PooledSshTransport = struct {
         if (self.remote_daemon_namespace) |namespace| self.allocator.free(namespace);
         if (self.stderr_fd >= 0) posix.close(self.stderr_fd);
         if (self.remote_write) |*write| write.deinit(self.allocator);
+        for (self.pending_cleanup_requests.items) |*request| request.deinit(self.allocator);
+        self.pending_cleanup_requests.deinit(self.allocator);
         if (self.bootstrap_artifacts) |*artifacts| artifacts.deinit();
         self.bootstrap_line.deinit(self.allocator);
         self.clients.deinit(self.allocator);
@@ -1247,14 +1273,24 @@ fn acquirePooledSshTransport(
     request: pb.ClientDaemonItem.SshTransportAcquire,
     client: *PooledSshTransportClient,
 ) !PooledSshTransportAcquire {
+    const acquire = try findOrCreatePooledSshTransport(allocator, target, request);
+    errdefer if (acquire.created) destroyUnstartedPooledSshTransport(allocator, acquire.transport);
+    try acquire.transport.clients.append(allocator, client);
+    return acquire;
+}
+
+fn findOrCreatePooledSshTransport(
+    allocator: std.mem.Allocator,
+    target: SshTarget,
+    request: pb.ClientDaemonItem.SshTransportAcquire,
+) !PooledSshTransportAcquire {
     const key = try pooledSshTransportKey(allocator, target, request);
     errdefer allocator.free(key);
 
     for (pooled_ssh_transports.items) |transport| {
-        if (transport.state == .closed) continue;
+        if (transport.state == .closed or transport.state == .closing) continue;
         if (!std.mem.eql(u8, transport.key, key)) continue;
         allocator.free(key);
-        try transport.clients.append(allocator, client);
         daemon_log.infof(
             allocator,
             "pooled ssh transport reusing host={s} pool={s} remote_namespace={s}",
@@ -1276,7 +1312,6 @@ fn acquirePooledSshTransport(
     };
     transport.remote_reader = protocol.FrameReader.init(allocator);
     errdefer transport.deinit();
-    try transport.clients.append(allocator, client);
     try pooled_ssh_transports.append(allocator, transport);
     active_pooled_ssh_transports += 1;
     daemon_log.infof(
@@ -1285,6 +1320,13 @@ fn acquirePooledSshTransport(
         .{ target.host, transport.key },
     );
     return .{ .transport = transport, .created = true };
+}
+
+fn destroyUnstartedPooledSshTransport(allocator: std.mem.Allocator, transport: *PooledSshTransport) void {
+    removePooledSshTransport(transport);
+    active_pooled_ssh_transports -= 1;
+    transport.deinit();
+    allocator.destroy(transport);
 }
 
 fn pooledSshTransportKey(
@@ -1473,10 +1515,11 @@ fn failStartingPooledSshTransport(
     if (transport.clients.items.len == 0) finishPooledSshTransport(daemon_dispatcher, transport);
 }
 
-pub fn sendCleanupRequestToRemote(
+pub fn enqueueCleanupRequestToRemote(
     allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
     record: daemon_cleanup.Record,
-) !daemon_cleanup.CleanupResult {
+) !void {
     var options = [_][]const u8{ "-l", record.remote_user, "-p", record.remote_port };
     const target = SshTarget{
         .options = &options,
@@ -1485,13 +1528,6 @@ pub fn sendCleanupRequestToRemote(
         .resolved_host = record.remote_host,
         .resolved_port = record.remote_port,
     };
-    var dummy: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &dummy) != 0) return error.SocketPairFailed;
-    defer {
-        posix.close(dummy[0]);
-        posix.close(dummy[1]);
-    }
-
     var request = pb.ClientDaemonItem.SshTransportAcquire{
         .host = record.remote_host,
         .bootstrap = true,
@@ -1499,49 +1535,19 @@ pub fn sendCleanupRequestToRemote(
     defer deinitSshTransportAcquireOwnedFields(allocator, &request);
     try appendCurrentSshAgentToSshTransportAcquire(allocator, &request);
 
-    var started = try startTerminalTransportForDaemon(allocator, dummy[1], target, request);
-    defer {
-        started.connection.terminate();
-        started.deinitNamespace(allocator);
-    }
+    const acquire = try findOrCreatePooledSshTransport(allocator, target, request);
+    var pending = try PendingCleanupRequest.fromRecord(allocator, record);
+    errdefer pending.deinit(allocator);
+    try acquire.transport.pending_cleanup_requests.append(allocator, pending);
+    pending = undefined;
 
-    const read_fd = started.connection.child.stdout.?.handle;
-    const write_fd = started.connection.child.stdin.?.handle;
-    try initiatePooledRemoteDaemonHandshake(allocator, read_fd, write_fd);
-    try daemon_cleanup.sendRemoteProcessCleanupRequest(allocator, write_fd, .{
-        .pid = record.remote_pid,
-        .start_time = record.remote_start_time,
-        .daemon_socket_path = record.remote_socket_path,
-        .guid = record.guid,
-    });
-    return readCleanupResponseForGuid(allocator, read_fd, record.guid);
-}
-
-fn readCleanupResponseForGuid(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    guid: []const u8,
-) !daemon_cleanup.CleanupResult {
-    while (true) {
-        var frame = try readFrameWithTimeoutForCleanup(allocator, fd, cleanup_remote_frame_timeout_ms);
-        defer frame.deinit(allocator);
-        if (frame.message_type != .daemon_tunnel) return error.UnexpectedDaemonFrame;
-        var item = try protocol.decodePayload(pb.DaemonTunnelItem, allocator, frame.payload);
-        defer item.deinit(allocator);
-        const payload = item.payload orelse return error.UnexpectedDaemonFrame;
-        switch (payload) {
-            .remote_process_cleanup_response => |response| {
-                const process = response.process orelse return error.UnexpectedDaemonFrame;
-                if (!std.mem.eql(u8, process.guid, guid)) return error.UnexpectedDaemonFrame;
-                const result = response.result orelse return error.UnexpectedDaemonFrame;
-                return switch (result) {
-                    .cleaned => .cleaned,
-                    .missing => .missing,
-                };
-            },
-            .ping, .pong => continue,
-            else => return error.UnexpectedDaemonFrame,
-        }
+    if (acquire.created) {
+        startNewPooledSshTransport(allocator, daemon_dispatcher, acquire.transport, -1, target, request) catch |err| {
+            finishPooledSshTransport(daemon_dispatcher, acquire.transport);
+            return err;
+        };
+    } else if (acquire.transport.state == .ready) {
+        try startNextPendingCleanupRequest(daemon_dispatcher, acquire.transport);
     }
 }
 
@@ -1811,6 +1817,13 @@ fn completePooledSshTransportStartup(daemon_dispatcher: *dispatcher.Dispatcher, 
     );
     sendPooledSshTransportConnectionEvent(daemon_dispatcher, transport, .{ .daemon_connected = .{} });
     activatePendingPooledSshTransportClients(daemon_dispatcher, transport);
+    startNextPendingCleanupRequest(daemon_dispatcher, transport) catch |err| {
+        daemon_log.infof(
+            transport.allocator,
+            "cleanup request enqueue failed host={s} error={t}",
+            .{ transport.display_host, err },
+        );
+    };
 }
 
 fn failPooledSshTransportStartup(
@@ -2009,6 +2022,7 @@ fn completePooledSshTransportRemoteFrameWrite(
             frame.frame.deinit();
             try resumePooledSshTransportClientReads(daemon_dispatcher, transport);
             try resumePooledSshTransportRemoteRead(daemon_dispatcher, transport);
+            try startNextPendingCleanupRequest(daemon_dispatcher, transport);
         },
         .client_mux_open_envelope => |*open| {
             const typed_open_bytes = open.typed_open_bytes;
@@ -2027,11 +2041,13 @@ fn completePooledSshTransportRemoteFrameWrite(
             frame.frame.deinit();
             if (client.state == .opening_stream) client.state = .active;
             try resumePooledSshTransportClientReads(daemon_dispatcher, transport);
+            try startNextPendingCleanupRequest(daemon_dispatcher, transport);
         },
         .proxy_ack, .remote_process_recorded, .cleanup_request => {
             frame.frame.deinit();
             try resumePooledSshTransportClientReads(daemon_dispatcher, transport);
             try resumePooledSshTransportRemoteRead(daemon_dispatcher, transport);
+            try startNextPendingCleanupRequest(daemon_dispatcher, transport);
         },
     }
 }
@@ -2429,7 +2445,10 @@ fn closeIdlePooledSshTransport(ctx: *anyopaque, daemon_dispatcher: *dispatcher.D
         .fd => return error.UnexpectedPooledSshTransportFd,
     }
     transport.idle_timer_id = null;
-    if (transport.clients.items.len != 0 or transport.state == .closed) return;
+    if (transport.clients.items.len != 0 or
+        transport.pending_cleanup_requests.items.len != 0 or
+        transport.cleanup_requests_in_flight != 0 or
+        transport.state == .closed) return;
     daemon_log.infof(
         transport.allocator,
         "pooled ssh transport idle host={s} pool={s}",
@@ -2467,7 +2486,13 @@ fn activatePendingPooledSshTransportClients(daemon_dispatcher: *dispatcher.Dispa
 }
 
 fn schedulePooledSshTransportIdleClose(daemon_dispatcher: *dispatcher.Dispatcher, transport: *PooledSshTransport) void {
-    if (transport.state == .closed or transport.state == .closing or transport.clients.items.len != 0 or transport.idle_timer_id != null) return;
+    if (transport.state == .closed or
+        transport.state == .closing or
+        transport.clients.items.len != 0 or
+        transport.pending_cleanup_requests.items.len != 0 or
+        transport.cleanup_requests_in_flight != 0 or
+        transport.remote_write != null or
+        transport.idle_timer_id != null) return;
     transport.idle_timer_id = daemon_dispatcher.watchTimerAfter(@intCast(pooled_ssh_transport_idle_close_ms), .{
         .ctx = transport,
         .callback = closeIdlePooledSshTransport,
@@ -2928,7 +2953,9 @@ fn handlePooledRemoteFrame(
             return true;
         },
         .remote_process_cleanup_response => |response| {
+            if (transport.cleanup_requests_in_flight != 0) transport.cleanup_requests_in_flight -= 1;
             daemon_cleanup.handleRemoteProcessCleanupResponse(transport.allocator, response);
+            try startNextPendingCleanupRequest(daemon_dispatcher, transport);
             return true;
         },
         .mux_stream => |mux| {
@@ -3200,6 +3227,28 @@ fn startPooledRemoteProcessCleanupRequest(
     });
     defer transport.allocator.free(payload);
     try startPooledSshTransportRemoteFrameWrite(transport, daemon_dispatcher, .daemon_tunnel, payload, .cleanup_request);
+    transport.cleanup_requests_in_flight += 1;
+}
+
+fn startNextPendingCleanupRequest(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+) !void {
+    if (transport.state != .ready) return;
+    if (transport.remote_write != null) return;
+    if (transport.pending_cleanup_requests.items.len == 0) {
+        if (transport.cleanup_requests_in_flight != 0) return;
+        schedulePooledSshTransportIdleClose(daemon_dispatcher, transport);
+        return;
+    }
+    var request = transport.pending_cleanup_requests.orderedRemove(0);
+    defer request.deinit(transport.allocator);
+    daemon_log.infof(
+        transport.allocator,
+        "cleanup record queued remote cleanup host={s} guid={s}",
+        .{ transport.display_host, request.remote.guid },
+    );
+    try startPooledRemoteProcessCleanupRequest(daemon_dispatcher, transport, request.remote);
 }
 
 fn findPooledSshTransportClient(transport: *PooledSshTransport, stream_id: u64) ?*PooledSshTransportClient {
@@ -3413,111 +3462,8 @@ fn removePooledSshTransport(transport: *PooledSshTransport) void {
     }
 }
 
-fn initiatePooledRemoteDaemonHandshake(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !void {
-    try sendPooledHelloRequest(write_fd);
-    var hello_error = try readPooledHelloReply(allocator, read_fd);
-    defer if (hello_error) |*err| err.deinit(allocator);
-    if (hello_error) |_| return error.VersionMismatch;
-    var peer_hello = try readPooledHelloRequest(allocator, read_fd);
-    defer peer_hello.deinit(allocator);
-    if (!protocol.helloRequestIsCompatible(peer_hello, config.min_protocol_major, config.min_protocol_minor)) {
-        try sendPooledHelloError(write_fd, "VERSION_MISMATCH", "sesshd is incompatible with this client", "");
-        return error.VersionMismatch;
-    }
-    try sendPooledHelloOk(write_fd);
-}
-
-fn sendPooledHelloRequest(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), protocol.hpb.HelloRequest{
-        .protocol_major = config.protocol_major,
-        .protocol_minor = config.protocol_minor,
-        .version = config.version,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_request, payload);
-}
-
-fn sendPooledHelloOk(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), protocol.hpb.HelloOk{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_ok, payload);
-}
-
-fn sendPooledHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), protocol.hpb.HelloError{
-        .code = code,
-        .message = message,
-        .hint = hint,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_error, payload);
-}
-
-fn readPooledHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.hpb.HelloRequest {
-    while (true) {
-        var frame = try readFrameWithTimeoutForCleanup(allocator, fd, cleanup_remote_frame_timeout_ms);
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .hello_request => return protocol.decodePayload(protocol.hpb.HelloRequest, allocator, frame.payload),
-            .daemon_tunnel => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
-            },
-            else => return error.UnexpectedDaemonFrame,
-        }
-    }
-}
-
-fn readPooledHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?protocol.hpb.HelloError {
-    while (true) {
-        var frame = try readFrameWithTimeoutForCleanup(allocator, fd, cleanup_remote_frame_timeout_ms);
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .hello_ok => {
-                var ok = try protocol.decodePayload(protocol.hpb.HelloOk, allocator, frame.payload);
-                defer ok.deinit(allocator);
-                return null;
-            },
-            .hello_error => return try protocol.decodePayload(protocol.hpb.HelloError, allocator, frame.payload),
-            .daemon_tunnel => {
-                _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
-            },
-            else => return error.UnexpectedDaemonFrame,
-        }
-    }
-}
-
-// BLOCKING_FRAME_READ: cleanup opens a short-lived SSH subprocess to ask a
-// remote daemon to clean up a recorded process. The waits use poll/readReady
-// and a timeout because this path runs from daemon maintenance.
-fn readFrameWithTimeoutForCleanup(allocator: std.mem.Allocator, fd: c.fd_t, timeout_ms: i32) !protocol.OwnedFrame {
-    var reader = protocol.FrameReader.init(allocator);
-    defer reader.deinit();
-    while (true) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, timeout_ms);
-        if (ready == 0) return error.CleanupResponseTimedOut;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[0].revents & posix.POLL.IN) == 0)
-        {
-            return error.EndOfStream;
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
-        switch (try reader.readReady(fd)) {
-            .blocked => continue,
-            .progress => continue,
-            .frame => |frame| return frame,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
-        }
-    }
-}
-
-// BLOCKING_FRAME_READ: test-only helper. Production SSH transport paths either
-// use dispatcher-owned FrameReader state or bounded poll/readReady waits.
+// BLOCKING_FRAME_READ: test-only helper. Production SSH transport paths keep
+// persistent FrameReader state in their dispatcher-owned connection objects.
 fn readFrameForTest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();
@@ -5047,20 +4993,10 @@ fn waitProxyFdPassAccepted(allocator: std.mem.Allocator, daemon_fd: c.fd_t) !voi
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();
     var frame = while (true) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = daemon_fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, proxy_fd_pass_ack_timeout_ms);
-        if (ready == 0) return error.ProxyFdPassAckTimedOut;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[0].revents & posix.POLL.IN) == 0)
-        {
-            return error.EndOfStream;
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
-        switch (try reader.readReady(daemon_fd)) {
+        // BLOCKING_FRAME_READ: `sessh-proxy` is a short-lived foreground
+        // helper. It must not hand OpenSSH the raw fd until sesshd has accepted
+        // the peer fd, so this synchronous wait is the command's work.
+        switch (try reader.readBlocking(daemon_fd)) {
             .blocked, .progress => continue,
             .frame => |frame| break frame,
             .eof => return error.EndOfStream,

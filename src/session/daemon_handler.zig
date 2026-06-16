@@ -1,9 +1,7 @@
 const std = @import("std");
 const app_allocator = @import("../core/app_allocator.zig");
 const c = std.c;
-const posix = std.posix;
 
-const config = @import("../core/config.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const io = @import("../core/io.zig");
@@ -18,9 +16,7 @@ const session_registry = @import("../runtime/session_registry.zig");
 const pb = protocol.pb;
 const hpb = protocol.hpb;
 
-const terminal_remote_handshake_frame_timeout_ms: i32 = 5_000;
-
-pub fn registerFrameAfterHandshakeFromDaemon(
+pub fn registerFrameWithTerminalRemoteFromDaemon(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
     exe: []const u8,
@@ -91,13 +87,6 @@ pub fn registerFrameAfterHandshakeFromDaemon(
         try sessionOpenPayloadWithCurrentEnvironment(allocator, request_payload);
     defer if (request.create != null) allocator.free(open_payload);
 
-    initiateTerminalRemoteHandshake(allocator, process_fd) catch |err| switch (err) {
-        error.VersionMismatch => {
-            try sendError(client_fd, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client", "Start a fresh sessh connection with matching binaries");
-            return;
-        },
-        else => return err,
-    };
     var session_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, open_payload);
     defer session_open.deinit(allocator);
     try protocol.sendTeStreamPayloadFrame(allocator, process_fd, .{ .open = session_open });
@@ -107,7 +96,7 @@ pub fn registerFrameAfterHandshakeFromDaemon(
     owns_process_fd = false;
 }
 
-pub fn registerDebugFrameAfterHandshakeFromDaemon(
+pub fn registerDebugFrameWithTerminalRemoteFromDaemon(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
     frame: protocol.OwnedFrame,
@@ -150,7 +139,6 @@ pub fn registerDebugFrameAfterHandshakeFromDaemon(
         if (owns_process_fd) _ = c.close(process_fd);
     }
 
-    try initiateTerminalRemoteHandshake(allocator, process_fd);
     try protocol.sendFrame(process_fd, frame.message_type, frame.payload);
     try frame_forwarder.registerFrameRelay(allocator, daemon_dispatcher, client_fd, process_fd);
     owns_client_fd = false;
@@ -276,15 +264,6 @@ fn handleTerminalMuxPayloadOpen(
             try sendTerminalMuxReset(allocator, mux_fd, stream_id, "SESSION_NOT_FOUND", "session not found");
             return;
         },
-        error.VersionMismatch => {
-            daemon_log.infof(
-                allocator,
-                "terminal mux stream open failed stream_id={} session={s} action={s} error={t}",
-                .{ stream_id, te_open.session_guid, action, err },
-            );
-            try sendTerminalMuxReset(allocator, mux_fd, stream_id, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client");
-            return;
-        },
         else => {
             daemon_log.infof(
                 allocator,
@@ -353,13 +332,6 @@ fn openTerminalMuxStream(
     else
         try startTerminalRemoteAndConnect(allocator, exe, remote_payload);
     errdefer _ = c.close(process_fd);
-    const handshake_started_ms = std.time.milliTimestamp();
-    try initiateTerminalRemoteHandshake(allocator, process_fd);
-    daemon_log.infof(
-        allocator,
-        "terminal mux remote handshake complete stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
-        .{ stream_id, request.session_guid, action, elapsedMsSince(handshake_started_ms), elapsedMsSince(open_started_ms) },
-    );
     const send_started_ms = std.time.milliTimestamp();
     var remote_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, remote_payload);
     defer remote_open.deinit(allocator);
@@ -624,122 +596,6 @@ fn appendEnvironmentEntry(
         .name = name,
         .value = value,
     });
-}
-
-fn errorIsVersionMismatch(allocator: std.mem.Allocator, payload: []const u8) !bool {
-    var message = try protocol.decodePayload(hpb.Error, allocator, payload);
-    defer message.deinit(allocator);
-    return std.mem.eql(u8, message.code, "VERSION_MISMATCH");
-}
-
-fn initiateTerminalRemoteHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendHelloRequest(fd);
-    var hello_error = try readHelloReply(allocator, fd);
-    defer if (hello_error) |*err| err.deinit(allocator);
-    if (hello_error) |err| {
-        if (std.mem.eql(u8, err.code, "VERSION_MISMATCH")) return error.VersionMismatch;
-        return error.RemoteHandshakeFailed;
-    }
-    var peer_hello = try readHelloRequest(allocator, fd, fd);
-    defer peer_hello.deinit(allocator);
-    if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client", "Start a fresh sessh connection with matching binaries");
-        return error.VersionMismatch;
-    }
-    try sendHelloOk(fd);
-}
-
-fn readHelloRequest(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !hpb.HelloRequest {
-    while (true) {
-        var frame = try readFrameWithTerminalRemoteHandshakeTimeout(allocator, read_fd);
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
-            else => {
-                try sendHelloError(write_fd, "PROTOCOL_ERROR", "expected HELLO_REQUEST", "");
-                return error.UnexpectedFrame;
-            },
-        }
-    }
-}
-
-fn readHelloReply(allocator: std.mem.Allocator, read_fd: c.fd_t) !?hpb.HelloError {
-    while (true) {
-        var frame = try readFrameWithTerminalRemoteHandshakeTimeout(allocator, read_fd);
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            .hello_ok => {
-                var ok = try protocol.decodePayload(hpb.HelloOk, allocator, frame.payload);
-                defer ok.deinit(allocator);
-                return null;
-            },
-            .hello_error => {
-                const err = try protocol.decodePayload(hpb.HelloError, allocator, frame.payload);
-                return err;
-            },
-            else => return error.UnexpectedFrame,
-        }
-    }
-}
-
-fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
-    return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
-}
-
-// BLOCKING_FRAME_READ: sesshd waits here only while handshaking with a freshly
-// started local terminal runtime process before registering the dispatcher
-// relay. The timeout prevents a broken runtime startup from pinning the daemon.
-fn readFrameWithTerminalRemoteHandshakeTimeout(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
-    var reader = protocol.FrameReader.init(allocator);
-    defer reader.deinit();
-    while (true) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, terminal_remote_handshake_frame_timeout_ms);
-        if (ready == 0) return error.TerminalRemoteHandshakeTimedOut;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[0].revents & posix.POLL.IN) == 0)
-        {
-            return error.EndOfStream;
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
-        switch (try reader.readReady(fd)) {
-            .blocked => continue,
-            .progress => continue,
-            .frame => |frame| return frame,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
-        }
-    }
-}
-
-fn sendHelloRequest(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloRequest{
-        .protocol_major = config.protocol_major,
-        .protocol_minor = config.protocol_minor,
-        .version = config.version,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_request, payload);
-}
-
-fn sendHelloOk(fd: c.fd_t) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloOk{});
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_ok, payload);
-}
-
-fn sendHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.HelloError{
-        .code = code,
-        .message = message,
-        .hint = hint,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .hello_error, payload);
 }
 
 fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {

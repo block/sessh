@@ -13,8 +13,6 @@ const socket_transport = @import("../transport/socket.zig");
 const hpb = protocol.hpb;
 const pb = protocol.pb;
 
-const local_daemon_handshake_frame_timeout_ms: i32 = 5_000;
-
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
     const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
@@ -217,7 +215,7 @@ pub fn initiateHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
 
 fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest {
     while (true) {
-        var frame = try readFrameWithLocalDaemonHandshakeTimeout(allocator, fd);
+        var frame = try readFrameForForegroundDaemonHandshake(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
@@ -231,7 +229,7 @@ fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest 
 
 fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
     while (true) {
-        var frame = try readFrameWithLocalDaemonHandshakeTimeout(allocator, fd);
+        var frame = try readFrameForForegroundDaemonHandshake(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_ok => {
@@ -253,27 +251,15 @@ fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
 }
 
 // BLOCKING_FRAME_READ: local daemon client handshakes happen before the caller
-// enters its long-lived daemon protocol. The wait is bounded so an unresponsive
-// daemon reports a connection error instead of wedging the CLI.
-fn readFrameWithLocalDaemonHandshakeTimeout(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+// enters its long-lived daemon protocol. This foreground path intentionally
+// blocks on the daemon handshake; daemon-owned paths must keep FrameReader
+// state in the dispatcher instead.
+fn readFrameForForegroundDaemonHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();
     while (true) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, local_daemon_handshake_frame_timeout_ms);
-        if (ready == 0) return error.LocalDaemonHandshakeTimedOut;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[0].revents & posix.POLL.IN) == 0)
-        {
-            return error.EndOfStream;
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
-        switch (try reader.readReady(fd)) {
-            .blocked => continue,
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
             .progress => continue,
             .frame => |frame| return frame,
             .eof => return error.EndOfStream,

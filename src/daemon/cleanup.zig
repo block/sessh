@@ -2,7 +2,6 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
-const config = @import("../core/config.zig");
 const protocol = @import("../protocol/mod.zig");
 const session_runtime = @import("../session/runtime.zig");
 const session_registry = @import("../runtime/session_registry.zig");
@@ -11,10 +10,8 @@ const stream_runtime = @import("../stream/runtime.zig");
 const daemon_identity = @import("identity.zig");
 const daemon_log = @import("log.zig");
 
-const hpb = protocol.hpb;
 const pb = protocol.pb;
 
-const cleanup_local_frame_timeout_ms: i32 = 2_000;
 pub const LocalProcessIdentity = struct {
     pid: u64,
     start_time: []const u8,
@@ -275,10 +272,6 @@ fn cleanupRemoteProcess(
         }
     }
 
-    if (!std.mem.eql(u8, process.daemon_socket_path, identity.socket_path)) {
-        if (forwardCleanupToDaemonSocket(allocator, process.daemon_socket_path, process)) |result| return result else |_| {}
-    }
-
     if (!daemon_identity.processIdentityMatches(allocator, process.pid, process.start_time)) return .missing;
     posix.kill(@intCast(process.pid), posix.SIG.HUP) catch return .missing;
     daemon_log.infof(allocator, "cleanup signaled remote process guid={s} pid={}", .{ process.guid, process.pid });
@@ -305,38 +298,6 @@ fn cleanupGuidOnCurrentDaemon(allocator: std.mem.Allocator, guid: []const u8) !C
     return .missing;
 }
 
-fn forwardCleanupToDaemonSocket(
-    allocator: std.mem.Allocator,
-    socket_path: []const u8,
-    process: pb.DaemonTunnelItem.RemoteProcessIdentity,
-) !CleanupResult {
-    const fd = try socket_transport.connectSocket(socket_path);
-    defer _ = c.close(fd);
-    try initiateDaemonSocketHandshake(allocator, fd);
-    try sendRemoteProcessCleanupRequest(allocator, fd, process);
-    while (true) {
-        var frame = try readFrameWithTimeout(allocator, fd, cleanup_local_frame_timeout_ms);
-        defer frame.deinit(allocator);
-        if (frame.message_type != .daemon_tunnel) return error.UnexpectedFrame;
-        var item = try protocol.decodePayload(pb.DaemonTunnelItem, allocator, frame.payload);
-        defer item.deinit(allocator);
-        const payload = item.payload orelse return error.UnexpectedFrame;
-        switch (payload) {
-            .remote_process_cleanup_response => |response| {
-                const response_process = response.process orelse return error.UnexpectedFrame;
-                if (!std.mem.eql(u8, response_process.guid, process.guid)) return error.UnexpectedFrame;
-                const result = response.result orelse return error.UnexpectedFrame;
-                return switch (result) {
-                    .cleaned => .cleaned,
-                    .missing => .missing,
-                };
-            },
-            .ping => continue,
-            else => return error.UnexpectedFrame,
-        }
-    }
-}
-
 fn sendRemoteProcessCleanupResponse(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
@@ -351,57 +312,6 @@ fn sendRemoteProcessCleanupResponse(
         .process = process,
         .result = result_payload,
     } });
-}
-
-fn initiateDaemonSocketHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    const hello_payload = try protocol.encodePayload(allocator, hpb.HelloRequest{
-        .protocol_major = config.protocol_major,
-        .protocol_minor = config.protocol_minor,
-        .version = config.version,
-    });
-    defer allocator.free(hello_payload);
-    try protocol.sendFrame(fd, .hello_request, hello_payload);
-
-    var frame = try readFrameWithTimeout(allocator, fd, cleanup_local_frame_timeout_ms);
-    defer frame.deinit(allocator);
-    switch (frame.message_type) {
-        .hello_ok => {
-            var ok = try protocol.decodePayload(hpb.HelloOk, allocator, frame.payload);
-            defer ok.deinit(allocator);
-        },
-        .hello_error => return error.VersionMismatch,
-        else => return error.UnexpectedFrame,
-    }
-}
-
-// BLOCKING_FRAME_READ: cleanup may synchronously contact another local daemon
-// socket, but the wait is bounded so a stale socket cannot pin this daemon's
-// maintenance loop indefinitely.
-fn readFrameWithTimeout(allocator: std.mem.Allocator, fd: c.fd_t, timeout_ms: i32) !protocol.OwnedFrame {
-    var reader = protocol.FrameReader.init(allocator);
-    defer reader.deinit();
-    while (true) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, timeout_ms);
-        if (ready == 0) return error.CleanupResponseTimedOut;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[0].revents & posix.POLL.IN) == 0)
-        {
-            return error.EndOfStream;
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
-        switch (try reader.readReady(fd)) {
-            .blocked => continue,
-            .progress => continue,
-            .frame => |frame| return frame,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
-        }
-    }
 }
 
 fn writeRecord(allocator: std.mem.Allocator, record: Record) !void {

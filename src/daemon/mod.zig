@@ -29,7 +29,6 @@ const daemon_idle_shutdown_ms: u64 = 1_000;
 const daemon_start_attempts: usize = 100;
 const daemon_start_sleep_ms: u64 = 20;
 const daemon_spawn_every_attempts: usize = 10;
-const local_daemon_handshake_frame_timeout_ms: i32 = 5_000;
 const daemon_lock_attempts: usize = 100;
 const daemon_lock_sleep_ms: u64 = 20;
 
@@ -352,6 +351,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     const file_config = client_config.loadFileConfig(allocator) catch client_config.FileConfig{};
     var cleanup_context = DaemonCleanupContext{
         .allocator = allocator,
+        .daemon_dispatcher = &daemon_dispatcher,
         .cleanup_wakeup_interval_ms = file_config.cleanup_wakeup_interval_ms orelse config.default_cleanup_wakeup_interval_ms,
         .cleanup_retry_limit_ms = file_config.cleanup_retry_limit_ms orelse config.default_cleanup_retry_limit_ms,
     };
@@ -648,7 +648,7 @@ fn transferInitialRequestToDispatcherOwner(
             daemon_dispatcher.cancel(id);
             const client_fd = context.fd;
             context.fd = -1;
-            try session_daemon_handler.registerFrameAfterHandshakeFromDaemon(
+            try session_daemon_handler.registerFrameWithTerminalRemoteFromDaemon(
                 context.allocator,
                 daemon_dispatcher,
                 context.terminal_remote_exe,
@@ -664,7 +664,7 @@ fn transferInitialRequestToDispatcherOwner(
                 daemon_dispatcher.cancel(id);
                 const client_fd = context.fd;
                 context.fd = -1;
-                try session_daemon_handler.registerDebugFrameAfterHandshakeFromDaemon(
+                try session_daemon_handler.registerDebugFrameWithTerminalRemoteFromDaemon(
                     context.allocator,
                     daemon_dispatcher,
                     frame.*,
@@ -777,6 +777,7 @@ const DaemonIdleContext = struct {
 
 const DaemonCleanupContext = struct {
     allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
     cleanup_wakeup_interval_ms: u64,
     cleanup_retry_limit_ms: u64,
     sweep_lock: ?daemon_cleanup.SweepLock = null,
@@ -946,19 +947,19 @@ fn cleanupRecordViaRemote(
     allocator: std.mem.Allocator,
     record: daemon_cleanup.Record,
 ) !daemon_cleanup.CleanupResult {
-    _ = ctx;
+    const cleanup_context: *DaemonCleanupContext = @ptrCast(@alignCast(ctx));
     daemon_log.infof(
         allocator,
-        "cleanup record attempting remote cleanup guid={s} host={s}@{s}:{s}",
+        "cleanup record enqueueing remote cleanup guid={s} host={s}@{s}:{s}",
         .{ record.guid, record.remote_user, record.remote_host, record.remote_port },
     );
-    const result = try transport_ssh.sendCleanupRequestToRemote(allocator, record);
+    try transport_ssh.enqueueCleanupRequestToRemote(allocator, cleanup_context.daemon_dispatcher, record);
     daemon_log.infof(
         allocator,
-        "cleanup record remote cleanup finished guid={s} result={s}",
-        .{ record.guid, @tagName(result) },
+        "cleanup record remote cleanup enqueued guid={s}",
+        .{record.guid},
     );
-    return result;
+    return error.CleanupRequestEnqueued;
 }
 
 const DaemonSocketLock = struct {
@@ -1134,7 +1135,7 @@ fn initiateHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
 
 fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest {
     while (true) {
-        var frame = try readFrameWithLocalDaemonHandshakeTimeout(allocator, fd);
+        var frame = try readFrameForForegroundDaemonHandshake(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
@@ -1148,7 +1149,7 @@ fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest 
 
 fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
     while (true) {
-        var frame = try readFrameWithLocalDaemonHandshakeTimeout(allocator, fd);
+        var frame = try readFrameForForegroundDaemonHandshake(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_ok => {
@@ -1170,27 +1171,15 @@ fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
 }
 
 // BLOCKING_FRAME_READ: local daemon startup/probe handshakes happen before a
-// connection is transferred to dispatcher-owned code. The wait is bounded so a
-// stale socket or wedged daemon fails instead of hanging startup.
-fn readFrameWithLocalDaemonHandshakeTimeout(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+// connection is transferred to dispatcher-owned code. This foreground startup
+// path intentionally blocks; daemon-owned paths must keep FrameReader state in
+// the dispatcher instead.
+fn readFrameForForegroundDaemonHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();
     while (true) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, local_daemon_handshake_frame_timeout_ms);
-        if (ready == 0) return error.LocalDaemonHandshakeTimedOut;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[0].revents & posix.POLL.IN) == 0)
-        {
-            return error.EndOfStream;
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
-        switch (try reader.readReady(fd)) {
-            .blocked => continue,
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
             .progress => continue,
             .frame => |frame| return frame,
             .eof => return error.EndOfStream,
