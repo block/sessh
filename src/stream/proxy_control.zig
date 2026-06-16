@@ -23,6 +23,41 @@ pub const OwnedMessage = struct {
     }
 };
 
+pub const ReadStatus = union(enum) {
+    blocked,
+    progress,
+    eof,
+    truncated_frame,
+    message: OwnedMessage,
+};
+
+pub const Reader = struct {
+    frame_reader: protocol.FrameReader,
+
+    pub fn init(allocator: std.mem.Allocator) Reader {
+        return .{ .frame_reader = protocol.FrameReader.init(allocator) };
+    }
+
+    pub fn deinit(self: *Reader) void {
+        self.frame_reader.deinit();
+        self.* = undefined;
+    }
+
+    pub fn readReady(self: *Reader, allocator: std.mem.Allocator, fd: c.fd_t) !ReadStatus {
+        switch (try self.frame_reader.readReady(fd)) {
+            .blocked => return .blocked,
+            .progress => return .progress,
+            .eof => return .eof,
+            .truncated_frame => return .truncated_frame,
+            .frame => |frame_value| {
+                var frame = frame_value;
+                defer frame.deinit(allocator);
+                return .{ .message = try messageFromFrame(allocator, frame) };
+            },
+        }
+    }
+};
+
 pub fn writeConnectionEvent(fd: c.fd_t, event: pb.ConnectionEvent.event_union) !void {
     try protocol.sendClientDaemonConnectionEventFrame(app_allocator.allocator(), fd, event);
 }
@@ -31,10 +66,26 @@ pub fn writeRetryNow(fd: c.fd_t) !void {
     try protocol.sendClientDaemonPayloadFrame(app_allocator.allocator(), fd, .{ .retry_now = .{} });
 }
 
+// Test/synchronous helper. Production proxy-control paths keep a Reader so
+// partial frames are not discarded between dispatcher callbacks.
 pub fn readMessage(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
-    var frame = try protocol.readFrameAlloc(allocator, fd);
-    defer frame.deinit(allocator);
+    var reader = protocol.FrameReader.init(allocator);
+    defer reader.deinit();
 
+    var frame = while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame_value| break frame_value,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    };
+    defer frame.deinit(allocator);
+    return messageFromFrame(allocator, frame);
+}
+
+fn messageFromFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !OwnedMessage {
     if (frame.message_type != .client_daemon) return error.UnexpectedProxyControlFrame;
     var item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, frame.payload);
     defer item.deinit(allocator);

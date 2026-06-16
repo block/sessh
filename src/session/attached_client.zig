@@ -326,6 +326,9 @@ pub const RuntimeSession = struct {
     initial_cursor_position: ?terminal.CursorPosition = null,
     initial_draw_alignment_pending: bool = false,
     initial_kitty_keyboard_flags: u5 = 0,
+    recovery_reader: protocol.FrameReader = undefined,
+    recovery_reader_fd: c.fd_t = -1,
+    recovery_reader_initialized: bool = false,
 
     pub fn adoptReconnectState(self: *RuntimeSession, reconnected: *const RuntimeSession) void {
         self.pending_repaint = reconnected.pending_repaint;
@@ -360,8 +363,25 @@ pub const RuntimeSession = struct {
     }
 
     pub fn deinit(self: *RuntimeSession) void {
+        self.resetRecoveryReader();
         self.attached_client_end_restore.deinit(app_allocator.allocator());
         self.attached_client_end_restore = .empty;
+    }
+
+    fn resetRecoveryReader(self: *RuntimeSession) void {
+        if (!self.recovery_reader_initialized) return;
+        self.recovery_reader.deinit();
+        self.recovery_reader_initialized = false;
+        self.recovery_reader_fd = -1;
+    }
+
+    fn recoveryReader(self: *RuntimeSession, fd: c.fd_t) *protocol.FrameReader {
+        if (self.recovery_reader_initialized and self.recovery_reader_fd == fd) return &self.recovery_reader;
+        self.resetRecoveryReader();
+        self.recovery_reader = protocol.FrameReader.init(app_allocator.allocator());
+        self.recovery_reader_fd = fd;
+        self.recovery_reader_initialized = true;
+        return &self.recovery_reader;
     }
 
     pub fn idSlice(self: *const RuntimeSession) []const u8 {
@@ -701,7 +721,7 @@ test "cancelled reconnect frame read returns without input" {
     defer posix.close(fds[1]);
 
     var cancelled = true;
-    try std.testing.expectError(error.ReconnectCancelled, readFrameAllocMaybeCancelled(fds[0], &cancelled));
+    try std.testing.expectError(error.ReconnectCancelled, readFrameMaybeCancelled(fds[0], &cancelled));
 }
 
 test "draw payload preserves app title presence bit" {
@@ -739,7 +759,7 @@ test "recovery polling stores attached-client-end restore bytes from draw" {
     defer posix.close(fds[1]);
 
     var session = RuntimeSession{};
-    defer session.attached_client_end_restore.deinit(app_allocator.allocator());
+    defer session.deinit();
 
     try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fds[1], .{ .draw = .{
         .scrollback_cursor = "opaque-cursor",
@@ -758,7 +778,7 @@ test "recovery polling ignores draw while repaint is outstanding" {
     defer posix.close(fds[1]);
 
     var session = RuntimeSession{ .pending_repaint = .{ .repaint_request_seq = 7 } };
-    defer session.attached_client_end_restore.deinit(app_allocator.allocator());
+    defer session.deinit();
 
     try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fds[1], .{ .draw = .{
         .scrollback_cursor = "stale-cursor",
@@ -778,7 +798,7 @@ test "recovery polling waits for resize repaint after input ack" {
     defer posix.close(fds[1]);
 
     var session = RuntimeSession{};
-    defer session.attached_client_end_restore.deinit(app_allocator.allocator());
+    defer session.deinit();
     const repaint_seq = session.pending_repaint.startResizeAt(1_000);
 
     try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fds[1], .{ .input_ack = .{
@@ -858,7 +878,7 @@ test "reconnect waits for repaint response before returning" {
     } });
 
     var session = RuntimeSession{};
-    defer session.attached_client_end_restore.deinit(app_allocator.allocator());
+    defer session.deinit();
     try session.scrollback_cursor.set("old-cursor");
 
     try reconnectSessionOnRuntime(remote_to_client[0], client_to_remote[1], &session);
@@ -888,13 +908,13 @@ test "runtime repaint after local ui requests screen-only repaint" {
     } });
 
     var session = RuntimeSession{};
-    defer session.attached_client_end_restore.deinit(app_allocator.allocator());
+    defer session.deinit();
     try session.scrollback_cursor.set("old-cursor");
     session.viewport_offset = 5;
 
     try repaintRuntimeSession(remote_to_client[0], client_to_remote[1], &session);
 
-    var frame = try protocol.readFrameAlloc(app_allocator.allocator(), client_to_remote[0]);
+    var frame = try readFrameBlocking(client_to_remote[0]);
     defer frame.deinit(app_allocator.allocator());
     try std.testing.expectEqual(protocol.MessageType.client_remote, frame.message_type);
     var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
@@ -1007,7 +1027,7 @@ fn finishReconnectRepaintInner(
 ) !void {
     _ = write_fd;
     while (session.pending_repaint.active()) {
-        var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
+        var frame = try readFrameMaybeCancelled(read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .client_remote => {
@@ -1085,6 +1105,8 @@ pub fn runAttachedClient(
 
 pub fn drainLocalTransportDiagnostics(read_fd: c.fd_t, timeout_ms: u64) void {
     var timer = NonSuspendingTimer.start() catch return;
+    var reader = protocol.FrameReader.init(app_allocator.allocator());
+    defer reader.deinit();
     while (true) {
         const elapsed_ms = @divTrunc(timer.read(), std.time.ns_per_ms);
         if (elapsed_ms >= timeout_ms) return;
@@ -1098,7 +1120,11 @@ pub fn drainLocalTransportDiagnostics(read_fd: c.fd_t, timeout_ms: u64) void {
         if (ready == 0) return;
         if ((pollfds[0].revents & posix.POLL.IN) == 0) return;
 
-        var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return;
+        var frame = switch (reader.readReady(read_fd) catch return) {
+            .blocked, .progress => continue,
+            .frame => |frame| frame,
+            .eof, .truncated_frame => return,
+        };
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .client_daemon => switch (handleClientDaemonFrame(frame.payload) catch return) {
@@ -1129,7 +1155,12 @@ pub fn pollRuntimeRecovery(
     }
     if ((pollfds[0].revents & posix.POLL.IN) == 0) return null;
 
-    var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
+    const reader = session.recoveryReader(read_fd);
+    var frame = switch (try reader.readReady(read_fd)) {
+        .blocked, .progress => return null,
+        .frame => |frame| frame,
+        .eof, .truncated_frame => return .transport_closed,
+    };
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
         .client_remote => {
@@ -1258,7 +1289,7 @@ pub fn pollAndForwardReconnectInput(
 
 fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
     while (true) {
-        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), read_fd);
+        var frame = try readFrameBlocking(read_fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .error_message => {
@@ -1328,7 +1359,7 @@ fn readSessionAttachedInner(
 ) !void {
     _ = write_fd;
     while (true) {
-        var frame = try readFrameAllocMaybeCancelled(read_fd, cancelled);
+        var frame = try readFrameMaybeCancelled(read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .error_message => {
@@ -1371,11 +1402,13 @@ fn readSessionAttachedInner(
     }
 }
 
-fn readFrameAllocMaybeCancelled(
+fn readFrameMaybeCancelled(
     fd: c.fd_t,
     cancelled: ?*const bool,
 ) !protocol.OwnedFrame {
-    const flag = cancelled orelse return protocol.readFrameAlloc(app_allocator.allocator(), fd);
+    const flag = cancelled orelse return readFrameBlocking(fd);
+    var reader = protocol.FrameReader.init(app_allocator.allocator());
+    defer reader.deinit();
     while (true) {
         if (flag.*) return error.ReconnectCancelled;
         var pollfds = [_]posix.pollfd{.{
@@ -1387,10 +1420,32 @@ fn readFrameAllocMaybeCancelled(
         if (flag.*) return error.ReconnectCancelled;
         if (ready == 0) continue;
         if ((pollfds[0].revents & posix.POLL.IN) != 0) {
-            return protocol.readFrameAlloc(app_allocator.allocator(), fd);
+            switch (try reader.readReady(fd)) {
+                .blocked, .progress => continue,
+                .frame => |frame| return frame,
+                .eof => return error.EndOfStream,
+                .truncated_frame => return error.TruncatedFrame,
+            }
         }
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) {
             return error.EndOfStream;
+        }
+    }
+}
+
+// Use only for synchronous startup/reconnect/test waits where no dispatcher or
+// poll-driven loop is active. Runtime polling paths must keep a persistent
+// FrameReader and call readReady so partial frames are preserved.
+fn readFrameBlocking(fd: c.fd_t) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(app_allocator.allocator());
+    defer reader.deinit();
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
         }
     }
 }
@@ -1525,7 +1580,7 @@ fn sendSessionAttach(
 
 fn readSessionEndedOrError(conn: c.fd_t) !bool {
     while (true) {
-        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), conn);
+        var frame = try readFrameBlocking(conn);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .error_message => {
@@ -1683,6 +1738,8 @@ fn runAttachedTerminal(
         .enabled = options.monitor_connection,
         .responsiveness_timeout_floor_ms = options.responsiveness_timeout_floor_ms,
     };
+    var runtime_reader = protocol.FrameReader.init(app_allocator.allocator());
+    defer runtime_reader.deinit();
     _ = presentation_guard;
 
     while (true) {
@@ -1692,6 +1749,7 @@ fn runAttachedTerminal(
             if (try drainAttachedClientRuntimeFrames(
                 read_fd,
                 write_fd,
+                &runtime_reader,
                 &connection_monitor,
                 scrollback_cursor,
                 viewport_offset,
@@ -1715,6 +1773,7 @@ fn runAttachedTerminal(
                 sendInputChunks(write_fd, result.bytes, input_ack_tracker, paste_like) catch |err| switch (err) {
                     error.WriteFailed => return try finishAttachedClientAfterRuntimeWriteFailed(
                         read_fd,
+                        &runtime_reader,
                         &connection_monitor,
                         scrollback_cursor,
                         viewport_offset,
@@ -1737,6 +1796,7 @@ fn runAttachedTerminal(
                         input_fd,
                         read_fd,
                         write_fd,
+                        &runtime_reader,
                         viewport_offset,
                         pending_repaint,
                         input_ack_tracker,
@@ -1746,6 +1806,7 @@ fn runAttachedTerminal(
                 .repaint => sendRepaint(write_fd, "", pending_repaint) catch |err| switch (err) {
                     error.WriteFailed => return try finishAttachedClientAfterRuntimeWriteFailed(
                         read_fd,
+                        &runtime_reader,
                         &connection_monitor,
                         scrollback_cursor,
                         viewport_offset,
@@ -1765,6 +1826,7 @@ fn runAttachedTerminal(
         maybeSendResize(write_fd, &last_size, scrollback_cursor, viewport_offset, pending_repaint) catch |err| switch (err) {
             error.WriteFailed => return try finishAttachedClientAfterRuntimeWriteFailed(
                 read_fd,
+                &runtime_reader,
                 &connection_monitor,
                 scrollback_cursor,
                 viewport_offset,
@@ -1791,6 +1853,7 @@ fn showEscapeHelpModal(
     input_fd: c.fd_t,
     read_fd: c.fd_t,
     write_fd: c.fd_t,
+    runtime_reader: *protocol.FrameReader,
     viewport_offset: *i32,
     pending_repaint: *PendingRepaint,
     input_ack_tracker: *InputAckTracker,
@@ -1816,6 +1879,7 @@ fn showEscapeHelpModal(
             if (try drainEscapeHelpRuntimeFrames(
                 read_fd,
                 write_fd,
+                runtime_reader,
                 input_ack_tracker,
                 ended_process_exit_code,
             )) |end| {
@@ -1893,6 +1957,7 @@ fn clearEscapeHelpOverlay(
 fn drainEscapeHelpRuntimeFrames(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
+    runtime_reader: *protocol.FrameReader,
     input_ack_tracker: *InputAckTracker,
     ended_process_exit_code: ?*?u8,
 ) !?AttachedClientEnd {
@@ -1911,18 +1976,23 @@ fn drainEscapeHelpRuntimeFrames(
         }
         if ((revents & posix.POLL.IN) == 0) return null;
 
-        if (try handleEscapeHelpRuntimeFrame(read_fd, write_fd, input_ack_tracker, ended_process_exit_code)) |end| return end;
+        if (try handleEscapeHelpRuntimeFrame(read_fd, write_fd, runtime_reader, input_ack_tracker, ended_process_exit_code)) |end| return end;
     }
 }
 
 fn handleEscapeHelpRuntimeFrame(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
+    runtime_reader: *protocol.FrameReader,
     input_ack_tracker: *InputAckTracker,
     ended_process_exit_code: ?*?u8,
 ) !?AttachedClientEnd {
     _ = write_fd;
-    var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
+    var frame = switch (try runtime_reader.readReady(read_fd)) {
+        .blocked, .progress => return null,
+        .frame => |frame| frame,
+        .eof, .truncated_frame => return .transport_closed,
+    };
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
         .client_remote => {
@@ -1968,6 +2038,7 @@ fn handleEscapeHelpRuntimeFrame(
 fn drainAttachedClientRuntimeFrames(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
+    runtime_reader: *protocol.FrameReader,
     connection_monitor: *ConnectionMonitor,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
@@ -1997,6 +2068,7 @@ fn drainAttachedClientRuntimeFrames(
         if (try handleAttachedClientRuntimeFrame(
             read_fd,
             write_fd,
+            runtime_reader,
             connection_monitor,
             scrollback_cursor,
             viewport_offset,
@@ -2013,6 +2085,7 @@ fn drainAttachedClientRuntimeFrames(
 
 fn finishAttachedClientAfterRuntimeWriteFailed(
     read_fd: c.fd_t,
+    runtime_reader: *protocol.FrameReader,
     connection_monitor: *ConnectionMonitor,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
@@ -2027,6 +2100,7 @@ fn finishAttachedClientAfterRuntimeWriteFailed(
     if (try drainAttachedClientRuntimeFrames(
         read_fd,
         @as(c.fd_t, -1),
+        runtime_reader,
         connection_monitor,
         scrollback_cursor,
         viewport_offset,
@@ -2044,6 +2118,7 @@ fn finishAttachedClientAfterRuntimeWriteFailed(
 fn handleAttachedClientRuntimeFrame(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
+    runtime_reader: *protocol.FrameReader,
     connection_monitor: *ConnectionMonitor,
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
@@ -2056,7 +2131,11 @@ fn handleAttachedClientRuntimeFrame(
     initial_draw_alignment_pending: *bool,
 ) !?AttachedClientEnd {
     _ = write_fd;
-    var frame = protocol.readFrameAlloc(app_allocator.allocator(), read_fd) catch return .transport_closed;
+    var frame = switch (try runtime_reader.readReady(read_fd)) {
+        .blocked, .progress => return null,
+        .frame => |frame| frame,
+        .eof, .truncated_frame => return .transport_closed,
+    };
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
         .client_remote => {

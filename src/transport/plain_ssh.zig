@@ -20,6 +20,7 @@ const ProxyClientControl = struct {
     const max_cleanup_title_bytes = 512;
 
     control_fd: c.fd_t = -1,
+    control_reader: proxy_control.Reader,
     title_tracker: stream_runtime.TerminalTitleTracker = .{},
     pending_title: [max_title_bytes]u8 = undefined,
     pending_title_len: usize = 0,
@@ -35,6 +36,7 @@ const ProxyClientControl = struct {
 
     fn init(allocator: std.mem.Allocator, ctrl_r_allowed: bool, onscreen_status: bool) ProxyClientControl {
         var diagnostics = ProxyClientControl{
+            .control_reader = proxy_control.Reader.init(allocator),
             .ctrl_r_allowed = ctrl_r_allowed,
             .onscreen_status = onscreen_status,
         };
@@ -44,6 +46,12 @@ const ProxyClientControl = struct {
             diagnostics.cleanup_title_len = copyBytes(&diagnostics.cleanup_title, title);
         }
         return diagnostics;
+    }
+
+    fn deinit(self: *ProxyClientControl) void {
+        self.closeControl();
+        self.control_reader.deinit();
+        self.* = undefined;
     }
 
     fn setControlFd(self: *ProxyClientControl, fd: c.fd_t) void {
@@ -66,12 +74,21 @@ const ProxyClientControl = struct {
 
     fn readControl(self: *ProxyClientControl) void {
         if (self.control_fd < 0) return;
-        var message = proxy_control.readMessage(std.heap.smp_allocator, self.control_fd) catch {
-            self.closeControl();
-            return;
-        };
-        defer message.deinit(std.heap.smp_allocator);
-        self.handleMessage(message.message);
+        while (true) {
+            var message = switch (self.control_reader.readReady(std.heap.smp_allocator, self.control_fd) catch {
+                self.closeControl();
+                return;
+            }) {
+                .blocked, .progress => return,
+                .eof, .truncated_frame => {
+                    self.closeControl();
+                    return;
+                },
+                .message => |value| value,
+            };
+            defer message.deinit(std.heap.smp_allocator);
+            self.handleMessage(message.message);
+        }
     }
 
     fn handleMessage(self: *ProxyClientControl, message: proxy_control.Message) void {
@@ -216,7 +233,7 @@ pub fn runArgvWithDiagnostics(
     if (control_fd >= 0) diagnostics.setControlFd(control_fd);
     defer {
         diagnostics.clear();
-        diagnostics.closeControl();
+        diagnostics.deinit();
     }
 
     const child_pid: c.pid_t = @intCast(child.id);
@@ -283,7 +300,7 @@ pub fn runArgvUnderLocalPty(
     if (control_fd >= 0) diagnostics.setControlFd(control_fd);
     defer {
         diagnostics.clear();
-        diagnostics.closeControl();
+        diagnostics.deinit();
     }
 
     while (true) {

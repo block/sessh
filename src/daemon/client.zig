@@ -86,7 +86,7 @@ pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
     try protocol.sendDaemonLogRequestFrame(allocator, fd, .{});
 
     while (true) {
-        var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
+        var frame = readFrameBlocking(allocator, fd) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
@@ -198,7 +198,7 @@ pub fn initiateHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
 
 fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest {
     while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
+        var frame = try readFrameBlocking(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
@@ -212,7 +212,7 @@ fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest 
 
 fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
     while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
+        var frame = try readFrameBlocking(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_ok => {
@@ -231,6 +231,22 @@ fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
 
 fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
+}
+
+// Use only while connecting to the local daemon. Long-lived daemon traffic is
+// handled by the caller after this one-shot handshake completes.
+fn readFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(allocator);
+    defer reader.deinit();
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    }
 }
 
 fn sendHelloRequest(fd: c.fd_t) !void {

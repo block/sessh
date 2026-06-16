@@ -93,6 +93,8 @@ const AttachedClient = struct {
     output_offset: usize = 0,
     input_pending: [128]u8 = [_]u8{0} ** 128,
     input_pending_len: usize = 0,
+    reader: protocol.FrameReader = undefined,
+    reader_initialized: bool = false,
     capture_tty_transcript: bool = false,
 
     fn queuedBytes(self: *const AttachedClient) usize {
@@ -1493,7 +1495,7 @@ fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !boo
     if (handshake_result == .mismatch) return false;
 
     while (true) {
-        var frame = protocol.readFrameAlloc(app_allocator.allocator(), fd) catch |err| switch (err) {
+        var frame = readFrameBlocking(fd) catch |err| switch (err) {
             error.EndOfStream => return false,
             else => return err,
         };
@@ -1592,7 +1594,7 @@ fn acceptRemoteHandshake(session_runtime: *SessionRuntime, fd: c.fd_t) !Handshak
 
 fn readHelloRequest(fd: c.fd_t) !hpb.HelloRequest {
     while (true) {
-        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
+        var frame = try readFrameBlocking(fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
@@ -1606,7 +1608,7 @@ fn readHelloRequest(fd: c.fd_t) !hpb.HelloRequest {
 
 fn readHelloReply(fd: c.fd_t) !?hpb.HelloError {
     while (true) {
-        var frame = try protocol.readFrameAlloc(app_allocator.allocator(), fd);
+        var frame = try readFrameBlocking(fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .hello_ok => {
@@ -1625,6 +1627,22 @@ fn readHelloReply(fd: c.fd_t) !?hpb.HelloError {
 
 fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
+}
+
+// Use only for synchronous handshakes before a client is handed to the runtime
+// dispatcher. Active runtime clients keep a persistent FrameReader.
+fn readFrameBlocking(fd: c.fd_t) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(app_allocator.allocator());
+    defer reader.deinit();
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    }
 }
 
 fn sendHelloRequest(fd: c.fd_t) !void {
@@ -2668,6 +2686,7 @@ fn attachSession(
 ) !void {
     const session = &session_runtime.session;
     disconnectAttachedClient(session_runtime);
+    try core_fds.setNonBlocking(client_fd);
 
     const attached_client = &session_runtime.attached_client;
     attached_client.* = .{
@@ -2676,10 +2695,13 @@ fn attachSession(
         .cols = resize.cols,
         .attached_at_unix_ms = nowUnixMs(),
         .active = true,
+        .reader = protocol.FrameReader.init(app_allocator.allocator()),
+        .reader_initialized = true,
         .capture_tty_transcript = capture_tty_transcript,
     };
     attached_client.presentation.setViewportOffset(resize.viewport_offset);
     errdefer {
+        if (attached_client.reader_initialized) attached_client.reader.deinit();
         attached_client.output.deinit(app_allocator.allocator());
         attached_client.* = AttachedClient{};
     }
@@ -2832,9 +2854,16 @@ fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
         return;
     }
 
-    var frame = protocol.readFrameAlloc(app_allocator.allocator(), attached_client.fd) catch {
+    var frame = switch (attached_client.reader.readReady(attached_client.fd) catch {
         disconnectAttachedClient(session_runtime);
         return;
+    }) {
+        .blocked, .progress => return,
+        .eof, .truncated_frame => {
+            disconnectAttachedClient(session_runtime);
+            return;
+        },
+        .frame => |frame_value| frame_value,
     };
     defer frame.deinit(app_allocator.allocator());
 
@@ -3550,6 +3579,7 @@ fn disconnectAttachedClient(session_runtime: *SessionRuntime) void {
     if (!attached_client.active) return;
 
     _ = c.close(attached_client.fd);
+    if (attached_client.reader_initialized) attached_client.reader.deinit();
     attached_client.output.deinit(app_allocator.allocator());
     attached_client.* = AttachedClient{};
     refreshAttachedFlag(session_runtime);

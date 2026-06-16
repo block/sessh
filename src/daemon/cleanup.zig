@@ -314,7 +314,7 @@ fn forwardCleanupToDaemonSocket(
     try initiateDaemonSocketHandshake(allocator, fd);
     try sendRemoteProcessCleanupRequest(allocator, fd, process);
     while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
+        var frame = try readFrameBlocking(allocator, fd);
         defer frame.deinit(allocator);
         if (frame.message_type != .daemon_tunnel) return error.UnexpectedFrame;
         var item = try protocol.decodePayload(pb.DaemonTunnelItem, allocator, frame.payload);
@@ -361,7 +361,7 @@ fn initiateDaemonSocketHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void
     defer allocator.free(hello_payload);
     try protocol.sendFrame(fd, .hello_request, hello_payload);
 
-    var frame = try protocol.readFrameAlloc(allocator, fd);
+    var frame = try readFrameBlocking(allocator, fd);
     defer frame.deinit(allocator);
     switch (frame.message_type) {
         .hello_ok => {
@@ -370,6 +370,22 @@ fn initiateDaemonSocketHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void
         },
         .hello_error => return error.VersionMismatch,
         else => return error.UnexpectedFrame,
+    }
+}
+
+// Use only for the bounded cleanup request/response exchange. Cleanup is still
+// synchronous today; daemon-owned sockets use dispatcher read state.
+fn readFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(allocator);
+    defer reader.deinit();
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
     }
 }
 

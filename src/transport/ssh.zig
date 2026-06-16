@@ -541,7 +541,7 @@ pub fn serveProxyControlOpen(
     defer unregisterProxyControlVisible(fd);
 
     while (true) {
-        var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
+        var frame = readFrameBlocking(allocator, fd) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
@@ -1542,7 +1542,7 @@ fn readCleanupResponseForGuid(
     guid: []const u8,
 ) !daemon_cleanup.CleanupResult {
     while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
+        var frame = try readFrameBlocking(allocator, fd);
         defer frame.deinit(allocator);
         if (frame.message_type != .daemon_tunnel) return error.UnexpectedDaemonFrame;
         var item = try protocol.decodePayload(pb.DaemonTunnelItem, allocator, frame.payload);
@@ -3474,7 +3474,7 @@ fn sendPooledHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint:
 
 fn readPooledHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.hpb.HelloRequest {
     while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
+        var frame = try readFrameBlocking(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(protocol.hpb.HelloRequest, allocator, frame.payload),
@@ -3488,7 +3488,7 @@ fn readPooledHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.hp
 
 fn readPooledHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?protocol.hpb.HelloError {
     while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
+        var frame = try readFrameBlocking(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_ok => {
@@ -3501,6 +3501,22 @@ fn readPooledHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?protocol.hpb
                 _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
             },
             else => return error.UnexpectedDaemonFrame,
+        }
+    }
+}
+
+// Use only for startup handshakes and test harness reads. Pooled daemon
+// transports keep persistent FrameReader state on their watched fds.
+fn readFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(allocator);
+    defer reader.deinit();
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
         }
     }
 }
@@ -5017,7 +5033,7 @@ fn sendRawFdMessageImmediate(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd
 }
 
 fn waitProxyFdPassAccepted(allocator: std.mem.Allocator, daemon_fd: c.fd_t) !void {
-    var frame = try protocol.readFrameAlloc(allocator, daemon_fd);
+    var frame = try readFrameBlocking(allocator, daemon_fd);
     defer frame.deinit(allocator);
     switch (frame.message_type) {
         .client_daemon => {
@@ -5558,7 +5574,7 @@ test "proxy control registry routes diagnostics and retry by proxy guid" {
         .payload = stderr_payload,
     });
 
-    var visible_frame = try protocol.readFrameAlloc(allocator, visible[1]);
+    var visible_frame = try readFrameBlocking(allocator, visible[1]);
     defer visible_frame.deinit(allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, visible_frame.message_type);
     var visible_item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, visible_frame.payload);
@@ -5582,7 +5598,7 @@ test "proxy control registry routes diagnostics and retry by proxy guid" {
         .payload = retry_payload,
     });
 
-    var stream_frame = try protocol.readFrameAlloc(allocator, stream[1]);
+    var stream_frame = try readFrameBlocking(allocator, stream[1]);
     defer stream_frame.deinit(allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, stream_frame.message_type);
     var stream_item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, stream_frame.payload);

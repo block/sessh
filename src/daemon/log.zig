@@ -69,10 +69,24 @@ test "daemon log writes new events to live subscribers" {
     infof(allocator, "test event {}", .{1});
     unsubscribe(fds[1]);
 
-    var frame = try protocol.readFrameAlloc(allocator, fds[0]);
+    var frame = try readFrameForTest(allocator, fds[0]);
     defer frame.deinit(allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, frame.message_type);
     var entry = try protocol.decodeClientDaemonLogEntry(allocator, frame.payload);
     defer entry.deinit(allocator);
     try std.testing.expectEqualStrings("test event 1", entry.message);
+}
+
+fn readFrameForTest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(allocator);
+    defer reader.deinit();
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    }
 }

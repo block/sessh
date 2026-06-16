@@ -329,6 +329,8 @@ const StreamAttachedClient = struct {
     state: *StreamState,
     transport_read_fd: c.fd_t,
     transport_write_fd: c.fd_t,
+    transport_reader: protocol.FrameReader,
+    control_reader: proxy_control.Reader,
     options: StreamAttachedClientOptions,
     liveness: StreamLiveness,
     interrupt_fd: c.fd_t = -1,
@@ -341,15 +343,24 @@ const StreamAttachedClient = struct {
     ) !StreamAttachedClient {
         state.peer_ready = false;
         state.outbound.outbound_eof_sent = false;
+        try core_fds.setNonBlocking(transport_read_fd);
         sendResumeMessage(state, transport_write_fd, options.send_proxy_open) catch return error.StreamTransportClosed;
         const now_ms = nowMillis();
         return .{
             .state = state,
             .transport_read_fd = transport_read_fd,
             .transport_write_fd = transport_write_fd,
+            .transport_reader = protocol.FrameReader.init(state.allocator),
+            .control_reader = proxy_control.Reader.init(state.allocator),
             .options = options,
             .liveness = StreamLiveness.init(now_ms),
         };
+    }
+
+    fn deinit(self: *StreamAttachedClient) void {
+        self.transport_reader.deinit();
+        self.control_reader.deinit();
+        self.* = undefined;
     }
 
     fn step(self: *StreamAttachedClient, requested_timeout_ms: i32) !StreamStepOutcome {
@@ -415,7 +426,7 @@ const StreamAttachedClient = struct {
         if (control_index) |index| {
             if (pollfds[index].revents != 0) {
                 if (self.options.control_input) |control| {
-                    if (!readControlInput(self.options.control_fd, control)) self.options.control_fd = -1;
+                    if (!readControlInput(self.options.control_fd, control, &self.control_reader)) self.options.control_fd = -1;
                 }
             }
         }
@@ -426,7 +437,15 @@ const StreamAttachedClient = struct {
             return .transport_closed;
         }
         if ((pollfds[transport_index].revents & posix.POLL.IN) != 0) {
-            const frame = protocol.readFrameAlloc(state.allocator, self.transport_read_fd) catch return .transport_closed;
+            const frame = switch (self.transport_reader.readReady(self.transport_read_fd) catch return .transport_closed) {
+                .blocked => return .idle,
+                .progress => {
+                    self.liveness.noteIncoming(nowMillis());
+                    return .progress;
+                },
+                .eof, .truncated_frame => return .transport_closed,
+                .frame => |frame_value| frame_value,
+            };
             self.liveness.noteIncoming(nowMillis());
             handleFrame(
                 state,
@@ -1079,6 +1098,7 @@ pub fn runLocalStream(
                 retrying = true;
                 continue :client_loop;
             };
+            defer attached_client.deinit();
             if (options.status_mode == .client_control and options.control_fd < 0 and options.status_fd < 0) {
                 reconnect_status.setFd(transport.writeFd());
                 reconnect_status.clear();
@@ -1813,11 +1833,13 @@ fn waitBeforeReconnect(
     interrupt: ?*LocalStreamInterrupt,
 ) StreamControlAction {
     var remaining_ms = delay_ms;
+    var control_reader = proxy_control.Reader.init(state.allocator);
+    defer control_reader.deinit();
     while (remaining_ms > 0) {
         status.showRetry(remaining_ms);
         input_control.status_visible = true;
         const step_ms = @min(remaining_ms, 1_000);
-        const action = pollReconnectInput(state, source_fd, control_fd, input_control, interrupt, @intCast(step_ms));
+        const action = pollReconnectInput(state, source_fd, control_fd, input_control, &control_reader, interrupt, @intCast(step_ms));
         if (action == .help) {
             status.showEscapeHelp();
             continue;
@@ -1839,6 +1861,7 @@ fn pollReconnectInput(
     source_fd: c.fd_t,
     control_fd: *c.fd_t,
     input_control: *StreamInputControl,
+    control_reader: *proxy_control.Reader,
     interrupt: ?*LocalStreamInterrupt,
     timeout_ms: i32,
 ) StreamControlAction {
@@ -1884,7 +1907,7 @@ fn pollReconnectInput(
     }
     if (control_index) |index| {
         if (pollfds[index].revents != 0) {
-            if (!readControlInput(control_fd.*, input_control)) control_fd.* = -1;
+            if (!readControlInput(control_fd.*, input_control, control_reader)) control_fd.* = -1;
         }
     }
     return input_control.consumeAction();
@@ -1911,15 +1934,20 @@ fn readReconnectInput(
     return input_control.consumeAction();
 }
 
-fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl) bool {
+fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl, reader: *proxy_control.Reader) bool {
     if (control_fd < 0) return false;
-    var message = proxy_control.readMessage(std.heap.smp_allocator, control_fd) catch return false;
-    defer message.deinit(std.heap.smp_allocator);
-    switch (message.message) {
-        .retry_now => input_control.reconnect_requested = true,
-        else => {},
+    while (true) {
+        var message = switch (reader.readReady(std.heap.smp_allocator, control_fd) catch return false) {
+            .blocked, .progress => return true,
+            .eof, .truncated_frame => return false,
+            .message => |value| value,
+        };
+        defer message.deinit(std.heap.smp_allocator);
+        switch (message.message) {
+            .retry_now => input_control.reconnect_requested = true,
+            else => {},
+        }
     }
-    return true;
 }
 
 pub const TerminalTitleTracker = struct {
@@ -2383,7 +2411,7 @@ fn encodeMuxAckPayload(allocator: std.mem.Allocator, recv_next_offset: u64) ![]u
 }
 
 fn expectMuxStreamFrame(fd: c.fd_t) !pb.DaemonTunnelItem.MuxStreamFrame {
-    var frame = try protocol.readFrameAlloc(std.testing.allocator, fd);
+    var frame = try readFrameForTest(fd);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.daemon_tunnel, frame.message_type);
     var mux = try protocol.decodeDaemonMuxStreamFrame(std.testing.allocator, frame.payload);
@@ -2500,11 +2528,25 @@ test "stream ping receives pong without changing offsets" {
         .payload = payload,
     });
 
-    var frame = try protocol.readFrameAlloc(std.testing.allocator, fds[0]);
+    var frame = try readFrameForTest(fds[0]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.daemon_tunnel, frame.message_type);
     try std.testing.expectEqual(@as(u64, 0), state.inbound.recv_next_offset);
     try std.testing.expectEqual(@as(u64, 0), state.outbound.outboundNext());
+}
+
+fn readFrameForTest(fd: c.fd_t) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(std.testing.allocator);
+    defer reader.deinit();
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    }
 }
 
 test "stream sender sends only newly appended bytes on a live transport" {
@@ -2572,11 +2614,14 @@ test "stream inbound eof promptly flushes generated outbound eof" {
         .state = &state,
         .transport_read_fd = transport_in[0],
         .transport_write_fd = transport_out[1],
+        .transport_reader = protocol.FrameReader.init(std.testing.allocator),
+        .control_reader = proxy_control.Reader.init(std.testing.allocator),
         .options = .{
             .close_outbound_on_inbound_eof = true,
         },
         .liveness = StreamLiveness.init(1_000),
     };
+    defer attached_client.deinit();
 
     try std.testing.expectEqual(StreamStepOutcome.progress, try attached_client.step(1_000));
 
@@ -2612,12 +2657,15 @@ test "stream source eof can reset proxy stream" {
         .state = &state,
         .transport_read_fd = transport_in[0],
         .transport_write_fd = transport_out[1],
+        .transport_reader = protocol.FrameReader.init(std.testing.allocator),
+        .control_reader = proxy_control.Reader.init(std.testing.allocator),
         .options = .{
             .source = .{ .fd = source[0] },
             .reset_on_source_eof = true,
         },
         .liveness = StreamLiveness.init(1_000),
     };
+    defer attached_client.deinit();
 
     try std.testing.expectEqual(StreamStepOutcome.complete, try attached_client.step(1_000));
     try expectResetFrame(transport_out[0], "SOURCE_CLOSED");
@@ -2641,9 +2689,12 @@ test "stream reset completes proxy stream" {
         .state = &state,
         .transport_read_fd = transport_in[0],
         .transport_write_fd = transport_out[1],
+        .transport_reader = protocol.FrameReader.init(std.testing.allocator),
+        .control_reader = proxy_control.Reader.init(std.testing.allocator),
         .options = .{},
         .liveness = StreamLiveness.init(1_000),
     };
+    defer attached_client.deinit();
 
     try std.testing.expectEqual(StreamStepOutcome.complete, try attached_client.step(1_000));
 }

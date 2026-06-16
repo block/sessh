@@ -150,63 +150,166 @@ fn forwardBrokerFramesToDaemon(
         _ = c.shutdown(daemon_fd, c.SHUT.WR);
     }
 
-    var pollfds = [_]std.posix.pollfd{
-        .{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = daemon_fd, .events = std.posix.POLL.IN, .revents = 0 },
-    };
+    try core_fds.setNonBlocking(stdin_fd);
+    try core_fds.setNonBlocking(stdout_fd);
+    try core_fds.setNonBlocking(daemon_fd);
+
+    var client_to_daemon = BrokerFramePipe.init(allocator, .add_current_environment);
+    defer client_to_daemon.deinit();
+    var daemon_to_client = BrokerFramePipe.init(allocator, .none);
+    defer daemon_to_client.deinit();
 
     while (true) {
+        var pollfds = [_]std.posix.pollfd{
+            .{ .fd = stdin_fd, .events = if (client_to_daemon.wantsRead()) std.posix.POLL.IN else 0, .revents = 0 },
+            .{ .fd = stdout_fd, .events = if (daemon_to_client.wantsWrite()) std.posix.POLL.OUT else 0, .revents = 0 },
+            .{ .fd = daemon_fd, .events = brokerDaemonPollEvents(&client_to_daemon, &daemon_to_client), .revents = 0 },
+        };
         _ = try std.posix.poll(&pollfds, -1);
 
-        if ((pollfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
-            if (!try copyClientFrameToDaemon(allocator, stdin_fd, daemon_fd)) return;
+        if ((pollfds[1].revents & std.posix.POLL.OUT) != 0) {
+            switch (try daemon_to_client.writeReady(stdout_fd)) {
+                .blocked, .progress, .drained => {},
+            }
         }
-        if ((pollfds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
-            if (!try copyFrame(allocator, daemon_fd, stdout_fd)) return;
+        if ((pollfds[2].revents & std.posix.POLL.OUT) != 0) {
+            switch (try client_to_daemon.writeReady(daemon_fd)) {
+                .blocked, .progress, .drained => {},
+            }
+        }
+
+        if ((pollfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
+            switch (try client_to_daemon.readReady(stdin_fd)) {
+                .blocked, .progress => {},
+                .closed => return,
+            }
+        }
+        if ((pollfds[2].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
+            switch (try daemon_to_client.readReady(daemon_fd)) {
+                .blocked, .progress => {},
+                .closed => return,
+            }
         }
     }
 }
 
-fn copyClientFrameToDaemon(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !bool {
-    var frame = protocol.readFrameAlloc(allocator, read_fd) catch |err| switch (err) {
-        error.EndOfStream => return false,
-        else => return err,
-    };
-    defer frame.deinit(allocator);
+fn brokerDaemonPollEvents(client_to_daemon: *const BrokerFramePipe, daemon_to_client: *const BrokerFramePipe) i16 {
+    var events: i16 = 0;
+    if (daemon_to_client.wantsRead()) events |= std.posix.POLL.IN;
+    if (client_to_daemon.wantsWrite()) events |= std.posix.POLL.OUT;
+    return events;
+}
 
-    if (frame.message_type == .client_remote) {
-        var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
-        defer item.deinit(allocator);
+const BrokerFrameReadStatus = enum {
+    blocked,
+    progress,
+    closed,
+};
+
+const BrokerFrameWriteStatus = enum {
+    blocked,
+    progress,
+    drained,
+};
+
+const BrokerFrameTransform = enum {
+    none,
+    add_current_environment,
+};
+
+const BrokerFramePipe = struct {
+    allocator: std.mem.Allocator,
+    transform: BrokerFrameTransform,
+    reader: protocol.FrameReader,
+    writer: ?protocol.FrameWriteState = null,
+
+    fn init(allocator: std.mem.Allocator, transform: BrokerFrameTransform) BrokerFramePipe {
+        return .{
+            .allocator = allocator,
+            .transform = transform,
+            .reader = protocol.FrameReader.init(allocator),
+        };
+    }
+
+    fn deinit(self: *BrokerFramePipe) void {
+        self.reader.deinit();
+        if (self.writer) |*writer| writer.deinit();
+        self.writer = null;
+    }
+
+    fn wantsRead(self: *const BrokerFramePipe) bool {
+        return self.writer == null;
+    }
+
+    fn wantsWrite(self: *const BrokerFramePipe) bool {
+        return self.writer != null;
+    }
+
+    fn readReady(self: *BrokerFramePipe, fd: c.fd_t) !BrokerFrameReadStatus {
+        if (self.writer != null) return .blocked;
+        switch (try self.reader.readReady(fd)) {
+            .blocked => return .blocked,
+            .progress => return .progress,
+            .eof, .truncated_frame => return .closed,
+            .frame => |frame_value| {
+                var frame = frame_value;
+                defer frame.deinit(self.allocator);
+                self.writer = try self.writerForFrame(&frame);
+                return .progress;
+            },
+        }
+    }
+
+    fn writeReady(self: *BrokerFramePipe, fd: c.fd_t) !BrokerFrameWriteStatus {
+        var writer = if (self.writer) |*value| value else return .drained;
+        switch (try writer.writeReady(fd)) {
+            .blocked => return .blocked,
+            .progress => return .progress,
+            .done => {
+                writer.deinit();
+                self.writer = null;
+                return .drained;
+            },
+        }
+    }
+
+    fn writerForFrame(self: *BrokerFramePipe, frame: *protocol.OwnedFrame) !protocol.FrameWriteState {
+        switch (self.transform) {
+            .none => return protocol.FrameWriteState.initOwnedFrame(self.allocator, frame.*),
+            .add_current_environment => return self.writerForClientFrame(frame),
+        }
+    }
+
+    fn writerForClientFrame(self: *BrokerFramePipe, frame: *protocol.OwnedFrame) !protocol.FrameWriteState {
+        if (frame.message_type != .client_remote) return protocol.FrameWriteState.initOwnedFrame(self.allocator, frame.*);
+        if (frame.fd != null) return error.FdSendUnsupported;
+
+        var item = try protocol.decodeClientRemoteTerminalEmulatorItem(self.allocator, frame.payload);
+        defer item.deinit(self.allocator);
         if (item.payload) |item_payload| {
             switch (item_payload) {
                 .open => |request| {
-                    const open_payload = try protocol.encodePayload(allocator, request);
-                    defer allocator.free(open_payload);
-                    const payload = try session_daemon_handler.sessionOpenPayloadWithCurrentEnvironment(allocator, open_payload);
-                    defer allocator.free(payload);
-                    var open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, payload);
-                    defer open.deinit(allocator);
-                    try protocol.sendTeStreamPayloadFrame(allocator, write_fd, .{ .open = open });
-                    return true;
+                    return self.writerForEnvironmentOpen(request);
                 },
                 else => {},
             }
         }
+        return protocol.FrameWriteState.initOwnedFrame(self.allocator, frame.*);
     }
 
-    try protocol.sendFrame(write_fd, frame.message_type, frame.payload);
-    return true;
-}
-
-fn copyFrame(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !bool {
-    var frame = protocol.readFrameAlloc(allocator, read_fd) catch |err| switch (err) {
-        error.EndOfStream => return false,
-        else => return err,
-    };
-    defer frame.deinit(allocator);
-    try protocol.sendFrame(write_fd, frame.message_type, frame.payload);
-    return true;
-}
+    fn writerForEnvironmentOpen(self: *BrokerFramePipe, request: pb.TerminalEmulatorItem.Open) !protocol.FrameWriteState {
+        const open_payload = try protocol.encodePayload(self.allocator, request);
+        defer self.allocator.free(open_payload);
+        const payload = try session_daemon_handler.sessionOpenPayloadWithCurrentEnvironment(self.allocator, open_payload);
+        defer self.allocator.free(payload);
+        var open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, self.allocator, payload);
+        defer open.deinit(self.allocator);
+        const terminal_item = pb.TerminalEmulatorItem{ .payload = .{ .open = open } };
+        const client_remote_payload = try protocol.encodePayload(self.allocator, pb.ClientRemoteItem{ .payload = .{ .terminal_emulator = terminal_item } });
+        defer self.allocator.free(client_remote_payload);
+        return protocol.FrameWriteState.init(self.allocator, .client_remote, client_remote_payload);
+    }
+};
 
 pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     core_fds.closeInheritedNonStdioFileDescriptors();
@@ -959,7 +1062,7 @@ fn handleClientFrameAfterHandshake(
                     return false;
                 },
                 .log_request => {
-                    try serveDaemonLogRequest(allocator, fd);
+                    try sendError(fd, "PROTOCOL_ERROR", "daemon log must be dispatcher-owned", "");
                     return false;
                 },
                 else => {
@@ -994,26 +1097,6 @@ fn handleDaemonTunnelControlFrame(
     }
 }
 
-fn serveDaemonLogRequest(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try daemon_log.subscribe(allocator, fd);
-    defer daemon_log.unsubscribe(fd);
-    daemon_log.infof(allocator, "daemon log subscribed", .{});
-
-    while (true) {
-        var frame = protocol.readFrameAlloc(allocator, fd) catch |err| switch (err) {
-            error.EndOfStream => {
-                daemon_log.infof(allocator, "daemon log subscriber disconnected", .{});
-                return;
-            },
-            else => return err,
-        };
-        defer frame.deinit(allocator);
-        switch (frame.message_type) {
-            else => return error.UnexpectedFrame,
-        }
-    }
-}
-
 fn initiateHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     try sendHelloRequest(fd);
     var hello_error = try readHelloReply(allocator, fd);
@@ -1033,7 +1116,7 @@ fn initiateHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
 
 fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest {
     while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
+        var frame = try readFrameBlocking(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
@@ -1047,7 +1130,7 @@ fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest 
 
 fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
     while (true) {
-        var frame = try protocol.readFrameAlloc(allocator, fd);
+        var frame = try readFrameBlocking(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_ok => {
@@ -1066,6 +1149,22 @@ fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
 
 fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
+}
+
+// Use only for synchronous daemon-client setup paths. Long-lived daemon
+// connections should be dispatcher-owned and use persistent FrameReader state.
+fn readFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(allocator);
+    defer reader.deinit();
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    }
 }
 
 fn sendHelloRequest(fd: c.fd_t) !void {

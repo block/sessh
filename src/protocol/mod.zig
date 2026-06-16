@@ -161,7 +161,7 @@ pub const FrameReader = struct {
 
     fn readWithMode(self: *FrameReader, fd: c.fd_t, mode: FrameReadMode) !FrameReadStatus {
         if (self.header_filled < frame_header_len) {
-            switch (try readSome(fd, self.header[self.header_filled..])) {
+            switch (try readSome(fd, self.header[self.header_filled..], mode)) {
                 .blocked => return .blocked,
                 .eof => return if (self.header_filled == 0) .eof else .truncated_frame,
                 .bytes => |bytes| {
@@ -180,7 +180,7 @@ pub const FrameReader = struct {
         }
 
         if (self.message_filled < self.message.len) {
-            switch (try readSome(fd, self.message[self.message_filled..])) {
+            switch (try readSome(fd, self.message[self.message_filled..], mode)) {
                 .blocked => return .blocked,
                 .eof => return .truncated_frame,
                 .bytes => |bytes| {
@@ -220,7 +220,7 @@ pub const FrameReader = struct {
         switch (self.attached_kind) {
             .RAW => {
                 if (self.attached_filled < frame.attached_bytes.len) {
-                    switch (try readSome(fd, frame.attached_bytes[self.attached_filled..])) {
+                    switch (try readSome(fd, frame.attached_bytes[self.attached_filled..], mode)) {
                         .blocked => return .blocked,
                         .eof => return .truncated_frame,
                         .bytes => |bytes| {
@@ -294,21 +294,6 @@ pub fn helloRequestIsCompatible(
 ) bool {
     return hello.protocol_major > min_major or
         (hello.protocol_major == min_major and hello.protocol_minor >= min_minor);
-}
-
-pub fn readFrameAlloc(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedFrame {
-    var reader = FrameReader.init(allocator);
-    defer reader.deinit();
-
-    while (true) {
-        switch (try reader.readBlocking(fd)) {
-            .blocked => return error.WouldBlock,
-            .progress => continue,
-            .frame => |frame| return frame,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
-        }
-    }
 }
 
 pub fn sendFrame(fd: c.fd_t, message_type: MessageType, payload: []const u8) !void {
@@ -695,8 +680,22 @@ const ReadSomeResult = union(enum) {
     bytes: []const u8,
 };
 
-fn readSome(fd: c.fd_t, buf: []u8) !ReadSomeResult {
+fn readSome(fd: c.fd_t, buf: []u8, mode: FrameReadMode) !ReadSomeResult {
     if (buf.len == 0) return .{ .bytes = buf };
+    const original_flags = if (mode == .ready) flags: {
+        const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+        if (flags < 0) return error.ReadFailed;
+        break :flags flags;
+    } else 0;
+    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
+    const changed_flags = mode == .ready and (original_flags & nonblocking_flag) == 0;
+    if (changed_flags and c.fcntl(fd, c.F.SETFL, original_flags | nonblocking_flag) < 0) {
+        return error.ReadFailed;
+    }
+    defer {
+        if (changed_flags) _ = c.fcntl(fd, c.F.SETFL, original_flags);
+    }
+
     while (true) {
         const n = c.read(fd, buf.ptr, buf.len);
         if (n > 0) return .{ .bytes = buf[0..@intCast(n)] };
@@ -798,6 +797,20 @@ fn writeU32(bytes: []u8, value: u32) void {
     bytes[3] = @intCast(value & 0xff);
 }
 
+fn readFrameForTest(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedFrame {
+    var reader = FrameReader.init(allocator);
+    defer reader.deinit();
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    }
+}
+
 test "generated protobuf payload round trip" {
     const original = pb.TerminalEmulatorItem.Draw{
         .scrollback_cursor = "opaque-cursor",
@@ -826,7 +839,7 @@ test "frame envelope round trip" {
     defer _ = c.close(pipe[0]);
     defer _ = c.close(pipe[1]);
     try io.writeAll(pipe[1], frame_bytes);
-    var frame = try readFrameAlloc(std.testing.allocator, pipe[0]);
+    var frame = try readFrameForTest(std.testing.allocator, pipe[0]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(MessageType.client_remote, frame.message_type);
     try std.testing.expectEqual(@as(usize, 0), frame.attached_bytes.len);
@@ -859,7 +872,7 @@ test "mux stream frame preserves stream id offset and proxy payload" {
     defer _ = c.close(pipe[0]);
     defer _ = c.close(pipe[1]);
     try io.writeAll(pipe[1], frame_bytes);
-    var frame = try readFrameAlloc(std.testing.allocator, pipe[0]);
+    var frame = try readFrameForTest(std.testing.allocator, pipe[0]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(MessageType.daemon_tunnel, frame.message_type);
     try std.testing.expectEqual(@as(usize, 0), frame.attached_bytes.len);
@@ -905,7 +918,7 @@ test "frame envelope preserves attached bytes appendix" {
     defer _ = c.close(pipe[0]);
     defer _ = c.close(pipe[1]);
     try io.writeAll(pipe[1], frame_bytes);
-    var frame = try readFrameAlloc(std.testing.allocator, pipe[0]);
+    var frame = try readFrameForTest(std.testing.allocator, pipe[0]);
     defer frame.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(MessageType.client_daemon, frame.message_type);
@@ -1061,7 +1074,7 @@ test "blocking frame read returns fd from SCM_RIGHTS frame" {
 
     try sendFrameWithScmRightsFd(std.testing.allocator, control[0], .client_daemon, payload, raw[0]);
 
-    var frame = try readFrameAlloc(std.testing.allocator, control[1]);
+    var frame = try readFrameForTest(std.testing.allocator, control[1]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(MessageType.client_daemon, frame.message_type);
     try std.testing.expectEqual(@as(usize, 0), frame.attached_bytes.len);
