@@ -2535,6 +2535,7 @@ test "stream ping receives pong without changing offsets" {
     try std.testing.expectEqual(@as(u64, 0), state.outbound.outboundNext());
 }
 
+// BLOCKING_FRAME_READ: test-only frame reader.
 fn readFrameForTest(fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(std.testing.allocator);
     defer reader.deinit();

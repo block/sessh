@@ -1,6 +1,7 @@
 const std = @import("std");
 const app_allocator = @import("../core/app_allocator.zig");
 const c = std.c;
+const posix = std.posix;
 
 const config = @import("../core/config.zig");
 const core_fds = @import("../core/fds.zig");
@@ -16,6 +17,8 @@ const session_registry = @import("../runtime/session_registry.zig");
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
+
+const terminal_remote_handshake_frame_timeout_ms: i32 = 5_000;
 
 pub fn registerFrameAfterHandshakeFromDaemon(
     allocator: std.mem.Allocator,
@@ -104,19 +107,25 @@ pub fn registerFrameAfterHandshakeFromDaemon(
     owns_process_fd = false;
 }
 
-pub fn serveDebugFrameAfterHandshake(
+pub fn registerDebugFrameAfterHandshakeFromDaemon(
     allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
     frame: protocol.OwnedFrame,
-    write_fd: c.fd_t,
+    client_fd: c.fd_t,
 ) !void {
+    var owns_client_fd = true;
+    defer {
+        if (owns_client_fd) _ = c.close(client_fd);
+    }
+
     if (frame.message_type != .client_remote) {
-        try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
+        try sendError(client_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
         return;
     }
     var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
     defer item.deinit(allocator);
     const item_payload = item.payload orelse {
-        try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
+        try sendError(client_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
         return;
     };
     switch (item_payload) {
@@ -124,23 +133,28 @@ pub fn serveDebugFrameAfterHandshake(
         .debug_unresponsive_connection_request,
         => {},
         else => {
-            try sendError(write_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
+            try sendError(client_fd, "PROTOCOL_ERROR", "session handler only supports session debug frames in this mode", "");
             return;
         },
     }
 
     const process_fd = session_runtime.connectSingleLiveTerminalRemote(allocator) catch |err| switch (err) {
         error.SessionNotFound, error.AmbiguousSession => {
-            try sendError(write_fd, "SESSION_NOT_FOUND", "session not found", "");
+            try sendError(client_fd, "SESSION_NOT_FOUND", "session not found", "");
             return;
         },
         else => return err,
     };
-    defer _ = c.close(process_fd);
+    var owns_process_fd = true;
+    defer {
+        if (owns_process_fd) _ = c.close(process_fd);
+    }
 
     try initiateTerminalRemoteHandshake(allocator, process_fd);
     try protocol.sendFrame(process_fd, frame.message_type, frame.payload);
-    try forwardTerminalRemoteFramesToClient(allocator, process_fd, write_fd);
+    try frame_forwarder.registerFrameRelay(allocator, daemon_dispatcher, client_fd, process_fd);
+    owns_client_fd = false;
+    owns_process_fd = false;
 }
 
 pub const TerminalMuxStream = struct {
@@ -612,17 +626,6 @@ fn appendEnvironmentEntry(
     });
 }
 
-fn forwardTerminalRemoteFramesToClient(allocator: std.mem.Allocator, process_fd: c.fd_t, write_fd: c.fd_t) !void {
-    while (true) {
-        var frame = readFrameBlocking(allocator, process_fd) catch |err| switch (err) {
-            error.EndOfStream => return,
-            else => return err,
-        };
-        defer frame.deinit(allocator);
-        try protocol.sendFrame(write_fd, frame.message_type, frame.payload);
-    }
-}
-
 fn errorIsVersionMismatch(allocator: std.mem.Allocator, payload: []const u8) !bool {
     var message = try protocol.decodePayload(hpb.Error, allocator, payload);
     defer message.deinit(allocator);
@@ -648,7 +651,7 @@ fn initiateTerminalRemoteHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !vo
 
 fn readHelloRequest(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.fd_t) !hpb.HelloRequest {
     while (true) {
-        var frame = try readFrameBlocking(allocator, read_fd);
+        var frame = try readFrameWithTerminalRemoteHandshakeTimeout(allocator, read_fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
@@ -662,7 +665,7 @@ fn readHelloRequest(allocator: std.mem.Allocator, read_fd: c.fd_t, write_fd: c.f
 
 fn readHelloReply(allocator: std.mem.Allocator, read_fd: c.fd_t) !?hpb.HelloError {
     while (true) {
-        var frame = try readFrameBlocking(allocator, read_fd);
+        var frame = try readFrameWithTerminalRemoteHandshakeTimeout(allocator, read_fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_ok => {
@@ -683,14 +686,28 @@ fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
 }
 
-// Use only for one-shot terminal-process handshakes. Dispatcher-owned relays
-// keep read state on the watched connection.
-fn readFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+// BLOCKING_FRAME_READ: sesshd waits here only while handshaking with a freshly
+// started local terminal runtime process before registering the dispatcher
+// relay. The timeout prevents a broken runtime startup from pinning the daemon.
+fn readFrameWithTerminalRemoteHandshakeTimeout(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();
     while (true) {
-        switch (try reader.readBlocking(fd)) {
-            .blocked => return error.WouldBlock,
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, terminal_remote_handshake_frame_timeout_ms);
+        if (ready == 0) return error.TerminalRemoteHandshakeTimedOut;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfds[0].revents & posix.POLL.IN) == 0)
+        {
+            return error.EndOfStream;
+        }
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
+        switch (try reader.readReady(fd)) {
+            .blocked => continue,
             .progress => continue,
             .frame => |frame| return frame,
             .eof => return error.EndOfStream,

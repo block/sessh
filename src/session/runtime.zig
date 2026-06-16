@@ -21,6 +21,7 @@ const preferred_live_output_batch_bytes = 1024;
 const max_live_output_reads_per_batch = 64;
 const synchronized_output_max_hold_ms: i64 = 1000;
 const pty_hangup_reap_poll_ms: i64 = 50;
+const runtime_handoff_frame_timeout_ms: i32 = 5_000;
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
@@ -1495,7 +1496,7 @@ fn handleSessionRuntimeClient(session_runtime: *SessionRuntime, fd: c.fd_t) !boo
     if (handshake_result == .mismatch) return false;
 
     while (true) {
-        var frame = readFrameBlocking(fd) catch |err| switch (err) {
+        var frame = readFrameWithHandoffTimeout(fd) catch |err| switch (err) {
             error.EndOfStream => return false,
             else => return err,
         };
@@ -1594,7 +1595,7 @@ fn acceptRemoteHandshake(session_runtime: *SessionRuntime, fd: c.fd_t) !Handshak
 
 fn readHelloRequest(fd: c.fd_t) !hpb.HelloRequest {
     while (true) {
-        var frame = try readFrameBlocking(fd);
+        var frame = try readFrameWithHandoffTimeout(fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, app_allocator.allocator(), frame.payload),
@@ -1608,7 +1609,7 @@ fn readHelloRequest(fd: c.fd_t) !hpb.HelloRequest {
 
 fn readHelloReply(fd: c.fd_t) !?hpb.HelloError {
     while (true) {
-        var frame = try readFrameBlocking(fd);
+        var frame = try readFrameWithHandoffTimeout(fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .hello_ok => {
@@ -1629,14 +1630,29 @@ fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
 }
 
-// Use only for synchronous handshakes before a client is handed to the runtime
-// dispatcher. Active runtime clients keep a persistent FrameReader.
-fn readFrameBlocking(fd: c.fd_t) !protocol.OwnedFrame {
+// BLOCKING_FRAME_READ: remote terminal handoff is a private local socket from
+// sesshd to this one-session runtime process. The wait is bounded so a stalled
+// handoff cannot freeze PTY processing indefinitely; attached clients use
+// persistent FrameReader state after attachSession.
+fn readFrameWithHandoffTimeout(fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(app_allocator.allocator());
     defer reader.deinit();
     while (true) {
-        switch (try reader.readBlocking(fd)) {
-            .blocked => return error.WouldBlock,
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, runtime_handoff_frame_timeout_ms);
+        if (ready == 0) return error.RuntimeHandoffTimedOut;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfds[0].revents & posix.POLL.IN) == 0)
+        {
+            return error.EndOfStream;
+        }
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
+        switch (try reader.readReady(fd)) {
+            .blocked => continue,
             .progress => continue,
             .frame => |frame| return frame,
             .eof => return error.EndOfStream,

@@ -77,6 +77,7 @@ test "daemon log writes new events to live subscribers" {
     try std.testing.expectEqualStrings("test event 1", entry.message);
 }
 
+// BLOCKING_FRAME_READ: test-only frame reader.
 fn readFrameForTest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();

@@ -33,6 +33,9 @@ const tty_transcript = @import("../tty/transcript.zig");
 const pb = protocol.pb;
 
 const CommonSessionOptions = sessh_cli.CommonSessionOptions;
+
+const cleanup_remote_frame_timeout_ms: i32 = 30_000;
+const proxy_fd_pass_ack_timeout_ms: i32 = 5_000;
 const pooled_ssh_transport_idle_close_ms: i32 = 60_000;
 const proxy_mux_stream_id: u64 = 1;
 const proxy_stream_window_bytes: u32 = 1024 * 1024;
@@ -527,28 +530,6 @@ var proxy_control_registrations: std.ArrayList(*ProxyControlRegistration) = .emp
 
 pub fn activePooledSshTransportCount() usize {
     return active_pooled_ssh_transports;
-}
-
-pub fn serveProxyControlOpen(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    open: pb.ClientDaemonItem.ProxyControlOpen,
-) !void {
-    const guid = try session_registry.canonicalProxyGuid(allocator, open.proxy_guid);
-    defer allocator.free(guid);
-
-    try registerProxyControlVisible(allocator, guid, fd);
-    defer unregisterProxyControlVisible(fd);
-
-    while (true) {
-        var frame = readFrameBlocking(allocator, fd) catch |err| switch (err) {
-            error.EndOfStream => return,
-            else => return err,
-        };
-        defer frame.deinit(allocator);
-        if (!try proxyControlVisibleFrameIsAllowed(allocator, frame)) return error.UnexpectedProxyControlFrame;
-        try forwardProxyControlToStream(guid, frame);
-    }
 }
 
 pub fn registerProxyControlOpenFromDaemon(
@@ -1542,7 +1523,7 @@ fn readCleanupResponseForGuid(
     guid: []const u8,
 ) !daemon_cleanup.CleanupResult {
     while (true) {
-        var frame = try readFrameBlocking(allocator, fd);
+        var frame = try readFrameWithTimeoutForCleanup(allocator, fd, cleanup_remote_frame_timeout_ms);
         defer frame.deinit(allocator);
         if (frame.message_type != .daemon_tunnel) return error.UnexpectedDaemonFrame;
         var item = try protocol.decodePayload(pb.DaemonTunnelItem, allocator, frame.payload);
@@ -3474,7 +3455,7 @@ fn sendPooledHelloError(fd: c.fd_t, code: []const u8, message: []const u8, hint:
 
 fn readPooledHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.hpb.HelloRequest {
     while (true) {
-        var frame = try readFrameBlocking(allocator, fd);
+        var frame = try readFrameWithTimeoutForCleanup(allocator, fd, cleanup_remote_frame_timeout_ms);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(protocol.hpb.HelloRequest, allocator, frame.payload),
@@ -3488,7 +3469,7 @@ fn readPooledHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.hp
 
 fn readPooledHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?protocol.hpb.HelloError {
     while (true) {
-        var frame = try readFrameBlocking(allocator, fd);
+        var frame = try readFrameWithTimeoutForCleanup(allocator, fd, cleanup_remote_frame_timeout_ms);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_ok => {
@@ -3505,9 +3486,39 @@ fn readPooledHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?protocol.hpb
     }
 }
 
-// Use only for startup handshakes and test harness reads. Pooled daemon
-// transports keep persistent FrameReader state on their watched fds.
-fn readFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+// BLOCKING_FRAME_READ: cleanup opens a short-lived SSH subprocess to ask a
+// remote daemon to clean up a recorded process. The waits use poll/readReady
+// and a timeout because this path runs from daemon maintenance.
+fn readFrameWithTimeoutForCleanup(allocator: std.mem.Allocator, fd: c.fd_t, timeout_ms: i32) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(allocator);
+    defer reader.deinit();
+    while (true) {
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, timeout_ms);
+        if (ready == 0) return error.CleanupResponseTimedOut;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfds[0].revents & posix.POLL.IN) == 0)
+        {
+            return error.EndOfStream;
+        }
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
+        switch (try reader.readReady(fd)) {
+            .blocked => continue,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    }
+}
+
+// BLOCKING_FRAME_READ: test-only helper. Production SSH transport paths either
+// use dispatcher-owned FrameReader state or bounded poll/readReady waits.
+fn readFrameForTest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();
     while (true) {
@@ -5033,7 +5044,29 @@ fn sendRawFdMessageImmediate(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd
 }
 
 fn waitProxyFdPassAccepted(allocator: std.mem.Allocator, daemon_fd: c.fd_t) !void {
-    var frame = try readFrameBlocking(allocator, daemon_fd);
+    var reader = protocol.FrameReader.init(allocator);
+    defer reader.deinit();
+    var frame = while (true) {
+        var pollfds = [_]posix.pollfd{.{
+            .fd = daemon_fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, proxy_fd_pass_ack_timeout_ms);
+        if (ready == 0) return error.ProxyFdPassAckTimedOut;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfds[0].revents & posix.POLL.IN) == 0)
+        {
+            return error.EndOfStream;
+        }
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
+        switch (try reader.readReady(daemon_fd)) {
+            .blocked, .progress => continue,
+            .frame => |frame| break frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    };
     defer frame.deinit(allocator);
     switch (frame.message_type) {
         .client_daemon => {
@@ -5574,7 +5607,7 @@ test "proxy control registry routes diagnostics and retry by proxy guid" {
         .payload = stderr_payload,
     });
 
-    var visible_frame = try readFrameBlocking(allocator, visible[1]);
+    var visible_frame = try readFrameForTest(allocator, visible[1]);
     defer visible_frame.deinit(allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, visible_frame.message_type);
     var visible_item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, visible_frame.payload);
@@ -5598,7 +5631,7 @@ test "proxy control registry routes diagnostics and retry by proxy guid" {
         .payload = retry_payload,
     });
 
-    var stream_frame = try readFrameBlocking(allocator, stream[1]);
+    var stream_frame = try readFrameForTest(allocator, stream[1]);
     defer stream_frame.deinit(allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, stream_frame.message_type);
     var stream_item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, stream_frame.payload);

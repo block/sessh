@@ -14,6 +14,7 @@ const daemon_log = @import("log.zig");
 const hpb = protocol.hpb;
 const pb = protocol.pb;
 
+const cleanup_local_frame_timeout_ms: i32 = 2_000;
 pub const LocalProcessIdentity = struct {
     pid: u64,
     start_time: []const u8,
@@ -314,7 +315,7 @@ fn forwardCleanupToDaemonSocket(
     try initiateDaemonSocketHandshake(allocator, fd);
     try sendRemoteProcessCleanupRequest(allocator, fd, process);
     while (true) {
-        var frame = try readFrameBlocking(allocator, fd);
+        var frame = try readFrameWithTimeout(allocator, fd, cleanup_local_frame_timeout_ms);
         defer frame.deinit(allocator);
         if (frame.message_type != .daemon_tunnel) return error.UnexpectedFrame;
         var item = try protocol.decodePayload(pb.DaemonTunnelItem, allocator, frame.payload);
@@ -361,7 +362,7 @@ fn initiateDaemonSocketHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void
     defer allocator.free(hello_payload);
     try protocol.sendFrame(fd, .hello_request, hello_payload);
 
-    var frame = try readFrameBlocking(allocator, fd);
+    var frame = try readFrameWithTimeout(allocator, fd, cleanup_local_frame_timeout_ms);
     defer frame.deinit(allocator);
     switch (frame.message_type) {
         .hello_ok => {
@@ -373,14 +374,28 @@ fn initiateDaemonSocketHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void
     }
 }
 
-// Use only for the bounded cleanup request/response exchange. Cleanup is still
-// synchronous today; daemon-owned sockets use dispatcher read state.
-fn readFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+// BLOCKING_FRAME_READ: cleanup may synchronously contact another local daemon
+// socket, but the wait is bounded so a stale socket cannot pin this daemon's
+// maintenance loop indefinitely.
+fn readFrameWithTimeout(allocator: std.mem.Allocator, fd: c.fd_t, timeout_ms: i32) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();
     while (true) {
-        switch (try reader.readBlocking(fd)) {
-            .blocked => return error.WouldBlock,
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, timeout_ms);
+        if (ready == 0) return error.CleanupResponseTimedOut;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfds[0].revents & posix.POLL.IN) == 0)
+        {
+            return error.EndOfStream;
+        }
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
+        switch (try reader.readReady(fd)) {
+            .blocked => continue,
             .progress => continue,
             .frame => |frame| return frame,
             .eof => return error.EndOfStream,

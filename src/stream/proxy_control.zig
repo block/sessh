@@ -66,8 +66,8 @@ pub fn writeRetryNow(fd: c.fd_t) !void {
     try protocol.sendClientDaemonPayloadFrame(app_allocator.allocator(), fd, .{ .retry_now = .{} });
 }
 
-// Test/synchronous helper. Production proxy-control paths keep a Reader so
-// partial frames are not discarded between dispatcher callbacks.
+// BLOCKING_FRAME_READ: test-only proxy-control helper. Production paths keep a
+// Reader so partial frames are not discarded between dispatcher callbacks.
 pub fn readMessage(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();

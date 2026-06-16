@@ -155,6 +155,8 @@ pub const FrameReader = struct {
         return self.readWithMode(fd, .ready);
     }
 
+    // BLOCKING_FRAME_READ: low-level primitive. Production call sites should
+    // be rare and explain why they cannot use dispatcher/readReady instead.
     pub fn readBlocking(self: *FrameReader, fd: c.fd_t) !FrameReadStatus {
         return self.readWithMode(fd, .blocking);
     }
@@ -797,6 +799,7 @@ fn writeU32(bytes: []u8, value: u32) void {
     bytes[3] = @intCast(value & 0xff);
 }
 
+// BLOCKING_FRAME_READ: test-only frame reader.
 fn readFrameForTest(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedFrame {
     var reader = FrameReader.init(allocator);
     defer reader.deinit();

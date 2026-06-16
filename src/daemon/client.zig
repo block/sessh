@@ -13,6 +13,8 @@ const socket_transport = @import("../transport/socket.zig");
 const hpb = protocol.hpb;
 const pb = protocol.pb;
 
+const local_daemon_handshake_frame_timeout_ms: i32 = 5_000;
+
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
     const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
@@ -86,7 +88,7 @@ pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
     try protocol.sendDaemonLogRequestFrame(allocator, fd, .{});
 
     while (true) {
-        var frame = readFrameBlocking(allocator, fd) catch |err| switch (err) {
+        var frame = readDaemonLogFrameBlocking(allocator, fd) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
@@ -154,6 +156,23 @@ fn formatDaemonLogTimestampParts(buf: *[daemon_log_timestamp_len]u8, local_time:
     });
 }
 
+// BLOCKING_FRAME_READ: `sessh --daemon-log` is an explicit foreground log
+// subscriber. It intentionally waits for future log entries on stdout and is
+// not used by the daemon, pooled transport, or session runtime.
+fn readDaemonLogFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+    var reader = protocol.FrameReader.init(allocator);
+    defer reader.deinit();
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    }
+}
+
 test "daemon log timestamp uses readable milliseconds" {
     var local_time = std.mem.zeroes(LocalTm);
     local_time.tm_hour = 3;
@@ -198,7 +217,7 @@ pub fn initiateHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
 
 fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest {
     while (true) {
-        var frame = try readFrameBlocking(allocator, fd);
+        var frame = try readFrameWithLocalDaemonHandshakeTimeout(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
@@ -212,7 +231,7 @@ fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest 
 
 fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
     while (true) {
-        var frame = try readFrameBlocking(allocator, fd);
+        var frame = try readFrameWithLocalDaemonHandshakeTimeout(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_ok => {
@@ -233,14 +252,28 @@ fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
 }
 
-// Use only while connecting to the local daemon. Long-lived daemon traffic is
-// handled by the caller after this one-shot handshake completes.
-fn readFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+// BLOCKING_FRAME_READ: local daemon client handshakes happen before the caller
+// enters its long-lived daemon protocol. The wait is bounded so an unresponsive
+// daemon reports a connection error instead of wedging the CLI.
+fn readFrameWithLocalDaemonHandshakeTimeout(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();
     while (true) {
-        switch (try reader.readBlocking(fd)) {
-            .blocked => return error.WouldBlock,
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, local_daemon_handshake_frame_timeout_ms);
+        if (ready == 0) return error.LocalDaemonHandshakeTimedOut;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfds[0].revents & posix.POLL.IN) == 0)
+        {
+            return error.EndOfStream;
+        }
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
+        switch (try reader.readReady(fd)) {
+            .blocked => continue,
             .progress => continue,
             .frame => |frame| return frame,
             .eof => return error.EndOfStream,

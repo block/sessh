@@ -914,7 +914,7 @@ test "runtime repaint after local ui requests screen-only repaint" {
 
     try repaintRuntimeSession(remote_to_client[0], client_to_remote[1], &session);
 
-    var frame = try readFrameBlocking(client_to_remote[0]);
+    var frame = try readVisibleClientFrameBlocking(client_to_remote[0]);
     defer frame.deinit(app_allocator.allocator());
     try std.testing.expectEqual(protocol.MessageType.client_remote, frame.message_type);
     var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
@@ -1289,7 +1289,7 @@ pub fn pollAndForwardReconnectInput(
 
 fn readRuntimeSession(read_fd: c.fd_t) !RuntimeSession {
     while (true) {
-        var frame = try readFrameBlocking(read_fd);
+        var frame = try readVisibleClientFrameBlocking(read_fd);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .error_message => {
@@ -1406,7 +1406,7 @@ fn readFrameMaybeCancelled(
     fd: c.fd_t,
     cancelled: ?*const bool,
 ) !protocol.OwnedFrame {
-    const flag = cancelled orelse return readFrameBlocking(fd);
+    const flag = cancelled orelse return readVisibleClientFrameBlocking(fd);
     var reader = protocol.FrameReader.init(app_allocator.allocator());
     defer reader.deinit();
     while (true) {
@@ -1433,10 +1433,10 @@ fn readFrameMaybeCancelled(
     }
 }
 
-// Use only for synchronous startup/reconnect/test waits where no dispatcher or
-// poll-driven loop is active. Runtime polling paths must keep a persistent
-// FrameReader and call readReady so partial frames are preserved.
-fn readFrameBlocking(fd: c.fd_t) !protocol.OwnedFrame {
+// BLOCKING_FRAME_READ: visible-client startup/reconnect/exit-status waits.
+// This code is outside sesshd and outside pooled transports; poll-driven
+// runtime paths keep a persistent FrameReader and call readReady.
+fn readVisibleClientFrameBlocking(fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(app_allocator.allocator());
     defer reader.deinit();
     while (true) {
@@ -1580,7 +1580,7 @@ fn sendSessionAttach(
 
 fn readSessionEndedOrError(conn: c.fd_t) !bool {
     while (true) {
-        var frame = try readFrameBlocking(conn);
+        var frame = try readVisibleClientFrameBlocking(conn);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .error_message => {

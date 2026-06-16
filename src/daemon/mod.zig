@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = std.c;
+const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
 const config = @import("../core/config.zig");
@@ -28,6 +29,7 @@ const daemon_idle_shutdown_ms: u64 = 1_000;
 const daemon_start_attempts: usize = 100;
 const daemon_start_sleep_ms: u64 = 20;
 const daemon_spawn_every_attempts: usize = 10;
+const local_daemon_handshake_frame_timeout_ms: i32 = 5_000;
 const daemon_lock_attempts: usize = 100;
 const daemon_lock_sleep_ms: u64 = 20;
 
@@ -655,6 +657,23 @@ fn transferInitialRequestToDispatcherOwner(
             );
             return .transferred;
         }
+        switch (item_payload) {
+            .debug_sever_connection_request,
+            .debug_unresponsive_connection_request,
+            => {
+                daemon_dispatcher.cancel(id);
+                const client_fd = context.fd;
+                context.fd = -1;
+                try session_daemon_handler.registerDebugFrameAfterHandshakeFromDaemon(
+                    context.allocator,
+                    daemon_dispatcher,
+                    frame.*,
+                    client_fd,
+                );
+                return .transferred;
+            },
+            else => {},
+        }
         return .not_transferred;
     }
 
@@ -1024,7 +1043,7 @@ fn handleClientFrameAfterHandshake(
                 .debug_sever_connection_request,
                 .debug_unresponsive_connection_request,
                 => {
-                    try session_daemon_handler.serveDebugFrameAfterHandshake(allocator, frame, fd);
+                    try sendError(fd, "PROTOCOL_ERROR", "session debug must be dispatcher-owned", "");
                     return false;
                 },
                 else => {
@@ -1052,9 +1071,8 @@ fn handleClientFrameAfterHandshake(
                     try sendError(fd, "PROTOCOL_ERROR", "ssh transport must be dispatcher-owned", "");
                     return false;
                 },
-                .proxy_control_open => |request| {
-                    daemon_log.infof(allocator, "proxy control requested guid={s}", .{request.proxy_guid});
-                    try transport_ssh.serveProxyControlOpen(allocator, fd, request);
+                .proxy_control_open => {
+                    try sendError(fd, "PROTOCOL_ERROR", "proxy control must be dispatcher-owned", "");
                     return false;
                 },
                 .proxy_fd_pass_open => {
@@ -1116,7 +1134,7 @@ fn initiateHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
 
 fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest {
     while (true) {
-        var frame = try readFrameBlocking(allocator, fd);
+        var frame = try readFrameWithLocalDaemonHandshakeTimeout(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
@@ -1130,7 +1148,7 @@ fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest 
 
 fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
     while (true) {
-        var frame = try readFrameBlocking(allocator, fd);
+        var frame = try readFrameWithLocalDaemonHandshakeTimeout(allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_ok => {
@@ -1151,14 +1169,28 @@ fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
 }
 
-// Use only for synchronous daemon-client setup paths. Long-lived daemon
-// connections should be dispatcher-owned and use persistent FrameReader state.
-fn readFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+// BLOCKING_FRAME_READ: local daemon startup/probe handshakes happen before a
+// connection is transferred to dispatcher-owned code. The wait is bounded so a
+// stale socket or wedged daemon fails instead of hanging startup.
+fn readFrameWithLocalDaemonHandshakeTimeout(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();
     while (true) {
-        switch (try reader.readBlocking(fd)) {
-            .blocked => return error.WouldBlock,
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&pollfds, local_daemon_handshake_frame_timeout_ms);
+        if (ready == 0) return error.LocalDaemonHandshakeTimedOut;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
+            (pollfds[0].revents & posix.POLL.IN) == 0)
+        {
+            return error.EndOfStream;
+        }
+        if ((pollfds[0].revents & posix.POLL.IN) == 0) continue;
+        switch (try reader.readReady(fd)) {
+            .blocked => continue,
             .progress => continue,
             .frame => |frame| return frame,
             .eof => return error.EndOfStream,
