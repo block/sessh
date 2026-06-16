@@ -59,6 +59,11 @@ pub const FrameWriteStatus = enum {
     done,
 };
 
+const FrameReadMode = enum {
+    ready,
+    blocking,
+};
+
 pub const FrameWriteState = struct {
     allocator: std.mem.Allocator,
     bytes: []u8 = &.{},
@@ -147,6 +152,14 @@ pub const FrameReader = struct {
     }
 
     pub fn readReady(self: *FrameReader, fd: c.fd_t) !FrameReadStatus {
+        return self.readWithMode(fd, .ready);
+    }
+
+    pub fn readBlocking(self: *FrameReader, fd: c.fd_t) !FrameReadStatus {
+        return self.readWithMode(fd, .blocking);
+    }
+
+    fn readWithMode(self: *FrameReader, fd: c.fd_t, mode: FrameReadMode) !FrameReadStatus {
         if (self.header_filled < frame_header_len) {
             switch (try readSome(fd, self.header[self.header_filled..])) {
                 .blocked => return .blocked,
@@ -220,7 +233,11 @@ pub const FrameReader = struct {
             },
             .SCM_RIGHTS => {
                 if (!self.scm_rights_progress.complete()) {
-                    switch (try fd_passing.recvBufferWithFdProgress(fd, &self.scm_rights_progress)) {
+                    const status = switch (mode) {
+                        .ready => try fd_passing.recvBufferWithFdProgress(fd, &self.scm_rights_progress),
+                        .blocking => try fd_passing.recvBufferWithFdProgressBlocking(fd, &self.scm_rights_progress),
+                    };
+                    switch (status) {
                         .blocked => return .blocked,
                         .eof => return .truncated_frame,
                         .progress => return .progress,
@@ -280,9 +297,18 @@ pub fn helloRequestIsCompatible(
 }
 
 pub fn readFrameAlloc(allocator: std.mem.Allocator, fd: c.fd_t) !OwnedFrame {
-    const message = try readFrameMessageAlloc(allocator, fd);
-    defer allocator.free(message);
-    return decodeMessageAlloc(allocator, fd, message);
+    var reader = FrameReader.init(allocator);
+    defer reader.deinit();
+
+    while (true) {
+        switch (try reader.readBlocking(fd)) {
+            .blocked => return error.WouldBlock,
+            .progress => continue,
+            .frame => |frame| return frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    }
 }
 
 pub fn sendFrame(fd: c.fd_t, message_type: MessageType, payload: []const u8) !void {
@@ -312,6 +338,49 @@ pub fn sendFrameWithAttachedKindAndBytes(
     const frame = try encodeFrameWithAttachedKindAndBytes(app_allocator.allocator(), message_type, payload, attached_kind, attached_bytes);
     defer app_allocator.allocator().free(frame);
     try io.writeAll(fd, frame);
+}
+
+pub fn sendFrameWithScmRightsFd(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    message_type: MessageType,
+    payload: []const u8,
+    passed_fd: c.fd_t,
+) !void {
+    var owned_fd = passed_fd;
+    errdefer {
+        if (owned_fd >= 0) _ = c.close(owned_fd);
+    }
+
+    const marker = [_]u8{0};
+    const frame = try encodeFrameWithAttachedKindAndBytes(
+        allocator,
+        message_type,
+        payload,
+        .SCM_RIGHTS,
+        &marker,
+    );
+    defer allocator.free(frame);
+
+    var header: [frame_header_len]u8 = undefined;
+    @memcpy(&header, frame[0..frame_header_len]);
+    const message_len = messageLenFromHeader(&header);
+    const attached_start = frame_header_len + message_len;
+    if (frame.len != attached_start + marker.len) return error.InvalidFileDescriptorCarrierFrame;
+
+    try io.writeAll(fd, frame[0..attached_start]);
+
+    var progress = fd_passing.SendBufferWithFdProgress.init(frame[attached_start..], owned_fd);
+    owned_fd = -1;
+    defer progress.deinit();
+    while (true) {
+        switch (try fd_passing.sendBufferWithFdProgressBlocking(fd, &progress)) {
+            .complete => return,
+            .progress => continue,
+            .blocked => return error.WouldBlock,
+            .eof => unreachable,
+        }
+    }
 }
 
 pub fn sendPing(fd: c.fd_t) !void {
@@ -555,29 +624,6 @@ pub fn messageLenFromHeader(header: *const [frame_header_len]u8) usize {
     return @intCast(readU32(header));
 }
 
-fn readFrameMessageAlloc(allocator: std.mem.Allocator, fd: c.fd_t) ![]u8 {
-    var length_bytes: [frame_header_len]u8 = undefined;
-    try io.readExact(fd, &length_bytes);
-
-    const message_len = messageLenFromHeader(&length_bytes);
-    const message = try allocator.alloc(u8, message_len);
-    errdefer allocator.free(message);
-    try io.readExact(fd, message);
-    return message;
-}
-
-fn decodeMessageAlloc(allocator: std.mem.Allocator, fd: c.fd_t, message_bytes: []const u8) !OwnedFrame {
-    var decoded = try decodeMessageEnvelopeAlloc(allocator, message_bytes);
-    errdefer decoded.frame.deinit(allocator);
-    if (decoded.attached_kind != .RAW) return error.ScmUnsupported;
-    const attached_bytes = try readAttachedBytesAlloc(allocator, fd, decoded.attached_bytes_len);
-    errdefer allocator.free(attached_bytes);
-
-    var frame = decoded.frame;
-    frame.attached_bytes = attached_bytes;
-    return frame;
-}
-
 pub const DecodedMessageEnvelope = struct {
     frame: OwnedFrame,
     attached_bytes_len: usize = 0,
@@ -641,13 +687,6 @@ fn ownedFrameFromMessage(allocator: std.mem.Allocator, message_type: MessageType
         .message_type = message_type,
         .payload = try encodePayload(allocator, message),
     };
-}
-
-fn readAttachedBytesAlloc(allocator: std.mem.Allocator, fd: c.fd_t, len: usize) ![]u8 {
-    const bytes = try allocator.alloc(u8, len);
-    errdefer allocator.free(bytes);
-    try io.readExact(fd, bytes);
-    return bytes;
 }
 
 const ReadSomeResult = union(enum) {
@@ -1003,6 +1042,37 @@ test "frame reader returns fd from SCM_RIGHTS marker byte" {
     const n = c.read(raw[1], &raw_buf, raw_buf.len);
     if (n < 0) return error.ReadFailed;
     try std.testing.expectEqualStrings("through-fd", raw_buf[0..@intCast(n)]);
+}
+
+test "blocking frame read returns fd from SCM_RIGHTS frame" {
+    const payload = try encodePayload(std.testing.allocator, pb.ClientDaemonItem{
+        .payload = .{ .proxy_fd_pass_open = .{} },
+    });
+    defer std.testing.allocator.free(payload);
+
+    var control: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &control) != 0) return error.SocketPairFailed;
+    defer _ = c.close(control[0]);
+    defer _ = c.close(control[1]);
+
+    var raw: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &raw) != 0) return error.SocketPairFailed;
+    defer _ = c.close(raw[1]);
+
+    try sendFrameWithScmRightsFd(std.testing.allocator, control[0], .client_daemon, payload, raw[0]);
+
+    var frame = try readFrameAlloc(std.testing.allocator, control[1]);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(MessageType.client_daemon, frame.message_type);
+    try std.testing.expectEqual(@as(usize, 0), frame.attached_bytes.len);
+
+    const fd = frame.takeFd() orelse return error.MissingFileDescriptor;
+    defer _ = c.close(fd);
+    try io.writeAll(fd, "through-blocking-reader");
+    var raw_buf: [64]u8 = undefined;
+    const n = c.read(raw[1], &raw_buf, raw_buf.len);
+    if (n < 0) return error.ReadFailed;
+    try std.testing.expectEqualStrings("through-blocking-reader", raw_buf[0..@intCast(n)]);
 }
 
 test "frame reader reports eof shape for empty and partial streams" {

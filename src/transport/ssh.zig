@@ -4991,64 +4991,16 @@ fn runProxyStreamFdPass(
         },
     } } });
     defer allocator.free(payload);
-    const marker = [_]u8{0};
-    const frame_bytes = try protocol.encodeFrameWithAttachedKindAndBytes(
-        allocator,
-        .client_daemon,
-        payload,
-        .SCM_RIGHTS,
-        &marker,
-    );
-    defer allocator.free(frame_bytes);
 
     const daemon_fd_to_pass = daemon_raw_fd;
     daemon_raw_fd = -1;
-    try sendFrameWithAttachedFdImmediate(daemon_fd, frame_bytes, daemon_fd_to_pass);
+    try protocol.sendFrameWithScmRightsFd(allocator, daemon_fd, .client_daemon, payload, daemon_fd_to_pass);
 
     try waitProxyFdPassAccepted(allocator, daemon_fd);
 
     const ssh_fd_to_pass = ssh_raw_fd;
     ssh_raw_fd = -1;
     try sendRawFdMessageImmediate(posix.STDOUT_FILENO, "sessh-proxy-fd", ssh_fd_to_pass);
-}
-
-fn sendBytesImmediate(sock_fd: c.fd_t, bytes: []const u8) !void {
-    var progress = fd_passing.SendByteProgress.init(bytes);
-    while (true) {
-        switch (try fd_passing.sendByteProgress(sock_fd, &progress)) {
-            .complete => return,
-            .progress => continue,
-            .blocked => return error.WouldBlock,
-            .eof => unreachable,
-        }
-    }
-}
-
-fn sendFrameWithAttachedFdImmediate(sock_fd: c.fd_t, frame_bytes: []const u8, passed_fd: c.fd_t) !void {
-    var owned_fd = passed_fd;
-    errdefer {
-        if (owned_fd >= 0) _ = c.close(owned_fd);
-    }
-
-    var header: [protocol.frame_header_len]u8 = undefined;
-    @memcpy(&header, frame_bytes[0..protocol.frame_header_len]);
-    const message_len = protocol.messageLenFromHeader(&header);
-    const attached_start = protocol.frame_header_len + message_len;
-    if (frame_bytes.len != attached_start + 1) return error.InvalidFileDescriptorCarrierFrame;
-
-    try sendBytesImmediate(sock_fd, frame_bytes[0..attached_start]);
-
-    var progress = fd_passing.SendBufferWithFdProgress.init(frame_bytes[attached_start..], owned_fd);
-    owned_fd = -1;
-    defer progress.deinit();
-    while (true) {
-        switch (try fd_passing.sendBufferWithFdProgress(sock_fd, &progress)) {
-            .complete => return,
-            .progress => continue,
-            .blocked => return error.WouldBlock,
-            .eof => unreachable,
-        }
-    }
 }
 
 fn sendRawFdMessageImmediate(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t) !void {

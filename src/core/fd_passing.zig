@@ -125,7 +125,7 @@ pub const BufferProgressStatus = enum {
 pub fn sendByteProgress(fd: c.fd_t, progress: *SendByteProgress) !BufferProgressStatus {
     if (progress.complete()) return .complete;
 
-    const written = sendBytes(fd, progress.remaining()) catch |err| switch (err) {
+    const written = sendBytes(fd, progress.remaining(), c.MSG.DONTWAIT) catch |err| switch (err) {
         error.WouldBlock => return .blocked,
         else => return err,
     };
@@ -154,11 +154,23 @@ pub fn sendByteProgress(fd: c.fd_t, progress: *SendByteProgress) !BufferProgress
 ///   treated as socket-fatal by callers that cannot otherwise recover the
 ///   higher-level message being sent.
 pub fn sendBufferWithFdProgress(sock_fd: c.fd_t, progress: *SendBufferWithFdProgress) !BufferProgressStatus {
+    return sendBufferWithFdProgressWithFlags(sock_fd, progress, c.MSG.DONTWAIT);
+}
+
+pub fn sendBufferWithFdProgressBlocking(sock_fd: c.fd_t, progress: *SendBufferWithFdProgress) !BufferProgressStatus {
+    return sendBufferWithFdProgressWithFlags(sock_fd, progress, 0);
+}
+
+fn sendBufferWithFdProgressWithFlags(
+    sock_fd: c.fd_t,
+    progress: *SendBufferWithFdProgress,
+    flags: u32,
+) !BufferProgressStatus {
     if (progress.complete()) return .complete;
 
     const remaining = progress.remaining();
     const sent = if (progress.fd) |passed_fd| sent: {
-        const n = sendFdPrefix(sock_fd, remaining, passed_fd) catch |err| switch (err) {
+        const n = sendFdPrefix(sock_fd, remaining, passed_fd, flags) catch |err| switch (err) {
             error.WouldBlock => return .blocked,
             else => return err,
         };
@@ -166,7 +178,7 @@ pub fn sendBufferWithFdProgress(sock_fd: c.fd_t, progress: *SendBufferWithFdProg
         progress.fd = null;
         break :sent n;
     } else sent: {
-        const n = sendBytes(sock_fd, remaining) catch |err| switch (err) {
+        const n = sendBytes(sock_fd, remaining, flags) catch |err| switch (err) {
             error.WouldBlock => return .blocked,
             else => return err,
         };
@@ -177,7 +189,7 @@ pub fn sendBufferWithFdProgress(sock_fd: c.fd_t, progress: *SendBufferWithFdProg
     return if (progress.complete()) .complete else .progress;
 }
 
-fn sendFdPrefix(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t) !usize {
+fn sendFdPrefix(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t, flags: u32) !usize {
     // SCM_RIGHTS does not send an integer fd value. The kernel duplicates the
     // underlying open file description into the receiver and reports the new fd
     // number as ancillary data on recvmsg.
@@ -214,7 +226,7 @@ fn sendFdPrefix(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t) !usize {
     };
 
     while (true) {
-        const n = c.sendmsg(sock_fd, &msg, c.MSG.DONTWAIT);
+        const n = c.sendmsg(sock_fd, &msg, flags);
         if (n >= 0) {
             const sent: usize = @intCast(n);
             if (sent == 0) return error.WriteFailed;
@@ -234,11 +246,11 @@ fn sendFdPrefix(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t) !usize {
     }
 }
 
-fn sendBytes(sock_fd: c.fd_t, bytes: []const u8) !usize {
+fn sendBytes(sock_fd: c.fd_t, bytes: []const u8, flags: u32) !usize {
     if (bytes.len == 0) return 0;
 
     while (true) {
-        const n = c.send(sock_fd, bytes.ptr, bytes.len, c.MSG.DONTWAIT);
+        const n = c.send(sock_fd, bytes.ptr, bytes.len, flags);
         if (n > 0) {
             const sent: usize = @intCast(n);
             io.noteWrite(sock_fd, bytes[0..sent]);
@@ -283,6 +295,18 @@ fn sendBytes(sock_fd: c.fd_t, bytes: []const u8) !usize {
 ///   already installed into this process from rejected control data are closed
 ///   before the error is returned.
 pub fn recvBufferWithFdProgress(sock_fd: c.fd_t, progress: *RecvBufferWithFdProgress) !BufferProgressStatus {
+    return recvBufferWithFdProgressWithFlags(sock_fd, progress, c.MSG.DONTWAIT);
+}
+
+pub fn recvBufferWithFdProgressBlocking(sock_fd: c.fd_t, progress: *RecvBufferWithFdProgress) !BufferProgressStatus {
+    return recvBufferWithFdProgressWithFlags(sock_fd, progress, 0);
+}
+
+fn recvBufferWithFdProgressWithFlags(
+    sock_fd: c.fd_t,
+    progress: *RecvBufferWithFdProgress,
+    flags: u32,
+) !BufferProgressStatus {
     // recvmsg returns stream bytes and, if this read crosses an SCM_RIGHTS
     // control message, any fd installed into this process. The byte buffer can
     // be smaller than the sender's payload; callers must therefore be prepared
@@ -307,7 +331,7 @@ pub fn recvBufferWithFdProgress(sock_fd: c.fd_t, progress: *RecvBufferWithFdProg
     };
 
     while (true) {
-        const n = c.recvmsg(sock_fd, &msg, c.MSG.DONTWAIT);
+        const n = c.recvmsg(sock_fd, &msg, flags);
         if (n > 0) {
             const received_control = control[0..@intCast(msg.controllen)];
             if ((msg.flags & c.MSG.CTRUNC) != 0) {
