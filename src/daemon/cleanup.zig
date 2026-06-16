@@ -286,7 +286,7 @@ fn cleanupRemoteProcess(
 
 fn cleanupGuidOnCurrentDaemon(allocator: std.mem.Allocator, guid: []const u8) !CleanupResult {
     if (std.mem.startsWith(u8, guid, "s-")) {
-        session_runtime.requestSessionCleanup(allocator, guid) catch |err| switch (err) {
+        session_runtime.requestTerminalRemoteCleanup(allocator, guid) catch |err| switch (err) {
             error.SessionNotFound, error.InvalidSessionId => return .missing,
             else => return err,
         };

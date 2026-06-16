@@ -108,21 +108,21 @@ const SessionRuntime = struct {
     started_session: bool = false,
 };
 
-const RuntimeProcessControl = struct {
+const TerminalRemoteProcess = struct {
     allocator: std.mem.Allocator,
     guid: []u8,
     socket_path: []u8,
     pid: c.pid_t = 0,
 
-    fn deinit(self: *RuntimeProcessControl) void {
+    fn deinit(self: *TerminalRemoteProcess) void {
         self.allocator.free(self.guid);
         self.allocator.free(self.socket_path);
         self.* = undefined;
     }
 };
 
-var runtime_registry: std.ArrayList(*RuntimeProcessControl) = .empty;
-var runtime_socket_sequence: u64 = 0;
+var terminal_remote_processes: std.ArrayList(*TerminalRemoteProcess) = .empty;
+var terminal_remote_socket_sequence: u64 = 0;
 
 const PollKind = union(enum) {
     listen,
@@ -767,7 +767,7 @@ fn isSafePlainReplay(bytes: []const u8) bool {
     if (bytes.len == 0) return false;
     // Starting at libghostty-vt ground state plus this byte allowlist preserves
     // ground state: there is no ESC/control introducer and no partial UTF-8.
-    // The remote session runtime therefore only needs to record whether the batch started at a
+    // The remote terminal process therefore only needs to record whether the batch started at a
     // plain-text parser boundary before considering original-byte replay.
     // TAB is intentionally excluded because its visual effect depends on tab
     // stop state; add it only after modeling and testing that state boundary.
@@ -1109,9 +1109,9 @@ fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
     };
 }
 
-pub fn runRuntimeProcess(allocator: std.mem.Allocator, args: []const []const u8) !void {
+pub fn runTerminalRemoteProcess(allocator: std.mem.Allocator, args: []const []const u8) !void {
     _ = allocator;
-    if (args.len != 2) return error.InvalidSessionRuntimeArgs;
+    if (args.len != 2) return error.InvalidTerminalRemoteArgs;
     core_fds.closeInheritedNonStdioFileDescriptors();
     socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
     const socket_path = args[0];
@@ -1123,14 +1123,15 @@ pub fn runRuntimeProcess(allocator: std.mem.Allocator, args: []const []const u8)
     try runSessionRuntimeLoop(session_guid, listen_fd);
 }
 
-pub fn startSessionRuntimeProcess(allocator: std.mem.Allocator, exe: []const u8, session_guid: []const u8) !*RuntimeProcessControl {
+pub fn startTerminalRemoteProcess(allocator: std.mem.Allocator, exe: []const u8, session_guid: []const u8) !*TerminalRemoteProcess {
     const guid = try session_registry.canonicalGuid(allocator, session_guid);
     errdefer allocator.free(guid);
 
-    const socket_path = try runtimeSocketPath(allocator, exe, "terminal");
+    const socket_path = try terminalRemoteSocketPath(allocator, exe, "terminal");
     errdefer allocator.free(socket_path);
+    try socket_transport.ensureSocketDir(allocator, socket_path);
 
-    const control = try allocator.create(RuntimeProcessControl);
+    const control = try allocator.create(TerminalRemoteProcess);
     errdefer allocator.destroy(control);
     control.* = .{
         .allocator = allocator,
@@ -1139,8 +1140,8 @@ pub fn startSessionRuntimeProcess(allocator: std.mem.Allocator, exe: []const u8,
     };
     errdefer control.deinit();
 
-    try registerRuntime(control);
-    errdefer unregisterRuntime(control);
+    try registerTerminalRemote(control);
+    errdefer unregisterTerminalRemote(control);
 
     const argv = [_][]const u8{ exe, socket_path, guid };
     var child = std.process.Child.init(&argv, allocator);
@@ -1152,11 +1153,14 @@ pub fn startSessionRuntimeProcess(allocator: std.mem.Allocator, exe: []const u8,
     return control;
 }
 
-fn runtimeSocketPath(allocator: std.mem.Allocator, exe: []const u8, prefix: []const u8) ![]u8 {
-    const dir = std.fs.path.dirname(exe) orelse return error.InvalidRuntimeExecutablePath;
-    const sequence = runtime_socket_sequence;
-    runtime_socket_sequence +%= 1;
-    return std.fmt.allocPrint(allocator, "{s}/{s}-{}-{}.sock", .{ dir, prefix, c.getpid(), sequence });
+fn terminalRemoteSocketPath(allocator: std.mem.Allocator, exe: []const u8, prefix: []const u8) ![]u8 {
+    const exe_dir = std.fs.path.dirname(exe) orelse return error.InvalidRemoteProcessExecutablePath;
+    const namespace = std.fs.path.basename(exe_dir);
+    const root = try socket_transport.shortRuntimeRoot(allocator);
+    defer allocator.free(root);
+    const sequence = terminal_remote_socket_sequence;
+    terminal_remote_socket_sequence +%= 1;
+    return std.fmt.allocPrint(allocator, "{s}/{s}/{s}-{}-{}.sock", .{ root, namespace, prefix, c.getpid(), sequence });
 }
 
 fn runSessionRuntimeLoop(session_guid: []const u8, listen_fd: c.fd_t) !void {
@@ -1172,24 +1176,24 @@ fn runSessionRuntimeLoop(session_guid: []const u8, listen_fd: c.fd_t) !void {
     }
 }
 
-pub fn connectSessionRuntime(allocator: std.mem.Allocator, guid: []const u8) !c.fd_t {
+pub fn connectTerminalRemoteProcess(allocator: std.mem.Allocator, guid: []const u8) !c.fd_t {
     const canonical = try session_registry.canonicalGuid(allocator, guid);
     defer allocator.free(canonical);
 
     const control = lookupRuntime(canonical) orelse return error.SessionNotFound;
-    return connectRuntimeControl(control) catch |err| switch (err) {
+    return connectTerminalRemoteProcessSocket(control) catch |err| switch (err) {
         error.SocketPathMissing, error.ConnectFailed => {
-            forgetSessionRuntime(canonical);
+            forgetTerminalRemote(canonical);
             return error.SessionNotFound;
         },
         else => return err,
     };
 }
 
-pub fn connectStartedSessionRuntime(control: *RuntimeProcessControl) !c.fd_t {
+pub fn connectStartedTerminalRemoteProcess(control: *TerminalRemoteProcess) !c.fd_t {
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
-        return connectRuntimeControl(control) catch |err| switch (err) {
+        return connectTerminalRemoteProcessSocket(control) catch |err| switch (err) {
             error.SocketPathMissing, error.ConnectFailed => {
                 io.sleepMillis(5);
                 continue;
@@ -1197,16 +1201,16 @@ pub fn connectStartedSessionRuntime(control: *RuntimeProcessControl) !c.fd_t {
             else => return err,
         };
     }
-    forgetSessionRuntime(control.guid);
+    forgetTerminalRemote(control.guid);
     return error.SessionNotFound;
 }
 
-fn connectRuntimeControl(control: *const RuntimeProcessControl) !c.fd_t {
+fn connectTerminalRemoteProcessSocket(control: *const TerminalRemoteProcess) !c.fd_t {
     return socket_transport.connectSocket(control.socket_path);
 }
 
-pub fn requestSessionCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
-    const fd = try connectSessionRuntime(allocator, guid);
+pub fn requestTerminalRemoteCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
+    const fd = try connectTerminalRemoteProcess(allocator, guid);
     defer _ = c.close(fd);
 
     try sendHelloRequest(fd);
@@ -1216,46 +1220,46 @@ pub fn requestSessionCleanup(allocator: std.mem.Allocator, guid: []const u8) !vo
     var peer_hello = try readHelloRequest(fd);
     defer peer_hello.deinit(app_allocator.allocator());
     if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote session runtime is incompatible with this client", "Start a fresh sessh connection with matching binaries");
+        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client", "Start a fresh sessh connection with matching binaries");
         return error.VersionMismatch;
     }
     try sendHelloOk(fd);
     try protocol.sendTeStreamPayloadFrame(allocator, fd, .{ .session_hangup_request = .{} });
 }
 
-pub fn connectSingleLiveSessionRuntime(allocator: std.mem.Allocator) !c.fd_t {
+pub fn connectSingleLiveTerminalRemote(allocator: std.mem.Allocator) !c.fd_t {
     var found_guid: ?[]u8 = null;
-    for (runtime_registry.items) |control| {
+    for (terminal_remote_processes.items) |control| {
         if (found_guid != null) {
             return error.AmbiguousSession;
         }
         found_guid = try allocator.dupe(u8, control.guid);
     }
     defer if (found_guid) |guid| allocator.free(guid);
-    return connectSessionRuntime(allocator, found_guid orelse return error.SessionNotFound);
+    return connectTerminalRemoteProcess(allocator, found_guid orelse return error.SessionNotFound);
 }
 
-fn registerRuntime(control: *RuntimeProcessControl) !void {
-    for (runtime_registry.items) |existing| {
+fn registerTerminalRemote(control: *TerminalRemoteProcess) !void {
+    for (terminal_remote_processes.items) |existing| {
         if (std.mem.eql(u8, existing.guid, control.guid)) return error.SessionExists;
     }
-    try runtime_registry.append(app_allocator.allocator(), control);
+    try terminal_remote_processes.append(app_allocator.allocator(), control);
 }
 
-fn unregisterRuntime(control: *RuntimeProcessControl) void {
-    for (runtime_registry.items, 0..) |existing, index| {
+fn unregisterTerminalRemote(control: *TerminalRemoteProcess) void {
+    for (terminal_remote_processes.items, 0..) |existing, index| {
         if (existing == control) {
-            _ = runtime_registry.orderedRemove(index);
+            _ = terminal_remote_processes.orderedRemove(index);
             return;
         }
     }
 }
 
-pub fn forgetSessionRuntime(guid: []const u8) void {
-    for (runtime_registry.items, 0..) |control, index| {
+pub fn forgetTerminalRemote(guid: []const u8) void {
+    for (terminal_remote_processes.items, 0..) |control, index| {
         if (std.mem.eql(u8, control.guid, guid)) {
-            _ = runtime_registry.orderedRemove(index);
-            _ = reapRuntimeProcess(control.pid);
+            _ = terminal_remote_processes.orderedRemove(index);
+            _ = reapTerminalRemote(control.pid);
             const allocator = control.allocator;
             control.deinit();
             allocator.destroy(control);
@@ -1264,24 +1268,24 @@ pub fn forgetSessionRuntime(guid: []const u8) void {
     }
 }
 
-pub fn activeRuntimeCount() usize {
-    pruneExitedRuntimes();
-    return runtime_registry.items.len;
+pub fn activeTerminalRemoteProcessCount() usize {
+    pruneExitedTerminalRemotes();
+    return terminal_remote_processes.items.len;
 }
 
-fn lookupRuntime(guid: []const u8) ?*RuntimeProcessControl {
-    for (runtime_registry.items) |control| {
+fn lookupRuntime(guid: []const u8) ?*TerminalRemoteProcess {
+    for (terminal_remote_processes.items) |control| {
         if (std.mem.eql(u8, control.guid, guid)) return control;
     }
     return null;
 }
 
-fn pruneExitedRuntimes() void {
+fn pruneExitedTerminalRemotes() void {
     var index: usize = 0;
-    while (index < runtime_registry.items.len) {
-        const control = runtime_registry.items[index];
-        if (reapRuntimeProcess(control.pid)) {
-            _ = runtime_registry.orderedRemove(index);
+    while (index < terminal_remote_processes.items.len) {
+        const control = terminal_remote_processes.items[index];
+        if (reapTerminalRemote(control.pid)) {
+            _ = terminal_remote_processes.orderedRemove(index);
             const allocator = control.allocator;
             control.deinit();
             allocator.destroy(control);
@@ -1291,7 +1295,7 @@ fn pruneExitedRuntimes() void {
     }
 }
 
-fn reapRuntimeProcess(pid: c.pid_t) bool {
+fn reapTerminalRemote(pid: c.pid_t) bool {
     if (pid <= 0) return true;
     var status: c_int = 0;
     const result = c.waitpid(pid, &status, 1);
@@ -1415,7 +1419,7 @@ fn sessionReapEnabled(session: *const Session) bool {
         session.reap_ms != 0;
 }
 
-test "remote session runtime poll timeout includes reap deadline" {
+test "remote terminal process poll timeout includes reap deadline" {
     var session_runtime = SessionRuntime{};
     session_runtime.session = .{
         .alive = true,
@@ -1432,7 +1436,7 @@ test "remote session runtime poll timeout includes reap deadline" {
     try std.testing.expectEqual(@as(i32, -1), sessionRuntimePollTimeoutMs(&session_runtime, 0, 6_000));
 }
 
-test "remote session runtime poll timeout wakes to reap pty hangup" {
+test "remote terminal process poll timeout wakes to reap pty hangup" {
     var session_runtime = SessionRuntime{};
     session_runtime.session = .{
         .alive = true,
@@ -1476,7 +1480,7 @@ fn handleRuntimeHandoffEvent(session_runtime: *SessionRuntime, listen_fd: c.fd_t
         return;
     };
     const keep_open = handleSessionRuntimeClient(session_runtime, client_fd) catch |err| blk: {
-        io.stderrPrint("sessh remote session runtime: client error: {t}\n", .{err}) catch {};
+        io.stderrPrint("sessh remote terminal process: client error: {t}\n", .{err}) catch {};
         break :blk false;
     };
     if (!keep_open) _ = c.close(client_fd);
@@ -1571,7 +1575,7 @@ fn acceptRemoteHandshake(session_runtime: *SessionRuntime, fd: c.fd_t) !Handshak
     var peer_hello = try readHelloRequest(fd);
     defer peer_hello.deinit(app_allocator.allocator());
     if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote session runtime is incompatible with this client", "Start a fresh sessh connection with matching binaries");
+        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client", "Start a fresh sessh connection with matching binaries");
         return .mismatch;
     }
     try sendHelloOk(fd);
@@ -3659,4 +3663,20 @@ fn nowUnixMs() u64 {
     if (c.clock_gettime(.REALTIME, &ts) != 0) return 0;
     if (ts.sec < 0) return 0;
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
+test "terminal remote socket path uses short runtime root" {
+    const allocator = std.testing.allocator;
+    const exe = "/tmp/sessh-ssh-reconnect-tmux-abcdefgh/sessh-test-root/runtime.remote/3.dev.abcdef12/sessh-terminal-remote";
+    const path = try terminalRemoteSocketPath(allocator, exe, "terminal");
+    defer allocator.free(path);
+
+    const root = try socket_transport.shortRuntimeRoot(allocator);
+    defer allocator.free(root);
+    const expected_prefix = try std.fmt.allocPrint(allocator, "{s}/3.dev.abcdef12/terminal-", .{root});
+    defer allocator.free(expected_prefix);
+
+    const addr: c.sockaddr.un = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, path, expected_prefix));
+    try std.testing.expect(path.len < addr.path.len);
 }

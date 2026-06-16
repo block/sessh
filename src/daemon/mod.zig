@@ -239,7 +239,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 
     var accept_context = DaemonAcceptContext{
         .allocator = allocator,
-        .terminal_runtime_exe = locked_runtime_executables.terminal_runtime,
+        .terminal_remote_exe = locked_runtime_executables.terminal_remote,
         .proxy_remote_exe = locked_runtime_executables.proxy_remote,
         .identity = identity,
         .listen_fd = listen_fd,
@@ -269,7 +269,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 
 const DaemonAcceptContext = struct {
     allocator: std.mem.Allocator,
-    terminal_runtime_exe: []const u8,
+    terminal_remote_exe: []const u8,
     proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     listen_fd: c.fd_t,
@@ -303,7 +303,7 @@ fn acceptDaemonClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher
     };
     context.* = .{
         .allocator = accept_context.allocator,
-        .terminal_runtime_exe = accept_context.terminal_runtime_exe,
+        .terminal_remote_exe = accept_context.terminal_remote_exe,
         .proxy_remote_exe = accept_context.proxy_remote_exe,
         .identity = accept_context.identity,
         .fd = client_fd,
@@ -330,7 +330,7 @@ const ClientStage = enum {
 
 const ClientContext = struct {
     allocator: std.mem.Allocator,
-    terminal_runtime_exe: []const u8,
+    terminal_remote_exe: []const u8,
     proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     fd: c.fd_t,
@@ -464,7 +464,7 @@ fn handleDaemonClientFrame(
                 .transferred => return .transferred,
                 .close => return .close,
             }
-            return if (try handleClientFrameAfterHandshake(context.allocator, context.terminal_runtime_exe, context.identity, context.fd, frame.*))
+            return if (try handleClientFrameAfterHandshake(context.allocator, context.terminal_remote_exe, context.identity, context.fd, frame.*))
                 .consumed
             else
                 .close;
@@ -529,7 +529,7 @@ fn transferInitialRequestToDispatcherOwner(
         try daemon_tunnel.registerMuxConnectionFromDaemon(
             context.allocator,
             daemon_dispatcher,
-            context.terminal_runtime_exe,
+            context.terminal_remote_exe,
             context.proxy_remote_exe,
             context.identity,
             initial_frames[0..],
@@ -623,7 +623,7 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
 fn daemonHasLiveWork() bool {
     return active_local_clients.load(.acquire) != 0 or
         transport_ssh.activePooledSshTransportCount() != 0 or
-        session_runtime.activeRuntimeCount() != 0 or
+        session_runtime.activeTerminalRemoteProcessCount() != 0 or
         stream_runtime.activeProxyRemoteProcessCount() != 0;
 }
 

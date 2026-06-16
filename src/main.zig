@@ -48,8 +48,8 @@ fn runMain() !void {
     if (std.mem.eql(u8, exe_name, "sessh-proxy")) {
         return transport_ssh.runProxyStream(allocator, args[0], args[1..]);
     }
-    if (std.mem.eql(u8, exe_name, "sessh-terminal")) {
-        return session_runtime.runRuntimeProcess(allocator, args[1..]);
+    if (std.mem.eql(u8, exe_name, "sessh-terminal-remote")) {
+        return session_runtime.runTerminalRemoteProcess(allocator, args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-proxy-remote")) {
         return stream_runtime.runProxyRemoteProcess(allocator, args[1..]);
@@ -70,7 +70,7 @@ fn runMain() !void {
     }
 
     if (std.mem.eql(u8, args[1], ":internal-terminal-runtime:")) {
-        return session_runtime.runRuntimeProcess(allocator, args[2..]);
+        return session_runtime.runTerminalRemoteProcess(allocator, args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":internal-proxy-remote:")) {

@@ -6,7 +6,7 @@ const socket_transport = @import("../transport/socket.zig");
 pub const daemon_executable_name = "sesshd";
 pub const broker_executable_name = "sessh-broker";
 pub const proxy_executable_name = "sessh-proxy";
-pub const terminal_runtime_executable_name = "sessh-terminal";
+pub const terminal_remote_executable_name = "sessh-terminal-remote";
 pub const proxy_remote_executable_name = "sessh-proxy-remote";
 pub const socket_filename = "sesshd.sock";
 pub const lock_filename = "sesshd.lock";
@@ -83,7 +83,7 @@ fn validateExecutableName(name: []const u8) !void {
     if (std.mem.eql(u8, name, daemon_executable_name) or
         std.mem.eql(u8, name, broker_executable_name) or
         std.mem.eql(u8, name, proxy_executable_name) or
-        std.mem.eql(u8, name, terminal_runtime_executable_name) or
+        std.mem.eql(u8, name, terminal_remote_executable_name) or
         std.mem.eql(u8, name, proxy_remote_executable_name))
     {
         return;

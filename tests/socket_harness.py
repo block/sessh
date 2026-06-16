@@ -918,7 +918,7 @@ def start_daemon(env, session_id=None):
     return proc
 
 
-def session_runtime_pids(env):
+def terminal_remote_pids(env):
     pids = []
     daemon_exe = socket_path(env).parent / "sesshd"
     try:
@@ -1437,14 +1437,14 @@ def run_daemon_log_session_lifecycle_test(_base_env):
             recv_until_message(conn, SESSION_ATTACHED)
             recv_until_message(conn, SESSION_ENDED)
 
-            output += read_until_pipe(log_proc.stdout, b"terminal stream runtime connected", timeout=5.0)
+            output += read_until_pipe(log_proc.stdout, b"terminal stream remote connected", timeout=5.0)
             text = output.decode("utf-8", "replace")
             for expected in (
                 "terminal stream opening session=",
                 "action=create",
                 "terminal session creating session=",
-                "terminal session runtime connected session=",
-                "terminal stream runtime connected session=",
+                "terminal remote process connected session=",
+                "terminal stream remote connected session=",
             ):
                 if expected not in text:
                     raise AssertionError(f"daemon log missing {expected!r}: {text!r}")
@@ -1505,11 +1505,11 @@ def run_daemon_log_mux_session_lifecycle_test(_base_env):
             text = output.decode("utf-8", "replace")
             for expected in (
                 f"terminal mux stream opening stream_id=1 session={session_id} action=create",
-                f"terminal mux runtime payload prepared stream_id=1 session={session_id} action=create",
+                f"terminal mux remote payload prepared stream_id=1 session={session_id} action=create",
                 f"terminal session creating session={session_id}",
-                f"terminal session runtime connected session={session_id}",
-                f"terminal mux runtime handshake complete stream_id=1 session={session_id} action=create",
-                f"terminal mux runtime open sent stream_id=1 session={session_id} action=create",
+                f"terminal remote process connected session={session_id}",
+                f"terminal mux remote handshake complete stream_id=1 session={session_id} action=create",
+                f"terminal mux remote open sent stream_id=1 session={session_id} action=create",
                 f"terminal mux stream open ok stream_id=1 session={session_id} action=create",
                 f"terminal session attached stream_id=1 session={session_id}",
                 f"terminal session ended stream_id=1 session={session_id}",
@@ -2022,7 +2022,7 @@ def run_active_screen_barrier_protocol_test(base_env):
 
 
 def run_terminal_modes_protocol_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-terminal-modes-", dir="/tmp") as tmp:
+    with tempfile.TemporaryDirectory(prefix="sessh-terminal-remote-modes-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         env["SHELL"] = "/bin/sh"
         shell = Path(tmp) / "terminal-modes-shell"
@@ -2869,8 +2869,8 @@ def run_screen_repaint_after_presentation_reset_clears_rows_test(base_env):
             cleanup_runtime(env)
 
 
-def run_session_runtime_crash_client_error_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-runtime-crash-", dir="/tmp") as tmp:
+def run_terminal_remote_crash_client_error_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-terminal-remote-crash-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         shell = Path(tmp) / "crash-shell"
         shell.write_text(
@@ -2890,17 +2890,17 @@ def run_session_runtime_crash_client_error_test(base_env):
             output = read_until(fd, b"READY$ ")
             os.write(fd, b"go\n")
             output += read_until(fd, b"CRASH_UI_READY")
-            pids = session_runtime_pids(env)
+            pids = terminal_remote_pids(env)
             if len(pids) != 1:
-                raise AssertionError(f"expected one session runtime, found {pids}")
+                raise AssertionError(f"expected one terminal process, found {pids}")
 
             os.kill(pids[0], signal.SIGKILL)
-            output += read_until(fd, b"sessh: ssh runtime attach failed", timeout=5.0)
-            if b"ssh runtime attach failed" not in output:
+            output += read_until(fd, b"sessh: ssh remote attach failed", timeout=5.0)
+            if b"ssh remote attach failed" not in output:
                 raise AssertionError(output)
             alt_leave = output.rfind(b"\x1b[?1049l")
             if alt_leave < 0:
-                raise AssertionError(f"runtime crash did not leave alternate screen: {output!r}")
+                raise AssertionError(f"terminal remote crash did not leave alternate screen: {output!r}")
             final_cleanup = output[alt_leave:]
             for seq in (b"\x1b[?1000l", b"\x1b[?1006l", b"\x1b[?1004l", b"\x1b[?2004l", b"\x1b[0 q"):
                 if seq not in final_cleanup:

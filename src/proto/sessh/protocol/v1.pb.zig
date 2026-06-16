@@ -3196,7 +3196,7 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Confirms that the remote session runtime received an Input frame.
+    /// Confirms that the remote terminal process received an Input frame.
     pub const InputAck = struct {
         input_seq: u64 = 0,
 
@@ -3336,7 +3336,7 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Requests that the remote session runtime redraw terminal state for this
+    /// Requests that the remote terminal process redraw terminal state for this
     /// attached client.
     pub const RepaintRequest = struct {
         repaint_request_seq: u64 = 0,
@@ -3887,7 +3887,7 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Session-runtime-generated terminal bytes for the attached session.
+    /// Remote-terminal-generated terminal bytes for the attached session.
     pub const Draw = struct {
         scrollback_cursor: []const u8 = &.{},
         viewport_offset: ?i32 = null,

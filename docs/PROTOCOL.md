@@ -37,7 +37,7 @@ versions.
 
 ## Seamless reconnect
 
-The protocol is designed so that the remote session runtime does not retain
+The protocol is designed so that the remote terminal process does not retain
 state of disconnected clients. Instead, a reconnecting client sends state to
 remote `sesshd`, which combines that with its own terminal state and then computes
 missing scrollback and generates accurate repaint instructions for the client.
@@ -46,7 +46,7 @@ In the event of a network disconnection, remote `sesshd` will continue
 terminal emulation. The virtual screen may update and/or generate additional
 lines of scrollback. When the client reconnects, it sends a `TeResize` message
 with an embedded `TeRepaintRequest` message containing enough information for the
-remote session runtime to decide:
+remote terminal process to decide:
 1. Are the client's scrollback contents stale? (i.e. are they from before
    scrollback was cleared?)
 2. Which retained scrollback rows, if any, should be sent to the client?
@@ -68,7 +68,7 @@ the matching `TeRepaintResponse` is received. It doesn't make sense to try to ap
 rendering operations that were generated for a different sized window.
 
 `TeResize` carries the client's current viewport offset when known. The remote
-runtime answers an unknown offset by aligning the viewport in the repaint
+the remote side answers an unknown offset by aligning the viewport in the repaint
 response.
 
 ## Client-side overlay rendering

@@ -26,23 +26,23 @@ const StreamEntry = struct {
 
 const MuxConnection = struct {
     allocator: std.mem.Allocator,
-    terminal_runtime_exe: []const u8,
+    terminal_remote_exe: []const u8,
     proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     mux_fd: c.fd_t = -1,
     mux_watch_id: ?dispatcher.FdWatchId = null,
     mux_reader: protocol.FrameReader = undefined,
     stream_entries: std.ArrayList(StreamEntry) = .empty,
-    terminal_sessions: std.ArrayList(session_daemon_handler.TeMuxRuntime) = .empty,
-    proxy_streams: std.ArrayList(stream_runtime.ProxyMuxRuntime) = .empty,
+    terminal_sessions: std.ArrayList(session_daemon_handler.TerminalMuxStream) = .empty,
+    proxy_streams: std.ArrayList(stream_runtime.ProxyMuxStream) = .empty,
 
     fn deinit(self: *MuxConnection, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
         if (daemon_dispatcher) |d| {
             if (self.mux_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
         }
         self.mux_watch_id = null;
-        session_daemon_handler.closeTeMuxRuntimes(self.allocator, &self.terminal_sessions, daemon_dispatcher);
-        stream_runtime.closeProxyMuxRuntimes(self.allocator, &self.proxy_streams, daemon_dispatcher);
+        session_daemon_handler.closeTerminalMuxStreams(self.allocator, &self.terminal_sessions, daemon_dispatcher);
+        stream_runtime.closeProxyMuxStreams(self.allocator, &self.proxy_streams, daemon_dispatcher);
         self.stream_entries.deinit(self.allocator);
         self.mux_reader.deinit();
         if (self.mux_fd >= 0) {
@@ -58,7 +58,7 @@ const MuxConnection = struct {
 pub fn registerMuxConnectionFromDaemon(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    terminal_runtime_exe: []const u8,
+    terminal_remote_exe: []const u8,
     proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     initial_frames: []const protocol.OwnedFrame,
@@ -68,7 +68,7 @@ pub fn registerMuxConnectionFromDaemon(
     errdefer allocator.destroy(connection);
     connection.* = .{
         .allocator = allocator,
-        .terminal_runtime_exe = terminal_runtime_exe,
+        .terminal_remote_exe = terminal_remote_exe,
         .proxy_remote_exe = proxy_remote_exe,
         .identity = identity,
         .mux_fd = fd,
@@ -170,14 +170,14 @@ fn handleMuxStreamFrame(
             try noteMuxOpen(connection, stream_id, open);
             var owned = mux_frame;
             switch (streamKind(connection, stream_id)) {
-                .terminal => try session_daemon_handler.handleTeMuxStreamFrame(
+                .terminal => try session_daemon_handler.handleTerminalMuxStreamFrame(
                     connection.allocator,
-                    connection.terminal_runtime_exe,
+                    connection.terminal_remote_exe,
                     connection.identity,
                     &connection.terminal_sessions,
                     connection.mux_fd,
                     owned,
-                    .{ .ctx = connection, .callback = readTerminalRuntime },
+                    .{ .ctx = connection, .callback = readTerminalRemote },
                     daemon_dispatcher,
                 ),
                 .proxy => try stream_runtime.handleProxyMuxStreamFrame(
@@ -187,7 +187,7 @@ fn handleMuxStreamFrame(
                     &connection.proxy_streams,
                     connection.mux_fd,
                     owned,
-                    .{ .ctx = connection, .callback = readProxyRuntime },
+                    .{ .ctx = connection, .callback = readProxyRemote },
                     daemon_dispatcher,
                 ),
                 .unknown => {},
@@ -199,14 +199,14 @@ fn handleMuxStreamFrame(
             try ensureStreamKind(connection, daemon_dispatcher, stream_id, kind);
             const owned = mux_frame;
             if (kind == .terminal) {
-                try session_daemon_handler.handleTeMuxStreamFrame(
+                try session_daemon_handler.handleTerminalMuxStreamFrame(
                     connection.allocator,
-                    connection.terminal_runtime_exe,
+                    connection.terminal_remote_exe,
                     connection.identity,
                     &connection.terminal_sessions,
                     connection.mux_fd,
                     owned,
-                    .{ .ctx = connection, .callback = readTerminalRuntime },
+                    .{ .ctx = connection, .callback = readTerminalRemote },
                     daemon_dispatcher,
                 );
             } else {
@@ -217,7 +217,7 @@ fn handleMuxStreamFrame(
                     &connection.proxy_streams,
                     connection.mux_fd,
                     owned,
-                    .{ .ctx = connection, .callback = readProxyRuntime },
+                    .{ .ctx = connection, .callback = readProxyRemote },
                     daemon_dispatcher,
                 );
             }
@@ -227,14 +227,14 @@ fn handleMuxStreamFrame(
             var owned = mux_frame;
             const closes_stream = message == .eof or message == .reset;
             switch (kind) {
-                .terminal => try session_daemon_handler.handleTeMuxStreamFrame(
+                .terminal => try session_daemon_handler.handleTerminalMuxStreamFrame(
                     connection.allocator,
-                    connection.terminal_runtime_exe,
+                    connection.terminal_remote_exe,
                     connection.identity,
                     &connection.terminal_sessions,
                     connection.mux_fd,
                     owned,
-                    .{ .ctx = connection, .callback = readTerminalRuntime },
+                    .{ .ctx = connection, .callback = readTerminalRemote },
                     daemon_dispatcher,
                 ),
                 .proxy => try stream_runtime.handleProxyMuxStreamFrame(
@@ -244,7 +244,7 @@ fn handleMuxStreamFrame(
                     &connection.proxy_streams,
                     connection.mux_fd,
                     owned,
-                    .{ .ctx = connection, .callback = readProxyRuntime },
+                    .{ .ctx = connection, .callback = readProxyRemote },
                     daemon_dispatcher,
                 ),
                 .unknown => {
@@ -291,7 +291,7 @@ fn ensureStreamKind(
     entry.kind = kind;
     const open = entry.pending_open orelse pb.DaemonTunnelItem.MuxStreamFrame.Open{};
     switch (kind) {
-        .terminal => try session_daemon_handler.handleTeMuxOpen(connection.allocator, &connection.terminal_sessions, stream_id, open),
+        .terminal => try session_daemon_handler.handleTerminalMuxOpen(connection.allocator, &connection.terminal_sessions, stream_id, open),
         .proxy => try stream_runtime.handleProxyMuxOpen(connection.allocator, &connection.proxy_streams, stream_id, open),
         .unknown => {},
     }
@@ -322,23 +322,23 @@ fn removeStreamEntry(connection: *MuxConnection, stream_id: u64) void {
 }
 
 fn markCleanupRecorded(connection: *MuxConnection, stream_id: u64) void {
-    if (session_daemon_handler.findTeMuxRuntimeIndex(&connection.terminal_sessions, stream_id)) |index| {
+    if (session_daemon_handler.findTerminalMuxStreamIndex(&connection.terminal_sessions, stream_id)) |index| {
         connection.terminal_sessions.items[index].cleanup_recorded = true;
     }
-    if (stream_runtime.findProxyMuxRuntimeIndex(&connection.proxy_streams, stream_id)) |index| {
+    if (stream_runtime.findProxyMuxStreamIndex(&connection.proxy_streams, stream_id)) |index| {
         connection.proxy_streams.items[index].cleanup_recorded = true;
     }
 }
 
-fn readTerminalRuntime(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+fn readTerminalRemote(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
     const connection: *MuxConnection = @ptrCast(@alignCast(ctx));
-    readTerminalRuntimeInner(connection, daemon_dispatcher, id, event) catch |err| {
-        daemon_log.infof(connection.allocator, "terminal mux runtime failed error={t}", .{err});
+    readTerminalRemoteInner(connection, daemon_dispatcher, id, event) catch |err| {
+        daemon_log.infof(connection.allocator, "terminal mux remote process failed error={t}", .{err});
         connection.deinit(daemon_dispatcher);
     };
 }
 
-fn readTerminalRuntimeInner(
+fn readTerminalRemoteInner(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
     id: dispatcher.WatchId,
@@ -348,65 +348,65 @@ fn readTerminalRuntimeInner(
         .fd => |fd| fd,
         .timer => return error.UnexpectedDaemonMuxTimer,
     };
-    const runtime_index = session_daemon_handler.findTeMuxRuntimeIndexByWatch(&connection.terminal_sessions, id.fd) orelse return;
+    const stream_index = session_daemon_handler.findTerminalMuxStreamIndexByWatch(&connection.terminal_sessions, id.fd) orelse return;
     if (fd_event.error_event or fd_event.invalid or (!fd_event.readable and fd_event.hangup)) {
-        closeTerminalRuntimeAfterRemoteClose(connection, daemon_dispatcher, runtime_index);
+        closeTerminalRemoteAfterProcessClose(connection, daemon_dispatcher, stream_index);
         return;
     }
     if (!fd_event.readable) return;
 
     while (true) {
-        const current_index = session_daemon_handler.findTeMuxRuntimeIndexByWatch(&connection.terminal_sessions, id.fd) orelse return;
-        var runtime = &connection.terminal_sessions.items[current_index];
-        switch (try runtime.reader.readReady(runtime.runtime_fd)) {
+        const current_index = session_daemon_handler.findTerminalMuxStreamIndexByWatch(&connection.terminal_sessions, id.fd) orelse return;
+        var stream = &connection.terminal_sessions.items[current_index];
+        switch (try stream.reader.readReady(stream.process_fd)) {
             .blocked => return,
             .progress => continue,
             .eof, .truncated_frame => {
-                closeTerminalRuntimeAfterRemoteClose(connection, daemon_dispatcher, current_index);
+                closeTerminalRemoteAfterProcessClose(connection, daemon_dispatcher, current_index);
                 return;
             },
             .frame => |frame_value| {
                 var frame = frame_value;
                 defer frame.deinit(connection.allocator);
-                if (try session_daemon_handler.forwardTeRuntimeOwnedFrameToMux(connection.allocator, connection.mux_fd, runtime, &frame)) {
+                if (try session_daemon_handler.forwardTerminalRemoteFrameToMux(connection.allocator, connection.mux_fd, stream, &frame)) {
                     continue;
                 }
-                closeTerminalRuntimeAfterRemoteClose(connection, daemon_dispatcher, current_index);
+                closeTerminalRemoteAfterProcessClose(connection, daemon_dispatcher, current_index);
                 return;
             },
         }
     }
 }
 
-fn closeTerminalRuntimeAfterRemoteClose(
+fn closeTerminalRemoteAfterProcessClose(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    runtime_index: usize,
+    stream_index: usize,
 ) void {
-    const stream_id = connection.terminal_sessions.items[runtime_index].stream_id;
-    if (!connection.terminal_sessions.items[runtime_index].ended) {
+    const stream_id = connection.terminal_sessions.items[stream_index].stream_id;
+    if (!connection.terminal_sessions.items[stream_index].ended) {
         daemon_log.infof(
             connection.allocator,
-            "terminal mux connection closing after runtime transport closed stream_id={} session={s}",
-            .{ stream_id, connection.terminal_sessions.items[runtime_index].session_guid },
+            "terminal mux connection closing after remote process transport closed stream_id={} session={s}",
+            .{ stream_id, connection.terminal_sessions.items[stream_index].session_guid },
         );
         connection.deinit(daemon_dispatcher);
         return;
     }
-    const runtime = connection.terminal_sessions.swapRemove(runtime_index);
-    session_daemon_handler.closeTeMuxRuntime(connection.allocator, runtime, false, daemon_dispatcher);
+    const stream = connection.terminal_sessions.swapRemove(stream_index);
+    session_daemon_handler.closeTerminalMuxStream(connection.allocator, stream, false, daemon_dispatcher);
     removeStreamEntry(connection, stream_id);
 }
 
-fn readProxyRuntime(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+fn readProxyRemote(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
     const connection: *MuxConnection = @ptrCast(@alignCast(ctx));
-    readProxyRuntimeInner(connection, daemon_dispatcher, id, event) catch |err| {
-        daemon_log.infof(connection.allocator, "proxy mux runtime failed error={t}", .{err});
+    readProxyRemoteInner(connection, daemon_dispatcher, id, event) catch |err| {
+        daemon_log.infof(connection.allocator, "proxy mux remote process failed error={t}", .{err});
         connection.deinit(daemon_dispatcher);
     };
 }
 
-fn readProxyRuntimeInner(
+fn readProxyRemoteInner(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
     id: dispatcher.WatchId,
@@ -416,45 +416,45 @@ fn readProxyRuntimeInner(
         .fd => |fd| fd,
         .timer => return error.UnexpectedDaemonMuxTimer,
     };
-    const runtime_index = stream_runtime.findProxyMuxRuntimeIndexByWatch(&connection.proxy_streams, id.fd) orelse return;
+    const stream_index = stream_runtime.findProxyMuxStreamIndexByWatch(&connection.proxy_streams, id.fd) orelse return;
     if (fd_event.error_event or fd_event.invalid or (!fd_event.readable and fd_event.hangup)) {
-        closeProxyRuntimeAfterRemoteClose(connection, daemon_dispatcher, runtime_index);
+        closeProxyRemoteAfterProcessClose(connection, daemon_dispatcher, stream_index);
         return;
     }
     if (!fd_event.readable) return;
 
     while (true) {
-        const current_index = stream_runtime.findProxyMuxRuntimeIndexByWatch(&connection.proxy_streams, id.fd) orelse return;
-        var runtime = &connection.proxy_streams.items[current_index];
-        switch (try runtime.reader.readReady(runtime.runtime_fd)) {
+        const current_index = stream_runtime.findProxyMuxStreamIndexByWatch(&connection.proxy_streams, id.fd) orelse return;
+        var stream = &connection.proxy_streams.items[current_index];
+        switch (try stream.reader.readReady(stream.process_fd)) {
             .blocked => return,
             .progress => continue,
             .eof, .truncated_frame => {
-                closeProxyRuntimeAfterRemoteClose(connection, daemon_dispatcher, current_index);
+                closeProxyRemoteAfterProcessClose(connection, daemon_dispatcher, current_index);
                 return;
             },
             .frame => |frame_value| {
                 var frame = frame_value;
                 defer frame.deinit(connection.allocator);
-                if (try stream_runtime.forwardProxyRuntimeOwnedFrameToMux(connection.allocator, connection.mux_fd, runtime, &frame)) {
+                if (try stream_runtime.forwardProxyRemoteFrameToMux(connection.allocator, connection.mux_fd, stream, &frame)) {
                     continue;
                 }
-                closeProxyRuntimeAfterRemoteClose(connection, daemon_dispatcher, current_index);
+                closeProxyRemoteAfterProcessClose(connection, daemon_dispatcher, current_index);
                 return;
             },
         }
     }
 }
 
-fn closeProxyRuntimeAfterRemoteClose(
+fn closeProxyRemoteAfterProcessClose(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    runtime_index: usize,
+    stream_index: usize,
 ) void {
-    const runtime = connection.proxy_streams.swapRemove(runtime_index);
-    stream_runtime.sendProxyMuxReset(connection.allocator, connection.mux_fd, runtime.stream_id, "RUNTIME_CLOSED", "proxy stream runtime closed") catch {};
-    removeStreamEntry(connection, runtime.stream_id);
-    stream_runtime.closeProxyMuxRuntime(connection.allocator, runtime, false, daemon_dispatcher);
+    const stream = connection.proxy_streams.swapRemove(stream_index);
+    stream_runtime.sendProxyMuxReset(connection.allocator, connection.mux_fd, stream.stream_id, "REMOTE_PROCESS_CLOSED", "remote proxy process closed") catch {};
+    removeStreamEntry(connection, stream.stream_id);
+    stream_runtime.closeProxyMuxStream(connection.allocator, stream, false, daemon_dispatcher);
 }
 
 fn sendMuxReset(

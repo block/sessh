@@ -8,7 +8,7 @@ const socket_transport = @import("../transport/socket.zig");
 pub const daemon_name = socket_namespace.daemon_executable_name;
 pub const broker_name = socket_namespace.broker_executable_name;
 pub const proxy_name = socket_namespace.proxy_executable_name;
-pub const terminal_runtime_name = socket_namespace.terminal_runtime_executable_name;
+pub const terminal_remote_name = socket_namespace.terminal_remote_executable_name;
 pub const proxy_remote_name = socket_namespace.proxy_remote_executable_name;
 
 pub const RuntimeExecutables = struct {
@@ -16,14 +16,14 @@ pub const RuntimeExecutables = struct {
     daemon: []u8,
     broker: []u8,
     proxy: []u8,
-    terminal_runtime: []u8,
+    terminal_remote: []u8,
     proxy_remote: []u8,
 
     pub fn deinit(self: *RuntimeExecutables) void {
         self.allocator.free(self.daemon);
         self.allocator.free(self.broker);
         self.allocator.free(self.proxy);
-        self.allocator.free(self.terminal_runtime);
+        self.allocator.free(self.terminal_remote);
         self.allocator.free(self.proxy_remote);
         self.* = undefined;
     }
@@ -74,7 +74,7 @@ pub fn installRuntimeExecutablesWhileHoldingLock(
     try replaceSymlink(allocator, target, executables.daemon);
     try replaceSymlink(allocator, target, executables.broker);
     try replaceSymlink(allocator, target, executables.proxy);
-    try replaceSymlink(allocator, target, executables.terminal_runtime);
+    try replaceSymlink(allocator, target, executables.terminal_remote);
     try replaceSymlink(allocator, target, executables.proxy_remote);
 
     return executables;
@@ -91,8 +91,8 @@ pub fn runtimeExecutablePaths(
     errdefer allocator.free(broker_path);
     const proxy_path = try socket_namespace.executablePath(allocator, dir_name, proxy_name);
     errdefer allocator.free(proxy_path);
-    const terminal_runtime_path = try socket_namespace.executablePath(allocator, dir_name, terminal_runtime_name);
-    errdefer allocator.free(terminal_runtime_path);
+    const terminal_remote_path = try socket_namespace.executablePath(allocator, dir_name, terminal_remote_name);
+    errdefer allocator.free(terminal_remote_path);
     const proxy_remote_path = try socket_namespace.executablePath(allocator, dir_name, proxy_remote_name);
     errdefer allocator.free(proxy_remote_path);
 
@@ -101,7 +101,7 @@ pub fn runtimeExecutablePaths(
         .daemon = daemon_path,
         .broker = broker_path,
         .proxy = proxy_path,
-        .terminal_runtime = terminal_runtime_path,
+        .terminal_remote = terminal_remote_path,
         .proxy_remote = proxy_remote_path,
     };
 }
@@ -210,9 +210,9 @@ test "runtime executables are written beside socket namespace" {
     const proxy = try socket_namespace.executablePath(allocator, dir_name, proxy_name);
     defer allocator.free(proxy);
     try std.testing.expect(std.mem.endsWith(u8, proxy, "/1.dev.exec-test/sessh-proxy"));
-    const terminal_runtime = try socket_namespace.executablePath(allocator, dir_name, terminal_runtime_name);
-    defer allocator.free(terminal_runtime);
-    try std.testing.expect(std.mem.endsWith(u8, terminal_runtime, "/1.dev.exec-test/sessh-terminal"));
+    const terminal_remote = try socket_namespace.executablePath(allocator, dir_name, terminal_remote_name);
+    defer allocator.free(terminal_remote);
+    try std.testing.expect(std.mem.endsWith(u8, terminal_remote, "/1.dev.exec-test/sessh-terminal-remote"));
     const proxy_remote = try socket_namespace.executablePath(allocator, dir_name, proxy_remote_name);
     defer allocator.free(proxy_remote);
     try std.testing.expect(std.mem.endsWith(u8, proxy_remote, "/1.dev.exec-test/sessh-proxy-remote"));

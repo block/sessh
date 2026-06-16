@@ -46,35 +46,35 @@ pub fn serveFrameAfterHandshake(
             const request_payload = try protocol.encodePayload(allocator, request);
             defer allocator.free(request_payload);
             if (request.create == null) {
-                const runtime_fd = connectRuntimeForOpen(allocator, request) catch |err| switch (err) {
+                const process_fd = connectTerminalRemoteForOpen(allocator, request) catch |err| switch (err) {
                     error.InvalidSessionGuid, error.SessionNotFound => {
                         try sendError(write_fd, "SESSION_NOT_FOUND", "session not found", "");
                         return;
                     },
                     else => return err,
                 };
-                defer _ = c.close(runtime_fd);
+                defer _ = c.close(process_fd);
                 daemon_log.infof(
                     allocator,
-                    "terminal stream runtime connected session={s} action={s}",
+                    "terminal stream remote connected session={s} action={s}",
                     .{ request.session_guid, action },
                 );
-                try openRuntimeAndForwardFrames(allocator, runtime_fd, request_payload, read_fd, write_fd);
+                try openTerminalRemoteAndForwardFrames(allocator, process_fd, request_payload, read_fd, write_fd);
                 return;
             }
 
             const open_payload = try sessionOpenPayloadWithCurrentEnvironment(allocator, request_payload);
             defer allocator.free(open_payload);
-            const runtime_fd = startSessionRuntimeAndConnect(allocator, exe, open_payload) catch |err| switch (err) {
+            const process_fd = startTerminalRemoteAndConnect(allocator, exe, open_payload) catch |err| switch (err) {
                 else => return err,
             };
-            defer _ = c.close(runtime_fd);
+            defer _ = c.close(process_fd);
             daemon_log.infof(
                 allocator,
-                "terminal stream runtime connected session={s} action={s}",
+                "terminal stream remote connected session={s} action={s}",
                 .{ request.session_guid, action },
             );
-            try openRuntimeAndForwardFrames(allocator, runtime_fd, open_payload, read_fd, write_fd);
+            try openTerminalRemoteAndForwardFrames(allocator, process_fd, open_payload, read_fd, write_fd);
             return;
         },
         else => {
@@ -109,24 +109,24 @@ pub fn serveDebugFrameAfterHandshake(
         },
     }
 
-    const runtime_fd = session_runtime.connectSingleLiveSessionRuntime(allocator) catch |err| switch (err) {
+    const process_fd = session_runtime.connectSingleLiveTerminalRemote(allocator) catch |err| switch (err) {
         error.SessionNotFound, error.AmbiguousSession => {
             try sendError(write_fd, "SESSION_NOT_FOUND", "session not found", "");
             return;
         },
         else => return err,
     };
-    defer _ = c.close(runtime_fd);
+    defer _ = c.close(process_fd);
 
-    try initiateRuntimeHandshake(allocator, runtime_fd);
-    try protocol.sendFrame(runtime_fd, frame.message_type, frame.payload);
-    try forwardRuntimeFramesToClient(allocator, runtime_fd, write_fd);
+    try initiateTerminalRemoteHandshake(allocator, process_fd);
+    try protocol.sendFrame(process_fd, frame.message_type, frame.payload);
+    try forwardTerminalRemoteFramesToClient(allocator, process_fd, write_fd);
 }
 
-pub const TeMuxRuntime = struct {
+pub const TerminalMuxStream = struct {
     stream_id: u64,
-    runtime_fd: c.fd_t = -1,
-    runtime_watch_id: ?dispatcher.FdWatchId = null,
+    process_fd: c.fd_t = -1,
+    process_watch_id: ?dispatcher.FdWatchId = null,
     reader: protocol.FrameReader = undefined,
     reader_initialized: bool = false,
     session_guid: []u8 = &.{},
@@ -137,87 +137,87 @@ pub const TeMuxRuntime = struct {
     cleanup_recorded: bool = false,
 };
 
-pub fn closeTeMuxRuntimes(
+pub fn closeTerminalMuxStreams(
     allocator: std.mem.Allocator,
-    sessions: *std.ArrayList(TeMuxRuntime),
+    sessions: *std.ArrayList(TerminalMuxStream),
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) void {
-    for (sessions.items) |runtime| {
-        closeTeMuxRuntime(allocator, runtime, true, daemon_dispatcher);
+    for (sessions.items) |stream| {
+        closeTerminalMuxStream(allocator, stream, true, daemon_dispatcher);
     }
     sessions.deinit(allocator);
 }
 
-pub fn closeTeMuxRuntime(
+pub fn closeTerminalMuxStream(
     allocator: std.mem.Allocator,
-    runtime: TeMuxRuntime,
+    stream: TerminalMuxStream,
     send_hangup: bool,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) void {
     if (daemon_dispatcher) |d| {
-        if (runtime.runtime_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
+        if (stream.process_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
     }
-    if (runtime.runtime_fd >= 0) {
-        if (send_hangup and !runtime.cleanup_recorded) sendTeHangupToRuntime(runtime.runtime_fd) catch {};
-        _ = c.close(runtime.runtime_fd);
+    if (stream.process_fd >= 0) {
+        if (send_hangup and !stream.cleanup_recorded) sendTerminalHangupToRemote(stream.process_fd) catch {};
+        _ = c.close(stream.process_fd);
     }
-    var moved_runtime = runtime;
-    if (moved_runtime.reader_initialized) moved_runtime.reader.deinit();
-    if (runtime.session_guid.len != 0) allocator.free(runtime.session_guid);
+    var moved_stream = stream;
+    if (moved_stream.reader_initialized) moved_stream.reader.deinit();
+    if (stream.session_guid.len != 0) allocator.free(stream.session_guid);
 }
 
-pub fn handleTeMuxStreamFrame(
+pub fn handleTerminalMuxStreamFrame(
     allocator: std.mem.Allocator,
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
-    sessions: *std.ArrayList(TeMuxRuntime),
+    sessions: *std.ArrayList(TerminalMuxStream),
     mux_fd: c.fd_t,
     mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
-    runtime_watch_handler: ?dispatcher.Handler,
+    process_watch_handler: ?dispatcher.Handler,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !void {
     var owned_mux_frame = mux_frame;
     defer owned_mux_frame.deinit(allocator);
     const message = owned_mux_frame.message orelse return error.UnexpectedFrame;
     switch (message) {
-        .open => |open| handleTeMuxOpen(allocator, sessions, owned_mux_frame.stream_id, open) catch |err| {
-            try sendTeMuxResetForError(allocator, mux_fd, owned_mux_frame.stream_id, "OPEN_FAILED", err);
+        .open => |open| handleTerminalMuxOpen(allocator, sessions, owned_mux_frame.stream_id, open) catch |err| {
+            try sendTerminalMuxResetForError(allocator, mux_fd, owned_mux_frame.stream_id, "OPEN_FAILED", err);
         },
-        .payload => |payload| handleTeMuxPayload(allocator, exe, identity, sessions, mux_fd, owned_mux_frame.stream_id, payload, runtime_watch_handler, daemon_dispatcher) catch |err| {
-            try sendTeMuxResetForError(allocator, mux_fd, owned_mux_frame.stream_id, "STREAM_FAILED", err);
-            try removeTeMuxRuntime(allocator, sessions, owned_mux_frame.stream_id, daemon_dispatcher);
+        .payload => |payload| handleTerminalMuxPayload(allocator, exe, identity, sessions, mux_fd, owned_mux_frame.stream_id, payload, process_watch_handler, daemon_dispatcher) catch |err| {
+            try sendTerminalMuxResetForError(allocator, mux_fd, owned_mux_frame.stream_id, "STREAM_FAILED", err);
+            try removeTerminalMuxStream(allocator, sessions, owned_mux_frame.stream_id, daemon_dispatcher);
         },
         .ack, .open_ok => {},
-        .eof => try removeTeMuxRuntime(allocator, sessions, owned_mux_frame.stream_id, daemon_dispatcher),
-        .reset => try removeTeMuxRuntime(allocator, sessions, owned_mux_frame.stream_id, daemon_dispatcher),
+        .eof => try removeTerminalMuxStream(allocator, sessions, owned_mux_frame.stream_id, daemon_dispatcher),
+        .reset => try removeTerminalMuxStream(allocator, sessions, owned_mux_frame.stream_id, daemon_dispatcher),
     }
 }
 
-pub fn handleTeMuxOpen(
+pub fn handleTerminalMuxOpen(
     allocator: std.mem.Allocator,
-    sessions: *std.ArrayList(TeMuxRuntime),
+    sessions: *std.ArrayList(TerminalMuxStream),
     stream_id: u64,
     open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
 ) !void {
     _ = open;
-    if (findTeMuxRuntimeIndex(sessions, stream_id) != null) return;
+    if (findTerminalMuxStreamIndex(sessions, stream_id) != null) return;
     try sessions.append(allocator, .{ .stream_id = stream_id });
 }
 
-fn handleTeMuxPayloadOpen(
+fn handleTerminalMuxPayloadOpen(
     allocator: std.mem.Allocator,
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
-    sessions: *std.ArrayList(TeMuxRuntime),
+    sessions: *std.ArrayList(TerminalMuxStream),
     mux_fd: c.fd_t,
     stream_id: u64,
     payload_offset: u64,
     te_open: pb.TerminalEmulatorItem.Open,
-    runtime_watch_handler: ?dispatcher.Handler,
+    process_watch_handler: ?dispatcher.Handler,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !void {
-    const runtime_index = findTeMuxRuntimeIndex(sessions, stream_id) orelse return error.UnexpectedFrame;
-    if (sessions.items[runtime_index].runtime_fd >= 0) return;
+    const stream_index = findTerminalMuxStreamIndex(sessions, stream_id) orelse return error.UnexpectedFrame;
+    if (sessions.items[stream_index].process_fd >= 0) return;
     const action = teStreamActionName(te_open);
     const open_started_ms = std.time.milliTimestamp();
     daemon_log.infof(
@@ -232,14 +232,14 @@ fn handleTeMuxPayloadOpen(
     const open_payload = try protocol.encodePayload(allocator, te_open);
     defer allocator.free(open_payload);
 
-    const runtime_fd = openTeMuxRuntime(allocator, exe, stream_id, te_open, action, open_payload, open_started_ms) catch |err| switch (err) {
+    const process_fd = openTerminalMuxStream(allocator, exe, stream_id, te_open, action, open_payload, open_started_ms) catch |err| switch (err) {
         error.InvalidSessionGuid, error.SessionNotFound => {
             daemon_log.infof(
                 allocator,
                 "terminal mux stream open failed stream_id={} session={s} action={s} error={t}",
                 .{ stream_id, te_open.session_guid, action, err },
             );
-            try sendTeMuxReset(allocator, mux_fd, stream_id, "SESSION_NOT_FOUND", "session not found");
+            try sendTerminalMuxReset(allocator, mux_fd, stream_id, "SESSION_NOT_FOUND", "session not found");
             return;
         },
         error.VersionMismatch => {
@@ -248,7 +248,7 @@ fn handleTeMuxPayloadOpen(
                 "terminal mux stream open failed stream_id={} session={s} action={s} error={t}",
                 .{ stream_id, te_open.session_guid, action, err },
             );
-            try sendTeMuxReset(allocator, mux_fd, stream_id, "VERSION_MISMATCH", "existing remote session runtime is incompatible with this client");
+            try sendTerminalMuxReset(allocator, mux_fd, stream_id, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client");
             return;
         },
         else => {
@@ -257,13 +257,13 @@ fn handleTeMuxPayloadOpen(
                 "terminal mux stream open failed stream_id={} session={s} action={s} error={t}",
                 .{ stream_id, te_open.session_guid, action, err },
             );
-            try sendTeMuxReset(allocator, mux_fd, stream_id, "OPEN_FAILED", "terminal stream open failed");
+            try sendTerminalMuxResetForError(allocator, mux_fd, stream_id, "OPEN_FAILED", err);
             return;
         },
     };
-    errdefer _ = c.close(runtime_fd);
+    errdefer _ = c.close(process_fd);
     if (daemon_dispatcher != null) {
-        try core_fds.setNonBlocking(runtime_fd);
+        try core_fds.setNonBlocking(process_fd);
     }
 
     try daemon_cleanup.sendRemoteProcessStarted(
@@ -272,19 +272,19 @@ fn handleTeMuxPayloadOpen(
         stream_id,
         daemon_cleanup.makeRemoteProcessIdentity(identity, te_open.session_guid),
     );
-    try sendTeMuxOpenOk(allocator, mux_fd, stream_id);
-    sessions.items[runtime_index].runtime_fd = runtime_fd;
+    try sendTerminalMuxOpenOk(allocator, mux_fd, stream_id);
+    sessions.items[stream_index].process_fd = process_fd;
     if (daemon_dispatcher) |d| {
-        const handler = runtime_watch_handler orelse return error.MissingTerminalRuntimeHandler;
-        sessions.items[runtime_index].reader = protocol.FrameReader.init(allocator);
-        sessions.items[runtime_index].reader_initialized = true;
-        sessions.items[runtime_index].runtime_watch_id = try d.watchFd(runtime_fd, .{ .readable = true }, .{
+        const handler = process_watch_handler orelse return error.MissingTerminalRemoteHandler;
+        sessions.items[stream_index].reader = protocol.FrameReader.init(allocator);
+        sessions.items[stream_index].reader_initialized = true;
+        sessions.items[stream_index].process_watch_id = try d.watchFd(process_fd, .{ .readable = true }, .{
             .ctx = handler.ctx,
             .callback = handler.callback,
         });
     }
-    sessions.items[runtime_index].session_guid = session_guid;
-    sessions.items[runtime_index].inbound_next_offset = @max(sessions.items[runtime_index].inbound_next_offset, payload_offset +| 1);
+    sessions.items[stream_index].session_guid = session_guid;
+    sessions.items[stream_index].inbound_next_offset = @max(sessions.items[stream_index].inbound_next_offset, payload_offset +| 1);
     session_guid_owned = false;
     daemon_log.infof(
         allocator,
@@ -293,7 +293,7 @@ fn handleTeMuxPayloadOpen(
     );
 }
 
-fn openTeMuxRuntime(
+fn openTerminalMuxStream(
     allocator: std.mem.Allocator,
     exe: []const u8,
     stream_id: u64,
@@ -303,54 +303,54 @@ fn openTeMuxRuntime(
     open_started_ms: i64,
 ) !c.fd_t {
     const prepare_started_ms = std.time.milliTimestamp();
-    const runtime_payload = if (request.create == null)
+    const remote_payload = if (request.create == null)
         open_payload
     else
         try sessionOpenPayloadWithCurrentEnvironment(allocator, open_payload);
-    defer if (request.create != null) allocator.free(runtime_payload);
+    defer if (request.create != null) allocator.free(remote_payload);
     daemon_log.infof(
         allocator,
-        "terminal mux runtime payload prepared stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
+        "terminal mux remote payload prepared stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
         .{ stream_id, request.session_guid, action, elapsedMsSince(prepare_started_ms), elapsedMsSince(open_started_ms) },
     );
 
-    const runtime_fd = if (request.create == null)
-        try connectRuntimeForOpen(allocator, request)
+    const process_fd = if (request.create == null)
+        try connectTerminalRemoteForOpen(allocator, request)
     else
-        try startSessionRuntimeAndConnect(allocator, exe, runtime_payload);
-    errdefer _ = c.close(runtime_fd);
+        try startTerminalRemoteAndConnect(allocator, exe, remote_payload);
+    errdefer _ = c.close(process_fd);
     const handshake_started_ms = std.time.milliTimestamp();
-    try initiateRuntimeHandshake(allocator, runtime_fd);
+    try initiateTerminalRemoteHandshake(allocator, process_fd);
     daemon_log.infof(
         allocator,
-        "terminal mux runtime handshake complete stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
+        "terminal mux remote handshake complete stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
         .{ stream_id, request.session_guid, action, elapsedMsSince(handshake_started_ms), elapsedMsSince(open_started_ms) },
     );
     const send_started_ms = std.time.milliTimestamp();
-    var runtime_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, runtime_payload);
-    defer runtime_open.deinit(allocator);
-    try protocol.sendTeStreamPayloadFrame(allocator, runtime_fd, .{ .open = runtime_open });
+    var remote_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, remote_payload);
+    defer remote_open.deinit(allocator);
+    try protocol.sendTeStreamPayloadFrame(allocator, process_fd, .{ .open = remote_open });
     daemon_log.infof(
         allocator,
-        "terminal mux runtime open sent stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
+        "terminal mux remote open sent stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
         .{ stream_id, request.session_guid, action, elapsedMsSince(send_started_ms), elapsedMsSince(open_started_ms) },
     );
-    return runtime_fd;
+    return process_fd;
 }
 
-fn handleTeMuxPayload(
+fn handleTerminalMuxPayload(
     allocator: std.mem.Allocator,
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
-    sessions: *std.ArrayList(TeMuxRuntime),
+    sessions: *std.ArrayList(TerminalMuxStream),
     mux_fd: c.fd_t,
     stream_id: u64,
     payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload,
-    runtime_watch_handler: ?dispatcher.Handler,
+    process_watch_handler: ?dispatcher.Handler,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !void {
-    const index = findTeMuxRuntimeIndex(sessions, stream_id) orelse {
-        try sendTeMuxReset(allocator, mux_fd, stream_id, "STREAM_NOT_FOUND", "mux stream not found");
+    const index = findTerminalMuxStreamIndex(sessions, stream_id) orelse {
+        try sendTerminalMuxReset(allocator, mux_fd, stream_id, "STREAM_NOT_FOUND", "mux stream not found");
         return;
     };
     const item = payload.item orelse return error.UnexpectedFrame;
@@ -358,97 +358,97 @@ fn handleTeMuxPayload(
         .terminal_emulator => |terminal_emulator| terminal_emulator,
         else => return error.UnexpectedFrame,
     };
-    var runtime = &sessions.items[index];
+    var stream = &sessions.items[index];
     if (te_item.payload) |te_payload| {
         if (te_payload == .open) {
-            try handleTeMuxPayloadOpen(allocator, exe, identity, sessions, mux_fd, stream_id, payload.offset, te_payload.open, runtime_watch_handler, daemon_dispatcher);
+            try handleTerminalMuxPayloadOpen(allocator, exe, identity, sessions, mux_fd, stream_id, payload.offset, te_payload.open, process_watch_handler, daemon_dispatcher);
             return;
         }
     }
-    if (runtime.runtime_fd < 0) return error.UnexpectedFrame;
-    runtime.inbound_next_offset = @max(runtime.inbound_next_offset, payload.offset +| 1);
+    if (stream.process_fd < 0) return error.UnexpectedFrame;
+    stream.inbound_next_offset = @max(stream.inbound_next_offset, payload.offset +| 1);
     if (te_item.payload) |te_payload| {
         if (te_payload == .session_hangup_request) {
             daemon_log.infof(
                 allocator,
                 "remote terminal hangup requested stream_id={} session={s}",
-                .{ stream_id, runtime.session_guid },
+                .{ stream_id, stream.session_guid },
             );
         }
     }
-    try protocol.sendTeStreamItemFrame(allocator, runtime.runtime_fd, te_item);
+    try protocol.sendTeStreamItemFrame(allocator, stream.process_fd, te_item);
 }
 
-pub fn forwardTeRuntimeOwnedFrameToMux(
+pub fn forwardTerminalRemoteFrameToMux(
     allocator: std.mem.Allocator,
     mux_fd: c.fd_t,
-    runtime: *TeMuxRuntime,
+    stream: *TerminalMuxStream,
     frame: *protocol.OwnedFrame,
 ) !bool {
     if (frame.message_type == .error_message) {
-        try sendTeMuxReset(allocator, mux_fd, runtime.stream_id, "RUNTIME_ERROR", "terminal runtime error");
+        try sendTerminalMuxReset(allocator, mux_fd, stream.stream_id, "REMOTE_PROCESS_ERROR", "terminal remote process error");
         return false;
     }
     if (frame.message_type != .client_remote) return error.UnexpectedFrame;
     var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
     defer item.deinit(allocator);
-    try sendTeMuxPayload(allocator, mux_fd, runtime.stream_id, runtime.outbound_next_offset, item);
-    runtime.outbound_next_offset +|= 1;
+    try sendTerminalMuxPayload(allocator, mux_fd, stream.stream_id, stream.outbound_next_offset, item);
+    stream.outbound_next_offset +|= 1;
     if (item.payload) |item_payload| {
-        if (item_payload == .session_attached and !runtime.attached_logged) {
-            runtime.attached_logged = true;
+        if (item_payload == .session_attached and !stream.attached_logged) {
+            stream.attached_logged = true;
             daemon_log.infof(
                 allocator,
                 "terminal session attached stream_id={} session={s}",
-                .{ runtime.stream_id, runtime.session_guid },
+                .{ stream.stream_id, stream.session_guid },
             );
         }
         if (item_payload == .session_ended) {
-            runtime.ended = true;
+            stream.ended = true;
             daemon_log.infof(
                 allocator,
                 "terminal session ended stream_id={} session={s}",
-                .{ runtime.stream_id, runtime.session_guid },
+                .{ stream.stream_id, stream.session_guid },
             );
-            try sendTeMuxEof(allocator, mux_fd, runtime.stream_id, runtime.outbound_next_offset);
+            try sendTerminalMuxEof(allocator, mux_fd, stream.stream_id, stream.outbound_next_offset);
         }
     }
     return true;
 }
 
-pub fn findTeMuxRuntimeIndexByWatch(sessions: *const std.ArrayList(TeMuxRuntime), watch_id: dispatcher.FdWatchId) ?usize {
-    for (sessions.items, 0..) |runtime, index| {
-        const runtime_watch_id = runtime.runtime_watch_id orelse continue;
-        if (runtime_watch_id.index == watch_id.index and runtime_watch_id.generation == watch_id.generation) return index;
+pub fn findTerminalMuxStreamIndexByWatch(sessions: *const std.ArrayList(TerminalMuxStream), watch_id: dispatcher.FdWatchId) ?usize {
+    for (sessions.items, 0..) |stream, index| {
+        const process_watch_id = stream.process_watch_id orelse continue;
+        if (process_watch_id.index == watch_id.index and process_watch_id.generation == watch_id.generation) return index;
     }
     return null;
 }
 
-pub fn findTeMuxRuntimeIndex(sessions: *const std.ArrayList(TeMuxRuntime), stream_id: u64) ?usize {
-    for (sessions.items, 0..) |runtime, index| {
-        if (runtime.stream_id == stream_id) return index;
+pub fn findTerminalMuxStreamIndex(sessions: *const std.ArrayList(TerminalMuxStream), stream_id: u64) ?usize {
+    for (sessions.items, 0..) |stream, index| {
+        if (stream.stream_id == stream_id) return index;
     }
     return null;
 }
 
-fn removeTeMuxRuntime(
+fn removeTerminalMuxStream(
     allocator: std.mem.Allocator,
-    sessions: *std.ArrayList(TeMuxRuntime),
+    sessions: *std.ArrayList(TerminalMuxStream),
     stream_id: u64,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !void {
-    const index = findTeMuxRuntimeIndex(sessions, stream_id) orelse return;
-    const runtime = sessions.swapRemove(index);
+    const index = findTerminalMuxStreamIndex(sessions, stream_id) orelse return;
+    const stream = sessions.swapRemove(index);
     daemon_log.infof(
         allocator,
         "terminal mux stream closing stream_id={} session={s}",
-        .{ runtime.stream_id, runtime.session_guid },
+        .{ stream.stream_id, stream.session_guid },
     );
-    closeTeMuxRuntime(allocator, runtime, true, daemon_dispatcher);
+    closeTerminalMuxStream(allocator, stream, true, daemon_dispatcher);
 }
 
-fn sendTeMuxOpenOk(allocator: std.mem.Allocator, fd: c.fd_t, stream_id: u64) !void {
-    try sendTeMuxFrame(allocator, fd, .{
+fn sendTerminalMuxOpenOk(allocator: std.mem.Allocator, fd: c.fd_t, stream_id: u64) !void {
+    try sendTerminalMuxFrame(allocator, fd, .{
         .stream_id = stream_id,
         .message = .{ .open_ok = .{
             .recv_next_offset = 0,
@@ -457,14 +457,14 @@ fn sendTeMuxOpenOk(allocator: std.mem.Allocator, fd: c.fd_t, stream_id: u64) !vo
     });
 }
 
-fn sendTeMuxPayload(
+fn sendTerminalMuxPayload(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     stream_id: u64,
     offset: u64,
     item: pb.TerminalEmulatorItem,
 ) !void {
-    try sendTeMuxFrame(allocator, fd, .{
+    try sendTerminalMuxFrame(allocator, fd, .{
         .stream_id = stream_id,
         .message = .{ .payload = .{
             .offset = offset,
@@ -473,21 +473,21 @@ fn sendTeMuxPayload(
     });
 }
 
-fn sendTeMuxEof(allocator: std.mem.Allocator, fd: c.fd_t, stream_id: u64, final_offset: u64) !void {
-    try sendTeMuxFrame(allocator, fd, .{
+fn sendTerminalMuxEof(allocator: std.mem.Allocator, fd: c.fd_t, stream_id: u64, final_offset: u64) !void {
+    try sendTerminalMuxFrame(allocator, fd, .{
         .stream_id = stream_id,
         .message = .{ .eof = .{ .final_offset = final_offset } },
     });
 }
 
-fn sendTeMuxReset(
+fn sendTerminalMuxReset(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     stream_id: u64,
     code: []const u8,
     message: []const u8,
 ) !void {
-    try sendTeMuxFrame(allocator, fd, .{
+    try sendTerminalMuxFrame(allocator, fd, .{
         .stream_id = stream_id,
         .message = .{ .reset = .{
             .code = code,
@@ -496,7 +496,7 @@ fn sendTeMuxReset(
     });
 }
 
-fn sendTeMuxResetForError(
+fn sendTerminalMuxResetForError(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     stream_id: u64,
@@ -505,23 +505,23 @@ fn sendTeMuxResetForError(
 ) !void {
     const message = try std.fmt.allocPrint(allocator, "terminal mux stream failed: {t}", .{err});
     defer allocator.free(message);
-    try sendTeMuxReset(allocator, fd, stream_id, code, message);
+    try sendTerminalMuxReset(allocator, fd, stream_id, code, message);
 }
 
-fn sendTeMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
+fn sendTerminalMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
     try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
 
-fn sendTeHangupToRuntime(fd: c.fd_t) !void {
+fn sendTerminalHangupToRemote(fd: c.fd_t) !void {
     try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fd, .{ .session_hangup_request = .{} });
 }
 
-fn connectRuntimeForOpen(allocator: std.mem.Allocator, request: pb.TerminalEmulatorItem.Open) !c.fd_t {
+fn connectTerminalRemoteForOpen(allocator: std.mem.Allocator, request: pb.TerminalEmulatorItem.Open) !c.fd_t {
     if (!session_registry.isValidSessionGuid(request.session_guid)) return error.InvalidSessionGuid;
-    return session_runtime.connectSessionRuntime(allocator, request.session_guid);
+    return session_runtime.connectTerminalRemoteProcess(allocator, request.session_guid);
 }
 
-fn startSessionRuntimeAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_open_payload: []const u8) !c.fd_t {
+fn startTerminalRemoteAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_open_payload: []const u8) !c.fd_t {
     const started_ms = std.time.milliTimestamp();
     var request = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, session_open_payload);
     defer request.deinit(allocator);
@@ -533,14 +533,14 @@ fn startSessionRuntimeAndConnect(allocator: std.mem.Allocator, exe: []const u8, 
     defer allocator.free(guid);
 
     daemon_log.infof(allocator, "terminal session creating session={s}", .{guid});
-    const control = try session_runtime.startSessionRuntimeProcess(allocator, exe, guid);
-    const runtime_fd = try session_runtime.connectStartedSessionRuntime(control);
+    const control = try session_runtime.startTerminalRemoteProcess(allocator, exe, guid);
+    const process_fd = try session_runtime.connectStartedTerminalRemoteProcess(control);
     daemon_log.infof(
         allocator,
-        "terminal session runtime connected session={s} elapsed_ms={}",
+        "terminal remote process connected session={s} elapsed_ms={}",
         .{ guid, elapsedMsSince(started_ms) },
     );
-    return runtime_fd;
+    return process_fd;
 }
 
 fn teStreamActionName(request: pb.TerminalEmulatorItem.Open) []const u8 {
@@ -592,29 +592,29 @@ fn appendEnvironmentEntry(
     });
 }
 
-fn openRuntimeAndForwardFrames(
+fn openTerminalRemoteAndForwardFrames(
     allocator: std.mem.Allocator,
-    runtime_fd: c.fd_t,
+    process_fd: c.fd_t,
     session_open_payload: []const u8,
     read_fd: c.fd_t,
     write_fd: c.fd_t,
 ) !void {
-    initiateRuntimeHandshake(allocator, runtime_fd) catch |err| switch (err) {
+    initiateTerminalRemoteHandshake(allocator, process_fd) catch |err| switch (err) {
         error.VersionMismatch => {
-            try sendError(write_fd, "VERSION_MISMATCH", "existing remote session runtime is incompatible with this client", "Start a fresh sessh connection with matching binaries");
+            try sendError(write_fd, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client", "Start a fresh sessh connection with matching binaries");
             return;
         },
         else => return err,
     };
     var session_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, session_open_payload);
     defer session_open.deinit(allocator);
-    try protocol.sendTeStreamPayloadFrame(allocator, runtime_fd, .{ .open = session_open });
-    try frame_forwarder.forwardFrames(read_fd, write_fd, runtime_fd);
+    try protocol.sendTeStreamPayloadFrame(allocator, process_fd, .{ .open = session_open });
+    try frame_forwarder.forwardFrames(read_fd, write_fd, process_fd);
 }
 
-fn forwardRuntimeFramesToClient(allocator: std.mem.Allocator, runtime_fd: c.fd_t, write_fd: c.fd_t) !void {
+fn forwardTerminalRemoteFramesToClient(allocator: std.mem.Allocator, process_fd: c.fd_t, write_fd: c.fd_t) !void {
     while (true) {
-        var frame = protocol.readFrameAlloc(allocator, runtime_fd) catch |err| switch (err) {
+        var frame = protocol.readFrameAlloc(allocator, process_fd) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
@@ -629,18 +629,18 @@ fn errorIsVersionMismatch(allocator: std.mem.Allocator, payload: []const u8) !bo
     return std.mem.eql(u8, message.code, "VERSION_MISMATCH");
 }
 
-fn initiateRuntimeHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+fn initiateTerminalRemoteHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     try sendHelloRequest(fd);
     var hello_error = try readHelloReply(allocator, fd);
     defer if (hello_error) |*err| err.deinit(allocator);
     if (hello_error) |err| {
         if (std.mem.eql(u8, err.code, "VERSION_MISMATCH")) return error.VersionMismatch;
-        return error.RuntimeHandshakeFailed;
+        return error.RemoteHandshakeFailed;
     }
     var peer_hello = try readHelloRequest(allocator, fd, fd);
     defer peer_hello.deinit(allocator);
     if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote session runtime is incompatible with this client", "Start a fresh sessh connection with matching binaries");
+        try sendHelloError(fd, "VERSION_MISMATCH", "existing remote terminal process is incompatible with this client", "Start a fresh sessh connection with matching binaries");
         return error.VersionMismatch;
     }
     try sendHelloOk(fd);

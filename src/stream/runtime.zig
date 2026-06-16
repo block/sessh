@@ -331,10 +331,6 @@ const StreamAttachedClient = struct {
     transport_write_fd: c.fd_t,
     options: StreamAttachedClientOptions,
     liveness: StreamLiveness,
-    // Optional fd used only by the local stream loop. It lets that loop wake an
-    // otherwise blocking attached client when an async replacement transport is
-    // ready, without shortening the main poll timeout.
-    external_wakeup_fd: c.fd_t = -1,
     interrupt_fd: c.fd_t = -1,
 
     fn init(
@@ -361,7 +357,7 @@ const StreamAttachedClient = struct {
         if (state.complete()) return .complete;
 
         const now_before_poll_ms = nowMillis();
-        var pollfds: [1 + 1 + 1 + 3]posix.pollfd = undefined;
+        var pollfds: [1 + 1 + 1 + 2]posix.pollfd = undefined;
         var count: usize = 0;
         const transport_index = count;
         pollfds[count] = .{ .fd = self.transport_read_fd, .events = posix.POLL.IN, .revents = 0 };
@@ -382,12 +378,6 @@ const StreamAttachedClient = struct {
             count += 1;
         }
 
-        var external_wakeup_index: ?usize = null;
-        if (self.external_wakeup_fd >= 0) {
-            external_wakeup_index = count;
-            pollfds[count] = .{ .fd = self.external_wakeup_fd, .events = posix.POLL.IN, .revents = 0 };
-            count += 1;
-        }
         var control_index: ?usize = null;
         if (self.options.control_fd >= 0 and self.options.control_input != null) {
             control_index = count;
@@ -471,14 +461,7 @@ const StreamAttachedClient = struct {
             }
             break :blk false;
         };
-        if (!source_ready) {
-            // A wake-only event means the local loop has a replacement result
-            // to inspect. Do not flush buffered bytes to the old transport just
-            // because the replacement thread finished.
-            if (external_wakeup_index) |index| {
-                if (pollfds[index].revents != 0) return .idle;
-            }
-        }
+        _ = source_ready;
         try drainStreamSourcesNonBlocking(state, &self.options);
         if (try self.completeAfterSourceReset()) return .complete;
 
@@ -578,25 +561,6 @@ fn setCloseOnExec(fd: c.fd_t) !void {
     if (c.fcntl(fd, c.F.SETFD, flags | close_on_exec_flag) < 0) return error.FcntlFailed;
 }
 
-fn createNotifyPipe() ![2]c.fd_t {
-    const notify_pipe = try createNotifyPipe();
-    return notify_pipe;
-}
-
-fn drainNotify(fd: c.fd_t) void {
-    var buf: [64]u8 = undefined;
-    while (true) {
-        const n = c.read(fd, &buf, buf.len);
-        if (n > 0) continue;
-        if (n == 0) return;
-        switch (posix.errno(n)) {
-            .INTR => continue,
-            .AGAIN => return,
-            else => return,
-        }
-    }
-}
-
 const LocalStreamInterrupt = struct {
     read_fd: c.fd_t = -1,
     write_fd: c.fd_t = -1,
@@ -666,144 +630,6 @@ const LocalStreamInterrupt = struct {
     }
 };
 
-fn PendingReplacement(comptime Starter: type, comptime Transport: type) type {
-    return struct {
-        const Self = @This();
-        const Result = reconnect.AsyncResult(Transport);
-
-        state: *State,
-
-        // The reconnect attempt runs on a thread, but the stream loop is built
-        // around fd readiness. This pipe turns thread completion into another
-        // pollable event so the loop does not need a short timeout just to ask
-        // whether the thread is done.
-        const State = struct {
-            allocator: std.mem.Allocator,
-            starter: Starter,
-            mutex: std.Thread.Mutex = .{},
-            done: bool = false,
-            abandoned: bool = false,
-            result: ?Result = null,
-            notify_read_fd: c.fd_t = -1,
-            notify_write_fd: c.fd_t = -1,
-
-            fn main(self: *State, thread_allocator: std.mem.Allocator) void {
-                var result: Result = if (self.starter.start()) |transport|
-                    .{ .ready = transport }
-                else |err|
-                    .{ .failed = err };
-
-                self.mutex.lock();
-                if (self.abandoned) {
-                    self.mutex.unlock();
-                    cleanupReplacementResult(Transport, &result);
-                    self.closeNotifyFds();
-                    self.allocator.destroy(self);
-                    return;
-                }
-                self.result = result;
-                self.done = true;
-                self.notifyDone();
-                self.mutex.unlock();
-                _ = thread_allocator;
-            }
-
-            fn notifyDone(self: *State) void {
-                var byte = [_]u8{1};
-                while (true) {
-                    const n = c.write(self.notify_write_fd, byte[0..].ptr, byte.len);
-                    if (n > 0) return;
-                    if (n == 0) return;
-                    switch (posix.errno(n)) {
-                        .INTR => continue,
-                        else => return,
-                    }
-                }
-            }
-
-            fn closeNotifyFds(self: *State) void {
-                if (self.notify_read_fd >= 0) {
-                    posix.close(self.notify_read_fd);
-                    self.notify_read_fd = -1;
-                }
-                if (self.notify_write_fd >= 0) {
-                    posix.close(self.notify_write_fd);
-                    self.notify_write_fd = -1;
-                }
-            }
-        };
-
-        fn start(allocator: std.mem.Allocator, starter: Starter) !Self {
-            const notify_pipe = try posix.pipe();
-            errdefer {
-                posix.close(notify_pipe[0]);
-                posix.close(notify_pipe[1]);
-            }
-            try setNonBlockingFd(notify_pipe[0]);
-            try setNonBlockingFd(notify_pipe[1]);
-            try setCloseOnExec(notify_pipe[0]);
-            try setCloseOnExec(notify_pipe[1]);
-
-            const state = try allocator.create(State);
-            state.* = .{
-                .allocator = allocator,
-                .starter = starter,
-                .notify_read_fd = notify_pipe[0],
-                .notify_write_fd = notify_pipe[1],
-            };
-            errdefer {
-                state.closeNotifyFds();
-                allocator.destroy(state);
-            }
-            const thread = try std.Thread.spawn(.{}, State.main, .{ state, std.heap.smp_allocator });
-            thread.detach();
-            return .{ .state = state };
-        }
-
-        fn notifyFd(self: *const Self) c.fd_t {
-            return self.state.notify_read_fd;
-        }
-
-        fn takeIfDone(self: *Self) ?Result {
-            self.state.mutex.lock();
-            if (!self.state.done) {
-                self.state.mutex.unlock();
-                return null;
-            }
-            const result = self.state.result.?;
-            self.state.result = null;
-            self.state.closeNotifyFds();
-            self.state.mutex.unlock();
-            self.state.allocator.destroy(self.state);
-            self.* = undefined;
-            return result;
-        }
-
-        fn abandon(self: *Self) void {
-            self.state.mutex.lock();
-            if (self.state.done) {
-                var result = self.state.result.?;
-                self.state.result = null;
-                self.state.closeNotifyFds();
-                self.state.mutex.unlock();
-                cleanupReplacementResult(Transport, &result);
-                self.state.allocator.destroy(self.state);
-            } else {
-                self.state.abandoned = true;
-                self.state.mutex.unlock();
-            }
-            self.* = undefined;
-        }
-    };
-}
-
-fn cleanupReplacementResult(comptime Transport: type, result: *reconnect.AsyncResult(Transport)) void {
-    switch (result.*) {
-        .ready => |*transport| transport.close(),
-        .failed => {},
-    }
-}
-
 const ProxyEndpoint = struct {
     stream: std.net.Stream,
     fd: c.fd_t,
@@ -838,10 +664,10 @@ const ProxyEndpoint = struct {
     }
 };
 
-pub const ProxyMuxRuntime = struct {
+pub const ProxyMuxStream = struct {
     stream_id: u64,
-    runtime_fd: c.fd_t = -1,
-    runtime_watch_id: ?dispatcher.FdWatchId = null,
+    process_fd: c.fd_t = -1,
+    process_watch_id: ?dispatcher.FdWatchId = null,
     reader: protocol.FrameReader = undefined,
     reader_initialized: bool = false,
     open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
@@ -849,53 +675,53 @@ pub const ProxyMuxRuntime = struct {
     proxy_guid_len: usize = 0,
     cleanup_recorded: bool = false,
 
-    pub fn proxyGuidSlice(self: *const ProxyMuxRuntime) []const u8 {
+    pub fn proxyGuidSlice(self: *const ProxyMuxStream) []const u8 {
         return self.proxy_guid[0..self.proxy_guid_len];
     }
 
-    fn setProxyGuid(self: *ProxyMuxRuntime, guid: []const u8) !void {
+    fn setProxyGuid(self: *ProxyMuxStream, guid: []const u8) !void {
         if (guid.len > self.proxy_guid.len) return error.ProxyGuidTooLarge;
         @memcpy(self.proxy_guid[0..guid.len], guid);
         self.proxy_guid_len = guid.len;
     }
 };
 
-pub fn closeProxyMuxRuntimes(
+pub fn closeProxyMuxStreams(
     allocator: std.mem.Allocator,
-    streams: *std.ArrayList(ProxyMuxRuntime),
+    streams: *std.ArrayList(ProxyMuxStream),
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) void {
     for (streams.items) |stream| {
-        closeProxyMuxRuntime(allocator, stream, true, daemon_dispatcher);
+        closeProxyMuxStream(allocator, stream, true, daemon_dispatcher);
     }
     streams.deinit(allocator);
 }
 
-pub fn closeProxyMuxRuntime(
+pub fn closeProxyMuxStream(
     allocator: std.mem.Allocator,
-    runtime: ProxyMuxRuntime,
+    stream: ProxyMuxStream,
     send_startup_failed: bool,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) void {
     if (daemon_dispatcher) |d| {
-        if (runtime.runtime_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
+        if (stream.process_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
     }
-    if (runtime.runtime_fd >= 0 and send_startup_failed and !runtime.cleanup_recorded) {
-        sendProxyMuxReset(allocator, runtime.runtime_fd, proxy_mux_stream_id, "STARTUP_FAILED", "proxy cleanup record was not acknowledged") catch {};
+    if (stream.process_fd >= 0 and send_startup_failed and !stream.cleanup_recorded) {
+        sendProxyMuxReset(allocator, stream.process_fd, proxy_mux_stream_id, "STARTUP_FAILED", "proxy cleanup record was not acknowledged") catch {};
     }
-    if (runtime.runtime_fd >= 0) _ = c.close(runtime.runtime_fd);
-    var moved_runtime = runtime;
-    if (moved_runtime.reader_initialized) moved_runtime.reader.deinit();
+    if (stream.process_fd >= 0) _ = c.close(stream.process_fd);
+    var moved_stream = stream;
+    if (moved_stream.reader_initialized) moved_stream.reader.deinit();
 }
 
 pub fn handleProxyMuxStreamFrame(
     allocator: std.mem.Allocator,
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
-    streams: *std.ArrayList(ProxyMuxRuntime),
+    streams: *std.ArrayList(ProxyMuxStream),
     mux_fd: c.fd_t,
     mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
-    runtime_watch_handler: ?dispatcher.Handler,
+    process_watch_handler: ?dispatcher.Handler,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !void {
     var owned_mux_frame = mux_frame;
@@ -903,25 +729,25 @@ pub fn handleProxyMuxStreamFrame(
     const message = owned_mux_frame.message orelse return error.StreamUnexpectedFrame;
     switch (message) {
         .open => |open| try handleProxyMuxOpen(allocator, streams, owned_mux_frame.stream_id, open),
-        .payload => |payload| try handleProxyMuxPayload(allocator, exe, identity, streams, mux_fd, owned_mux_frame.stream_id, payload, owned_mux_frame, runtime_watch_handler, daemon_dispatcher),
-        .open_ok, .ack, .eof => try forwardProxyMuxFrameToRuntime(allocator, streams, owned_mux_frame),
+        .payload => |payload| try handleProxyMuxPayload(allocator, exe, identity, streams, mux_fd, owned_mux_frame.stream_id, payload, owned_mux_frame, process_watch_handler, daemon_dispatcher),
+        .open_ok, .ack, .eof => try forwardProxyMuxFrameToProxyRemote(allocator, streams, owned_mux_frame),
         .reset => {
-            forwardProxyMuxFrameToRuntime(allocator, streams, owned_mux_frame) catch {};
-            try removeProxyMuxRuntime(allocator, streams, owned_mux_frame.stream_id, daemon_dispatcher);
+            forwardProxyMuxFrameToProxyRemote(allocator, streams, owned_mux_frame) catch {};
+            try removeProxyMuxStream(allocator, streams, owned_mux_frame.stream_id, daemon_dispatcher);
         },
     }
 }
 
 pub fn handleProxyMuxOpen(
     allocator: std.mem.Allocator,
-    streams: *std.ArrayList(ProxyMuxRuntime),
+    streams: *std.ArrayList(ProxyMuxStream),
     stream_id: u64,
     open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
 ) !void {
-    if (findProxyMuxRuntimeIndex(streams, stream_id)) |index| {
+    if (findProxyMuxStreamIndex(streams, stream_id)) |index| {
         streams.items[index].open = open;
-        if (streams.items[index].runtime_fd >= 0) {
-            try sendProxyRuntimeMuxFrame(allocator, streams.items[index].runtime_fd, .{
+        if (streams.items[index].process_fd >= 0) {
+            try sendProxyMuxFrame(allocator, streams.items[index].process_fd, .{
                 .stream_id = proxy_mux_stream_id,
                 .message = .{ .open = open },
             });
@@ -938,12 +764,12 @@ fn handleProxyMuxPayload(
     allocator: std.mem.Allocator,
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
-    streams: *std.ArrayList(ProxyMuxRuntime),
+    streams: *std.ArrayList(ProxyMuxStream),
     mux_fd: c.fd_t,
     stream_id: u64,
     payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload,
     mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
-    runtime_watch_handler: ?dispatcher.Handler,
+    process_watch_handler: ?dispatcher.Handler,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !void {
     const item = payload.item orelse return error.StreamUnexpectedFrame;
@@ -953,8 +779,8 @@ fn handleProxyMuxPayload(
     };
     const proxy_payload = proxy_item.payload orelse return error.StreamUnexpectedFrame;
     switch (proxy_payload) {
-        .open => |request| try handleProxyMuxPayloadOpen(allocator, exe, identity, streams, mux_fd, stream_id, request, runtime_watch_handler, daemon_dispatcher),
-        .data => try forwardProxyMuxFrameToRuntime(allocator, streams, mux_frame),
+        .open => |request| try handleProxyMuxPayloadOpen(allocator, exe, identity, streams, mux_fd, stream_id, request, process_watch_handler, daemon_dispatcher),
+        .data => try forwardProxyMuxFrameToProxyRemote(allocator, streams, mux_frame),
     }
 }
 
@@ -962,36 +788,36 @@ fn handleProxyMuxPayloadOpen(
     allocator: std.mem.Allocator,
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
-    streams: *std.ArrayList(ProxyMuxRuntime),
+    streams: *std.ArrayList(ProxyMuxStream),
     mux_fd: c.fd_t,
     stream_id: u64,
     request: pb.ProxyStreamItem.Open,
-    runtime_watch_handler: ?dispatcher.Handler,
+    process_watch_handler: ?dispatcher.Handler,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !void {
-    const index = findProxyMuxRuntimeIndex(streams, stream_id) orelse return error.StreamUnexpectedFrame;
-    if (streams.items[index].runtime_fd >= 0) return;
+    const index = findProxyMuxStreamIndex(streams, stream_id) orelse return error.StreamUnexpectedFrame;
+    if (streams.items[index].process_fd >= 0) return;
     if (!session_registry.isValidProxyGuid(request.proxy_guid)) return error.InvalidStreamGuid;
     if (request.proxy_port == 0 or request.proxy_port > std.math.maxInt(u16)) return error.InvalidStreamArgs;
 
-    const runtime = try connectOrStartProxyRemote(
+    const remote_process = try connectOrStartProxyRemote(
         allocator,
         exe,
         request.proxy_guid,
         request.proxy_host,
         @intCast(request.proxy_port),
     );
-    const runtime_fd = try connectStartedProxyRemote(runtime);
-    errdefer _ = c.close(runtime_fd);
+    const process_fd = try connectStartedProxyRemote(remote_process);
+    errdefer _ = c.close(process_fd);
     if (daemon_dispatcher != null) {
-        try core_fds.setNonBlocking(runtime_fd);
+        try core_fds.setNonBlocking(process_fd);
     }
 
-    try sendProxyRuntimeMuxFrame(allocator, runtime_fd, .{
+    try sendProxyMuxFrame(allocator, process_fd, .{
         .stream_id = proxy_mux_stream_id,
         .message = .{ .open = streams.items[index].open },
     });
-    streams.items[index].runtime_fd = runtime_fd;
+    streams.items[index].process_fd = process_fd;
     const canonical = try session_registry.canonicalProxyGuid(allocator, request.proxy_guid);
     defer allocator.free(canonical);
     try streams.items[index].setProxyGuid(canonical);
@@ -1002,66 +828,66 @@ fn handleProxyMuxPayloadOpen(
         daemon_cleanup.makeRemoteProcessIdentity(identity, canonical),
     );
     if (daemon_dispatcher) |d| {
-        const handler = runtime_watch_handler orelse return error.MissingProxyRuntimeHandler;
+        const handler = process_watch_handler orelse return error.MissingProxyRemoteHandler;
         streams.items[index].reader = protocol.FrameReader.init(allocator);
         streams.items[index].reader_initialized = true;
-        streams.items[index].runtime_watch_id = try d.watchFd(runtime_fd, .{ .readable = true }, .{
+        streams.items[index].process_watch_id = try d.watchFd(process_fd, .{ .readable = true }, .{
             .ctx = handler.ctx,
             .callback = handler.callback,
         });
     }
 }
 
-fn forwardProxyMuxFrameToRuntime(
+fn forwardProxyMuxFrameToProxyRemote(
     allocator: std.mem.Allocator,
-    streams: *std.ArrayList(ProxyMuxRuntime),
+    streams: *std.ArrayList(ProxyMuxStream),
     mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !void {
-    const index = findProxyMuxRuntimeIndex(streams, mux_frame.stream_id) orelse return error.StreamUnexpectedFrame;
-    if (streams.items[index].runtime_fd < 0) return error.StreamUnexpectedFrame;
+    const index = findProxyMuxStreamIndex(streams, mux_frame.stream_id) orelse return error.StreamUnexpectedFrame;
+    if (streams.items[index].process_fd < 0) return error.StreamUnexpectedFrame;
     var remapped = mux_frame;
     remapped.stream_id = proxy_mux_stream_id;
-    try sendProxyRuntimeMuxFrame(allocator, streams.items[index].runtime_fd, remapped);
+    try sendProxyMuxFrame(allocator, streams.items[index].process_fd, remapped);
 }
 
-pub fn forwardProxyRuntimeOwnedFrameToMux(
+pub fn forwardProxyRemoteFrameToMux(
     allocator: std.mem.Allocator,
     mux_fd: c.fd_t,
-    runtime: *ProxyMuxRuntime,
+    stream: *ProxyMuxStream,
     frame: *protocol.OwnedFrame,
 ) !bool {
     if (frame.message_type != .daemon_tunnel) return error.StreamUnexpectedFrame;
     var mux_frame = try protocol.decodeDaemonMuxStreamFrame(allocator, frame.payload);
     defer mux_frame.deinit(allocator);
-    mux_frame.stream_id = runtime.stream_id;
-    try sendProxyRuntimeMuxFrame(allocator, mux_fd, mux_frame);
+    mux_frame.stream_id = stream.stream_id;
+    try sendProxyMuxFrame(allocator, mux_fd, mux_frame);
     return true;
 }
 
-pub fn findProxyMuxRuntimeIndex(streams: *const std.ArrayList(ProxyMuxRuntime), stream_id: u64) ?usize {
+pub fn findProxyMuxStreamIndex(streams: *const std.ArrayList(ProxyMuxStream), stream_id: u64) ?usize {
     for (streams.items, 0..) |stream, index| {
         if (stream.stream_id == stream_id) return index;
     }
     return null;
 }
 
-pub fn findProxyMuxRuntimeIndexByWatch(streams: *const std.ArrayList(ProxyMuxRuntime), watch_id: dispatcher.FdWatchId) ?usize {
-    for (streams.items, 0..) |runtime, index| {
-        const runtime_watch_id = runtime.runtime_watch_id orelse continue;
-        if (runtime_watch_id.index == watch_id.index and runtime_watch_id.generation == watch_id.generation) return index;
+pub fn findProxyMuxStreamIndexByWatch(streams: *const std.ArrayList(ProxyMuxStream), watch_id: dispatcher.FdWatchId) ?usize {
+    for (streams.items, 0..) |stream, index| {
+        const process_watch_id = stream.process_watch_id orelse continue;
+        if (process_watch_id.index == watch_id.index and process_watch_id.generation == watch_id.generation) return index;
     }
     return null;
 }
 
-pub fn removeProxyMuxRuntime(
+pub fn removeProxyMuxStream(
     allocator: std.mem.Allocator,
-    streams: *std.ArrayList(ProxyMuxRuntime),
+    streams: *std.ArrayList(ProxyMuxStream),
     stream_id: u64,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !void {
-    const index = findProxyMuxRuntimeIndex(streams, stream_id) orelse return;
-    const runtime = streams.swapRemove(index);
-    closeProxyMuxRuntime(allocator, runtime, false, daemon_dispatcher);
+    const index = findProxyMuxStreamIndex(streams, stream_id) orelse return;
+    const stream = streams.swapRemove(index);
+    closeProxyMuxStream(allocator, stream, false, daemon_dispatcher);
 }
 
 pub fn sendProxyMuxReset(
@@ -1071,7 +897,7 @@ pub fn sendProxyMuxReset(
     code: []const u8,
     message: []const u8,
 ) !void {
-    try sendProxyRuntimeMuxFrame(allocator, fd, .{
+    try sendProxyMuxFrame(allocator, fd, .{
         .stream_id = stream_id,
         .message = .{ .reset = .{
             .code = code,
@@ -1080,7 +906,7 @@ pub fn sendProxyMuxReset(
     });
 }
 
-fn sendProxyRuntimeMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
+fn sendProxyMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
     try protocol.sendMuxStreamFrame(allocator, fd, message);
 }
 
@@ -1127,7 +953,7 @@ fn waitForReplacementWhileDisconnected(
     options: *const StreamAttachedClientOptions,
 ) !c.fd_t {
     while (true) {
-        // The proxy stream runtime is durable even when no ssh transport is currently
+        // The remote proxy process is durable even when no ssh transport is currently
         // attached. It must keep draining remote fds into the offset-tracked
         // buffers; otherwise the remote TCP peer can block before a
         // replacement transport attaches.
@@ -1177,9 +1003,7 @@ pub fn runLocalStream(
     start_transport: anytype,
     options: LocalStreamOptions,
 ) !u8 {
-    const Starter = @TypeOf(start_transport);
     const Transport = @TypeOf(start_transport.start() catch unreachable);
-    const Pending = PendingReplacement(Starter, Transport);
     var control_fd = options.control_fd;
     if (control_fd >= 0) setNonBlockingFd(control_fd) catch {};
 
@@ -1204,35 +1028,26 @@ pub fn runLocalStream(
     var attempt: usize = 0;
     var had_transport = false;
     var retrying = false;
-    var pending: ?Pending = null;
-    var resumed_transport: ?Transport = null;
-    defer if (pending) |*replacement| replacement.abandon();
-    defer if (resumed_transport) |*transport| transport.close();
 
     client_loop: while (true) {
         var transport: Transport = undefined;
-        if (resumed_transport) |existing| {
-            transport = existing;
-            resumed_transport = null;
-        } else {
-            if (retrying) reconnect_status.showReconnecting();
-            transport = start_transport.start() catch |err| {
-                // Before the first successful transport, a start failure usually
-                // means ssh could not authenticate in BatchMode. Return that to
-                // the outer ssh instead of retrying forever.
-                if (!had_transport and !state.hasProgress()) {
-                    reconnect_status.flushDiagnostics();
-                    return err;
-                }
-                const delay_ms = reconnect.delayMs(attempt);
-                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
-                if (action == .disconnect) return 0;
-                if (action == .interrupt) return 255;
-                attempt = reconnect.nextAttempt(attempt, action == .reconnect);
-                retrying = true;
-                continue;
-            };
-        }
+        if (retrying) reconnect_status.showReconnecting();
+        transport = start_transport.start() catch |err| {
+            // Before the first successful transport, a start failure usually
+            // means ssh could not authenticate in BatchMode. Return that to
+            // the outer ssh instead of retrying forever.
+            if (!had_transport and !state.hasProgress()) {
+                reconnect_status.flushDiagnostics();
+                return err;
+            }
+            const delay_ms = reconnect.delayMs(attempt);
+            const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
+            if (action == .disconnect) return 0;
+            if (action == .interrupt) return 255;
+            attempt = reconnect.nextAttempt(attempt, action == .reconnect);
+            retrying = true;
+            continue;
+        };
         had_transport = true;
         reconnect_status.flushDiagnostics();
         reconnect_status.clear();
@@ -1270,7 +1085,6 @@ pub fn runLocalStream(
             }
             var old_unresponsive = false;
             while (true) {
-                attached_client.external_wakeup_fd = if (pending) |*replacement| replacement.notifyFd() else -1;
                 attached_client.interrupt_fd = local_interrupt.read_fd;
                 const outcome = attached_client.step(-1) catch .transport_closed;
                 switch (outcome) {
@@ -1292,19 +1106,22 @@ pub fn runLocalStream(
                             reconnect_status.showReconnecting();
                             input_control.status_visible = true;
                         }
-                        if (pending == null) {
-                            pending = Pending.start(allocator, start_transport) catch |err| {
-                                client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
-                                const delay_ms = reconnect.delayMs(attempt);
-                                const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
-                                if (action == .disconnect) return 0;
-                                if (action == .interrupt) return 255;
-                                attempt = reconnect.nextAttempt(attempt, action == .reconnect);
-                                continue;
-                            };
-                            reconnect_status.showReconnecting();
-                            input_control.status_visible = true;
-                        }
+                        const new_transport = start_transport.start() catch |err| {
+                            client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
+                            const delay_ms = reconnect.delayMs(attempt);
+                            const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
+                            if (action == .disconnect) return 0;
+                            if (action == .interrupt) return 255;
+                            attempt = reconnect.nextAttempt(attempt, action == .reconnect);
+                            continue;
+                        };
+                        abortTransport(&transport);
+                        transport = new_transport;
+                        attempt = 0;
+                        retrying = false;
+                        reconnect_status.clear();
+                        input_control.status_visible = false;
+                        continue :transport_loop;
                     },
                     .transport_closed => {
                         transport.close();
@@ -1329,120 +1146,26 @@ pub fn runLocalStream(
                         abortTransport(&transport);
                         return 0;
                     },
-                    .reconnect => if (old_unresponsive and pending == null) {
-                        pending = Pending.start(allocator, start_transport) catch |err| {
+                    .reconnect => if (old_unresponsive) {
+                        const new_transport = start_transport.start() catch |err| {
                             client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                             continue;
                         };
-                        reconnect_status.showReconnecting();
-                        input_control.status_visible = true;
+                        abortTransport(&transport);
+                        transport = new_transport;
+                        attempt = 0;
+                        retrying = false;
+                        reconnect_status.clear();
+                        input_control.status_visible = false;
+                        continue :transport_loop;
                     },
                     .help => reconnect_status.showEscapeHelp(),
                     .none => {},
                     .interrupt => unreachable,
                 }
-
-                if (pending) |*replacement| {
-                    if (replacement.takeIfDone()) |result| {
-                        pending = null;
-                        switch (result) {
-                            .ready => |new_transport| {
-                                if (old_unresponsive) {
-                                    abortTransport(&transport);
-                                    transport = new_transport;
-                                    attempt = 0;
-                                    retrying = false;
-                                    reconnect_status.clear();
-                                    input_control.status_visible = false;
-                                    continue :transport_loop;
-                                }
-                                var discard = new_transport;
-                                discard.close();
-                            },
-                            .failed => |err| {
-                                client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
-                                if (old_unresponsive) {
-                                    const delay_ms = reconnect.delayMs(attempt);
-                                    const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
-                                    if (action == .disconnect) return 0;
-                                    if (action == .interrupt) return 255;
-                                    attempt = reconnect.nextAttempt(attempt, action == .reconnect);
-                                    pending = Pending.start(allocator, start_transport) catch |retry_err| {
-                                        client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{retry_err});
-                                        continue;
-                                    };
-                                    reconnect_status.showReconnecting();
-                                }
-                            },
-                        }
-                    }
-                }
             }
         }
 
-        if (pending) |*replacement| {
-            var result: ?reconnect.AsyncResult(Transport) = null;
-            while (result == null) {
-                result = replacement.takeIfDone();
-                if (result != null) break;
-                reconnect_status.showReconnecting();
-                input_control.status_visible = true;
-                var pollfds: [4]posix.pollfd = undefined;
-                var count: usize = 0;
-                pollfds[count] = .{ .fd = replacement.notifyFd(), .events = posix.POLL.IN, .revents = 0 };
-                count += 1;
-                const interrupt_index = count;
-                pollfds[count] = .{ .fd = local_interrupt.read_fd, .events = posix.POLL.IN, .revents = 0 };
-                count += 1;
-                var input_index: ?usize = null;
-                if (reconnectInputPollEnabled(&input_control)) {
-                    input_index = count;
-                    pollfds[count] = .{ .fd = options.source_fd, .events = posix.POLL.IN, .revents = 0 };
-                    count += 1;
-                }
-                var control_index: ?usize = null;
-                if (control_fd >= 0) {
-                    control_index = count;
-                    pollfds[count] = .{ .fd = control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-                    count += 1;
-                }
-
-                _ = posix.poll(pollfds[0..count], -1) catch {};
-                if (pollfds[interrupt_index].revents != 0) {
-                    local_interrupt.consume();
-                    return 255;
-                }
-                if (input_index) |index| {
-                    if (pollfds[index].revents != 0) {
-                        switch (readReconnectInput(&state, options.source_fd, &input_control)) {
-                            .disconnect => return 0,
-                            .help => reconnect_status.showEscapeHelp(),
-                            .none, .reconnect => {},
-                            .interrupt => unreachable,
-                        }
-                    }
-                }
-                if (control_index) |index| {
-                    if (pollfds[index].revents != 0) {
-                        if (!readControlInput(control_fd, &input_control)) control_fd = -1;
-                    }
-                }
-                reconnect_status.flushDiagnostics();
-            }
-            pending = null;
-            switch (result.?) {
-                .ready => |new_transport| {
-                    resumed_transport = new_transport;
-                    attempt = 0;
-                    retrying = false;
-                    input_control.status_visible = false;
-                    continue :client_loop;
-                },
-                .failed => |err| {
-                    client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
-                },
-            }
-        }
         const delay_ms = reconnect.delayMs(attempt);
         const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
         if (action == .disconnect) return 0;
@@ -1936,7 +1659,7 @@ pub fn requestProxyRemoteCleanup(allocator: std.mem.Allocator, guid: []const u8)
 }
 
 pub fn runProxyRemoteProcess(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len != 4) return error.InvalidProxyRuntimeArgs;
+    if (args.len != 4) return error.InvalidProxyRemoteArgs;
     core_fds.closeInheritedNonStdioFileDescriptors();
     const socket_path = args[0];
     const guid = args[1];
@@ -1987,7 +1710,7 @@ fn startProxyRemoteProcess(
 }
 
 fn proxyRemoteSocketPath(allocator: std.mem.Allocator, exe: []const u8) ![]u8 {
-    const dir = std.fs.path.dirname(exe) orelse return error.InvalidRuntimeExecutablePath;
+    const dir = std.fs.path.dirname(exe) orelse return error.InvalidRemoteProcessExecutablePath;
     const sequence = proxy_remote_socket_sequence;
     proxy_remote_socket_sequence +%= 1;
     return std.fmt.allocPrint(allocator, "{s}/proxy-{}-{}.sock", .{ dir, c.getpid(), sequence });
@@ -2718,46 +2441,33 @@ fn expectResetFrame(fd: c.fd_t, expected_code: []const u8) !void {
 }
 
 test "raw duplex propagates right-side eof to the left peer" {
-    const DuplexThread = struct {
-        left_fd: c.fd_t,
-        right_fd: c.fd_t,
+    const left_input = try posix.pipe();
+    posix.close(left_input[1]);
+    defer posix.close(left_input[0]);
 
-        fn main(self: *@This()) void {
-            forwardRawDuplex(self.left_fd, self.left_fd, self.right_fd) catch {};
-            _ = c.close(self.left_fd);
-            _ = c.close(self.right_fd);
-        }
-    };
-
-    var left: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &left) != 0) return error.SocketPairFailed;
-    defer _ = c.close(left[1]);
+    var left_output: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &left_output) != 0) return error.SocketPairFailed;
+    defer _ = c.close(left_output[0]);
+    defer _ = c.close(left_output[1]);
 
     var right: [2]c.fd_t = undefined;
     if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &right) != 0) return error.SocketPairFailed;
-    defer _ = c.close(right[1]);
-
-    var context = DuplexThread{
-        .left_fd = left[0],
-        .right_fd = right[0],
-    };
-    const thread = try std.Thread.spawn(.{}, DuplexThread.main, .{&context});
-    defer thread.join();
+    defer _ = c.close(right[0]);
 
     _ = c.close(right[1]);
     right[1] = -1;
 
+    try forwardRawDuplex(left_input[0], left_output[0], right[0]);
+
     var pollfds = [_]posix.pollfd{.{
-        .fd = left[1],
+        .fd = left_output[1],
         .events = posix.POLL.IN,
         .revents = 0,
     }};
-    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 1_000));
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 0));
 
     var byte: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(isize, 0), c.read(left[1], &byte, byte.len));
-
-    _ = c.shutdown(left[1], c.SHUT.WR);
+    try std.testing.expectEqual(@as(isize, 0), c.read(left_output[1], &byte, byte.len));
 }
 
 test "stream frames round trip through a pipe" {
@@ -2993,73 +2703,6 @@ test "stream input control supports ssh help and doubled tilde escapes" {
 
     try std.testing.expectEqualStrings("~hello", control.filter("~~hello", &out));
     try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
-}
-
-test "pending stream replacement hands off a prepared transport" {
-    const TestTransport = struct {
-        closed: *bool,
-
-        fn close(self: *@This()) void {
-            self.closed.* = true;
-        }
-    };
-    const TestStarter = struct {
-        closed: *bool,
-
-        fn start(self: *@This()) !TestTransport {
-            return .{ .closed = self.closed };
-        }
-    };
-
-    var closed = false;
-    var starter = TestStarter{ .closed = &closed };
-    const Pending = PendingReplacement(*TestStarter, TestTransport);
-    var pending = try Pending.start(std.testing.allocator, &starter);
-
-    var pollfds = [_]posix.pollfd{.{
-        .fd = pending.notifyFd(),
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 1_000));
-
-    var completed = pending.takeIfDone() orelse return error.PendingReplacementDidNotFinish;
-    defer cleanupReplacementResult(TestTransport, &completed);
-
-    switch (completed) {
-        .ready => try std.testing.expect(!closed),
-        .failed => return error.UnexpectedPendingReplacementFailure,
-    }
-}
-
-test "pending stream replacement notifies failed preparation" {
-    const TestTransport = struct {
-        fn close(_: *@This()) void {}
-    };
-    const TestStarter = struct {
-        fn start(_: *@This()) !TestTransport {
-            return error.TestReplacementFailed;
-        }
-    };
-
-    var starter = TestStarter{};
-    const Pending = PendingReplacement(*TestStarter, TestTransport);
-    var pending = try Pending.start(std.testing.allocator, &starter);
-
-    var pollfds = [_]posix.pollfd{.{
-        .fd = pending.notifyFd(),
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 1_000));
-
-    var completed = pending.takeIfDone() orelse return error.PendingReplacementDidNotFinish;
-    defer cleanupReplacementResult(TestTransport, &completed);
-
-    switch (completed) {
-        .ready => return error.UnexpectedPendingReplacementSuccess,
-        .failed => |err| try std.testing.expectEqual(error.TestReplacementFailed, err),
-    }
 }
 
 test "stream completion waits for eof acknowledgement" {

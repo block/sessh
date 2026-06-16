@@ -56,7 +56,7 @@ pub const Child = struct {
 // All PTY users should go through these master-read helpers instead of calling
 // read(2) directly. PTY EOF is not identical to pipe EOF on every platform:
 // Linux reports the closed slave side as EIO on the master. Keeping that rule
-// here prevents the stream and remote session runtimes from growing separate PTY lore.
+// here prevents the stream and remote terminal processs from growing separate PTY lore.
 pub const MasterRead = union(enum) {
     bytes: []const u8,
     would_block,

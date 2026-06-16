@@ -19,6 +19,10 @@ fn runtimeRootFor(allocator: std.mem.Allocator, uid: c.uid_t) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/sessh-{}", .{uid});
 }
 
+pub fn shortRuntimeRoot(allocator: std.mem.Allocator) ![]u8 {
+    return runtimeRootFor(allocator, c.getuid());
+}
+
 fn runtimeRootForXdg(allocator: std.mem.Allocator, xdg_runtime_dir: []const u8) ![]u8 {
     return allocator.dupe(u8, xdg_runtime_dir);
 }

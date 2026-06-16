@@ -865,11 +865,11 @@ fn runRemoteNewSession(
         if (err == error.VersionMismatch) {
             transport.close();
             if (runtime_config.common.capture_tty_transcript != null) {
-                try io.writeAll(2, "sessh: --capture-tty-transcript requires a compatible sessh runtime\n");
+                try io.writeAll(2, "sessh: --capture-tty-transcript requires a compatible sessh remote\n");
                 return process_exit.request(1);
             }
             if (new.command_argv.len > 0 or shell_command != null) {
-                try io.writeAll(2, "sessh: persistent command sessions require a compatible sessh runtime\n");
+                try io.writeAll(2, "sessh: persistent command sessions require a compatible sessh remote\n");
                 return process_exit.request(1);
             }
             try runPlainSshFallbackAfterVersionMismatch(allocator, target);
@@ -880,7 +880,7 @@ fn runRemoteNewSession(
         }
         waitAfterRuntimeAttachFailure(&transport, "start");
         if (process_exit.is(err)) return err;
-        try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
+        try io.stderrPrint("sessh: ssh remote attach failed: {t}\n", .{err});
         return process_exit.request(1);
     };
     defer session.deinit();
@@ -1861,6 +1861,7 @@ fn completePooledSshTransportRemoteFrameWrite(
         },
         .pong => {
             frame.frame.deinit();
+            try resumePooledSshTransportClientReads(daemon_dispatcher, transport);
             try resumePooledSshTransportRemoteRead(daemon_dispatcher, transport);
         },
         .client_mux_open_envelope => |*open| {
@@ -1883,6 +1884,7 @@ fn completePooledSshTransportRemoteFrameWrite(
         },
         .remote_process_recorded, .cleanup_request => {
             frame.frame.deinit();
+            try resumePooledSshTransportClientReads(daemon_dispatcher, transport);
             try resumePooledSshTransportRemoteRead(daemon_dispatcher, transport);
         },
     }
@@ -2373,7 +2375,7 @@ fn openPooledSshTransportClientStream(
     };
     client.kind = .te;
     try appendFilteredClientEnvironmentToTerminalOpen(transport.allocator, client, open);
-    try sendPooledTeMuxOpen(daemon_dispatcher, transport, client, open.*);
+    try sendPooledTerminalMuxOpen(daemon_dispatcher, transport, client, open.*);
     return true;
 }
 
@@ -2396,7 +2398,7 @@ fn forwardPooledSshTransportClientFrame(
             }
             var item = try protocol.decodeClientRemoteTerminalEmulatorItem(transport.allocator, frame.payload);
             defer item.deinit(transport.allocator);
-            try sendPooledTeMuxPayload(daemon_dispatcher, transport, client, item);
+            try sendPooledTerminalMuxPayload(daemon_dispatcher, transport, client, item);
         },
         .client_daemon => {
             if (client.kind != .proxy or client.proxy_guid_len == 0) {
@@ -2479,7 +2481,7 @@ fn sendEnvPatternMatchesFrom(pattern: []const u8, pattern_index: usize, name: []
     return false;
 }
 
-fn sendPooledTeMuxOpen(
+fn sendPooledTerminalMuxOpen(
     daemon_dispatcher: *dispatcher.Dispatcher,
     transport: *PooledSshTransport,
     client: *PooledSshTransportClient,
@@ -2584,7 +2586,7 @@ fn maybeRegisterProxyControlStream(
     try registerProxyControlStream(allocator, canonical, client.fd);
 }
 
-fn sendPooledTeMuxPayload(
+fn sendPooledTerminalMuxPayload(
     daemon_dispatcher: *dispatcher.Dispatcher,
     transport: *PooledSshTransport,
     client: *PooledSshTransportClient,
@@ -3288,7 +3290,7 @@ fn runAttachedRemoteClient(
         ) catch |err| {
             waitAfterRuntimeAttachFailure(transport, "attached client");
             if (process_exit.is(err)) return err;
-            try io.stderrPrint("sessh: ssh runtime attach failed: {t}\n", .{err});
+            try io.stderrPrint("sessh: ssh remote attach failed: {t}\n", .{err});
             return process_exit.request(1);
         };
 
@@ -3472,7 +3474,7 @@ fn waitAfterRuntimeAttachFailure(transport: *TerminalTransport, stage: []const u
     transport.closeStdin();
     transport.close();
     client_log.flush(2);
-    io.stderrPrint("sessh: ssh runtime transport closed after attach {s} failure\n", .{stage}) catch {};
+    io.stderrPrint("sessh: ssh remote transport closed after attach {s} failure\n", .{stage}) catch {};
 }
 
 fn finishHungUpSshSession(session: *attached_client.RuntimeSession) !void {
@@ -4113,8 +4115,8 @@ fn hasRemoteShellCommand(args: []const []const u8) bool {
 // as X11, agent forwarding, port forwarding, subsystems, and non-tty commands.
 // The visible outer `ssh` process gets the user's original options plus a
 // ProxyCommand. That ProxyCommand is a local sessh process that reconnects a
-// byte-clean stream to a remote stream runtime, and the remote stream runtime then
-// opens a TCP connection to sshd on the remote machine.
+// byte-clean stream to sesshd, and the remote proxy process then opens a TCP
+// connection to sshd on the remote machine.
 fn runProxyStreamSsh(
     allocator: std.mem.Allocator,
     exe: []const u8,

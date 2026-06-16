@@ -331,7 +331,7 @@ message TerminalEmulatorItem {
     string session_guid = 1;
     // Initial terminal size and repaint request for this client view.
     Resize resize = 2;
-    // When true, the remote session runtime sends raw inner PTY transcript
+    // When true, the remote terminal process sends raw inner PTY transcript
     // chunks for this client view. The client still owns archive creation and
     // storage.
     bool capture_tty_transcript = 3;
@@ -387,17 +387,17 @@ message TerminalEmulatorItem {
       string command = 1;
     }
 
-    // Maximum runtime-retained scrollback rows for this session.
+    // Maximum remote-terminal-retained scrollback rows for this session.
     uint32 scrollback_row_limit = 2;
     // Environment entries to apply to the PTY child. Entries already present in
     // the request take precedence over environment inherited by the remote
     // broker/daemon.
     repeated EnvironmentEntry environment = 3;
-    // Colors the remote session runtime may use to answer early OSC 10/11
+    // Colors the remote terminal process may use to answer early OSC 10/11
     // queries.
     DefaultColors query_default_colors = 4;
     // At most one command form may be present. When command is unset, the
-    // runtime starts the user's interactive login shell. The shell_command
+    // remote terminal process starts the user's interactive login shell. The shell_command
     // variant mirrors ssh's `ssh HOST cmd args...` behavior after the local argv
     // has been joined into a command string for the remote shell.
     oneof command {
@@ -406,8 +406,8 @@ message TerminalEmulatorItem {
     }
     // Portable local tty settings to apply to the newly created remote PTY.
     TtySettings tty_settings = 10;
-    // Maximum time the session may remain disconnected before the runtime ends
-    // it. Zero means disabled.
+    // Maximum time the session may remain disconnected before the remote
+    // terminal process ends it. Zero means disabled.
     uint64 reap_ms = 11;
   }
 
@@ -415,42 +415,42 @@ message TerminalEmulatorItem {
   message Input {
     // Raw bytes read from the local terminal.
     bytes data = 1;
-    // Client-assigned input sequence. The remote session runtime acknowledges
+    // Client-assigned input sequence. The remote terminal process acknowledges
     // nonzero sequence numbers after receiving the input frame.
     uint64 input_seq = 2;
   }
 
-  // Confirms that the remote session runtime received an Input frame.
+  // Confirms that the remote terminal process received an Input frame.
   message InputAck {
     uint64 input_seq = 1;
   }
 
   // Current terminal size for this attached client.
   message Resize {
-    // Rows visible in the local terminal. The remote session runtime bounds
+    // Rows visible in the local terminal. The remote terminal process bounds
     // this to u16.
     uint32 terminal_rows = 1;
-    // Columns visible in the local terminal. The remote session runtime bounds
+    // Columns visible in the local terminal. The remote terminal process bounds
     // this to u16.
     uint32 terminal_cols = 2;
-    // Present for resize frames that need a redraw. The remote session runtime
+    // Present for resize frames that need a redraw. The remote terminal process
     // applies the new size, then answers this request with a RepaintResponse.
     optional RepaintRequest repaint_request = 3;
     // Rows between the outer terminal viewport top and the sessh viewport top.
     // Omitted means the viewports are aligned. -1 means the client no longer
     // knows the offset, typically after SIGWINCH resized an unaligned viewport;
-    // the remote session runtime must align the viewports in its repaint
+    // the remote terminal process must align the viewports in its repaint
     // response.
     optional sint32 viewport_offset = 4;
   }
 
-  // Requests that the remote session runtime redraw terminal state for this
+  // Requests that the remote terminal process redraw terminal state for this
   // attached client.
   message RepaintRequest {
     // Client-local repaint request sequence copied into RepaintResponse. While
     // this repaint is outstanding, the client ignores framed Draw messages and
     // resumes applying draws only after receiving the matching RepaintResponse.
-    // If multiple RepaintRequests are in flight, the remote session runtime may
+    // If multiple RepaintRequests are in flight, the remote terminal process may
     // ignore all but the last one.
     uint64 repaint_request_seq = 1;
     // Opaque scrollback cursor. Absent means assume the client has current
@@ -507,14 +507,14 @@ message TerminalEmulatorItem {
     }
 
     Reason reason = 1;
-    // Absent means the remote session runtime did not observe a wait status,
+    // Absent means the remote terminal process did not observe a wait status,
     // for example because it is shutting down and synthesized the end
     // notification.
     optional ExitStatus exit_status = 2;
     optional uint64 ended_at_unix_ms = 3;
   }
 
-  // Session-runtime-generated terminal bytes for the attached session.
+  // Remote-terminal-generated terminal bytes for the attached session.
   message Draw {
     // Opaque cursor representing the client scrollback state after applying
     // this draw. Clients must store and pass this back without interpreting it.
@@ -536,7 +536,7 @@ message TerminalEmulatorItem {
     // string. False means no app title is known. The client needs this bit so a
     // temporary local title such as reconnect status can be restored correctly:
     // use the app title when present, otherwise use a client-local fallback. Do
-    // not send that fallback to the remote session runtime. It may contain the
+    // not send that fallback to the remote terminal process. It may contain the
     // user's local ssh alias or other client-private naming for the remote host,
     // which ssh does not normally reveal to the remote side.
     optional bool app_title_present = 5;

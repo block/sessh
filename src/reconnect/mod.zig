@@ -18,47 +18,6 @@ pub fn nextAttempt(attempt: usize, reset: bool) usize {
     return if (reset) 0 else attempt + 1;
 }
 
-pub fn AsyncResult(comptime Ready: type) type {
-    return union(enum) {
-        ready: Ready,
-        failed: anyerror,
-    };
-}
-
-// Shared handoff for reconnect attempts that prepare a replacement transport
-// in a worker thread. The transport-specific code owns how a replacement is
-// created and attached; this type only provides the synchronized result slot
-// used by both the PTY reconnect path and reconnectable byte streams.
-pub fn AsyncTask(comptime Ready: type) type {
-    return struct {
-        const Self = @This();
-        const Result = AsyncResult(Ready);
-
-        mutex: std.Thread.Mutex = .{},
-        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        result: ?Result = null,
-
-        pub fn store(self: *Self, result: Result) void {
-            self.mutex.lock();
-            self.result = result;
-            self.mutex.unlock();
-            self.done.store(true, .release);
-        }
-
-        pub fn isDone(self: *const Self) bool {
-            return self.done.load(.acquire);
-        }
-
-        pub fn take(self: *Self) ?Result {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const result = self.result orelse return null;
-            self.result = null;
-            return result;
-        }
-    };
-}
-
 test "delayMs follows the documented backoff schedule" {
     try std.testing.expectEqual(@as(u64, 10_000), delayMs(0));
     try std.testing.expectEqual(@as(u64, 20_000), delayMs(1));

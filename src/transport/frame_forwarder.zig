@@ -293,21 +293,21 @@ const CircularBuffer = struct {
     }
 };
 
-pub fn forwardFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, runtime_fd: c.fd_t) !void {
-    return forwardFramesBetween(stdin_fd, stdout_fd, runtime_fd, runtime_fd);
+pub fn forwardFrames(stdin_fd: c.fd_t, stdout_fd: c.fd_t, peer_fd: c.fd_t) !void {
+    return forwardFramesBetween(stdin_fd, stdout_fd, peer_fd, peer_fd);
 }
 
 pub fn forwardFramesBetween(
     client_read_fd: c.fd_t,
     client_write_fd: c.fd_t,
-    runtime_read_fd: c.fd_t,
-    runtime_write_fd: c.fd_t,
+    peer_read_fd: c.fd_t,
+    peer_write_fd: c.fd_t,
 ) !void {
     return forwardFramesBetweenWithClientCloseAction(
         client_read_fd,
         client_write_fd,
-        runtime_read_fd,
-        runtime_write_fd,
+        peer_read_fd,
+        peer_write_fd,
         .none,
     );
 }
@@ -315,15 +315,15 @@ pub fn forwardFramesBetween(
 pub fn forwardFramesBetweenWithClientCloseAction(
     client_read_fd: c.fd_t,
     client_write_fd: c.fd_t,
-    runtime_read_fd: c.fd_t,
-    runtime_write_fd: c.fd_t,
+    peer_read_fd: c.fd_t,
+    peer_write_fd: c.fd_t,
     client_close_action: ClientCloseAction,
 ) !void {
     return forwardFramesBetweenWithClientCloseActionAndDiagnostics(
         client_read_fd,
         client_write_fd,
-        runtime_read_fd,
-        runtime_write_fd,
+        peer_read_fd,
+        peer_write_fd,
         client_close_action,
         .{},
     );
@@ -332,15 +332,15 @@ pub fn forwardFramesBetweenWithClientCloseAction(
 pub fn forwardFramesBetweenWithClientCloseActionAndDiagnostics(
     client_read_fd: c.fd_t,
     client_write_fd: c.fd_t,
-    runtime_read_fd: c.fd_t,
-    runtime_write_fd: c.fd_t,
+    peer_read_fd: c.fd_t,
+    peer_write_fd: c.fd_t,
     client_close_action: ClientCloseAction,
     diagnostics: ClientDiagnosticForwarding,
 ) !void {
     defer {
         _ = c.shutdown(client_read_fd, c.SHUT.WR);
         if (client_write_fd != client_read_fd) _ = c.shutdown(client_write_fd, c.SHUT.WR);
-        _ = c.shutdown(runtime_write_fd, c.SHUT.WR);
+        _ = c.shutdown(peer_write_fd, c.SHUT.WR);
     }
 
     while (true) {
@@ -349,8 +349,8 @@ pub fn forwardFramesBetweenWithClientCloseActionAndDiagnostics(
         const client_index = count;
         pollfds[count] = .{ .fd = client_read_fd, .events = posix.POLL.IN, .revents = 0 };
         count += 1;
-        const runtime_index = count;
-        pollfds[count] = .{ .fd = runtime_read_fd, .events = posix.POLL.IN, .revents = 0 };
+        const peer_index = count;
+        pollfds[count] = .{ .fd = peer_read_fd, .events = posix.POLL.IN, .revents = 0 };
         count += 1;
         var diagnostic_index: ?usize = null;
         if (diagnostics.notify_read_fd >= 0) {
@@ -367,13 +367,13 @@ pub fn forwardFramesBetweenWithClientCloseActionAndDiagnostics(
             }
         }
         if ((pollfds[client_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (!try copyOneFrame(client_read_fd, runtime_write_fd)) {
-                try handleClientClose(runtime_write_fd, client_close_action, diagnostics.log_context);
+            if (!try copyOneFrame(client_read_fd, peer_write_fd)) {
+                try handleClientClose(peer_write_fd, client_close_action, diagnostics.log_context);
                 return;
             }
         }
-        if ((pollfds[runtime_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (!try copyOneFrame(runtime_read_fd, client_write_fd)) {
+        if ((pollfds[peer_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+            if (!try copyOneFrame(peer_read_fd, client_write_fd)) {
                 logDaemonEvent(diagnostics.log_context, "ssh transport disconnected from daemon");
                 if (diagnostics.notify_remote_close) try sendSshTransportClosed(client_write_fd);
                 return;
@@ -392,8 +392,8 @@ fn copyOneFrame(read_fd: c.fd_t, write_fd: c.fd_t) !bool {
     return true;
 }
 
-fn handleClientClose(runtime_write_fd: c.fd_t, action: ClientCloseAction, log_context: LogContext) !void {
-    _ = runtime_write_fd;
+fn handleClientClose(peer_write_fd: c.fd_t, action: ClientCloseAction, log_context: LogContext) !void {
+    _ = peer_write_fd;
     _ = log_context;
     switch (action) {
         .none => {},
