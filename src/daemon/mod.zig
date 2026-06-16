@@ -15,6 +15,7 @@ const daemon_cleanup = @import("cleanup.zig");
 const daemon_executable = @import("executable.zig");
 const daemon_identity = @import("identity.zig");
 const daemon_log = @import("log.zig");
+const startup_notify = @import("startup_notify.zig");
 const daemon_tunnel = @import("tunnel.zig");
 const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
@@ -26,11 +27,6 @@ const pb = protocol.pb;
 
 const daemon_idle_check_ms: u64 = 250;
 const daemon_idle_shutdown_ms: u64 = 1_000;
-const daemon_start_attempts: usize = 100;
-const daemon_start_sleep_ms: u64 = 20;
-const daemon_spawn_every_attempts: usize = 10;
-const daemon_lock_attempts: usize = 100;
-const daemon_lock_sleep_ms: u64 = 20;
 
 var active_local_clients: usize = 0;
 
@@ -102,25 +98,48 @@ pub fn reexecDaemonOrRun(allocator: std.mem.Allocator, exe: []const u8, args: []
 }
 
 fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
-    var attempts: usize = 0;
-    while (attempts < daemon_start_attempts) : (attempts += 1) {
-        if (attempts % daemon_spawn_every_attempts == 0) {
-            _ = try spawnDaemon(allocator, exe, dir_name);
-        }
-        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
-        io.waitMillis(daemon_start_sleep_ms);
+    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
+
+    var startup_lock = (try startup_notify.tryAcquireStartupLock(allocator, dir_name)) orelse {
+        try startup_notify.waitForStartupLockRelease(allocator, dir_name);
+        return connectAndHandshakeForDirName(allocator, dir_name);
+    };
+    defer startup_lock.deinit();
+
+    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
+
+    var pipe = try startup_notify.ReadyPipe.init();
+    defer pipe.deinit();
+    if (!try spawnDaemon(allocator, exe, dir_name, pipe.write_fd, startup_lock.file.handle)) {
+        return error.DaemonDidNotStart;
     }
-    return error.DaemonDidNotStart;
+    pipe.closeWrite();
+    switch (try startup_notify.waitForReady(pipe.read_fd)) {
+        .ready => return connectAndHandshakeForDirName(allocator, dir_name),
+        .closed, .timed_out => return error.DaemonDidNotStart,
+    }
 }
 
-fn spawnDaemon(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !bool {
+fn spawnDaemon(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    dir_name: []const u8,
+    ready_fd: c.fd_t,
+    startup_lock_fd: c.fd_t,
+) !bool {
     var runtime_executables = (try daemon_executable.installRuntimeExecutablesForDaemonStart(allocator, exe, dir_name)) orelse return false;
     defer runtime_executables.deinit();
     const argv = [_][]const u8{ runtime_executables.daemon, dir_name };
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try startup_notify.addReadyFdToEnvMap(allocator, &env_map, ready_fd);
+    try startup_notify.addStartupLockFdToEnvMap(allocator, &env_map, startup_lock_fd);
+    try socket_transport.clearCloseOnExec(startup_lock_fd);
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
+    child.env_map = &env_map;
     child.pgid = 0;
     try child.spawn();
     return true;
@@ -313,7 +332,13 @@ const BrokerFramePipe = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
-    core_fds.closeInheritedNonStdioFileDescriptors();
+    var ready_fd = startup_notify.inheritedReadyFd();
+    var startup_lock_fd = startup_notify.inheritedStartupLockFd();
+    defer {
+        if (ready_fd >= 0) _ = c.close(ready_fd);
+        startup_notify.closeStartupLockFd(&startup_lock_fd);
+    }
+    core_fds.closeInheritedNonStdioFileDescriptorsExceptList(&.{ ready_fd, startup_lock_fd });
 
     if (args.len > 1) {
         try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-daemon: accepts at most one daemon socket namespace\n");
@@ -336,6 +361,8 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     const listen_fd = try socket_transport.listenSocket(path);
     defer _ = c.close(listen_fd);
     defer std.fs.deleteFileAbsolute(path) catch {};
+    startup_notify.signalReady(&ready_fd);
+    startup_notify.closeStartupLockFd(&startup_lock_fd);
     daemon_log.infof(allocator, "daemon started socket={s}", .{path});
 
     var daemon_dispatcher = try dispatcher.Dispatcher.init(allocator);
@@ -978,21 +1005,16 @@ const DaemonSocketLock = struct {
 fn acquireDaemonSocketLock(allocator: std.mem.Allocator, dir_name: []const u8, socket_path: []const u8) !DaemonSocketLock {
     try socket_transport.ensureSocketDir(allocator, socket_path);
 
-    var attempts: usize = 0;
-    while (attempts < daemon_lock_attempts) : (attempts += 1) {
-        if (tryAcquireDaemonSocketLock(allocator, socket_path)) |lock| return lock else |err| switch (err) {
-            error.DaemonLockBusy => {},
-            else => return err,
-        }
-
-        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| {
-            _ = c.close(fd);
-            return error.DaemonAlreadyRunning;
-        } else |_| {}
-
-        io.waitMillis(daemon_lock_sleep_ms);
-    }
-    return error.DaemonLockBusy;
+    return tryAcquireDaemonSocketLock(allocator, socket_path) catch |err| switch (err) {
+        error.DaemonLockBusy => lock_busy: {
+            if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| {
+                _ = c.close(fd);
+                return error.DaemonAlreadyRunning;
+            } else |_| {}
+            break :lock_busy error.DaemonLockBusy;
+        },
+        else => return err,
+    };
 }
 
 fn tryAcquireDaemonSocketLock(allocator: std.mem.Allocator, socket_path: []const u8) !DaemonSocketLock {

@@ -10,6 +10,7 @@ pub const terminal_remote_executable_name = "sessh-terminal-remote";
 pub const proxy_remote_executable_name = "sessh-proxy-remote";
 pub const socket_filename = "sesshd.sock";
 pub const lock_filename = "sesshd.lock";
+pub const startup_lock_filename = "sesshd.start.lock";
 pub const namespace_env = "SESSH_DAEMON_NAMESPACE";
 
 pub fn selectedDirName(allocator: std.mem.Allocator) ![]u8 {
@@ -77,6 +78,12 @@ pub fn lockPath(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
     const dir = try dirPath(allocator, dir_name);
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, lock_filename });
+}
+
+pub fn startupLockPath(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
+    const dir = try dirPath(allocator, dir_name);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, startup_lock_filename });
 }
 
 pub fn validateDirName(dir_name: []const u8) !void {

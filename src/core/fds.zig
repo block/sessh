@@ -7,12 +7,23 @@ pub fn closeInheritedNonStdioFileDescriptors() void {
 }
 
 pub fn closeInheritedNonStdioFileDescriptorsExcept(except_fd: c.fd_t) void {
+    closeInheritedNonStdioFileDescriptorsExceptList(&.{except_fd});
+}
+
+pub fn closeInheritedNonStdioFileDescriptorsExceptList(except_fds: []const c.fd_t) void {
     const limit = inheritedFdCloseLimit();
     var fd: c.fd_t = 3;
     while (fd < limit) : (fd += 1) {
-        if (fd == except_fd) continue;
+        if (fdIsExcepted(fd, except_fds)) continue;
         _ = c.close(fd);
     }
+}
+
+fn fdIsExcepted(fd: c.fd_t, except_fds: []const c.fd_t) bool {
+    for (except_fds) |except_fd| {
+        if (fd == except_fd) return true;
+    }
+    return false;
 }
 
 pub fn setNonBlocking(fd: c.fd_t) !void {

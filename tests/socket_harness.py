@@ -1508,7 +1508,6 @@ def run_daemon_log_mux_session_lifecycle_test(_base_env):
                 f"terminal mux remote payload prepared stream_id=1 session={session_id} action=create",
                 f"terminal session creating session={session_id}",
                 f"terminal remote process connected session={session_id}",
-                f"terminal mux remote handshake complete stream_id=1 session={session_id} action=create",
                 f"terminal mux remote open sent stream_id=1 session={session_id} action=create",
                 f"terminal mux stream open ok stream_id=1 session={session_id} action=create",
                 f"terminal session attached stream_id=1 session={session_id}",

@@ -106,11 +106,6 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) !void {
     try writeAll(2, text);
 }
 
-pub fn waitMillis(ms: u64) void {
-    var pollfds: [0]posix.pollfd = .{};
-    _ = posix.poll(&pollfds, @intCast(@min(ms, @as(u64, @intCast(std.math.maxInt(i32)))))) catch {};
-}
-
 fn waitReadable(fd: c.fd_t) !void {
     var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
     while (true) {

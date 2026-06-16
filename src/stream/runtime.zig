@@ -1889,7 +1889,7 @@ fn pollReconnectInput(
     }
 
     if (count == 0) {
-        if (timeout_ms > 0) io.waitMillis(@intCast(timeout_ms));
+        if (timeout_ms > 0) _ = posix.poll(pollfds[0..0], timeout_ms) catch 0;
         return input_control.consumeAction();
     }
     const ready = posix.poll(pollfds[0..count], timeout_ms) catch return input_control.consumeAction();

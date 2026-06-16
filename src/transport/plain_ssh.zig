@@ -14,6 +14,12 @@ const stream_runtime = @import("../stream/runtime.zig");
 const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
 
+// POSIX WNOHANG. Zig exposes this through platform-specific constants, but the
+// numeric value is stable on our supported Unix targets and keeps the C
+// waitpid(2) call auditable here.
+const wait_nohang: c_int = 1;
+const child_wait_poll_ms: u64 = 100;
+
 const ProxyClientControl = struct {
     const max_title_bytes = 128;
     const max_status_bytes = 192;
@@ -243,25 +249,36 @@ pub fn runArgvWithDiagnostics(
 
 fn waitForChildAndDiagnostics(pid: c.pid_t, diagnostics: *ProxyClientControl) std.process.Child.Term {
     while (true) {
+        if (checkChildExit(pid)) |term| return term;
+
+        var pollfds: [1]posix.pollfd = undefined;
+        const fds = if (diagnostics.control_fd >= 0) blk: {
+            pollfds[0] = .{
+                .fd = diagnostics.control_fd,
+                .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR,
+                .revents = 0,
+            };
+            break :blk pollfds[0..1];
+        } else pollfds[0..0];
+
+        const ready = posix.poll(fds, child_wait_poll_ms) catch return .{ .Unknown = 0 };
+        if (ready == 0) continue;
+        if (diagnostics.control_fd >= 0 and pollfds[0].revents != 0) {
+            diagnostics.readControl();
+        }
+    }
+}
+
+fn checkChildExit(pid: c.pid_t) ?std.process.Child.Term {
+    while (true) {
         var status: c_int = 0;
-        const result = c.waitpid(pid, &status, 1);
+        const result = c.waitpid(pid, &status, wait_nohang);
         if (result == pid) return pty_process.waitStatusToTerm(@bitCast(status));
+        if (result == 0) return null;
         if (result < 0) switch (posix.errno(result)) {
-            .INTR => {},
+            .INTR => continue,
             else => return .{ .Unknown = 0 },
         };
-
-        if (diagnostics.control_fd < 0) {
-            io.waitMillis(100);
-            continue;
-        }
-        var pollfds = [_]posix.pollfd{.{
-            .fd = diagnostics.control_fd,
-            .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR,
-            .revents = 0,
-        }};
-        _ = posix.poll(&pollfds, 100) catch continue;
-        if (pollfds[0].revents != 0) diagnostics.readControl();
     }
 }
 

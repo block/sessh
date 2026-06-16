@@ -8,6 +8,7 @@ const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const daemon_executable = @import("executable.zig");
 const socket_namespace = @import("socket_namespace.zig");
+const startup_notify = @import("startup_notify.zig");
 const socket_transport = @import("../transport/socket.zig");
 
 const hpb = protocol.hpb;
@@ -46,26 +47,48 @@ pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
 }
 
 pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
-    var spawned = false;
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        if (!spawned) {
-            spawned = try spawnDaemonIfNamespaceUnlocked(allocator, exe, dir_name);
-        }
-        if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
-        io.waitMillis(20);
+    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
+
+    var startup_lock = (try startup_notify.tryAcquireStartupLock(allocator, dir_name)) orelse {
+        try startup_notify.waitForStartupLockRelease(allocator, dir_name);
+        return connectAndHandshakeForDirName(allocator, dir_name);
+    };
+    defer startup_lock.deinit();
+
+    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
+
+    var pipe = try startup_notify.ReadyPipe.init();
+    defer pipe.deinit();
+    if (!try spawnDaemonIfNamespaceUnlocked(allocator, exe, dir_name, pipe.write_fd, startup_lock.file.handle)) {
+        return error.DaemonDidNotStart;
     }
-    return error.DaemonDidNotStart;
+    pipe.closeWrite();
+    switch (try startup_notify.waitForReady(pipe.read_fd)) {
+        .ready => return connectAndHandshakeForDirName(allocator, dir_name),
+        .closed, .timed_out => return error.DaemonDidNotStart,
+    }
 }
 
-fn spawnDaemonIfNamespaceUnlocked(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !bool {
+fn spawnDaemonIfNamespaceUnlocked(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    dir_name: []const u8,
+    ready_fd: c.fd_t,
+    startup_lock_fd: c.fd_t,
+) !bool {
     var runtime_executables = (try daemon_executable.installRuntimeExecutablesForDaemonStart(allocator, exe, dir_name)) orelse return false;
     defer runtime_executables.deinit();
     const argv = [_][]const u8{ runtime_executables.daemon, dir_name };
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try startup_notify.addReadyFdToEnvMap(allocator, &env_map, ready_fd);
+    try startup_notify.addStartupLockFdToEnvMap(allocator, &env_map, startup_lock_fd);
+    try socket_transport.clearCloseOnExec(startup_lock_fd);
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
+    child.env_map = &env_map;
     child.pgid = 0;
     try child.spawn();
     return true;
