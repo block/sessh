@@ -5,6 +5,7 @@ const posix = std.posix;
 const app_allocator = @import("../core/app_allocator.zig");
 const client_log = @import("../core/client_log.zig");
 const client_renderer = @import("renderer.zig");
+const diagnostics_jsonl = @import("../diagnostics/jsonl.zig");
 const io_helpers = @import("../core/io.zig");
 const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
 const reconnect_control = @import("../reconnect/control.zig");
@@ -571,9 +572,7 @@ pub const ReconnectUi = struct {
     }
 
     fn writeJsonlDiagnostic(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
-        io_helpers.writeAll(self.line_fd, "{\"event\":\"diagnostic\",\"message\":") catch return;
-        writeJsonString(self.line_fd, diagnostic.slice()) catch return;
-        io_helpers.writeAll(self.line_fd, "}\n") catch return;
+        diagnostics_jsonl.writeMessage(self.line_fd, "diagnostic", diagnostic.slice()) catch return;
     }
 
     fn appendDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
@@ -1039,9 +1038,7 @@ fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
 }
 
 fn writeJsonlStatus(fd: c.fd_t, message: []const u8) !void {
-    try io_helpers.writeAll(fd, "{\"event\":\"status\",\"message\":");
-    try writeJsonString(fd, message);
-    try io_helpers.writeAll(fd, "}\n");
+    try diagnostics_jsonl.writeMessage(fd, "status", message);
 }
 
 fn appendOnlyRetryStatus(buf: []u8, delay_ms: u64, ctrl_r: bool) ![]const u8 {
@@ -1066,27 +1063,6 @@ fn nowUnixMs() u64 {
     const ms = std.time.milliTimestamp();
     if (ms <= 0) return 0;
     return @intCast(ms);
-}
-
-fn writeJsonString(fd: c.fd_t, value: []const u8) !void {
-    try io_helpers.writeAll(fd, "\"");
-    for (value) |byte| switch (byte) {
-        '"' => try io_helpers.writeAll(fd, "\\\""),
-        '\\' => try io_helpers.writeAll(fd, "\\\\"),
-        '\n' => try io_helpers.writeAll(fd, "\\n"),
-        '\r' => try io_helpers.writeAll(fd, "\\r"),
-        '\t' => try io_helpers.writeAll(fd, "\\t"),
-        else => {
-            if (byte < 0x20) {
-                var buf: [6]u8 = undefined;
-                const escaped = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{byte});
-                try io_helpers.writeAll(fd, escaped);
-            } else {
-                try io_helpers.writeAll(fd, (&[_]u8{byte})[0..]);
-            }
-        },
-    };
-    try io_helpers.writeAll(fd, "\"");
 }
 
 fn formatSwitchDelay(delay_ms: u64, buf: []u8) ![]const u8 {
@@ -1188,6 +1164,54 @@ test "ReconnectUi records resize event for runtime forwarding" {
     try std.testing.expect(ui.resize_generation != 0);
     try std.testing.expect(ui.consumeResizeForRuntime());
     try std.testing.expect(!ui.consumeResizeForRuntime());
+}
+
+test "ReconnectUi writes append-only diagnostics to configured line fd" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var ui = ReconnectUi{
+        .mode_guard = undefined,
+        .presentation = .stderr_plain,
+        .line_fd = fds[1],
+        .input_fd = -1,
+        .output_fd = -1,
+    };
+    try ui.drawReconnectOverlay(53_000);
+    try ui.drawReconnectOverlay(52_000);
+    posix.close(fds[1]);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    while (true) {
+        var buf: [128]u8 = undefined;
+        const n = c.read(fds[0], &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.items, "Retry connecting"));
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "retry_at_unix_ms=") != null);
+}
+
+test "ReconnectUi reads reconnect controls from configured input fd" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    try io_helpers.writeAll(fds[1], &.{reconnect_control.ctrl_r});
+
+    var ui = ReconnectUi{
+        .mode_guard = undefined,
+        .presentation = .none,
+        .input_fd = fds[0],
+        .output_fd = -1,
+        .line_fd = -1,
+    };
+
+    try std.testing.expectEqual(ReconnectDecision.reconnect_now, try ui.pollDecision(0));
+    try std.testing.expect(ui.hasReconnectAcknowledgement());
 }
 
 test "reconnect switch disposition distinguishes typing paste and unresponsive" {

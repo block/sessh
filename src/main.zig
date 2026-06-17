@@ -192,6 +192,9 @@ test {
     _ = @import("daemon/executable.zig");
     _ = @import("daemon/log.zig");
     _ = @import("daemon/mod.zig");
+    _ = @import("diagnostics/file.zig");
+    _ = @import("diagnostics/jsonl.zig");
+    _ = @import("diagnostics/policy.zig");
     _ = @import("protocol/mod.zig");
     _ = @import("reconnect/control.zig");
     _ = @import("reconnect/mod.zig");

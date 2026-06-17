@@ -18,6 +18,8 @@ const daemon_executable = @import("../daemon/executable.zig");
 const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
 const daemon_socket_namespace = @import("../daemon/socket_namespace.zig");
+const diagnostics_file = @import("../diagnostics/file.zig");
+const diagnostics_policy = @import("../diagnostics/policy.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
@@ -664,7 +666,7 @@ fn runRemoteNewSession(
     defer runtime_config.deinit(allocator);
     client_log.setLevel(runtime_config.common.client_log_level);
     if (runtime_config.common.diagnostics_file) |path| {
-        validateDiagnosticsFilePath(path) catch |err| {
+        diagnostics_file.validatePath(path) catch |err| {
             try io.stderrPrint("sessh: cannot open diagnostics file {s}: {t}\n", .{ path, err });
             return process_exit.request(1);
         };
@@ -3566,28 +3568,29 @@ fn reconnectRemoteSessionClient(
 ) !void {
     const pending_input_at_disconnect = session.hasPendingInputAck();
     const pending_paste_like_input_at_disconnect = session.hasPendingPasteLikeInputAck();
-    var diagnostics_file = DiagnosticsFile.open(runtime_config.common.diagnostics_file) catch |err| blk: {
+    var diagnostics_handle = diagnostics_file.Handle.open(runtime_config.common.diagnostics_file) catch |err| blk: {
         client_log.userDiagnosticInfo("cannot open diagnostics file during reconnect: {t}", .{err});
-        break :blk DiagnosticsFile{};
+        break :blk diagnostics_file.Handle{};
     };
-    defer diagnostics_file.deinit();
-    const diagnostics_output_fd = if (diagnostics_file.output_fd >= 0)
-        diagnostics_file.output_fd
+    defer diagnostics_handle.deinit();
+    const diagnostics_output_fd = if (diagnostics_handle.output_fd >= 0)
+        diagnostics_handle.output_fd
     else
         posix.STDOUT_FILENO;
-    const diagnostics_line_fd = if (diagnostics_file.output_fd >= 0)
-        diagnostics_file.output_fd
+    const diagnostics_line_fd = if (diagnostics_handle.output_fd >= 0)
+        diagnostics_handle.output_fd
     else
         posix.STDERR_FILENO;
-    const diagnostics_input_fd = if (diagnostics_file.input_fd >= 0)
-        diagnostics_file.input_fd
+    const diagnostics_input_fd = if (diagnostics_handle.input_fd >= 0)
+        diagnostics_handle.input_fd
     else
         posix.STDIN_FILENO;
     var reconnect_ui = try client_ui.ReconnectUi.beginWithOptions(
         session.viewport_offset,
         .{
-            .presentation = reconnectPresentationForConfig(
-                runtime_config.common,
+            .presentation = diagnostics_policy.terminalPresentation(
+                runtime_config.common.filter_level,
+                runtime_config.common.diagnostics_level,
                 c.isatty(diagnostics_output_fd) != 0,
             ),
             .input_fd = diagnostics_input_fd,
@@ -3782,25 +3785,6 @@ fn noteReconnectFailure(
     client_log.userDiagnosticInfo("reconnect failed: " ++ stage ++ ": {t}", .{err});
 }
 
-fn reconnectPresentationForConfig(common: CommonSessionOptions, diagnostics_output_is_tty: bool) client_ui.ReconnectPresentation {
-    if (common.diagnostics_level == .jsonl) return .jsonl;
-    if (!diagnostics_output_is_tty) return .stderr_plain;
-    return switch (common.diagnostics_level) {
-        .jsonl => unreachable,
-        .line => .stderr_plain,
-        .title => .title,
-        .status => switch (common.filter_level) {
-            .unhygienic => .none,
-            .hygienic, .emulated => .title,
-        },
-        .overlay => switch (common.filter_level) {
-            .unhygienic => .none,
-            .hygienic => .title,
-            .emulated => .overlay,
-        },
-    };
-}
-
 fn waitForReconnectSwitchIfNeeded(
     reconnect_ui: *client_ui.ReconnectUi,
     pending_input_at_disconnect: bool,
@@ -3885,91 +3869,6 @@ fn setNonBlockingFd(fd: c.fd_t) !void {
     const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
     if ((flags & nonblocking_flag) != 0) return;
     if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-}
-
-const DiagnosticsFile = struct {
-    output_fd: c.fd_t = -1,
-    input_fd: c.fd_t = -1,
-    mode_guard: terminal.TerminalModeGuard = undefined,
-    mode_guard_enabled: bool = false,
-
-    fn open(path: ?[]const u8) !DiagnosticsFile {
-        const file_path = path orelse return .{};
-        if (file_path.len == 0) return .{};
-
-        const probe_fd = posix.open(file_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch {
-            return try openOutputOnly(file_path);
-        };
-        if (c.isatty(probe_fd) == 0) {
-            posix.close(probe_fd);
-            return try openOutputOnly(file_path);
-        }
-
-        var control = DiagnosticsFile{
-            .output_fd = probe_fd,
-            .input_fd = probe_fd,
-        };
-        core_fds.setNonBlocking(probe_fd) catch |err| {
-            control.deinit();
-            return err;
-        };
-        // ProxyCommand stdin is the SSH byte stream, so Ctrl-R cannot be read
-        // from fd 0. If the diagnostics file is a tty, read control keystrokes
-        // from it and write status there. If it is a normal file, it is output
-        // only and reconnect control remains unavailable.
-        control.mode_guard = terminal.TerminalModeGuard.enable(probe_fd) catch |err| {
-            control.deinit();
-            return err;
-        };
-        control.mode_guard_enabled = true;
-        return control;
-    }
-
-    fn openOutputOnly(path: []const u8) !DiagnosticsFile {
-        const fd = posix.open(path, .{
-            .ACCMODE = .WRONLY,
-            .CLOEXEC = true,
-            .CREAT = true,
-            .APPEND = true,
-            .NONBLOCK = true,
-        }, 0o600) catch |err| return err;
-        return .{ .output_fd = fd };
-    }
-
-    fn deinit(self: *DiagnosticsFile) void {
-        if (self.mode_guard_enabled) {
-            self.mode_guard.restore();
-            self.mode_guard_enabled = false;
-        }
-        if (self.output_fd >= 0) {
-            posix.close(self.output_fd);
-            self.output_fd = -1;
-        }
-        self.input_fd = -1;
-    }
-};
-
-fn validateDiagnosticsFilePath(path: []const u8) !void {
-    const probe_fd = posix.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch {
-        const output_fd = try posix.open(path, .{
-            .ACCMODE = .WRONLY,
-            .CLOEXEC = true,
-            .CREAT = true,
-            .APPEND = true,
-        }, 0o600);
-        posix.close(output_fd);
-        return;
-    };
-    defer posix.close(probe_fd);
-    if (c.isatty(probe_fd) != 0) return;
-
-    const output_fd = try posix.open(path, .{
-        .ACCMODE = .WRONLY,
-        .CLOEXEC = true,
-        .CREAT = true,
-        .APPEND = true,
-    }, 0o600);
-    posix.close(output_fd);
 }
 
 fn sameTerminalFd(left: c.fd_t, right: c.fd_t) bool {
@@ -4527,7 +4426,7 @@ fn runProxyStreamSsh(
     {
         auto_diagnostics_file = try ttyPathForFd(allocator, posix.STDERR_FILENO);
     }
-    const diagnostics_file = common.diagnostics_file orelse auto_diagnostics_file;
+    const diagnostics_file_path = common.diagnostics_file orelse auto_diagnostics_file;
     const proxy_client_ctrl_r = diagnostics_plan.client_ctrl_r;
     const proxy_daemon_dir_name = daemon_dir_name orelse try daemon_socket_namespace.defaultDirName(allocator);
     defer if (daemon_dir_name == null) allocator.free(proxy_daemon_dir_name);
@@ -4543,7 +4442,7 @@ fn runProxyStreamSsh(
         diagnostics_plan.command_level,
         common.diagnostics_level,
         proxy_client_ctrl_r,
-        diagnostics_file,
+        diagnostics_file_path,
         common.bootstrap,
         daemon_dir_name,
         use_fd_pass,
@@ -4651,19 +4550,19 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .daemon_dir_name = invocation.daemon_dir_name,
     };
 
-    var diagnostics_file = DiagnosticsFile.open(invocation.diagnostics_file) catch |err| {
+    var diagnostics_handle = diagnostics_file.Handle.open(invocation.diagnostics_file) catch |err| {
         try io.stderrPrint(
             "sessh: proxy mode cannot open diagnostics file {s}: {t}\n",
             .{ invocation.diagnostics_file orelse "", err },
         );
         return process_exit.request(1);
     };
-    defer diagnostics_file.deinit();
-    const diagnostics_output_is_tty = if (diagnostics_file.output_fd >= 0)
-        c.isatty(diagnostics_file.output_fd) != 0
+    defer diagnostics_handle.deinit();
+    const diagnostics_output_is_tty = if (diagnostics_handle.output_fd >= 0)
+        c.isatty(diagnostics_handle.output_fd) != 0
     else
         c.isatty(posix.STDERR_FILENO) != 0;
-    const status_mode = proxy_command.reconnectStatusModeForDiagnostics(
+    const status_mode = diagnostics_policy.streamStatusMode(
         invocation.filter_level,
         invocation.diagnostics_level,
         invocation.control_guid != null and invocation.diagnostics_file == null,
@@ -4676,14 +4575,14 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .proxy_port = proxy_port,
         .source_fd = 0,
         .sink_fd = 1,
-        .reconnect_input_fd = diagnostics_file.input_fd,
+        .reconnect_input_fd = diagnostics_handle.input_fd,
         .status_mode = status_mode,
         .status_fd = if (status_mode == .stderr_plain or status_mode == .status_line or status_mode == .jsonl or status_mode == .title)
-            if (diagnostics_file.output_fd >= 0) diagnostics_file.output_fd else posix.STDERR_FILENO
+            if (diagnostics_handle.output_fd >= 0) diagnostics_handle.output_fd else posix.STDERR_FILENO
         else
             -1,
         .intercept_ctrl_r = false,
-        .ctrl_r_status_enabled = (invocation.client_ctrl_r and invocation.control_guid != null) or diagnostics_file.input_fd >= 0,
+        .ctrl_r_status_enabled = (invocation.client_ctrl_r and invocation.control_guid != null) or diagnostics_handle.input_fd >= 0,
         .title_fallback = invocation.host,
         .reset_on_source_eof = true,
     }) catch |err| {
@@ -5426,66 +5325,6 @@ test "proxy invocation parses explicit fd-pass and diagnostics file flags" {
     try std.testing.expectEqualStrings("/tmp/sessh-diagnostics.log", invocation.diagnostics_file.?);
 }
 
-test "diagnostics file opens regular file as output only" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(tmp_path);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "diagnostics.log" });
-    defer std.testing.allocator.free(path);
-
-    var diagnostics = try DiagnosticsFile.open(path);
-    defer diagnostics.deinit();
-
-    try std.testing.expect(diagnostics.output_fd >= 0);
-    try std.testing.expect(diagnostics.input_fd < 0);
-    try io.writeAll(diagnostics.output_fd, "status\n");
-    diagnostics.deinit();
-
-    const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "diagnostics.log", 64);
-    defer std.testing.allocator.free(contents);
-    try std.testing.expectEqualStrings("status\n", contents);
-}
-
-test "diagnostics file reports uncreatable path" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(tmp_path);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "missing-parent", "diagnostics.log" });
-    defer std.testing.allocator.free(path);
-
-    try std.testing.expectError(error.FileNotFound, DiagnosticsFile.open(path));
-}
-
-test "diagnostics file validation creates regular file" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(tmp_path);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "validated-diagnostics.log" });
-    defer std.testing.allocator.free(path);
-
-    try validateDiagnosticsFilePath(path);
-    const file = try tmp.dir.openFile("validated-diagnostics.log", .{});
-    file.close();
-}
-
-test "diagnostics file validation reports uncreatable path" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(tmp_path);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "missing-parent", "diagnostics.log" });
-    defer std.testing.allocator.free(path);
-
-    try std.testing.expectError(error.FileNotFound, validateDiagnosticsFilePath(path));
-}
-
 test "stream routing preserves ssh remote command tty semantics" {
     var command = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
@@ -5646,46 +5485,6 @@ test "default ssh options append resolved interactive IPQoS value" {
 
     parsed.default_ipqos_option = null;
     try std.testing.expectEqual(@as(usize, 0), defaultSshOptionsLen(parsed));
-}
-
-test "proxy stream reconnect status follows filter level" {
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.disabled, proxy_command.reconnectStatusMode(.unhygienic, false));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, proxy_command.reconnectStatusMode(.hygienic, false));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxy_command.reconnectStatusMode(.hygienic, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxy_command.reconnectStatusMode(.emulated, true));
-}
-
-test "proxy stream reconnect status follows diagnostics level" {
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.jsonl, proxy_command.reconnectStatusModeForDiagnostics(.emulated, .jsonl, true, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, proxy_command.reconnectStatusModeForDiagnostics(.emulated, .line, true, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, proxy_command.reconnectStatusModeForDiagnostics(.emulated, .overlay, true, false));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.title, proxy_command.reconnectStatusModeForDiagnostics(.hygienic, .title, true, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxy_command.reconnectStatusModeForDiagnostics(.emulated, .overlay, true, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.status_line, proxy_command.reconnectStatusModeForDiagnostics(.emulated, .overlay, false, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.status_line, proxy_command.reconnectStatusModeForDiagnostics(.hygienic, .status, false, true));
-}
-
-test "terminal reconnect presentation follows diagnostics level" {
-    try std.testing.expectEqual(
-        client_ui.ReconnectPresentation.overlay,
-        reconnectPresentationForConfig(.{ .filter_level = .emulated, .diagnostics_level = .overlay }, true),
-    );
-    try std.testing.expectEqual(
-        client_ui.ReconnectPresentation.title,
-        reconnectPresentationForConfig(.{ .filter_level = .emulated, .diagnostics_level = .status }, true),
-    );
-    try std.testing.expectEqual(
-        client_ui.ReconnectPresentation.title,
-        reconnectPresentationForConfig(.{ .filter_level = .hygienic, .diagnostics_level = .overlay }, true),
-    );
-    try std.testing.expectEqual(
-        client_ui.ReconnectPresentation.stderr_plain,
-        reconnectPresentationForConfig(.{ .filter_level = .emulated, .diagnostics_level = .overlay }, false),
-    );
-    try std.testing.expectEqual(
-        client_ui.ReconnectPresentation.jsonl,
-        reconnectPresentationForConfig(.{ .filter_level = .emulated, .diagnostics_level = .jsonl }, false),
-    );
 }
 
 test "proxy diagnostics plan maps emulated to daemon control" {

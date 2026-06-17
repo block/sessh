@@ -9,6 +9,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
+const diagnostics_jsonl = @import("../diagnostics/jsonl.zig");
 const socket_transport = @import("../transport/socket.zig");
 const local_boot_time = @import("../core/local_boot_time.zig");
 const protocol = @import("../protocol/mod.zig");
@@ -2383,24 +2384,12 @@ const StreamReconnectStatus = struct {
 
     fn writeJsonlRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
         if (self.mode != .jsonl or self.fd < 0) return;
-        var buf: [128]u8 = undefined;
-        const line = std.fmt.bufPrint(
-            &buf,
-            "{{\"event\":\"retry\",\"retry_at_unix_ms\":{}}}\n",
-            .{nowUnixMs() +| delay_ms},
-        ) catch return;
-        io.writeAll(self.fd, line) catch return;
+        diagnostics_jsonl.writeRetry(self.fd, nowUnixMs() +| delay_ms) catch return;
     }
 
     fn writeJsonlEvent(self: *StreamReconnectStatus, event: []const u8) void {
         if (self.mode != .jsonl or self.fd < 0) return;
-        var buf: [96]u8 = undefined;
-        const line = std.fmt.bufPrint(
-            &buf,
-            "{{\"event\":\"{s}\"}}\n",
-            .{event},
-        ) catch return;
-        io.writeAll(self.fd, line) catch return;
+        diagnostics_jsonl.writeEvent(self.fd, event) catch return;
     }
 
     fn writeTitleRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
@@ -2514,32 +2503,9 @@ const StreamReconnectStatus = struct {
 
     fn writeJsonlDiagnostic(self: *StreamReconnectStatus, line: []const u8) void {
         if (self.mode != .jsonl or self.fd < 0) return;
-        io.writeAll(self.fd, "{\"event\":\"diagnostic\",\"message\":") catch return;
-        writeJsonString(self.fd, line) catch return;
-        io.writeAll(self.fd, "}\n") catch return;
+        diagnostics_jsonl.writeMessage(self.fd, "diagnostic", line) catch return;
     }
 };
-
-fn writeJsonString(fd: c.fd_t, value: []const u8) !void {
-    try io.writeAll(fd, "\"");
-    for (value) |byte| switch (byte) {
-        '"' => try io.writeAll(fd, "\\\""),
-        '\\' => try io.writeAll(fd, "\\\\"),
-        '\n' => try io.writeAll(fd, "\\n"),
-        '\r' => try io.writeAll(fd, "\\r"),
-        '\t' => try io.writeAll(fd, "\\t"),
-        else => {
-            if (byte < 0x20) {
-                var buf: [6]u8 = undefined;
-                const escaped = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{byte});
-                try io.writeAll(fd, escaped);
-            } else {
-                try io.writeAll(fd, (&[_]u8{byte})[0..]);
-            }
-        },
-    };
-    try io.writeAll(fd, "\"");
-}
 
 fn retryDelayFromLocalBootDeadline(deadline_ms: ?u64) u64 {
     const deadline = deadline_ms orelse return 0;

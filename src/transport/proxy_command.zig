@@ -3,7 +3,6 @@ const std = @import("std");
 const config = @import("../core/config.zig");
 const remote_shell = @import("remote_shell.zig");
 const ssh_opts = @import("ssh_options.zig");
-const stream_runtime = @import("../stream/runtime.zig");
 
 pub const DiagnosticsPlan = struct {
     command_level: config.FilterLevel,
@@ -11,30 +10,6 @@ pub const DiagnosticsPlan = struct {
     wrap_visible_ssh: bool,
     client_ctrl_r: bool,
 };
-
-pub fn reconnectStatusMode(level: config.FilterLevel, has_daemon_control: bool) stream_runtime.StreamReconnectStatusMode {
-    return switch (level) {
-        .unhygienic => .disabled,
-        .hygienic, .emulated => if (has_daemon_control) .client_control else .stderr_plain,
-    };
-}
-
-pub fn reconnectStatusModeForDiagnostics(
-    filter_level: config.FilterLevel,
-    diagnostics_level: config.DiagnosticsLevel,
-    has_daemon_control: bool,
-    diagnostics_output_is_tty: bool,
-) stream_runtime.StreamReconnectStatusMode {
-    if (diagnostics_level == .jsonl) return .jsonl;
-    if (!diagnostics_output_is_tty) return .stderr_plain;
-    if (diagnostics_level == .line) return .stderr_plain;
-    if (diagnostics_level == .title) return .title;
-    if (has_daemon_control) return .client_control;
-    return switch (filter_level) {
-        .unhygienic => .disabled,
-        .hygienic, .emulated => .status_line,
-    };
-}
 
 pub fn diagnosticsPlan(
     ssh_options: []const []const u8,
