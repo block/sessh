@@ -10,7 +10,7 @@ pub const Entrypoint = enum {
 
     pub fn arg(self: Entrypoint) []const u8 {
         return switch (self) {
-            .broker => ":internal-broker:",
+            .broker => ":broker:",
         };
     }
 };

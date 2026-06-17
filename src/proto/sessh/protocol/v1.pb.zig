@@ -1267,9 +1267,10 @@ pub const ClientDaemonItem = struct {
         }
     };
 
-    /// ProxyCommand setup for isolation-mode=none. This frame must also include
-    /// Attached.SCM_RIGHTS and one attached marker byte carrying the raw OpenSSH
-    /// byte-stream fd via SCM_RIGHTS.
+    /// ProxyCommand setup for direct proxy placement (`isolation-mode=full` or
+    /// `isolation-mode=none`). This frame must also include Attached.SCM_RIGHTS
+    /// and one attached marker byte carrying the raw OpenSSH byte-stream fd via
+    /// SCM_RIGHTS.
     pub const ProxyFdPassOpen = struct {
         transport: ?ClientDaemonItem.SshTransportAcquire = null,
         proxy: ?ProxyStreamItem.Open = null,

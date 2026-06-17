@@ -51,6 +51,7 @@ pub const LocalStreamOptions = struct {
     proxy_port: u16 = 0,
     source_fd: c.fd_t,
     sink_fd: c.fd_t,
+    reconnect_input_fd: c.fd_t = -1,
     status_mode: StreamReconnectStatusMode,
     intercept_ctrl_r: bool,
     intercept_escape: bool = false,
@@ -211,6 +212,7 @@ fn sinkWithFd(stdin_fd: c.fd_t, close_fd_on_eof: ?*c.fd_t) StreamSink {
 const StreamAttachedClientOptions = struct {
     source: StreamSource = .{},
     sink: StreamSink = .{},
+    reconnect_input_fd: c.fd_t = -1,
     reconnect_status: ?*StreamReconnectStatus = null,
     control_fd: c.fd_t = -1,
     control_input: ?*StreamInputControl = null,
@@ -256,6 +258,25 @@ const StreamInputControl = struct {
             written += 1;
         }
         return out[0..written];
+    }
+
+    fn observeControlOnly(self: *StreamInputControl, bytes: []const u8) void {
+        var input = bytes;
+        var scratch: [max_chunk_bytes]u8 = undefined;
+        if (self.escape_enabled) {
+            const result = self.escape_filter.filter(bytes, &scratch);
+            if (result.end) |end| switch (end) {
+                .disconnect => self.disconnect_requested = true,
+                .help => self.help_requested = true,
+                .repaint => {},
+            };
+            input = result.bytes;
+        }
+
+        if (!self.enabled or !self.status_visible) return;
+        for (input) |byte| {
+            if (byte == reconnect_control.ctrl_r) self.reconnect_requested = true;
+        }
     }
 
     fn consumeAction(self: *StreamInputControl) StreamControlAction {
@@ -372,7 +393,7 @@ const StreamAttachedClient = struct {
         if (state.complete()) return .complete;
 
         const now_before_poll_ms = nowMillis();
-        var pollfds: [1 + 1 + 1 + 2]posix.pollfd = undefined;
+        var pollfds: [1 + 1 + 1 + 1 + 2]posix.pollfd = undefined;
         var count: usize = 0;
         const transport_index = count;
         pollfds[count] = .{ .fd = self.transport_read_fd, .events = posix.POLL.IN, .revents = 0 };
@@ -398,6 +419,16 @@ const StreamAttachedClient = struct {
             control_index = count;
             pollfds[count] = .{ .fd = self.options.control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
             count += 1;
+        }
+        var reconnect_input_index: ?usize = null;
+        if (self.options.reconnect_input_fd >= 0 and self.options.control_input != null) {
+            if (self.options.control_input) |control| {
+                if (reconnectInputPollEnabled(control)) {
+                    reconnect_input_index = count;
+                    pollfds[count] = .{ .fd = self.options.reconnect_input_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+                    count += 1;
+                }
+            }
         }
         var interrupt_index: ?usize = null;
         if (self.interrupt_fd >= 0) {
@@ -431,6 +462,13 @@ const StreamAttachedClient = struct {
             if (pollfds[index].revents != 0) {
                 if (self.options.control_input) |control| {
                     if (!readControlInput(self.options.control_fd, control, &self.control_reader)) self.options.control_fd = -1;
+                }
+            }
+        }
+        if (reconnect_input_index) |index| {
+            if (pollfds[index].revents != 0) {
+                if (self.options.control_input) |control| {
+                    readReconnectControlInput(self.options.reconnect_input_fd, control);
                 }
             }
         }
@@ -1022,7 +1060,7 @@ fn acceptRuntimeClient(listen_fd: c.fd_t) ?c.fd_t {
 }
 
 /// Runs in the local `sessh` process. `start_transport` creates ssh transports
-/// that execute the remote `:internal-broker:` entrypoint; this loop owns local
+/// that execute the remote `:broker:` entrypoint; this loop owns local
 /// stdin/stdout and the reconnect policy.
 pub fn runLocalStream(
     allocator: std.mem.Allocator,
@@ -1032,14 +1070,15 @@ pub fn runLocalStream(
     const Transport = @TypeOf(start_transport.start() catch unreachable);
     var control_fd = options.control_fd;
     if (control_fd >= 0) setNonBlockingFd(control_fd) catch {};
+    if (options.reconnect_input_fd >= 0) setNonBlockingFd(options.reconnect_input_fd) catch {};
 
     var state = StreamState.init(allocator, options.guid, options.proxy_host, options.proxy_port);
     defer state.deinit();
     var input_control = StreamInputControl{
-        .enabled = options.intercept_ctrl_r,
+        .enabled = options.intercept_ctrl_r or options.reconnect_input_fd >= 0,
         .escape_enabled = options.intercept_escape,
     };
-    const ctrl_r_status_enabled = options.ctrl_r_status_enabled orelse options.intercept_ctrl_r;
+    const ctrl_r_status_enabled = options.ctrl_r_status_enabled orelse (options.intercept_ctrl_r or options.reconnect_input_fd >= 0);
     const status_fd = if (options.status_fd >= 0) options.status_fd else control_fd;
     var reconnect_status = StreamReconnectStatus.init(
         options.status_mode,
@@ -1067,7 +1106,7 @@ pub fn runLocalStream(
                 return err;
             }
             const delay_ms = reconnect.delayMs(attempt);
-            const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
+            const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, options.reconnect_input_fd, &control_fd, &input_control, &local_interrupt);
             if (action == .disconnect) return 0;
             if (action == .interrupt) return 255;
             attempt = reconnect.nextAttempt(attempt, action == .reconnect);
@@ -1090,6 +1129,7 @@ pub fn runLocalStream(
                         .input_control = &input_control,
                     },
                     .sink = .{ .fd = options.sink_fd },
+                    .reconnect_input_fd = options.reconnect_input_fd,
                     .reconnect_status = &reconnect_status,
                     .control_fd = control_fd,
                     .control_input = &input_control,
@@ -1136,7 +1176,7 @@ pub fn runLocalStream(
                         const new_transport = start_transport.start() catch |err| {
                             client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                             const delay_ms = reconnect.delayMs(attempt);
-                            const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
+                            const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, options.reconnect_input_fd, &control_fd, &input_control, &local_interrupt);
                             if (action == .disconnect) return 0;
                             if (action == .interrupt) return 255;
                             attempt = reconnect.nextAttempt(attempt, action == .reconnect);
@@ -1194,7 +1234,7 @@ pub fn runLocalStream(
         }
 
         const delay_ms = reconnect.delayMs(attempt);
-        const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, &control_fd, &input_control, &local_interrupt);
+        const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, options.reconnect_input_fd, &control_fd, &input_control, &local_interrupt);
         if (action == .disconnect) return 0;
         if (action == .interrupt) return 255;
         attempt = reconnect.nextAttempt(attempt, action == .reconnect);
@@ -1837,6 +1877,7 @@ fn waitBeforeReconnect(
     delay_ms: u64,
     state: *StreamState,
     source_fd: c.fd_t,
+    reconnect_input_fd: c.fd_t,
     control_fd: *c.fd_t,
     input_control: *StreamInputControl,
     interrupt: ?*LocalStreamInterrupt,
@@ -1848,7 +1889,7 @@ fn waitBeforeReconnect(
         status.showRetry(remaining_ms);
         input_control.status_visible = true;
         const step_ms = @min(remaining_ms, 1_000);
-        const action = pollReconnectInput(state, source_fd, control_fd, input_control, &control_reader, interrupt, @intCast(step_ms));
+        const action = pollReconnectInput(state, source_fd, reconnect_input_fd, control_fd, input_control, &control_reader, interrupt, @intCast(step_ms));
         if (action == .help) {
             status.showEscapeHelp();
             continue;
@@ -1868,13 +1909,14 @@ fn waitBeforeReconnect(
 fn pollReconnectInput(
     state: *StreamState,
     source_fd: c.fd_t,
+    reconnect_input_fd: c.fd_t,
     control_fd: *c.fd_t,
     input_control: *StreamInputControl,
     control_reader: *proxy_control.Reader,
     interrupt: ?*LocalStreamInterrupt,
     timeout_ms: i32,
 ) StreamControlAction {
-    var pollfds: [3]posix.pollfd = undefined;
+    var pollfds: [4]posix.pollfd = undefined;
     var count: usize = 0;
     var interrupt_index: ?usize = null;
     if (interrupt) |local_interrupt| {
@@ -1885,9 +1927,15 @@ fn pollReconnectInput(
         }
     }
     var input_index: ?usize = null;
-    if (reconnectInputPollEnabled(input_control)) {
+    if (source_fd >= 0 and reconnectInputPollEnabled(input_control)) {
         input_index = count;
         pollfds[count] = .{ .fd = source_fd, .events = posix.POLL.IN, .revents = 0 };
+        count += 1;
+    }
+    var reconnect_input_index: ?usize = null;
+    if (reconnect_input_fd >= 0 and reconnectInputPollEnabled(input_control)) {
+        reconnect_input_index = count;
+        pollfds[count] = .{ .fd = reconnect_input_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
         count += 1;
     }
     var control_index: ?usize = null;
@@ -1917,6 +1965,11 @@ fn pollReconnectInput(
             return readReconnectInput(state, source_fd, input_control);
         }
     }
+    if (reconnect_input_index) |index| {
+        if (pollfds[index].revents != 0) {
+            readReconnectControlInput(reconnect_input_fd, input_control);
+        }
+    }
     if (control_index) |index| {
         if (pollfds[index].revents != 0) {
             if (!readControlInput(control_fd.*, input_control, control_reader)) control_fd.* = -1;
@@ -1944,6 +1997,16 @@ fn readReconnectInput(
         state.appendOutbound(filtered_bytes) catch {};
     }
     return input_control.consumeAction();
+}
+
+fn readReconnectControlInput(
+    fd: c.fd_t,
+    input_control: *StreamInputControl,
+) void {
+    var buf: [max_chunk_bytes]u8 = undefined;
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return;
+    input_control.observeControlOnly(buf[0..@intCast(n)]);
 }
 
 fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl, reader: *proxy_control.Reader) bool {
@@ -2741,6 +2804,23 @@ test "stream input control intercepts only reconnect UI controls" {
 
     control.status_visible = false;
     try std.testing.expectEqualStrings("\x12", control.filter("\x12", &out));
+    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
+}
+
+test "stream control-only input never forwards bytes" {
+    var control = StreamInputControl{
+        .enabled = true,
+        .status_visible = true,
+    };
+
+    control.observeControlOnly("a\x12b");
+    try std.testing.expectEqual(StreamControlAction.reconnect, control.consumeAction());
+
+    control.observeControlOnly("abc");
+    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
+
+    control.status_visible = false;
+    control.observeControlOnly("\x12");
     try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
 }
 

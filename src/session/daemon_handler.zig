@@ -11,6 +11,7 @@ const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
 const session_runtime = @import("runtime.zig");
+const session_runtime_process = @import("runtime_process.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 
 const pb = protocol.pb;
@@ -553,7 +554,7 @@ fn startTerminalRemoteAndConnect(
     const control = if (uses_daemon_runtime)
         try session_runtime.startTerminalRuntimeInDaemon(allocator, daemon_dispatcher orelse return error.MissingDispatcher, guid)
     else
-        try session_runtime.startTerminalRemoteProcess(allocator, exe, guid);
+        try session_runtime_process.start(allocator, exe, guid);
     const process_fd = session_runtime.connectStartedTerminalRuntime(control, daemon_dispatcher) catch |err| {
         if (uses_daemon_runtime) {
             session_runtime.destroyInDaemonTerminalRuntime(control, daemon_dispatcher.?);

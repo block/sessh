@@ -910,7 +910,7 @@ def start_daemon(env, session_id=None):
     _ = session_id
     path = socket_path(env, session_id)
     proc = subprocess.Popen(
-        [str(BIN), ":internal-daemon:"],
+        [str(BIN), ":daemon:"],
         cwd=ROOT,
         env=env,
         stdin=subprocess.DEVNULL,
@@ -1151,7 +1151,7 @@ def send_hello(conn, major_delta=0, minor_delta=0, version_override=None, expect
 
 def broker_hello(env, **kwargs):
     proc = subprocess.Popen(
-        [str(BIN), ":internal-broker:"],
+        [str(BIN), ":broker:"],
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
@@ -1173,7 +1173,7 @@ def broker_hello(env, **kwargs):
 
 def run_daemon_ping_test(env):
     proc = subprocess.Popen(
-        [str(BIN), ":internal-daemon:"],
+        [str(BIN), ":daemon:"],
         cwd=ROOT,
         env=env,
         stdin=subprocess.DEVNULL,
@@ -1225,7 +1225,7 @@ def run_daemon_concurrent_start_test(_base_env):
             for _ in range(6):
                 procs.append(
                     subprocess.Popen(
-                        [str(BIN), ":internal-daemon:"],
+                        [str(BIN), ":daemon:"],
                         cwd=ROOT,
                         env=env,
                         stdin=subprocess.DEVNULL,
@@ -3002,7 +3002,7 @@ def run_broker_starts_daemon_session_test(base_env):
         shell.chmod(0o700)
 
         proc = subprocess.Popen(
-            [str(BIN), ":internal-broker:"],
+            [str(BIN), ":broker:"],
             cwd=ROOT,
             env=env,
             stdin=subprocess.PIPE,
@@ -3163,7 +3163,7 @@ def main():
                 expected_socket = runtime_root(env) / daemon_socket_dir_name_for_executable(sessh_artifact) / "sesshd.sock"
                 cleanup_runtime(env)
                 proc = subprocess.Popen(
-                    [str(sessh_wrapper), ":internal-daemon:"],
+                    [str(sessh_wrapper), ":daemon:"],
                     cwd=ROOT,
                     env=env,
                     stdin=subprocess.DEVNULL,

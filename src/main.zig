@@ -8,6 +8,7 @@ const daemon_client = @import("daemon/client.zig");
 const io = @import("core/io.zig");
 const process_exit = @import("core/process_exit.zig");
 const session_runtime = @import("session/runtime.zig");
+const session_runtime_process = @import("session/runtime_process.zig");
 const stream_runtime = @import("stream/runtime.zig");
 const terminal = @import("tty/terminal.zig");
 const transport_ssh = @import("transport/ssh.zig");
@@ -49,7 +50,7 @@ fn runMain() !void {
         return transport_ssh.runProxyStream(allocator, args[0], args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-terminal-remote")) {
-        return session_runtime.runTerminalRemoteProcess(allocator, args[1..]);
+        return session_runtime_process.run(allocator, args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-proxy-remote")) {
         return stream_runtime.runProxyRemoteProcess(allocator, args[1..]);
@@ -57,23 +58,23 @@ fn runMain() !void {
 
     if (args.len == 1) return usage(0);
 
-    if (std.mem.eql(u8, args[1], ":internal-daemon:")) {
+    if (std.mem.eql(u8, args[1], ":daemon:")) {
         return daemon.reexecDaemonOrRun(allocator, args[0], args[2..]);
     }
 
-    if (std.mem.eql(u8, args[1], ":internal-broker:")) {
+    if (std.mem.eql(u8, args[1], ":broker:")) {
         return daemon.reexecBrokerOrForward(allocator, args[0], args[2..]);
     }
 
-    if (std.mem.eql(u8, args[1], ":internal-proxy-stream:")) {
+    if (std.mem.eql(u8, args[1], ":proxy:")) {
         return transport_ssh.runProxyStream(allocator, args[0], args[2..]);
     }
 
-    if (std.mem.eql(u8, args[1], ":internal-terminal-runtime:")) {
-        return session_runtime.runTerminalRemoteProcess(allocator, args[2..]);
+    if (std.mem.eql(u8, args[1], ":terminal-remote:")) {
+        return session_runtime_process.run(allocator, args[2..]);
     }
 
-    if (std.mem.eql(u8, args[1], ":internal-proxy-remote:")) {
+    if (std.mem.eql(u8, args[1], ":proxy-remote:")) {
         return stream_runtime.runProxyRemoteProcess(allocator, args[2..]);
     }
 

@@ -23,14 +23,19 @@ const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
 const protocol = @import("../protocol/mod.zig");
 const plain_ssh = @import("plain_ssh.zig");
+const proxy_command = @import("proxy_command.zig");
+const proxy_control_registry = @import("proxy_control_registry.zig");
 const reconnect = @import("../reconnect/mod.zig");
 const remote_shell = @import("remote_shell.zig");
 const session_registry = @import("../runtime/session_registry.zig");
 const socket_transport = @import("socket.zig");
 const ssh_opts = @import("ssh_options.zig");
 const stream_runtime = @import("../stream/runtime.zig");
+const terminal = @import("../tty/terminal.zig");
 const tty_transcript = @import("../tty/transcript.zig");
 const pb = protocol.pb;
+
+extern "c" fn ttyname(fd: c_int) ?[*:0]u8;
 
 const CommonSessionOptions = sessh_cli.CommonSessionOptions;
 
@@ -45,16 +50,8 @@ pub const classifySshOptions = ssh_opts.classifySshOptions;
 pub const resolveSshConfig = ssh_opts.resolveSshConfig;
 
 const appendTransportSshOptions = ssh_opts.appendTransportSshOptions;
-const isProxyRequiredSshFlag = ssh_opts.isProxyRequiredSshFlag;
-const isProxyRequiredSshOptionWithValue = ssh_opts.isProxyRequiredSshOptionWithValue;
-const isSshTtyRequestOption = ssh_opts.isSshTtyRequestOption;
 const isUnsafeSshOptionWithValue = ssh_opts.isUnsafeSshOptionWithValue;
-const sshConfigKey = ssh_opts.sshConfigKey;
-const sshConfigKeyIs = ssh_opts.sshConfigKeyIs;
-const sshConfigOptionRequiresProxy = ssh_opts.sshConfigOptionRequiresProxy;
-const sshConfigValueIs = ssh_opts.sshConfigValueIs;
 const sshOptionRequiresValue = ssh_opts.sshOptionRequiresValue;
-const sshOptionSeparateValueIndex = ssh_opts.sshOptionSeparateValueIndex;
 const transportSshOptionsLen = ssh_opts.transportSshOptionsLen;
 
 const BootstrapEntrypoint = remote_shell.Entrypoint;
@@ -541,222 +538,8 @@ const PooledSshTransportAcquire = struct {
 var pooled_ssh_transports: std.ArrayList(*PooledSshTransport) = .empty;
 var active_pooled_ssh_transports: usize = 0;
 
-const ProxyControlRegistration = struct {
-    allocator: std.mem.Allocator,
-    guid: []u8,
-    visible_fd: c.fd_t = -1,
-    stream_fd: c.fd_t = -1,
-
-    fn deinit(self: *ProxyControlRegistration) void {
-        self.allocator.free(self.guid);
-        self.* = undefined;
-    }
-};
-
-var proxy_control_registrations: std.ArrayList(*ProxyControlRegistration) = .empty;
-
 pub fn activePooledSshTransportCount() usize {
     return active_pooled_ssh_transports;
-}
-
-pub fn registerProxyControlOpenFromDaemon(
-    allocator: std.mem.Allocator,
-    daemon_dispatcher: *dispatcher.Dispatcher,
-    fd: c.fd_t,
-    open: pb.ClientDaemonItem.ProxyControlOpen,
-) !void {
-    const context = try allocator.create(ProxyControlVisibleConnection);
-    errdefer allocator.destroy(context);
-    const guid = try session_registry.canonicalProxyGuid(allocator, open.proxy_guid);
-    errdefer allocator.free(guid);
-    try registerProxyControlVisible(allocator, guid, fd);
-    errdefer unregisterProxyControlVisible(fd);
-    try core_fds.setNonBlocking(fd);
-    context.* = .{
-        .allocator = allocator,
-        .fd = fd,
-        .guid = guid,
-        .reader = protocol.FrameReader.init(allocator),
-    };
-    errdefer context.reader.deinit();
-    context.watch_id = try daemon_dispatcher.watchFd(fd, .{ .readable = true }, .{
-        .ctx = context,
-        .callback = readProxyControlVisibleConnection,
-    });
-}
-
-const ProxyControlVisibleConnection = struct {
-    allocator: std.mem.Allocator,
-    fd: c.fd_t = -1,
-    guid: []u8,
-    reader: protocol.FrameReader,
-    watch_id: ?dispatcher.FdWatchId = null,
-
-    fn deinit(self: *ProxyControlVisibleConnection, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
-        if (daemon_dispatcher) |d| {
-            if (self.watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
-        }
-        self.watch_id = null;
-        if (self.fd >= 0) {
-            unregisterProxyControlVisible(self.fd);
-            _ = c.close(self.fd);
-            self.fd = -1;
-        }
-        self.reader.deinit();
-        self.allocator.free(self.guid);
-        const allocator = self.allocator;
-        self.* = undefined;
-        allocator.destroy(self);
-    }
-};
-
-fn readProxyControlVisibleConnection(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
-    _ = id;
-    const connection: *ProxyControlVisibleConnection = @ptrCast(@alignCast(ctx));
-    readProxyControlVisibleConnectionInner(connection, daemon_dispatcher, event) catch {
-        connection.deinit(daemon_dispatcher);
-    };
-}
-
-fn readProxyControlVisibleConnectionInner(
-    connection: *ProxyControlVisibleConnection,
-    daemon_dispatcher: *dispatcher.Dispatcher,
-    event: dispatcher.Event,
-) !void {
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return error.UnexpectedProxyControlTimer,
-    };
-    if (fd_event.error_event or fd_event.invalid) {
-        connection.deinit(daemon_dispatcher);
-        return;
-    }
-    if (!fd_event.readable) {
-        if (fd_event.hangup) connection.deinit(daemon_dispatcher);
-        return;
-    }
-    while (true) {
-        switch (try connection.reader.readReady(connection.fd)) {
-            .blocked => return,
-            .progress => continue,
-            .eof, .truncated_frame => {
-                connection.deinit(daemon_dispatcher);
-                return;
-            },
-            .frame => |frame_value| {
-                var frame = frame_value;
-                defer frame.deinit(connection.allocator);
-                if (!try proxyControlVisibleFrameIsAllowed(connection.allocator, frame)) return error.UnexpectedProxyControlFrame;
-                try forwardProxyControlToStream(connection.guid, frame);
-            },
-        }
-    }
-}
-
-fn registerProxyControlVisible(allocator: std.mem.Allocator, guid: []const u8, fd: c.fd_t) !void {
-    const registration = try findOrCreateProxyControlRegistrationLocked(allocator, guid);
-    if (registration.visible_fd >= 0 and registration.visible_fd != fd) return error.ProxyControlAlreadyOpen;
-    registration.visible_fd = fd;
-}
-
-fn registerProxyControlStream(allocator: std.mem.Allocator, guid: []const u8, fd: c.fd_t) !void {
-    const registration = try findOrCreateProxyControlRegistrationLocked(allocator, guid);
-    registration.stream_fd = fd;
-}
-
-fn unregisterProxyControlVisible(fd: c.fd_t) void {
-    for (proxy_control_registrations.items) |registration| {
-        if (registration.visible_fd == fd) registration.visible_fd = -1;
-    }
-    removeUnusedProxyControlRegistrationsLocked();
-}
-
-fn unregisterProxyControlStream(fd: c.fd_t) void {
-    for (proxy_control_registrations.items) |registration| {
-        if (registration.stream_fd == fd) registration.stream_fd = -1;
-    }
-    removeUnusedProxyControlRegistrationsLocked();
-}
-
-fn findOrCreateProxyControlRegistrationLocked(allocator: std.mem.Allocator, guid: []const u8) !*ProxyControlRegistration {
-    for (proxy_control_registrations.items) |registration| {
-        if (std.mem.eql(u8, registration.guid, guid)) return registration;
-    }
-    const registration = try allocator.create(ProxyControlRegistration);
-    errdefer allocator.destroy(registration);
-    registration.* = .{
-        .allocator = allocator,
-        .guid = try allocator.dupe(u8, guid),
-    };
-    errdefer registration.deinit();
-    try proxy_control_registrations.append(allocator, registration);
-    return registration;
-}
-
-fn removeUnusedProxyControlRegistrationsLocked() void {
-    var index: usize = 0;
-    while (index < proxy_control_registrations.items.len) {
-        const registration = proxy_control_registrations.items[index];
-        if (registration.visible_fd >= 0 or registration.stream_fd >= 0) {
-            index += 1;
-            continue;
-        }
-        _ = proxy_control_registrations.swapRemove(index);
-        const allocator = registration.allocator;
-        registration.deinit();
-        allocator.destroy(registration);
-    }
-}
-
-fn proxyControlVisibleFrameIsAllowed(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !bool {
-    if (frame.message_type != .client_daemon) return false;
-    var item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, frame.payload);
-    defer item.deinit(allocator);
-    return switch (item.payload orelse return false) {
-        .retry_now => true,
-        else => false,
-    };
-}
-
-fn forwardProxyControlToStream(guid: []const u8, frame: protocol.OwnedFrame) !void {
-    const stream_fd = proxyControlStreamFd(guid) orelse return;
-    protocol.sendFrame(stream_fd, frame.message_type, frame.payload) catch |err| {
-        unregisterProxyControlStream(stream_fd);
-        return err;
-    };
-}
-
-fn forwardProxyControlFromStream(allocator: std.mem.Allocator, guid: []const u8, frame: protocol.OwnedFrame) !void {
-    if (!try proxyControlStreamFrameIsAllowed(allocator, frame)) return error.UnexpectedProxyControlFrame;
-    const visible_fd = proxyControlVisibleFd(guid) orelse return;
-    protocol.sendFrame(visible_fd, frame.message_type, frame.payload) catch |err| {
-        unregisterProxyControlVisible(visible_fd);
-        return err;
-    };
-}
-
-fn proxyControlStreamFrameIsAllowed(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !bool {
-    if (frame.message_type != .client_daemon) return false;
-    var item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, frame.payload);
-    defer item.deinit(allocator);
-    return switch (item.payload orelse return false) {
-        .connection_event => true,
-        else => false,
-    };
-}
-
-fn proxyControlVisibleFd(guid: []const u8) ?c.fd_t {
-    for (proxy_control_registrations.items) |registration| {
-        if (std.mem.eql(u8, registration.guid, guid) and registration.visible_fd >= 0) return registration.visible_fd;
-    }
-    return null;
-}
-
-fn proxyControlStreamFd(guid: []const u8) ?c.fd_t {
-    for (proxy_control_registrations.items) |registration| {
-        if (std.mem.eql(u8, registration.guid, guid) and registration.stream_fd >= 0) return registration.stream_fd;
-    }
-    return null;
 }
 
 fn resolveSshTarget(
@@ -787,7 +570,7 @@ const reconnect_ready_switch_delay_ms: u64 = 10_000;
 /// Start the ssh transport by running the bootstrapper as the remote command.
 ///
 /// The bootstrapper installs or finds the remote sessh binary, then execs
-/// the internal `:internal-broker:` entrypoint we send in the EXEC line.
+/// the `:broker:` entrypoint we send in the EXEC line.
 /// Installed packages keep one executable per supported platform under
 /// `libexec/sessh/<os>-<arch>/sessh`. If that layout is unavailable, upload the
 /// current binary for same-platform development tests.
@@ -2702,7 +2485,7 @@ fn forwardPooledSshTransportClientFrame(
             if (client.kind != .proxy or client.proxy_guid_len == 0) {
                 return failPooledSshTransportClientWithError(daemon_dispatcher, transport, client, "PROTOCOL_ERROR", "unexpected proxy control frame", "", true);
             }
-            try forwardProxyControlFromStream(transport.allocator, client.proxyGuidSlice(), frame.*);
+            try proxy_control_registry.forwardFromStream(transport.allocator, client.proxyGuidSlice(), frame.*);
         },
         else => {
             return failPooledSshTransportClientWithError(daemon_dispatcher, transport, client, "PROTOCOL_ERROR", "unexpected terminal client frame", "", true);
@@ -2917,7 +2700,7 @@ fn maybeRegisterProxyControlStream(
     const canonical = try session_registry.canonicalProxyGuid(allocator, open.proxy_guid);
     defer allocator.free(canonical);
     try client.setProxyGuid(canonical);
-    try registerProxyControlStream(allocator, canonical, client.fd);
+    try proxy_control_registry.registerStream(allocator, canonical, client.fd);
 }
 
 fn sendPooledTerminalMuxPayload(
@@ -3267,7 +3050,7 @@ fn finishPooledSshTransportClient(
     client: *PooledSshTransportClient,
     send_hangup: bool,
 ) void {
-    if (client.kind == .proxy) unregisterProxyControlStream(client.fd);
+    if (client.kind == .proxy) proxy_control_registry.unregisterStream(client.fd);
     if (send_hangup and client.state == .active and transport.state != .closing and transport.state != .closed) {
         if (!client.session_ended) {
             if (client.remote_cleanup) |remote| {
@@ -4059,6 +3842,52 @@ fn setNonBlockingFd(fd: c.fd_t) !void {
     if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
 }
 
+const StderrTtyControl = struct {
+    fd: c.fd_t = -1,
+    mode_guard: terminal.TerminalModeGuard = undefined,
+    mode_guard_enabled: bool = false,
+
+    fn open(enabled: bool) StderrTtyControl {
+        if (!enabled) return .{};
+        if (c.isatty(posix.STDERR_FILENO) == 0) return .{};
+        const path_z = ttyname(posix.STDERR_FILENO) orelse return .{};
+        const fd = posix.openZ(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return .{};
+        var control = StderrTtyControl{ .fd = fd };
+        core_fds.setNonBlocking(fd) catch {
+            control.deinit();
+            return .{};
+        };
+        // ProxyCommand stdin is the SSH byte stream, so Ctrl-R cannot be read
+        // from fd 0. When requested, read control keystrokes from stderr's tty
+        // instead. Terminal mode is attached to the tty device, not this fd
+        // alone, so the guard restores the visible terminal on exit.
+        control.mode_guard = terminal.TerminalModeGuard.enable(fd) catch {
+            control.deinit();
+            return .{};
+        };
+        control.mode_guard_enabled = true;
+        return control;
+    }
+
+    fn deinit(self: *StderrTtyControl) void {
+        if (self.mode_guard_enabled) {
+            self.mode_guard.restore();
+            self.mode_guard_enabled = false;
+        }
+        if (self.fd >= 0) {
+            posix.close(self.fd);
+            self.fd = -1;
+        }
+    }
+};
+
+fn sameTerminalFd(left: c.fd_t, right: c.fd_t) bool {
+    if (c.isatty(left) == 0 or c.isatty(right) == 0) return false;
+    const left_stat = posix.fstat(left) catch return false;
+    const right_stat = posix.fstat(right) catch return false;
+    return left_stat.dev == right_stat.dev and left_stat.ino == right_stat.ino;
+}
+
 fn inferredClientLogLevel(ssh_options: []const []const u8) client_log.Level {
     const verbosity = sshVerbosity(ssh_options);
     if (verbosity >= 3) return .verbose;
@@ -4526,13 +4355,6 @@ fn openProxyControl(
     return fd;
 }
 
-fn proxyStreamReconnectStatusMode(level: config.FilterLevel, has_daemon_control: bool) stream_runtime.StreamReconnectStatusMode {
-    return switch (level) {
-        .unhygienic => .disabled,
-        .hygienic, .emulated => if (has_daemon_control) .client_control else .stderr_plain,
-    };
-}
-
 fn filterLevelForcesProxy(level: config.FilterLevel) bool {
     return switch (level) {
         .unhygienic, .hygienic => true,
@@ -4572,13 +4394,13 @@ fn runProxyStreamSsh(
         new.shell_command_args
     else
         &.{};
-    const use_fd_pass = common.isolation_mode == .none;
-    const diagnostics_plan = if (use_fd_pass) ProxyDiagnosticsPlan{
+    const use_fd_pass = proxy_command.isolationModeUsesDirectPlacement(common.isolation_mode);
+    const diagnostics_plan = if (use_fd_pass) proxy_command.DiagnosticsPlan{
         .command_level = .unhygienic,
         .use_daemon_control = false,
         .wrap_visible_ssh = false,
         .client_ctrl_r = false,
-    } else proxyDiagnosticsPlan(
+    } else proxy_command.diagnosticsPlan(
         target.options,
         common.filter_level,
         new.tty_request,
@@ -4599,19 +4421,24 @@ fn runProxyStreamSsh(
             daemon_dir_name,
         );
     }
+    const stdin_from_stderr = diagnostics_plan.use_daemon_control and
+        !diagnostics_plan.wrap_visible_ssh and
+        sameTerminalFd(posix.STDIN_FILENO, posix.STDERR_FILENO);
+    const proxy_client_ctrl_r = diagnostics_plan.client_ctrl_r or stdin_from_stderr;
     const proxy_daemon_dir_name = daemon_dir_name orelse try daemon_socket_namespace.defaultDirName(allocator);
     defer if (daemon_dir_name == null) allocator.free(proxy_daemon_dir_name);
     try daemon_client.ensureStartedForDirName(allocator, exe, proxy_daemon_dir_name);
     var runtime_executables = try daemon_executable.runtimeExecutablePaths(allocator, proxy_daemon_dir_name);
     defer runtime_executables.deinit();
 
-    const proxy_command_option = try proxyCommandOption(
+    const proxy_command_option = try proxy_command.commandOption(
         allocator,
         runtime_executables.proxy,
         target.options,
         control_guid,
         diagnostics_plan.command_level,
-        diagnostics_plan.client_ctrl_r,
+        proxy_client_ctrl_r,
+        stdin_from_stderr,
         common.bootstrap,
         daemon_dir_name,
         use_fd_pass,
@@ -4653,226 +4480,24 @@ fn runProxyStreamSsh(
     try plain_ssh.runArgv(allocator, ssh_args, "proxy-stream");
 }
 
-const ProxyDiagnosticsPlan = struct {
-    command_level: config.FilterLevel,
-    use_daemon_control: bool,
-    wrap_visible_ssh: bool,
-    client_ctrl_r: bool,
-};
-
-fn proxyDiagnosticsPlan(
-    ssh_options: []const []const u8,
-    filter_level: config.FilterLevel,
-    tty_request: SshTtyRequest,
-    shell_command_args: []const []const u8,
-    stdin_is_tty: bool,
-    stdout_is_tty: bool,
-) ProxyDiagnosticsPlan {
-    return switch (filter_level) {
-        .unhygienic => .{
-            .command_level = .unhygienic,
-            .use_daemon_control = false,
-            .wrap_visible_ssh = false,
-            .client_ctrl_r = false,
-        },
-        .hygienic, .emulated => blk: {
-            if (!stdin_is_tty or !stdout_is_tty) break :blk .{
-                .command_level = .unhygienic,
-                .use_daemon_control = false,
-                .wrap_visible_ssh = false,
-                .client_ctrl_r = false,
-            };
-            const wrap_visible_ssh = outerSshAllocatesTty(ssh_options, tty_request, shell_command_args, stdin_is_tty);
-            break :blk .{
-                .command_level = .hygienic,
-                .use_daemon_control = true,
-                .wrap_visible_ssh = wrap_visible_ssh,
-                .client_ctrl_r = wrap_visible_ssh and stdin_is_tty,
-            };
-        },
-    };
-}
-
-fn outerSshAllocatesTty(
-    ssh_options: []const []const u8,
-    tty_request: SshTtyRequest,
-    shell_command_args: []const []const u8,
-    stdin_is_tty: bool,
-) bool {
-    const explicit = explicitTtyRequest(ssh_options);
-    if (explicit) |request| return switch (request) {
-        .none => false,
-        .requested => stdin_is_tty,
-        .forced => true,
-    };
-    return switch (tty_request) {
-        .none => stdin_is_tty and shell_command_args.len == 0,
-        .requested => stdin_is_tty,
-        .forced => true,
-    };
-}
-
-fn explicitTtyRequest(options: []const []const u8) ?SshTtyRequest {
-    var result: ?SshTtyRequest = null;
-    var i: usize = 0;
-    while (i < options.len) {
-        const arg = options[i];
-        if (std.mem.startsWith(u8, arg, "--") or arg.len < 2 or arg[0] != '-') {
-            i += 1;
-            continue;
-        }
-        var pos: usize = 1;
-        while (pos < arg.len) {
-            const option = arg[pos];
-            if (option == 'T') {
-                result = .none;
-                pos += 1;
-                continue;
-            }
-            if (option == 't') {
-                if (result != null and result.? == .requested) {
-                    result = .forced;
-                } else if (result == null or result.? != .forced) {
-                    result = .requested;
-                }
-                pos += 1;
-                continue;
-            }
-            if (option == 'o') {
-                const value = optionValueFromOptions(options, i, pos) orelse return result;
-                if (sshConfigKeyIs(value, "RequestTTY")) {
-                    const key = sshConfigKey(value);
-                    if (sshConfigValueIs(value, key.len, "no")) {
-                        result = .none;
-                    } else if (sshConfigValueIs(value, key.len, "force")) {
-                        result = .forced;
-                    } else if (sshConfigValueIs(value, key.len, "yes")) {
-                        result = .requested;
-                    }
-                }
-                i = if (pos + 1 < arg.len) i + 1 else i + 2;
-                break;
-            }
-            if (sshOptionRequiresValue(option) or isUnsafeSshOptionWithValue(option) or isProxyRequiredSshOptionWithValue(option)) {
-                i = if (pos + 1 < arg.len) i + 1 else i + 2;
-                break;
-            }
-            pos += 1;
-        } else {
-            i += 1;
-        }
-    }
-    return result;
-}
-
-fn proxyCommandOption(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    ssh_options: []const []const u8,
-    control_guid: ?[]const u8,
-    filter_level: config.FilterLevel,
-    client_ctrl_r: bool,
-    bootstrap: bool,
-    daemon_dir_name: ?[]const u8,
-    use_fd_pass: bool,
-) ![]u8 {
-    var command: std.ArrayList(u8) = .empty;
-    defer command.deinit(allocator);
-
-    try appendShellToken(allocator, &command, exe);
-    try appendShellToken(allocator, &command, "--host");
-    // Use the original host token so the inner ssh sees the same Host block.
-    // `%h` is already resolved to HostName and can lose alias-scoped options.
-    try appendShellToken(allocator, &command, "%n");
-    try appendShellToken(allocator, &command, "--port");
-    try appendShellToken(allocator, &command, "%p");
-    try appendShellToken(allocator, &command, "--user");
-    try appendShellToken(allocator, &command, "%r");
-    try appendShellToken(allocator, &command, "--filter-level");
-    try appendShellToken(allocator, &command, filter_level.label());
-    if (use_fd_pass) try appendShellToken(allocator, &command, "--use-fd-pass");
-    try appendShellToken(allocator, &command, if (bootstrap) "--bootstrap" else "--no-bootstrap");
-    if (daemon_dir_name) |dir_name| {
-        try appendShellToken(allocator, &command, "--daemon-namespace");
-        try appendShellToken(allocator, &command, dir_name);
-    }
-    if (control_guid) |guid| {
-        try appendShellToken(allocator, &command, "--control-guid");
-        try appendShellToken(allocator, &command, guid);
-        try appendShellToken(allocator, &command, "--client-ctrl-r");
-        try appendShellToken(allocator, &command, if (client_ctrl_r) "1" else "0");
-    }
-    try appendProxyTransportSshOptions(allocator, &command, ssh_options);
-
-    return std.fmt.allocPrint(allocator, "-oProxyCommand={s}", .{command.items});
-}
-
-fn appendProxyTransportSshOptions(
-    allocator: std.mem.Allocator,
-    command: *std.ArrayList(u8),
-    options: []const []const u8,
-) !void {
-    var i: usize = 0;
-    while (i < options.len) {
-        const value_index = sshOptionSeparateValueIndex(options, i);
-        if (isSshTtyRequestOption(options[i])) {
-            i += 1;
-            continue;
-        }
-        if (sshOptionRequiresOuterProxy(options, i)) {
-            i = if (value_index) |index| index + 1 else i + 1;
-            continue;
-        }
-
-        try appendShellToken(allocator, command, "--ssh-option");
-        try appendShellToken(allocator, command, options[i]);
-        if (value_index) |index| {
-            try appendShellToken(allocator, command, "--ssh-option");
-            try appendShellToken(allocator, command, options[index]);
-            i = index + 1;
-        } else {
-            i += 1;
-        }
-    }
-}
-
-fn sshOptionRequiresOuterProxy(options: []const []const u8, index: usize) bool {
-    const arg = options[index];
-    if (arg.len < 2 or arg[0] != '-' or std.mem.startsWith(u8, arg, "--")) return false;
-
-    var pos: usize = 1;
-    while (pos < arg.len) : (pos += 1) {
-        const option = arg[pos];
-        if (isProxyRequiredSshFlag(option) or isProxyRequiredSshOptionWithValue(option)) return true;
-        if (option == 'o') {
-            const value = optionValueFromOptions(options, index, pos) orelse return false;
-            return sshConfigOptionRequiresProxy(value) catch false;
-        }
-        if (sshOptionRequiresValue(option) or isUnsafeSshOptionWithValue(option)) return false;
-    }
-    return false;
-}
-
-fn optionValueFromOptions(options: []const []const u8, index: usize, option_pos: usize) ?[]const u8 {
-    const arg = options[index];
-    if (option_pos + 1 < arg.len) return arg[option_pos + 1 ..];
-    if (index + 1 >= options.len) return null;
-    return options[index + 1];
-}
-
 const ProxyStreamInvocation = struct {
     host: []const u8,
     port: []const u8,
     user: []const u8 = "",
     daemon_dir_name: ?[]const u8 = null,
+    daemon_dir_name_owned: bool = false,
     control_guid: ?[]const u8 = null,
     filter_level: config.FilterLevel = .unhygienic,
     client_ctrl_r: bool = false,
     bootstrap: bool = true,
     use_fd_pass: bool = false,
+    stdin_from_stderr: bool = false,
     ssh_options: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *ProxyStreamInvocation, allocator: std.mem.Allocator) void {
+        if (self.daemon_dir_name_owned) {
+            if (self.daemon_dir_name) |dir_name| allocator.free(dir_name);
+        }
         self.ssh_options.deinit(allocator);
         self.* = undefined;
     }
@@ -4920,10 +4545,12 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .daemon_dir_name = invocation.daemon_dir_name,
     };
 
-    const status_mode = proxyStreamReconnectStatusMode(
+    const status_mode = proxy_command.reconnectStatusMode(
         invocation.filter_level,
         invocation.control_guid != null,
     );
+    var stderr_tty_control = StderrTtyControl.open(invocation.stdin_from_stderr);
+    defer stderr_tty_control.deinit();
 
     const exit_status = stream_runtime.runLocalStream(allocator, &starter, .{
         .guid = proxy_guid,
@@ -4931,9 +4558,10 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .proxy_port = proxy_port,
         .source_fd = 0,
         .sink_fd = 1,
+        .reconnect_input_fd = stderr_tty_control.fd,
         .status_mode = status_mode,
         .intercept_ctrl_r = false,
-        .ctrl_r_status_enabled = invocation.client_ctrl_r and invocation.control_guid != null,
+        .ctrl_r_status_enabled = (invocation.client_ctrl_r and invocation.control_guid != null) or stderr_tty_control.fd >= 0,
         .title_fallback = invocation.host,
         .reset_on_source_eof = true,
     }) catch |err| {
@@ -5087,15 +4715,35 @@ fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []cons
             i += 1;
             if (i >= args.len or args[i].len == 0) return error.MissingDaemonNamespace;
             try daemon_socket_namespace.validateDirName(args[i]);
+            clearOwnedProxyDaemonDirName(allocator, &invocation);
             invocation.daemon_dir_name = args[i];
+            invocation.daemon_dir_name_owned = false;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--filter-level")) {
             i += 1;
             if (i >= args.len or args[i].len == 0) return error.MissingFilterLevel;
             invocation.filter_level = try config.parseFilterLevel(args[i]);
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--isolation-mode")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingIsolationMode;
+            const isolation_mode = try config.parseIsolationMode(args[i]);
+            switch (isolation_mode) {
+                .full => {
+                    const private_dir_name = try daemon_socket_namespace.privateConnectionDirName(allocator);
+                    errdefer allocator.free(private_dir_name);
+                    clearOwnedProxyDaemonDirName(allocator, &invocation);
+                    invocation.daemon_dir_name = private_dir_name;
+                    invocation.daemon_dir_name_owned = true;
+                },
+                .none, .process => {},
+            }
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--use-fd-pass")) {
             invocation.use_fd_pass = true;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--stdin-from-stderr")) {
+            invocation.stdin_from_stderr = true;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--client-ctrl-r")) {
             i += 1;
@@ -5113,26 +4761,42 @@ fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []cons
         }
     }
 
+    if (stdinFromStderrEnvEnabled()) invocation.stdin_from_stderr = true;
     if (invocation.host.len == 0) return error.MissingProxyHost;
     if (invocation.port.len == 0) return error.MissingProxyPort;
     return invocation;
 }
 
+fn stdinFromStderrEnvEnabled() bool {
+    const value_z = c.getenv("SESSH_STDIN_FROM_STDERR") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value_z), "1");
+}
+
+fn clearOwnedProxyDaemonDirName(allocator: std.mem.Allocator, invocation: *ProxyStreamInvocation) void {
+    if (invocation.daemon_dir_name_owned) {
+        if (invocation.daemon_dir_name) |dir_name| allocator.free(dir_name);
+    }
+    invocation.daemon_dir_name = null;
+    invocation.daemon_dir_name_owned = false;
+}
+
 fn printProxyStreamArgError(err: anyerror) !void {
     switch (err) {
-        error.MissingProxyHost => try io.writeAll(2, "sessh: :internal-proxy-stream: requires --host HOST\n"),
-        error.MissingProxyPort => try io.writeAll(2, "sessh: :internal-proxy-stream: requires --port PORT\n"),
-        error.MissingProxyUser => try io.writeAll(2, "sessh: :internal-proxy-stream: --user requires a value\n"),
-        error.MissingSshOptionValue => try io.writeAll(2, "sessh: :internal-proxy-stream: --ssh-option requires a value\n"),
-        error.MissingProxyControlGuid => try io.writeAll(2, "sessh: :internal-proxy-stream: --control-guid requires a p-guid\n"),
-        error.InvalidProxyControlGuid => try io.writeAll(2, "sessh: :internal-proxy-stream: --control-guid requires a valid p-guid\n"),
-        error.MissingDaemonNamespace => try io.writeAll(2, "sessh: :internal-proxy-stream: --daemon-namespace requires a value\n"),
-        error.InvalidDaemonSocketDir => try io.writeAll(2, "sessh: :internal-proxy-stream: invalid daemon namespace\n"),
-        error.MissingFilterLevel => try io.writeAll(2, "sessh: :internal-proxy-stream: --filter-level requires a value\n"),
-        error.InvalidFilterLevel => try io.writeAll(2, "sessh: :internal-proxy-stream: invalid filter level\n"),
-        error.MissingClientCtrlR => try io.writeAll(2, "sessh: :internal-proxy-stream: --client-ctrl-r requires a value\n"),
-        error.InvalidClientCtrlR => try io.writeAll(2, "sessh: :internal-proxy-stream: --client-ctrl-r must be 0 or 1\n"),
-        else => try io.stderrPrint("sessh: invalid :internal-proxy-stream: arguments: {t}\n", .{err}),
+        error.MissingProxyHost => try io.writeAll(2, "sessh: proxy mode requires --host HOST\n"),
+        error.MissingProxyPort => try io.writeAll(2, "sessh: proxy mode requires --port PORT\n"),
+        error.MissingProxyUser => try io.writeAll(2, "sessh: proxy mode --user requires a value\n"),
+        error.MissingSshOptionValue => try io.writeAll(2, "sessh: proxy mode --ssh-option requires a value\n"),
+        error.MissingProxyControlGuid => try io.writeAll(2, "sessh: proxy mode --control-guid requires a p-guid\n"),
+        error.InvalidProxyControlGuid => try io.writeAll(2, "sessh: proxy mode --control-guid requires a valid p-guid\n"),
+        error.MissingDaemonNamespace => try io.writeAll(2, "sessh: proxy mode --daemon-namespace requires a value\n"),
+        error.InvalidDaemonSocketDir => try io.writeAll(2, "sessh: proxy mode invalid daemon namespace\n"),
+        error.MissingFilterLevel => try io.writeAll(2, "sessh: proxy mode --filter-level requires a value\n"),
+        error.InvalidFilterLevel => try io.writeAll(2, "sessh: proxy mode invalid filter level\n"),
+        error.MissingIsolationMode => try io.writeAll(2, "sessh: proxy mode --isolation-mode requires one of: full, process, none\n"),
+        error.InvalidIsolationMode => try io.writeAll(2, "sessh: proxy mode invalid isolation mode; expected one of: full, process, none\n"),
+        error.MissingClientCtrlR => try io.writeAll(2, "sessh: proxy mode --client-ctrl-r requires a value\n"),
+        error.InvalidClientCtrlR => try io.writeAll(2, "sessh: proxy mode --client-ctrl-r must be 0 or 1\n"),
+        else => try io.stderrPrint("sessh: invalid proxy mode arguments: {t}\n", .{err}),
     }
 }
 
@@ -5368,8 +5032,8 @@ fn shouldUseProxyStreamForTestWithStdout(parsed: ParsedSesshForTest, stdin_is_tt
     return shouldUseProxyStream(remoteNewFromParsedSessh(parsed), parsed.invocation.common, stdin_is_tty, stdout_is_tty);
 }
 
-fn proxyDiagnosticsPlanForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool, stdout_is_tty: bool) ProxyDiagnosticsPlan {
-    return proxyDiagnosticsPlan(
+fn proxyDiagnosticsPlanForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool, stdout_is_tty: bool) proxy_command.DiagnosticsPlan {
+    return proxy_command.diagnosticsPlan(
         parsed.invocation.ssh_options,
         parsed.invocation.common.filter_level,
         parsed.invocation.tty_request,
@@ -5500,17 +5164,18 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(shouldUseProxyStreamForTest(parsed, true));
 
-    const option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "p-550e8400-e29b-41d4-a716-446655440000", .hygienic, true, true, "3.conn.test", false);
+    const option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "p-550e8400-e29b-41d4-a716-446655440000", .hygienic, true, true, true, "3.conn.test", false);
     defer std.testing.allocator.free(option);
 
     try std.testing.expect(std.mem.indexOf(u8, option, "sessh-proxy") != null);
-    try std.testing.expect(std.mem.indexOf(u8, option, ":internal-proxy-stream:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, option, ":proxy:") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%n") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%p") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "%r") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--filter-level") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "hygienic") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--use-fd-pass") == null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "--stdin-from-stderr") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--bootstrap") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--daemon-namespace") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "3.conn.test") != null);
@@ -5524,81 +5189,67 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "'-X'") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "'-tt'") == null);
 
-    const no_bootstrap_option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, false, null, false);
+    const no_bootstrap_option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, false, false, null, false);
     defer std.testing.allocator.free(no_bootstrap_option);
     try std.testing.expect(std.mem.indexOf(u8, no_bootstrap_option, "--no-bootstrap") != null);
 
-    const fd_pass_option = try proxyCommandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, true, null, true);
+    const fd_pass_option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, false, true, null, true);
     defer std.testing.allocator.free(fd_pass_option);
     try std.testing.expect(std.mem.indexOf(u8, fd_pass_option, "--use-fd-pass") != null);
 }
 
-test "proxy control registry routes diagnostics and retry by proxy guid" {
-    const allocator = std.testing.allocator;
-    const guid = "p-550e8400-e29b-41d4-a716-446655440000";
-
-    var visible: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &visible) != 0) return error.SocketPairFailed;
-    defer _ = c.close(visible[0]);
-    defer _ = c.close(visible[1]);
-
-    var stream: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &stream) != 0) return error.SocketPairFailed;
-    defer _ = c.close(stream[0]);
-    defer _ = c.close(stream[1]);
-
-    defer {
-        unregisterProxyControlVisible(visible[0]);
-        unregisterProxyControlStream(stream[0]);
-        proxy_control_registrations.deinit(allocator);
-        proxy_control_registrations = .empty;
-    }
-
-    try registerProxyControlVisible(allocator, guid, visible[0]);
-    try registerProxyControlStream(allocator, guid, stream[0]);
-
-    const stderr_payload = try protocol.encodePayload(allocator, pb.ClientDaemonItem{ .payload = .{
-        .connection_event = .{ .event = .{ .ssh_stderr = .{ .data = "proxy stderr line" } } },
-    } });
-    defer allocator.free(stderr_payload);
-    try forwardProxyControlFromStream(allocator, guid, .{
-        .message_type = .client_daemon,
-        .payload = stderr_payload,
+test "proxy invocation isolation mode controls placement" {
+    var full = try parseProxyStreamInvocation(std.testing.allocator, &.{
+        "--host",
+        "example.com",
+        "--port",
+        "22",
+        "--isolation-mode",
+        "full",
     });
+    defer full.deinit(std.testing.allocator);
+    try std.testing.expect(!full.use_fd_pass);
+    try std.testing.expect(full.daemon_dir_name_owned);
+    try std.testing.expect(std.mem.indexOf(u8, full.daemon_dir_name orelse "", ".conn.") != null);
 
-    var visible_frame = try readFrameForTest(allocator, visible[1]);
-    defer visible_frame.deinit(allocator);
-    try std.testing.expectEqual(protocol.MessageType.client_daemon, visible_frame.message_type);
-    var visible_item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, visible_frame.payload);
-    defer visible_item.deinit(allocator);
-    const event = switch (visible_item.payload orelse return error.MissingProxyControlPayload) {
-        .connection_event => |event| event,
-        else => return error.UnexpectedProxyControlFrame,
-    };
-    const stderr = switch (event.event orelse return error.MissingProxyControlPayload) {
-        .ssh_stderr => |stderr| stderr,
-        else => return error.UnexpectedProxyControlFrame,
-    };
-    try std.testing.expectEqualStrings("proxy stderr line", stderr.data);
-
-    const retry_payload = try protocol.encodePayload(allocator, pb.ClientDaemonItem{ .payload = .{
-        .retry_now = .{},
-    } });
-    defer allocator.free(retry_payload);
-    try forwardProxyControlToStream(guid, .{
-        .message_type = .client_daemon,
-        .payload = retry_payload,
+    var process = try parseProxyStreamInvocation(std.testing.allocator, &.{
+        "--host",
+        "example.com",
+        "--port",
+        "22",
+        "--use-fd-pass",
+        "--isolation-mode",
+        "process",
     });
+    defer process.deinit(std.testing.allocator);
+    try std.testing.expect(process.use_fd_pass);
+    try std.testing.expect(process.daemon_dir_name == null);
 
-    var stream_frame = try readFrameForTest(allocator, stream[1]);
-    defer stream_frame.deinit(allocator);
-    try std.testing.expectEqual(protocol.MessageType.client_daemon, stream_frame.message_type);
-    var stream_item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, stream_frame.payload);
-    defer stream_item.deinit(allocator);
-    switch (stream_item.payload orelse return error.MissingProxyControlPayload) {
-        .retry_now => {},
-        else => return error.UnexpectedProxyControlFrame,
-    }
+    var none = try parseProxyStreamInvocation(std.testing.allocator, &.{
+        "--host",
+        "example.com",
+        "--port",
+        "22",
+        "--isolation-mode",
+        "none",
+    });
+    defer none.deinit(std.testing.allocator);
+    try std.testing.expect(!none.use_fd_pass);
+    try std.testing.expect(none.daemon_dir_name == null);
+}
+
+test "proxy invocation parses explicit fd-pass and stdin-from-stderr flags" {
+    var invocation = try parseProxyStreamInvocation(std.testing.allocator, &.{
+        "--host",
+        "example.com",
+        "--port",
+        "22",
+        "--use-fd-pass",
+        "--stdin-from-stderr",
+    });
+    defer invocation.deinit(std.testing.allocator);
+    try std.testing.expect(invocation.use_fd_pass);
+    try std.testing.expect(invocation.stdin_from_stderr);
 }
 
 test "stream routing preserves ssh remote command tty semantics" {
@@ -5764,10 +5415,10 @@ test "default ssh options append resolved interactive IPQoS value" {
 }
 
 test "proxy stream reconnect status follows filter level" {
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.disabled, proxyStreamReconnectStatusMode(.unhygienic, false));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, proxyStreamReconnectStatusMode(.hygienic, false));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.hygienic, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxyStreamReconnectStatusMode(.emulated, true));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.disabled, proxy_command.reconnectStatusMode(.unhygienic, false));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, proxy_command.reconnectStatusMode(.hygienic, false));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxy_command.reconnectStatusMode(.hygienic, true));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxy_command.reconnectStatusMode(.emulated, true));
 }
 
 test "proxy diagnostics plan maps emulated to daemon control" {

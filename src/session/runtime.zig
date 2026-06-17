@@ -148,7 +148,7 @@ const PendingRuntimeClient = struct {
     }
 };
 
-const TerminalRemoteProcessKind = union(enum) {
+pub const TerminalRemoteProcessKind = union(enum) {
     process: struct {
         socket_path: []u8,
         pid: c.pid_t = 0,
@@ -156,12 +156,12 @@ const TerminalRemoteProcessKind = union(enum) {
     in_daemon: *DispatcherSessionRuntime,
 };
 
-const TerminalRemoteProcess = struct {
+pub const TerminalRemoteProcess = struct {
     allocator: std.mem.Allocator,
     guid: []u8,
     kind: TerminalRemoteProcessKind,
 
-    fn deinit(self: *TerminalRemoteProcess, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
+    pub fn deinit(self: *TerminalRemoteProcess, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
         self.allocator.free(self.guid);
         switch (self.kind) {
             .process => |process| self.allocator.free(process.socket_path),
@@ -323,8 +323,6 @@ const DispatcherSessionRuntime = struct {
 };
 
 var terminal_remote_processes: std.ArrayList(*TerminalRemoteProcess) = .empty;
-var terminal_remote_socket_sequence: u64 = 0;
-
 const PollKind = union(enum) {
     listen,
     session,
@@ -1306,58 +1304,6 @@ fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
     };
 }
 
-pub fn runTerminalRemoteProcess(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    _ = allocator;
-    if (args.len != 3) return error.InvalidTerminalRemoteArgs;
-    const listen_fd = try std.fmt.parseInt(c.fd_t, args[0], 10);
-    const socket_path = args[1];
-    const session_guid = args[2];
-    core_fds.closeInheritedNonStdioFileDescriptorsExcept(listen_fd);
-    socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
-    defer _ = c.close(listen_fd);
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
-
-    try runSessionRuntimeLoop(session_guid, listen_fd);
-}
-
-pub fn startTerminalRemoteProcess(allocator: std.mem.Allocator, exe: []const u8, session_guid: []const u8) !*TerminalRemoteProcess {
-    const guid = try session_registry.canonicalGuid(allocator, session_guid);
-    errdefer allocator.free(guid);
-
-    const socket_path = try terminalRemoteSocketPath(allocator, exe, "terminal");
-    errdefer allocator.free(socket_path);
-    try socket_transport.ensureSocketDir(allocator, socket_path);
-    const listen_fd = try socket_transport.listenSocket(socket_path);
-    errdefer _ = c.close(listen_fd);
-    try socket_transport.clearCloseOnExec(listen_fd);
-
-    const control = try allocator.create(TerminalRemoteProcess);
-    errdefer allocator.destroy(control);
-    control.* = .{
-        .allocator = allocator,
-        .guid = guid,
-        .kind = .{ .process = .{
-            .socket_path = socket_path,
-        } },
-    };
-    errdefer control.deinit(null);
-
-    try registerTerminalRemote(control);
-    errdefer unregisterTerminalRemote(control);
-
-    const listen_fd_arg = try std.fmt.allocPrint(allocator, "{}", .{listen_fd});
-    defer allocator.free(listen_fd_arg);
-    const argv = [_][]const u8{ exe, listen_fd_arg, socket_path, guid };
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    _ = c.close(listen_fd);
-    control.kind.process.pid = @intCast(child.id);
-    return control;
-}
-
 pub fn startTerminalRuntimeInDaemon(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -1388,17 +1334,7 @@ pub fn startTerminalRuntimeInDaemon(
     return control;
 }
 
-fn terminalRemoteSocketPath(allocator: std.mem.Allocator, exe: []const u8, prefix: []const u8) ![]u8 {
-    const exe_dir = std.fs.path.dirname(exe) orelse return error.InvalidRemoteProcessExecutablePath;
-    const namespace = std.fs.path.basename(exe_dir);
-    const root = try socket_transport.shortRuntimeRoot(allocator);
-    defer allocator.free(root);
-    const sequence = terminal_remote_socket_sequence;
-    terminal_remote_socket_sequence +%= 1;
-    return std.fmt.allocPrint(allocator, "{s}/{s}/{s}-{}-{}.sock", .{ root, namespace, prefix, c.getpid(), sequence });
-}
-
-fn runSessionRuntimeLoop(session_guid: []const u8, listen_fd: c.fd_t) !void {
+pub fn runSessionRuntimeLoop(session_guid: []const u8, listen_fd: c.fd_t) !void {
     var session_runtime = SessionRuntime{
         .fixed_session_id = session_guid,
     };
@@ -1502,14 +1438,14 @@ pub fn connectSingleLiveTerminalRemote(allocator: std.mem.Allocator) !c.fd_t {
     return connectTerminalRemoteProcess(allocator, found_guid orelse return error.SessionNotFound);
 }
 
-fn registerTerminalRemote(control: *TerminalRemoteProcess) !void {
+pub fn registerTerminalRemote(control: *TerminalRemoteProcess) !void {
     for (terminal_remote_processes.items) |existing| {
         if (std.mem.eql(u8, existing.guid, control.guid)) return error.SessionExists;
     }
     try terminal_remote_processes.append(app_allocator.allocator(), control);
 }
 
-fn unregisterTerminalRemote(control: *TerminalRemoteProcess) void {
+pub fn unregisterTerminalRemote(control: *TerminalRemoteProcess) void {
     for (terminal_remote_processes.items, 0..) |existing, index| {
         if (existing == control) {
             _ = terminal_remote_processes.orderedRemove(index);
@@ -4024,20 +3960,4 @@ fn nowUnixMs() u64 {
     if (c.clock_gettime(.REALTIME, &ts) != 0) return 0;
     if (ts.sec < 0) return 0;
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
-}
-
-test "terminal remote socket path uses short runtime root" {
-    const allocator = std.testing.allocator;
-    const exe = "/tmp/sessh-ssh-reconnect-tmux-abcdefgh/sessh-test-root/runtime.remote/3.dev.abcdef12/sessh-terminal-remote";
-    const path = try terminalRemoteSocketPath(allocator, exe, "terminal");
-    defer allocator.free(path);
-
-    const root = try socket_transport.shortRuntimeRoot(allocator);
-    defer allocator.free(root);
-    const expected_prefix = try std.fmt.allocPrint(allocator, "{s}/3.dev.abcdef12/terminal-", .{root});
-    defer allocator.free(expected_prefix);
-
-    const addr: c.sockaddr.un = undefined;
-    try std.testing.expect(std.mem.startsWith(u8, path, expected_prefix));
-    try std.testing.expect(path.len < addr.path.len);
 }

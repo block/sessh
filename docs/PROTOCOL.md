@@ -10,7 +10,9 @@ visible client sends `ProxyControlOpen` with the stream's `p-` GUID. The
 ProxyCommand process does not open a separate control channel; its normal
 `ProxyStreamItem.Open` carries the same GUID, and the daemon relays
 `ConnectionEvent` and `RetryNow` frames between the visible client connection and
-that proxy stream.
+that proxy stream. When proxy functionality is handled directly by `sesshd`,
+the ProxyCommand process instead sends `ProxyFdPassOpen` with an SCM_RIGHTS fd
+for the raw OpenSSH byte stream, then exits after `sesshd` accepts the fd.
 
 The `HelloFrame`/`Frame` separation is designed to allow us maximum protocol
 flexibility in the future. We could migrate off of protobuf for everything past

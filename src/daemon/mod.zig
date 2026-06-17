@@ -20,6 +20,7 @@ const daemon_log = @import("log.zig");
 const daemon_startup = @import("startup.zig");
 const daemon_tunnel = @import("tunnel.zig");
 const socket_namespace = @import("socket_namespace.zig");
+const proxy_control_registry = @import("../transport/proxy_control_registry.zig");
 const socket_transport = @import("../transport/socket.zig");
 const stream_runtime = @import("../stream/runtime.zig");
 const transport_ssh = @import("../transport/ssh.zig");
@@ -54,7 +55,7 @@ fn ensureStartedForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_na
 
 pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     if (args.len > 1) {
-        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-broker: accepts at most one daemon socket namespace\n");
+        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :broker: accepts at most one daemon socket namespace\n");
         return error.InvalidBrokerArgs;
     }
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
@@ -68,7 +69,7 @@ pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args
 
 pub fn reexecBrokerOrForward(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     if (args.len > 1) {
-        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-broker: accepts at most one daemon socket namespace\n");
+        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :broker: accepts at most one daemon socket namespace\n");
         return error.InvalidBrokerArgs;
     }
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
@@ -81,7 +82,7 @@ pub fn reexecBrokerOrForward(allocator: std.mem.Allocator, exe: []const u8, args
 
 pub fn reexecDaemonOrRun(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     if (args.len > 1) {
-        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-daemon: accepts at most one daemon socket namespace\n");
+        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :daemon: accepts at most one daemon socket namespace\n");
         return error.InvalidDaemonArgs;
     }
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
@@ -278,7 +279,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     core_fds.closeInheritedNonStdioFileDescriptorsExceptList(&.{ ready_fd, startup_lock_fd });
 
     if (args.len > 1) {
-        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :internal-daemon: accepts at most one daemon socket namespace\n");
+        try io.writeAll(std.posix.STDERR_FILENO, "sessh: :daemon: accepts at most one daemon socket namespace\n");
         return error.InvalidDaemonArgs;
     }
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
@@ -695,7 +696,7 @@ fn transferInitialRequestToDispatcherOwner(
             }
             daemon_log.infof(context.allocator, "proxy control requested guid={s}", .{request.proxy_guid});
             daemon_dispatcher.cancel(id);
-            try transport_ssh.registerProxyControlOpenFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
+            try proxy_control_registry.registerOpenFromDaemon(context.allocator, daemon_dispatcher, context.fd, request);
             context.fd = -1;
             return .transferred;
         },

@@ -2049,7 +2049,7 @@ def test_ssh_proxy_fd_pass_process_exits_and_raw_fd_streams(tmp):
         proxy_proc = subprocess.Popen(
             sessh_argv(
                 [
-                    ":internal-proxy-stream:",
+                    ":proxy:",
                     "--host",
                     "test-host",
                     "--port",
@@ -2926,6 +2926,8 @@ def test_ssh_isolation_mode_full_uses_private_proxy_namespace(tmp):
         raise AssertionError(log_text)
     if "--daemon-namespace" not in log_text or "3.conn." not in log_text:
         raise AssertionError(log_text)
+    if "--use-fd-pass" not in log_text:
+        raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
 
@@ -2956,7 +2958,7 @@ def test_ssh_remote_command_uses_proxy_stream(tmp):
         raise AssertionError(log_text)
 
 
-def test_internal_sessh_host_list_is_remote_command(tmp):
+def test_sessh_host_list_is_remote_command(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -3968,7 +3970,7 @@ def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
     log_text = fake_log.read_text()
     if "direct_broker=1" not in log_text:
         raise AssertionError(log_text)
-    if "direct_broker_argc=1" not in log_text or "direct_broker_arg1=:internal-broker:" not in log_text:
+    if "direct_broker_argc=1" not in log_text or "direct_broker_arg1=:broker:" not in log_text:
         raise AssertionError(log_text)
     if "bootstrapper=1" in log_text:
         raise AssertionError(log_text)
@@ -4845,7 +4847,7 @@ def main(argv=None):
         ),
         (
             "ssh host list is remote command",
-            test_internal_sessh_host_list_is_remote_command,
+            test_sessh_host_list_is_remote_command,
         ),
         (
             "ssh config-only cli options are rejected",
