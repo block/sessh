@@ -379,11 +379,11 @@ test "parse preserves isolation mode" {
     const parsed = try parse(&scratch, &.{
         "sessh",
         "--isolation-mode",
-        "connection",
+        "full",
         "example.com",
     });
 
     try std.testing.expectEqualStrings("example.com", parsed.host);
-    try std.testing.expectEqual(config.IsolationMode.connection, parsed.common.isolation_mode);
+    try std.testing.expectEqual(config.IsolationMode.full, parsed.common.isolation_mode);
     try std.testing.expect(parsed.common.isolation_mode_set);
 }

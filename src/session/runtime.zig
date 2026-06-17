@@ -5,6 +5,7 @@ const posix = std.posix;
 
 const config = @import("../core/config.zig");
 const core_fds = @import("../core/fds.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const client_renderer = @import("renderer.zig");
 const io = @import("../core/io.zig");
 const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
@@ -147,16 +148,177 @@ const PendingRuntimeClient = struct {
     }
 };
 
+const TerminalRemoteProcessKind = union(enum) {
+    process: struct {
+        socket_path: []u8,
+        pid: c.pid_t = 0,
+    },
+    in_daemon: *DispatcherSessionRuntime,
+};
+
 const TerminalRemoteProcess = struct {
     allocator: std.mem.Allocator,
     guid: []u8,
-    socket_path: []u8,
-    pid: c.pid_t = 0,
+    kind: TerminalRemoteProcessKind,
 
-    fn deinit(self: *TerminalRemoteProcess) void {
+    fn deinit(self: *TerminalRemoteProcess, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
         self.allocator.free(self.guid);
-        self.allocator.free(self.socket_path);
+        switch (self.kind) {
+            .process => |process| self.allocator.free(process.socket_path),
+            .in_daemon => |runtime| {
+                runtime.deinit(daemon_dispatcher);
+                self.allocator.destroy(runtime);
+            },
+        }
         self.* = undefined;
+    }
+};
+
+const RuntimeFdWatch = struct {
+    id: ?dispatcher.FdWatchId = null,
+    fd: c.fd_t = -1,
+
+    fn cancel(self: *RuntimeFdWatch, daemon_dispatcher: *dispatcher.Dispatcher) void {
+        if (self.id) |id| daemon_dispatcher.cancel(.{ .fd = id });
+        self.* = .{};
+    }
+
+    fn matches(self: *const RuntimeFdWatch, id: dispatcher.FdWatchId) bool {
+        const watch_id = self.id orelse return false;
+        return watch_id.index == id.index and watch_id.generation == id.generation;
+    }
+};
+
+const DispatcherSessionRuntime = struct {
+    allocator: std.mem.Allocator,
+    control: *TerminalRemoteProcess,
+    session_runtime: SessionRuntime,
+    session_watch: RuntimeFdWatch = .{},
+    attached_watch: RuntimeFdWatch = .{},
+    pending_watch: RuntimeFdWatch = .{},
+    timer_watch_id: ?dispatcher.TimerWatchId = null,
+
+    fn deinit(self: *DispatcherSessionRuntime, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
+        if (daemon_dispatcher) |d| {
+            self.session_watch.cancel(d);
+            self.attached_watch.cancel(d);
+            self.pending_watch.cancel(d);
+            if (self.timer_watch_id) |id| d.cancel(.{ .timer = id });
+        }
+        self.timer_watch_id = null;
+        closeSessionRuntime(&self.session_runtime);
+        self.* = undefined;
+    }
+
+    fn connect(self: *DispatcherSessionRuntime, daemon_dispatcher: *dispatcher.Dispatcher) !c.fd_t {
+        if (!self.session_runtime.running) return error.SessionNotFound;
+        if (self.session_runtime.pending_client.active) return error.PendingRuntimeClientBusy;
+
+        var fds: [2]c.fd_t = undefined;
+        if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+        var daemon_fd: c.fd_t = fds[0];
+        var runtime_fd: c.fd_t = fds[1];
+        errdefer {
+            if (daemon_fd >= 0) _ = c.close(daemon_fd);
+        }
+        errdefer {
+            if (runtime_fd >= 0) _ = c.close(runtime_fd);
+        }
+
+        try socket_transport.setCloseOnExec(daemon_fd);
+        try socket_transport.setCloseOnExec(runtime_fd);
+        try core_fds.setNonBlocking(daemon_fd);
+        try core_fds.setNonBlocking(runtime_fd);
+
+        self.session_runtime.pending_client.start(runtime_fd);
+        runtime_fd = -1;
+        try self.updateWatches(daemon_dispatcher);
+        const result = daemon_fd;
+        daemon_fd = -1;
+        return result;
+    }
+
+    fn updateWatches(self: *DispatcherSessionRuntime, daemon_dispatcher: *dispatcher.Dispatcher) !void {
+        if (!self.session_runtime.running) {
+            destroyRegisteredTerminalRemote(self.control, daemon_dispatcher);
+            return;
+        }
+
+        const now_ms = sessionRuntimeMonotonicMs(&self.session_runtime);
+        const session = &self.session_runtime.session;
+        if (session.alive and session.pty_fd >= 0) {
+            try self.ensureWatch(daemon_dispatcher, &self.session_watch, session.pty_fd, .{ .readable = true });
+        } else {
+            self.session_watch.cancel(daemon_dispatcher);
+        }
+
+        const attached_client = &self.session_runtime.attached_client;
+        if (attached_client.active) {
+            const debug_unresponsive = attached_client.debug_unresponsive_until_ms > now_ms;
+            try self.ensureWatch(daemon_dispatcher, &self.attached_watch, attached_client.fd, .{
+                .readable = !attached_client.close_after_flush and !debug_unresponsive,
+                .writable = !debug_unresponsive and attached_client.queuedBytes() > 0,
+            });
+        } else {
+            self.attached_watch.cancel(daemon_dispatcher);
+        }
+
+        const pending_client = &self.session_runtime.pending_client;
+        if (pending_client.active) {
+            try self.ensureWatch(daemon_dispatcher, &self.pending_watch, pending_client.fd, .{ .readable = true });
+        } else {
+            self.pending_watch.cancel(daemon_dispatcher);
+        }
+
+        try self.updateTimer(daemon_dispatcher, now_ms, nowUnixMs());
+    }
+
+    fn ensureWatch(
+        self: *DispatcherSessionRuntime,
+        daemon_dispatcher: *dispatcher.Dispatcher,
+        watch: *RuntimeFdWatch,
+        fd: c.fd_t,
+        events: dispatcher.FdEvents,
+    ) !void {
+        if (watch.id != null and watch.fd != fd) {
+            watch.cancel(daemon_dispatcher);
+        }
+        if (watch.id) |id| {
+            try daemon_dispatcher.updateFdEvents(id, events);
+        } else {
+            watch.id = try daemon_dispatcher.watchFd(fd, events, .{
+                .ctx = self,
+                .callback = handleDispatcherSessionRuntimeEvent,
+            });
+            watch.fd = fd;
+        }
+    }
+
+    fn updateTimer(
+        self: *DispatcherSessionRuntime,
+        daemon_dispatcher: *dispatcher.Dispatcher,
+        now_ms: i64,
+        now_unix_ms: u64,
+    ) !void {
+        if (self.timer_watch_id) |id| daemon_dispatcher.cancel(.{ .timer = id });
+        self.timer_watch_id = null;
+        const timeout_ms = sessionRuntimePollTimeoutMs(&self.session_runtime, now_ms, now_unix_ms);
+        if (timeout_ms < 0) return;
+        self.timer_watch_id = try daemon_dispatcher.watchTimerAfter(@intCast(timeout_ms), .{
+            .ctx = self,
+            .callback = handleDispatcherSessionRuntimeEvent,
+        });
+    }
+
+    fn runMaintenance(self: *DispatcherSessionRuntime) void {
+        runSessionRuntimeMaintenance(&self.session_runtime);
+        if (!self.session_runtime.started_session and
+            !self.session_runtime.pending_client.active and
+            !self.session_runtime.attached_client.active and
+            !self.session_runtime.session.alive)
+        {
+            self.session_runtime.running = false;
+        }
     }
 };
 
@@ -1174,9 +1336,11 @@ pub fn startTerminalRemoteProcess(allocator: std.mem.Allocator, exe: []const u8,
     control.* = .{
         .allocator = allocator,
         .guid = guid,
-        .socket_path = socket_path,
+        .kind = .{ .process = .{
+            .socket_path = socket_path,
+        } },
     };
-    errdefer control.deinit();
+    errdefer control.deinit(null);
 
     try registerTerminalRemote(control);
     errdefer unregisterTerminalRemote(control);
@@ -1190,7 +1354,37 @@ pub fn startTerminalRemoteProcess(allocator: std.mem.Allocator, exe: []const u8,
     child.stderr_behavior = .Ignore;
     try child.spawn();
     _ = c.close(listen_fd);
-    control.pid = @intCast(child.id);
+    control.kind.process.pid = @intCast(child.id);
+    return control;
+}
+
+pub fn startTerminalRuntimeInDaemon(
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    session_guid: []const u8,
+) !*TerminalRemoteProcess {
+    const guid = try session_registry.canonicalGuid(allocator, session_guid);
+    errdefer allocator.free(guid);
+
+    const control = try allocator.create(TerminalRemoteProcess);
+    errdefer allocator.destroy(control);
+    const runtime = try allocator.create(DispatcherSessionRuntime);
+    errdefer allocator.destroy(runtime);
+
+    control.* = .{
+        .allocator = allocator,
+        .guid = guid,
+        .kind = .{ .in_daemon = runtime },
+    };
+    errdefer control.deinit(daemon_dispatcher);
+
+    runtime.* = .{
+        .allocator = allocator,
+        .control = control,
+        .session_runtime = .{ .fixed_session_id = guid },
+    };
+
+    try registerTerminalRemote(control);
     return control;
 }
 
@@ -1231,8 +1425,33 @@ pub fn connectTerminalRemoteProcess(allocator: std.mem.Allocator, guid: []const 
     };
 }
 
+pub fn connectTerminalRuntime(
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: ?*dispatcher.Dispatcher,
+    guid: []const u8,
+) !c.fd_t {
+    const canonical = try session_registry.canonicalGuid(allocator, guid);
+    defer allocator.free(canonical);
+
+    const control = lookupRuntime(canonical) orelse return error.SessionNotFound;
+    return connectTerminalRuntimeControl(control, daemon_dispatcher) catch |err| switch (err) {
+        error.SocketPathMissing, error.ConnectFailed => {
+            forgetTerminalRemote(canonical);
+            return error.SessionNotFound;
+        },
+        else => return err,
+    };
+}
+
 pub fn connectStartedTerminalRemoteProcess(control: *TerminalRemoteProcess) !c.fd_t {
-    return connectTerminalRemoteProcessSocket(control) catch |err| switch (err) {
+    return connectStartedTerminalRuntime(control, null);
+}
+
+pub fn connectStartedTerminalRuntime(
+    control: *TerminalRemoteProcess,
+    daemon_dispatcher: ?*dispatcher.Dispatcher,
+) !c.fd_t {
+    return connectTerminalRuntimeControl(control, daemon_dispatcher) catch |err| switch (err) {
         error.SocketPathMissing, error.ConnectFailed => {
             forgetTerminalRemote(control.guid);
             return error.SessionNotFound;
@@ -1241,8 +1460,28 @@ pub fn connectStartedTerminalRemoteProcess(control: *TerminalRemoteProcess) !c.f
     };
 }
 
+pub fn destroyInDaemonTerminalRuntime(control: *TerminalRemoteProcess, daemon_dispatcher: *dispatcher.Dispatcher) void {
+    switch (control.kind) {
+        .in_daemon => destroyRegisteredTerminalRemote(control, daemon_dispatcher),
+        .process => {},
+    }
+}
+
 fn connectTerminalRemoteProcessSocket(control: *const TerminalRemoteProcess) !c.fd_t {
-    return socket_transport.connectSocket(control.socket_path);
+    return switch (control.kind) {
+        .process => |process| socket_transport.connectSocket(process.socket_path),
+        .in_daemon => error.MissingDispatcher,
+    };
+}
+
+fn connectTerminalRuntimeControl(
+    control: *TerminalRemoteProcess,
+    daemon_dispatcher: ?*dispatcher.Dispatcher,
+) !c.fd_t {
+    return switch (control.kind) {
+        .process => connectTerminalRemoteProcessSocket(control),
+        .in_daemon => |runtime| runtime.connect(daemon_dispatcher orelse return error.MissingDispatcher),
+    };
 }
 
 pub fn requestTerminalRemoteCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
@@ -1282,10 +1521,14 @@ fn unregisterTerminalRemote(control: *TerminalRemoteProcess) void {
 pub fn forgetTerminalRemote(guid: []const u8) void {
     for (terminal_remote_processes.items, 0..) |control, index| {
         if (std.mem.eql(u8, control.guid, guid)) {
+            const process = switch (control.kind) {
+                .process => |process_value| process_value,
+                .in_daemon => return,
+            };
             _ = terminal_remote_processes.orderedRemove(index);
-            _ = reapTerminalRemote(control.pid);
+            _ = reapTerminalRemote(process.pid);
             const allocator = control.allocator;
-            control.deinit();
+            control.deinit(null);
             allocator.destroy(control);
             return;
         }
@@ -1308,15 +1551,32 @@ fn pruneExitedTerminalRemotes() void {
     var index: usize = 0;
     while (index < terminal_remote_processes.items.len) {
         const control = terminal_remote_processes.items[index];
-        if (reapTerminalRemote(control.pid)) {
+        if (terminalRuntimeIsExited(control)) {
             _ = terminal_remote_processes.orderedRemove(index);
             const allocator = control.allocator;
-            control.deinit();
+            control.deinit(null);
             allocator.destroy(control);
             continue;
         }
         index += 1;
     }
+}
+
+fn terminalRuntimeIsExited(control: *const TerminalRemoteProcess) bool {
+    return switch (control.kind) {
+        .process => |process| reapTerminalRemote(process.pid),
+        // In-daemon runtimes own dispatcher watches. Their dispatcher callback
+        // destroys them when the runtime completes; pruning here has no
+        // dispatcher to cancel those watches safely.
+        .in_daemon => false,
+    };
+}
+
+fn destroyRegisteredTerminalRemote(control: *TerminalRemoteProcess, daemon_dispatcher: *dispatcher.Dispatcher) void {
+    unregisterTerminalRemote(control);
+    const allocator = control.allocator;
+    control.deinit(daemon_dispatcher);
+    allocator.destroy(control);
 }
 
 fn reapTerminalRemote(pid: c.pid_t) bool {
@@ -1389,6 +1649,76 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, listen_fd: c.fd_t) !
             .pending_client => handlePendingRuntimeClientEvents(session_runtime, pollfd.revents),
         }
     }
+}
+
+fn handleDispatcherSessionRuntimeEvent(
+    ctx: *anyopaque,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    id: dispatcher.WatchId,
+    event: dispatcher.Event,
+) !void {
+    const runtime: *DispatcherSessionRuntime = @ptrCast(@alignCast(ctx));
+    runtime.runMaintenance();
+    if (!runtime.session_runtime.running) {
+        destroyRegisteredTerminalRemote(runtime.control, daemon_dispatcher);
+        return;
+    }
+
+    switch (event) {
+        .fd => |fd_event| {
+            const fd_id = switch (id) {
+                .fd => |watch_id| watch_id,
+                .timer => return error.UnexpectedRuntimeTimerId,
+            };
+            if (runtime.session_watch.matches(fd_id)) {
+                drainSessionOutput(&runtime.session_runtime);
+            } else if (runtime.attached_watch.matches(fd_id)) {
+                handleAttachedClientEvents(&runtime.session_runtime, pollReventsFromDispatcherEvent(fd_event));
+            } else if (runtime.pending_watch.matches(fd_id)) {
+                handlePendingRuntimeClientEvents(&runtime.session_runtime, pollReventsFromDispatcherEvent(fd_event));
+            }
+        },
+        .timer => {
+            if (runtime.timer_watch_id) |timer_id| {
+                switch (id) {
+                    .timer => |fired| {
+                        if (timer_id.index == fired.index and timer_id.generation == fired.generation) {
+                            runtime.timer_watch_id = null;
+                        }
+                    },
+                    .fd => return error.UnexpectedRuntimeFdId,
+                }
+            }
+        },
+    }
+
+    runtime.runMaintenance();
+    if (!runtime.session_runtime.running) {
+        destroyRegisteredTerminalRemote(runtime.control, daemon_dispatcher);
+        return;
+    }
+    try runtime.updateWatches(daemon_dispatcher);
+}
+
+fn pollReventsFromDispatcherEvent(event: dispatcher.FdEvent) i16 {
+    var revents: i16 = 0;
+    if (event.readable) revents |= posix.POLL.IN;
+    if (event.writable) revents |= posix.POLL.OUT;
+    if (event.hangup) revents |= posix.POLL.HUP;
+    if (event.error_event) revents |= posix.POLL.ERR;
+    if (event.invalid) revents |= posix.POLL.NVAL;
+    return revents;
+}
+
+fn runSessionRuntimeMaintenance(session_runtime: *SessionRuntime) void {
+    const now_ms = sessionRuntimeMonotonicMs(session_runtime);
+    const now_unix_ms = nowUnixMs();
+    clearExpiredDebugUnresponsiveAttachedClients(session_runtime, now_ms);
+    flushExpiredSynchronizedOutputSessions(session_runtime, now_ms);
+    if (!reapPtyHangupSessionIfExited(session_runtime)) {
+        _ = endReapedSessions(session_runtime, now_unix_ms);
+    }
+    stopSessionRuntimeIfComplete(session_runtime);
 }
 
 fn sessionRuntimeMonotonicMs(session_runtime: *SessionRuntime) i64 {

@@ -5,7 +5,7 @@ pub const version = "0.7.0-dev";
 pub const default_scrollback_row_count = 2000;
 pub const default_debug_unresponsive_seconds = 10;
 pub const default_filter_level: FilterLevel = .emulated;
-pub const default_isolation_mode: IsolationMode = .daemon;
+pub const default_isolation_mode: IsolationMode = .process;
 pub const hour_ms: u64 = 60 * 60 * 1000;
 pub const default_cleanup_wakeup_interval_ms: u64 = hour_ms;
 pub const default_cleanup_retry_limit_ms: u64 = 168 * hour_ms;
@@ -42,22 +42,22 @@ pub fn parseFilterLevel(value: []const u8) !FilterLevel {
 }
 
 pub const IsolationMode = enum {
-    connection,
-    daemon,
+    full,
+    process,
     none,
 
     pub fn label(self: IsolationMode) []const u8 {
         return switch (self) {
-            .connection => "connection",
-            .daemon => "daemon",
+            .full => "full",
+            .process => "process",
             .none => "none",
         };
     }
 };
 
 pub fn parseIsolationMode(value: []const u8) !IsolationMode {
-    if (std.ascii.eqlIgnoreCase(value, "connection")) return .connection;
-    if (std.ascii.eqlIgnoreCase(value, "daemon")) return .daemon;
+    if (std.ascii.eqlIgnoreCase(value, "full")) return .full;
+    if (std.ascii.eqlIgnoreCase(value, "process")) return .process;
     if (std.ascii.eqlIgnoreCase(value, "none")) return .none;
     return error.InvalidIsolationMode;
 }

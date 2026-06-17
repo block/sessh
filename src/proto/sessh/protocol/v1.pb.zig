@@ -7,6 +7,14 @@ const fd = protobuf.fd;
 /// import package sessh.handshake.v1
 const sessh_handshake_v1 = @import("../handshake/v1.pb.zig");
 
+pub const IsolationMode = enum(i32) {
+    ISOLATION_MODE_UNSPECIFIED = 0,
+    ISOLATION_MODE_FULL = 1,
+    ISOLATION_MODE_PROCESS = 2,
+    ISOLATION_MODE_NONE = 3,
+    _,
+};
+
 /// Versioned sessh protocol payloads.
 ///
 /// The stable handshake payloads live in sessh_handshake.proto. After both
@@ -917,6 +925,7 @@ pub const ClientDaemonItem = struct {
         local_pid: u64 = 0,
         local_start_time: []const u8 = &.{},
         client_environment: std.ArrayListUnmanaged(EnvironmentEntry) = .empty,
+        isolation_mode: IsolationMode = @enumFromInt(0),
 
         pub const _desc_table = .{
             .ssh_option = fd(1, .{ .repeated = .{ .scalar = .string } }),
@@ -927,6 +936,7 @@ pub const ClientDaemonItem = struct {
             .local_pid = fd(6, .{ .scalar = .uint64 }),
             .local_start_time = fd(7, .{ .scalar = .string }),
             .client_environment = fd(9, .{ .repeated = .submessage }),
+            .isolation_mode = fd(10, .@"enum"),
         };
 
         /// Encodes the message to the writer
@@ -2839,12 +2849,14 @@ pub const TerminalEmulatorItem = struct {
         resize: ?TerminalEmulatorItem.Resize = null,
         capture_tty_transcript: bool = false,
         create: ?TerminalEmulatorItem.SessionCreate = null,
+        isolation_mode: IsolationMode = @enumFromInt(0),
 
         pub const _desc_table = .{
             .session_guid = fd(1, .{ .scalar = .string }),
             .resize = fd(2, .submessage),
             .capture_tty_transcript = fd(3, .{ .scalar = .bool }),
             .create = fd(4, .submessage),
+            .isolation_mode = fd(5, .@"enum"),
         };
 
         /// Encodes the message to the writer

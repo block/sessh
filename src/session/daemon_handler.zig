@@ -58,7 +58,7 @@ pub fn registerFrameWithTerminalRemoteFromDaemon(
     defer allocator.free(request_payload);
 
     const process_fd = if (request.create == null) blk: {
-        break :blk connectTerminalRemoteForOpen(allocator, request) catch |err| switch (err) {
+        break :blk connectTerminalRemoteForOpen(allocator, request, daemon_dispatcher) catch |err| switch (err) {
             error.InvalidSessionGuid, error.SessionNotFound => {
                 try sendError(client_fd, "SESSION_NOT_FOUND", "session not found", "");
                 return;
@@ -68,7 +68,7 @@ pub fn registerFrameWithTerminalRemoteFromDaemon(
     } else blk: {
         const open_payload = try sessionOpenPayloadWithCurrentEnvironment(allocator, request_payload);
         defer allocator.free(open_payload);
-        break :blk try startTerminalRemoteAndConnect(allocator, exe, open_payload);
+        break :blk try startTerminalRemoteAndConnect(allocator, exe, open_payload, daemon_dispatcher);
     };
     var owns_process_fd = true;
     defer {
@@ -254,7 +254,7 @@ fn handleTerminalMuxPayloadOpen(
     const open_payload = try protocol.encodePayload(allocator, te_open);
     defer allocator.free(open_payload);
 
-    const process_fd = openTerminalMuxStream(allocator, exe, stream_id, te_open, action, open_payload, open_started_ms) catch |err| switch (err) {
+    const process_fd = openTerminalMuxStream(allocator, exe, daemon_dispatcher, stream_id, te_open, action, open_payload, open_started_ms) catch |err| switch (err) {
         error.InvalidSessionGuid, error.SessionNotFound => {
             daemon_log.infof(
                 allocator,
@@ -309,6 +309,7 @@ fn handleTerminalMuxPayloadOpen(
 fn openTerminalMuxStream(
     allocator: std.mem.Allocator,
     exe: []const u8,
+    daemon_dispatcher: ?*dispatcher.Dispatcher,
     stream_id: u64,
     request: pb.TerminalEmulatorItem.Open,
     action: []const u8,
@@ -328,9 +329,9 @@ fn openTerminalMuxStream(
     );
 
     const process_fd = if (request.create == null)
-        try connectTerminalRemoteForOpen(allocator, request)
+        try connectTerminalRemoteForOpen(allocator, request, daemon_dispatcher)
     else
-        try startTerminalRemoteAndConnect(allocator, exe, remote_payload);
+        try startTerminalRemoteAndConnect(allocator, exe, remote_payload, daemon_dispatcher);
     errdefer _ = c.close(process_fd);
     const send_started_ms = std.time.milliTimestamp();
     var remote_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, remote_payload);
@@ -522,12 +523,21 @@ fn sendTerminalHangupToRemote(fd: c.fd_t) !void {
     try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fd, .{ .session_hangup_request = .{} });
 }
 
-fn connectTerminalRemoteForOpen(allocator: std.mem.Allocator, request: pb.TerminalEmulatorItem.Open) !c.fd_t {
+fn connectTerminalRemoteForOpen(
+    allocator: std.mem.Allocator,
+    request: pb.TerminalEmulatorItem.Open,
+    daemon_dispatcher: ?*dispatcher.Dispatcher,
+) !c.fd_t {
     if (!session_registry.isValidSessionGuid(request.session_guid)) return error.InvalidSessionGuid;
-    return session_runtime.connectTerminalRemoteProcess(allocator, request.session_guid);
+    return session_runtime.connectTerminalRuntime(allocator, daemon_dispatcher, request.session_guid);
 }
 
-fn startTerminalRemoteAndConnect(allocator: std.mem.Allocator, exe: []const u8, session_open_payload: []const u8) !c.fd_t {
+fn startTerminalRemoteAndConnect(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    session_open_payload: []const u8,
+    daemon_dispatcher: ?*dispatcher.Dispatcher,
+) !c.fd_t {
     const started_ms = std.time.milliTimestamp();
     var request = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, session_open_payload);
     defer request.deinit(allocator);
@@ -539,14 +549,38 @@ fn startTerminalRemoteAndConnect(allocator: std.mem.Allocator, exe: []const u8, 
     defer allocator.free(guid);
 
     daemon_log.infof(allocator, "terminal session creating session={s}", .{guid});
-    const control = try session_runtime.startTerminalRemoteProcess(allocator, exe, guid);
-    const process_fd = try session_runtime.connectStartedTerminalRemoteProcess(control);
+    const uses_daemon_runtime = terminalOpenUsesDaemonRuntime(request);
+    const control = if (uses_daemon_runtime)
+        try session_runtime.startTerminalRuntimeInDaemon(allocator, daemon_dispatcher orelse return error.MissingDispatcher, guid)
+    else
+        try session_runtime.startTerminalRemoteProcess(allocator, exe, guid);
+    const process_fd = session_runtime.connectStartedTerminalRuntime(control, daemon_dispatcher) catch |err| {
+        if (uses_daemon_runtime) {
+            session_runtime.destroyInDaemonTerminalRuntime(control, daemon_dispatcher.?);
+        }
+        return err;
+    };
     daemon_log.infof(
         allocator,
-        "terminal remote process connected session={s} elapsed_ms={}",
-        .{ guid, elapsedMsSince(started_ms) },
+        "terminal runtime connected session={s} isolation_mode={s} elapsed_ms={}",
+        .{ guid, terminalIsolationModeName(request), elapsedMsSince(started_ms) },
     );
     return process_fd;
+}
+
+fn terminalOpenUsesDaemonRuntime(request: pb.TerminalEmulatorItem.Open) bool {
+    return switch (request.isolation_mode) {
+        .ISOLATION_MODE_FULL, .ISOLATION_MODE_NONE => true,
+        else => false,
+    };
+}
+
+fn terminalIsolationModeName(request: pb.TerminalEmulatorItem.Open) []const u8 {
+    return switch (request.isolation_mode) {
+        .ISOLATION_MODE_FULL => "full",
+        .ISOLATION_MODE_NONE => "none",
+        else => "process",
+    };
 }
 
 fn teStreamActionName(request: pb.TerminalEmulatorItem.Open) []const u8 {

@@ -59,6 +59,13 @@ message EnvironmentEntry {
   string value = 2;
 }
 
+enum IsolationMode {
+  ISOLATION_MODE_UNSPECIFIED = 0;
+  ISOLATION_MODE_FULL = 1;
+  ISOLATION_MODE_PROCESS = 2;
+  ISOLATION_MODE_NONE = 3;
+}
+
 // Semantic connection-state transition shared by terminal-emulator sessions,
 // proxy byte streams, and local daemon transport setup. This is not remote
 // process output. Visible clients decide how, where, and whether to render it.
@@ -144,6 +151,10 @@ message ClientDaemonItem {
     // this through the resolved ssh SendEnv rules before forwarding anything to
     // the remote daemon.
     repeated EnvironmentEntry client_environment = 9;
+    // Public isolation mode requested by the visible client. This is not part
+    // of pooled-transport identity; the local daemon stamps it onto each
+    // terminal open before forwarding that open to the remote daemon.
+    IsolationMode isolation_mode = 10;
   }
 
   // Local client -> local daemon request to follow new operational log entries.
@@ -368,6 +379,7 @@ message TerminalEmulatorItem {
     // Present when creating a new remote terminal-emulator session. Absent
     // means resume the existing session identified by session_guid.
     SessionCreate create = 4;
+    IsolationMode isolation_mode = 5;
   }
 
   // Creates a new interactive PTY session for this terminal-emulator protocol

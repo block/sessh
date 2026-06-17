@@ -2905,7 +2905,7 @@ def test_ssh_filter_level_cli_overrides_config(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_isolation_mode_connection_uses_private_proxy_namespace(tmp):
+def test_ssh_isolation_mode_full_uses_private_proxy_namespace(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -2914,7 +2914,7 @@ def test_ssh_isolation_mode_connection_uses_private_proxy_namespace(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
 
     result = run_sessh(
-        ["--isolation-mode", "connection", "--filter-level", "unhygienic", "test-host"],
+        ["--isolation-mode", "full", "--filter-level", "unhygienic", "test-host"],
         env,
         timeout=5.0,
     )
@@ -4700,8 +4700,8 @@ def main(argv=None):
             test_ssh_filter_level_cli_overrides_config,
         ),
         (
-            "ssh isolation-mode connection uses private proxy namespace",
-            test_ssh_isolation_mode_connection_uses_private_proxy_namespace,
+            "ssh isolation-mode full uses private proxy namespace",
+            test_ssh_isolation_mode_full_uses_private_proxy_namespace,
         ),
         (
             "ssh remote command uses proxy stream",

@@ -442,6 +442,7 @@ const PooledSshTransportClient = struct {
     local_start_time: ?[]u8 = null,
     send_env: []const []const u8 = &.{},
     client_environment: std.ArrayList(OwnedEnvironmentEntry) = .empty,
+    isolation_mode: pb.IsolationMode = .ISOLATION_MODE_PROCESS,
     remote_cleanup: ?RemoteCleanupIdentity = null,
     proxy_guid: [session_registry.proxy_guid_len]u8 = [_]u8{0} ** session_registry.proxy_guid_len,
     proxy_guid_len: usize = 0,
@@ -847,7 +848,7 @@ fn remoteSessionConfig(
     if (!result.common.isolation_mode_set) {
         if (file_config.isolation_mode) |mode| result.common.isolation_mode = mode;
     }
-    if (result.common.isolation_mode == .connection) {
+    if (result.common.isolation_mode == .full) {
         result.daemon_dir_name = try daemon_socket_namespace.privateConnectionDirName(allocator);
     }
     if (file_config.disconnected_reap_ms) |ms| result.disconnected_reap_ms = ms;
@@ -1193,6 +1194,7 @@ fn registerPooledSshTransportClientFromDaemon(
         .local_start_time = local_start_time,
         .send_env = send_env_copy,
         .client_environment = client_environment,
+        .isolation_mode = protoIsolationModeFromAcquire(request),
     };
     local_start_time = null;
     send_env_copy = &.{};
@@ -2670,6 +2672,7 @@ fn openPooledSshTransportClientStream(
     };
     client.kind = .te;
     try appendFilteredClientEnvironmentToTerminalOpen(transport.allocator, client, open);
+    open.isolation_mode = client.isolation_mode;
     try sendPooledTerminalMuxOpen(daemon_dispatcher, transport, client, open.*);
     return true;
 }
@@ -3494,6 +3497,7 @@ fn openTerminalDaemonTransport(
     var request = pb.ClientDaemonItem.SshTransportAcquire{
         .host = target.host,
         .bootstrap = common.bootstrap,
+        .isolation_mode = protoIsolationModeForConfig(common.isolation_mode),
     };
     defer request.ssh_option.deinit(allocator);
     defer deinitSshTransportAcquireOwnedFields(allocator, &request);
@@ -3504,6 +3508,22 @@ fn openTerminalDaemonTransport(
 
     try protocol.sendSshTransportAcquireFrame(allocator, fd, request);
     return .{ .fd = fd };
+}
+
+fn protoIsolationModeForConfig(mode: config.IsolationMode) pb.IsolationMode {
+    return switch (mode) {
+        .full => .ISOLATION_MODE_FULL,
+        .process => .ISOLATION_MODE_PROCESS,
+        .none => .ISOLATION_MODE_NONE,
+    };
+}
+
+fn protoIsolationModeFromAcquire(request: pb.ClientDaemonItem.SshTransportAcquire) pb.IsolationMode {
+    return switch (request.isolation_mode) {
+        .ISOLATION_MODE_FULL => .ISOLATION_MODE_FULL,
+        .ISOLATION_MODE_NONE => .ISOLATION_MODE_NONE,
+        else => .ISOLATION_MODE_PROCESS,
+    };
 }
 
 fn sendDaemonTransportError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
@@ -5274,7 +5294,7 @@ pub fn printSshArgError(err: anyerror) !void {
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
         error.MissingFilterLevel => try io.writeAll(2, "sessh: --filter-level requires one of: unhygienic, hygienic, emulated\n"),
-        error.MissingIsolationMode => try io.writeAll(2, "sessh: --isolation-mode requires one of: connection, daemon, none\n"),
+        error.MissingIsolationMode => try io.writeAll(2, "sessh: --isolation-mode requires one of: full, process, none\n"),
         error.MissingTtyTranscriptPath => try io.writeAll(2, "sessh: --capture-tty-transcript requires a path\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: ssh option is missing its value\n"),
         error.SesshOptionAfterHost => try io.writeAll(2, "sessh: sessh options must appear before HOST\n"),
@@ -5282,7 +5302,7 @@ pub fn printSshArgError(err: anyerror) !void {
         error.InvalidScrollbackRowCount => try io.writeAll(2, "sessh: invalid scrollback row count\n"),
         error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
         error.InvalidFilterLevel => try io.writeAll(2, "sessh: invalid filter level; expected one of: unhygienic, hygienic, emulated\n"),
-        error.InvalidIsolationMode => try io.writeAll(2, "sessh: invalid isolation mode; expected one of: connection, daemon, none\n"),
+        error.InvalidIsolationMode => try io.writeAll(2, "sessh: invalid isolation mode; expected one of: full, process, none\n"),
         error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
         error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands require -t or -tt for persistent sessions\n"),
         error.UnsafeSshOption => try io.writeAll(2, "sessh: ssh option is not safe for sessh transport\n"),

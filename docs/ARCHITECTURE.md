@@ -6,7 +6,7 @@ to file descriptors becoming readable/writable.
 
 The processes involved depend on your `filter-level` and `isolation-mode`
 settings, described below. The default settings are `filter-level=emulated` and
-`isolation-mode=daemon`.
+`isolation-mode=process`.
 
 ## Processes and Threads - filter-level=emulated
 
@@ -16,7 +16,7 @@ protocol. If the `ssh` invocation does not create a remote PTY, such as for port
 forwarding, there is no terminal stream for sessh to emulate. The connection
 runs at `filter-level=unhygienic`.
 
-The diagram below shows the default `isolation-mode=daemon` layout.
+The diagram below shows the default `isolation-mode=process` layout.
 
 ```
                             +--------+     unix     +--------+
@@ -64,7 +64,7 @@ sees a PTY, but `sessh` can filter its output. If the `ssh` invocation does not
 create a remote PTY, such as for port forwarding, there is no terminal stream to
 filter. The connection runs at `filter-level=unhygienic`.
 
-The diagram below shows the default `isolation-mode=daemon` layout.
+The diagram below shows the default `isolation-mode=process` layout.
 
 ```
 +--------+    stdin     +-----+    stdin     +-------+     unix     +--------+
@@ -96,7 +96,7 @@ The diagram below shows the default `isolation-mode=daemon` layout.
 This is like `filter-level=hygienic` but the outer `sessh` is replaced by `ssh`
 via `exec(2)`. There is no PTY filtering.
 
-The diagram below shows the default `isolation-mode=daemon` layout.
+The diagram below shows the default `isolation-mode=process` layout.
 
 ```
                         +-----+    stdin     +-------+     unix     +--------+
@@ -142,19 +142,19 @@ attempt reconnection immediately.
 
 `sessh` is designed to be robust in the face of `ssh` disconnections, but not
 necessarily in the face of other `sessh` processes crashing. `isolation-mode`
-can be one of `connection`, `daemon`, or `none`.
+can be one of `full`, `process`, or `none`.
 
 | `isolation-mode` | Connection pooling | Terminal/proxy functionality |
 | --- | --- | --- |
-| `connection` | Disabled | Handled directly within a unique `sesshd` for this invocation. |
-| `daemon` | Enabled | Handled by separate terminal/proxy processes so we can recover even if the shared `sesshd` dies. |
+| `full` | Disabled | Handled directly within a unique `sesshd` for this invocation. |
+| `process` | Enabled | Handled by separate terminal/proxy processes so we can recover even if the shared `sesshd` dies. |
 | `none` | Enabled | Handled directly within the shared `sesshd`. |
 
 When proxy functionality is handled directly within `sesshd` we use
 `ProxyUseFdPass`. The `sessh` `ProxyCommand` process runs briefly to set up the
 unix-domain-socket connection to the local `sesshd`, then passes that
 file-descriptor back to `ssh` and exits. After that `ssh` communicates directly
-with the local `sesshd` process. Under `isolation-mode=daemon`, the proxy
+with the local `sesshd` process. Under `isolation-mode=process`, the proxy
 functionality lives in a separate process and `ProxyUseFdPass` is not used.
 
 ## Manual ProxyCommand
