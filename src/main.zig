@@ -94,9 +94,11 @@ test "sessh top-level options do not match remote command arguments" {
     try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "-V" }));
     try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "-vV", "example.com" }));
     try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "--no-terminal-emulator", "-V", "example.com" }));
+    try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "--diagnostics-file", "/tmp/sessh.log", "-V", "example.com" }));
     try std.testing.expect(!topLevelArgIs(&.{ "sessh-dev", "example.com", "--version" }, &.{"--version"}));
     try std.testing.expect(!sesshShortVersionRequested(&.{ "sessh-dev", "example.com", "-V" }));
     try std.testing.expect(!sesshShortVersionRequested(&.{ "sessh-dev", "-F", "-V", "example.com" }));
+    try std.testing.expect(!sesshShortVersionRequested(&.{ "sessh-dev", "--diagnostics-file", "-V", "example.com" }));
 }
 
 fn usage(code: u8) !void {
@@ -165,6 +167,7 @@ fn sesshLongOptionConsumesValue(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--filter-level") or
         std.mem.eql(u8, arg, "--isolation-mode") or
+        std.mem.eql(u8, arg, "--diagnostics-file") or
         std.mem.eql(u8, arg, "--ssh-options") or
         std.mem.eql(u8, arg, "--capture-tty-transcript");
 }

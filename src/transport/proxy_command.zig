@@ -138,7 +138,7 @@ pub fn commandOption(
     control_guid: ?[]const u8,
     filter_level: config.FilterLevel,
     client_ctrl_r: bool,
-    stdin_from_stderr: bool,
+    diagnostics_file: ?[]const u8,
     bootstrap: bool,
     daemon_dir_name: ?[]const u8,
     use_fd_pass: bool,
@@ -158,7 +158,10 @@ pub fn commandOption(
     try appendShellToken(allocator, &command, "--filter-level");
     try appendShellToken(allocator, &command, filter_level.label());
     if (use_fd_pass) try appendShellToken(allocator, &command, "--use-fd-pass");
-    if (stdin_from_stderr) try appendShellToken(allocator, &command, "--stdin-from-stderr");
+    if (diagnostics_file) |path| {
+        try appendShellToken(allocator, &command, "--diagnostics-file");
+        try appendShellToken(allocator, &command, path);
+    }
     try appendShellToken(allocator, &command, if (bootstrap) "--bootstrap" else "--no-bootstrap");
     if (daemon_dir_name) |dir_name| {
         try appendShellToken(allocator, &command, "--daemon-namespace");

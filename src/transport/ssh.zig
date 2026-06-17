@@ -660,6 +660,12 @@ fn runRemoteNewSession(
     };
     defer runtime_config.deinit(allocator);
     client_log.setLevel(runtime_config.common.client_log_level);
+    if (runtime_config.common.diagnostics_file) |path| {
+        validateDiagnosticsFilePath(path) catch |err| {
+            try io.stderrPrint("sessh: cannot open diagnostics file {s}: {t}\n", .{ path, err });
+            return process_exit.request(1);
+        };
+    }
 
     const target = SshTarget{ .options = ssh_options, .host = host };
     const stdin_is_tty = c.isatty(posix.STDIN_FILENO) != 0;
@@ -3842,50 +3848,102 @@ fn setNonBlockingFd(fd: c.fd_t) !void {
     if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
 }
 
-const StderrTtyControl = struct {
-    fd: c.fd_t = -1,
+const DiagnosticsFile = struct {
+    output_fd: c.fd_t = -1,
+    input_fd: c.fd_t = -1,
     mode_guard: terminal.TerminalModeGuard = undefined,
     mode_guard_enabled: bool = false,
 
-    fn open(enabled: bool) StderrTtyControl {
-        if (!enabled) return .{};
-        if (c.isatty(posix.STDERR_FILENO) == 0) return .{};
-        const path_z = ttyname(posix.STDERR_FILENO) orelse return .{};
-        const fd = posix.openZ(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return .{};
-        var control = StderrTtyControl{ .fd = fd };
-        core_fds.setNonBlocking(fd) catch {
+    fn open(path: ?[]const u8) !DiagnosticsFile {
+        const file_path = path orelse return .{};
+        if (file_path.len == 0) return .{};
+
+        const probe_fd = posix.open(file_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch {
+            return try openOutputOnly(file_path);
+        };
+        if (c.isatty(probe_fd) == 0) {
+            posix.close(probe_fd);
+            return try openOutputOnly(file_path);
+        }
+
+        var control = DiagnosticsFile{
+            .output_fd = probe_fd,
+            .input_fd = probe_fd,
+        };
+        core_fds.setNonBlocking(probe_fd) catch |err| {
             control.deinit();
-            return .{};
+            return err;
         };
         // ProxyCommand stdin is the SSH byte stream, so Ctrl-R cannot be read
-        // from fd 0. When requested, read control keystrokes from stderr's tty
-        // instead. Terminal mode is attached to the tty device, not this fd
-        // alone, so the guard restores the visible terminal on exit.
-        control.mode_guard = terminal.TerminalModeGuard.enable(fd) catch {
+        // from fd 0. If the diagnostics file is a tty, read control keystrokes
+        // from it and write status there. If it is a normal file, it is output
+        // only and reconnect control remains unavailable.
+        control.mode_guard = terminal.TerminalModeGuard.enable(probe_fd) catch |err| {
             control.deinit();
-            return .{};
+            return err;
         };
         control.mode_guard_enabled = true;
         return control;
     }
 
-    fn deinit(self: *StderrTtyControl) void {
+    fn openOutputOnly(path: []const u8) !DiagnosticsFile {
+        const fd = posix.open(path, .{
+            .ACCMODE = .WRONLY,
+            .CLOEXEC = true,
+            .CREAT = true,
+            .APPEND = true,
+            .NONBLOCK = true,
+        }, 0o600) catch |err| return err;
+        return .{ .output_fd = fd };
+    }
+
+    fn deinit(self: *DiagnosticsFile) void {
         if (self.mode_guard_enabled) {
             self.mode_guard.restore();
             self.mode_guard_enabled = false;
         }
-        if (self.fd >= 0) {
-            posix.close(self.fd);
-            self.fd = -1;
+        if (self.output_fd >= 0) {
+            posix.close(self.output_fd);
+            self.output_fd = -1;
         }
+        self.input_fd = -1;
     }
 };
+
+fn validateDiagnosticsFilePath(path: []const u8) !void {
+    const probe_fd = posix.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch {
+        const output_fd = try posix.open(path, .{
+            .ACCMODE = .WRONLY,
+            .CLOEXEC = true,
+            .CREAT = true,
+            .APPEND = true,
+        }, 0o600);
+        posix.close(output_fd);
+        return;
+    };
+    defer posix.close(probe_fd);
+    if (c.isatty(probe_fd) != 0) return;
+
+    const output_fd = try posix.open(path, .{
+        .ACCMODE = .WRONLY,
+        .CLOEXEC = true,
+        .CREAT = true,
+        .APPEND = true,
+    }, 0o600);
+    posix.close(output_fd);
+}
 
 fn sameTerminalFd(left: c.fd_t, right: c.fd_t) bool {
     if (c.isatty(left) == 0 or c.isatty(right) == 0) return false;
     const left_stat = posix.fstat(left) catch return false;
     const right_stat = posix.fstat(right) catch return false;
     return left_stat.dev == right_stat.dev and left_stat.ino == right_stat.ino;
+}
+
+fn ttyPathForFd(allocator: std.mem.Allocator, fd: c.fd_t) !?[]u8 {
+    if (c.isatty(fd) == 0) return null;
+    const path_z = ttyname(fd) orelse return null;
+    return try allocator.dupe(u8, std.mem.span(path_z));
 }
 
 fn inferredClientLogLevel(ssh_options: []const []const u8) client_log.Level {
@@ -4421,10 +4479,17 @@ fn runProxyStreamSsh(
             daemon_dir_name,
         );
     }
-    const stdin_from_stderr = diagnostics_plan.use_daemon_control and
+    var auto_diagnostics_file: ?[]u8 = null;
+    defer if (auto_diagnostics_file) |path| allocator.free(path);
+    if (common.diagnostics_file == null and
+        diagnostics_plan.use_daemon_control and
         !diagnostics_plan.wrap_visible_ssh and
-        sameTerminalFd(posix.STDIN_FILENO, posix.STDERR_FILENO);
-    const proxy_client_ctrl_r = diagnostics_plan.client_ctrl_r or stdin_from_stderr;
+        sameTerminalFd(posix.STDIN_FILENO, posix.STDERR_FILENO))
+    {
+        auto_diagnostics_file = try ttyPathForFd(allocator, posix.STDERR_FILENO);
+    }
+    const diagnostics_file = common.diagnostics_file orelse auto_diagnostics_file;
+    const proxy_client_ctrl_r = diagnostics_plan.client_ctrl_r;
     const proxy_daemon_dir_name = daemon_dir_name orelse try daemon_socket_namespace.defaultDirName(allocator);
     defer if (daemon_dir_name == null) allocator.free(proxy_daemon_dir_name);
     try daemon_client.ensureStartedForDirName(allocator, exe, proxy_daemon_dir_name);
@@ -4438,7 +4503,7 @@ fn runProxyStreamSsh(
         control_guid,
         diagnostics_plan.command_level,
         proxy_client_ctrl_r,
-        stdin_from_stderr,
+        diagnostics_file,
         common.bootstrap,
         daemon_dir_name,
         use_fd_pass,
@@ -4491,7 +4556,7 @@ const ProxyStreamInvocation = struct {
     client_ctrl_r: bool = false,
     bootstrap: bool = true,
     use_fd_pass: bool = false,
-    stdin_from_stderr: bool = false,
+    diagnostics_file: ?[]const u8 = null,
     ssh_options: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *ProxyStreamInvocation, allocator: std.mem.Allocator) void {
@@ -4549,8 +4614,14 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         invocation.filter_level,
         invocation.control_guid != null,
     );
-    var stderr_tty_control = StderrTtyControl.open(invocation.stdin_from_stderr);
-    defer stderr_tty_control.deinit();
+    var diagnostics_file = DiagnosticsFile.open(invocation.diagnostics_file) catch |err| {
+        try io.stderrPrint(
+            "sessh: proxy mode cannot open diagnostics file {s}: {t}\n",
+            .{ invocation.diagnostics_file orelse "", err },
+        );
+        return process_exit.request(1);
+    };
+    defer diagnostics_file.deinit();
 
     const exit_status = stream_runtime.runLocalStream(allocator, &starter, .{
         .guid = proxy_guid,
@@ -4558,10 +4629,14 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .proxy_port = proxy_port,
         .source_fd = 0,
         .sink_fd = 1,
-        .reconnect_input_fd = stderr_tty_control.fd,
+        .reconnect_input_fd = diagnostics_file.input_fd,
         .status_mode = status_mode,
+        .status_fd = if (status_mode == .stderr_plain)
+            if (diagnostics_file.output_fd >= 0) diagnostics_file.output_fd else posix.STDERR_FILENO
+        else
+            -1,
         .intercept_ctrl_r = false,
-        .ctrl_r_status_enabled = (invocation.client_ctrl_r and invocation.control_guid != null) or stderr_tty_control.fd >= 0,
+        .ctrl_r_status_enabled = (invocation.client_ctrl_r and invocation.control_guid != null) or diagnostics_file.input_fd >= 0,
         .title_fallback = invocation.host,
         .reset_on_source_eof = true,
     }) catch |err| {
@@ -4742,8 +4817,10 @@ fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []cons
         } else if (std.mem.eql(u8, arg, "--use-fd-pass")) {
             invocation.use_fd_pass = true;
             i += 1;
-        } else if (std.mem.eql(u8, arg, "--stdin-from-stderr")) {
-            invocation.stdin_from_stderr = true;
+        } else if (std.mem.eql(u8, arg, "--diagnostics-file")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingDiagnosticsFile;
+            invocation.diagnostics_file = args[i];
             i += 1;
         } else if (std.mem.eql(u8, arg, "--client-ctrl-r")) {
             i += 1;
@@ -4761,15 +4838,17 @@ fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []cons
         }
     }
 
-    if (stdinFromStderrEnvEnabled()) invocation.stdin_from_stderr = true;
+    if (diagnosticsFileEnv()) |path| invocation.diagnostics_file = path;
     if (invocation.host.len == 0) return error.MissingProxyHost;
     if (invocation.port.len == 0) return error.MissingProxyPort;
     return invocation;
 }
 
-fn stdinFromStderrEnvEnabled() bool {
-    const value_z = c.getenv("SESSH_STDIN_FROM_STDERR") orelse return false;
-    return std.mem.eql(u8, std.mem.span(value_z), "1");
+fn diagnosticsFileEnv() ?[]const u8 {
+    const value_z = c.getenv("SESSH_DIAGNOSTICS_FILE") orelse return null;
+    const value = std.mem.span(value_z);
+    if (value.len == 0) return null;
+    return value;
 }
 
 fn clearOwnedProxyDaemonDirName(allocator: std.mem.Allocator, invocation: *ProxyStreamInvocation) void {
@@ -4794,6 +4873,7 @@ fn printProxyStreamArgError(err: anyerror) !void {
         error.InvalidFilterLevel => try io.writeAll(2, "sessh: proxy mode invalid filter level\n"),
         error.MissingIsolationMode => try io.writeAll(2, "sessh: proxy mode --isolation-mode requires one of: full, process, none\n"),
         error.InvalidIsolationMode => try io.writeAll(2, "sessh: proxy mode invalid isolation mode; expected one of: full, process, none\n"),
+        error.MissingDiagnosticsFile => try io.writeAll(2, "sessh: proxy mode --diagnostics-file requires a file path\n"),
         error.MissingClientCtrlR => try io.writeAll(2, "sessh: proxy mode --client-ctrl-r requires a value\n"),
         error.InvalidClientCtrlR => try io.writeAll(2, "sessh: proxy mode --client-ctrl-r must be 0 or 1\n"),
         else => try io.stderrPrint("sessh: invalid proxy mode arguments: {t}\n", .{err}),
@@ -4959,6 +5039,7 @@ pub fn printSshArgError(err: anyerror) !void {
         error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
         error.MissingFilterLevel => try io.writeAll(2, "sessh: --filter-level requires one of: unhygienic, hygienic, emulated\n"),
         error.MissingIsolationMode => try io.writeAll(2, "sessh: --isolation-mode requires one of: full, process, none\n"),
+        error.MissingDiagnosticsFile => try io.writeAll(2, "sessh: --diagnostics-file requires a file path\n"),
         error.MissingTtyTranscriptPath => try io.writeAll(2, "sessh: --capture-tty-transcript requires a path\n"),
         error.MissingSshOptionValue => try io.writeAll(2, "sessh: ssh option is missing its value\n"),
         error.SesshOptionAfterHost => try io.writeAll(2, "sessh: sessh options must appear before HOST\n"),
@@ -5164,7 +5245,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(shouldUseProxyStreamForTest(parsed, true));
 
-    const option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "p-550e8400-e29b-41d4-a716-446655440000", .hygienic, true, true, true, "3.conn.test", false);
+    const option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "p-550e8400-e29b-41d4-a716-446655440000", .hygienic, true, "/dev/ttys001", true, "3.conn.test", false);
     defer std.testing.allocator.free(option);
 
     try std.testing.expect(std.mem.indexOf(u8, option, "sessh-proxy") != null);
@@ -5175,7 +5256,8 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "--filter-level") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "hygienic") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--use-fd-pass") == null);
-    try std.testing.expect(std.mem.indexOf(u8, option, "--stdin-from-stderr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "--diagnostics-file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "/dev/ttys001") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--bootstrap") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--daemon-namespace") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "3.conn.test") != null);
@@ -5189,13 +5271,42 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "'-X'") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "'-tt'") == null);
 
-    const no_bootstrap_option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, false, false, null, false);
+    const no_bootstrap_option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, null, false, null, false);
     defer std.testing.allocator.free(no_bootstrap_option);
     try std.testing.expect(std.mem.indexOf(u8, no_bootstrap_option, "--no-bootstrap") != null);
 
-    const fd_pass_option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, false, true, null, true);
+    const fd_pass_option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, null, true, null, true);
     defer std.testing.allocator.free(fd_pass_option);
     try std.testing.expect(std.mem.indexOf(u8, fd_pass_option, "--use-fd-pass") != null);
+}
+
+test "proxy command forwards parsed diagnostics file" {
+    var parsed = try parseSshArgsForTest(std.testing.allocator, &.{
+        "sessh",
+        "--diagnostics-file",
+        "/tmp/sessh-diagnostics.log",
+        "-L",
+        "8080:localhost:80",
+        "example.com",
+    }, .{});
+    defer parsed.deinit(std.testing.allocator);
+
+    const option = try proxy_command.commandOption(
+        std.testing.allocator,
+        "/tmp/sessh-test/sessh-proxy",
+        parsed.invocation.ssh_options,
+        null,
+        .hygienic,
+        false,
+        parsed.invocation.common.diagnostics_file,
+        true,
+        null,
+        false,
+    );
+    defer std.testing.allocator.free(option);
+
+    try std.testing.expect(std.mem.indexOf(u8, option, "--diagnostics-file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "/tmp/sessh-diagnostics.log") != null);
 }
 
 test "proxy invocation isolation mode controls placement" {
@@ -5238,18 +5349,79 @@ test "proxy invocation isolation mode controls placement" {
     try std.testing.expect(none.daemon_dir_name == null);
 }
 
-test "proxy invocation parses explicit fd-pass and stdin-from-stderr flags" {
+test "proxy invocation parses explicit fd-pass and diagnostics file flags" {
     var invocation = try parseProxyStreamInvocation(std.testing.allocator, &.{
         "--host",
         "example.com",
         "--port",
         "22",
         "--use-fd-pass",
-        "--stdin-from-stderr",
+        "--diagnostics-file",
+        "/tmp/sessh-diagnostics.log",
     });
     defer invocation.deinit(std.testing.allocator);
     try std.testing.expect(invocation.use_fd_pass);
-    try std.testing.expect(invocation.stdin_from_stderr);
+    try std.testing.expectEqualStrings("/tmp/sessh-diagnostics.log", invocation.diagnostics_file.?);
+}
+
+test "diagnostics file opens regular file as output only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "diagnostics.log" });
+    defer std.testing.allocator.free(path);
+
+    var diagnostics = try DiagnosticsFile.open(path);
+    defer diagnostics.deinit();
+
+    try std.testing.expect(diagnostics.output_fd >= 0);
+    try std.testing.expect(diagnostics.input_fd < 0);
+    try io.writeAll(diagnostics.output_fd, "status\n");
+    diagnostics.deinit();
+
+    const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "diagnostics.log", 64);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("status\n", contents);
+}
+
+test "diagnostics file reports uncreatable path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "missing-parent", "diagnostics.log" });
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectError(error.FileNotFound, DiagnosticsFile.open(path));
+}
+
+test "diagnostics file validation creates regular file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "validated-diagnostics.log" });
+    defer std.testing.allocator.free(path);
+
+    try validateDiagnosticsFilePath(path);
+    const file = try tmp.dir.openFile("validated-diagnostics.log", .{});
+    file.close();
+}
+
+test "diagnostics file validation reports uncreatable path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "missing-parent", "diagnostics.log" });
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectError(error.FileNotFound, validateDiagnosticsFilePath(path));
 }
 
 test "stream routing preserves ssh remote command tty semantics" {

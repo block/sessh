@@ -169,14 +169,21 @@ You can control whether the proxy uses a shared daemon with
 `--isolation-mode=full`, `--isolation-mode=process`, or `--isolation-mode=none`.
 `full` uses a private daemon namespace for this connection.
 
-`sessh :proxy:` has a `--stdin-from-stderr` option. When passed, and when stderr
-is a TTY, it opens that same TTY as a control input for reconnect keystrokes
-while keeping stdin/stdout reserved for the SSH proxy byte stream. If stderr is
-not a TTY, the flag does nothing. The outer `sessh` only passes this flag after
-checking that stdin and stderr refer to the same TTY. You should not hard-code
-`--stdin-from-stderr` inside an `ssh_config(5)` alias, because you cannot know
-ahead of time whether ssh will be run with stdin redirected, but you can use it
-one-off via `SESSH_STDIN_FROM_STDERR=1 ssh ...`.
+`sessh :proxy:` writes diagnostics to stderr by default. If stderr is a TTY,
+those diagnostics can use TTY-appropriate behavior; if not, they fall back to
+plain line output.
+
+`sessh` and `sessh :proxy:` also have a `--diagnostics-file PATH` option.
+`PATH` can be `/dev/tty` for the current controlling terminal, a specific
+terminal device if you want diagnostics somewhere else, or a normal file. When
+`PATH` opens as a TTY, sessh uses that terminal for reconnect keystrokes and
+diagnostics while keeping stdin/stdout reserved for the SSH proxy byte stream.
+When it opens as a normal file, sessh appends diagnostics there but does not
+read reconnect keystrokes from it. If the file does not exist, sessh creates
+it. If `PATH` cannot be opened or created, sessh exits with an error. The outer
+`sessh` only auto-passes a terminal path to `sessh :proxy:` after checking that
+stdin and stderr refer to the same TTY. For one-off use with a plain `ssh`
+invocation, set `SESSH_DIAGNOSTICS_FILE=/dev/tty`.
 
 
 # Other Docs

@@ -30,6 +30,7 @@ Sessh accepts normal ssh options, plus a small set of sessh-specific options:
 - `--terminal-emulator` / `--no-terminal-emulator`
 - `--filter-level unhygienic|hygienic|emulated`
 - `--isolation-mode full|process|none`
+- `--diagnostics-file PATH`
 - `--capture-tty-transcript PATH.tar.gz`
 - `--daemon-log`
 
@@ -39,6 +40,11 @@ filtering, and `hygienic` uses the side-channel path when the visible client can
 support it.
 
 `--daemon-log` follows new local daemon log entries on stdout until stopped.
+
+`--diagnostics-file PATH` sends proxy-path connection diagnostics to `PATH`.
+If `PATH` is a terminal device, sessh can also read reconnect keystrokes from
+it. If `PATH` is a normal file, sessh appends diagnostic lines there, creating
+the file if necessary.
 
 `--isolation-mode process` is the default. `full` uses a private local
 daemon namespace for that invocation, so it does not pool TCP connections with
