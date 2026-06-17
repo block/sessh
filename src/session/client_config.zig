@@ -10,6 +10,7 @@ pub const FileConfig = struct {
     bootstrap: ?bool = null,
     terminal_emulator: ?bool = null,
     filter_level: ?config.FilterLevel = null,
+    diagnostics_level: ?config.DiagnosticsLevel = null,
     isolation_mode: ?config.IsolationMode = null,
     cleanup_wakeup_interval_ms: ?u64 = null,
     cleanup_retry_limit_ms: ?u64 = null,
@@ -73,6 +74,8 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
             parsed.terminal_emulator = try parseBool(value);
         } else if (keyMatches(key, "filter-level")) {
             parsed.filter_level = try config.parseFilterLevel(value);
+        } else if (keyMatches(key, "diagnostics-level")) {
+            parsed.diagnostics_level = try config.parseDiagnosticsLevel(value);
         } else if (keyMatches(key, "isolation-mode")) {
             parsed.isolation_mode = try config.parseIsolationMode(value);
         } else if (keyMatches(key, "cleanup-wakeup-interval-hours")) {
@@ -151,6 +154,7 @@ test "parseEnvConfig accepts sessh env keys" {
         \\bootstrap=false
         \\terminal-emulator=no
         \\filter-level=hygienic
+        \\diagnostics-level=status
         \\isolation-mode=full
         \\cleanup-wakeup-interval-hours=0.25
         \\cleanup-retry-limit-hours=2
@@ -162,6 +166,7 @@ test "parseEnvConfig accepts sessh env keys" {
     try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
     try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
     try std.testing.expectEqual(@as(?config.FilterLevel, .hygienic), parsed.filter_level);
+    try std.testing.expectEqual(@as(?config.DiagnosticsLevel, .status), parsed.diagnostics_level);
     try std.testing.expectEqual(@as(?config.IsolationMode, .full), parsed.isolation_mode);
     try std.testing.expectEqual(@as(?u64, 900_000), parsed.cleanup_wakeup_interval_ms);
     try std.testing.expectEqual(@as(?u64, 7_200_000), parsed.cleanup_retry_limit_ms);

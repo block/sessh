@@ -23,6 +23,7 @@ pub const ReconnectPresentation = enum {
     none,
     stderr_plain,
     title,
+    jsonl,
     overlay,
 };
 
@@ -37,6 +38,13 @@ pub const ReconnectSwitchDisposition = enum {
     delayed,
     manual_disconnected,
     manual_unresponsive,
+};
+
+pub const ReconnectUiOptions = struct {
+    presentation: ReconnectPresentation = .overlay,
+    input_fd: c.fd_t = posix.STDIN_FILENO,
+    output_fd: c.fd_t = posix.STDOUT_FILENO,
+    line_fd: c.fd_t = posix.STDERR_FILENO,
 };
 
 pub const ReconnectUi = struct {
@@ -63,6 +71,9 @@ pub const ReconnectUi = struct {
     input_during_disconnect: bool = false,
     escape_filter: terminal.EscapeFilter = .{},
     cancelled: bool = false,
+    input_fd: c.fd_t = posix.STDIN_FILENO,
+    output_fd: c.fd_t = posix.STDOUT_FILENO,
+    line_fd: c.fd_t = posix.STDERR_FILENO,
     title_enabled: bool = false,
     title_fd: c.fd_t = posix.STDOUT_FILENO,
     title_visible: bool = false,
@@ -73,17 +84,26 @@ pub const ReconnectUi = struct {
     resize_generation: u64 = 0,
     forwarded_resize_generation: u64 = 0,
     disconnected_input_flash_until_ms: u64 = 0,
+    append_only_retry_announced: bool = false,
 
     pub fn begin(viewport_offset: i32) !ReconnectUi {
         return beginWithPresentation(viewport_offset, .overlay);
     }
 
     pub fn beginWithPresentation(viewport_offset: i32, presentation: ReconnectPresentation) !ReconnectUi {
+        return beginWithOptions(viewport_offset, .{ .presentation = presentation });
+    }
+
+    pub fn beginWithOptions(viewport_offset: i32, options: ReconnectUiOptions) !ReconnectUi {
         var ui = ReconnectUi{
-            .mode_guard = try terminal.TerminalModeGuard.enable(posix.STDIN_FILENO),
+            .mode_guard = try terminal.TerminalModeGuard.enable(options.input_fd),
             .clock = try NonSuspendingTimer.start(),
-            .title_enabled = (presentation == .overlay or presentation == .title) and c.isatty(posix.STDOUT_FILENO) != 0,
-            .presentation = presentation,
+            .input_fd = options.input_fd,
+            .output_fd = options.output_fd,
+            .line_fd = options.line_fd,
+            .title_enabled = (options.presentation == .overlay or options.presentation == .title) and c.isatty(options.output_fd) != 0,
+            .title_fd = options.output_fd,
+            .presentation = options.presentation,
             .last_size = terminal.currentWindowSize(),
         };
         errdefer ui.mode_guard.restore();
@@ -110,7 +130,7 @@ pub const ReconnectUi = struct {
         client_log.registerUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
         errdefer client_log.unregisterUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
         try ui.consumeDiagnostics();
-        if (presentation == .overlay) try ui.hideCursor();
+        if (options.presentation == .overlay) try ui.hideCursor();
         return ui;
     }
 
@@ -131,6 +151,7 @@ pub const ReconnectUi = struct {
     }
 
     pub fn waitForReconnect(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
+        self.append_only_retry_announced = false;
         try self.drawReconnectOverlay(delay_ms);
         var timer = try NonSuspendingTimer.start();
         var next_overlay_update_ms = nextOverlayUpdateDelayMs(delay_ms);
@@ -298,10 +319,10 @@ pub const ReconnectUi = struct {
         self.last_size = size;
         self.resize_generation +%= 1;
         if (self.resize_generation == 0) self.resize_generation = 1;
-        if (self.presentation != .overlay or c.isatty(posix.STDOUT_FILENO) == 0) return;
+        if (self.presentation != .overlay or c.isatty(self.output_fd) == 0) return;
 
-        const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
-        try renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(posix.STDIN_FILENO, posix.STDOUT_FILENO));
+        const renderer = client_renderer.Renderer.init(self.output_fd);
+        try renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(self.input_fd, self.output_fd));
         try renderer.clearVisible();
         self.overlay_state = null;
         self.viewport_offset = 0;
@@ -311,7 +332,7 @@ pub const ReconnectUi = struct {
     fn pollInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
         var pollfds = [_]posix.pollfd{
             .{
-                .fd = posix.STDIN_FILENO,
+                .fd = self.input_fd,
                 .events = posix.POLL.IN,
                 .revents = 0,
             },
@@ -332,9 +353,9 @@ pub const ReconnectUi = struct {
 
         var input: [256]u8 = undefined;
         var filtered: [512]u8 = undefined;
-        const n = c.read(posix.STDIN_FILENO, &input, input.len);
+        const n = c.read(self.input_fd, &input, input.len);
         if (n <= 0) return .client_hangup;
-        io_helpers.noteRead(posix.STDIN_FILENO, input[0..@intCast(n)]);
+        io_helpers.noteRead(self.input_fd, input[0..@intCast(n)]);
 
         const bytes = input[0..@intCast(n)];
         switch (reconnect_control.scanInput(bytes, .{})) {
@@ -358,10 +379,10 @@ pub const ReconnectUi = struct {
     }
 
     fn alertDisconnectedInput(self: *ReconnectUi) !void {
-        try io_helpers.writeAll(posix.STDOUT_FILENO, "\x07");
-        if (c.isatty(posix.STDOUT_FILENO) == 0) return;
+        try io_helpers.writeAll(self.output_fd, "\x07");
+        if (c.isatty(self.output_fd) == 0) return;
         if (self.disconnected_input_flash_until_ms <= 0) {
-            try io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?5h");
+            try io_helpers.writeAll(self.output_fd, "\x1b[?5h");
         }
         self.disconnected_input_flash_until_ms = self.nowMs() +| disconnected_input_flash_ms;
     }
@@ -375,7 +396,7 @@ pub const ReconnectUi = struct {
     fn clearDisconnectedInputFlash(self: *ReconnectUi) !void {
         if (self.disconnected_input_flash_until_ms <= 0) return;
         self.disconnected_input_flash_until_ms = 0;
-        if (c.isatty(posix.STDOUT_FILENO) != 0) try io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?5l");
+        if (c.isatty(self.output_fd) != 0) try io_helpers.writeAll(self.output_fd, "\x1b[?5l");
     }
 
     fn nowMs(self: *ReconnectUi) u64 {
@@ -384,9 +405,9 @@ pub const ReconnectUi = struct {
 
     pub fn clearOverlay(self: *ReconnectUi) !i32 {
         if (self.presentation != .overlay) return @intCast(self.viewport_offset);
-        if (c.isatty(posix.STDOUT_FILENO) == 0) return @intCast(self.viewport_offset);
+        if (c.isatty(self.output_fd) == 0) return @intCast(self.viewport_offset);
         const state = self.overlay_state orelse return @intCast(self.viewport_offset);
-        const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
+        const renderer = client_renderer.Renderer.init(self.output_fd);
         const size = terminal.currentWindowSize();
         try eraseOverlayRows(renderer, state, size.rows, size.cols);
         try restoreOverlayExpansion(renderer, state, size.rows);
@@ -402,6 +423,14 @@ pub const ReconnectUi = struct {
 
     fn drawReconnectOverlay(self: *ReconnectUi, delay_ms: u64) !void {
         self.showRetryTitle(delay_ms);
+        if (self.appendOnlyPresentation()) {
+            if (self.append_only_retry_announced) return;
+            self.append_only_retry_announced = true;
+            var message_buf: [192]u8 = undefined;
+            const message = try appendOnlyRetryStatus(&message_buf, delay_ms, true);
+            try self.drawStaticOverlay(message);
+            return;
+        }
         var status_buf: [96]u8 = undefined;
         const status = try reconnect_title.retryStatus(
             &status_buf,
@@ -451,22 +480,26 @@ pub const ReconnectUi = struct {
         const message = self.overlay_message[0..self.overlay_message_len];
         switch (self.presentation) {
             .none, .title => return,
+            .jsonl => {
+                try writeJsonlStatus(self.line_fd, message);
+                return;
+            },
             .stderr_plain => {
-                try io_helpers.writeAll(posix.STDERR_FILENO, message);
-                try io_helpers.writeAll(posix.STDERR_FILENO, "\r\n");
+                try io_helpers.writeAll(self.line_fd, message);
+                try io_helpers.writeAll(self.line_fd, "\r\n");
                 return;
             },
             .overlay => {},
         }
 
-        if (c.isatty(posix.STDOUT_FILENO) == 0) {
-            try io_helpers.writeAll(posix.STDOUT_FILENO, "\r\n");
-            try io_helpers.writeAll(posix.STDOUT_FILENO, message);
-            try io_helpers.writeAll(posix.STDOUT_FILENO, "\r\n");
+        if (c.isatty(self.output_fd) == 0) {
+            try io_helpers.writeAll(self.output_fd, "\r\n");
+            try io_helpers.writeAll(self.output_fd, message);
+            try io_helpers.writeAll(self.output_fd, "\r\n");
             for (self.diagnostic_lines[0..self.diagnostic_line_count]) |*line| {
                 if (line.len == 0) continue;
-                try io_helpers.writeAll(posix.STDOUT_FILENO, line.slice());
-                try io_helpers.writeAll(posix.STDOUT_FILENO, "\r\n");
+                try io_helpers.writeAll(self.output_fd, line.slice());
+                try io_helpers.writeAll(self.output_fd, "\r\n");
             }
             return;
         }
@@ -489,7 +522,7 @@ pub const ReconnectUi = struct {
             overlay_lines[overlay_line_count] = .{ .text = line.slice(), .alignment = .left };
             overlay_line_count += 1;
         }
-        const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
+        const renderer = client_renderer.Renderer.init(self.output_fd);
         const state = try drawOverlayLines(renderer, size, self.viewport_offset, self.overlay_state, overlay_lines[0..overlay_line_count]);
         self.viewport_offset = state.viewport_offset;
         self.overlay_state = state;
@@ -499,7 +532,12 @@ pub const ReconnectUi = struct {
         if (self.overlay_message_len == 0) return;
         if (client_log.currentUserDiagnosticSeq() == self.rendered_diagnostic_seq) return;
         try self.consumeDiagnostics();
+        if (self.appendOnlyPresentation()) return;
         try self.drawCurrentOverlay();
+    }
+
+    fn appendOnlyPresentation(self: *const ReconnectUi) bool {
+        return self.presentation == .stderr_plain or self.presentation == .jsonl;
     }
 
     fn consumeDiagnostics(self: *ReconnectUi) !void {
@@ -515,6 +553,7 @@ pub const ReconnectUi = struct {
             switch (self.presentation) {
                 .overlay => self.appendDiagnosticLine(diagnostic),
                 .stderr_plain => self.writePlainDiagnosticLine(diagnostic),
+                .jsonl => self.writeJsonlDiagnostic(diagnostic),
                 .title, .none => {},
             }
         }
@@ -527,8 +566,14 @@ pub const ReconnectUi = struct {
         const delayed = diagnostic.seq <= self.live_diagnostic_start_seq;
         var line_buf: [client_log.max_user_diagnostic_display_bytes]u8 = undefined;
         const len = formatOverlayDiagnostic(line_buf[0..], diagnostic, delayed);
-        io_helpers.writeAll(posix.STDERR_FILENO, line_buf[0..len]) catch return;
-        io_helpers.writeAll(posix.STDERR_FILENO, "\r\n") catch {};
+        io_helpers.writeAll(self.line_fd, line_buf[0..len]) catch return;
+        io_helpers.writeAll(self.line_fd, "\r\n") catch {};
+    }
+
+    fn writeJsonlDiagnostic(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
+        io_helpers.writeAll(self.line_fd, "{\"event\":\"diagnostic\",\"message\":") catch return;
+        writeJsonString(self.line_fd, diagnostic.slice()) catch return;
+        io_helpers.writeAll(self.line_fd, "}\n") catch return;
     }
 
     fn appendDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
@@ -559,15 +604,15 @@ pub const ReconnectUi = struct {
     }
 
     fn hideCursor(self: *ReconnectUi) !void {
-        if (c.isatty(posix.STDOUT_FILENO) == 0) return;
-        try io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?25l");
+        if (c.isatty(self.output_fd) == 0) return;
+        try io_helpers.writeAll(self.output_fd, "\x1b[?25l");
         self.cursor_hidden = true;
     }
 
     fn showCursor(self: *ReconnectUi) !void {
         if (!self.cursor_hidden) return;
         self.cursor_hidden = false;
-        try io_helpers.writeAll(posix.STDOUT_FILENO, "\x1b[?25h");
+        try io_helpers.writeAll(self.output_fd, "\x1b[?25h");
     }
 
     pub fn restoreTitleAfterReconnect(self: *ReconnectUi, app_title_present: ?bool, fallback_title: []const u8) void {
@@ -991,6 +1036,57 @@ fn setNonBlocking(fd: c.fd_t) !void {
 
 fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
     return reconnect_title.formatDelay(delay_ms, buf);
+}
+
+fn writeJsonlStatus(fd: c.fd_t, message: []const u8) !void {
+    try io_helpers.writeAll(fd, "{\"event\":\"status\",\"message\":");
+    try writeJsonString(fd, message);
+    try io_helpers.writeAll(fd, "}\n");
+}
+
+fn appendOnlyRetryStatus(buf: []u8, delay_ms: u64, ctrl_r: bool) ![]const u8 {
+    var delay_buf: [16]u8 = undefined;
+    const delay = try formatDelay(delay_ms, &delay_buf);
+    const retry_at_unix_ms = nowUnixMs() +| delay_ms;
+    if (ctrl_r) {
+        return std.fmt.bufPrint(
+            buf,
+            "sessh: disconnected: Retry connecting {s} (retry_at_unix_ms={}). CTRL-R now",
+            .{ delay, retry_at_unix_ms },
+        );
+    }
+    return std.fmt.bufPrint(
+        buf,
+        "sessh: disconnected: Retry connecting {s} (retry_at_unix_ms={})",
+        .{ delay, retry_at_unix_ms },
+    );
+}
+
+fn nowUnixMs() u64 {
+    const ms = std.time.milliTimestamp();
+    if (ms <= 0) return 0;
+    return @intCast(ms);
+}
+
+fn writeJsonString(fd: c.fd_t, value: []const u8) !void {
+    try io_helpers.writeAll(fd, "\"");
+    for (value) |byte| switch (byte) {
+        '"' => try io_helpers.writeAll(fd, "\\\""),
+        '\\' => try io_helpers.writeAll(fd, "\\\\"),
+        '\n' => try io_helpers.writeAll(fd, "\\n"),
+        '\r' => try io_helpers.writeAll(fd, "\\r"),
+        '\t' => try io_helpers.writeAll(fd, "\\t"),
+        else => {
+            if (byte < 0x20) {
+                var buf: [6]u8 = undefined;
+                const escaped = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{byte});
+                try io_helpers.writeAll(fd, escaped);
+            } else {
+                try io_helpers.writeAll(fd, (&[_]u8{byte})[0..]);
+            }
+        },
+    };
+    try io_helpers.writeAll(fd, "\"");
 }
 
 fn formatSwitchDelay(delay_ms: u64, buf: []u8) ![]const u8 {

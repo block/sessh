@@ -628,6 +628,9 @@ fn remoteSessionConfig(
     if (!result.common.filter_level_set) {
         if (file_config.filter_level) |level| result.common.filter_level = level;
     }
+    if (!result.common.diagnostics_level_set) {
+        if (file_config.diagnostics_level) |level| result.common.diagnostics_level = level;
+    }
     if (!result.common.isolation_mode_set) {
         if (file_config.isolation_mode) |mode| result.common.isolation_mode = mode;
     }
@@ -3563,9 +3566,34 @@ fn reconnectRemoteSessionClient(
 ) !void {
     const pending_input_at_disconnect = session.hasPendingInputAck();
     const pending_paste_like_input_at_disconnect = session.hasPendingPasteLikeInputAck();
-    var reconnect_ui = try client_ui.ReconnectUi.beginWithPresentation(
+    var diagnostics_file = DiagnosticsFile.open(runtime_config.common.diagnostics_file) catch |err| blk: {
+        client_log.userDiagnosticInfo("cannot open diagnostics file during reconnect: {t}", .{err});
+        break :blk DiagnosticsFile{};
+    };
+    defer diagnostics_file.deinit();
+    const diagnostics_output_fd = if (diagnostics_file.output_fd >= 0)
+        diagnostics_file.output_fd
+    else
+        posix.STDOUT_FILENO;
+    const diagnostics_line_fd = if (diagnostics_file.output_fd >= 0)
+        diagnostics_file.output_fd
+    else
+        posix.STDERR_FILENO;
+    const diagnostics_input_fd = if (diagnostics_file.input_fd >= 0)
+        diagnostics_file.input_fd
+    else
+        posix.STDIN_FILENO;
+    var reconnect_ui = try client_ui.ReconnectUi.beginWithOptions(
         session.viewport_offset,
-        reconnectPresentationForFilterLevel(runtime_config.common.filter_level),
+        .{
+            .presentation = reconnectPresentationForConfig(
+                runtime_config.common,
+                c.isatty(diagnostics_output_fd) != 0,
+            ),
+            .input_fd = diagnostics_input_fd,
+            .output_fd = diagnostics_output_fd,
+            .line_fd = diagnostics_line_fd,
+        },
     );
     var reconnect_ui_active = true;
     defer if (reconnect_ui_active) reconnect_ui.deinit();
@@ -3754,11 +3782,22 @@ fn noteReconnectFailure(
     client_log.userDiagnosticInfo("reconnect failed: " ++ stage ++ ": {t}", .{err});
 }
 
-fn reconnectPresentationForFilterLevel(level: config.FilterLevel) client_ui.ReconnectPresentation {
-    return switch (level) {
-        .unhygienic => .none,
-        .hygienic => .title,
-        .emulated => .overlay,
+fn reconnectPresentationForConfig(common: CommonSessionOptions, diagnostics_output_is_tty: bool) client_ui.ReconnectPresentation {
+    if (common.diagnostics_level == .jsonl) return .jsonl;
+    if (!diagnostics_output_is_tty) return .stderr_plain;
+    return switch (common.diagnostics_level) {
+        .jsonl => unreachable,
+        .line => .stderr_plain,
+        .title => .title,
+        .status => switch (common.filter_level) {
+            .unhygienic => .none,
+            .hygienic, .emulated => .title,
+        },
+        .overlay => switch (common.filter_level) {
+            .unhygienic => .none,
+            .hygienic => .title,
+            .emulated => .overlay,
+        },
     };
 }
 
@@ -4502,6 +4541,7 @@ fn runProxyStreamSsh(
         target.options,
         control_guid,
         diagnostics_plan.command_level,
+        common.diagnostics_level,
         proxy_client_ctrl_r,
         diagnostics_file,
         common.bootstrap,
@@ -4553,6 +4593,7 @@ const ProxyStreamInvocation = struct {
     daemon_dir_name_owned: bool = false,
     control_guid: ?[]const u8 = null,
     filter_level: config.FilterLevel = .unhygienic,
+    diagnostics_level: config.DiagnosticsLevel = config.default_diagnostics_level,
     client_ctrl_r: bool = false,
     bootstrap: bool = true,
     use_fd_pass: bool = false,
@@ -4610,10 +4651,6 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .daemon_dir_name = invocation.daemon_dir_name,
     };
 
-    const status_mode = proxy_command.reconnectStatusMode(
-        invocation.filter_level,
-        invocation.control_guid != null,
-    );
     var diagnostics_file = DiagnosticsFile.open(invocation.diagnostics_file) catch |err| {
         try io.stderrPrint(
             "sessh: proxy mode cannot open diagnostics file {s}: {t}\n",
@@ -4622,6 +4659,16 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         return process_exit.request(1);
     };
     defer diagnostics_file.deinit();
+    const diagnostics_output_is_tty = if (diagnostics_file.output_fd >= 0)
+        c.isatty(diagnostics_file.output_fd) != 0
+    else
+        c.isatty(posix.STDERR_FILENO) != 0;
+    const status_mode = proxy_command.reconnectStatusModeForDiagnostics(
+        invocation.filter_level,
+        invocation.diagnostics_level,
+        invocation.control_guid != null and invocation.diagnostics_file == null,
+        diagnostics_output_is_tty,
+    );
 
     const exit_status = stream_runtime.runLocalStream(allocator, &starter, .{
         .guid = proxy_guid,
@@ -4631,7 +4678,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .sink_fd = 1,
         .reconnect_input_fd = diagnostics_file.input_fd,
         .status_mode = status_mode,
-        .status_fd = if (status_mode == .stderr_plain)
+        .status_fd = if (status_mode == .stderr_plain or status_mode == .status_line or status_mode == .jsonl or status_mode == .title)
             if (diagnostics_file.output_fd >= 0) diagnostics_file.output_fd else posix.STDERR_FILENO
         else
             -1,
@@ -4799,6 +4846,11 @@ fn parseProxyStreamInvocation(allocator: std.mem.Allocator, args: []const []cons
             if (i >= args.len or args[i].len == 0) return error.MissingFilterLevel;
             invocation.filter_level = try config.parseFilterLevel(args[i]);
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--diagnostics-level")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingDiagnosticsLevel;
+            invocation.diagnostics_level = try config.parseDiagnosticsLevel(args[i]);
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--isolation-mode")) {
             i += 1;
             if (i >= args.len or args[i].len == 0) return error.MissingIsolationMode;
@@ -4871,6 +4923,8 @@ fn printProxyStreamArgError(err: anyerror) !void {
         error.InvalidDaemonSocketDir => try io.writeAll(2, "sessh: proxy mode invalid daemon namespace\n"),
         error.MissingFilterLevel => try io.writeAll(2, "sessh: proxy mode --filter-level requires a value\n"),
         error.InvalidFilterLevel => try io.writeAll(2, "sessh: proxy mode invalid filter level\n"),
+        error.MissingDiagnosticsLevel => try io.writeAll(2, "sessh: proxy mode --diagnostics-level requires one of: overlay, status, title, line, jsonl\n"),
+        error.InvalidDiagnosticsLevel => try io.writeAll(2, "sessh: proxy mode invalid diagnostics level; expected one of: overlay, status, title, line, jsonl\n"),
         error.MissingIsolationMode => try io.writeAll(2, "sessh: proxy mode --isolation-mode requires one of: full, process, none\n"),
         error.InvalidIsolationMode => try io.writeAll(2, "sessh: proxy mode invalid isolation mode; expected one of: full, process, none\n"),
         error.MissingDiagnosticsFile => try io.writeAll(2, "sessh: proxy mode --diagnostics-file requires a file path\n"),
@@ -5038,6 +5092,7 @@ pub fn printSshArgError(err: anyerror) !void {
         error.MissingScrollbackRowCount => try io.writeAll(2, "sessh: --scrollback-limit requires a value\n"),
         error.MissingClientLogLevel => try io.writeAll(2, "sessh: --log-level requires a value\n"),
         error.MissingFilterLevel => try io.writeAll(2, "sessh: --filter-level requires one of: unhygienic, hygienic, emulated\n"),
+        error.MissingDiagnosticsLevel => try io.writeAll(2, "sessh: --diagnostics-level requires one of: overlay, status, title, line, jsonl\n"),
         error.MissingIsolationMode => try io.writeAll(2, "sessh: --isolation-mode requires one of: full, process, none\n"),
         error.MissingDiagnosticsFile => try io.writeAll(2, "sessh: --diagnostics-file requires a file path\n"),
         error.MissingTtyTranscriptPath => try io.writeAll(2, "sessh: --capture-tty-transcript requires a path\n"),
@@ -5047,6 +5102,7 @@ pub fn printSshArgError(err: anyerror) !void {
         error.InvalidScrollbackRowCount => try io.writeAll(2, "sessh: invalid scrollback row count\n"),
         error.InvalidClientLogLevel => try io.writeAll(2, "sessh: invalid log level\n"),
         error.InvalidFilterLevel => try io.writeAll(2, "sessh: invalid filter level; expected one of: unhygienic, hygienic, emulated\n"),
+        error.InvalidDiagnosticsLevel => try io.writeAll(2, "sessh: invalid diagnostics level; expected one of: overlay, status, title, line, jsonl\n"),
         error.InvalidIsolationMode => try io.writeAll(2, "sessh: invalid isolation mode; expected one of: full, process, none\n"),
         error.InvalidBool => try io.writeAll(2, "sessh: expected true or false\n"),
         error.RemoteCommandUnsupported => try io.writeAll(2, "sessh: remote commands require -t or -tt for persistent sessions\n"),
@@ -5245,7 +5301,7 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(shouldUseProxyStreamForTest(parsed, true));
 
-    const option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "p-550e8400-e29b-41d4-a716-446655440000", .hygienic, true, "/dev/ttys001", true, "3.conn.test", false);
+    const option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, "p-550e8400-e29b-41d4-a716-446655440000", .hygienic, .status, true, "/dev/ttys001", true, "3.conn.test", false);
     defer std.testing.allocator.free(option);
 
     try std.testing.expect(std.mem.indexOf(u8, option, "sessh-proxy") != null);
@@ -5255,6 +5311,8 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "%r") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--filter-level") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "hygienic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "--diagnostics-level") != null);
+    try std.testing.expect(std.mem.indexOf(u8, option, "status") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--use-fd-pass") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "--diagnostics-file") != null);
     try std.testing.expect(std.mem.indexOf(u8, option, "/dev/ttys001") != null);
@@ -5271,11 +5329,11 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "'-X'") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "'-tt'") == null);
 
-    const no_bootstrap_option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, null, false, null, false);
+    const no_bootstrap_option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, .overlay, false, null, false, null, false);
     defer std.testing.allocator.free(no_bootstrap_option);
     try std.testing.expect(std.mem.indexOf(u8, no_bootstrap_option, "--no-bootstrap") != null);
 
-    const fd_pass_option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, false, null, true, null, true);
+    const fd_pass_option = try proxy_command.commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.invocation.ssh_options, null, .unhygienic, .overlay, false, null, true, null, true);
     defer std.testing.allocator.free(fd_pass_option);
     try std.testing.expect(std.mem.indexOf(u8, fd_pass_option, "--use-fd-pass") != null);
 }
@@ -5297,6 +5355,7 @@ test "proxy command forwards parsed diagnostics file" {
         parsed.invocation.ssh_options,
         null,
         .hygienic,
+        .overlay,
         false,
         parsed.invocation.common.diagnostics_file,
         true,
@@ -5356,11 +5415,14 @@ test "proxy invocation parses explicit fd-pass and diagnostics file flags" {
         "--port",
         "22",
         "--use-fd-pass",
+        "--diagnostics-level",
+        "jsonl",
         "--diagnostics-file",
         "/tmp/sessh-diagnostics.log",
     });
     defer invocation.deinit(std.testing.allocator);
     try std.testing.expect(invocation.use_fd_pass);
+    try std.testing.expectEqual(config.DiagnosticsLevel.jsonl, invocation.diagnostics_level);
     try std.testing.expectEqualStrings("/tmp/sessh-diagnostics.log", invocation.diagnostics_file.?);
 }
 
@@ -5591,6 +5653,39 @@ test "proxy stream reconnect status follows filter level" {
     try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, proxy_command.reconnectStatusMode(.hygienic, false));
     try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxy_command.reconnectStatusMode(.hygienic, true));
     try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxy_command.reconnectStatusMode(.emulated, true));
+}
+
+test "proxy stream reconnect status follows diagnostics level" {
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.jsonl, proxy_command.reconnectStatusModeForDiagnostics(.emulated, .jsonl, true, true));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, proxy_command.reconnectStatusModeForDiagnostics(.emulated, .line, true, true));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, proxy_command.reconnectStatusModeForDiagnostics(.emulated, .overlay, true, false));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.title, proxy_command.reconnectStatusModeForDiagnostics(.hygienic, .title, true, true));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, proxy_command.reconnectStatusModeForDiagnostics(.emulated, .overlay, true, true));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.status_line, proxy_command.reconnectStatusModeForDiagnostics(.emulated, .overlay, false, true));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.status_line, proxy_command.reconnectStatusModeForDiagnostics(.hygienic, .status, false, true));
+}
+
+test "terminal reconnect presentation follows diagnostics level" {
+    try std.testing.expectEqual(
+        client_ui.ReconnectPresentation.overlay,
+        reconnectPresentationForConfig(.{ .filter_level = .emulated, .diagnostics_level = .overlay }, true),
+    );
+    try std.testing.expectEqual(
+        client_ui.ReconnectPresentation.title,
+        reconnectPresentationForConfig(.{ .filter_level = .emulated, .diagnostics_level = .status }, true),
+    );
+    try std.testing.expectEqual(
+        client_ui.ReconnectPresentation.title,
+        reconnectPresentationForConfig(.{ .filter_level = .hygienic, .diagnostics_level = .overlay }, true),
+    );
+    try std.testing.expectEqual(
+        client_ui.ReconnectPresentation.stderr_plain,
+        reconnectPresentationForConfig(.{ .filter_level = .emulated, .diagnostics_level = .overlay }, false),
+    );
+    try std.testing.expectEqual(
+        client_ui.ReconnectPresentation.jsonl,
+        reconnectPresentationForConfig(.{ .filter_level = .emulated, .diagnostics_level = .jsonl }, false),
+    );
 }
 
 test "proxy diagnostics plan maps emulated to daemon control" {

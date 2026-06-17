@@ -19,6 +19,23 @@ pub fn reconnectStatusMode(level: config.FilterLevel, has_daemon_control: bool) 
     };
 }
 
+pub fn reconnectStatusModeForDiagnostics(
+    filter_level: config.FilterLevel,
+    diagnostics_level: config.DiagnosticsLevel,
+    has_daemon_control: bool,
+    diagnostics_output_is_tty: bool,
+) stream_runtime.StreamReconnectStatusMode {
+    if (diagnostics_level == .jsonl) return .jsonl;
+    if (!diagnostics_output_is_tty) return .stderr_plain;
+    if (diagnostics_level == .line) return .stderr_plain;
+    if (diagnostics_level == .title) return .title;
+    if (has_daemon_control) return .client_control;
+    return switch (filter_level) {
+        .unhygienic => .disabled,
+        .hygienic, .emulated => .status_line,
+    };
+}
+
 pub fn diagnosticsPlan(
     ssh_options: []const []const u8,
     filter_level: config.FilterLevel,
@@ -137,6 +154,7 @@ pub fn commandOption(
     ssh_options: []const []const u8,
     control_guid: ?[]const u8,
     filter_level: config.FilterLevel,
+    diagnostics_level: config.DiagnosticsLevel,
     client_ctrl_r: bool,
     diagnostics_file: ?[]const u8,
     bootstrap: bool,
@@ -157,6 +175,8 @@ pub fn commandOption(
     try appendShellToken(allocator, &command, "%r");
     try appendShellToken(allocator, &command, "--filter-level");
     try appendShellToken(allocator, &command, filter_level.label());
+    try appendShellToken(allocator, &command, "--diagnostics-level");
+    try appendShellToken(allocator, &command, diagnostics_level.label());
     if (use_fd_pass) try appendShellToken(allocator, &command, "--use-fd-pass");
     if (diagnostics_file) |path| {
         try appendShellToken(allocator, &command, "--diagnostics-file");

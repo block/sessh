@@ -29,6 +29,7 @@ Sessh accepts normal ssh options, plus a small set of sessh-specific options:
 - `--log-level quiet|error|warn|info|debug|verbose`
 - `--terminal-emulator` / `--no-terminal-emulator`
 - `--filter-level unhygienic|hygienic|emulated`
+- `--diagnostics-level overlay|status|title|line|jsonl`
 - `--isolation-mode full|process|none`
 - `--diagnostics-file PATH`
 - `--capture-tty-transcript PATH.tar.gz`
@@ -41,7 +42,10 @@ support it.
 
 `--daemon-log` follows new local daemon log entries on stdout until stopped.
 
-`--diagnostics-file PATH` sends proxy-path connection diagnostics to `PATH`.
+`--diagnostics-level` caps the richest diagnostics display method sessh may
+use. `jsonl` is explicit-only and forces scriptable JSONL diagnostics.
+
+`--diagnostics-file PATH` sends connection diagnostics to `PATH`.
 If `PATH` is a terminal device, sessh can also read reconnect keystrokes from
 it. If `PATH` is a normal file, sessh appends diagnostic lines there, creating
 the file if necessary.
@@ -68,6 +72,7 @@ client-log-level=warn
 bootstrap=true
 terminal-emulator=true
 filter-level=emulated
+diagnostics-level=overlay
 isolation-mode=process
 cleanup-wakeup-interval-hours=1
 cleanup-retry-limit-hours=168

@@ -41,7 +41,9 @@ const StreamOutcome = union(enum) {
 pub const StreamReconnectStatusMode = enum {
     disabled,
     stderr_plain,
+    status_line,
     title,
+    jsonl,
     client_control,
 };
 
@@ -2190,6 +2192,9 @@ const StreamReconnectStatus = struct {
     live_diagnostic_start_seq: u64,
     rendered_diagnostic_seq: u64,
     title_visible: bool = false,
+    status_line_visible: bool = false,
+    connection_status_active: bool = false,
+    append_only_retry_announced: bool = false,
     escape_help_pending: bool = false,
     title_tracker: TerminalTitleTracker = .{},
     title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
@@ -2205,7 +2210,7 @@ const StreamReconnectStatus = struct {
         var status = StreamReconnectStatus{
             .fd = if (status_fd >= 0) status_fd else switch (mode) {
                 .title => 1,
-                .stderr_plain => 2,
+                .stderr_plain, .status_line, .jsonl => 2,
                 .client_control, .disabled => -1,
             },
             .mode = mode,
@@ -2245,9 +2250,11 @@ const StreamReconnectStatus = struct {
             .ctrl_r = self.ctrl_r_enabled,
         }) catch return;
         self.line_len = message.len;
+        self.connection_status_active = true;
         self.refreshDiagnostics();
         self.writeTitleRetry(delay_ms);
-        self.writePlainStatusLine();
+        self.writeStatusLine();
+        self.writeAppendOnlyRetry(delay_ms);
         self.writeClientRetry(delay_ms);
     }
 
@@ -2257,16 +2264,27 @@ const StreamReconnectStatus = struct {
         });
         @memcpy(self.line[0..message.len], message);
         self.line_len = message.len;
+        self.connection_status_active = true;
+        self.append_only_retry_announced = false;
         self.refreshDiagnostics();
         self.writeTitleReconnecting();
+        self.writeStatusLine();
         self.writePlainStatusLine();
+        self.writeJsonlEvent("reconnecting");
         self.writeClientReconnecting();
     }
 
     fn clear(self: *StreamReconnectStatus) void {
+        const had_connection_status = self.connection_status_active;
+        self.connection_status_active = false;
+        self.append_only_retry_announced = false;
         self.refreshDiagnostics();
+        self.clearStatusLine();
         self.restoreTitle();
-        self.writeClientClear();
+        if (had_connection_status) {
+            self.writeJsonlEvent("connected");
+            self.writeClientClear();
+        }
     }
 
     fn flushDiagnostics(self: *StreamReconnectStatus) void {
@@ -2286,6 +2304,12 @@ const StreamReconnectStatus = struct {
                 self.writeEscapeHelpText();
             },
             .stderr_plain => self.writeEscapeHelpText(),
+            .status_line => {
+                self.clearStatusLine();
+                self.writeEscapeHelpText();
+                if (self.connection_status_active) self.writeStatusLine();
+            },
+            .jsonl => {},
             .client_control => {},
             .disabled => {},
         }
@@ -2302,6 +2326,13 @@ const StreamReconnectStatus = struct {
                     io.writeAll(self.fd, "sessh: bootstrapping...") catch return;
                     io.writeAll(self.fd, "\r\n") catch return;
                 },
+                .status_line => {
+                    @memcpy(self.line[0.."sessh: bootstrapping...".len], "sessh: bootstrapping...");
+                    self.line_len = "sessh: bootstrapping...".len;
+                    self.connection_status_active = true;
+                    self.writeStatusLine();
+                },
+                .jsonl => self.writeJsonlEvent("binary_bootstrapping"),
                 .client_control => proxy_control.writeConnectionEvent(self.fd, .{ .binary_bootstrapping = .{} }) catch return,
                 .title, .disabled => {},
             },
@@ -2320,6 +2351,56 @@ const StreamReconnectStatus = struct {
         const message = self.line[0..self.line_len];
         io.writeAll(self.fd, message) catch return;
         io.writeAll(self.fd, "\r\n") catch return;
+    }
+
+    fn writeStatusLine(self: *StreamReconnectStatus) void {
+        if (self.mode != .status_line or self.fd < 0) return;
+        const message = self.line[0..self.line_len];
+        io.writeAll(self.fd, "\r\x1b[K") catch return;
+        io.writeAll(self.fd, message) catch return;
+        self.status_line_visible = true;
+    }
+
+    fn clearStatusLine(self: *StreamReconnectStatus) void {
+        if (self.mode != .status_line or self.fd < 0 or !self.status_line_visible) return;
+        io.writeAll(self.fd, "\r\x1b[K") catch return;
+        self.status_line_visible = false;
+    }
+
+    fn writeAppendOnlyRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
+        switch (self.mode) {
+            .stderr_plain, .jsonl => {},
+            else => return,
+        }
+        if (self.append_only_retry_announced) return;
+        self.append_only_retry_announced = true;
+        switch (self.mode) {
+            .stderr_plain => self.writePlainStatusLine(),
+            .jsonl => self.writeJsonlRetry(delay_ms),
+            else => unreachable,
+        }
+    }
+
+    fn writeJsonlRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
+        if (self.mode != .jsonl or self.fd < 0) return;
+        var buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "{{\"event\":\"retry\",\"retry_at_unix_ms\":{}}}\n",
+            .{nowUnixMs() +| delay_ms},
+        ) catch return;
+        io.writeAll(self.fd, line) catch return;
+    }
+
+    fn writeJsonlEvent(self: *StreamReconnectStatus, event: []const u8) void {
+        if (self.mode != .jsonl or self.fd < 0) return;
+        var buf: [96]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "{{\"event\":\"{s}\"}}\n",
+            .{event},
+        ) catch return;
+        io.writeAll(self.fd, line) catch return;
     }
 
     fn writeTitleRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
@@ -2380,7 +2461,7 @@ const StreamReconnectStatus = struct {
     }
 
     fn refreshDiagnostics(self: *StreamReconnectStatus) void {
-        if (self.mode != .stderr_plain and self.mode != .client_control) return;
+        if (self.mode != .stderr_plain and self.mode != .status_line and self.mode != .client_control and self.mode != .jsonl) return;
         if (client_log.currentUserDiagnosticSeq() == self.rendered_diagnostic_seq) return;
 
         var diagnostics = [_]client_log.UserDiagnosticLine{.{}} ** max_diagnostic_lines;
@@ -2400,10 +2481,17 @@ const StreamReconnectStatus = struct {
                 diagnostic.seq <= self.live_diagnostic_start_seq,
             ) catch continue;
             switch (self.mode) {
+                .status_line => {
+                    self.clearStatusLine();
+                    io.writeAll(self.fd, line) catch return;
+                    io.writeAll(self.fd, "\r\n") catch return;
+                    if (self.connection_status_active) self.writeStatusLine();
+                },
                 .stderr_plain => {
                     io.writeAll(self.fd, line) catch return;
                     io.writeAll(self.fd, "\r\n") catch return;
                 },
+                .jsonl => self.writeJsonlDiagnostic(line),
                 .client_control => proxy_control.writeConnectionEvent(self.fd, .{ .ssh_stderr = .{ .data = line } }) catch return,
                 .title, .disabled => unreachable,
             }
@@ -2423,7 +2511,35 @@ const StreamReconnectStatus = struct {
             io.writeAll(self.fd, "\r\n") catch return;
         }
     }
+
+    fn writeJsonlDiagnostic(self: *StreamReconnectStatus, line: []const u8) void {
+        if (self.mode != .jsonl or self.fd < 0) return;
+        io.writeAll(self.fd, "{\"event\":\"diagnostic\",\"message\":") catch return;
+        writeJsonString(self.fd, line) catch return;
+        io.writeAll(self.fd, "}\n") catch return;
+    }
 };
+
+fn writeJsonString(fd: c.fd_t, value: []const u8) !void {
+    try io.writeAll(fd, "\"");
+    for (value) |byte| switch (byte) {
+        '"' => try io.writeAll(fd, "\\\""),
+        '\\' => try io.writeAll(fd, "\\\\"),
+        '\n' => try io.writeAll(fd, "\\n"),
+        '\r' => try io.writeAll(fd, "\\r"),
+        '\t' => try io.writeAll(fd, "\\t"),
+        else => {
+            if (byte < 0x20) {
+                var buf: [6]u8 = undefined;
+                const escaped = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{byte});
+                try io.writeAll(fd, escaped);
+            } else {
+                try io.writeAll(fd, (&[_]u8{byte})[0..]);
+            }
+        },
+    };
+    try io.writeAll(fd, "\"");
+}
 
 fn retryDelayFromLocalBootDeadline(deadline_ms: ?u64) u64 {
     const deadline = deadline_ms orelse return 0;
@@ -2880,6 +2996,7 @@ test "stream reconnect status uses plain stderr lines" {
 
     var status = StreamReconnectStatus.initForTest(fds[1], .stderr_plain, false, "");
     status.showRetry(1_000);
+    status.showRetry(500);
     status.showReconnecting();
     status.clear();
     posix.close(fds[1]);
@@ -2899,6 +3016,62 @@ test "stream reconnect status uses plain stderr lines" {
             "sessh: disconnected: Reconnecting...\r\n",
         output.items,
     );
+}
+
+test "stream reconnect status line redraws in place" {
+    client_log.markUserDiagnosticsDisplayedThrough(client_log.currentUserDiagnosticSeq());
+
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var status = StreamReconnectStatus.initForTest(fds[1], .status_line, false, "");
+    status.showRetry(2_000);
+    status.showRetry(1_000);
+    status.clear();
+    posix.close(fds[1]);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    while (true) {
+        var buf: [128]u8 = undefined;
+        const n = c.read(fds[0], &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\r\x1b[Ksessh: disconnected: Retry connecting 2sec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\r\x1b[Ksessh: disconnected: Retry connecting 1sec") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output.items, "\r\x1b[K"));
+}
+
+test "stream reconnect status emits one jsonl retry per wait" {
+    client_log.markUserDiagnosticsDisplayedThrough(client_log.currentUserDiagnosticSeq());
+
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    var status = StreamReconnectStatus.initForTest(fds[1], .jsonl, false, "");
+    status.showRetry(2_000);
+    status.showRetry(1_000);
+    status.showReconnecting();
+    status.clear();
+    posix.close(fds[1]);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    while (true) {
+        var buf: [128]u8 = undefined;
+        const n = c.read(fds[0], &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.items, "\"event\":\"retry\""));
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\"retry_at_unix_ms\":") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.items, "\"event\":\"reconnecting\""));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.items, "\"event\":\"connected\""));
 }
 
 test "disabled stream reconnect status emits no UI" {

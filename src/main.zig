@@ -166,6 +166,7 @@ fn sesshLongOptionConsumesValue(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--scrollback-limit") or
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--filter-level") or
+        std.mem.eql(u8, arg, "--diagnostics-level") or
         std.mem.eql(u8, arg, "--isolation-mode") or
         std.mem.eql(u8, arg, "--diagnostics-file") or
         std.mem.eql(u8, arg, "--ssh-options") or

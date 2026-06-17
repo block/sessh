@@ -5,6 +5,7 @@ pub const version = "0.7.0-dev";
 pub const default_scrollback_row_count = 2000;
 pub const default_debug_unresponsive_seconds = 10;
 pub const default_filter_level: FilterLevel = .emulated;
+pub const default_diagnostics_level: DiagnosticsLevel = .overlay;
 pub const default_isolation_mode: IsolationMode = .process;
 pub const hour_ms: u64 = 60 * 60 * 1000;
 pub const default_cleanup_wakeup_interval_ms: u64 = hour_ms;
@@ -39,6 +40,33 @@ pub fn parseFilterLevel(value: []const u8) !FilterLevel {
     if (std.ascii.eqlIgnoreCase(value, "hygienic")) return .hygienic;
     if (std.ascii.eqlIgnoreCase(value, "emulated")) return .emulated;
     return error.InvalidFilterLevel;
+}
+
+pub const DiagnosticsLevel = enum {
+    overlay,
+    status,
+    title,
+    line,
+    jsonl,
+
+    pub fn label(self: DiagnosticsLevel) []const u8 {
+        return switch (self) {
+            .overlay => "overlay",
+            .status => "status",
+            .title => "title",
+            .line => "line",
+            .jsonl => "jsonl",
+        };
+    }
+};
+
+pub fn parseDiagnosticsLevel(value: []const u8) !DiagnosticsLevel {
+    if (std.ascii.eqlIgnoreCase(value, "overlay")) return .overlay;
+    if (std.ascii.eqlIgnoreCase(value, "status")) return .status;
+    if (std.ascii.eqlIgnoreCase(value, "title")) return .title;
+    if (std.ascii.eqlIgnoreCase(value, "line")) return .line;
+    if (std.ascii.eqlIgnoreCase(value, "jsonl")) return .jsonl;
+    return error.InvalidDiagnosticsLevel;
 }
 
 pub const IsolationMode = enum {
