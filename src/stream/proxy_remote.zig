@@ -230,7 +230,7 @@ fn registerExisting(
 fn socketPath(allocator: std.mem.Allocator, exe: []const u8, guid: []const u8) ![]u8 {
     const exe_dir = std.fs.path.dirname(exe) orelse return error.InvalidRemoteProcessExecutablePath;
     const namespace = std.fs.path.basename(exe_dir);
-    const root = try socket_transport.shortRuntimeRoot(allocator);
+    const root = try socket_transport.shortSesshRuntimeDir(allocator);
     defer allocator.free(root);
     return std.fmt.allocPrint(allocator, "{s}/{s}/proxy-{s}.sock", .{ root, namespace, guid });
 }

@@ -73,12 +73,12 @@ message ConnectionEvent {
   message SshConnecting {
   }
 
-  // The child ssh transport is connected and running its remote command. The
+  // The ssh transport process is connected and running its remote command. The
   // remote sesshd may still need to be bootstrapped or handshaken.
   message SshConnected {
   }
 
-  // Raw bytes written by the child ssh transport to stderr. This is still a
+  // Raw bytes written by the ssh transport process to stderr. This is still a
   // connection event, not remote process stderr: remote process stderr is
   // carried by the SSH channel itself.
   message SshStderr {
@@ -96,7 +96,7 @@ message ConnectionEvent {
   }
 
   // The daemon-to-daemon tunnel dropped after it had been established. This
-  // usually means the child ssh transport died or the network path broke. It
+  // usually means the ssh transport process died or the network path broke. It
   // does not prove the remote sesshd process exited.
   message DaemonDisconnected {
     // Deadline on the sender machine's sessh local-boot-time clock, in
@@ -130,7 +130,7 @@ message ClientDaemonItem {
   // transport to a remote sesshd, plus the per-client context the daemon needs
   // for stream opens queued behind that acquisition. Only host/bootstrap/IPQoS
   // and the daemon's resolved target identity participate in the pooled
-  // transport reuse key. Other fields configure a newly-started child ssh
+  // transport reuse key. Other fields configure a newly-started ssh transport
   // process or annotate cleanup/environment behavior for the streams that
   // follow. The client may immediately pipeline stream frames after this
   // request; the local daemon queues them behind tunnel setup and forwards them
@@ -139,7 +139,7 @@ message ClientDaemonItem {
     repeated string ssh_option = 1;
     string host = 2;
     bool bootstrap = 3;
-    // SSH_AUTH_SOCK to expose to the child ssh process when creating a new
+    // SSH_AUTH_SOCK to expose to the ssh transport process when creating a new
     // transport. This is not part of pooled-transport identity; a reused
     // transport keeps the agent environment it was created with.
     optional string ssh_auth_sock = 4;

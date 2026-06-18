@@ -133,9 +133,9 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(
             ssh_failure_diagnostics("ssh attach did not render remote output", result, fake_log, fake_trace)
         )
-    if "ssh runtime attach is not implemented yet" in result.stderr:
+    if "ssh terminal worker attach is not implemented yet" in result.stderr:
         raise AssertionError(
-            ssh_failure_diagnostics("ssh runtime attach fallback was used", result, fake_log, fake_trace)
+            ssh_failure_diagnostics("ssh terminal worker attach fallback was used", result, fake_log, fake_trace)
         )
     if any(token in result.stdout or token in result.stderr for token in ("MISSING ", "UPLOAD ", "OK\n")):
         raise AssertionError(

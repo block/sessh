@@ -17,14 +17,14 @@ const protocol = @import("../protocol/mod.zig");
 const proxy_diagnostics_router = @import("proxy_diagnostics_router.zig");
 const remote_shell = @import("remote_shell.zig");
 const send_env_filter = @import("send_env.zig");
-const ssh_child = @import("ssh_child.zig");
+const ssh_transport_process = @import("ssh_transport_process.zig");
 const guid_ref = @import("../core/guid.zig");
 const ssh_transport_acquire = @import("ssh_transport_acquire.zig");
 const ssh_opts = @import("ssh_options.zig");
 const pb = protocol.pb;
 
-const SshTarget = ssh_child.Target;
-const RuntimeConnection = ssh_child.RuntimeConnection;
+const SshTarget = ssh_transport_process.Target;
+const SshTransportProcess = ssh_transport_process.SshTransportProcess;
 const ArtifactSet = transport_bootstrap.ArtifactSet;
 const artifactFilenameForPlatform = transport_bootstrap.artifactFilenameForPlatform;
 const loadArtifactSet = transport_bootstrap.loadArtifactSet;
@@ -327,7 +327,7 @@ const PooledSshTransport = struct {
     bootstrap_failure_timer_id: ?dispatcher.TimerWatchId = null,
     bootstrap_failure_started_ms: u64 = 0,
     bootstrap_failure_error: ?anyerror = null,
-    connection: ?RuntimeConnection = null,
+    connection: ?SshTransportProcess = null,
     stderr_fd: c.fd_t = -1,
     remote_daemon_namespace: ?[]u8 = null,
     next_stream_id: u64 = 1,
@@ -495,7 +495,7 @@ fn startPooledSshTransportProcessForDaemon(
     var ssh_launch_environment = try ssh_transport_acquire.envMap(allocator, request);
     defer ssh_launch_environment.deinit();
 
-    transport.connection = try ssh_child.spawnRuntimeConnection(
+    transport.connection = try ssh_transport_process.spawnSshTransportProcess(
         allocator,
         target,
         remote_command,
@@ -508,8 +508,8 @@ fn startPooledSshTransportProcessForDaemon(
     }
 
     const remote_read_fd = transport.connection.?.child.stdout.?.handle;
-    try ssh_child.setNonBlockingFd(remote_read_fd);
-    try ssh_child.setNonBlockingFd(transport.connection.?.child.stdin.?.handle);
+    try ssh_transport_process.setNonBlockingFd(remote_read_fd);
+    try ssh_transport_process.setNonBlockingFd(transport.connection.?.child.stdin.?.handle);
     transport.stderr_fd = transport.connection.?.stderr_fd;
     transport.connection.?.stderr_fd = -1;
     transport.remote_daemon_namespace = broker_socket_dir;
@@ -2262,7 +2262,7 @@ fn appendFilteredClientEnvironmentToTerminalOpen(
 ) !void {
     if (open.create) |*create| {
         for (client.client_environment.items) |entry| {
-            // SessionCreate uses SHELL as the remote runtime's login-shell
+            // SessionCreate uses SHELL as the remote terminal worker's login shell
             // convention. OpenSSH SendEnv must not let the visible client's
             // SHELL choose the remote PTY child shell.
             if (std.mem.eql(u8, entry.name, "SHELL")) continue;

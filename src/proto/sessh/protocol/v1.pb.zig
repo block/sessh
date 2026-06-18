@@ -360,7 +360,7 @@ pub const ConnectionEvent = struct {
         }
     };
 
-    /// The child ssh transport is connected and running its remote command. The
+    /// The ssh transport process is connected and running its remote command. The
     /// remote sesshd may still need to be bootstrapped or handshaken.
     pub const SshConnected = struct {
         pub const _desc_table = .{};
@@ -424,7 +424,7 @@ pub const ConnectionEvent = struct {
         }
     };
 
-    /// Raw bytes written by the child ssh transport to stderr. This is still a
+    /// Raw bytes written by the ssh transport process to stderr. This is still a
     /// connection event, not remote process stderr: remote process stderr is
     /// carried by the SSH channel itself.
     pub const SshStderr = struct {
@@ -681,7 +681,7 @@ pub const ConnectionEvent = struct {
     };
 
     /// The daemon-to-daemon tunnel dropped after it had been established. This
-    /// usually means the child ssh transport died or the network path broke. It
+    /// usually means the ssh transport process died or the network path broke. It
     /// does not prove the remote sesshd process exited.
     pub const DaemonDisconnected = struct {
         retry_at_local_boot_time_ms: ?u64 = null,
@@ -916,7 +916,7 @@ pub const ClientDaemonItem = struct {
     /// transport to a remote sesshd, plus the per-client context the daemon needs
     /// for stream opens queued behind that acquisition. Only host/bootstrap/IPQoS
     /// and the daemon's resolved target identity participate in the pooled
-    /// transport reuse key. Other fields configure a newly-started child ssh
+    /// transport reuse key. Other fields configure a newly-started ssh transport
     /// process or annotate cleanup/environment behavior for the streams that
     /// follow. The client may immediately pipeline stream frames after this
     /// request; the local daemon queues them behind tunnel setup and forwards them

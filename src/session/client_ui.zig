@@ -295,7 +295,7 @@ pub const ReconnectUi = struct {
         return &self.cancelled;
     }
 
-    pub fn consumeResizeForRuntime(self: *ReconnectUi) bool {
+    pub fn consumeResizeForWorker(self: *ReconnectUi) bool {
         if (self.forwarded_resize_generation == self.resize_generation) return false;
         self.forwarded_resize_generation = self.resize_generation;
         return true;
@@ -572,7 +572,7 @@ fn elapsedTimerMs(timer: *NonSuspendingTimer) u64 {
     return timer.read() / std.time.ns_per_ms;
 }
 
-test "ReconnectUi records resize event for runtime forwarding" {
+test "ReconnectUi records resize event for terminal worker forwarding" {
     var ui = ReconnectUi{
         .mode_guard = undefined,
         .presentation = .none,
@@ -581,8 +581,8 @@ test "ReconnectUi records resize event for runtime forwarding" {
 
     try ui.refreshForResize();
     try std.testing.expect(ui.resize_generation != 0);
-    try std.testing.expect(ui.consumeResizeForRuntime());
-    try std.testing.expect(!ui.consumeResizeForRuntime());
+    try std.testing.expect(ui.consumeResizeForWorker());
+    try std.testing.expect(!ui.consumeResizeForWorker());
 }
 
 test "ReconnectUi writes append-only diagnostics to configured line fd" {

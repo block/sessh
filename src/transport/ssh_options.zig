@@ -218,7 +218,7 @@ pub fn transportSshOptionsLen(options: []const []const u8) usize {
     return len;
 }
 
-// The runtime transport always uses `ssh -T` because sessh owns the PTY
+// The daemon-tunnel transport always uses `ssh -T` because sessh owns the PTY
 // protocol. User-provided `-t`/`-tt` only decides whether ssh-shaped remote
 // command args are accepted, so those options must not be forwarded to the
 // transport ssh invocation.

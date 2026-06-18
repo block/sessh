@@ -446,7 +446,7 @@ const StreamAttachedClient = struct {
 
         if (replacement_index) |index| {
             if ((pollfds[index].revents & posix.POLL.IN) != 0) {
-                if (acceptRuntimeClient(self.options.replacement_listen_fd)) |fd| return .{ .replacement = fd };
+                if (acceptWorkerClient(self.options.replacement_listen_fd)) |fd| return .{ .replacement = fd };
             }
         }
         if (interrupt_index) |index| {
@@ -762,7 +762,7 @@ fn waitForReplacementWhileDisconnected(
     replacement_listen_fd: c.fd_t,
     options: *const StreamAttachedClientOptions,
 ) !c.fd_t {
-    // PROCESS_EVENT_LOOP: remote proxy runtime without an active transport.
+    // PROCESS_EVENT_LOOP: remote proxy worker without an active transport.
     // It must keep draining its remote fd and accepting a replacement transport;
     // this is the process's main loop, not a helper-owned Dispatcher.
     while (true) {
@@ -786,7 +786,7 @@ fn waitForReplacementWhileDisconnected(
 
         _ = try posix.poll(pollfds[0..count], -1);
         if ((pollfds[replacement_index].revents & posix.POLL.IN) != 0) {
-            if (acceptRuntimeClient(replacement_listen_fd)) |fd| return fd;
+            if (acceptWorkerClient(replacement_listen_fd)) |fd| return fd;
         }
 
         if (source_poll_index) |poll_index| {
@@ -798,7 +798,7 @@ fn waitForReplacementWhileDisconnected(
     }
 }
 
-fn acceptRuntimeClient(listen_fd: c.fd_t) ?c.fd_t {
+fn acceptWorkerClient(listen_fd: c.fd_t) ?c.fd_t {
     const fd = c.accept(listen_fd, null, null);
     if (fd < 0) return null;
     setCloseOnExec(fd) catch {

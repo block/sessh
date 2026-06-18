@@ -3,10 +3,10 @@ const c = std.c;
 const posix = std.posix;
 
 const protocol = @import("../protocol/mod.zig");
-const session_runtime = @import("../session/runtime.zig");
+const terminal_worker = @import("../session/terminal_worker.zig");
 const guid_ref = @import("../core/guid.zig");
 const socket_transport = @import("../transport/socket.zig");
-const stream_runtime = @import("../stream/runtime.zig");
+const proxy_worker = @import("../stream/proxy_worker.zig");
 const daemon_identity = @import("identity.zig");
 const daemon_log = @import("log.zig");
 const frame_write_queue = @import("../transport/frame_write_queue.zig");
@@ -299,7 +299,7 @@ fn cleanupRemoteProcess(
 
 fn cleanupGuidOnCurrentDaemon(allocator: std.mem.Allocator, guid: []const u8) !CleanupResult {
     if (std.mem.startsWith(u8, guid, "s-")) {
-        session_runtime.requestTerminalRemoteCleanup(allocator, guid) catch |err| switch (err) {
+        terminal_worker.requestTerminalWorkerCleanup(allocator, guid) catch |err| switch (err) {
             error.SessionNotFound, error.InvalidSessionId => return .missing,
             else => return err,
         };
@@ -307,7 +307,7 @@ fn cleanupGuidOnCurrentDaemon(allocator: std.mem.Allocator, guid: []const u8) !C
         return .cleaned;
     }
     if (std.mem.startsWith(u8, guid, "p-")) {
-        stream_runtime.requestProxyRemoteCleanup(allocator, guid) catch |err| switch (err) {
+        proxy_worker.requestProxyRemoteCleanup(allocator, guid) catch |err| switch (err) {
             error.StreamNotFound, error.InvalidProxyId => return .missing,
             else => return err,
         };

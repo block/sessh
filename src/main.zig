@@ -8,10 +8,10 @@ const daemon_client = @import("daemon/client.zig");
 const io = @import("core/io.zig");
 const process_exit = @import("core/process_exit.zig");
 const user_error = @import("core/user_error.zig");
-const session_runtime = @import("session/runtime.zig");
-const session_runtime_process = @import("session/runtime_process.zig");
+const terminal_worker = @import("session/terminal_worker.zig");
+const terminal_worker_process = @import("session/terminal_worker_process.zig");
 const sessh_run = @import("sessh/run.zig");
-const stream_runtime = @import("stream/runtime.zig");
+const proxy_worker = @import("stream/proxy_worker.zig");
 const terminal = @import("tty/terminal.zig");
 const transport_ssh = @import("transport/ssh.zig");
 
@@ -52,10 +52,10 @@ fn runMain() !void {
         return transport_ssh.runProxyStream(allocator, args[0], args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-terminal-remote")) {
-        return session_runtime_process.run(allocator, args[1..]);
+        return terminal_worker_process.run(allocator, args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-proxy-remote")) {
-        return stream_runtime.runProxyRemoteProcess(allocator, args[1..]);
+        return proxy_worker.runProxyRemoteProcess(allocator, args[1..]);
     }
 
     if (args.len == 1) return usage(0);
@@ -69,11 +69,11 @@ fn runMain() !void {
     }
 
     if (std.mem.eql(u8, args[1], ":terminal-remote:")) {
-        return session_runtime_process.run(allocator, args[2..]);
+        return terminal_worker_process.run(allocator, args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":proxy-remote:")) {
-        return stream_runtime.runProxyRemoteProcess(allocator, args[2..]);
+        return proxy_worker.runProxyRemoteProcess(allocator, args[2..]);
     }
 
     if (topLevelArgIs(args, &.{ "--help", "-h" })) return usage(0);
@@ -245,9 +245,9 @@ test {
     _ = @import("sessh/routing.zig");
     _ = @import("sessh/routing_tests.zig");
     _ = @import("session/attached_client.zig");
-    _ = @import("session/runtime.zig");
-    _ = @import("session/runtime_requests.zig");
-    _ = @import("session/terminal_runtime.zig");
+    _ = @import("session/terminal_worker.zig");
+    _ = @import("session/terminal_worker_requests.zig");
+    _ = @import("session/attached_client_presentation.zig");
     _ = @import("session/daemon_handler.zig");
     _ = @import("session/client_config.zig");
     _ = @import("session/client_ui.zig");
@@ -263,7 +263,7 @@ test {
     _ = @import("session/vt.zig");
     _ = @import("sessh/run.zig");
     _ = @import("stream/mux_proxy.zig");
-    _ = @import("stream/runtime.zig");
+    _ = @import("stream/proxy_worker.zig");
     _ = @import("stream/raw_bridge.zig");
     _ = @import("stream/status_output.zig");
     _ = @import("stream/proxy_diagnostics_channel.zig");
@@ -282,7 +282,7 @@ test {
     _ = @import("transport/remote_shell.zig");
     _ = @import("transport/send_env.zig");
     _ = @import("transport/socket.zig");
-    _ = @import("transport/ssh_child.zig");
+    _ = @import("transport/ssh_transport_process.zig");
     _ = @import("transport/ssh_options.zig");
     _ = @import("transport/ssh_transport_acquire.zig");
     _ = @import("transport/ssh.zig");

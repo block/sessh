@@ -5,7 +5,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const core_fds = @import("../core/fds.zig");
 const guid_ref = @import("../core/guid.zig");
 const socket_transport = @import("../transport/socket.zig");
-const session_runtime = @import("runtime.zig");
+const terminal_worker = @import("terminal_worker.zig");
 
 var terminal_remote_socket_sequence: u64 = 0;
 
@@ -16,14 +16,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const socket_path = args[1];
     const session_guid = args[2];
     core_fds.closeInheritedNonStdioFileDescriptorsExcept(listen_fd);
-    socket_transport.publishRuntimeRootSymlinkOnce(app_allocator.allocator());
+    socket_transport.publishSesshRuntimeDirSymlinkOnce(app_allocator.allocator());
     defer _ = c.close(listen_fd);
     defer std.fs.deleteFileAbsolute(socket_path) catch {};
 
-    try session_runtime.runSessionRuntimeLoop(session_guid, listen_fd);
+    try terminal_worker.runTerminalWorkerLoop(session_guid, listen_fd);
 }
 
-pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []const u8) !*session_runtime.TerminalRemoteProcess {
+pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []const u8) !*terminal_worker.TerminalWorkerHandle {
     const guid = try guid_ref.canonicalSessionGuid(allocator, session_guid);
     errdefer allocator.free(guid);
 
@@ -34,7 +34,7 @@ pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []cons
     errdefer _ = c.close(listen_fd);
     try socket_transport.clearCloseOnExec(listen_fd);
 
-    const control = try allocator.create(session_runtime.TerminalRemoteProcess);
+    const control = try allocator.create(terminal_worker.TerminalWorkerHandle);
     errdefer allocator.destroy(control);
     control.* = .{
         .allocator = allocator,
@@ -45,8 +45,8 @@ pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []cons
     };
     errdefer control.deinit(null);
 
-    try session_runtime.registerTerminalRemote(control);
-    errdefer session_runtime.unregisterTerminalRemote(control);
+    try terminal_worker.registerTerminalWorker(control);
+    errdefer terminal_worker.unregisterTerminalWorker(control);
 
     const listen_fd_arg = try std.fmt.allocPrint(allocator, "{}", .{listen_fd});
     defer allocator.free(listen_fd_arg);
@@ -64,20 +64,20 @@ pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []cons
 fn terminalRemoteSocketPath(allocator: std.mem.Allocator, exe: []const u8, prefix: []const u8) ![]u8 {
     const exe_dir = std.fs.path.dirname(exe) orelse return error.InvalidRemoteProcessExecutablePath;
     const namespace = std.fs.path.basename(exe_dir);
-    const root = try socket_transport.shortRuntimeRoot(allocator);
+    const root = try socket_transport.shortSesshRuntimeDir(allocator);
     defer allocator.free(root);
     const sequence = terminal_remote_socket_sequence;
     terminal_remote_socket_sequence +%= 1;
     return std.fmt.allocPrint(allocator, "{s}/{s}/{s}-{}-{}.sock", .{ root, namespace, prefix, c.getpid(), sequence });
 }
 
-test "terminal remote socket path uses short runtime root" {
+test "terminal worker socket path uses short sessh runtime dir" {
     const allocator = std.testing.allocator;
     const exe = "/tmp/sessh-ssh-reconnect-tmux-abcdefgh/sessh-test-root/runtime.remote/3.dev.abcdef12/sessh-terminal-remote";
     const path = try terminalRemoteSocketPath(allocator, exe, "terminal");
     defer allocator.free(path);
 
-    const root = try socket_transport.shortRuntimeRoot(allocator);
+    const root = try socket_transport.shortSesshRuntimeDir(allocator);
     defer allocator.free(root);
     const expected_prefix = try std.fmt.allocPrint(allocator, "{s}/3.dev.abcdef12/terminal-", .{root});
     defer allocator.free(expected_prefix);

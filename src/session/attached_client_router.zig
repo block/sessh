@@ -5,7 +5,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const protocol = @import("../protocol/mod.zig");
 const input_translation = @import("input_translation.zig");
-const terminal_runtime = @import("terminal_runtime.zig");
+const attached_client_presentation = @import("attached_client_presentation.zig");
 
 const hpb = protocol.hpb;
 const pb = protocol.pb;
@@ -16,11 +16,11 @@ pub const AttachedClient = struct {
     rows: u16 = 24,
     cols: u16 = 80,
     attached_at_unix_ms: u64 = 0,
-    origin: ?terminal_runtime.TerminalOrigin = null,
+    origin: ?attached_client_presentation.TerminalOrigin = null,
     active: bool = false,
     close_after_flush: bool = false,
     debug_unresponsive_until_ms: i64 = 0,
-    presentation: terminal_runtime.PresentationState = .{},
+    presentation: attached_client_presentation.PresentationState = .{},
     output: std.ArrayList(u8) = .empty,
     output_offset: usize = 0,
     input_pending: input_translation.PendingInput = .{},
@@ -81,13 +81,13 @@ pub const AttachedClient = struct {
     }
 };
 
-pub const PendingRuntimeClient = struct {
+pub const PendingWorkerClient = struct {
     fd: c.fd_t = -1,
     active: bool = false,
     reader: protocol.FrameReader = undefined,
     reader_initialized: bool = false,
 
-    pub fn start(self: *PendingRuntimeClient, fd: c.fd_t) void {
+    pub fn start(self: *PendingWorkerClient, fd: c.fd_t) void {
         self.close();
         self.* = .{
             .fd = fd,
@@ -97,7 +97,7 @@ pub const PendingRuntimeClient = struct {
         };
     }
 
-    pub fn close(self: *PendingRuntimeClient) void {
+    pub fn close(self: *PendingWorkerClient) void {
         if (self.fd >= 0) {
             _ = c.close(self.fd);
         }
@@ -105,23 +105,23 @@ pub const PendingRuntimeClient = struct {
         self.* = .{};
     }
 
-    pub fn takeFd(self: *PendingRuntimeClient) c.fd_t {
+    pub fn takeFd(self: *PendingWorkerClient) c.fd_t {
         const fd = self.fd;
         self.fd = -1;
         return fd;
     }
 };
 
-pub const RuntimeFdWatch = struct {
+pub const WorkerFdWatch = struct {
     id: ?dispatcher.FdWatchId = null,
     fd: c.fd_t = -1,
 
-    pub fn cancel(self: *RuntimeFdWatch, daemon_dispatcher: *dispatcher.Dispatcher) void {
+    pub fn cancel(self: *WorkerFdWatch, daemon_dispatcher: *dispatcher.Dispatcher) void {
         if (self.id) |id| daemon_dispatcher.cancel(.{ .fd = id });
         self.* = .{};
     }
 
-    pub fn matches(self: *const RuntimeFdWatch, id: dispatcher.FdWatchId) bool {
+    pub fn matches(self: *const WorkerFdWatch, id: dispatcher.FdWatchId) bool {
         const watch_id = self.id orelse return false;
         return watch_id.index == id.index and watch_id.generation == id.generation;
     }

@@ -179,5 +179,6 @@ display methods, and `--diagnostics-file` behavior are documented in
 
 # Other Docs
 
-Networking behavior is documented in [NETWORKING](NETWORKING.md). Runtime and
-state layout is documented in [FILESYSTEM_LAYOUT](FILESYSTEM_LAYOUT.md).
+Naming is defined in [TERMINOLOGY](TERMINOLOGY.md). Networking behavior is
+documented in [NETWORKING](NETWORKING.md). Runtime-directory and state layout is
+documented in [FILESYSTEM_LAYOUT](FILESYSTEM_LAYOUT.md).

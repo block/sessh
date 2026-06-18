@@ -34,9 +34,9 @@ pub fn reexecBrokerOrForward(allocator: std.mem.Allocator, exe: []const u8, args
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
     defer if (args.len == 0) allocator.free(dir_name);
 
-    var runtime_executables = try daemon_executable.installRuntimeExecutablesOrUseNamespaceOwner(allocator, exe, dir_name);
-    defer runtime_executables.deinit();
-    return daemon_executable.reexec(allocator, runtime_executables.broker, args);
+    var namespace_executables = try daemon_executable.installNamespaceExecutablesOrUseNamespaceOwner(allocator, exe, dir_name);
+    defer namespace_executables.deinit();
+    return daemon_executable.reexec(allocator, namespace_executables.broker, args);
 }
 
 fn forwardBrokerFramesToDaemon(

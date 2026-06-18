@@ -7,7 +7,7 @@ client. Release archives include one binary per supported platform under:
 libexec/sessh/<os>-<arch>/sessh
 ```
 
-Role-shaped executable names are runtime details, not packaged artifacts. When
+Role-shaped executable names are daemon-namespace details, not packaged artifacts. When
 `sessh` starts a daemon namespace it writes `sesshd`, `sessh-broker`,
 `sessh-proxy`, `sessh-terminal-remote`, and `sessh-proxy-remote` symlinks beside
 `sesshd.sock`, all pointing back to the active `sessh` binary. That keeps

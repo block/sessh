@@ -361,8 +361,8 @@ def main(argv=None):
             test_ssh_remote_transport_close_reconnects_in_tty,
         ),
         (
-            "ssh child ssh death reconnects in tty",
-            test_ssh_child_ssh_death_reconnects_in_tty,
+            "ssh ssh transport process death reconnects in tty",
+            test_ssh_transport_process_ssh_death_reconnects_in_tty,
         ),
         (
             "ssh remote daemon death reports remote error",

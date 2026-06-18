@@ -1070,7 +1070,7 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(result)
         if marker not in result.stdout:
             raise AssertionError(result)
-        if "ssh runtime attach is not implemented yet" in result.stderr:
+        if "ssh terminal worker attach is not implemented yet" in result.stderr:
             raise AssertionError(result.stderr)
 
         artifact_path = prefix / "libexec" / "sessh" / f"{os_name}-{arch}" / "sessh"

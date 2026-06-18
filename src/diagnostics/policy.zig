@@ -5,7 +5,7 @@ const posix = std.posix;
 const config = @import("../core/config.zig");
 const client_ui = @import("../session/client_ui.zig");
 const ssh_opts = @import("../transport/ssh_options.zig");
-const stream_runtime = @import("../stream/runtime.zig");
+const proxy_worker = @import("../stream/proxy_worker.zig");
 
 extern "c" fn ttyname(fd: c_int) ?[*:0]u8;
 
@@ -44,7 +44,7 @@ pub fn streamStatusMode(
     diagnostics_level: config.DiagnosticsLevel,
     has_daemon_control: bool,
     diagnostics_output_is_tty: bool,
-) stream_runtime.StreamReconnectStatusMode {
+) proxy_worker.StreamReconnectStatusMode {
     if (diagnostics_level == .jsonl) return .jsonl;
     if (!diagnostics_output_is_tty) return .line;
     if (diagnostics_level == .line) return .line;
@@ -203,13 +203,13 @@ fn optionValueFromOptions(options: []const []const u8, index: usize, option_pos:
 }
 
 test "stream status mode follows diagnostics level" {
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.jsonl, streamStatusMode(.emulated, .jsonl, true, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.line, streamStatusMode(.emulated, .line, true, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.line, streamStatusMode(.emulated, .overlay, true, false));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.title, streamStatusMode(.hygienic, .title, true, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, streamStatusMode(.emulated, .overlay, true, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.status_line, streamStatusMode(.emulated, .overlay, false, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.status_line, streamStatusMode(.hygienic, .status, false, true));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.jsonl, streamStatusMode(.emulated, .jsonl, true, true));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.line, streamStatusMode(.emulated, .line, true, true));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.line, streamStatusMode(.emulated, .overlay, true, false));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.title, streamStatusMode(.hygienic, .title, true, true));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.client_control, streamStatusMode(.emulated, .overlay, true, true));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.status_line, streamStatusMode(.emulated, .overlay, false, true));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.status_line, streamStatusMode(.hygienic, .status, false, true));
 }
 
 test "terminal presentation follows diagnostics level" {

@@ -56,9 +56,9 @@ pub fn reexecDaemonOrRun(allocator: std.mem.Allocator, exe: []const u8, args: []
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
     defer if (args.len == 0) allocator.free(dir_name);
 
-    var runtime_executables = try daemon_executable.installRuntimeExecutablesOrUseNamespaceOwner(allocator, exe, dir_name);
-    defer runtime_executables.deinit();
-    return daemon_executable.reexec(allocator, runtime_executables.daemon, args);
+    var namespace_executables = try daemon_executable.installNamespaceExecutablesOrUseNamespaceOwner(allocator, exe, dir_name);
+    defer namespace_executables.deinit();
+    return daemon_executable.reexec(allocator, namespace_executables.daemon, args);
 }
 
 pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
@@ -77,7 +77,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
     defer if (args.len == 0) allocator.free(dir_name);
 
-    socket_transport.publishRuntimeRootSymlinkOnce(allocator);
+    socket_transport.publishSesshRuntimeDirSymlinkOnce(allocator);
     const path = try socketPathForDirName(allocator, dir_name);
     defer allocator.free(path);
     const identity = try daemon_identity.current(allocator, path);
@@ -85,8 +85,8 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 
     var daemon_lock = try acquireDaemonSocketLock(allocator, dir_name, path);
     defer daemon_lock.deinit();
-    var locked_runtime_executables = try daemon_executable.installRuntimeExecutablesWhileHoldingLock(allocator, exe, dir_name);
-    defer locked_runtime_executables.deinit();
+    var locked_namespace_executables = try daemon_executable.installNamespaceExecutablesWhileHoldingLock(allocator, exe, dir_name);
+    defer locked_namespace_executables.deinit();
 
     const listen_fd = try socket_transport.listenSocket(path);
     defer _ = c.close(listen_fd);
@@ -103,8 +103,8 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
 
     var accept_context = daemon_accept.Context{
         .allocator = allocator,
-        .terminal_remote_exe = locked_runtime_executables.terminal_remote,
-        .proxy_remote_exe = locked_runtime_executables.proxy_remote,
+        .terminal_remote_exe = locked_namespace_executables.terminal_remote,
+        .proxy_remote_exe = locked_namespace_executables.proxy_remote,
         .identity = identity,
         .listen_fd = listen_fd,
         .active_local_clients = &active_local_clients,
@@ -178,7 +178,7 @@ fn daemonSocketLockPath(allocator: std.mem.Allocator, socket_path: []const u8) !
     return std.fmt.allocPrint(allocator, "{s}/sesshd.lock", .{socket_path[0..slash]});
 }
 
-test "daemon socket path uses runtime root" {
+test "daemon socket path uses sessh runtime dir" {
     const allocator = std.testing.allocator;
     const path = try socketPathForDirName(allocator, "1.dev.abcdef12");
     defer allocator.free(path);

@@ -22,26 +22,26 @@ pub const Target = struct {
     resolved_port: []const u8 = config.default_ssh_port,
 };
 
-pub const RuntimeConnection = struct {
+pub const SshTransportProcess = struct {
     child: std.process.Child,
     stderr_fd: c.fd_t = -1,
 
-    pub fn closeStdin(self: *RuntimeConnection) void {
+    pub fn closeStdin(self: *SshTransportProcess) void {
         closeChildStdin(&self.child);
     }
 
-    pub fn closeStderr(self: *RuntimeConnection) void {
+    pub fn closeStderr(self: *SshTransportProcess) void {
         if (self.stderr_fd >= 0) {
             posix.close(self.stderr_fd);
             self.stderr_fd = -1;
         }
     }
 
-    pub fn wait(self: *RuntimeConnection) !std.process.Child.Term {
+    pub fn wait(self: *SshTransportProcess) !std.process.Child.Term {
         return self.child.wait();
     }
 
-    pub fn pollExit(self: *RuntimeConnection) ?std.process.Child.Term {
+    pub fn pollExit(self: *SshTransportProcess) ?std.process.Child.Term {
         if (self.child.term) |term| {
             return term catch .{ .Unknown = 0 };
         }
@@ -60,7 +60,7 @@ pub const RuntimeConnection = struct {
         return term;
     }
 
-    pub fn terminate(self: *RuntimeConnection) void {
+    pub fn terminate(self: *SshTransportProcess) void {
         self.closeStdin();
         _ = self.child.kill() catch {
             _ = self.child.wait() catch {};
@@ -91,13 +91,13 @@ pub fn appendDefaultSshOptions(ssh_argv: [][]const u8, arg_index: *usize, defaul
     }
 }
 
-pub fn spawnRuntimeConnection(
+pub fn spawnSshTransportProcess(
     allocator: std.mem.Allocator,
     target: Target,
     remote_command: []const u8,
     env_map: ?*const std.process.EnvMap,
     bootstrap: bool,
-) !RuntimeConnection {
+) !SshTransportProcess {
     const batch_mode_options: usize = 1;
     const default_options = defaultSshOptionsLen(target);
     const transport_options = transportSshOptionsLen(target.options);
@@ -125,7 +125,7 @@ pub fn spawnRuntimeConnection(
     child.env_map = env_map;
     try child.spawn();
     daemon_log.infof(allocator, "ssh transport started host={s}", .{target.host});
-    var connection = RuntimeConnection{ .child = child };
+    var connection = SshTransportProcess{ .child = child };
     errdefer connection.terminate();
     const stderr_file = connection.child.stderr.?;
     connection.child.stderr = null;

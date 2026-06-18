@@ -1,9 +1,9 @@
 const std = @import("std");
 
 const client_renderer = @import("renderer.zig");
-const terminal_runtime = @import("terminal_runtime.zig");
+const attached_client_presentation = @import("attached_client_presentation.zig");
 
-const TerminalOrigin = terminal_runtime.TerminalOrigin;
+const TerminalOrigin = attached_client_presentation.TerminalOrigin;
 
 pub const PendingInput = struct {
     bytes: [128]u8 = [_]u8{0} ** 128,

@@ -4,18 +4,18 @@ const app_allocator = @import("../core/app_allocator.zig");
 const client_renderer = @import("renderer.zig");
 const protocol = @import("../protocol/mod.zig");
 const remote_process = @import("remote_process.zig");
-const runtime_requests = @import("runtime_requests.zig");
-const runtime_state = @import("runtime_state.zig");
+const terminal_worker_requests = @import("terminal_worker_requests.zig");
+const terminal_worker_state = @import("terminal_worker_state.zig");
 const attached_client_router = @import("attached_client_router.zig");
 const vt = @import("vt.zig");
 
 const pb = protocol.pb;
 const AttachedClient = attached_client_router.AttachedClient;
 const ExitInfo = remote_process.ExitInfo;
-const RepaintRequest = runtime_requests.RepaintRequest;
-const Session = runtime_state.Session;
-const encoded_scrollback_cursor_len = runtime_requests.encoded_scrollback_cursor_len;
-const encodeScrollbackCursor = runtime_requests.encodeScrollbackCursor;
+const RepaintRequest = terminal_worker_requests.RepaintRequest;
+const Session = terminal_worker_state.Session;
+const encoded_scrollback_cursor_len = terminal_worker_requests.encoded_scrollback_cursor_len;
+const encodeScrollbackCursor = terminal_worker_requests.encodeScrollbackCursor;
 
 pub fn sendSessionAttached(attached_client: *AttachedClient, session: *const Session) !void {
     try attached_client.queueTerminalEmulatorFrame(.{ .session_attached = .{
@@ -408,7 +408,7 @@ pub fn queueRepaintSnapshot(
         primary_screen = try model.renderedPrimaryScreen(app_allocator.allocator());
     }
 
-    // Retained scrollback is owned by the remote terminal runtime only for the
+    // Retained scrollback is owned by the remote terminal worker only for the
     // currently visible client recovering after a dropped transport. There is
     // no detached reattach flow; the cursor below is just the client's last
     // acknowledged point in this one session transcript.

@@ -13,7 +13,7 @@ const pty_process = @import("../tty/pty_process.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect_title = @import("../reconnect/title.zig");
 const status_output = @import("../stream/status_output.zig");
-const stream_runtime = @import("../stream/runtime.zig");
+const proxy_worker = @import("../stream/proxy_worker.zig");
 const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
 
@@ -329,7 +329,7 @@ pub fn runArgvUnderLocalPty(
     }
 
     // PROCESS_EVENT_LOOP: this is the visible foreground tty wrapper around a
-    // child ssh process. It is intentionally a direct poll loop rather than a
+    // ssh transport process. It is intentionally a direct poll loop rather than a
     // daemon Dispatcher helper.
     while (true) {
         refreshLocalPtySize(child.master_fd, &size);

@@ -109,7 +109,7 @@ pub fn waitForStartupLockRelease(allocator: std.mem.Allocator, dir_name: []const
 }
 
 /// BLOCKING_POLL: foreground daemon startup waits for one byte on the inherited
-/// ready pipe. This is not daemon runtime work; it is the caller waiting for the
+/// ready pipe. This is not daemon event-loop work; it is the caller waiting for the
 /// daemon process it just spawned to begin listening.
 pub fn waitForReady(read_fd: c.fd_t) !WaitResult {
     var pollfds = [_]posix.pollfd{.{

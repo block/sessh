@@ -25,12 +25,12 @@ const proxy_diagnostics_router = @import("proxy_diagnostics_router.zig");
 const proxy_entry = @import("proxy_entry.zig");
 const reconnect = @import("../reconnect/mod.zig");
 const remote_shell = @import("remote_shell.zig");
-const ssh_child = @import("ssh_child.zig");
+const ssh_transport_process = @import("ssh_transport_process.zig");
 const pooled_ssh = @import("pooled_ssh.zig");
 const guid_ref = @import("../core/guid.zig");
 const ssh_transport_acquire = @import("ssh_transport_acquire.zig");
 const ssh_opts = @import("ssh_options.zig");
-const stream_runtime = @import("../stream/runtime.zig");
+const proxy_worker = @import("../stream/proxy_worker.zig");
 const terminal = @import("../tty/terminal.zig");
 const tty_transcript = @import("../tty/transcript.zig");
 const pb = protocol.pb;
@@ -44,21 +44,21 @@ pub const registerPooledSshTransportFromDaemon = pooled_ssh.registerPooledSshTra
 pub const registerProxyFdPassOpenFromDaemon = pooled_ssh.registerProxyFdPassOpenFromDaemon;
 pub const enqueueCleanupRequestToRemote = pooled_ssh.enqueueCleanupRequestToRemote;
 
-const appendDefaultSshOptions = ssh_child.appendDefaultSshOptions;
-const defaultSshOptionsLen = ssh_child.defaultSshOptionsLen;
+const appendDefaultSshOptions = ssh_transport_process.appendDefaultSshOptions;
+const defaultSshOptionsLen = ssh_transport_process.defaultSshOptionsLen;
 
 const shellCommandFromRemoteArgs = remote_shell.shellCommandFromRemoteArgs;
 
 const Platform = @import("bootstrap.zig").Platform;
 
-const SshTarget = ssh_child.Target;
+const SshTarget = ssh_transport_process.Target;
 
-const SessionRuntimeConfig = struct {
+const RemoteSessionConfig = struct {
     common: CommonSessionOptions,
     daemon_dir_name: ?[]u8 = null,
     disconnected_reap_ms: u64 = config.default_disconnected_reap_ms,
 
-    fn deinit(self: *SessionRuntimeConfig, allocator: std.mem.Allocator) void {
+    fn deinit(self: *RemoteSessionConfig, allocator: std.mem.Allocator) void {
         if (self.daemon_dir_name) |dir_name| allocator.free(dir_name);
         self.* = undefined;
     }
@@ -102,8 +102,8 @@ fn remoteSessionConfig(
     allocator: std.mem.Allocator,
     common: CommonSessionOptions,
     ssh_options: []const []const u8,
-) !SessionRuntimeConfig {
-    var result = SessionRuntimeConfig{
+) !RemoteSessionConfig {
+    var result = RemoteSessionConfig{
         .common = common,
     };
     const file_config = try client_config.loadFileConfig(allocator);
@@ -155,13 +155,13 @@ pub fn runRemoteNewSession(
     new: RemoteNewSession,
     failure_policy: BootstrapFailurePolicy,
 ) !void {
-    var runtime_config = remoteSessionConfig(allocator, common, ssh_options) catch |err| {
+    var session_config = remoteSessionConfig(allocator, common, ssh_options) catch |err| {
         try user_error.printLine("invalid config: {t}", .{err});
         return process_exit.request(64);
     };
-    defer runtime_config.deinit(allocator);
-    client_log.setLevel(runtime_config.common.client_log_level);
-    if (runtime_config.common.diagnostics_file) |path| {
+    defer session_config.deinit(allocator);
+    client_log.setLevel(session_config.common.client_log_level);
+    if (session_config.common.diagnostics_file) |path| {
         diagnostics_file.validatePath(path) catch |err| {
             try user_error.printLine("cannot open diagnostics file {s}: {t}", .{ path, err });
             return process_exit.request(1);
@@ -171,12 +171,12 @@ pub fn runRemoteNewSession(
     const target = SshTarget{ .options = ssh_options, .host = host };
     const stdin_is_tty = c.isatty(posix.STDIN_FILENO) != 0;
     const stdout_is_tty = c.isatty(posix.STDOUT_FILENO) != 0;
-    if (sessh_routing.shouldUseProxyStream(new, runtime_config.common, stdin_is_tty, stdout_is_tty)) {
-        if (runtime_config.common.capture_tty_transcript != null) {
+    if (sessh_routing.shouldUseProxyStream(new, session_config.common, stdin_is_tty, stdout_is_tty)) {
+        if (session_config.common.capture_tty_transcript != null) {
             try user_error.line("--capture-tty-transcript is not supported with proxy stream mode");
             return process_exit.request(64);
         }
-        try runProxyStreamSsh(allocator, exe, target, runtime_config.common, runtime_config.daemon_dir_name, new);
+        try runProxyStreamSsh(allocator, exe, target, session_config.common, session_config.daemon_dir_name, new);
     }
 
     const shell_command = try shellCommandFromRemoteArgs(allocator, new.shell_command_args);
@@ -186,7 +186,7 @@ pub fn runRemoteNewSession(
     defer local_terminal_probe.deinit();
 
     var transcript_recorder: ?tty_transcript.Recorder = null;
-    try setupTranscriptRecorder(allocator, runtime_config.common.capture_tty_transcript, &transcript_recorder);
+    try setupTranscriptRecorder(allocator, session_config.common.capture_tty_transcript, &transcript_recorder);
     defer teardownTranscriptRecorder(&transcript_recorder);
 
     const new_guid = try guid_ref.generateSessionGuid(allocator);
@@ -196,26 +196,26 @@ pub fn runRemoteNewSession(
         allocator,
         exe,
         target,
-        runtime_config.common,
-        runtime_config.daemon_dir_name,
+        session_config.common,
+        session_config.daemon_dir_name,
     );
 
     var local_terminal = local_terminal_probe.finish();
     defer local_terminal.deinit();
 
-    var session = attached_client.startNewSessionOnRuntime(
+    var session = attached_client.startNewSessionOnTerminalWorker(
         transport.readFd(),
         transport.writeFd(),
-        runtime_config.common.scrollback_row_count,
+        session_config.common.scrollback_row_count,
         new_guid,
         new.command_argv,
         shell_command,
-        runtime_config.disconnected_reap_ms,
+        session_config.disconnected_reap_ms,
         &local_terminal,
     ) catch |err| {
         if (err == error.VersionMismatch) {
             transport.close();
-            if (runtime_config.common.capture_tty_transcript != null) {
+            if (session_config.common.capture_tty_transcript != null) {
                 try user_error.line("--capture-tty-transcript requires a compatible sessh remote");
                 return process_exit.request(1);
             }
@@ -229,7 +229,7 @@ pub fn runRemoteNewSession(
             transport.close();
             try runPlainSshFallback(allocator, target, null);
         }
-        waitAfterRuntimeAttachFailure(&transport, "start");
+        waitAfterTerminalWorkerAttachFailure(&transport, "start");
         if (process_exit.is(err)) return err;
         try user_error.printLine("ssh remote attach failed: {t}", .{err});
         return process_exit.request(1);
@@ -240,7 +240,7 @@ pub fn runRemoteNewSession(
         allocator,
         exe,
         target,
-        runtime_config,
+        session_config,
         &transport,
         &session,
     );
@@ -301,9 +301,9 @@ fn runAttachedRemoteClient(
     allocator: std.mem.Allocator,
     exe: []const u8,
     target: SshTarget,
-    runtime_config: SessionRuntimeConfig,
+    session_config: RemoteSessionConfig,
     transport: *TerminalTransport,
-    session: *attached_client.RuntimeSession,
+    session: *attached_client.AttachedSessionState,
 ) !void {
     while (true) {
         const end = attached_client.runAttachedClient(
@@ -312,7 +312,7 @@ fn runAttachedRemoteClient(
             session,
             .{ .monitor_connection = false },
         ) catch |err| {
-            waitAfterRuntimeAttachFailure(transport, "attached client");
+            waitAfterTerminalWorkerAttachFailure(transport, "attached client");
             if (process_exit.is(err)) return err;
             try user_error.printLine("ssh remote attach failed: {t}", .{err});
             return process_exit.request(1);
@@ -348,7 +348,7 @@ fn runAttachedRemoteClient(
                     allocator,
                     exe,
                     target,
-                    runtime_config,
+                    session_config,
                     transport,
                     session,
                 );
@@ -361,13 +361,13 @@ fn reconnectRemoteSessionClient(
     allocator: std.mem.Allocator,
     exe: []const u8,
     target: SshTarget,
-    runtime_config: SessionRuntimeConfig,
+    session_config: RemoteSessionConfig,
     transport: *TerminalTransport,
-    session: *attached_client.RuntimeSession,
+    session: *attached_client.AttachedSessionState,
 ) !void {
     const pending_input_at_disconnect = session.hasPendingInputAck();
     const pending_paste_like_input_at_disconnect = session.hasPendingPasteLikeInputAck();
-    var diagnostics_handle = diagnostics_file.Handle.open(runtime_config.common.diagnostics_file) catch |err| blk: {
+    var diagnostics_handle = diagnostics_file.Handle.open(session_config.common.diagnostics_file) catch |err| blk: {
         client_log.userDiagnosticInfo("cannot open diagnostics file during reconnect: {t}", .{err});
         break :blk diagnostics_file.Handle{};
     };
@@ -388,8 +388,8 @@ fn reconnectRemoteSessionClient(
         session.viewport_offset,
         .{
             .presentation = diagnostics_policy.terminalPresentation(
-                runtime_config.common.filter_level,
-                runtime_config.common.diagnostics_level,
+                session_config.common.filter_level,
+                session_config.common.diagnostics_level,
                 c.isatty(diagnostics_output_fd) != 0,
             ),
             .input_fd = diagnostics_input_fd,
@@ -428,8 +428,8 @@ fn reconnectRemoteSessionClient(
             allocator,
             exe,
             target,
-            runtime_config.common,
-            runtime_config.daemon_dir_name,
+            session_config.common,
+            session_config.daemon_dir_name,
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
@@ -442,7 +442,7 @@ fn reconnectRemoteSessionClient(
         defer if (replacement_active) replacement.close();
 
         session.viewport_offset = reconnect_ui.currentViewportOffset();
-        attached_client.reconnectSessionOnRuntimeCancellable(
+        attached_client.reconnectSessionOnTerminalWorkerCancellable(
             replacement.readFd(),
             replacement.writeFd(),
             session,
@@ -521,20 +521,20 @@ fn reconnectRemoteSessionClient(
     }
 }
 
-fn waitAfterRuntimeAttachFailure(transport: *TerminalTransport, stage: []const u8) void {
+fn waitAfterTerminalWorkerAttachFailure(transport: *TerminalTransport, stage: []const u8) void {
     transport.closeStdin();
     transport.close();
     client_log.flush(2);
     user_error.printLine("ssh remote transport closed after attach {s} failure", .{stage}) catch {};
 }
 
-fn finishHungUpSshSession(session: *attached_client.RuntimeSession) !void {
+fn finishHungUpSshSession(session: *attached_client.AttachedSessionState) !void {
     session.restoreAttachedClientEndPresentationForExit();
     client_log.flush(2);
     try tty_transcript.finishActiveOrReport();
 }
 
-fn finishLocalDaemonClosedSshSession(transport: *TerminalTransport, session: *attached_client.RuntimeSession) !void {
+fn finishLocalDaemonClosedSshSession(transport: *TerminalTransport, session: *attached_client.AttachedSessionState) !void {
     transport.close();
     session.restoreAttachedClientEndPresentationForExit();
     client_log.flush(2);
@@ -542,7 +542,7 @@ fn finishLocalDaemonClosedSshSession(transport: *TerminalTransport, session: *at
     try tty_transcript.finishActiveOrReport();
 }
 
-fn finishRemoteDaemonDiedSshSession(transport: *TerminalTransport, session: *attached_client.RuntimeSession) !void {
+fn finishRemoteDaemonDiedSshSession(transport: *TerminalTransport, session: *attached_client.AttachedSessionState) !void {
     transport.close();
     session.restoreAttachedClientEndPresentationForExit();
     client_log.flush(2);
@@ -561,7 +561,7 @@ fn finishReconnectUi(reconnect_ui: *client_ui.ReconnectUi, active: *bool) void {
 fn noteReconnectFailure(
     comptime stage: []const u8,
     target: SshTarget,
-    session: *const attached_client.RuntimeSession,
+    session: *const attached_client.AttachedSessionState,
     attempt: usize,
     err: anyerror,
 ) void {
@@ -597,7 +597,7 @@ fn nextReconnectAttemptAfterFailure(attempt: usize, reconnect_ui: *client_ui.Rec
     return reconnect.nextAttempt(attempt, reconnect_ui.consumeReconnectAcknowledgement());
 }
 
-fn finishEndedRemoteSession(transport: *TerminalTransport, session: *attached_client.RuntimeSession) !u8 {
+fn finishEndedRemoteSession(transport: *TerminalTransport, session: *attached_client.AttachedSessionState) !u8 {
     const exit_status = session.endedProcessExitCode();
     session.restoreAttachedClientEndPresentationForExit();
     transport.closeStdin();
@@ -746,12 +746,12 @@ fn runProxyStreamSsh(
     const proxy_daemon_dir_name = daemon_dir_name orelse try daemon_socket_namespace.defaultDirName(allocator);
     defer if (daemon_dir_name == null) allocator.free(proxy_daemon_dir_name);
     try daemon_client.ensureStartedForDirName(allocator, exe, proxy_daemon_dir_name);
-    var runtime_executables = try daemon_executable.runtimeExecutablePaths(allocator, proxy_daemon_dir_name);
-    defer runtime_executables.deinit();
+    var namespace_executables = try daemon_executable.namespaceExecutablePaths(allocator, proxy_daemon_dir_name);
+    defer namespace_executables.deinit();
 
     const proxy_command_option = try proxy_command.commandOption(
         allocator,
-        runtime_executables.proxy,
+        namespace_executables.proxy,
         target.options,
         diagnostics_guid,
         diagnostics_plan.command_level,
@@ -860,7 +860,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         diagnostics_output_is_tty,
     );
 
-    const exit_status = stream_runtime.runLocalStream(allocator, &starter, .{
+    const exit_status = proxy_worker.runLocalStream(allocator, &starter, .{
         .guid = proxy_guid,
         .proxy_host = "localhost",
         .proxy_port = proxy_port,

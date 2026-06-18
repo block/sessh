@@ -32,8 +32,8 @@ pub const ScrollbackCursor = struct {
     }
 };
 
-/// Client-side state carried across runtime transports for one attached session.
-pub const RuntimeSession = struct {
+/// Client-side state carried across terminal worker transports for one attached session.
+pub const AttachedSessionState = struct {
     const max_title_fallback_bytes = 512;
 
     guid: [guid_ref.session_guid_len]u8 = [_]u8{0} ** guid_ref.session_guid_len,
@@ -64,52 +64,52 @@ pub const RuntimeSession = struct {
     recovery_reader_fd: c.fd_t = -1,
     recovery_reader_initialized: bool = false,
 
-    pub fn adoptReconnectState(self: *RuntimeSession, reconnected: *const RuntimeSession) void {
+    pub fn adoptReconnectState(self: *AttachedSessionState, reconnected: *const AttachedSessionState) void {
         self.pending_repaint = reconnected.pending_repaint;
     }
 
-    pub fn noteUnresponsiveRecovery(self: *RuntimeSession) void {
+    pub fn noteUnresponsiveRecovery(self: *AttachedSessionState) void {
         self.unresponsive_timeout_floor_ms = @min(
             max_responsiveness_timeout_ms,
             @max(default_responsiveness_timeout_ms, self.unresponsive_timeout_floor_ms * 2),
         );
     }
 
-    pub fn hasPendingInputAck(self: *const RuntimeSession) bool {
+    pub fn hasPendingInputAck(self: *const AttachedSessionState) bool {
         return self.input_ack_tracker.pending();
     }
 
-    pub fn hasPendingPasteLikeInputAck(self: *const RuntimeSession) bool {
+    pub fn hasPendingPasteLikeInputAck(self: *const AttachedSessionState) bool {
         return self.input_ack_tracker.pendingPasteLike();
     }
 
-    pub fn discardPendingInputAcks(self: *RuntimeSession) void {
+    pub fn discardPendingInputAcks(self: *AttachedSessionState) void {
         self.input_ack_tracker.discardPending();
     }
 
-    pub fn restoreAttachedClientEndPresentation(self: *RuntimeSession) void {
+    pub fn restoreAttachedClientEndPresentation(self: *AttachedSessionState) void {
         presentation_guard.restoreAttachedClientEndBytes(&self.attached_client_end_restore);
     }
 
-    pub fn restoreAttachedClientEndPresentationForExit(self: *RuntimeSession) void {
+    pub fn restoreAttachedClientEndPresentationForExit(self: *AttachedSessionState) void {
         self.restoreAttachedClientEndPresentation();
         presentation_guard.restoreLocal(self.initial_kitty_keyboard_flags);
     }
 
-    pub fn deinit(self: *RuntimeSession) void {
+    pub fn deinit(self: *AttachedSessionState) void {
         self.resetRecoveryReader();
         self.attached_client_end_restore.deinit(app_allocator.allocator());
         self.attached_client_end_restore = .empty;
     }
 
-    fn resetRecoveryReader(self: *RuntimeSession) void {
+    fn resetRecoveryReader(self: *AttachedSessionState) void {
         if (!self.recovery_reader_initialized) return;
         self.recovery_reader.deinit();
         self.recovery_reader_initialized = false;
         self.recovery_reader_fd = -1;
     }
 
-    pub fn recoveryReader(self: *RuntimeSession, fd: c.fd_t) *protocol.FrameReader {
+    pub fn recoveryReader(self: *AttachedSessionState, fd: c.fd_t) *protocol.FrameReader {
         if (self.recovery_reader_initialized and self.recovery_reader_fd == fd) return &self.recovery_reader;
         self.resetRecoveryReader();
         self.recovery_reader = protocol.FrameReader.init(app_allocator.allocator());
@@ -118,35 +118,35 @@ pub const RuntimeSession = struct {
         return &self.recovery_reader;
     }
 
-    pub fn idSlice(self: *const RuntimeSession) []const u8 {
+    pub fn idSlice(self: *const AttachedSessionState) []const u8 {
         return self.guidSlice();
     }
 
-    pub fn guidSlice(self: *const RuntimeSession) []const u8 {
+    pub fn guidSlice(self: *const AttachedSessionState) []const u8 {
         return self.guid[0..self.guid_len];
     }
 
-    pub fn titleFallbackSlice(self: *const RuntimeSession) []const u8 {
+    pub fn titleFallbackSlice(self: *const AttachedSessionState) []const u8 {
         if (self.title_fallback_len > 0) return self.title_fallback[0..self.title_fallback_len];
         return self.idSlice();
     }
 
-    pub fn setTitleFallback(self: *RuntimeSession, title: []const u8) void {
+    pub fn setTitleFallback(self: *AttachedSessionState, title: []const u8) void {
         self.title_fallback_len = copyTitleFallback(&self.title_fallback, title);
     }
 
-    pub fn setIdentity(self: *RuntimeSession, guid: []const u8) !void {
+    pub fn setIdentity(self: *AttachedSessionState, guid: []const u8) !void {
         if (guid.len > self.guid.len) return error.SessionGuidTooLarge;
         @memcpy(self.guid[0..guid.len], guid);
         self.guid_len = guid.len;
         tty_transcript.setSessionGuid(guid);
     }
 
-    pub fn recordSessionEnded(self: *RuntimeSession, ended: pb.TerminalEmulatorItem.SessionEnded) void {
+    pub fn recordSessionEnded(self: *AttachedSessionState, ended: pb.TerminalEmulatorItem.SessionEnded) void {
         self.ended_process_exit_code = processExitCodeFromSessionEnded(ended);
     }
 
-    pub fn endedProcessExitCode(self: *const RuntimeSession) u8 {
+    pub fn endedProcessExitCode(self: *const AttachedSessionState) u8 {
         return self.ended_process_exit_code orelse 0;
     }
 };
@@ -166,8 +166,8 @@ fn copyTitleFallback(dest: []u8, title: []const u8) usize {
     return len;
 }
 
-test "runtime session backs off unresponsive floor after recovery" {
-    var session = RuntimeSession{};
+test "attached session backs off unresponsive floor after recovery" {
+    var session = AttachedSessionState{};
     try std.testing.expectEqual(default_responsiveness_timeout_ms, session.unresponsive_timeout_floor_ms);
     session.noteUnresponsiveRecovery();
     try std.testing.expectEqual(@as(i64, 10_000), session.unresponsive_timeout_floor_ms);

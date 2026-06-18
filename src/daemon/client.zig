@@ -44,7 +44,7 @@ pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
 
 // Foreground startup path shared by sessh, sesshd reexec helpers, and proxy
 // roles. It owns the daemon startup lock/ready-pipe choreography so daemon
-// runtime code does not duplicate client-side spawn behavior.
+// daemon client code does not duplicate client-side spawn behavior.
 pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
     if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
 
@@ -75,9 +75,9 @@ fn spawnDaemonIfNamespaceUnlocked(
     ready_fd: c.fd_t,
     startup_lock_fd: c.fd_t,
 ) !bool {
-    var runtime_executables = (try daemon_executable.installRuntimeExecutablesForDaemonStart(allocator, exe, dir_name)) orelse return false;
-    defer runtime_executables.deinit();
-    const argv = [_][]const u8{ runtime_executables.daemon, dir_name };
+    var namespace_executables = (try daemon_executable.installNamespaceExecutablesForDaemonStart(allocator, exe, dir_name)) orelse return false;
+    defer namespace_executables.deinit();
+    const argv = [_][]const u8{ namespace_executables.daemon, dir_name };
     var env_map = try std.process.getEnvMap(allocator);
     defer env_map.deinit();
     try daemon_startup.addReadyFdToEnvMap(allocator, &env_map, ready_fd);
@@ -178,7 +178,7 @@ fn formatDaemonLogTimestampParts(buf: *[daemon_log_timestamp_len]u8, local_time:
 
 // BLOCKING_FRAME_READ: `sessh --daemon-log` is an explicit foreground log
 // subscriber. It intentionally waits for future log entries on stdout and is
-// not used by the daemon, pooled transport, or session runtime.
+// not used by the daemon, pooled transport, or terminal worker.
 fn readDaemonLogFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(allocator);
     defer reader.deinit();

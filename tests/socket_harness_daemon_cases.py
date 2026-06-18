@@ -559,7 +559,7 @@ def run_daemon_log_session_lifecycle_test(_base_env):
                 "terminal stream opening session=",
                 "action=create",
                 "terminal session creating session=",
-                "terminal runtime connected session=",
+                "terminal worker connected session=",
                 "isolation_mode=process",
                 "terminal stream remote connected session=",
             ):
@@ -624,7 +624,7 @@ def run_daemon_log_mux_session_lifecycle_test(_base_env):
                 f"terminal mux stream opening stream_id=1 session={session_id} action=create",
                 f"terminal mux remote payload prepared stream_id=1 session={session_id} action=create",
                 f"terminal session creating session={session_id}",
-                f"terminal runtime connected session={session_id} isolation_mode=process",
+                f"terminal worker connected session={session_id} isolation_mode=process",
                 f"terminal mux remote open queued stream_id=1 session={session_id} action=create",
                 f"terminal mux stream open ok stream_id=1 session={session_id} action=create",
                 f"terminal session attached stream_id=1 session={session_id}",
@@ -651,7 +651,7 @@ def run_daemon_log_mux_session_lifecycle_test(_base_env):
             cleanup_runtime(env)
 
 
-def run_daemon_log_mux_session_in_daemon_runtime_test(_base_env):
+def run_daemon_log_mux_session_in_daemon_worker_test(_base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-daemon-log-mux-in-daemon-session-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         shell = Path(tmp) / "log-mux-in-daemon-session-shell"
@@ -690,15 +690,15 @@ def run_daemon_log_mux_session_in_daemon_runtime_test(_base_env):
             text = output.decode("utf-8", "replace")
             for expected in (
                 f"terminal mux stream opening stream_id=1 session={session_id} action=create",
-                f"terminal runtime connected session={session_id} isolation_mode=none",
+                f"terminal worker connected session={session_id} isolation_mode=none",
                 f"terminal mux stream open ok stream_id=1 session={session_id} action=create",
                 f"terminal session attached stream_id=1 session={session_id}",
                 f"terminal session ended stream_id=1 session={session_id}",
             ):
                 if expected not in text:
                     raise AssertionError(f"daemon log missing {expected!r}: {text!r}")
-            if "isolation_mode=process" in text or "terminal remote process connected" in text:
-                raise AssertionError(f"daemon runtime test used child process path: {text!r}")
+            if "isolation_mode=process" in text or "terminal worker process connected" in text:
+                raise AssertionError(f"daemon worker test used child process path: {text!r}")
         finally:
             if conn is not None:
                 conn.close()

@@ -317,7 +317,7 @@ def test_ssh_remote_transport_close_reconnects_in_tty(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_child_ssh_death_reconnects_in_tty(tmp):
+def test_ssh_transport_process_ssh_death_reconnects_in_tty(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -354,7 +354,7 @@ def test_ssh_child_ssh_death_reconnects_in_tty(tmp):
         os.write(fd, after.encode("utf-8") + b"\r")
         output = read_pty_until(fd, output, f"REMOTE:{after}".encode("utf-8"), timeout=30.0)
         os.write(fd, b"\r~.")
-        returncode, output = wait_for_pty_child(pid, fd, output, timeout=30.0, context="child ssh death client")
+        returncode, output = wait_for_pty_child(pid, fd, output, timeout=30.0, context="ssh transport process death client")
         waited = True
     finally:
         if not waited:

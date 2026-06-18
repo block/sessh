@@ -146,7 +146,7 @@ def main():
             run_daemon_log_namespace_env_test(env)
             run_daemon_log_session_lifecycle_test(env)
             run_daemon_log_mux_session_lifecycle_test(env)
-            run_daemon_log_mux_session_in_daemon_runtime_test(env)
+            run_daemon_log_mux_session_in_daemon_worker_test(env)
             run_session_create_command_argv_test(env)
             run_session_create_shell_command_test(env)
             run_session_create_tty_settings_test(env)

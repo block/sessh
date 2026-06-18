@@ -11,7 +11,7 @@ pub const proxy_name = socket_namespace.proxy_executable_name;
 pub const terminal_remote_name = socket_namespace.terminal_remote_executable_name;
 pub const proxy_remote_name = socket_namespace.proxy_remote_executable_name;
 
-pub const RuntimeExecutables = struct {
+pub const NamespaceExecutables = struct {
     allocator: std.mem.Allocator,
     daemon: []u8,
     broker: []u8,
@@ -19,7 +19,7 @@ pub const RuntimeExecutables = struct {
     terminal_remote: []u8,
     proxy_remote: []u8,
 
-    pub fn deinit(self: *RuntimeExecutables) void {
+    pub fn deinit(self: *NamespaceExecutables) void {
         self.allocator.free(self.daemon);
         self.allocator.free(self.broker);
         self.allocator.free(self.proxy);
@@ -32,43 +32,43 @@ pub const RuntimeExecutables = struct {
 /// Startup callers use this before starting a daemon. If the namespace lock is
 /// busy, another daemon or daemon starter is the source of truth, so the caller
 /// must not start a daemon through whatever symlink happens to be there.
-pub fn installRuntimeExecutablesForDaemonStart(
+pub fn installNamespaceExecutablesForDaemonStart(
     allocator: std.mem.Allocator,
     exe: []const u8,
     dir_name: []const u8,
-) !?RuntimeExecutables {
+) !?NamespaceExecutables {
     var lock = tryAcquireNamespaceLock(allocator, dir_name) catch |err| switch (err) {
         error.WouldBlock => return null,
         else => return err,
     };
     defer lock.deinit();
-    return try installRuntimeExecutablesWhileHoldingLock(allocator, exe, dir_name);
+    return try installNamespaceExecutablesWhileHoldingLock(allocator, exe, dir_name);
 }
 
 /// Role re-exec callers need a role path. They rewrite it only when the
 /// namespace is not already owned; otherwise they use the existing path.
-pub fn installRuntimeExecutablesOrUseNamespaceOwner(
+pub fn installNamespaceExecutablesOrUseNamespaceOwner(
     allocator: std.mem.Allocator,
     exe: []const u8,
     dir_name: []const u8,
-) !RuntimeExecutables {
-    if (try installRuntimeExecutablesForDaemonStart(allocator, exe, dir_name)) |executables| {
+) !NamespaceExecutables {
+    if (try installNamespaceExecutablesForDaemonStart(allocator, exe, dir_name)) |executables| {
         return executables;
     }
-    return runtimeExecutablePaths(allocator, dir_name);
+    return namespaceExecutablePaths(allocator, dir_name);
 }
 
 /// Replace the role symlinks. The caller must already hold sesshd.lock for
 /// this namespace.
-pub fn installRuntimeExecutablesWhileHoldingLock(
+pub fn installNamespaceExecutablesWhileHoldingLock(
     allocator: std.mem.Allocator,
     exe: []const u8,
     dir_name: []const u8,
-) !RuntimeExecutables {
+) !NamespaceExecutables {
     const target = try resolveExecutablePath(allocator, exe);
     defer allocator.free(target);
 
-    var executables = try runtimeExecutablePaths(allocator, dir_name);
+    var executables = try namespaceExecutablePaths(allocator, dir_name);
     errdefer executables.deinit();
 
     try replaceSymlink(allocator, target, executables.daemon);
@@ -81,10 +81,10 @@ pub fn installRuntimeExecutablesWhileHoldingLock(
 }
 
 /// Compute the role paths without reading or writing the symlinks.
-pub fn runtimeExecutablePaths(
+pub fn namespaceExecutablePaths(
     allocator: std.mem.Allocator,
     dir_name: []const u8,
-) !RuntimeExecutables {
+) !NamespaceExecutables {
     const daemon_path = try socket_namespace.executablePath(allocator, dir_name, daemon_name);
     errdefer allocator.free(daemon_path);
     const broker_path = try socket_namespace.executablePath(allocator, dir_name, broker_name);
@@ -198,7 +198,7 @@ fn resolveExecutablePath(allocator: std.mem.Allocator, exe: []const u8) ![]u8 {
     return allocator.dupe(u8, exe);
 }
 
-test "runtime executables are written beside socket namespace" {
+test "namespace executables are written beside socket namespace" {
     const allocator = std.testing.allocator;
     const dir_name = "1.dev.exec-test";
     const daemon = try socket_namespace.executablePath(allocator, dir_name, daemon_name);
@@ -218,16 +218,16 @@ test "runtime executables are written beside socket namespace" {
     try std.testing.expect(std.mem.endsWith(u8, proxy_remote, "/1.dev.exec-test/sessh-proxy-remote"));
 }
 
-test "runtime executables are not rewritten while namespace lock is held" {
+test "namespace executables are not rewritten while namespace lock is held" {
     const allocator = std.testing.allocator;
     const dir_name = "1.dev.exec-lock-test";
 
     var owner_lock = try tryAcquireNamespaceLock(allocator, dir_name);
     defer owner_lock.deinit();
 
-    var executables = try installRuntimeExecutablesWhileHoldingLock(allocator, "/tmp/sessh-source-a", dir_name);
+    var executables = try installNamespaceExecutablesWhileHoldingLock(allocator, "/tmp/sessh-source-a", dir_name);
     defer {
-        deleteRuntimeExecutables(executables);
+        deleteNamespaceExecutables(executables);
         executables.deinit();
     }
 
@@ -235,8 +235,8 @@ test "runtime executables are not rewritten while namespace lock is held" {
     defer allocator.free(initial_target);
     try std.testing.expectEqualStrings("/tmp/sessh-source-a", initial_target);
 
-    const contender = try installRuntimeExecutablesForDaemonStart(allocator, "/tmp/sessh-source-b", dir_name);
-    try std.testing.expectEqual(@as(?RuntimeExecutables, null), contender);
+    const contender = try installNamespaceExecutablesForDaemonStart(allocator, "/tmp/sessh-source-b", dir_name);
+    try std.testing.expectEqual(@as(?NamespaceExecutables, null), contender);
 
     const final_target = try readLinkAlloc(allocator, executables.daemon);
     defer allocator.free(final_target);
@@ -249,7 +249,7 @@ fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return allocator.dupe(u8, target);
 }
 
-fn deleteRuntimeExecutables(executables: RuntimeExecutables) void {
+fn deleteNamespaceExecutables(executables: NamespaceExecutables) void {
     std.fs.deleteFileAbsolute(executables.daemon) catch {};
     std.fs.deleteFileAbsolute(executables.broker) catch {};
     std.fs.deleteFileAbsolute(executables.proxy) catch {};

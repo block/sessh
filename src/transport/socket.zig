@@ -6,24 +6,24 @@ const posix = std.posix;
 
 extern "c" fn socket(domain: c_int, socket_type: c_int, protocol: c_int) c_int;
 
-var runtime_root_symlink_published = false;
+var sessh_runtime_dir_symlink_published = false;
 
-/// Runtime root for live sockets and daemon-owned files. Keep this path short:
+/// Sessh runtime dir for live sockets and daemon-owned files. Keep this path short:
 /// Unix-domain socket paths have tight platform limits.
-pub fn runtimeRoot(allocator: std.mem.Allocator) ![]u8 {
-    if (envVar("XDG_RUNTIME_DIR")) |root| return runtimeRootForXdg(allocator, root);
-    return runtimeRootFor(allocator, c.getuid());
+pub fn sesshRuntimeDir(allocator: std.mem.Allocator) ![]u8 {
+    if (envVar("XDG_RUNTIME_DIR")) |root| return sesshRuntimeDirForXdgRuntimeDir(allocator, root);
+    return sesshRuntimeDirForUid(allocator, c.getuid());
 }
 
-fn runtimeRootFor(allocator: std.mem.Allocator, uid: c.uid_t) ![]u8 {
+fn sesshRuntimeDirForUid(allocator: std.mem.Allocator, uid: c.uid_t) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/sessh-{}", .{uid});
 }
 
-pub fn shortRuntimeRoot(allocator: std.mem.Allocator) ![]u8 {
-    return runtimeRootFor(allocator, c.getuid());
+pub fn shortSesshRuntimeDir(allocator: std.mem.Allocator) ![]u8 {
+    return sesshRuntimeDirForUid(allocator, c.getuid());
 }
 
-fn runtimeRootForXdg(allocator: std.mem.Allocator, xdg_runtime_dir: []const u8) ![]u8 {
+fn sesshRuntimeDirForXdgRuntimeDir(allocator: std.mem.Allocator, xdg_runtime_dir: []const u8) ![]u8 {
     return allocator.dupe(u8, xdg_runtime_dir);
 }
 
@@ -67,15 +67,15 @@ pub fn cachedArtifactPath(allocator: std.mem.Allocator, artifact_set_id: []const
     return std.fmt.allocPrint(allocator, "{s}/bin/{s}/{s}/sessh", .{ root, artifact_set_id, hash_hex });
 }
 
-pub fn publishRuntimeRootSymlinkOnce(allocator: std.mem.Allocator) void {
-    if (runtime_root_symlink_published) return;
-    const root = runtimeRoot(allocator) catch return;
+pub fn publishSesshRuntimeDirSymlinkOnce(allocator: std.mem.Allocator) void {
+    if (sessh_runtime_dir_symlink_published) return;
+    const root = sesshRuntimeDir(allocator) catch return;
     defer allocator.free(root);
-    publishRuntimeRootSymlink(allocator, root) catch return;
-    runtime_root_symlink_published = true;
+    publishSesshRuntimeDirSymlink(allocator, root) catch return;
+    sessh_runtime_dir_symlink_published = true;
 }
 
-fn publishRuntimeRootSymlink(allocator: std.mem.Allocator, runtime_root: []const u8) !void {
+fn publishSesshRuntimeDirSymlink(allocator: std.mem.Allocator, sessh_runtime_dir: []const u8) !void {
     const root = cacheRoot(allocator) catch |err| switch (err) {
         error.MissingCacheHome => return,
         else => return err,
@@ -94,7 +94,7 @@ fn publishRuntimeRootSymlink(allocator: std.mem.Allocator, runtime_root: []const
         else => return err,
     };
 
-    try posix.symlink(runtime_root, tmp_path);
+    try posix.symlink(sessh_runtime_dir, tmp_path);
     try std.fs.renameAbsolute(tmp_path, link_path);
 }
 
@@ -255,24 +255,24 @@ fn envVar(name: [*:0]const u8) ?[]const u8 {
     return value;
 }
 
-test "runtime root uses fixed tmp fallback" {
+test "sessh runtime dir uses fixed tmp fallback" {
     const allocator = std.testing.allocator;
-    const fallback_root = try runtimeRootFor(allocator, 501);
+    const fallback_root = try sesshRuntimeDirForUid(allocator, 501);
     defer allocator.free(fallback_root);
     try std.testing.expectEqualStrings("/tmp/sessh-501", fallback_root);
 }
 
-test "xdg runtime root is used directly" {
+test "xdg sessh runtime dir is used directly" {
     const allocator = std.testing.allocator;
 
-    const short = try runtimeRootForXdg(allocator, "/run/user/501");
+    const short = try sesshRuntimeDirForXdgRuntimeDir(allocator, "/run/user/501");
     defer allocator.free(short);
     try std.testing.expectEqualStrings("/run/user/501", short);
 
     const too_long = try allocator.alloc(u8, 256);
     defer allocator.free(too_long);
     @memset(too_long, 'x');
-    const long = try runtimeRootForXdg(allocator, too_long);
+    const long = try sesshRuntimeDirForXdgRuntimeDir(allocator, too_long);
     defer allocator.free(long);
     try std.testing.expectEqualStrings(too_long, long);
 }

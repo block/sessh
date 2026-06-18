@@ -1,8 +1,8 @@
 const std = @import("std");
 
 const dispatcher = @import("../core/dispatcher.zig");
-const session_runtime = @import("../session/runtime.zig");
-const stream_runtime = @import("../stream/runtime.zig");
+const terminal_worker = @import("../session/terminal_worker.zig");
+const proxy_worker = @import("../stream/proxy_worker.zig");
 const daemon_cleanup_scheduler = @import("cleanup_scheduler.zig");
 const daemon_log = @import("log.zig");
 const daemon_tunnel = @import("tunnel.zig");
@@ -54,8 +54,8 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
         .active_local_clients = idle_context.active_local_clients.*,
         .active_pooled_transports = transport_ssh.activePooledSshTransportCount(),
         .active_mux_connections = daemon_tunnel.activeMuxConnectionCount(),
-        .active_terminal_remotes = session_runtime.activeTerminalRemoteProcessCount(),
-        .active_proxy_remotes = stream_runtime.activeProxyRemoteProcessCount(),
+        .active_terminal_remotes = terminal_worker.activeTerminalWorkerHandleCount(),
+        .active_proxy_remotes = proxy_worker.activeProxyRemoteProcessCount(),
         .active_log_subscribers = daemon_log.activeSubscriberCount(),
         .cleanup_keeps_daemon_alive = cleanup_keeps_daemon_alive,
     })) {
