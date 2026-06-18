@@ -51,10 +51,11 @@ envelope. It names the logical stream, then carries one of:
 - `Reset` to abort a stream abruptly, in the same spirit as TCP RST or
   HTTP/2 `RST_STREAM`.
 
-Mux fairness/backpressure is intentionally not expressed as protocol credit yet.
-If one stream fills its local buffer, the daemon should stop reading for that
-stream without freezing unrelated terminal or proxy streams on the same TCP
-connection.
+Mux fairness/backpressure is only partially implemented today. The daemon
+already avoids letting one stream's local write backlog make unrelated streams
+unreadable, but protocol-level credit is still future work. Once implemented, if
+one stream fills its local buffer, the daemon should stop reading for that stream
+without freezing unrelated terminal or proxy streams on the same TCP connection.
 
 # Connection and cleanup events
 
