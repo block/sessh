@@ -4,11 +4,12 @@ const posix = std.posix;
 
 const protocol = @import("../protocol/mod.zig");
 const session_runtime = @import("../session/runtime.zig");
-const session_registry = @import("../runtime/session_registry.zig");
+const guid_ref = @import("../core/guid.zig");
 const socket_transport = @import("../transport/socket.zig");
 const stream_runtime = @import("../stream/runtime.zig");
 const daemon_identity = @import("identity.zig");
 const daemon_log = @import("log.zig");
+const frame_write_queue = @import("../transport/frame_write_queue.zig");
 
 const pb = protocol.pb;
 
@@ -156,6 +157,17 @@ pub fn handleRemoteProcessCleanupRequest(
     try sendRemoteProcessCleanupResponse(allocator, fd, process, result);
 }
 
+pub fn handleRemoteProcessCleanupRequestQueued(
+    allocator: std.mem.Allocator,
+    mux_writer: *frame_write_queue.FrameWriteQueue,
+    identity: daemon_identity.DaemonIdentity,
+    request: pb.DaemonTunnelItem.RemoteProcessCleanupRequest,
+) !void {
+    const process = request.process orelse return error.UnexpectedFrame;
+    const result = cleanupRemoteProcess(allocator, identity, process) catch .missing;
+    try queueRemoteProcessCleanupResponse(mux_writer, process, result);
+}
+
 pub fn handleRemoteProcessCleanupResponse(
     allocator: std.mem.Allocator,
     response: pb.DaemonTunnelItem.RemoteProcessCleanupResponse,
@@ -169,6 +181,13 @@ pub fn tryAcquireSweepLock(
 ) !?SweepLock {
     const path = try sweepLockPath(allocator);
     defer allocator.free(path);
+    return tryAcquireSweepLockPath(allocator, path);
+}
+
+fn tryAcquireSweepLockPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !?SweepLock {
     try socket_transport.ensureSocketDir(allocator, path);
 
     var file = try std.fs.createFileAbsolute(path, .{
@@ -314,9 +333,28 @@ fn sendRemoteProcessCleanupResponse(
     } });
 }
 
+fn queueRemoteProcessCleanupResponse(
+    mux_writer: *frame_write_queue.FrameWriteQueue,
+    process: pb.DaemonTunnelItem.RemoteProcessIdentity,
+    result: CleanupResult,
+) !void {
+    const result_payload: pb.DaemonTunnelItem.RemoteProcessCleanupResponse.result_union = switch (result) {
+        .cleaned => .{ .cleaned = .{} },
+        .missing => .{ .missing = .{} },
+    };
+    try mux_writer.queueDaemonTunnelPayload(.{ .remote_process_cleanup_response = .{
+        .process = process,
+        .result = result_payload,
+    } });
+}
+
 fn writeRecord(allocator: std.mem.Allocator, record: Record) !void {
     const procs_dir = try ensureProcsDir(allocator);
     defer allocator.free(procs_dir);
+    try writeRecordInProcsDir(allocator, procs_dir, record);
+}
+
+fn writeRecordInProcsDir(allocator: std.mem.Allocator, procs_dir: []const u8, record: Record) !void {
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ procs_dir, record.guid });
     defer allocator.free(path);
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ path, c.getpid() });
@@ -392,7 +430,7 @@ fn recordPath(allocator: std.mem.Allocator, guid: []const u8) ![]u8 {
 fn validateGuidForFile(guid: []const u8) !void {
     if (guid.len == 0) return error.InvalidGuid;
     if (std.mem.indexOfAny(u8, guid, "/\x00") != null) return error.InvalidGuid;
-    if (!session_registry.isValidGuid(guid)) return error.InvalidGuid;
+    if (!guid_ref.isValidGuid(guid)) return error.InvalidGuid;
 }
 
 fn guidFromRecordFilename(filename: []const u8) ![]const u8 {
@@ -451,6 +489,7 @@ fn sweepRecordPath(
     const now_ms = nowUnixMs();
     const record_mtime_unix_ms = fileMtimeUnixMs(stat);
     if (cleanup_retry_limit_ms > 0 and record_mtime_unix_ms > 0 and now_ms -| record_mtime_unix_ms >= cleanup_retry_limit_ms) {
+        daemon_log.infof(allocator, "cleanup record expired guid={s}", .{guid});
         std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
@@ -482,6 +521,10 @@ test "record filename provides cleanup guid" {
         "s-550e8400-e29b-41d4-a716-446655440000",
         try guidFromRecordFilename("s-550e8400-e29b-41d4-a716-446655440000.json"),
     );
+    try std.testing.expectEqualStrings(
+        "p-550e8400-e29b-41d4-a716-446655440000",
+        try guidFromRecordFilename("p-550e8400-e29b-41d4-a716-446655440000.json"),
+    );
     try std.testing.expectError(error.InvalidGuid, guidFromRecordFilename("s-nope/nope.json"));
     try std.testing.expectError(error.InvalidGuid, guidFromRecordFilename("s-550e8400-e29b-41d4-a716-446655440000"));
 }
@@ -511,6 +554,82 @@ test "cleanup record JSON omits filename-owned identity and age fields" {
     try std.testing.expectEqualStrings("/tmp/sesshd.sock", parsed.value.remote_socket_path);
 }
 
+test "cleanup record writer uses filename identity for session and proxy resources" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const procs_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(procs_dir);
+
+    const session_guid = "s-550e8400-e29b-41d4-a716-446655440000";
+    const proxy_guid = "p-550e8400-e29b-41d4-a716-446655440000";
+
+    try writeRecordInProcsDir(allocator, procs_dir, .{
+        .guid = session_guid,
+        .local_pid = 12,
+        .local_start_time = "local-start",
+        .remote_user = "user",
+        .remote_host = "host",
+        .remote_port = "22",
+        .remote_pid = 34,
+        .remote_start_time = "remote-start",
+        .remote_socket_path = "/tmp/session.sock",
+    });
+    try writeRecordInProcsDir(allocator, procs_dir, .{
+        .guid = proxy_guid,
+        .local_pid = 56,
+        .local_start_time = "proxy-local-start",
+        .remote_user = "proxy-user",
+        .remote_host = "proxy-host",
+        .remote_port = "2222",
+        .remote_pid = 78,
+        .remote_start_time = "proxy-remote-start",
+        .remote_socket_path = "/tmp/proxy.sock",
+    });
+
+    const session_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ procs_dir, session_guid });
+    defer allocator.free(session_path);
+    const proxy_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ procs_dir, proxy_guid });
+    defer allocator.free(proxy_path);
+
+    const session_bytes = try std.fs.cwd().readFileAlloc(allocator, session_path, 64 * 1024);
+    defer allocator.free(session_bytes);
+    const proxy_bytes = try std.fs.cwd().readFileAlloc(allocator, proxy_path, 64 * 1024);
+    defer allocator.free(proxy_bytes);
+
+    for ([_][]const u8{ session_bytes, proxy_bytes }) |bytes| {
+        try std.testing.expect(std.mem.endsWith(u8, bytes, "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"guid\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "recorded_at_unix_ms") == null);
+    }
+
+    var parsed_session = try std.json.parseFromSlice(RecordJson, allocator, session_bytes, .{});
+    defer parsed_session.deinit();
+    try std.testing.expectEqual(@as(u64, 12), parsed_session.value.local_pid);
+    try std.testing.expectEqualStrings("/tmp/session.sock", parsed_session.value.remote_socket_path);
+
+    var parsed_proxy = try std.json.parseFromSlice(RecordJson, allocator, proxy_bytes, .{});
+    defer parsed_proxy.deinit();
+    try std.testing.expectEqual(@as(u64, 56), parsed_proxy.value.local_pid);
+    try std.testing.expectEqualStrings("proxy-host", parsed_proxy.value.remote_host);
+    try std.testing.expectEqualStrings("/tmp/proxy.sock", parsed_proxy.value.remote_socket_path);
+
+    const session_file = try std.fs.openFileAbsolute(session_path, .{});
+    defer session_file.close();
+    const stat = try session_file.stat();
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+
+    var dir = try std.fs.openDirAbsolute(procs_dir, .{ .iterate = true });
+    defer dir.close();
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (std.mem.indexOf(u8, entry.name, ".tmp.") != null) {
+            return error.LeftoverCleanupRecordTempFile;
+        }
+    }
+}
+
 test "cleanup sweep lock mtime throttles repeated sweeps" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -526,4 +645,133 @@ test "cleanup sweep lock mtime throttles repeated sweeps" {
     const now_ms = nowUnixMs();
     try std.testing.expect(try sweepDueAndMark(&lock, 60_000, now_ms));
     try std.testing.expect(!(try sweepDueAndMark(&lock, 60_000, now_ms + 1)));
+}
+
+test "cleanup sweep lock prevents duplicate sweep owners" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const tmp_path_z = try allocator.dupeZ(u8, tmp_path);
+    defer allocator.free(tmp_path_z);
+    if (c.chmod(tmp_path_z.ptr, 0o700) != 0) return error.ChmodFailed;
+    const lock_path = try std.fs.path.join(allocator, &.{ tmp_path, "cleanup-sweep" });
+    defer allocator.free(lock_path);
+
+    var first = (try tryAcquireSweepLockPath(allocator, lock_path)) orelse return error.ExpectedSweepLock;
+    defer first.deinit();
+    const second = try tryAcquireSweepLockPath(allocator, lock_path);
+    try std.testing.expect(second == null);
+}
+
+test "expired cleanup record is deleted without invoking remote cleanup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const record_path = try std.fs.path.join(allocator, &.{ tmp_path, "p-550e8400-e29b-41d4-a716-446655440000.json" });
+    defer allocator.free(record_path);
+
+    const file = try tmp.dir.createFile("p-550e8400-e29b-41d4-a716-446655440000.json", .{});
+    try file.writeAll(
+        \\{"local_pid":99999999,"local_start_time":"missing-local","remote_user":"user","remote_host":"host","remote_port":"22","remote_pid":99999998,"remote_start_time":"missing-remote","remote_socket_path":"/tmp/sesshd.sock"}
+        \\
+    );
+
+    const old_ns = std.time.nanoTimestamp() - 2 * std.time.ns_per_s;
+    try file.updateTimes(old_ns, old_ns);
+    file.close();
+
+    var invoked = false;
+    try sweepRecordPath(
+        allocator,
+        record_path,
+        "p-550e8400-e29b-41d4-a716-446655440000",
+        1,
+        &invoked,
+        testSweepCleanMarksInvoked,
+    );
+
+    try std.testing.expect(!invoked);
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(record_path, .{}));
+}
+
+test "cleanup sweep skips live local owner and deletes missing dead owner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const procs_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(procs_dir);
+
+    const local = try currentLocalProcessIdentity(allocator);
+    defer allocator.free(local.start_time);
+
+    const live_guid = "s-550e8400-e29b-41d4-a716-446655440000";
+    const dead_guid = "p-550e8400-e29b-41d4-a716-446655440000";
+    try writeRecordInProcsDir(allocator, procs_dir, .{
+        .guid = live_guid,
+        .local_pid = local.pid,
+        .local_start_time = local.start_time,
+        .remote_user = "user",
+        .remote_host = "host",
+        .remote_port = "22",
+        .remote_pid = 34,
+        .remote_start_time = "remote-start",
+        .remote_socket_path = "/tmp/live.sock",
+    });
+    try writeRecordInProcsDir(allocator, procs_dir, .{
+        .guid = dead_guid,
+        .local_pid = 99999999,
+        .local_start_time = "missing-local",
+        .remote_user = "user",
+        .remote_host = "host",
+        .remote_port = "22",
+        .remote_pid = 99999998,
+        .remote_start_time = "missing-remote",
+        .remote_socket_path = "/tmp/dead.sock",
+    });
+
+    const live_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ procs_dir, live_guid });
+    defer allocator.free(live_path);
+    const dead_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ procs_dir, dead_guid });
+    defer allocator.free(dead_path);
+
+    var context = TestSweepContext{};
+    try sweepRecordPath(allocator, live_path, live_guid, 0, &context, testSweepCleanReturnsMissing);
+    try std.testing.expectEqual(@as(usize, 0), context.invocations);
+    {
+        const file = try std.fs.openFileAbsolute(live_path, .{});
+        file.close();
+    }
+
+    try sweepRecordPath(allocator, dead_path, dead_guid, 0, &context, testSweepCleanReturnsMissing);
+    try std.testing.expectEqual(@as(usize, 1), context.invocations);
+    try std.testing.expectEqualStrings(dead_guid, context.last_guid.?);
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(dead_path, .{}));
+}
+
+const TestSweepContext = struct {
+    invocations: usize = 0,
+    last_guid: ?[]const u8 = null,
+};
+
+fn testSweepCleanReturnsMissing(ctx: *anyopaque, allocator: std.mem.Allocator, record: Record) !CleanupResult {
+    _ = allocator;
+    const context: *TestSweepContext = @ptrCast(@alignCast(ctx));
+    context.invocations += 1;
+    context.last_guid = record.guid;
+    return .missing;
+}
+
+fn testSweepCleanMarksInvoked(ctx: *anyopaque, allocator: std.mem.Allocator, record: Record) !CleanupResult {
+    _ = allocator;
+    _ = record;
+    const invoked: *bool = @ptrCast(@alignCast(ctx));
+    invoked.* = true;
+    return .cleaned;
 }

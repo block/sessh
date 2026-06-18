@@ -173,12 +173,28 @@ append_exec_arg() {
       decoded=$arg
       ;;
   esac
+  if [ "$exec_arg_count" -eq 0 ]; then
+    case "$decoded" in
+      sesshd|sessh-broker|sessh-proxy|sessh-terminal-remote|sessh-proxy-remote)
+        exec_role=$decoded
+        exec_arg_count=$((exec_arg_count + 1))
+        return
+        ;;
+    esac
+  fi
   quoted=$(shell_quote "$decoded") || err INVALID_EXEC quote_failed
   exec_args="${exec_args}${exec_args:+ }$quoted"
+  exec_arg_count=$((exec_arg_count + 1))
 }
 
 exec_candidate() {
   candidate=$1
+  if [ -n "$exec_role" ]; then
+    candidate_dir=${candidate%/*}
+    role_candidate=$candidate_dir/$exec_role
+    /bin/ln -sf sessh "$role_candidate" || err INSTALL_FAILED role_symlink_failed
+    candidate=$role_candidate
+  fi
   quoted_candidate=$(shell_quote "$candidate") || err INVALID_EXEC quote_failed
   eval "exec $quoted_candidate $exec_args"
 }
@@ -214,6 +230,8 @@ is_safe_relpath "$artifact_set_id" || err INVALID_EXEC invalid_artifact_set_id
 shift 2
 
 exec_args=
+exec_arg_count=0
+exec_role=
 hashes=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--" ]; then
@@ -230,7 +248,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-[ -n "$exec_args" ] || err INVALID_EXEC missing_exec_command
+[ -n "$exec_args" ] || [ -n "$exec_role" ] || err INVALID_EXEC missing_exec_command
 
 cache_root=${XDG_CACHE_HOME:-${HOME:-}/.cache}/sessh/bin
 [ "$cache_root" != "/.cache/sessh/bin" ] || err INVALID_ENV missing_cache_home

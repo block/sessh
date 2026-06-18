@@ -6,19 +6,18 @@ const io = @import("../core/io.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const app_allocator = @import("../core/app_allocator.zig");
-const daemon_cleanup = @import("../daemon/cleanup.zig");
-const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
-const diagnostics_jsonl = @import("../diagnostics/jsonl.zig");
 const socket_transport = @import("../transport/socket.zig");
-const local_boot_time = @import("../core/local_boot_time.zig");
 const protocol = @import("../protocol/mod.zig");
+const protocol_test_helpers = @import("../protocol/test_helpers.zig");
 const client_log = @import("../core/client_log.zig");
-const proxy_control = @import("proxy_control.zig");
+const proxy_diagnostics = @import("proxy_diagnostics_channel.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect = @import("../reconnect/mod.zig");
-const reconnect_title = @import("../reconnect/title.zig");
-const session_registry = @import("../runtime/session_registry.zig");
+const mux_proxy = @import("mux_proxy.zig");
+const proxy_remote = @import("proxy_remote.zig");
+const raw_bridge = @import("raw_bridge.zig");
+const status_output = @import("status_output.zig");
 const terminal = @import("../tty/terminal.zig");
 const pb = protocol.pb;
 
@@ -28,10 +27,6 @@ const transport_ping_interval_ms: u64 = 1_000;
 const stream_unresponsive_after_ms: u64 = 10_000;
 const proxy_mux_stream_id: u64 = 1;
 
-// POSIX WNOHANG. Zig 0.15 does not expose a portable constant, and our
-// supported Unix targets use the stable POSIX value.
-const wait_nohang: c_int = 1;
-
 const StreamOutcome = union(enum) {
     complete,
     transport_closed,
@@ -39,14 +34,22 @@ const StreamOutcome = union(enum) {
     replacement: c.fd_t,
 };
 
-pub const StreamReconnectStatusMode = enum {
-    disabled,
-    stderr_plain,
-    status_line,
-    title,
-    jsonl,
-    client_control,
-};
+pub const StreamReconnectStatusMode = status_output.Mode;
+pub const forwardRawDuplex = raw_bridge.forwardRawDuplex;
+pub const ProxyMuxStream = mux_proxy.ProxyMuxStream;
+pub const closeProxyMuxStreams = mux_proxy.closeProxyMuxStreams;
+pub const closeProxyMuxStream = mux_proxy.closeProxyMuxStream;
+pub const handleProxyMuxStreamFrame = mux_proxy.handleProxyMuxStreamFrame;
+pub const handleProxyMuxOpen = mux_proxy.handleProxyMuxOpen;
+pub const forwardProxyRemoteFrameToMux = mux_proxy.forwardProxyRemoteFrameToMux;
+pub const handleProxyRemoteControlFrame = mux_proxy.handleProxyRemoteControlFrame;
+pub const findProxyMuxStreamIndex = mux_proxy.findProxyMuxStreamIndex;
+pub const findProxyMuxStreamIndexByWatch = mux_proxy.findProxyMuxStreamIndexByWatch;
+pub const removeProxyMuxStream = mux_proxy.removeProxyMuxStream;
+pub const sendProxyMuxReset = mux_proxy.sendProxyMuxReset;
+pub const queueProxyMuxReset = mux_proxy.queueProxyMuxReset;
+pub const drainProxyProcessWrites = mux_proxy.drainProxyProcessWrites;
+const StreamReconnectStatus = status_output.Status;
 
 pub const LocalStreamOptions = struct {
     guid: []const u8 = "",
@@ -188,22 +191,6 @@ const StreamSink = struct {
     close_fd_on_eof: ?*c.fd_t = null,
     shutdown_on_eof: bool = false,
 };
-
-const ProxyRemoteProcess = struct {
-    allocator: std.mem.Allocator,
-    guid: []u8,
-    socket_path: []u8,
-    pid: c.pid_t = 0,
-
-    fn deinit(self: *ProxyRemoteProcess) void {
-        self.allocator.free(self.guid);
-        self.allocator.free(self.socket_path);
-        self.* = undefined;
-    }
-};
-
-var proxy_remote_processes: std.ArrayList(*ProxyRemoteProcess) = .empty;
-var proxy_remote_socket_sequence: u64 = 0;
 
 fn sinkWithFd(stdin_fd: c.fd_t, close_fd_on_eof: ?*c.fd_t) StreamSink {
     return .{
@@ -358,7 +345,7 @@ const StreamAttachedClient = struct {
     transport_read_fd: c.fd_t,
     transport_write_fd: c.fd_t,
     transport_reader: protocol.FrameReader,
-    control_reader: proxy_control.Reader,
+    control_reader: proxy_diagnostics.Reader,
     options: StreamAttachedClientOptions,
     liveness: StreamLiveness,
     interrupt_fd: c.fd_t = -1,
@@ -379,7 +366,7 @@ const StreamAttachedClient = struct {
             .transport_read_fd = transport_read_fd,
             .transport_write_fd = transport_write_fd,
             .transport_reader = protocol.FrameReader.init(state.allocator),
-            .control_reader = proxy_control.Reader.init(state.allocator),
+            .control_reader = proxy_diagnostics.Reader.init(state.allocator),
             .options = options,
             .liveness = StreamLiveness.init(now_ms),
         };
@@ -395,6 +382,10 @@ const StreamAttachedClient = struct {
         const state = self.state;
         if (state.complete()) return .complete;
 
+        // PROCESS_EVENT_LOOP: foreground proxy-stream client loop. It owns the
+        // raw byte source, mux transport, diagnostics control, replacement
+        // listener, and reconnect input for this process; sesshd-owned proxy
+        // streams use the daemon dispatcher instead.
         const now_before_poll_ms = nowMillis();
         var pollfds: [1 + 1 + 1 + 1 + 2]posix.pollfd = undefined;
         var count: usize = 0;
@@ -508,6 +499,7 @@ const StreamAttachedClient = struct {
             // our outbound side closed.
             try drainStreamSourcesNonBlocking(state, &self.options);
             if (try self.completeAfterSourceReset()) return .complete;
+            if (state.complete()) return .complete;
             if (state.peer_ready) {
                 sendPending(state, self.transport_write_fd) catch |err| switch (err) {
                     error.WriteFailed => return .transport_closed,
@@ -728,252 +720,6 @@ const ProxyEndpoint = struct {
     }
 };
 
-pub const ProxyMuxStream = struct {
-    stream_id: u64,
-    process_fd: c.fd_t = -1,
-    process_watch_id: ?dispatcher.FdWatchId = null,
-    reader: protocol.FrameReader = undefined,
-    reader_initialized: bool = false,
-    open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
-    proxy_guid: [session_registry.proxy_guid_len]u8 = [_]u8{0} ** session_registry.proxy_guid_len,
-    proxy_guid_len: usize = 0,
-    cleanup_recorded: bool = false,
-
-    pub fn proxyGuidSlice(self: *const ProxyMuxStream) []const u8 {
-        return self.proxy_guid[0..self.proxy_guid_len];
-    }
-
-    fn setProxyGuid(self: *ProxyMuxStream, guid: []const u8) !void {
-        if (guid.len > self.proxy_guid.len) return error.ProxyGuidTooLarge;
-        @memcpy(self.proxy_guid[0..guid.len], guid);
-        self.proxy_guid_len = guid.len;
-    }
-};
-
-pub fn closeProxyMuxStreams(
-    allocator: std.mem.Allocator,
-    streams: *std.ArrayList(ProxyMuxStream),
-    daemon_dispatcher: ?*dispatcher.Dispatcher,
-) void {
-    for (streams.items) |stream| {
-        closeProxyMuxStream(allocator, stream, true, daemon_dispatcher);
-    }
-    streams.deinit(allocator);
-}
-
-pub fn closeProxyMuxStream(
-    allocator: std.mem.Allocator,
-    stream: ProxyMuxStream,
-    send_startup_failed: bool,
-    daemon_dispatcher: ?*dispatcher.Dispatcher,
-) void {
-    if (daemon_dispatcher) |d| {
-        if (stream.process_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
-    }
-    if (stream.process_fd >= 0 and send_startup_failed and !stream.cleanup_recorded) {
-        sendProxyMuxReset(allocator, stream.process_fd, proxy_mux_stream_id, "STARTUP_FAILED", "proxy cleanup record was not acknowledged") catch {};
-    }
-    if (stream.process_fd >= 0) _ = c.close(stream.process_fd);
-    var moved_stream = stream;
-    if (moved_stream.reader_initialized) moved_stream.reader.deinit();
-}
-
-pub fn handleProxyMuxStreamFrame(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    identity: daemon_identity.DaemonIdentity,
-    streams: *std.ArrayList(ProxyMuxStream),
-    mux_fd: c.fd_t,
-    mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
-    process_watch_handler: ?dispatcher.Handler,
-    daemon_dispatcher: ?*dispatcher.Dispatcher,
-) !void {
-    var owned_mux_frame = mux_frame;
-    defer owned_mux_frame.deinit(allocator);
-    const message = owned_mux_frame.message orelse return error.StreamUnexpectedFrame;
-    switch (message) {
-        .open => |open| try handleProxyMuxOpen(allocator, streams, owned_mux_frame.stream_id, open),
-        .payload => |payload| try handleProxyMuxPayload(allocator, exe, identity, streams, mux_fd, owned_mux_frame.stream_id, payload, owned_mux_frame, process_watch_handler, daemon_dispatcher),
-        .open_ok, .ack, .eof => try forwardProxyMuxFrameToProxyRemote(allocator, streams, owned_mux_frame),
-        .reset => {
-            forwardProxyMuxFrameToProxyRemote(allocator, streams, owned_mux_frame) catch {};
-            try removeProxyMuxStream(allocator, streams, owned_mux_frame.stream_id, daemon_dispatcher);
-        },
-    }
-}
-
-pub fn handleProxyMuxOpen(
-    allocator: std.mem.Allocator,
-    streams: *std.ArrayList(ProxyMuxStream),
-    stream_id: u64,
-    open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
-) !void {
-    if (findProxyMuxStreamIndex(streams, stream_id)) |index| {
-        streams.items[index].open = open;
-        if (streams.items[index].process_fd >= 0) {
-            try sendProxyMuxFrame(allocator, streams.items[index].process_fd, .{
-                .stream_id = proxy_mux_stream_id,
-                .message = .{ .open = open },
-            });
-        }
-        return;
-    }
-    try streams.append(allocator, .{
-        .stream_id = stream_id,
-        .open = open,
-    });
-}
-
-fn handleProxyMuxPayload(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    identity: daemon_identity.DaemonIdentity,
-    streams: *std.ArrayList(ProxyMuxStream),
-    mux_fd: c.fd_t,
-    stream_id: u64,
-    payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload,
-    mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
-    process_watch_handler: ?dispatcher.Handler,
-    daemon_dispatcher: ?*dispatcher.Dispatcher,
-) !void {
-    const item = payload.item orelse return error.StreamUnexpectedFrame;
-    const proxy_item = switch (item) {
-        .proxy => |proxy| proxy,
-        else => return error.StreamUnexpectedFrame,
-    };
-    const proxy_payload = proxy_item.payload orelse return error.StreamUnexpectedFrame;
-    switch (proxy_payload) {
-        .open => |request| try handleProxyMuxPayloadOpen(allocator, exe, identity, streams, mux_fd, stream_id, request, process_watch_handler, daemon_dispatcher),
-        .data => try forwardProxyMuxFrameToProxyRemote(allocator, streams, mux_frame),
-    }
-}
-
-fn handleProxyMuxPayloadOpen(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    identity: daemon_identity.DaemonIdentity,
-    streams: *std.ArrayList(ProxyMuxStream),
-    mux_fd: c.fd_t,
-    stream_id: u64,
-    request: pb.ProxyStreamItem.Open,
-    process_watch_handler: ?dispatcher.Handler,
-    daemon_dispatcher: ?*dispatcher.Dispatcher,
-) !void {
-    const index = findProxyMuxStreamIndex(streams, stream_id) orelse return error.StreamUnexpectedFrame;
-    if (streams.items[index].process_fd >= 0) return;
-    if (!session_registry.isValidProxyGuid(request.proxy_guid)) return error.InvalidStreamGuid;
-    if (request.proxy_port == 0 or request.proxy_port > std.math.maxInt(u16)) return error.InvalidStreamArgs;
-
-    const remote_process = try connectOrStartProxyRemote(
-        allocator,
-        exe,
-        request.proxy_guid,
-        request.proxy_host,
-        @intCast(request.proxy_port),
-    );
-    const process_fd = try connectStartedProxyRemote(remote_process);
-    errdefer _ = c.close(process_fd);
-    if (daemon_dispatcher != null) {
-        try core_fds.setNonBlocking(process_fd);
-    }
-
-    try sendProxyMuxFrame(allocator, process_fd, .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .open = streams.items[index].open },
-    });
-    streams.items[index].process_fd = process_fd;
-    const canonical = try session_registry.canonicalProxyGuid(allocator, request.proxy_guid);
-    defer allocator.free(canonical);
-    try streams.items[index].setProxyGuid(canonical);
-    try daemon_cleanup.sendRemoteProcessStarted(
-        allocator,
-        mux_fd,
-        stream_id,
-        daemon_cleanup.makeRemoteProcessIdentity(identity, canonical),
-    );
-    if (daemon_dispatcher) |d| {
-        const handler = process_watch_handler orelse return error.MissingProxyRemoteHandler;
-        streams.items[index].reader = protocol.FrameReader.init(allocator);
-        streams.items[index].reader_initialized = true;
-        streams.items[index].process_watch_id = try d.watchFd(process_fd, .{ .readable = true }, .{
-            .ctx = handler.ctx,
-            .callback = handler.callback,
-        });
-    }
-}
-
-fn forwardProxyMuxFrameToProxyRemote(
-    allocator: std.mem.Allocator,
-    streams: *std.ArrayList(ProxyMuxStream),
-    mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
-) !void {
-    const index = findProxyMuxStreamIndex(streams, mux_frame.stream_id) orelse return error.StreamUnexpectedFrame;
-    if (streams.items[index].process_fd < 0) return error.StreamUnexpectedFrame;
-    var remapped = mux_frame;
-    remapped.stream_id = proxy_mux_stream_id;
-    try sendProxyMuxFrame(allocator, streams.items[index].process_fd, remapped);
-}
-
-pub fn forwardProxyRemoteFrameToMux(
-    allocator: std.mem.Allocator,
-    mux_fd: c.fd_t,
-    stream: *ProxyMuxStream,
-    frame: *protocol.OwnedFrame,
-) !bool {
-    if (frame.message_type != .daemon_tunnel) return error.StreamUnexpectedFrame;
-    var mux_frame = try protocol.decodeDaemonMuxStreamFrame(allocator, frame.payload);
-    defer mux_frame.deinit(allocator);
-    mux_frame.stream_id = stream.stream_id;
-    try sendProxyMuxFrame(allocator, mux_fd, mux_frame);
-    return true;
-}
-
-pub fn findProxyMuxStreamIndex(streams: *const std.ArrayList(ProxyMuxStream), stream_id: u64) ?usize {
-    for (streams.items, 0..) |stream, index| {
-        if (stream.stream_id == stream_id) return index;
-    }
-    return null;
-}
-
-pub fn findProxyMuxStreamIndexByWatch(streams: *const std.ArrayList(ProxyMuxStream), watch_id: dispatcher.FdWatchId) ?usize {
-    for (streams.items, 0..) |stream, index| {
-        const process_watch_id = stream.process_watch_id orelse continue;
-        if (process_watch_id.index == watch_id.index and process_watch_id.generation == watch_id.generation) return index;
-    }
-    return null;
-}
-
-pub fn removeProxyMuxStream(
-    allocator: std.mem.Allocator,
-    streams: *std.ArrayList(ProxyMuxStream),
-    stream_id: u64,
-    daemon_dispatcher: ?*dispatcher.Dispatcher,
-) !void {
-    const index = findProxyMuxStreamIndex(streams, stream_id) orelse return;
-    const stream = streams.swapRemove(index);
-    closeProxyMuxStream(allocator, stream, false, daemon_dispatcher);
-}
-
-pub fn sendProxyMuxReset(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    stream_id: u64,
-    code: []const u8,
-    message: []const u8,
-) !void {
-    try sendProxyMuxFrame(allocator, fd, .{
-        .stream_id = stream_id,
-        .message = .{ .reset = .{
-            .code = code,
-            .message = message,
-        } },
-    });
-}
-
-fn sendProxyMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
-    try protocol.sendMuxStreamFrame(allocator, fd, message);
-}
-
 fn runProxyRemote(allocator: std.mem.Allocator, guid: []const u8, replacement_listen_fd: c.fd_t, proxy_host: []const u8, proxy_port: u16) !void {
     var endpoint = try ProxyEndpoint.connect(allocator, proxy_host, proxy_port);
     defer endpoint.deinit();
@@ -1016,7 +762,7 @@ fn waitForReplacementWhileDisconnected(
     replacement_listen_fd: c.fd_t,
     options: *const StreamAttachedClientOptions,
 ) !c.fd_t {
-    // PROCESS_EVENT_LOOP: remote proxy runtime while detached from a transport.
+    // PROCESS_EVENT_LOOP: remote proxy runtime without an active transport.
     // It must keep draining its remote fd and accepting a replacement transport;
     // this is the process's main loop, not a helper-owned Dispatcher.
     while (true) {
@@ -1063,7 +809,7 @@ fn acceptRuntimeClient(listen_fd: c.fd_t) ?c.fd_t {
 }
 
 /// Runs in the local `sessh` process. `start_transport` creates ssh transports
-/// that execute the remote `:broker:` entrypoint; this loop owns local
+/// that execute the remote `sessh-broker` role; this loop owns local
 /// stdin/stdout and the reconnect policy.
 pub fn runLocalStream(
     allocator: std.mem.Allocator,
@@ -1108,8 +854,10 @@ pub fn runLocalStream(
                 reconnect_status.flushDiagnostics();
                 return err;
             }
+            if (try disconnectedSourceClosed(&state, options.source_fd, &input_control)) return 0;
             const delay_ms = reconnect.delayMs(attempt);
             const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, options.reconnect_input_fd, &control_fd, &input_control, &local_interrupt);
+            if (options.reset_on_source_eof and state.source_eof) return 0;
             if (action == .disconnect) return 0;
             if (action == .interrupt) return 255;
             attempt = reconnect.nextAttempt(attempt, action == .reconnect);
@@ -1198,6 +946,7 @@ pub fn runLocalStream(
                         if (options.status_mode == .client_control and options.control_fd < 0 and options.status_fd < 0) {
                             reconnect_status.setFd(-1);
                         }
+                        if (try disconnectedSourceClosed(&state, options.source_fd, &input_control)) return 0;
                         break :transport_loop;
                     },
                     .interrupted => {
@@ -1238,11 +987,28 @@ pub fn runLocalStream(
 
         const delay_ms = reconnect.delayMs(attempt);
         const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, options.reconnect_input_fd, &control_fd, &input_control, &local_interrupt);
+        if (options.reset_on_source_eof and state.source_eof) return 0;
         if (action == .disconnect) return 0;
         if (action == .interrupt) return 255;
         attempt = reconnect.nextAttempt(attempt, action == .reconnect);
         retrying = true;
     }
+}
+
+fn disconnectedSourceClosed(
+    state: *StreamState,
+    source_fd: c.fd_t,
+    input_control: *StreamInputControl,
+) !bool {
+    if (source_fd < 0) return false;
+    var options = StreamAttachedClientOptions{
+        .source = .{
+            .fd = source_fd,
+            .input_control = input_control,
+        },
+    };
+    try drainStreamSourcesNonBlocking(state, &options);
+    return state.source_eof;
 }
 
 fn runAttachedStream(
@@ -1450,7 +1216,15 @@ fn handleInboundEof(
         }
     }
     if (options.close_outbound_on_inbound_eof and state.inbound.inbound_eof) {
+        const final_outbound_offset = state.outbound.outboundNext();
+        state.outbound.outbound.shrinkRetainingCapacity(0);
+        state.outbound.outbound_base = final_outbound_offset;
+        state.outbound.peer_recv = final_outbound_offset;
+        state.outbound.outbound_sent_next = final_outbound_offset;
         state.outbound.outbound_eof = true;
+        state.outbound.outbound_eof_sent = true;
+        state.outbound.outbound_eof_acked = true;
+        state.source_eof = true;
     }
     sendAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
         error.WriteFailed => return error.StreamTransportWriteFailed,
@@ -1468,7 +1242,6 @@ fn sendResumeMessage(state: *StreamState, fd: c.fd_t, send_proxy_open: bool) !vo
         .stream_id = proxy_mux_stream_id,
         .message = .{ .open = .{
             .recv_next_offset = state.inbound.recv_next_offset,
-            .receive_window_bytes = max_buffered_bytes,
         } },
     });
     if (!send_proxy_open) return;
@@ -1490,7 +1263,6 @@ fn sendOpenOk(state: *StreamState, fd: c.fd_t) !void {
         .stream_id = proxy_mux_stream_id,
         .message = .{ .open_ok = .{
             .recv_next_offset = state.inbound.recv_next_offset,
-            .receive_window_bytes = max_buffered_bytes,
         } },
     });
 }
@@ -1500,7 +1272,6 @@ fn sendAck(state: *StreamState, fd: c.fd_t, offset: u64) !void {
         .stream_id = proxy_mux_stream_id,
         .message = .{ .ack = .{
             .recv_next_offset = offset,
-            .receive_window_bytes = max_buffered_bytes,
         } },
     });
 }
@@ -1587,58 +1358,6 @@ fn abortTransport(transport: anytype) void {
     }
 }
 
-pub fn forwardRawDuplex(left_read_fd: c.fd_t, left_write_fd: c.fd_t, right_fd: c.fd_t) !void {
-    var left_open = true;
-    var right_open = true;
-    // PROCESS_EVENT_LOOP: foreground raw proxy bridge. This process exists only
-    // to relay bytes between two fds, so a direct poll loop is the event loop.
-    while (left_open or right_open) {
-        var pollfds: [2]posix.pollfd = undefined;
-        var count: usize = 0;
-        if (left_open) {
-            pollfds[count] = .{ .fd = left_read_fd, .events = posix.POLL.IN, .revents = 0 };
-            count += 1;
-        }
-        if (right_open) {
-            pollfds[count] = .{ .fd = right_fd, .events = posix.POLL.IN, .revents = 0 };
-            count += 1;
-        }
-        if (count == 0) return;
-        _ = try posix.poll(pollfds[0..count], -1);
-
-        var poll_index: usize = 0;
-        if (left_open) {
-            if ((pollfds[poll_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-                if (!copySomeOrClose(left_read_fd, right_fd)) {
-                    left_open = false;
-                    _ = c.shutdown(right_fd, c.SHUT.WR);
-                }
-            }
-            poll_index += 1;
-        }
-        if (right_open) {
-            if ((pollfds[poll_index].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-                if (!copySomeOrClose(right_fd, left_write_fd)) {
-                    right_open = false;
-                    _ = c.shutdown(left_write_fd, c.SHUT.WR);
-                }
-            }
-        }
-    }
-}
-
-fn copySomeOrClose(read_fd: c.fd_t, write_fd: c.fd_t) bool {
-    var buf: [8192]u8 = undefined;
-    const n = c.read(read_fd, &buf, buf.len);
-    if (n < 0) return switch (posix.errno(n)) {
-        .AGAIN, .INTR => true,
-        else => false,
-    };
-    if (n == 0) return false;
-    io.writeAll(write_fd, buf[0..@intCast(n)]) catch return false;
-    return true;
-}
-
 const ReadSomeResult = union(enum) {
     bytes: []const u8,
     would_block,
@@ -1671,58 +1390,8 @@ fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) !ReadSomeResult {
     return readSome(fd, buf);
 }
 
-fn connectOrStartProxyRemote(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    guid: []const u8,
-    proxy_host: []const u8,
-    proxy_port: u16,
-) !*ProxyRemoteProcess {
-    const canonical = try session_registry.canonicalProxyGuid(allocator, guid);
-    defer allocator.free(canonical);
-
-    if (lookupProxyRemote(canonical)) |control| return control;
-
-    return startProxyRemoteProcess(allocator, exe, canonical, proxy_host, proxy_port);
-}
-
-fn connectProxyRemote(control: *ProxyRemoteProcess) !c.fd_t {
-    return connectProxyRemoteProcess(control) catch |err| switch (err) {
-        error.SocketPathMissing, error.ConnectFailed => {
-            forgetProxyRemote(control.guid);
-            return error.StreamNotFound;
-        },
-        else => return err,
-    };
-}
-
-fn connectStartedProxyRemote(control: *ProxyRemoteProcess) !c.fd_t {
-    return connectProxyRemoteProcess(control) catch |err| switch (err) {
-        error.SocketPathMissing, error.ConnectFailed => {
-            forgetProxyRemote(control.guid);
-            return error.StreamNotFound;
-        },
-        else => return err,
-    };
-}
-
-fn connectProxyRemoteProcess(control: *const ProxyRemoteProcess) !c.fd_t {
-    return socket_transport.connectSocket(control.socket_path);
-}
-
 pub fn requestProxyRemoteCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
-    const canonical = try session_registry.canonicalProxyGuid(allocator, guid);
-    defer allocator.free(canonical);
-    const control = lookupProxyRemote(canonical) orelse return error.StreamNotFound;
-    const fd = try connectProxyRemote(control);
-    defer _ = c.close(fd);
-    try sendMuxStreamFrame(allocator, fd, .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .reset = .{
-            .code = "CLEANUP_REQUESTED",
-            .message = "remote cleanup requested",
-        } },
-    });
+    return proxy_remote.requestCleanup(allocator, guid);
 }
 
 pub fn runProxyRemoteProcess(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -1739,136 +1408,16 @@ pub fn runProxyRemoteProcess(allocator: std.mem.Allocator, args: []const []const
     try runProxyRemote(allocator, guid, listen_fd, proxy_host, proxy_port);
 }
 
-fn startProxyRemoteProcess(
-    allocator: std.mem.Allocator,
-    exe: []const u8,
-    guid: []const u8,
-    proxy_host: []const u8,
-    proxy_port: u16,
-) !*ProxyRemoteProcess {
-    const canonical = try session_registry.canonicalProxyGuid(allocator, guid);
-    errdefer allocator.free(canonical);
-
-    const socket_path = try proxyRemoteSocketPath(allocator, exe);
-    errdefer allocator.free(socket_path);
-    try socket_transport.ensureSocketDir(allocator, socket_path);
-    const listen_fd = try socket_transport.listenSocket(socket_path);
-    errdefer _ = c.close(listen_fd);
-    try socket_transport.clearCloseOnExec(listen_fd);
-
-    const control = try allocator.create(ProxyRemoteProcess);
-    errdefer allocator.destroy(control);
-    control.* = .{
-        .allocator = allocator,
-        .guid = canonical,
-        .socket_path = socket_path,
-    };
-    errdefer control.deinit();
-
-    try registerProxyRemote(control);
-    errdefer unregisterProxyRemote(control);
-
-    const port_arg = try std.fmt.allocPrint(allocator, "{}", .{proxy_port});
-    defer allocator.free(port_arg);
-    const listen_fd_arg = try std.fmt.allocPrint(allocator, "{}", .{listen_fd});
-    defer allocator.free(listen_fd_arg);
-    const argv = [_][]const u8{ exe, listen_fd_arg, socket_path, canonical, proxy_host, port_arg };
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    _ = c.close(listen_fd);
-    control.pid = @intCast(child.id);
-    return control;
-}
-
-fn proxyRemoteSocketPath(allocator: std.mem.Allocator, exe: []const u8) ![]u8 {
-    const exe_dir = std.fs.path.dirname(exe) orelse return error.InvalidRemoteProcessExecutablePath;
-    const namespace = std.fs.path.basename(exe_dir);
-    const root = try socket_transport.shortRuntimeRoot(allocator);
-    defer allocator.free(root);
-    const sequence = proxy_remote_socket_sequence;
-    proxy_remote_socket_sequence +%= 1;
-    return std.fmt.allocPrint(allocator, "{s}/{s}/proxy-{}-{}.sock", .{ root, namespace, c.getpid(), sequence });
-}
-
-fn registerProxyRemote(control: *ProxyRemoteProcess) !void {
-    for (proxy_remote_processes.items) |existing| {
-        if (std.mem.eql(u8, existing.guid, control.guid)) return error.StreamExists;
-    }
-    try proxy_remote_processes.append(app_allocator.allocator(), control);
-}
-
-fn unregisterProxyRemote(control: *ProxyRemoteProcess) void {
-    for (proxy_remote_processes.items, 0..) |existing, index| {
-        if (existing == control) {
-            _ = proxy_remote_processes.orderedRemove(index);
-            return;
-        }
-    }
-}
-
 pub fn forgetProxyRemote(guid: []const u8) void {
-    for (proxy_remote_processes.items, 0..) |control, index| {
-        if (std.mem.eql(u8, control.guid, guid)) {
-            _ = proxy_remote_processes.orderedRemove(index);
-            _ = reapProxyRemote(control.pid);
-            const allocator = control.allocator;
-            control.deinit();
-            allocator.destroy(control);
-            return;
-        }
-    }
+    proxy_remote.forget(guid);
 }
 
 pub fn activeProxyRemoteProcessCount() usize {
-    pruneExitedProxyRemotes();
-    return proxy_remote_processes.items.len;
-}
-
-fn lookupProxyRemote(guid: []const u8) ?*ProxyRemoteProcess {
-    for (proxy_remote_processes.items) |control| {
-        if (std.mem.eql(u8, control.guid, guid)) return control;
-    }
-    return null;
-}
-
-fn pruneExitedProxyRemotes() void {
-    var index: usize = 0;
-    while (index < proxy_remote_processes.items.len) {
-        const control = proxy_remote_processes.items[index];
-        if (reapProxyRemote(control.pid)) {
-            _ = proxy_remote_processes.orderedRemove(index);
-            const allocator = control.allocator;
-            control.deinit();
-            allocator.destroy(control);
-            continue;
-        }
-        index += 1;
-    }
-}
-
-fn reapProxyRemote(pid: c.pid_t) bool {
-    if (pid <= 0) return true;
-    var status: c_int = 0;
-    const result = c.waitpid(pid, &status, wait_nohang);
-    if (result == pid) return true;
-    if (result < 0) return switch (posix.errno(result)) {
-        .CHILD => true,
-        else => false,
-    };
-    return false;
+    return proxy_remote.activeCount();
 }
 
 fn nowMillis() u64 {
     return @intCast(std.time.milliTimestamp());
-}
-
-fn nowUnixMs() u64 {
-    const ms = std.time.milliTimestamp();
-    if (ms <= 0) return 0;
-    return @intCast(ms);
 }
 
 fn elapsedMs(start_ms: u64, end_ms: u64) u64 {
@@ -1886,7 +1435,7 @@ fn waitBeforeReconnect(
     interrupt: ?*LocalStreamInterrupt,
 ) StreamControlAction {
     var remaining_ms = delay_ms;
-    var control_reader = proxy_control.Reader.init(state.allocator);
+    var control_reader = proxy_diagnostics.Reader.init(state.allocator);
     defer control_reader.deinit();
     while (remaining_ms > 0) {
         status.showRetry(remaining_ms);
@@ -1915,10 +1464,13 @@ fn pollReconnectInput(
     reconnect_input_fd: c.fd_t,
     control_fd: *c.fd_t,
     input_control: *StreamInputControl,
-    control_reader: *proxy_control.Reader,
+    control_reader: *proxy_diagnostics.Reader,
     interrupt: ?*LocalStreamInterrupt,
     timeout_ms: i32,
 ) StreamControlAction {
+    // BLOCKING_POLL: foreground proxy-stream reconnect/control helper. It is
+    // called by the stream client loop to multiplex local reconnect input and
+    // diagnostics control without creating a second process dispatcher.
     var pollfds: [4]posix.pollfd = undefined;
     var count: usize = 0;
     var interrupt_index: ?usize = null;
@@ -1993,6 +1545,7 @@ fn readReconnectInput(
     var buf: [max_chunk_bytes]u8 = undefined;
     const n = c.read(source_fd, &buf, buf.len);
     if (n <= 0) {
+        state.source_eof = true;
         state.outbound.outbound_eof = true;
     } else {
         var filtered: [max_chunk_bytes]u8 = undefined;
@@ -2012,15 +1565,16 @@ fn readReconnectControlInput(
     input_control.observeControlOnly(buf[0..@intCast(n)]);
 }
 
-fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl, reader: *proxy_control.Reader) bool {
+fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl, reader: *proxy_diagnostics.Reader) bool {
     if (control_fd < 0) return false;
+    const allocator = app_allocator.allocator();
     while (true) {
-        var message = switch (reader.readReady(std.heap.smp_allocator, control_fd) catch return false) {
+        var message = switch (reader.readReady(allocator, control_fd) catch return false) {
             .blocked, .progress => return true,
             .eof, .truncated_frame => return false,
             .message => |value| value,
         };
-        defer message.deinit(std.heap.smp_allocator);
+        defer message.deinit(allocator);
         switch (message.message) {
             .retry_now => input_control.reconnect_requested = true,
             else => {},
@@ -2028,547 +1582,34 @@ fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl, read
     }
 }
 
-pub const TerminalTitleTracker = struct {
-    const max_title_bytes = 512;
-    const State = enum {
-        ground,
-        escape,
-        csi,
-        osc_command,
-        osc_text,
-        osc_escape,
-        string,
-        string_escape,
-    };
-
-    state: State = .ground,
-    osc_command: [8]u8 = [_]u8{0} ** 8,
-    osc_command_len: usize = 0,
-    tracking_title: bool = false,
-    title: [max_title_bytes]u8 = [_]u8{0} ** max_title_bytes,
-    title_len: usize = 0,
-    title_present: bool = false,
-    pending_title: [max_title_bytes]u8 = [_]u8{0} ** max_title_bytes,
-    pending_title_len: usize = 0,
-    csi_bytes: [32]u8 = [_]u8{0} ** 32,
-    csi_len: usize = 0,
-    synchronized_update_active: bool = false,
-
-    pub fn observe(self: *TerminalTitleTracker, bytes: []const u8) void {
-        for (bytes) |byte| self.observeByte(byte);
-    }
-
-    pub fn safeForLocalTitle(self: *const TerminalTitleTracker) bool {
-        // A finished `CSI ? 2026 h` leaves the parser in ground state, but the
-        // terminal is still inside a synchronized update. Title changes made
-        // there can be held back by the terminal until the matching `l`, so the
-        // reconnect UI treats that interval as unsafe too.
-        return self.state == .ground and !self.synchronized_update_active;
-    }
-
-    pub fn titlePresent(self: *const TerminalTitleTracker) bool {
-        return self.title_present;
-    }
-
-    pub fn titleSlice(self: *const TerminalTitleTracker) []const u8 {
-        return self.title[0..self.title_len];
-    }
-
-    fn observeByte(self: *TerminalTitleTracker, byte: u8) void {
-        switch (self.state) {
-            .ground => {
-                if (byte == 0x1b) self.state = .escape;
-            },
-            .escape => switch (byte) {
-                '[' => {
-                    self.state = .csi;
-                    self.csi_len = 0;
-                },
-                ']' => {
-                    self.state = .osc_command;
-                    self.osc_command_len = 0;
-                    self.tracking_title = false;
-                    self.pending_title_len = 0;
-                },
-                'P', '^', '_', 'X' => self.state = .string,
-                else => self.state = .ground,
-            },
-            .csi => {
-                if (byte == 0x1b) {
-                    self.state = .escape;
-                } else if (byte >= 0x40 and byte <= 0x7e) {
-                    self.finishCsi(byte);
-                    self.state = .ground;
-                } else if (self.csi_len < self.csi_bytes.len) {
-                    self.csi_bytes[self.csi_len] = byte;
-                    self.csi_len += 1;
-                }
-            },
-            .osc_command => {
-                if (byte == 0x07) {
-                    self.state = .ground;
-                } else if (byte == 0x1b) {
-                    self.state = .osc_escape;
-                } else if (byte == ';') {
-                    self.tracking_title = self.isTitleCommand();
-                    self.pending_title_len = 0;
-                    self.state = .osc_text;
-                } else if (self.osc_command_len < self.osc_command.len) {
-                    self.osc_command[self.osc_command_len] = byte;
-                    self.osc_command_len += 1;
-                }
-            },
-            .osc_text => {
-                if (byte == 0x07) {
-                    self.finishOsc();
-                    self.state = .ground;
-                } else if (byte == 0x1b) {
-                    self.state = .osc_escape;
-                } else {
-                    self.appendPendingTitle(byte);
-                }
-            },
-            .osc_escape => {
-                if (byte == '\\') {
-                    self.finishOsc();
-                    self.state = .ground;
-                } else {
-                    self.appendPendingTitle(0x1b);
-                    self.appendPendingTitle(byte);
-                    self.state = .osc_text;
-                }
-            },
-            .string => {
-                if (byte == 0x1b) self.state = .string_escape;
-            },
-            .string_escape => {
-                self.state = if (byte == '\\') .ground else .string;
-            },
-        }
-    }
-
-    fn isTitleCommand(self: *const TerminalTitleTracker) bool {
-        const command = self.osc_command[0..self.osc_command_len];
-        return std.mem.eql(u8, command, "0") or std.mem.eql(u8, command, "2");
-    }
-
-    fn appendPendingTitle(self: *TerminalTitleTracker, byte: u8) void {
-        if (!self.tracking_title) return;
-        if (self.pending_title_len >= self.pending_title.len) return;
-        self.pending_title[self.pending_title_len] = byte;
-        self.pending_title_len += 1;
-    }
-
-    fn finishOsc(self: *TerminalTitleTracker) void {
-        if (!self.tracking_title) return;
-        @memcpy(self.title[0..self.pending_title_len], self.pending_title[0..self.pending_title_len]);
-        self.title_len = self.pending_title_len;
-        self.title_present = true;
-    }
-
-    fn finishCsi(self: *TerminalTitleTracker, final_byte: u8) void {
-        const params = self.csi_bytes[0..self.csi_len];
-        if (std.mem.eql(u8, params, "?2026")) {
-            if (final_byte == 'h') self.synchronized_update_active = true;
-            if (final_byte == 'l') self.synchronized_update_active = false;
-        }
-    }
-};
-
-// Stream reconnect UI must keep application bytes clean. When stdout is a
-// terminal a caller may use the window title for reconnect status; otherwise it
-// may allow append-only stderr lines. Title mode tracks app OSC titles in the
-// byte stream so reconnect status can be restored without inventing a second UI
-// channel.
-const StreamReconnectStatus = struct {
-    const max_diagnostic_lines = 3;
-    const max_title_fallback_bytes = 512;
-
-    fd: c.fd_t,
-    mode: StreamReconnectStatusMode,
-    line: [96]u8 = undefined,
-    line_len: usize = 0,
-    ctrl_r_enabled: bool,
-    diagnostic_cursor: u64,
-    live_diagnostic_start_seq: u64,
-    rendered_diagnostic_seq: u64,
-    title_visible: bool = false,
-    status_line_visible: bool = false,
-    connection_status_active: bool = false,
-    append_only_retry_announced: bool = false,
-    escape_help_pending: bool = false,
-    title_tracker: TerminalTitleTracker = .{},
-    title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
-    title_fallback_len: usize = 0,
-
-    fn init(
-        mode: StreamReconnectStatusMode,
-        ctrl_r_enabled: bool,
-        title_fallback: []const u8,
-        status_fd: c.fd_t,
-    ) StreamReconnectStatus {
-        const displayed = client_log.displayedUserDiagnosticSeq();
-        var status = StreamReconnectStatus{
-            .fd = if (status_fd >= 0) status_fd else switch (mode) {
-                .title => 1,
-                .stderr_plain, .status_line, .jsonl => 2,
-                .client_control, .disabled => -1,
-            },
-            .mode = mode,
-            .ctrl_r_enabled = ctrl_r_enabled,
-            .diagnostic_cursor = displayed,
-            .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
-            .rendered_diagnostic_seq = displayed,
-        };
-        status.title_fallback_len = copyTitle(&status.title_fallback, title_fallback);
-        return status;
-    }
-
-    fn initForTest(fd: c.fd_t, mode: StreamReconnectStatusMode, ctrl_r_enabled: bool, title_fallback: []const u8) StreamReconnectStatus {
-        const displayed = client_log.displayedUserDiagnosticSeq();
-        var status = StreamReconnectStatus{
-            .fd = fd,
-            .mode = mode,
-            .ctrl_r_enabled = ctrl_r_enabled,
-            .diagnostic_cursor = displayed,
-            .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
-            .rendered_diagnostic_seq = displayed,
-        };
-        status.title_fallback_len = copyTitle(&status.title_fallback, title_fallback);
-        return status;
-    }
-
-    fn deinit(self: *StreamReconnectStatus) void {
-        self.clear();
-    }
-
-    fn setFd(self: *StreamReconnectStatus, fd: c.fd_t) void {
-        self.fd = fd;
-    }
-
-    fn showRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
-        const message = reconnect_title.retryStatus(&self.line, delay_ms, .{
-            .ctrl_r = self.ctrl_r_enabled,
-        }) catch return;
-        self.line_len = message.len;
-        self.connection_status_active = true;
-        self.refreshDiagnostics();
-        self.writeTitleRetry(delay_ms);
-        self.writeStatusLine();
-        self.writeAppendOnlyRetry(delay_ms);
-        self.writeClientRetry(delay_ms);
-    }
-
-    fn showReconnecting(self: *StreamReconnectStatus) void {
-        const message = reconnect_title.reconnectingStatus(.{
-            .ctrl_r = self.ctrl_r_enabled,
-        });
-        @memcpy(self.line[0..message.len], message);
-        self.line_len = message.len;
-        self.connection_status_active = true;
-        self.append_only_retry_announced = false;
-        self.refreshDiagnostics();
-        self.writeTitleReconnecting();
-        self.writeStatusLine();
-        self.writePlainStatusLine();
-        self.writeJsonlEvent("reconnecting");
-        self.writeClientReconnecting();
-    }
-
-    fn clear(self: *StreamReconnectStatus) void {
-        const had_connection_status = self.connection_status_active;
-        self.connection_status_active = false;
-        self.append_only_retry_announced = false;
-        self.refreshDiagnostics();
-        self.clearStatusLine();
-        self.restoreTitle();
-        if (had_connection_status) {
-            self.writeJsonlEvent("connected");
-            self.writeClientClear();
-        }
-    }
-
-    fn flushDiagnostics(self: *StreamReconnectStatus) void {
-        self.refreshDiagnostics();
-    }
-
-    fn showEscapeHelp(self: *StreamReconnectStatus) void {
-        switch (self.mode) {
-            .title => {
-                if (!self.canWriteTitle()) {
-                    // Direct stream UI shares the terminal with remote output.
-                    // If the remote stream is mid-control-sequence, wait until
-                    // the parser reaches a safe point before writing local help.
-                    self.escape_help_pending = true;
-                    return;
-                }
-                self.writeEscapeHelpText();
-            },
-            .stderr_plain => self.writeEscapeHelpText(),
-            .status_line => {
-                self.clearStatusLine();
-                self.writeEscapeHelpText();
-                if (self.connection_status_active) self.writeStatusLine();
-            },
-            .jsonl => {},
-            .client_control => {},
-            .disabled => {},
-        }
-    }
-
-    fn handleConnectionEvent(self: *StreamReconnectStatus, event: pb.ConnectionEvent) void {
-        switch (event.event orelse return) {
-            .ssh_stderr => |stderr| {
-                client_log.appendSshStderr(stderr.data);
-                self.refreshDiagnostics();
-            },
-            .binary_bootstrapping => switch (self.mode) {
-                .stderr_plain => {
-                    io.writeAll(self.fd, "sessh: bootstrapping...") catch return;
-                    io.writeAll(self.fd, "\r\n") catch return;
-                },
-                .status_line => {
-                    @memcpy(self.line[0.."sessh: bootstrapping...".len], "sessh: bootstrapping...");
-                    self.line_len = "sessh: bootstrapping...".len;
-                    self.connection_status_active = true;
-                    self.writeStatusLine();
-                },
-                .jsonl => self.writeJsonlEvent("binary_bootstrapping"),
-                .client_control => proxy_control.writeConnectionEvent(self.fd, .{ .binary_bootstrapping = .{} }) catch return,
-                .title, .disabled => {},
-            },
-            .daemon_connecting => self.showReconnecting(),
-            .daemon_connected => self.clear(),
-            .daemon_disconnected => |disconnected| self.showRetry(retryDelayFromLocalBootDeadline(disconnected.retry_at_local_boot_time_ms)),
-            .unresponsive => |unresponsive| self.showRetry(retryDelayFromLocalBootDeadline(unresponsive.retry_at_local_boot_time_ms)),
-            .ssh_connecting,
-            .ssh_connected,
-            => {},
-        }
-    }
-
-    fn writePlainStatusLine(self: *StreamReconnectStatus) void {
-        if (self.mode != .stderr_plain) return;
-        const message = self.line[0..self.line_len];
-        io.writeAll(self.fd, message) catch return;
-        io.writeAll(self.fd, "\r\n") catch return;
-    }
-
-    fn writeStatusLine(self: *StreamReconnectStatus) void {
-        if (self.mode != .status_line or self.fd < 0) return;
-        const message = self.line[0..self.line_len];
-        io.writeAll(self.fd, "\r\x1b[K") catch return;
-        io.writeAll(self.fd, message) catch return;
-        self.status_line_visible = true;
-    }
-
-    fn clearStatusLine(self: *StreamReconnectStatus) void {
-        if (self.mode != .status_line or self.fd < 0 or !self.status_line_visible) return;
-        io.writeAll(self.fd, "\r\x1b[K") catch return;
-        self.status_line_visible = false;
-    }
-
-    fn writeAppendOnlyRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
-        switch (self.mode) {
-            .stderr_plain, .jsonl => {},
-            else => return,
-        }
-        if (self.append_only_retry_announced) return;
-        self.append_only_retry_announced = true;
-        switch (self.mode) {
-            .stderr_plain => self.writePlainStatusLine(),
-            .jsonl => self.writeJsonlRetry(delay_ms),
-            else => unreachable,
-        }
-    }
-
-    fn writeJsonlRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
-        if (self.mode != .jsonl or self.fd < 0) return;
-        diagnostics_jsonl.writeRetry(self.fd, nowUnixMs() +| delay_ms) catch return;
-    }
-
-    fn writeJsonlEvent(self: *StreamReconnectStatus, event: []const u8) void {
-        if (self.mode != .jsonl or self.fd < 0) return;
-        diagnostics_jsonl.writeEvent(self.fd, event) catch return;
-    }
-
-    fn writeTitleRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
-        if (!self.canWriteTitle()) return;
-        if (self.ctrl_r_enabled) {
-            reconnect_title.writeRetryNowTitle(self.fd, delay_ms) catch return;
-        } else {
-            reconnect_title.writeRetryTitle(self.fd, delay_ms) catch return;
-        }
-        self.title_visible = true;
-    }
-
-    fn writeTitleReconnecting(self: *StreamReconnectStatus) void {
-        if (!self.canWriteTitle()) return;
-        if (self.ctrl_r_enabled) {
-            reconnect_title.writeReconnectingNowTitle(self.fd) catch return;
-        } else {
-            reconnect_title.writeReconnectingTitle(self.fd) catch return;
-        }
-        self.title_visible = true;
-    }
-
-    fn writeClientRetry(self: *StreamReconnectStatus, delay_ms: u64) void {
-        if (self.mode != .client_control or self.fd < 0) return;
-        proxy_control.writeConnectionEvent(self.fd, .{ .daemon_disconnected = .{
-            .retry_at_local_boot_time_ms = local_boot_time.nowMs() +| delay_ms,
-        } }) catch return;
-    }
-
-    fn writeClientReconnecting(self: *StreamReconnectStatus) void {
-        if (self.mode != .client_control or self.fd < 0) return;
-        proxy_control.writeConnectionEvent(self.fd, .{ .daemon_connecting = .{} }) catch return;
-    }
-
-    fn writeClientClear(self: *StreamReconnectStatus) void {
-        if (self.mode != .client_control or self.fd < 0) return;
-        proxy_control.writeConnectionEvent(self.fd, .{ .daemon_connected = .{} }) catch return;
-    }
-
-    fn canWriteTitle(self: *const StreamReconnectStatus) bool {
-        return self.mode == .title and self.fd >= 0 and self.title_tracker.safeForLocalTitle();
-    }
-
-    fn restoreTitle(self: *StreamReconnectStatus) void {
-        if (!self.title_visible or self.mode != .title or self.fd < 0) return;
-        const title = if (self.title_tracker.titlePresent())
-            self.title_tracker.titleSlice()
-        else
-            self.title_fallback[0..self.title_fallback_len];
-        reconnect_title.writeTitle(self.fd, title) catch {};
-        self.title_visible = false;
-    }
-
-    fn observeInbound(self: *StreamReconnectStatus, bytes: []const u8) void {
-        if (self.mode != .title) return;
-        self.title_tracker.observe(bytes);
-        if (self.escape_help_pending and self.canWriteTitle()) self.writeEscapeHelpText();
-    }
-
-    fn refreshDiagnostics(self: *StreamReconnectStatus) void {
-        if (self.mode != .stderr_plain and self.mode != .status_line and self.mode != .client_control and self.mode != .jsonl) return;
-        if (client_log.currentUserDiagnosticSeq() == self.rendered_diagnostic_seq) return;
-
-        var diagnostics = [_]client_log.UserDiagnosticLine{.{}} ** max_diagnostic_lines;
-        const new_cursor = client_log.copyUserDiagnosticsSince(self.diagnostic_cursor, &diagnostics);
-        if (new_cursor == self.diagnostic_cursor) {
-            self.rendered_diagnostic_seq = new_cursor;
-            return;
-        }
-
-        for (&diagnostics) |*diagnostic| {
-            if (diagnostic.seq == 0) continue;
-
-            var line_buf: [client_log.max_user_diagnostic_display_bytes]u8 = undefined;
-            const line = formatDiagnosticLine(
-                &line_buf,
-                diagnostic,
-                diagnostic.seq <= self.live_diagnostic_start_seq,
-            ) catch continue;
-            switch (self.mode) {
-                .status_line => {
-                    self.clearStatusLine();
-                    io.writeAll(self.fd, line) catch return;
-                    io.writeAll(self.fd, "\r\n") catch return;
-                    if (self.connection_status_active) self.writeStatusLine();
-                },
-                .stderr_plain => {
-                    io.writeAll(self.fd, line) catch return;
-                    io.writeAll(self.fd, "\r\n") catch return;
-                },
-                .jsonl => self.writeJsonlDiagnostic(line),
-                .client_control => proxy_control.writeConnectionEvent(self.fd, .{ .ssh_stderr = .{ .data = line } }) catch return,
-                .title, .disabled => unreachable,
-            }
-        }
-
-        self.diagnostic_cursor = new_cursor;
-        self.rendered_diagnostic_seq = new_cursor;
-        client_log.markUserDiagnosticsDisplayedThrough(new_cursor);
-    }
-
-    fn writeEscapeHelpText(self: *StreamReconnectStatus) void {
-        if (self.fd < 0) return;
-        self.escape_help_pending = false;
-        io.writeAll(self.fd, "\r\n") catch return;
-        inline for (terminal.escape_help_lines) |line| {
-            io.writeAll(self.fd, line) catch return;
-            io.writeAll(self.fd, "\r\n") catch return;
-        }
-    }
-
-    fn writeJsonlDiagnostic(self: *StreamReconnectStatus, line: []const u8) void {
-        if (self.mode != .jsonl or self.fd < 0) return;
-        diagnostics_jsonl.writeMessage(self.fd, "diagnostic", line) catch return;
-    }
-};
-
-fn retryDelayFromLocalBootDeadline(deadline_ms: ?u64) u64 {
-    const deadline = deadline_ms orelse return 0;
-    const now = local_boot_time.nowMs();
-    return deadline -| now;
-}
-
-fn copyTitle(dest: []u8, title: []const u8) usize {
-    const len = @min(dest.len, title.len);
-    @memcpy(dest[0..len], title[0..len]);
-    return len;
-}
-
-fn formatDiagnosticLine(
-    out: []u8,
-    diagnostic: *const client_log.UserDiagnosticLine,
-    delayed: bool,
-) ![]const u8 {
-    const prefix = if (delayed)
-        try std.fmt.bufPrint(out, "{s} ts_ms={}: ", .{ diagnostic.tag.label(), diagnostic.ts_ms })
-    else
-        try std.fmt.bufPrint(out, "{s}: ", .{diagnostic.tag.label()});
-    const message = diagnostic.slice();
-    if (prefix.len + message.len > out.len) return error.NoSpaceLeft;
-    @memcpy(out[prefix.len .. prefix.len + message.len], message);
-    return out[0 .. prefix.len + message.len];
-}
-
 fn encodeMuxProxyDataPayload(allocator: std.mem.Allocator, offset: u64, data: []const u8) ![]u8 {
-    return protocol.encodePayload(allocator, pb.DaemonTunnelItem{
-        .payload = .{ .mux_stream = .{
-            .stream_id = proxy_mux_stream_id,
-            .message = .{ .payload = .{
-                .offset = offset,
-                .item = .{ .proxy = .{ .payload = .{ .data = data } } },
-            } },
+    return protocol.encodeMuxStreamFramePayload(allocator, .{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .payload = .{
+            .offset = offset,
+            .item = .{ .proxy = .{ .payload = .{ .data = data } } },
         } },
     });
 }
 
 fn encodeMuxProxyEofPayload(allocator: std.mem.Allocator, offset: u64) ![]u8 {
-    return protocol.encodePayload(allocator, pb.DaemonTunnelItem{
-        .payload = .{ .mux_stream = .{
-            .stream_id = proxy_mux_stream_id,
-            .message = .{ .eof = .{ .final_offset = offset } },
-        } },
+    return protocol.encodeMuxStreamFramePayload(allocator, .{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .eof = .{ .final_offset = offset } },
     });
 }
 
 fn encodeMuxAckPayload(allocator: std.mem.Allocator, recv_next_offset: u64) ![]u8 {
-    return protocol.encodePayload(allocator, pb.DaemonTunnelItem{
-        .payload = .{ .mux_stream = .{
-            .stream_id = proxy_mux_stream_id,
-            .message = .{ .ack = .{
-                .recv_next_offset = recv_next_offset,
-                .receive_window_bytes = max_buffered_bytes,
-            } },
+    return protocol.encodeMuxStreamFramePayload(allocator, .{
+        .stream_id = proxy_mux_stream_id,
+        .message = .{ .ack = .{
+            .recv_next_offset = recv_next_offset,
         } },
     });
 }
 
 fn expectMuxStreamFrame(fd: c.fd_t) !pb.DaemonTunnelItem.MuxStreamFrame {
-    var frame = try readFrameForTest(fd);
+    var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, fd);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.daemon_tunnel, frame.message_type);
     var mux = try protocol.decodeDaemonMuxStreamFrame(std.testing.allocator, frame.payload);
@@ -2630,36 +1671,6 @@ fn expectResetFrame(fd: c.fd_t, expected_code: []const u8) !void {
     }
 }
 
-test "raw duplex propagates right-side eof to the left peer" {
-    const left_input = try posix.pipe();
-    posix.close(left_input[1]);
-    defer posix.close(left_input[0]);
-
-    var left_output: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &left_output) != 0) return error.SocketPairFailed;
-    defer _ = c.close(left_output[0]);
-    defer _ = c.close(left_output[1]);
-
-    var right: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &right) != 0) return error.SocketPairFailed;
-    defer _ = c.close(right[0]);
-
-    _ = c.close(right[1]);
-    right[1] = -1;
-
-    try forwardRawDuplex(left_input[0], left_output[0], right[0]);
-
-    var pollfds = [_]posix.pollfd{.{
-        .fd = left_output[1],
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 0));
-
-    var byte: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(isize, 0), c.read(left_output[1], &byte, byte.len));
-}
-
 test "stream frames round trip through a pipe" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
@@ -2678,33 +1689,18 @@ test "stream ping receives pong without changing offsets" {
 
     var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
     defer state.deinit();
-    const payload = try protocol.encodePayload(std.testing.allocator, pb.DaemonTunnelItem{ .payload = .{ .ping = .{} } });
+    const payload = try protocol.encodeDaemonTunnelPayload(std.testing.allocator, .{ .ping = .{} });
     const options = StreamAttachedClientOptions{};
     try handleFrame(&state, fds[1], &options, .{
         .message_type = .daemon_tunnel,
         .payload = payload,
     });
 
-    var frame = try readFrameForTest(fds[0]);
+    var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.daemon_tunnel, frame.message_type);
     try std.testing.expectEqual(@as(u64, 0), state.inbound.recv_next_offset);
     try std.testing.expectEqual(@as(u64, 0), state.outbound.outboundNext());
-}
-
-// BLOCKING_FRAME_READ: test-only frame reader.
-fn readFrameForTest(fd: c.fd_t) !protocol.OwnedFrame {
-    var reader = protocol.FrameReader.init(std.testing.allocator);
-    defer reader.deinit();
-    while (true) {
-        switch (try reader.readBlocking(fd)) {
-            .blocked => return error.WouldBlock,
-            .progress => continue,
-            .frame => |frame| return frame,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
-        }
-    }
 }
 
 test "stream sender sends only newly appended bytes on a live transport" {
@@ -2752,7 +1748,7 @@ test "stream receiver keeps suffix from overlapping data frame" {
     try expectAckFrame(ack[0], 11);
 }
 
-test "stream inbound eof promptly flushes generated outbound eof" {
+test "stream inbound eof can complete without generated outbound eof ack" {
     const transport_in = try posix.pipe();
     defer posix.close(transport_in[0]);
     defer posix.close(transport_in[1]);
@@ -2773,7 +1769,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
         .transport_read_fd = transport_in[0],
         .transport_write_fd = transport_out[1],
         .transport_reader = protocol.FrameReader.init(std.testing.allocator),
-        .control_reader = proxy_control.Reader.init(std.testing.allocator),
+        .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
         .options = .{
             .close_outbound_on_inbound_eof = true,
         },
@@ -2781,7 +1777,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
     };
     defer attached_client.deinit();
 
-    try std.testing.expectEqual(StreamStepOutcome.progress, try attached_client.step(1_000));
+    try std.testing.expectEqual(StreamStepOutcome.complete, try attached_client.step(1_000));
 
     try expectAckFrame(transport_out[0], 0);
 
@@ -2790,9 +1786,7 @@ test "stream inbound eof promptly flushes generated outbound eof" {
         .events = posix.POLL.IN,
         .revents = 0,
     }};
-    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 0));
-
-    try expectProxyEofFrame(transport_out[0], 0);
+    try std.testing.expectEqual(@as(usize, 0), try posix.poll(&pollfds, 0));
 }
 
 test "stream source eof can reset proxy stream" {
@@ -2816,7 +1810,7 @@ test "stream source eof can reset proxy stream" {
         .transport_read_fd = transport_in[0],
         .transport_write_fd = transport_out[1],
         .transport_reader = protocol.FrameReader.init(std.testing.allocator),
-        .control_reader = proxy_control.Reader.init(std.testing.allocator),
+        .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
         .options = .{
             .source = .{ .fd = source[0] },
             .reset_on_source_eof = true,
@@ -2827,6 +1821,20 @@ test "stream source eof can reset proxy stream" {
 
     try std.testing.expectEqual(StreamStepOutcome.complete, try attached_client.step(1_000));
     try expectResetFrame(transport_out[0], "SOURCE_CLOSED");
+}
+
+test "disconnected proxy stream notices source eof before retry" {
+    const source = try posix.pipe();
+    defer posix.close(source[0]);
+    posix.close(source[1]);
+
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    defer state.deinit();
+    var input_control = StreamInputControl{ .enabled = false };
+
+    try std.testing.expect(try disconnectedSourceClosed(&state, source[0], &input_control));
+    try std.testing.expect(state.source_eof);
+    try std.testing.expect(state.outbound.outbound_eof);
 }
 
 test "stream reset completes proxy stream" {
@@ -2848,13 +1856,42 @@ test "stream reset completes proxy stream" {
         .transport_read_fd = transport_in[0],
         .transport_write_fd = transport_out[1],
         .transport_reader = protocol.FrameReader.init(std.testing.allocator),
-        .control_reader = proxy_control.Reader.init(std.testing.allocator),
+        .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
         .options = .{},
         .liveness = StreamLiveness.init(1_000),
     };
     defer attached_client.deinit();
 
     try std.testing.expectEqual(StreamStepOutcome.complete, try attached_client.step(1_000));
+}
+
+test "proxy mux close resets unrecorded remote process startup" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    closeProxyMuxStream(std.testing.allocator, .{
+        .stream_id = 42,
+        .process_fd = fds[1],
+        .open = .{},
+        .cleanup_recorded = false,
+    }, true, null);
+
+    try expectResetFrame(fds[0], "STARTUP_FAILED");
+}
+
+test "proxy mux close after cleanup record sends no startup reset" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    closeProxyMuxStream(std.testing.allocator, .{
+        .stream_id = 42,
+        .process_fd = fds[1],
+        .open = .{},
+        .cleanup_recorded = true,
+    }, true, null);
+
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), c.read(fds[0], &byte, byte.len));
 }
 
 test "stream liveness schedules probes before declaring unresponsive" {
@@ -2954,324 +1991,28 @@ test "stream completion waits for eof acknowledgement" {
     try std.testing.expect(state.complete());
 }
 
-test "stream reconnect status uses plain stderr lines" {
-    client_log.markUserDiagnosticsDisplayedThrough(client_log.currentUserDiagnosticSeq());
+test "stream inbound eof can complete outbound when caller closes outbound on inbound eof" {
+    const sink = try posix.pipe();
+    defer posix.close(sink[0]);
+    defer posix.close(sink[1]);
+    const ack = try posix.pipe();
+    defer posix.close(ack[0]);
+    defer posix.close(ack[1]);
 
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
+    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    defer state.deinit();
+    try state.appendOutbound("unsent local input");
 
-    var status = StreamReconnectStatus.initForTest(fds[1], .stderr_plain, false, "");
-    status.showRetry(1_000);
-    status.showRetry(500);
-    status.showReconnecting();
-    status.clear();
-    posix.close(fds[1]);
+    const payload = try encodeMuxProxyEofPayload(std.testing.allocator, 0);
+    const options = StreamAttachedClientOptions{
+        .sink = .{ .fd = sink[1] },
+        .close_outbound_on_inbound_eof = true,
+    };
+    try handleFrame(&state, ack[1], &options, .{
+        .message_type = .daemon_tunnel,
+        .payload = payload,
+    });
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fds[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expectEqualStrings(
-        "sessh: disconnected: Retry connecting 1sec\r\n" ++
-            "sessh: disconnected: Reconnecting...\r\n",
-        output.items,
-    );
-}
-
-test "stream reconnect status line redraws in place" {
-    client_log.markUserDiagnosticsDisplayedThrough(client_log.currentUserDiagnosticSeq());
-
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var status = StreamReconnectStatus.initForTest(fds[1], .status_line, false, "");
-    status.showRetry(2_000);
-    status.showRetry(1_000);
-    status.clear();
-    posix.close(fds[1]);
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fds[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "\r\x1b[Ksessh: disconnected: Retry connecting 2sec") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "\r\x1b[Ksessh: disconnected: Retry connecting 1sec") != null);
-    try std.testing.expect(std.mem.endsWith(u8, output.items, "\r\x1b[K"));
-}
-
-test "stream reconnect status emits one jsonl retry per wait" {
-    client_log.markUserDiagnosticsDisplayedThrough(client_log.currentUserDiagnosticSeq());
-
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var status = StreamReconnectStatus.initForTest(fds[1], .jsonl, false, "");
-    status.showRetry(2_000);
-    status.showRetry(1_000);
-    status.showReconnecting();
-    status.clear();
-    posix.close(fds[1]);
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fds[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.items, "\"event\":\"retry\""));
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "\"retry_at_unix_ms\":") != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.items, "\"event\":\"reconnecting\""));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.items, "\"event\":\"connected\""));
-}
-
-test "disabled stream reconnect status emits no UI" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var status = StreamReconnectStatus.initForTest(fds[1], .disabled, true, "test-host");
-    status.showRetry(1_000);
-    status.showReconnecting();
-    status.showEscapeHelp();
-    status.clear();
-    posix.close(fds[1]);
-
-    var buf: [16]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    try std.testing.expectEqual(@as(usize, 0), n);
-}
-
-test "stream reconnect status emits client control messages" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var status = StreamReconnectStatus.initForTest(fds[1], .client_control, true, "");
-    status.showRetry(1_000);
-    status.showReconnecting();
-    status.clear();
-    posix.close(fds[1]);
-
-    var saw_disconnected = false;
-    var saw_reconnecting = false;
-    var saw_connected = false;
-    while (true) {
-        var message = proxy_control.readMessage(std.testing.allocator, fds[0]) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        defer message.deinit(std.testing.allocator);
-
-        switch (message.message) {
-            .connection_event => |event| {
-                switch (event.event orelse continue) {
-                    .daemon_disconnected => |disconnected| {
-                        try std.testing.expect(disconnected.retry_at_local_boot_time_ms != null);
-                        saw_disconnected = true;
-                    },
-                    .daemon_connecting => saw_reconnecting = true,
-                    .daemon_connected => saw_connected = true,
-                    else => {},
-                }
-            },
-            .retry_now => {},
-        }
-    }
-
-    try std.testing.expect(saw_disconnected);
-    try std.testing.expect(saw_reconnecting);
-    try std.testing.expect(saw_connected);
-}
-
-test "stream reconnect status restores tracked application title" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
-    status.observeInbound("\x1b]2;remote");
-    status.observeInbound("-title\x1b\\");
-    status.showRetry(10_000);
-    status.clear();
-    posix.close(fds[1]);
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fds[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expectEqualStrings(
-        "\x1b]2;10sec retry CTRL-R\x1b\\\x1b]2;remote-title\x1b\\",
-        output.items,
-    );
-}
-
-test "stream reconnect status uses fallback title when app set none" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
-    status.showRetry(10_000);
-    status.clear();
-    posix.close(fds[1]);
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fds[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expectEqualStrings(
-        "\x1b]2;10sec retry CTRL-R\x1b\\\x1b]2;test-host\x1b\\",
-        output.items,
-    );
-}
-
-test "stream reconnect status skips title while terminal parser is unsafe" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
-    status.observeInbound("\x1b]2;partial-title");
-    status.showRetry(10_000);
-    status.clear();
-    posix.close(fds[1]);
-
-    var buf: [16]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    try std.testing.expectEqual(@as(usize, 0), n);
-}
-
-test "stream escape help waits for terminal parser safe point" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-    try setNonBlockingFd(fds[0]);
-
-    var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
-    status.observeInbound("\x1b]2;partial-title");
-    status.showEscapeHelp();
-
-    var empty_buf: [16]u8 = undefined;
-    try std.testing.expectError(error.WouldBlock, posix.read(fds[0], &empty_buf));
-
-    status.observeInbound("\x1b\\");
-    posix.close(fds[1]);
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fds[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "Supported escape sequences") != null);
-}
-
-test "stream reconnect status treats synchronized update as unsafe for title" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var status = StreamReconnectStatus.initForTest(fds[1], .title, true, "test-host");
-    status.observeInbound("\x1b[?2026h");
-    status.showRetry(10_000);
-    status.clear();
-    status.observeInbound("\x1b[?2026l");
-    status.showRetry(10_000);
-    status.clear();
-    posix.close(fds[1]);
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fds[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expectEqualStrings(
-        "\x1b]2;10sec retry CTRL-R\x1b\\\x1b]2;test-host\x1b\\",
-        output.items,
-    );
-}
-
-test "stream reconnect status renders ssh diagnostics before status" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var status = StreamReconnectStatus.initForTest(fds[1], .stderr_plain, false, "");
-    client_log.appendSshStderr("control sequence: \x1b[31mred\n");
-    status.showRetry(1_000);
-    status.clear();
-    posix.close(fds[1]);
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fds[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expectEqualStrings(
-        "ssh: control sequence: ?[31mred\r\n" ++
-            "sessh: disconnected: Retry connecting 1sec\r\n",
-        output.items,
-    );
-}
-
-test "stream reconnect status appends diagnostics after status line" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    client_log.markUserDiagnosticsDisplayedThrough(client_log.currentUserDiagnosticSeq());
-    var status = StreamReconnectStatus.initForTest(fds[1], .stderr_plain, false, "");
-    status.showRetry(1_000);
-    client_log.appendSshStderr("connection failed\n");
-    status.flushDiagnostics();
-    posix.close(fds[1]);
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fds[0], &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
-    }
-
-    try std.testing.expectEqualStrings(
-        "sessh: disconnected: Retry connecting 1sec\r\n" ++
-            "ssh: connection failed\r\n",
-        output.items,
-    );
+    try std.testing.expect(state.complete());
+    try std.testing.expectEqual(@as(usize, 0), state.outbound.outbound.items.len);
 }

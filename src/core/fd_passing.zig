@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
+const core_fds = @import("fds.zig");
 const io = @import("io.zig");
 
 // Local reimplementation of the small `sys/socket.h` CMSG_* macro subset we
@@ -489,4 +490,144 @@ test "sendBufferWithFdProgress transfers a usable descriptor" {
     const n = c.read(raw[1], &raw_buf, raw_buf.len);
     if (n < 0) return error.ReadFailed;
     try std.testing.expectEqualStrings("raw-bytes", raw_buf[0..@intCast(n)]);
+}
+
+test "sendBufferWithFdProgress takes ownership after accepted send" {
+    var control: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &control) != 0) return error.SocketPairFailed;
+    defer _ = c.close(control[0]);
+    defer _ = c.close(control[1]);
+
+    var raw: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &raw) != 0) return error.SocketPairFailed;
+    defer _ = c.close(raw[1]);
+
+    const sender_fd = raw[0];
+    var send_progress = SendBufferWithFdProgress.init("x", sender_fd);
+    defer send_progress.deinit();
+    while (true) {
+        switch (try sendBufferWithFdProgress(control[0], &send_progress)) {
+            .blocked, .progress => continue,
+            .complete => break,
+            .eof => unreachable,
+        }
+    }
+    try std.testing.expectEqual(@as(?c.fd_t, null), send_progress.fd);
+    const write_after_close = c.write(sender_fd, "closed", 6);
+    try std.testing.expect(write_after_close < 0);
+    try std.testing.expectEqual(posix.E.BADF, posix.errno(write_after_close));
+
+    var buf: [1]u8 = undefined;
+    var recv_progress = RecvBufferWithFdProgress.init(&buf, null);
+    defer recv_progress.deinit();
+    while (true) {
+        switch (try recvBufferWithFdProgress(control[1], &recv_progress)) {
+            .blocked, .progress => continue,
+            .complete => break,
+            .eof => return error.UnexpectedEndOfStream,
+        }
+    }
+    const received_fd = recv_progress.takeFd() orelse return error.MissingFileDescriptor;
+    defer _ = c.close(received_fd);
+    try io.writeAll(received_fd, "still-open");
+}
+
+test "sendBufferWithFdProgress supports partial byte progress after fd transfer" {
+    var control: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &control) != 0) return error.SocketPairFailed;
+    defer _ = c.close(control[0]);
+    defer _ = c.close(control[1]);
+
+    var small_send_buffer: c_int = 4096;
+    const set_result = c.setsockopt(
+        control[0],
+        c.SOL.SOCKET,
+        c.SO.SNDBUF,
+        &small_send_buffer,
+        @sizeOf(c_int),
+    );
+    if (set_result != 0) return error.SetSockOptFailed;
+    try core_fds.setNonBlocking(control[0]);
+
+    var raw: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &raw) != 0) return error.SocketPairFailed;
+    defer _ = c.close(raw[1]);
+
+    const payload = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+
+    const sender_fd = raw[0];
+    var send_progress = SendBufferWithFdProgress.init(payload, sender_fd);
+    defer send_progress.deinit();
+    const status = try sendBufferWithFdProgress(control[0], &send_progress);
+
+    try std.testing.expectEqual(BufferProgressStatus.progress, status);
+    try std.testing.expect(send_progress.offset > 0);
+    try std.testing.expect(send_progress.offset < payload.len);
+    try std.testing.expectEqual(@as(?c.fd_t, null), send_progress.fd);
+    const write_after_close = c.write(sender_fd, "closed", 6);
+    try std.testing.expect(write_after_close < 0);
+    try std.testing.expectEqual(posix.E.BADF, posix.errno(write_after_close));
+
+    var first_byte: [1]u8 = undefined;
+    var recv_progress = RecvBufferWithFdProgress.init(&first_byte, null);
+    defer recv_progress.deinit();
+    while (true) {
+        switch (try recvBufferWithFdProgress(control[1], &recv_progress)) {
+            .blocked, .progress => continue,
+            .complete => break,
+            .eof => return error.UnexpectedEndOfStream,
+        }
+    }
+    const received_fd = recv_progress.takeFd() orelse return error.MissingFileDescriptor;
+    defer _ = c.close(received_fd);
+}
+
+test "recvBufferWithFdProgress returns fd with the bytes that carried it" {
+    var control: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &control) != 0) return error.SocketPairFailed;
+    defer _ = c.close(control[0]);
+    defer _ = c.close(control[1]);
+
+    var raw: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &raw) != 0) return error.SocketPairFailed;
+    defer _ = c.close(raw[1]);
+
+    var send_progress = SendBufferWithFdProgress.init("abcd", raw[0]);
+    defer send_progress.deinit();
+    while (true) {
+        switch (try sendBufferWithFdProgress(control[0], &send_progress)) {
+            .blocked, .progress => continue,
+            .complete => break,
+            .eof => unreachable,
+        }
+    }
+
+    var first_byte: [1]u8 = undefined;
+    var recv_first = RecvBufferWithFdProgress.init(&first_byte, null);
+    defer recv_first.deinit();
+    while (true) {
+        switch (try recvBufferWithFdProgress(control[1], &recv_first)) {
+            .blocked, .progress => continue,
+            .complete => break,
+            .eof => return error.UnexpectedEndOfStream,
+        }
+    }
+    try std.testing.expectEqualStrings("a", first_byte[0..recv_first.offset]);
+    const received_fd = recv_first.takeFd() orelse return error.MissingFileDescriptor;
+    defer _ = c.close(received_fd);
+
+    var rest: [3]u8 = undefined;
+    var recv_rest = RecvBufferWithFdProgress.init(&rest, null);
+    defer recv_rest.deinit();
+    while (true) {
+        switch (try recvBufferWithFdProgress(control[1], &recv_rest)) {
+            .blocked, .progress => continue,
+            .complete => break,
+            .eof => return error.UnexpectedEndOfStream,
+        }
+    }
+    try std.testing.expectEqualStrings("bcd", rest[0..recv_rest.offset]);
+    try std.testing.expectEqual(@as(?c.fd_t, null), recv_rest.fd);
 }

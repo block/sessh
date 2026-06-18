@@ -879,7 +879,7 @@ pub const ClientDaemonItem = struct {
 
     pub const _payload_case = enum {
         ssh_transport_acquire,
-        proxy_control_open,
+        proxy_diagnostics_open,
         proxy_fd_pass_open,
         proxy_fd_pass_accepted,
         log_request,
@@ -889,7 +889,7 @@ pub const ClientDaemonItem = struct {
     };
     pub const payload_union = union(_payload_case) {
         ssh_transport_acquire: ClientDaemonItem.SshTransportAcquire,
-        proxy_control_open: ClientDaemonItem.ProxyControlOpen,
+        proxy_diagnostics_open: ClientDaemonItem.ProxyDiagnosticsOpen,
         proxy_fd_pass_open: ClientDaemonItem.ProxyFdPassOpen,
         proxy_fd_pass_accepted: ClientDaemonItem.ProxyFdPassAccepted,
         log_request: ClientDaemonItem.DaemonLogRequest,
@@ -898,7 +898,7 @@ pub const ClientDaemonItem = struct {
         retry_now: ClientDaemonItem.RetryNow,
         pub const _desc_table = .{
             .ssh_transport_acquire = fd(1, .submessage),
-            .proxy_control_open = fd(2, .submessage),
+            .proxy_diagnostics_open = fd(2, .submessage),
             .proxy_fd_pass_open = fd(3, .submessage),
             .proxy_fd_pass_accepted = fd(4, .submessage),
             .log_request = fd(10, .submessage),
@@ -913,9 +913,14 @@ pub const ClientDaemonItem = struct {
     };
 
     /// Local visible-client -> local daemon request to acquire an SSH-backed
-    /// transport to a remote sesshd. The client may immediately pipeline stream
-    /// frames after this request; the local daemon queues them behind tunnel setup
-    /// and forwards them over ssh when the remote daemon endpoint is ready.
+    /// transport to a remote sesshd, plus the per-client context the daemon needs
+    /// for stream opens queued behind that acquisition. Only host/bootstrap/IPQoS
+    /// and the daemon's resolved target identity participate in the pooled
+    /// transport reuse key. Other fields configure a newly-started child ssh
+    /// process or annotate cleanup/environment behavior for the streams that
+    /// follow. The client may immediately pipeline stream frames after this
+    /// request; the local daemon queues them behind tunnel setup and forwards them
+    /// over ssh when the remote daemon endpoint is ready.
     pub const SshTransportAcquire = struct {
         ssh_option: std.ArrayListUnmanaged([]const u8) = .empty,
         host: []const u8 = &.{},
@@ -1201,7 +1206,7 @@ pub const ClientDaemonItem = struct {
     /// The ProxyCommand process does not send this: its normal ProxyStreamItem.Open
     /// already carries the same p-guid, so sesshd can attach this control channel
     /// to the in-memory proxy stream.
-    pub const ProxyControlOpen = struct {
+    pub const ProxyDiagnosticsOpen = struct {
         proxy_guid: []const u8 = &.{},
 
         pub const _desc_table = .{
@@ -1743,15 +1748,13 @@ pub const DaemonTunnelItem = struct {
         };
 
         /// Opens or resumes a mux stream. Application-specific open details are
-        /// carried as typed payload items, not in the mux envelope, so this layer only
-        /// tracks resume and backpressure state.
+        /// carried as typed payload items, not in the mux envelope, so this layer
+        /// only tracks the peer's durable receive offset.
         pub const Open = struct {
             recv_next_offset: u64 = 0,
-            receive_window_bytes: u32 = 0,
 
             pub const _desc_table = .{
                 .recv_next_offset = fd(1, .{ .scalar = .uint64 }),
-                .receive_window_bytes = fd(2, .{ .scalar = .uint32 }),
             };
 
             /// Encodes the message to the writer
@@ -1815,14 +1818,12 @@ pub const DaemonTunnelItem = struct {
 
         /// Accepts a mux stream open and reports the acceptor's receive state. This
         /// is not a required round-trip barrier; peers may pipeline payload after
-        /// open when they already have credit.
+        /// open when they already know the peer's receive offset.
         pub const OpenOk = struct {
             recv_next_offset: u64 = 0,
-            receive_window_bytes: u32 = 0,
 
             pub const _desc_table = .{
                 .recv_next_offset = fd(1, .{ .scalar = .uint64 }),
-                .receive_window_bytes = fd(2, .{ .scalar = .uint32 }),
             };
 
             /// Encodes the message to the writer
@@ -1971,11 +1972,9 @@ pub const DaemonTunnelItem = struct {
 
         pub const Ack = struct {
             recv_next_offset: u64 = 0,
-            receive_window_bytes: u32 = 0,
 
             pub const _desc_table = .{
                 .recv_next_offset = fd(1, .{ .scalar = .uint64 }),
-                .receive_window_bytes = fd(2, .{ .scalar = .uint32 }),
             };
 
             /// Encodes the message to the writer
@@ -2786,8 +2785,9 @@ pub const DaemonTunnelItem = struct {
     }
 };
 
-/// Ordered terminal-emulator protocol item. Direct local IPC can carry this as a
-/// top-level Frame payload; mux tunnels carry it inside MuxStreamFrame.Payload.
+/// Ordered terminal-emulator protocol item. On local client/daemon IPC this is
+/// carried by Frame.client_remote. Across daemon-to-daemon tunnels it is carried
+/// inside DaemonTunnelItem.MuxStreamFrame.Payload.
 pub const TerminalEmulatorItem = struct {
     payload: ?payload_union = null,
 
@@ -2844,7 +2844,7 @@ pub const TerminalEmulatorItem = struct {
         .payload = fd(null, .{ .oneof = payload_union }),
     };
 
-    /// Terminal-emulator open details for a direct connection or mux stream.
+    /// Terminal-emulator open details for a client/daemon connection or mux stream.
     pub const Open = struct {
         session_guid: []const u8 = &.{},
         resize: ?TerminalEmulatorItem.Resize = null,
@@ -4395,8 +4395,11 @@ pub const TerminalEmulatorItem = struct {
     }
 };
 
-/// Ordered proxy byte-stream item. Data is offset-free here; mux offsets live in
-/// MuxStreamFrame.Payload, and direct local IPC relies on socket ordering.
+/// Ordered proxy byte-stream item. On local client/daemon IPC this is carried by
+/// Frame.client_remote. Across daemon-to-daemon tunnels it is carried inside
+/// DaemonTunnelItem.MuxStreamFrame.Payload. Data is offset-free here; mux
+/// offsets live in MuxStreamFrame.Payload, and local IPC relies on socket
+/// ordering.
 pub const ProxyStreamItem = struct {
     payload: ?payload_union = null,
 

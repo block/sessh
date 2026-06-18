@@ -10,7 +10,9 @@ pub const Entrypoint = enum {
 
     pub fn arg(self: Entrypoint) []const u8 {
         return switch (self) {
-            .broker => ":broker:",
+            // Role process for the daemon-to-daemon tunnel bridge. The name is
+            // about brokering tunnel bytes across ssh stdio, not owning sessions.
+            .broker => "sessh-broker",
         };
     }
 };
@@ -24,23 +26,18 @@ pub fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []const u8) ![]u8 {
-    return directEntrypointCommand(allocator, .broker, broker_args);
-}
-
-pub fn directEntrypointCommand(
-    allocator: std.mem.Allocator,
-    entrypoint: Entrypoint,
-    entrypoint_args: []const []const u8,
-) ![]u8 {
+    // `--no-bootstrap` can only assume a `sessh` executable is already on the
+    // remote PATH. The bootstrapped path uses the `sessh-broker` role name;
+    // this fallback enters broker mode through `sessh` itself and immediately
+    // re-execs the role symlink once the remote namespace is known.
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(allocator);
     const client_version = try shellQuote(allocator, config.version);
     defer allocator.free(client_version);
     try script.appendSlice(allocator, "SESSH_CLIENT_VERSION=");
     try script.appendSlice(allocator, client_version);
-    try script.appendSlice(allocator, " exec sessh ");
-    try script.appendSlice(allocator, entrypoint.arg());
-    for (entrypoint_args) |arg| {
+    try script.appendSlice(allocator, " exec sessh :broker:");
+    for (broker_args) |arg| {
         const quoted = try shellQuote(allocator, arg);
         defer allocator.free(quoted);
         try script.append(allocator, ' ');

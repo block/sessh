@@ -6,13 +6,15 @@ const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
+const protocol_test_helpers = @import("../protocol/test_helpers.zig");
 const frame_forwarder = @import("../transport/frame_forwarder.zig");
+const frame_write_queue = @import("../transport/frame_write_queue.zig");
 const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
 const session_runtime = @import("runtime.zig");
 const session_runtime_process = @import("runtime_process.zig");
-const session_registry = @import("../runtime/session_registry.zig");
+const guid_ref = @import("../core/guid.zig");
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
@@ -90,9 +92,13 @@ pub fn registerFrameWithTerminalRemoteFromDaemon(
 
     var session_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, open_payload);
     defer session_open.deinit(allocator);
-    try protocol.sendTeStreamPayloadFrame(allocator, process_fd, .{ .open = session_open });
+    const client_remote_payload = try protocol.encodeTerminalEmulatorItemPayload(allocator, .{ .payload = .{ .open = session_open } });
+    defer allocator.free(client_remote_payload);
+    const initial_write = try protocol.FrameWriteState.init(allocator, .client_remote, client_remote_payload);
 
-    try frame_forwarder.registerFrameRelay(allocator, daemon_dispatcher, client_fd, process_fd);
+    try frame_forwarder.registerFrameRelayWithInitialWrites(allocator, daemon_dispatcher, client_fd, process_fd, .{
+        .left_to_right = initial_write,
+    });
     owns_client_fd = false;
     owns_process_fd = false;
 }
@@ -140,8 +146,10 @@ pub fn registerDebugFrameWithTerminalRemoteFromDaemon(
         if (owns_process_fd) _ = c.close(process_fd);
     }
 
-    try protocol.sendFrame(process_fd, frame.message_type, frame.payload);
-    try frame_forwarder.registerFrameRelay(allocator, daemon_dispatcher, client_fd, process_fd);
+    const initial_write = try protocol.FrameWriteState.init(allocator, frame.message_type, frame.payload);
+    try frame_forwarder.registerFrameRelayWithInitialWrites(allocator, daemon_dispatcher, client_fd, process_fd, .{
+        .left_to_right = initial_write,
+    });
     owns_client_fd = false;
     owns_process_fd = false;
 }
@@ -152,6 +160,8 @@ pub const TerminalMuxStream = struct {
     process_watch_id: ?dispatcher.FdWatchId = null,
     reader: protocol.FrameReader = undefined,
     reader_initialized: bool = false,
+    process_writer: frame_write_queue.FrameWriteQueue = undefined,
+    writer_initialized: bool = false,
     session_guid: []u8 = &.{},
     inbound_next_offset: u64 = 0,
     outbound_next_offset: u64 = 0,
@@ -186,6 +196,7 @@ pub fn closeTerminalMuxStream(
     }
     var moved_stream = stream;
     if (moved_stream.reader_initialized) moved_stream.reader.deinit();
+    if (moved_stream.writer_initialized) moved_stream.process_writer.deinit();
     if (stream.session_guid.len != 0) allocator.free(stream.session_guid);
 }
 
@@ -194,7 +205,7 @@ pub fn handleTerminalMuxStreamFrame(
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     sessions: *std.ArrayList(TerminalMuxStream),
-    mux_fd: c.fd_t,
+    mux_writer: *frame_write_queue.FrameWriteQueue,
     mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
     process_watch_handler: ?dispatcher.Handler,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
@@ -204,10 +215,10 @@ pub fn handleTerminalMuxStreamFrame(
     const message = owned_mux_frame.message orelse return error.UnexpectedFrame;
     switch (message) {
         .open => |open| handleTerminalMuxOpen(allocator, sessions, owned_mux_frame.stream_id, open) catch |err| {
-            try sendTerminalMuxResetForError(allocator, mux_fd, owned_mux_frame.stream_id, "OPEN_FAILED", err);
+            try sendTerminalMuxResetForError(allocator, mux_writer, owned_mux_frame.stream_id, "OPEN_FAILED", err);
         },
-        .payload => |payload| handleTerminalMuxPayload(allocator, exe, identity, sessions, mux_fd, owned_mux_frame.stream_id, payload, process_watch_handler, daemon_dispatcher) catch |err| {
-            try sendTerminalMuxResetForError(allocator, mux_fd, owned_mux_frame.stream_id, "STREAM_FAILED", err);
+        .payload => |payload| handleTerminalMuxPayload(allocator, exe, identity, sessions, mux_writer, owned_mux_frame.stream_id, payload, process_watch_handler, daemon_dispatcher) catch |err| {
+            try sendTerminalMuxResetForError(allocator, mux_writer, owned_mux_frame.stream_id, "STREAM_FAILED", err);
             try removeTerminalMuxStream(allocator, sessions, owned_mux_frame.stream_id, daemon_dispatcher);
         },
         .ack, .open_ok => {},
@@ -232,7 +243,7 @@ fn handleTerminalMuxPayloadOpen(
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     sessions: *std.ArrayList(TerminalMuxStream),
-    mux_fd: c.fd_t,
+    mux_writer: *frame_write_queue.FrameWriteQueue,
     stream_id: u64,
     payload_offset: u64,
     te_open: pb.TerminalEmulatorItem.Open,
@@ -254,15 +265,20 @@ fn handleTerminalMuxPayloadOpen(
 
     const open_payload = try protocol.encodePayload(allocator, te_open);
     defer allocator.free(open_payload);
+    const remote_payload = if (te_open.create == null)
+        open_payload
+    else
+        try sessionOpenPayloadWithCurrentEnvironment(allocator, open_payload);
+    defer if (te_open.create != null) allocator.free(remote_payload);
 
-    const process_fd = openTerminalMuxStream(allocator, exe, daemon_dispatcher, stream_id, te_open, action, open_payload, open_started_ms) catch |err| switch (err) {
+    const process_fd = openTerminalMuxStream(allocator, exe, daemon_dispatcher, stream_id, te_open, action, remote_payload, open_started_ms) catch |err| switch (err) {
         error.InvalidSessionGuid, error.SessionNotFound => {
             daemon_log.infof(
                 allocator,
                 "terminal mux stream open failed stream_id={} session={s} action={s} error={t}",
                 .{ stream_id, te_open.session_guid, action, err },
             );
-            try sendTerminalMuxReset(allocator, mux_fd, stream_id, "SESSION_NOT_FOUND", "session not found");
+            try sendTerminalMuxReset(allocator, mux_writer, stream_id, "SESSION_NOT_FOUND", "session not found");
             return;
         },
         else => {
@@ -271,7 +287,7 @@ fn handleTerminalMuxPayloadOpen(
                 "terminal mux stream open failed stream_id={} session={s} action={s} error={t}",
                 .{ stream_id, te_open.session_guid, action, err },
             );
-            try sendTerminalMuxResetForError(allocator, mux_fd, stream_id, "OPEN_FAILED", err);
+            try sendTerminalMuxResetForError(allocator, mux_writer, stream_id, "OPEN_FAILED", err);
             return;
         },
     };
@@ -280,19 +296,22 @@ fn handleTerminalMuxPayloadOpen(
         try core_fds.setNonBlocking(process_fd);
     }
 
-    try daemon_cleanup.sendRemoteProcessStarted(
-        allocator,
-        mux_fd,
-        stream_id,
-        daemon_cleanup.makeRemoteProcessIdentity(identity, te_open.session_guid),
-    );
-    try sendTerminalMuxOpenOk(allocator, mux_fd, stream_id);
+    try mux_writer.queueDaemonTunnelPayload(.{ .remote_process_started = .{
+        .stream_id = stream_id,
+        .process = daemon_cleanup.makeRemoteProcessIdentity(identity, te_open.session_guid),
+    } });
+    try sendTerminalMuxOpenOk(allocator, mux_writer, stream_id);
     sessions.items[stream_index].process_fd = process_fd;
+    sessions.items[stream_index].process_writer = frame_write_queue.FrameWriteQueue.init(allocator);
+    sessions.items[stream_index].writer_initialized = true;
+    var remote_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, remote_payload);
+    defer remote_open.deinit(allocator);
+    try queueTerminalProcessPayload(allocator, &sessions.items[stream_index], .{ .open = remote_open });
     if (daemon_dispatcher) |d| {
         const handler = process_watch_handler orelse return error.MissingTerminalRemoteHandler;
         sessions.items[stream_index].reader = protocol.FrameReader.init(allocator);
         sessions.items[stream_index].reader_initialized = true;
-        sessions.items[stream_index].process_watch_id = try d.watchFd(process_fd, .{ .readable = true }, .{
+        sessions.items[stream_index].process_watch_id = try d.watchFd(process_fd, terminalProcessWatchEvents(&sessions.items[stream_index]), .{
             .ctx = handler.ctx,
             .callback = handler.callback,
         });
@@ -314,15 +333,10 @@ fn openTerminalMuxStream(
     stream_id: u64,
     request: pb.TerminalEmulatorItem.Open,
     action: []const u8,
-    open_payload: []const u8,
+    remote_payload: []const u8,
     open_started_ms: i64,
 ) !c.fd_t {
     const prepare_started_ms = std.time.milliTimestamp();
-    const remote_payload = if (request.create == null)
-        open_payload
-    else
-        try sessionOpenPayloadWithCurrentEnvironment(allocator, open_payload);
-    defer if (request.create != null) allocator.free(remote_payload);
     daemon_log.infof(
         allocator,
         "terminal mux remote payload prepared stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
@@ -334,14 +348,10 @@ fn openTerminalMuxStream(
     else
         try startTerminalRemoteAndConnect(allocator, exe, remote_payload, daemon_dispatcher);
     errdefer _ = c.close(process_fd);
-    const send_started_ms = std.time.milliTimestamp();
-    var remote_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, remote_payload);
-    defer remote_open.deinit(allocator);
-    try protocol.sendTeStreamPayloadFrame(allocator, process_fd, .{ .open = remote_open });
     daemon_log.infof(
         allocator,
-        "terminal mux remote open sent stream_id={} session={s} action={s} elapsed_ms={} since_open_ms={}",
-        .{ stream_id, request.session_guid, action, elapsedMsSince(send_started_ms), elapsedMsSince(open_started_ms) },
+        "terminal mux remote open queued stream_id={} session={s} action={s} since_open_ms={}",
+        .{ stream_id, request.session_guid, action, elapsedMsSince(open_started_ms) },
     );
     return process_fd;
 }
@@ -351,14 +361,14 @@ fn handleTerminalMuxPayload(
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     sessions: *std.ArrayList(TerminalMuxStream),
-    mux_fd: c.fd_t,
+    mux_writer: *frame_write_queue.FrameWriteQueue,
     stream_id: u64,
     payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload,
     process_watch_handler: ?dispatcher.Handler,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !void {
     const index = findTerminalMuxStreamIndex(sessions, stream_id) orelse {
-        try sendTerminalMuxReset(allocator, mux_fd, stream_id, "STREAM_NOT_FOUND", "mux stream not found");
+        try sendTerminalMuxReset(allocator, mux_writer, stream_id, "STREAM_NOT_FOUND", "mux stream not found");
         return;
     };
     const item = payload.item orelse return error.UnexpectedFrame;
@@ -369,7 +379,7 @@ fn handleTerminalMuxPayload(
     var stream = &sessions.items[index];
     if (te_item.payload) |te_payload| {
         if (te_payload == .open) {
-            try handleTerminalMuxPayloadOpen(allocator, exe, identity, sessions, mux_fd, stream_id, payload.offset, te_payload.open, process_watch_handler, daemon_dispatcher);
+            try handleTerminalMuxPayloadOpen(allocator, exe, identity, sessions, mux_writer, stream_id, payload.offset, te_payload.open, process_watch_handler, daemon_dispatcher);
             return;
         }
     }
@@ -384,23 +394,65 @@ fn handleTerminalMuxPayload(
             );
         }
     }
-    try protocol.sendTeStreamItemFrame(allocator, stream.process_fd, te_item);
+    try queueTerminalProcessItem(allocator, stream, te_item);
+    if (daemon_dispatcher) |d| try updateTerminalProcessWatch(stream, d);
+}
+
+pub fn drainTerminalProcessWrites(
+    stream: *TerminalMuxStream,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+) !frame_write_queue.WriteQueueStatus {
+    if (!stream.writer_initialized or stream.process_fd < 0) return .drained;
+    const status = try stream.process_writer.writeReady(stream.process_fd);
+    try updateTerminalProcessWatch(stream, daemon_dispatcher);
+    return status;
+}
+
+fn queueTerminalProcessPayload(
+    allocator: std.mem.Allocator,
+    stream: *TerminalMuxStream,
+    payload: protocol.TerminalEmulatorPayload,
+) !void {
+    try queueTerminalProcessItem(allocator, stream, .{ .payload = payload });
+}
+
+fn queueTerminalProcessItem(
+    allocator: std.mem.Allocator,
+    stream: *TerminalMuxStream,
+    item: pb.TerminalEmulatorItem,
+) !void {
+    if (!stream.writer_initialized) return error.TerminalProcessWriterMissing;
+    const encoded = try protocol.encodeTerminalEmulatorItemPayload(allocator, item);
+    defer allocator.free(encoded);
+    try stream.process_writer.queueFrame(.client_remote, encoded);
+}
+
+fn terminalProcessWatchEvents(stream: *const TerminalMuxStream) dispatcher.FdEvents {
+    return .{
+        .readable = true,
+        .writable = stream.writer_initialized and stream.process_writer.hasPending(),
+    };
+}
+
+fn updateTerminalProcessWatch(stream: *TerminalMuxStream, daemon_dispatcher: *dispatcher.Dispatcher) !void {
+    const watch_id = stream.process_watch_id orelse return;
+    try daemon_dispatcher.updateFdEvents(watch_id, terminalProcessWatchEvents(stream));
 }
 
 pub fn forwardTerminalRemoteFrameToMux(
     allocator: std.mem.Allocator,
-    mux_fd: c.fd_t,
+    mux_writer: *frame_write_queue.FrameWriteQueue,
     stream: *TerminalMuxStream,
     frame: *protocol.OwnedFrame,
 ) !bool {
     if (frame.message_type == .error_message) {
-        try sendTerminalMuxReset(allocator, mux_fd, stream.stream_id, "REMOTE_PROCESS_ERROR", "terminal remote process error");
+        try sendTerminalMuxReset(allocator, mux_writer, stream.stream_id, "REMOTE_PROCESS_ERROR", "terminal remote process error");
         return false;
     }
     if (frame.message_type != .client_remote) return error.UnexpectedFrame;
     var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
     defer item.deinit(allocator);
-    try sendTerminalMuxPayload(allocator, mux_fd, stream.stream_id, stream.outbound_next_offset, item);
+    try sendTerminalMuxPayload(allocator, mux_writer, stream.stream_id, stream.outbound_next_offset, item);
     stream.outbound_next_offset +|= 1;
     if (item.payload) |item_payload| {
         if (item_payload == .session_attached and !stream.attached_logged) {
@@ -418,7 +470,7 @@ pub fn forwardTerminalRemoteFrameToMux(
                 "terminal session ended stream_id={} session={s}",
                 .{ stream.stream_id, stream.session_guid },
             );
-            try sendTerminalMuxEof(allocator, mux_fd, stream.stream_id, stream.outbound_next_offset);
+            try sendTerminalMuxEof(allocator, mux_writer, stream.stream_id, stream.outbound_next_offset);
         }
     }
     return true;
@@ -455,24 +507,23 @@ fn removeTerminalMuxStream(
     closeTerminalMuxStream(allocator, stream, true, daemon_dispatcher);
 }
 
-fn sendTerminalMuxOpenOk(allocator: std.mem.Allocator, fd: c.fd_t, stream_id: u64) !void {
-    try sendTerminalMuxFrame(allocator, fd, .{
+fn sendTerminalMuxOpenOk(allocator: std.mem.Allocator, mux_writer: *frame_write_queue.FrameWriteQueue, stream_id: u64) !void {
+    try sendTerminalMuxFrame(allocator, mux_writer, .{
         .stream_id = stream_id,
         .message = .{ .open_ok = .{
             .recv_next_offset = 0,
-            .receive_window_bytes = 0,
         } },
     });
 }
 
 fn sendTerminalMuxPayload(
     allocator: std.mem.Allocator,
-    fd: c.fd_t,
+    mux_writer: *frame_write_queue.FrameWriteQueue,
     stream_id: u64,
     offset: u64,
     item: pb.TerminalEmulatorItem,
 ) !void {
-    try sendTerminalMuxFrame(allocator, fd, .{
+    try sendTerminalMuxFrame(allocator, mux_writer, .{
         .stream_id = stream_id,
         .message = .{ .payload = .{
             .offset = offset,
@@ -481,8 +532,8 @@ fn sendTerminalMuxPayload(
     });
 }
 
-fn sendTerminalMuxEof(allocator: std.mem.Allocator, fd: c.fd_t, stream_id: u64, final_offset: u64) !void {
-    try sendTerminalMuxFrame(allocator, fd, .{
+fn sendTerminalMuxEof(allocator: std.mem.Allocator, mux_writer: *frame_write_queue.FrameWriteQueue, stream_id: u64, final_offset: u64) !void {
+    try sendTerminalMuxFrame(allocator, mux_writer, .{
         .stream_id = stream_id,
         .message = .{ .eof = .{ .final_offset = final_offset } },
     });
@@ -490,12 +541,12 @@ fn sendTerminalMuxEof(allocator: std.mem.Allocator, fd: c.fd_t, stream_id: u64, 
 
 fn sendTerminalMuxReset(
     allocator: std.mem.Allocator,
-    fd: c.fd_t,
+    mux_writer: *frame_write_queue.FrameWriteQueue,
     stream_id: u64,
     code: []const u8,
     message: []const u8,
 ) !void {
-    try sendTerminalMuxFrame(allocator, fd, .{
+    try sendTerminalMuxFrame(allocator, mux_writer, .{
         .stream_id = stream_id,
         .message = .{ .reset = .{
             .code = code,
@@ -506,22 +557,23 @@ fn sendTerminalMuxReset(
 
 fn sendTerminalMuxResetForError(
     allocator: std.mem.Allocator,
-    fd: c.fd_t,
+    mux_writer: *frame_write_queue.FrameWriteQueue,
     stream_id: u64,
     code: []const u8,
     err: anyerror,
 ) !void {
     const message = try std.fmt.allocPrint(allocator, "terminal mux stream failed: {t}", .{err});
     defer allocator.free(message);
-    try sendTerminalMuxReset(allocator, fd, stream_id, code, message);
+    try sendTerminalMuxReset(allocator, mux_writer, stream_id, code, message);
 }
 
-fn sendTerminalMuxFrame(allocator: std.mem.Allocator, fd: c.fd_t, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
-    try protocol.sendMuxStreamFrame(allocator, fd, message);
+fn sendTerminalMuxFrame(allocator: std.mem.Allocator, mux_writer: *frame_write_queue.FrameWriteQueue, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
+    _ = allocator;
+    try mux_writer.queueMuxStreamFrame(message);
 }
 
 fn sendTerminalHangupToRemote(fd: c.fd_t) !void {
-    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fd, .{ .session_hangup_request = .{} });
+    try protocol.sendTerminalEmulatorPayloadFrame(app_allocator.allocator(), fd, .{ .session_hangup_request = .{} });
 }
 
 fn connectTerminalRemoteForOpen(
@@ -529,7 +581,7 @@ fn connectTerminalRemoteForOpen(
     request: pb.TerminalEmulatorItem.Open,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !c.fd_t {
-    if (!session_registry.isValidSessionGuid(request.session_guid)) return error.InvalidSessionGuid;
+    if (!guid_ref.isValidSessionGuid(request.session_guid)) return error.InvalidSessionGuid;
     return session_runtime.connectTerminalRuntime(allocator, daemon_dispatcher, request.session_guid);
 }
 
@@ -544,9 +596,9 @@ fn startTerminalRemoteAndConnect(
     defer request.deinit(allocator);
     if (request.create == null) return error.MissingSessionCreate;
     const guid = if (request.session_guid.len > 0)
-        try session_registry.canonicalGuid(allocator, request.session_guid)
+        try guid_ref.canonicalSessionGuid(allocator, request.session_guid)
     else
-        try session_registry.generateGuid(allocator);
+        try guid_ref.generateSessionGuid(allocator);
     defer allocator.free(guid);
 
     daemon_log.infof(allocator, "terminal session creating session={s}", .{guid});
@@ -641,4 +693,36 @@ fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8
     });
     defer app_allocator.allocator().free(payload);
     try protocol.sendFrame(fd, .error_message, payload);
+}
+
+test "terminal mux close hangs up unrecorded remote process" {
+    const fds = try std.posix.pipe();
+    defer std.posix.close(fds[0]);
+
+    closeTerminalMuxStream(std.testing.allocator, .{
+        .stream_id = 1,
+        .process_fd = fds[1],
+        .cleanup_recorded = false,
+    }, true, null);
+
+    var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, fds[0]);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.client_remote, frame.message_type);
+    var item = try protocol.decodeClientRemoteTerminalEmulatorItem(std.testing.allocator, frame.payload);
+    defer item.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.TerminalEmulatorPayload{ .session_hangup_request = .{} }, item.payload.?);
+}
+
+test "terminal mux close after cleanup record sends no startup hangup" {
+    const fds = try std.posix.pipe();
+    defer std.posix.close(fds[0]);
+
+    closeTerminalMuxStream(std.testing.allocator, .{
+        .stream_id = 1,
+        .process_fd = fds[1],
+        .cleanup_recorded = true,
+    }, true, null);
+
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), c.read(fds[0], &byte, byte.len));
 }

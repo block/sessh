@@ -7,8 +7,10 @@ const daemon = @import("daemon/mod.zig");
 const daemon_client = @import("daemon/client.zig");
 const io = @import("core/io.zig");
 const process_exit = @import("core/process_exit.zig");
+const user_error = @import("core/user_error.zig");
 const session_runtime = @import("session/runtime.zig");
 const session_runtime_process = @import("session/runtime_process.zig");
+const sessh_run = @import("sessh/run.zig");
 const stream_runtime = @import("stream/runtime.zig");
 const terminal = @import("tty/terminal.zig");
 const transport_ssh = @import("transport/ssh.zig");
@@ -23,7 +25,7 @@ pub fn main() !void {
             if (exit_code != 0) std.process.exit(exit_code);
             return;
         }
-        std.debug.print("sessh: error: {t}\n", .{err});
+        user_error.printLine("error: {t}", .{err}) catch {};
         std.process.exit(1);
     };
     app_allocator.deinit();
@@ -66,10 +68,6 @@ fn runMain() !void {
         return daemon.reexecBrokerOrForward(allocator, args[0], args[2..]);
     }
 
-    if (std.mem.eql(u8, args[1], ":proxy:")) {
-        return transport_ssh.runProxyStream(allocator, args[0], args[2..]);
-    }
-
     if (std.mem.eql(u8, args[1], ":terminal-remote:")) {
         return session_runtime_process.run(allocator, args[2..]);
     }
@@ -85,7 +83,7 @@ fn runMain() !void {
     }
     if (topLevelArgIs(args, &.{"--daemon-log"})) return daemon_client.printDaemonLog(allocator, args[0]);
 
-    return transport_ssh.run(allocator, args);
+    return sessh_run.run(allocator, args);
 }
 
 test "sessh top-level options do not match remote command arguments" {
@@ -99,6 +97,36 @@ test "sessh top-level options do not match remote command arguments" {
     try std.testing.expect(!sesshShortVersionRequested(&.{ "sessh-dev", "example.com", "-V" }));
     try std.testing.expect(!sesshShortVersionRequested(&.{ "sessh-dev", "-F", "-V", "example.com" }));
     try std.testing.expect(!sesshShortVersionRequested(&.{ "sessh-dev", "--diagnostics-file", "-V", "example.com" }));
+}
+
+test "user manual documents public usage options and config defaults" {
+    const manual = try std.fs.cwd().readFileAlloc(std.testing.allocator, "docs/USER_MANUAL.md", 256 * 1024);
+    defer std.testing.allocator.free(manual);
+
+    const expected_snippets = [_][]const u8{
+        "sessh [ssh-option ...] destination [command [argument ...]]",
+        "`--log-level quiet|error|warn|info|debug|verbose`",
+        "`--terminal-emulator` / `--no-terminal-emulator`",
+        "`--filter-level unhygienic|hygienic|emulated`",
+        "`--diagnostics-level overlay|status|title|line|jsonl`",
+        "`--isolation-mode full|process|none`",
+        "`--diagnostics-file PATH`",
+        "`--capture-tty-transcript PATH.tar.gz`",
+        "`--daemon-log`",
+        "scrollback-limit=2000",
+        "client-log-level=warn",
+        "bootstrap=true",
+        "terminal-emulator=true",
+        "filter-level=emulated",
+        "diagnostics-level=overlay",
+        "isolation-mode=process",
+        "cleanup-wakeup-interval-hours=1",
+        "cleanup-retry-limit-hours=168",
+        "disconnected-reap-hours=168",
+    };
+    for (expected_snippets) |snippet| {
+        try std.testing.expect(std.mem.indexOf(u8, manual, snippet) != null);
+    }
 }
 
 fn usage(code: u8) !void {
@@ -183,43 +211,79 @@ test {
     _ = @import("core/config.zig");
     _ = @import("core/dispatcher.zig");
     _ = @import("core/fd_passing.zig");
+    _ = @import("core/guid.zig");
     _ = @import("core/io.zig");
     _ = @import("core/local_boot_time.zig");
     _ = @import("core/non_suspending_timer.zig");
     _ = @import("core/process_exit.zig");
     _ = @import("core/shell.zig");
+    _ = @import("core/user_error.zig");
+    _ = @import("daemon/accept.zig");
+    _ = @import("daemon/client_router.zig");
     _ = @import("daemon/client.zig");
+    _ = @import("daemon/cleanup.zig");
+    _ = @import("daemon/cleanup_scheduler.zig");
     _ = @import("daemon/executable.zig");
     _ = @import("daemon/log.zig");
     _ = @import("daemon/mod.zig");
+    _ = @import("daemon/shutdown.zig");
+    _ = @import("daemon/tunnel.zig");
+    _ = @import("diagnostics/display.zig");
     _ = @import("diagnostics/file.zig");
     _ = @import("diagnostics/jsonl.zig");
     _ = @import("diagnostics/policy.zig");
+    _ = @import("diagnostics/reconnect_input.zig");
+    _ = @import("protocol/frame.zig");
+    _ = @import("protocol/handshake.zig");
     _ = @import("protocol/mod.zig");
+    _ = @import("protocol/test_helpers.zig");
+    _ = @import("protocol/typed_send.zig");
     _ = @import("reconnect/control.zig");
     _ = @import("reconnect/mod.zig");
     _ = @import("reconnect/title.zig");
-    _ = @import("runtime/session_registry.zig");
     _ = @import("sessh/cli.zig");
+    _ = @import("sessh/routing.zig");
+    _ = @import("sessh/routing_tests.zig");
     _ = @import("session/attached_client.zig");
     _ = @import("session/runtime.zig");
+    _ = @import("session/runtime_requests.zig");
+    _ = @import("session/terminal_runtime.zig");
     _ = @import("session/daemon_handler.zig");
     _ = @import("session/client_config.zig");
     _ = @import("session/client_ui.zig");
+    _ = @import("session/connection_monitor.zig");
+    _ = @import("session/error_payload.zig");
+    _ = @import("session/input_ack.zig");
+    _ = @import("session/input_translation.zig");
+    _ = @import("session/local_terminal.zig");
+    _ = @import("session/overlay.zig");
+    _ = @import("session/presentation_guard.zig");
+    _ = @import("session/repaint.zig");
     _ = @import("session/renderer.zig");
     _ = @import("session/vt.zig");
+    _ = @import("sessh/run.zig");
+    _ = @import("stream/mux_proxy.zig");
     _ = @import("stream/runtime.zig");
-    _ = @import("stream/proxy_control.zig");
+    _ = @import("stream/raw_bridge.zig");
+    _ = @import("stream/status_output.zig");
+    _ = @import("stream/proxy_diagnostics_channel.zig");
+    _ = @import("stream/proxy_remote.zig");
     _ = @import("tty/pty_process.zig");
     _ = @import("tty/settings.zig");
     _ = @import("tty/terminal.zig");
     _ = @import("tty/transcript.zig");
     _ = @import("transport/artifact_manifest.zig");
     _ = @import("transport/bootstrap.zig");
+    _ = @import("transport/bootstrap_client.zig");
     _ = @import("transport/frame_forwarder.zig");
     _ = @import("transport/plain_ssh.zig");
+    _ = @import("transport/pooled_ssh.zig");
+    _ = @import("transport/proxy_entry.zig");
     _ = @import("transport/remote_shell.zig");
+    _ = @import("transport/send_env.zig");
     _ = @import("transport/socket.zig");
+    _ = @import("transport/ssh_child.zig");
     _ = @import("transport/ssh_options.zig");
+    _ = @import("transport/ssh_transport_acquire.zig");
     _ = @import("transport/ssh.zig");
 }

@@ -1,0 +1,335 @@
+const std = @import("std");
+const c = std.c;
+
+const config = @import("../core/config.zig");
+const daemon_socket_namespace = @import("../daemon/socket_namespace.zig");
+const fd_passing = @import("../core/fd_passing.zig");
+const guid_ref = @import("../core/guid.zig");
+const io = @import("../core/io.zig");
+const user_error = @import("../core/user_error.zig");
+const protocol = @import("../protocol/mod.zig");
+const pb = protocol.pb;
+
+pub const Invocation = struct {
+    host: []const u8,
+    port: []const u8,
+    user: []const u8 = "",
+    daemon_dir_name: ?[]const u8 = null,
+    daemon_dir_name_owned: bool = false,
+    diagnostics_guid: ?[]const u8 = null,
+    filter_level: config.FilterLevel = .unhygienic,
+    diagnostics_level: config.DiagnosticsLevel = config.default_diagnostics_level,
+    client_ctrl_r: bool = false,
+    bootstrap: bool = true,
+    use_fd_pass: bool = false,
+    diagnostics_file: ?[]const u8 = null,
+    ssh_options: std.ArrayList([]const u8) = .empty,
+
+    pub fn deinit(self: *Invocation, allocator: std.mem.Allocator) void {
+        if (self.daemon_dir_name_owned) {
+            if (self.daemon_dir_name) |dir_name| allocator.free(dir_name);
+        }
+        self.ssh_options.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Invocation {
+    var invocation = Invocation{
+        .host = "",
+        .port = "",
+    };
+    errdefer invocation.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < args.len) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--host")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingProxyHost;
+            invocation.host = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingProxyPort;
+            _ = try std.fmt.parseInt(u16, args[i], 10);
+            invocation.port = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--user")) {
+            i += 1;
+            if (i >= args.len) return error.MissingProxyUser;
+            invocation.user = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--ssh-option")) {
+            i += 1;
+            if (i >= args.len) return error.MissingSshOptionValue;
+            try invocation.ssh_options.append(allocator, args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--diagnostics-guid")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingProxyDiagnosticsGuid;
+            if (!guid_ref.isValidProxyGuid(args[i])) return error.InvalidProxyDiagnosticsGuid;
+            invocation.diagnostics_guid = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--daemon-namespace")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingDaemonNamespace;
+            try daemon_socket_namespace.validateDirName(args[i]);
+            clearOwnedDaemonDirName(allocator, &invocation);
+            invocation.daemon_dir_name = args[i];
+            invocation.daemon_dir_name_owned = false;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--filter-level")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingFilterLevel;
+            invocation.filter_level = try config.parseFilterLevel(args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--diagnostics-level")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingDiagnosticsLevel;
+            invocation.diagnostics_level = try config.parseDiagnosticsLevel(args[i]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--isolation-mode")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingIsolationMode;
+            const isolation_mode = try config.parseIsolationMode(args[i]);
+            switch (isolation_mode) {
+                .full => {
+                    const private_dir_name = try daemon_socket_namespace.privateConnectionDirName(allocator);
+                    errdefer allocator.free(private_dir_name);
+                    clearOwnedDaemonDirName(allocator, &invocation);
+                    invocation.daemon_dir_name = private_dir_name;
+                    invocation.daemon_dir_name_owned = true;
+                },
+                .none, .process => {},
+            }
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--use-fd-pass")) {
+            invocation.use_fd_pass = true;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--diagnostics-file")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingDiagnosticsFile;
+            invocation.diagnostics_file = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--client-ctrl-r")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.MissingClientCtrlR;
+            invocation.client_ctrl_r = parseBool(args[i]) catch return error.InvalidClientCtrlR;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--bootstrap")) {
+            invocation.bootstrap = true;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--no-bootstrap")) {
+            invocation.bootstrap = false;
+            i += 1;
+        } else {
+            return error.InvalidProxyStreamArgs;
+        }
+    }
+
+    if (diagnosticsFileEnv()) |path| invocation.diagnostics_file = path;
+    if (invocation.host.len == 0) return error.MissingProxyHost;
+    if (invocation.port.len == 0) return error.MissingProxyPort;
+    return invocation;
+}
+
+fn diagnosticsFileEnv() ?[]const u8 {
+    const value_z = c.getenv("SESSH_DIAGNOSTICS_FILE") orelse return null;
+    const value = std.mem.span(value_z);
+    if (value.len == 0) return null;
+    return value;
+}
+
+fn clearOwnedDaemonDirName(allocator: std.mem.Allocator, invocation: *Invocation) void {
+    if (invocation.daemon_dir_name_owned) {
+        if (invocation.daemon_dir_name) |dir_name| allocator.free(dir_name);
+    }
+    invocation.daemon_dir_name = null;
+    invocation.daemon_dir_name_owned = false;
+}
+
+pub fn printArgError(err: anyerror) !void {
+    switch (err) {
+        error.MissingProxyHost => try user_error.line("proxy mode requires --host HOST"),
+        error.MissingProxyPort => try user_error.line("proxy mode requires --port PORT"),
+        error.MissingProxyUser => try user_error.line("proxy mode --user requires a value"),
+        error.MissingSshOptionValue => try user_error.line("proxy mode --ssh-option requires a value"),
+        error.MissingProxyDiagnosticsGuid => try user_error.line("proxy mode --diagnostics-guid requires a p-guid"),
+        error.InvalidProxyDiagnosticsGuid => try user_error.line("proxy mode --diagnostics-guid requires a valid p-guid"),
+        error.MissingDaemonNamespace => try user_error.line("proxy mode --daemon-namespace requires a value"),
+        error.InvalidDaemonSocketDir => try user_error.line("proxy mode invalid daemon namespace"),
+        error.MissingFilterLevel => try user_error.line("proxy mode --filter-level requires a value"),
+        error.InvalidFilterLevel => try user_error.line("proxy mode invalid filter level"),
+        error.MissingDiagnosticsLevel => try user_error.line("proxy mode --diagnostics-level requires one of: overlay, status, title, line, jsonl"),
+        error.InvalidDiagnosticsLevel => try user_error.line("proxy mode invalid diagnostics level; expected one of: overlay, status, title, line, jsonl"),
+        error.MissingIsolationMode => try user_error.line("proxy mode --isolation-mode requires one of: full, process, none"),
+        error.InvalidIsolationMode => try user_error.line("proxy mode invalid isolation mode; expected one of: full, process, none"),
+        error.MissingDiagnosticsFile => try user_error.line("proxy mode --diagnostics-file requires a file path"),
+        error.MissingClientCtrlR => try user_error.line("proxy mode --client-ctrl-r requires a value"),
+        error.InvalidClientCtrlR => try user_error.line("proxy mode --client-ctrl-r must be 0 or 1"),
+        else => try user_error.printLine("invalid proxy mode arguments: {t}", .{err}),
+    }
+}
+
+pub fn runFdPassSetup(
+    allocator: std.mem.Allocator,
+    daemon_fd: c.fd_t,
+    transport: pb.ClientDaemonItem.SshTransportAcquire,
+    proxy_guid: []const u8,
+    proxy_port: u16,
+) !void {
+    var raw_pair: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &raw_pair) != 0) return error.SocketPairFailed;
+    var daemon_raw_fd: c.fd_t = raw_pair[0];
+    var ssh_raw_fd: c.fd_t = raw_pair[1];
+    defer {
+        if (daemon_raw_fd >= 0) _ = c.close(daemon_raw_fd);
+    }
+    defer {
+        if (ssh_raw_fd >= 0) _ = c.close(ssh_raw_fd);
+    }
+
+    const payload = try protocol.encodeClientDaemonPayload(allocator, .{ .proxy_fd_pass_open = .{
+        .transport = transport,
+        .proxy = .{
+            .proxy_guid = proxy_guid,
+            .proxy_host = "localhost",
+            .proxy_port = proxy_port,
+        },
+    } });
+    defer allocator.free(payload);
+
+    const daemon_fd_to_pass = daemon_raw_fd;
+    daemon_raw_fd = -1;
+    try protocol.sendFrameWithScmRightsFd(allocator, daemon_fd, .client_daemon, payload, daemon_fd_to_pass);
+
+    try waitFdPassAccepted(allocator, daemon_fd);
+
+    const ssh_fd_to_pass = ssh_raw_fd;
+    ssh_raw_fd = -1;
+    try sendRawFdMessageImmediate(std.posix.STDOUT_FILENO, "sessh-proxy-fd", ssh_fd_to_pass);
+}
+
+fn sendRawFdMessageImmediate(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t) !void {
+    var progress = fd_passing.SendBufferWithFdProgress.init(bytes, passed_fd);
+    defer progress.deinit();
+    while (true) {
+        switch (try fd_passing.sendBufferWithFdProgress(sock_fd, &progress)) {
+            .complete => return,
+            .progress => continue,
+            .blocked => return error.WouldBlock,
+            .eof => unreachable,
+        }
+    }
+}
+
+fn waitFdPassAccepted(allocator: std.mem.Allocator, daemon_fd: c.fd_t) !void {
+    var reader = protocol.FrameReader.init(allocator);
+    defer reader.deinit();
+    var frame = while (true) {
+        // BLOCKING_FRAME_READ: `sessh-proxy` is a short-lived foreground
+        // helper. It must not hand OpenSSH the raw fd until sesshd has accepted
+        // the peer fd, so this synchronous wait is the command's work.
+        switch (try reader.readBlocking(daemon_fd)) {
+            .blocked, .progress => continue,
+            .frame => |frame| break frame,
+            .eof => return error.EndOfStream,
+            .truncated_frame => return error.TruncatedFrame,
+        }
+    };
+    defer frame.deinit(allocator);
+    switch (frame.message_type) {
+        .client_daemon => {
+            var item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, frame.payload);
+            defer item.deinit(allocator);
+            switch (item.payload orelse return error.UnexpectedDaemonFrame) {
+                .proxy_fd_pass_accepted => return,
+                else => return error.UnexpectedDaemonFrame,
+            }
+        },
+        .error_message => {
+            var message = try protocol.decodePayload(protocol.hpb.Error, allocator, frame.payload);
+            defer message.deinit(allocator);
+            try user_error.rolePrintLine("sessh-proxy", "daemon rejected fd-pass proxy: {s}", .{message.message});
+            return error.ProxyFdPassRejected;
+        },
+        else => return error.UnexpectedDaemonFrame,
+    }
+}
+
+fn parseBool(value: []const u8) !bool {
+    if (std.mem.eql(u8, value, "1")) return true;
+    if (std.mem.eql(u8, value, "0")) return false;
+    return error.InvalidBool;
+}
+
+test "proxy entry parses isolation namespace and explicit fd-pass" {
+    var full = try parse(std.testing.allocator, &.{
+        "--host",
+        "example.com",
+        "--port",
+        "22",
+        "--isolation-mode",
+        "full",
+    });
+    defer full.deinit(std.testing.allocator);
+    try std.testing.expect(!full.use_fd_pass);
+    try std.testing.expect(full.daemon_dir_name_owned);
+    try std.testing.expect(std.mem.indexOf(u8, full.daemon_dir_name orelse "", ".conn.") != null);
+
+    var process = try parse(std.testing.allocator, &.{
+        "--host",
+        "example.com",
+        "--port",
+        "22",
+        "--isolation-mode",
+        "process",
+    });
+    defer process.deinit(std.testing.allocator);
+    try std.testing.expect(!process.use_fd_pass);
+    try std.testing.expect(process.daemon_dir_name == null);
+
+    var none = try parse(std.testing.allocator, &.{
+        "--host",
+        "example.com",
+        "--port",
+        "22",
+        "--isolation-mode",
+        "none",
+    });
+    defer none.deinit(std.testing.allocator);
+    try std.testing.expect(!none.use_fd_pass);
+    try std.testing.expect(none.daemon_dir_name == null);
+
+    var explicit_fd_pass = try parse(std.testing.allocator, &.{
+        "--host",
+        "example.com",
+        "--port",
+        "22",
+        "--use-fd-pass",
+        "--isolation-mode",
+        "none",
+    });
+    defer explicit_fd_pass.deinit(std.testing.allocator);
+    try std.testing.expect(explicit_fd_pass.use_fd_pass);
+    try std.testing.expect(explicit_fd_pass.daemon_dir_name == null);
+}
+
+test "parses explicit fd-pass and diagnostics file flags" {
+    var invocation = try parse(std.testing.allocator, &.{
+        "--host",
+        "example.com",
+        "--port",
+        "22",
+        "--use-fd-pass",
+        "--diagnostics-level",
+        "jsonl",
+        "--diagnostics-file",
+        "/tmp/sessh-diagnostics.log",
+    });
+    defer invocation.deinit(std.testing.allocator);
+    try std.testing.expect(invocation.use_fd_pass);
+    try std.testing.expectEqual(config.DiagnosticsLevel.jsonl, invocation.diagnostics_level);
+    try std.testing.expectEqualStrings("/tmp/sessh-diagnostics.log", invocation.diagnostics_file.?);
+}

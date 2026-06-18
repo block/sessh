@@ -127,9 +127,14 @@ message ConnectionEvent {
 
 message ClientDaemonItem {
   // Local visible-client -> local daemon request to acquire an SSH-backed
-  // transport to a remote sesshd. The client may immediately pipeline stream
-  // frames after this request; the local daemon queues them behind tunnel setup
-  // and forwards them over ssh when the remote daemon endpoint is ready.
+  // transport to a remote sesshd, plus the per-client context the daemon needs
+  // for stream opens queued behind that acquisition. Only host/bootstrap/IPQoS
+  // and the daemon's resolved target identity participate in the pooled
+  // transport reuse key. Other fields configure a newly-started child ssh
+  // process or annotate cleanup/environment behavior for the streams that
+  // follow. The client may immediately pipeline stream frames after this
+  // request; the local daemon queues them behind tunnel setup and forwards them
+  // over ssh when the remote daemon endpoint is ready.
   message SshTransportAcquire {
     repeated string ssh_option = 1;
     string host = 2;
@@ -179,7 +184,7 @@ message ClientDaemonItem {
   // The ProxyCommand process does not send this: its normal ProxyStreamItem.Open
   // already carries the same p-guid, so sesshd can attach this control channel
   // to the in-memory proxy stream.
-  message ProxyControlOpen {
+  message ProxyDiagnosticsOpen {
     string proxy_guid = 1;
   }
 
@@ -199,7 +204,7 @@ message ClientDaemonItem {
 
   oneof payload {
     SshTransportAcquire ssh_transport_acquire = 1;
-    ProxyControlOpen proxy_control_open = 2;
+    ProxyDiagnosticsOpen proxy_diagnostics_open = 2;
     ProxyFdPassOpen proxy_fd_pass_open = 3;
     ProxyFdPassAccepted proxy_fd_pass_accepted = 4;
     DaemonLogRequest log_request = 10;
@@ -235,26 +240,19 @@ message DaemonTunnelItem {
     uint64 stream_id = 1;
 
     // Opens or resumes a mux stream. Application-specific open details are
-    // carried as typed payload items, not in the mux envelope, so this layer only
-    // tracks resume and backpressure state.
+    // carried as typed payload items, not in the mux envelope, so this layer
+    // only tracks the peer's durable receive offset.
     message Open {
       // First outbound unit this side still needs from the peer. The payload
       // family defines whether this is a byte offset or an ordered item offset.
       uint64 recv_next_offset = 1;
-      // Backpressure credit this side grants the peer. The peer may send units
-      // in [recv_next_offset, recv_next_offset + receive_window_bytes) for this
-      // mux stream and must stop when that window is exhausted.
-      uint32 receive_window_bytes = 2;
     }
 
     // Accepts a mux stream open and reports the acceptor's receive state. This
     // is not a required round-trip barrier; peers may pipeline payload after
-    // open when they already have credit.
+    // open when they already know the peer's receive offset.
     message OpenOk {
       uint64 recv_next_offset = 1;
-      // Initial backpressure credit granted by the stream acceptor. This has
-      // the same meaning as Open.receive_window_bytes.
-      uint32 receive_window_bytes = 2;
     }
 
     // Ordered durable payload carried over a mux stream. The payload family
@@ -273,11 +271,6 @@ message DaemonTunnelItem {
     message Ack {
       // First byte offset not yet received from the peer.
       uint64 recv_next_offset = 1;
-      // Updated backpressure credit. Receivers increase this as they drain
-      // their bounded per-stream buffer; senders stop sending on this mux
-      // stream when the advertised window is exhausted. Other mux streams have
-      // independent windows and may continue making progress.
-      uint32 receive_window_bytes = 2;
     }
 
     // Graceful end of this peer's outbound direction for the mux stream. The
@@ -364,10 +357,11 @@ message DaemonTunnelItem {
   }
 }
 
-// Ordered terminal-emulator protocol item. Direct local IPC can carry this as a
-// top-level Frame payload; mux tunnels carry it inside MuxStreamFrame.Payload.
+// Ordered terminal-emulator protocol item. On local client/daemon IPC this is
+// carried by Frame.client_remote. Across daemon-to-daemon tunnels it is carried
+// inside DaemonTunnelItem.MuxStreamFrame.Payload.
 message TerminalEmulatorItem {
-  // Terminal-emulator open details for a direct connection or mux stream.
+  // Terminal-emulator open details for a client/daemon connection or mux stream.
   message Open {
     // Durable session GUID.
     string session_guid = 1;
@@ -622,8 +616,11 @@ message TerminalEmulatorItem {
   }
 }
 
-// Ordered proxy byte-stream item. Data is offset-free here; mux offsets live in
-// MuxStreamFrame.Payload, and direct local IPC relies on socket ordering.
+// Ordered proxy byte-stream item. On local client/daemon IPC this is carried by
+// Frame.client_remote. Across daemon-to-daemon tunnels it is carried inside
+// DaemonTunnelItem.MuxStreamFrame.Payload. Data is offset-free here; mux
+// offsets live in MuxStreamFrame.Payload, and local IPC relies on socket
+// ordering.
 message ProxyStreamItem {
   // Proxy byte-stream open details. When muxed, this is sent as the first typed
   // proxy payload after MuxStreamFrame.Open and does not consume proxy byte

@@ -6,6 +6,7 @@ const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
+const test_helpers = @import("../protocol/test_helpers.zig");
 
 pub const ReadStatus = enum {
     blocked,
@@ -425,12 +426,38 @@ pub fn registerFrameRelay(
     left_fd: c.fd_t,
     right_fd: c.fd_t,
 ) !void {
+    try registerFrameRelayWithInitialWrites(allocator, d, left_fd, right_fd, .{});
+}
+
+pub const InitialWrites = struct {
+    left_to_right: ?protocol.FrameWriteState = null,
+    right_to_left: ?protocol.FrameWriteState = null,
+};
+
+pub fn registerFrameRelayWithInitialWrites(
+    allocator: std.mem.Allocator,
+    d: *dispatcher.Dispatcher,
+    left_fd: c.fd_t,
+    right_fd: c.fd_t,
+    initial_writes: InitialWrites,
+) !void {
+    // Takes ownership of any supplied FrameWriteState immediately. If setup
+    // later fails, this function releases the encoded frames before returning.
+    var writes = initial_writes;
+    errdefer {
+        if (writes.left_to_right) |*write| write.deinit();
+        if (writes.right_to_left) |*write| write.deinit();
+    }
+
     try core_fds.setNonBlocking(left_fd);
     try core_fds.setNonBlocking(right_fd);
 
     const relay = try allocator.create(DispatcherFrameRelay);
     errdefer allocator.destroy(relay);
     relay.* = DispatcherFrameRelay.init(allocator, left_fd, right_fd);
+    relay.left_to_right.writer = writes.left_to_right;
+    relay.right_to_left.writer = writes.right_to_left;
+    writes = .{};
     errdefer {
         relay.left_to_right.deinit();
         relay.right_to_left.deinit();
@@ -512,51 +539,10 @@ const CircularBuffer = struct {
     }
 };
 
-fn setNonBlockingFdForTest(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-}
-
-fn closePipeForTest(pipe: [2]c.fd_t) void {
-    _ = c.close(pipe[0]);
-    _ = c.close(pipe[1]);
-}
-
-fn socketPairForTest() ![2]c.fd_t {
-    var fds: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
-    return fds;
-}
-
-fn readAvailableForTest(fd: c.fd_t, out: *std.ArrayList(u8)) !void {
-    var buf: [128]u8 = undefined;
-    while (true) {
-        const n = posix.read(fd, &buf) catch |err| switch (err) {
-            error.WouldBlock => return,
-            else => return err,
-        };
-        if (n == 0) return;
-        try out.appendSlice(std.testing.allocator, buf[0..n]);
-    }
-}
-
-fn rawFrameForTest(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
-    const frame = try allocator.alloc(u8, protocol.frame_header_len + payload.len);
-    const len: u32 = @intCast(payload.len);
-    frame[0] = @intCast((len >> 24) & 0xff);
-    frame[1] = @intCast((len >> 16) & 0xff);
-    frame[2] = @intCast((len >> 8) & 0xff);
-    frame[3] = @intCast(len & 0xff);
-    @memcpy(frame[protocol.frame_header_len..], payload);
-    return frame;
-}
-
 test "ReadBuffer fills incrementally and reports eof shape" {
     const pipe = try posix.pipe();
-    defer closePipeForTest(pipe);
-    try setNonBlockingFdForTest(pipe[0]);
+    defer test_helpers.closePipeForTest(pipe);
+    try test_helpers.setNonBlockingFdForTest(pipe[0]);
 
     var storage: [5]u8 = undefined;
     var buffer = ReadBuffer.init(&storage);
@@ -575,7 +561,7 @@ test "ReadBuffer fills incrementally and reports eof shape" {
 
 test "ReadBuffer distinguishes clean eof from partial frame eof" {
     const clean_pipe = try posix.pipe();
-    try setNonBlockingFdForTest(clean_pipe[0]);
+    try test_helpers.setNonBlockingFdForTest(clean_pipe[0]);
     _ = c.close(clean_pipe[1]);
     var clean_storage: [4]u8 = undefined;
     var clean = ReadBuffer.init(&clean_storage);
@@ -584,7 +570,7 @@ test "ReadBuffer distinguishes clean eof from partial frame eof" {
 
     const partial_pipe = try posix.pipe();
     defer _ = c.close(partial_pipe[0]);
-    try setNonBlockingFdForTest(partial_pipe[0]);
+    try test_helpers.setNonBlockingFdForTest(partial_pipe[0]);
     try io.writeAll(partial_pipe[1], "xy");
     _ = c.close(partial_pipe[1]);
     var partial_storage: [4]u8 = undefined;
@@ -605,8 +591,8 @@ test "WriteBuffer tracks progress through caller-owned bytes" {
 
 test "WriteBuffer writes to a nonblocking fd" {
     const pipe = try posix.pipe();
-    defer closePipeForTest(pipe);
-    try setNonBlockingFdForTest(pipe[1]);
+    defer test_helpers.closePipeForTest(pipe);
+    try test_helpers.setNonBlockingFdForTest(pipe[1]);
 
     var buffer = WriteBuffer.init("hello");
     try std.testing.expectEqual(WriteStatus.drained, try buffer.writeReady(pipe[1]));
@@ -630,18 +616,18 @@ test "CircularBuffer writes into empty and wrapped storage" {
 
 test "FrameForwarder streams multiple raw frames without decoding" {
     const source = try posix.pipe();
-    defer closePipeForTest(source);
+    defer test_helpers.closePipeForTest(source);
     const dest = try posix.pipe();
-    defer closePipeForTest(dest);
-    try setNonBlockingFdForTest(source[0]);
-    try setNonBlockingFdForTest(dest[0]);
-    try setNonBlockingFdForTest(dest[1]);
+    defer test_helpers.closePipeForTest(dest);
+    try test_helpers.setNonBlockingFdForTest(source[0]);
+    try test_helpers.setNonBlockingFdForTest(dest[0]);
+    try test_helpers.setNonBlockingFdForTest(dest[1]);
 
-    const first = try rawFrameForTest(std.testing.allocator, "abcdef");
+    const first = try test_helpers.rawFrameForTest(std.testing.allocator, protocol.frame_header_len, "abcdef");
     defer std.testing.allocator.free(first);
-    const second = try rawFrameForTest(std.testing.allocator, "");
+    const second = try test_helpers.rawFrameForTest(std.testing.allocator, protocol.frame_header_len, "");
     defer std.testing.allocator.free(second);
-    const third = try rawFrameForTest(std.testing.allocator, "xyz");
+    const third = try test_helpers.rawFrameForTest(std.testing.allocator, protocol.frame_header_len, "xyz");
     defer std.testing.allocator.free(third);
     try io.writeAll(source[1], first);
     try io.writeAll(source[1], second);
@@ -664,7 +650,7 @@ test "FrameForwarder streams multiple raw frames without decoding" {
             }
         }
         if (forwarder.hasPendingWrite()) _ = try forwarder.writeReady();
-        try readAvailableForTest(dest[0], &output);
+        try test_helpers.readAvailableForTest(std.testing.allocator, dest[0], &output);
     }
     try std.testing.expect(saw_eof);
 
@@ -678,14 +664,14 @@ test "FrameForwarder streams multiple raw frames without decoding" {
 
 test "FrameForwarder applies output backpressure before reading frame body" {
     const source = try posix.pipe();
-    defer closePipeForTest(source);
+    defer test_helpers.closePipeForTest(source);
     const dest = try posix.pipe();
-    defer closePipeForTest(dest);
-    try setNonBlockingFdForTest(source[0]);
-    try setNonBlockingFdForTest(dest[0]);
-    try setNonBlockingFdForTest(dest[1]);
+    defer test_helpers.closePipeForTest(dest);
+    try test_helpers.setNonBlockingFdForTest(source[0]);
+    try test_helpers.setNonBlockingFdForTest(dest[0]);
+    try test_helpers.setNonBlockingFdForTest(dest[1]);
 
-    const frame = try rawFrameForTest(std.testing.allocator, "body");
+    const frame = try test_helpers.rawFrameForTest(std.testing.allocator, protocol.frame_header_len, "body");
     defer std.testing.allocator.free(frame);
     try io.writeAll(source[1], frame);
 
@@ -701,7 +687,7 @@ test "FrameForwarder applies output backpressure before reading frame body" {
     try std.testing.expectEqual(FrameForwarderWriteStatus.drained, try forwarder.writeReady());
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(std.testing.allocator);
-    try readAvailableForTest(dest[0], &output);
+    try test_helpers.readAvailableForTest(std.testing.allocator, dest[0], &output);
     try std.testing.expectEqualStrings(frame[0..protocol.frame_header_len], output.items);
 
     try std.testing.expect(forwarder.wantsRead());
@@ -709,8 +695,8 @@ test "FrameForwarder applies output backpressure before reading frame body" {
 }
 
 test "dispatcher frame relay forwards attached-byte frames in both directions" {
-    const left = try socketPairForTest();
-    const right = try socketPairForTest();
+    const left = try test_helpers.socketPairForTest();
+    const right = try test_helpers.socketPairForTest();
     var left_external_open = true;
     var right_external_open = true;
     defer {
@@ -727,9 +713,7 @@ test "dispatcher frame relay forwards attached-byte frames in both directions" {
     defer d.deinit();
     try registerFrameRelay(std.testing.allocator, &d, left[1], right[1]);
 
-    const payload = try protocol.encodePayload(std.testing.allocator, protocol.pb.ClientDaemonItem{
-        .payload = .{ .log_request = .{} },
-    });
+    const payload = try protocol.encodeClientDaemonPayload(std.testing.allocator, .{ .log_request = .{} });
     defer std.testing.allocator.free(payload);
 
     try protocol.sendFrameWithAttachedBytes(left[0], .client_daemon, payload, "left-to-right");
@@ -757,15 +741,62 @@ test "dispatcher frame relay forwards attached-byte frames in both directions" {
     try std.testing.expectEqual(@as(usize, 0), d.active_count);
 }
 
+test "dispatcher frame relay drains initial left-to-right write through dispatcher" {
+    const left = try test_helpers.socketPairForTest();
+    const right = try test_helpers.socketPairForTest();
+    var left_external_open = true;
+    var right_external_open = true;
+    defer {
+        if (left_external_open) _ = c.close(left[0]);
+    }
+    defer {
+        if (right_external_open) _ = c.close(right[0]);
+    }
+
+    try core_fds.setNonBlocking(left[0]);
+    try core_fds.setNonBlocking(right[0]);
+
+    const payload = try protocol.encodeClientDaemonPayload(std.testing.allocator, .{ .log_request = .{} });
+    defer std.testing.allocator.free(payload);
+    const initial_write = try protocol.FrameWriteState.init(std.testing.allocator, .client_daemon, payload);
+
+    var d = try dispatcher.Dispatcher.init(std.testing.allocator);
+    defer d.deinit();
+    try registerFrameRelayWithInitialWrites(std.testing.allocator, &d, left[1], right[1], .{
+        .left_to_right = initial_write,
+    });
+
+    var initial = try readRelayedFrameForTest(&d, right[0]);
+    defer initial.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.client_daemon, initial.message_type);
+    try std.testing.expectEqualStrings(payload, initial.payload);
+
+    try protocol.sendFrame(left[0], .client_daemon, payload);
+    var relayed = try readRelayedFrameForTest(&d, right[0]);
+    defer relayed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.client_daemon, relayed.message_type);
+    try std.testing.expectEqualStrings(payload, relayed.payload);
+
+    _ = c.close(left[0]);
+    left_external_open = false;
+    _ = c.close(right[0]);
+    right_external_open = false;
+    var iterations: usize = 0;
+    while (d.active_count != 0 and iterations < 10) : (iterations += 1) {
+        _ = try d.runOnce();
+    }
+    try std.testing.expectEqual(@as(usize, 0), d.active_count);
+}
+
 test "FrameForwarder reports truncated frame bodies" {
     const source = try posix.pipe();
     defer _ = c.close(source[0]);
     const dest = try posix.pipe();
-    defer closePipeForTest(dest);
-    try setNonBlockingFdForTest(source[0]);
-    try setNonBlockingFdForTest(dest[1]);
+    defer test_helpers.closePipeForTest(dest);
+    try test_helpers.setNonBlockingFdForTest(source[0]);
+    try test_helpers.setNonBlockingFdForTest(dest[1]);
 
-    const frame = try rawFrameForTest(std.testing.allocator, "abcde");
+    const frame = try test_helpers.rawFrameForTest(std.testing.allocator, protocol.frame_header_len, "abcde");
     defer std.testing.allocator.free(frame);
     try io.writeAll(source[1], frame[0 .. protocol.frame_header_len + 2]);
     _ = c.close(source[1]);

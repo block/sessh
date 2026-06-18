@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import collections
+import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -8,6 +10,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
 sys.path.insert(0, str(TESTS))
+
+
+def ensure_protoc_env():
+    if os.environ.get("SESSH_PROTOC"):
+        return
+    for candidate in (
+        shutil.which("protoc-33.0.0"),
+        "/opt/homebrew/opt/protobuf/bin/protoc",
+        "/usr/local/opt/protobuf/bin/protoc",
+        shutil.which("protoc"),
+    ):
+        if candidate and Path(candidate).exists():
+            os.environ["SESSH_PROTOC"] = candidate
+            return
+    raise RuntimeError("missing protobuf protoc; set SESSH_PROTOC")
 
 from harness_cleanup import cleanup_runtime
 from socket_harness import (
@@ -29,6 +46,8 @@ from test_env import isolated_env
 
 
 def message_name(message_type):
+    if message_type.startswith("te_"):
+        return "TERMINAL_EMULATOR_" + message_type[len("te_") :].upper()
     return message_type.upper()
 
 
@@ -126,6 +145,7 @@ def print_summary(summary):
 
 
 def main():
+    ensure_protoc_env()
     with tempfile.TemporaryDirectory(prefix="sessh-protocol-overhead-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         shell = Path(tmp) / "perf-shell"

@@ -44,17 +44,20 @@ The diagram below shows the default `isolation-mode=process` layout.
 ```
 
 `sessh` will set up a connection to the local `sesshd` (creating it if
-necessary). `sesshd` will communicate over a pooled connection to the broker,
-which provides a bridge to the remote `sesshd`, which sets up the terminal
-process, which creates the actual requested remote process (typically a shell).
+necessary). `sesshd` will communicate over a pooled connection to
+`sessh-broker`, which is only a daemon-tunnel bridge over ssh stdin/stdout. It
+does not own sessions or proxy streams. The remote `sesshd` receives the tunnel
+frames and sets up the terminal process, which creates the actual requested
+remote process (typically a shell).
 
 The local `sesshd` process serves two purposes:
 1. Watch for the `sessh` client to die, and signal the remote to clean up in
    response.
 2. Pool connections
 
-The broker process is needed to allow reconnecting to the same remote `sesshd`
-in the event of `ssh` disconnecting.
+The broker process is needed because ssh gives us one remote command connected
+to stdin/stdout. Keeping that role as a tiny bridge lets the local daemon
+reconnect to the same remote `sesshd` after an ssh disconnect.
 
 ## Processes and Threads - filter-level=hygienic
 
@@ -123,15 +126,15 @@ The diagram below shows the default `isolation-mode=process` layout.
             +-----------+              +----------+   (typically)   +--------+
 ```
 
-`sessh :proxy:` will send its stderr file-descriptor to the local `sesshd` via
+`sessh-proxy` will send its stderr file-descriptor to the local `sesshd` via
 unix-domain-socket ancillary data, but we can't see what `ssh` is
 reading/writing to the TTY. Any diagnostics `sesshd` writes will be blindly
 interleaved with the normal TTY output. This is why the mode is named
 `unhygienic`.
 
 The benefit of `unhygienic` is lower overhead. The lack of hygiene is not
-necessarily a problem. If it is, you can disable output with
-`--no-diagnostics`.
+necessarily a problem. If it is, choose a less intrusive diagnostics level such
+as `--diagnostics-level=line`.
 
 If the requested `ssh` command doesn't use stdin (e.g. port forwarding) then we
 can potentially use stdin ourselves (assuming its a TTY), allowing us to show
@@ -159,17 +162,17 @@ functionality lives in a separate process and `ProxyUseFdPass` is not used.
 
 ## Manual ProxyCommand
 
-You can use `sessh :proxy:` as your `ssh_config(5)` `ProxyCommand`. In this
+You can use `sessh-proxy` as your `ssh_config(5)` `ProxyCommand`. In this
 case your `filter-level` is effectively `unhygienic`. If you set
-`ProxyUseFdPass` then you must pass `--use-fd-pass` to `sessh :proxy:`. If you
-do not pass `--use-fd-pass`, `sessh :proxy:` uses the normal `ProxyUseFdPass=no`
+`ProxyUseFdPass` then you must pass `--use-fd-pass` to `sessh-proxy`. If you
+do not pass `--use-fd-pass`, `sessh-proxy` uses the normal `ProxyUseFdPass=no`
 stdin/stdout protocol.
 
 You can control whether the proxy uses a shared daemon with
 `--isolation-mode=full`, `--isolation-mode=process`, or `--isolation-mode=none`.
 `full` uses a private daemon namespace for this connection.
 
-`sessh :proxy:` writes diagnostics to stderr by default. Diagnostics routing,
+`sessh-proxy` writes diagnostics to stderr by default. Diagnostics routing,
 display methods, and `--diagnostics-file` behavior are documented in
 [DIAGNOSTICS](DIAGNOSTICS.md).
 

@@ -45,8 +45,8 @@ pub fn installRuntimeExecutablesForDaemonStart(
     return try installRuntimeExecutablesWhileHoldingLock(allocator, exe, dir_name);
 }
 
-/// Compatibility re-exec callers need a role path. They rewrite it only when
-/// the namespace is not already owned; otherwise they use the existing path.
+/// Role re-exec callers need a role path. They rewrite it only when the
+/// namespace is not already owned; otherwise they use the existing path.
 pub fn installRuntimeExecutablesOrUseNamespaceOwner(
     allocator: std.mem.Allocator,
     exe: []const u8,
@@ -216,4 +216,43 @@ test "runtime executables are written beside socket namespace" {
     const proxy_remote = try socket_namespace.executablePath(allocator, dir_name, proxy_remote_name);
     defer allocator.free(proxy_remote);
     try std.testing.expect(std.mem.endsWith(u8, proxy_remote, "/1.dev.exec-test/sessh-proxy-remote"));
+}
+
+test "runtime executables are not rewritten while namespace lock is held" {
+    const allocator = std.testing.allocator;
+    const dir_name = "1.dev.exec-lock-test";
+
+    var owner_lock = try tryAcquireNamespaceLock(allocator, dir_name);
+    defer owner_lock.deinit();
+
+    var executables = try installRuntimeExecutablesWhileHoldingLock(allocator, "/tmp/sessh-source-a", dir_name);
+    defer {
+        deleteRuntimeExecutables(executables);
+        executables.deinit();
+    }
+
+    const initial_target = try readLinkAlloc(allocator, executables.daemon);
+    defer allocator.free(initial_target);
+    try std.testing.expectEqualStrings("/tmp/sessh-source-a", initial_target);
+
+    const contender = try installRuntimeExecutablesForDaemonStart(allocator, "/tmp/sessh-source-b", dir_name);
+    try std.testing.expectEqual(@as(?RuntimeExecutables, null), contender);
+
+    const final_target = try readLinkAlloc(allocator, executables.daemon);
+    defer allocator.free(final_target);
+    try std.testing.expectEqualStrings(initial_target, final_target);
+}
+
+fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = try std.fs.readLinkAbsolute(path, &buf);
+    return allocator.dupe(u8, target);
+}
+
+fn deleteRuntimeExecutables(executables: RuntimeExecutables) void {
+    std.fs.deleteFileAbsolute(executables.daemon) catch {};
+    std.fs.deleteFileAbsolute(executables.broker) catch {};
+    std.fs.deleteFileAbsolute(executables.proxy) catch {};
+    std.fs.deleteFileAbsolute(executables.terminal_remote) catch {};
+    std.fs.deleteFileAbsolute(executables.proxy_remote) catch {};
 }

@@ -13,6 +13,7 @@ from pathlib import Path
 # tree that was deliberately created by isolated_env, not at a normal runtime
 # or cache directory that merely happens to contain sessh files.
 TEST_ROOT_SENTINEL = ".sessh-test-root"
+SOCKET_OWNER_TOOL_TIMEOUT_SECONDS = 1.0
 
 
 def state_root(env):
@@ -150,13 +151,17 @@ def socket_owner_pids(socket_path):
 def socket_owner_pids_lsof(socket_path):
     if shutil.which("lsof") is None:
         return set()
-    result = subprocess.run(
-        ["lsof", "-nP", "-t", str(socket_path)],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-t", str(socket_path)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=SOCKET_OWNER_TOOL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return set()
     if result.returncode not in (0, 1):
         return set()
     return parse_pid_words(result.stdout)
@@ -165,13 +170,17 @@ def socket_owner_pids_lsof(socket_path):
 def socket_owner_pids_fuser(socket_path):
     if shutil.which("fuser") is None:
         return set()
-    result = subprocess.run(
-        ["fuser", str(socket_path)],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["fuser", str(socket_path)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=SOCKET_OWNER_TOOL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return set()
     if result.returncode not in (0, 1):
         return set()
     return parse_pid_words(result.stdout)

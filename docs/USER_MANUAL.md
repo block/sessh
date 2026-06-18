@@ -24,7 +24,9 @@ There is intentionally no public resume/list/kill command surface.
 
 # Options
 
-Sessh accepts normal ssh options, plus a small set of sessh-specific options:
+Sessh accepts normal ssh options, plus a small set of sessh-specific options.
+Sessh-specific options must appear before `destination`; after `destination`,
+all tokens are treated as the remote command, matching `ssh`.
 
 - `--log-level quiet|error|warn|info|debug|verbose`
 - `--terminal-emulator` / `--no-terminal-emulator`
@@ -67,7 +69,6 @@ Supported keys with defaults:
 
 ```dotenv
 scrollback-limit=2000
-initial-scrollback=-1
 client-log-level=warn
 bootstrap=true
 terminal-emulator=true

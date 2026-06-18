@@ -333,12 +333,12 @@ def main():
             sever_attached_clients(child_env)
             wait_capture(env, session, "sessh: disconnected: Retry connecting 10sec")
             wait_capture(env, session, "sessh: disconnected: Retry connecting 9sec", timeout=2.0)
-            banner = capture_visible(env, session).splitlines()
-            if remote_top_index + 1 >= len(banner) or "sessh: disconnected: Retry connecting 9sec" not in banner[remote_top_index + 1]:
+            overlay = capture_visible(env, session).splitlines()
+            if remote_top_index + 1 >= len(overlay) or "sessh: disconnected: Retry connecting 9sec" not in overlay[remote_top_index + 1]:
                 raise AssertionError(
-                    "reconnect banner was not drawn one row below the sessh screen top\n"
+                    "reconnect overlay was not drawn one row below the sessh screen top\n"
                     f"before:\n{before}\n"
-                    f"banner:\n{capture_visible(env, session)}"
+                    f"overlay:\n{capture_visible(env, session)}"
                 )
 
             run(env, [*TMUX_ARGS, "send-keys", "-t", session, "C-r"])
@@ -348,7 +348,7 @@ def main():
             final = wait_capture(env, session, "REMOTE:after-reconnect")
             after_repaint = capture_visible(env, session)
             if "sessh: disconnected: Retry" in after_repaint:
-                raise AssertionError(f"reconnect banner was still visible after repaint:\n{after_repaint}")
+                raise AssertionError(f"reconnect overlay was still visible after repaint:\n{after_repaint}")
             if after_repaint.count("REMOTE_TOP") != 1:
                 raise AssertionError(f"reconnect did not repaint the session screen before input:\n{after_repaint}")
             after_repaint_lines = after_repaint.splitlines()
@@ -359,9 +359,9 @@ def main():
                     f"after:\n{after_repaint}"
                 )
             if "sessh: disconnected: Retry" in final:
-                raise AssertionError(f"reconnect banner leaked into final pane:\n{final}")
+                raise AssertionError(f"reconnect overlay leaked into final pane:\n{final}")
             if "sessh: reconnected" in final:
-                raise AssertionError(f"reconnected banner leaked into final pane:\n{final}")
+                raise AssertionError(f"reconnected overlay leaked into final pane:\n{final}")
             if final.count("REMOTE_TOP") != 1:
                 raise AssertionError(f"reconnect duplicated session screen content:\n{final}")
             if "OUTER_BEFORE_1" not in final or "OUTER_BEFORE_2" not in final:
@@ -458,7 +458,7 @@ def main():
             if bottom_failure_after.count("REMOTE_TOP") != 1:
                 raise AssertionError(f"bottom reconnect after failed attempt duplicated session screen content:\n{bottom_failure_after}")
             if "sessh: disconnected" in bottom_failure_after:
-                raise AssertionError(f"bottom reconnect after failed attempt leaked banner:\n{bottom_failure_after}")
+                raise AssertionError(f"bottom reconnect after failed attempt leaked overlay:\n{bottom_failure_after}")
 
             reset_runtime()
             idle_close_session = f"{close_session}-idle"
@@ -553,7 +553,7 @@ def main():
                 )
             cleanup_runtime(env)
 
-    print("ok ssh reconnect banner is temporary and close returns to the outer prompt")
+    print("ok ssh reconnect overlay is temporary and close returns to the outer prompt")
 
 
 if __name__ == "__main__":

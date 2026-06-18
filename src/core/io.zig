@@ -24,9 +24,11 @@ pub fn noteWrite(fd: c.fd_t, bytes: []const u8) void {
     if (write_hook) |hook| hook(fd, bytes);
 }
 
-// Some callers hand us fds whose blocking mode we did not choose. Keep these
-// helpers blocking-style by waiting and retrying when the kernel reports "try
-// again".
+// Blocking convenience helpers. These are appropriate for foreground command
+// setup, terminal restoration, tests, and other paths where the current process
+// has no dispatcher work to service while waiting. Long-lived daemon/session
+// callbacks must keep read/write progress in their own state machines instead;
+// otherwise one stalled fd can freeze unrelated clients sharing the process.
 pub fn readExact(fd: c.fd_t, buf: []u8) !void {
     var offset: usize = 0;
     while (offset < buf.len) {
@@ -107,6 +109,9 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) !void {
 }
 
 fn waitReadable(fd: c.fd_t) !void {
+    // BLOCKING_POLL: used only by the blocking helpers above. Long-lived
+    // daemon/session callbacks should use dispatcher-driven FrameReader state
+    // instead of reaching this helper.
     var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
     while (true) {
         pollfds[0].revents = 0;
@@ -117,6 +122,9 @@ fn waitReadable(fd: c.fd_t) !void {
 }
 
 fn waitWritable(fd: c.fd_t) !void {
+    // BLOCKING_POLL: used only by the blocking helpers above. Long-lived
+    // daemon/session callbacks should use dispatcher-owned write state instead
+    // of reaching this helper.
     var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
     while (true) {
         pollfds[0].revents = 0;

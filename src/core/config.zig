@@ -3,6 +3,7 @@ const std = @import("std");
 pub const version = "0.7.0-dev";
 
 pub const default_scrollback_row_count = 2000;
+pub const default_ssh_port = "22";
 pub const default_debug_unresponsive_seconds = 10;
 pub const default_filter_level: FilterLevel = .emulated;
 pub const default_diagnostics_level: DiagnosticsLevel = .overlay;
@@ -14,7 +15,6 @@ pub const default_disconnected_reap_ms: u64 = 168 * hour_ms;
 
 pub const session_guid_env = "SESSH_GUID";
 pub const client_version_env = "SESSH_CLIENT_VERSION";
-pub const compat_env = "SESSH_COMPAT";
 
 pub const protocol_major = 3;
 pub const protocol_minor = 0;

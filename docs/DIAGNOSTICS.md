@@ -18,9 +18,9 @@ output there and does not read reconnect input from it. If the file does not
 exist, sessh creates it. If `PATH` cannot be opened or created, sessh exits with
 an error.
 
-When outer `sessh` starts `sessh :proxy:`, it forwards the same
+When outer `sessh` starts `sessh-proxy`, it forwards the same
 `--diagnostics-file` option. If the user did not specify one, and stdin/stderr
-refer to the same TTY, outer `sessh` passes that TTY path to `sessh :proxy:` so
+refer to the same TTY, outer `sessh` passes that TTY path to `sessh-proxy` so
 the proxy process can still show diagnostics and receive reconnect input while
 stdin/stdout remain the SSH proxy byte stream.
 
@@ -86,7 +86,9 @@ attempt to reconnect.
 ## `diagnostics-level=jsonl`: scriptable events in json form, one-per-line
 
 We emit diagnostics in JSONL format: One JSON event per line. This is intended
-for scripts that wish to react to diagnostics programmatically.
+for scripts that wish to react to diagnostics programmatically. Event names are
+stable; the source tests pin exact shapes for connection events, retry
+scheduling, stderr diagnostics, and final failures.
 
 # Disconnections
 

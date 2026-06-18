@@ -1,8 +1,20 @@
 const std = @import("std");
+const c = std.c;
+const posix = std.posix;
 
 const config = @import("../core/config.zig");
 const client_ui = @import("../session/client_ui.zig");
+const ssh_opts = @import("../transport/ssh_options.zig");
 const stream_runtime = @import("../stream/runtime.zig");
+
+extern "c" fn ttyname(fd: c_int) ?[*:0]u8;
+
+pub const ProxyStreamPlan = struct {
+    command_level: config.FilterLevel,
+    use_daemon_control: bool,
+    wrap_visible_ssh: bool,
+    client_ctrl_r: bool,
+};
 
 pub fn terminalPresentation(
     filter_level: config.FilterLevel,
@@ -10,10 +22,10 @@ pub fn terminalPresentation(
     diagnostics_output_is_tty: bool,
 ) client_ui.ReconnectPresentation {
     if (diagnostics_level == .jsonl) return .jsonl;
-    if (!diagnostics_output_is_tty) return .stderr_plain;
+    if (!diagnostics_output_is_tty) return .line;
     return switch (diagnostics_level) {
         .jsonl => unreachable,
-        .line => .stderr_plain,
+        .line => .line,
         .title => .title,
         .status => switch (filter_level) {
             .unhygienic => .none,
@@ -34,8 +46,8 @@ pub fn streamStatusMode(
     diagnostics_output_is_tty: bool,
 ) stream_runtime.StreamReconnectStatusMode {
     if (diagnostics_level == .jsonl) return .jsonl;
-    if (!diagnostics_output_is_tty) return .stderr_plain;
-    if (diagnostics_level == .line) return .stderr_plain;
+    if (!diagnostics_output_is_tty) return .line;
+    if (diagnostics_level == .line) return .line;
     if (diagnostics_level == .title) return .title;
     if (has_daemon_control) return .client_control;
     return switch (filter_level) {
@@ -44,10 +56,156 @@ pub fn streamStatusMode(
     };
 }
 
+pub fn proxyStreamPlan(
+    ssh_options: []const []const u8,
+    filter_level: config.FilterLevel,
+    tty_request: ssh_opts.SshTtyRequest,
+    shell_command_args: []const []const u8,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) ProxyStreamPlan {
+    return switch (filter_level) {
+        .unhygienic => .{
+            .command_level = .unhygienic,
+            .use_daemon_control = false,
+            .wrap_visible_ssh = false,
+            .client_ctrl_r = false,
+        },
+        .hygienic, .emulated => blk: {
+            if (!stdin_is_tty or !stdout_is_tty) break :blk .{
+                .command_level = .unhygienic,
+                .use_daemon_control = false,
+                .wrap_visible_ssh = false,
+                .client_ctrl_r = false,
+            };
+            const wrap_visible_ssh = outerSshAllocatesTty(ssh_options, tty_request, shell_command_args, stdin_is_tty);
+            break :blk .{
+                .command_level = .hygienic,
+                .use_daemon_control = true,
+                .wrap_visible_ssh = wrap_visible_ssh,
+                .client_ctrl_r = wrap_visible_ssh and stdin_is_tty,
+            };
+        },
+    };
+}
+
+pub fn isolationModeUsesDirectProxyPlacement(mode: config.IsolationMode) bool {
+    return switch (mode) {
+        .full, .none => true,
+        .process => false,
+    };
+}
+
+pub fn autoProxyDiagnosticsFile(
+    allocator: std.mem.Allocator,
+    explicit_diagnostics_file: ?[]const u8,
+    use_daemon_control: bool,
+    wrap_visible_ssh: bool,
+    stdin_fd: c.fd_t,
+    stderr_fd: c.fd_t,
+) !?[]u8 {
+    if (explicit_diagnostics_file != null) return null;
+    if (!use_daemon_control or wrap_visible_ssh) return null;
+    if (!sameTerminalFd(stdin_fd, stderr_fd)) return null;
+    return try ttyPathForFd(allocator, stderr_fd);
+}
+
+fn sameTerminalFd(left: c.fd_t, right: c.fd_t) bool {
+    if (c.isatty(left) == 0 or c.isatty(right) == 0) return false;
+    const left_stat = posix.fstat(left) catch return false;
+    const right_stat = posix.fstat(right) catch return false;
+    return left_stat.dev == right_stat.dev and left_stat.ino == right_stat.ino;
+}
+
+fn ttyPathForFd(allocator: std.mem.Allocator, fd: c.fd_t) !?[]u8 {
+    if (c.isatty(fd) == 0) return null;
+    const path_z = ttyname(fd) orelse return null;
+    return try allocator.dupe(u8, std.mem.span(path_z));
+}
+
+fn outerSshAllocatesTty(
+    ssh_options: []const []const u8,
+    tty_request: ssh_opts.SshTtyRequest,
+    shell_command_args: []const []const u8,
+    stdin_is_tty: bool,
+) bool {
+    const explicit = explicitTtyRequest(ssh_options);
+    if (explicit) |request| return switch (request) {
+        .none => false,
+        .requested => stdin_is_tty,
+        .forced => true,
+    };
+    return switch (tty_request) {
+        .none => stdin_is_tty and shell_command_args.len == 0,
+        .requested => stdin_is_tty,
+        .forced => true,
+    };
+}
+
+fn explicitTtyRequest(options: []const []const u8) ?ssh_opts.SshTtyRequest {
+    var result: ?ssh_opts.SshTtyRequest = null;
+    var i: usize = 0;
+    while (i < options.len) {
+        const arg = options[i];
+        if (std.mem.startsWith(u8, arg, "--") or arg.len < 2 or arg[0] != '-') {
+            i += 1;
+            continue;
+        }
+        var pos: usize = 1;
+        while (pos < arg.len) {
+            const option = arg[pos];
+            if (option == 'T') {
+                result = .none;
+                pos += 1;
+                continue;
+            }
+            if (option == 't') {
+                if (result != null and result.? == .requested) {
+                    result = .forced;
+                } else if (result == null or result.? != .forced) {
+                    result = .requested;
+                }
+                pos += 1;
+                continue;
+            }
+            if (option == 'o') {
+                const value = optionValueFromOptions(options, i, pos) orelse return result;
+                if (ssh_opts.sshConfigKeyIs(value, "RequestTTY")) {
+                    const key = ssh_opts.sshConfigKey(value);
+                    if (ssh_opts.sshConfigValueIs(value, key.len, "no")) {
+                        result = .none;
+                    } else if (ssh_opts.sshConfigValueIs(value, key.len, "force")) {
+                        result = .forced;
+                    } else if (ssh_opts.sshConfigValueIs(value, key.len, "yes")) {
+                        result = .requested;
+                    }
+                }
+                i = if (pos + 1 < arg.len) i + 1 else i + 2;
+                break;
+            }
+            if (ssh_opts.sshOptionRequiresValue(option) or ssh_opts.isUnsafeSshOptionWithValue(option) or ssh_opts.isProxyRequiredSshOptionWithValue(option)) {
+                i = if (pos + 1 < arg.len) i + 1 else i + 2;
+                break;
+            }
+            pos += 1;
+        } else {
+            i += 1;
+        }
+    }
+    return result;
+}
+
+fn optionValueFromOptions(options: []const []const u8, index: usize, option_pos: usize) ?[]const u8 {
+    const arg = options[index];
+    if (option_pos + 1 < arg.len) return arg[option_pos + 1 ..];
+    if (index + 1 >= options.len) return null;
+    return options[index + 1];
+}
+
 test "stream status mode follows diagnostics level" {
     try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.jsonl, streamStatusMode(.emulated, .jsonl, true, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, streamStatusMode(.emulated, .line, true, true));
-    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.stderr_plain, streamStatusMode(.emulated, .overlay, true, false));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.line, streamStatusMode(.emulated, .line, true, true));
+    try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.line, streamStatusMode(.emulated, .overlay, true, false));
     try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.title, streamStatusMode(.hygienic, .title, true, true));
     try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.client_control, streamStatusMode(.emulated, .overlay, true, true));
     try std.testing.expectEqual(stream_runtime.StreamReconnectStatusMode.status_line, streamStatusMode(.emulated, .overlay, false, true));
@@ -68,11 +226,64 @@ test "terminal presentation follows diagnostics level" {
         terminalPresentation(.hygienic, .overlay, true),
     );
     try std.testing.expectEqual(
-        client_ui.ReconnectPresentation.stderr_plain,
+        client_ui.ReconnectPresentation.line,
         terminalPresentation(.emulated, .overlay, false),
     );
     try std.testing.expectEqual(
         client_ui.ReconnectPresentation.jsonl,
         terminalPresentation(.emulated, .jsonl, false),
     );
+}
+
+test "proxy stream plan maps emulated proxy output to daemon control when stdio is tty" {
+    const interactive = proxyStreamPlan(&.{}, .emulated, .none, &.{}, true, true);
+    try std.testing.expectEqual(config.FilterLevel.hygienic, interactive.command_level);
+    try std.testing.expect(interactive.use_daemon_control);
+    try std.testing.expect(interactive.wrap_visible_ssh);
+    try std.testing.expect(interactive.client_ctrl_r);
+
+    const no_stdout = proxyStreamPlan(&.{}, .emulated, .none, &.{}, true, false);
+    try std.testing.expectEqual(config.FilterLevel.unhygienic, no_stdout.command_level);
+    try std.testing.expect(!no_stdout.use_daemon_control);
+    try std.testing.expect(!no_stdout.wrap_visible_ssh);
+    try std.testing.expect(!no_stdout.client_ctrl_r);
+
+    const no_stdin = proxyStreamPlan(&.{}, .emulated, .none, &.{}, false, true);
+    try std.testing.expectEqual(config.FilterLevel.unhygienic, no_stdin.command_level);
+    try std.testing.expect(!no_stdin.use_daemon_control);
+    try std.testing.expect(!no_stdin.wrap_visible_ssh);
+    try std.testing.expect(!no_stdin.client_ctrl_r);
+}
+
+test "proxy stream plan honors unhygienic level" {
+    const result = proxyStreamPlan(&.{}, .unhygienic, .none, &.{}, true, true);
+    try std.testing.expectEqual(config.FilterLevel.unhygienic, result.command_level);
+    try std.testing.expect(!result.use_daemon_control);
+}
+
+test "proxy stream plan disables ctrl-r when visible ssh is not wrapped" {
+    const result = proxyStreamPlan(&.{"-T"}, .hygienic, .none, &.{}, true, true);
+    try std.testing.expectEqual(config.FilterLevel.hygienic, result.command_level);
+    try std.testing.expect(result.use_daemon_control);
+    try std.testing.expect(!result.wrap_visible_ssh);
+    try std.testing.expect(!result.client_ctrl_r);
+}
+
+test "diagnostics doc describes current public levels and diagnostics file behavior" {
+    const doc = try std.fs.cwd().readFileAlloc(std.testing.allocator, "docs/DIAGNOSTICS.md", 128 * 1024);
+    defer std.testing.allocator.free(doc);
+
+    const snippets = [_][]const u8{
+        "`--diagnostics-file PATH`",
+        "`diagnostics-level=overlay`",
+        "`diagnostics-level=status`",
+        "`diagnostics-level=title`",
+        "`diagnostics-level=line`",
+        "`diagnostics-level=jsonl`",
+        "`diagnostics-level=jsonl` means force\nJSONL",
+        "If the file does not\nexist, sessh creates it.",
+    };
+    for (snippets) |snippet| {
+        try std.testing.expect(std.mem.indexOf(u8, doc, snippet) != null);
+    }
 }

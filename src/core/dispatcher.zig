@@ -103,6 +103,7 @@ pub const Dispatcher = struct {
     free_timer_watches: std.ArrayList(usize) = .empty,
     timer_heap: std.ArrayList(TimerWatchId) = .empty,
     pending_events: std.ArrayList(PendingEvent) = .empty,
+    next_fd_dispatch_index: usize = 0,
     active_count: usize = 0,
     running: bool = false,
 
@@ -258,8 +259,14 @@ pub const Dispatcher = struct {
         self.pending_events.clearRetainingCapacity();
 
         if (ready > 0) {
-            for (self.pollfds.items, 0..) |pollfd, index| {
+            const pollfd_count = self.pollfds.items.len;
+            var first_ready_index: ?usize = null;
+            var offset: usize = 0;
+            while (offset < pollfd_count) : (offset += 1) {
+                const index = (self.next_fd_dispatch_index + offset) % pollfd_count;
+                const pollfd = self.pollfds.items[index];
                 if (pollfd.revents == 0) continue;
+                if (first_ready_index == null) first_ready_index = index;
                 const fd_id = self.fdWatchIdForIndex(index);
                 const slot = self.fdSlotForId(fd_id) orelse continue;
                 const event = fdEventFromRevents(slot.fd, pollfd.revents);
@@ -267,6 +274,9 @@ pub const Dispatcher = struct {
                     .id = .{ .fd = fd_id },
                     .event = .{ .fd = event },
                 });
+            }
+            if (first_ready_index) |index| {
+                self.next_fd_dispatch_index = (index + 1) % pollfd_count;
             }
         }
 
@@ -590,6 +600,62 @@ test "dispatcher fd watch slots are reused and stale ids are rejected" {
 
     try dispatcher.updateFdEvents(new_id, .{ .readable = true });
     try std.testing.expectEqual(pollEvents(.{ .readable = true }), dispatcher.pollfds.items[new_id.index].events);
+}
+
+test "dispatcher rotates ready fd dispatch order" {
+    const Context = struct {
+        fds: [3]c.fd_t,
+        seen: std.ArrayList(u8) = .empty,
+
+        fn onReadable(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+            _ = dispatcher;
+            _ = id;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const fd_event = switch (event) {
+                .fd => |fd| fd,
+                .timer => return error.UnexpectedTimerEvent,
+            };
+            for (self.fds, 0..) |fd, index| {
+                if (fd_event.fd == fd) {
+                    try self.seen.append(std.testing.allocator, @intCast(index));
+                    return;
+                }
+            }
+            return error.UnexpectedFd;
+        }
+    };
+
+    var pipes: [3][2]c.fd_t = undefined;
+    for (&pipes) |*fds| {
+        fds.* = try posix.pipe();
+    }
+    defer for (pipes) |fds| {
+        posix.close(fds[0]);
+        posix.close(fds[1]);
+    };
+    for (pipes) |fds| {
+        try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], "x"));
+    }
+
+    var dispatcher = try Dispatcher.init(std.testing.allocator);
+    defer dispatcher.deinit();
+    var context = Context{ .fds = .{ pipes[0][0], pipes[1][0], pipes[2][0] } };
+    defer context.seen.deinit(std.testing.allocator);
+
+    for (context.fds) |fd| {
+        _ = try dispatcher.watchFd(fd, .{ .readable = true }, .{ .ctx = &context, .callback = Context.onReadable });
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), try dispatcher.runOnce());
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2 }, context.seen.items);
+    context.seen.clearRetainingCapacity();
+
+    try std.testing.expectEqual(@as(usize, 3), try dispatcher.runOnce());
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 0 }, context.seen.items);
+    context.seen.clearRetainingCapacity();
+
+    try std.testing.expectEqual(@as(usize, 3), try dispatcher.runOnce());
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, 1 }, context.seen.items);
 }
 
 test "dispatcher timer heap fires earliest timer first without scanning pollfds" {

@@ -6,6 +6,9 @@ const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
 const terminal = @import("../tty/terminal.zig");
 
+extern "c" fn openpty(amaster: *c_int, aslave: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp: ?*c.winsize) c_int;
+extern "c" fn ttyname(fd: c_int) ?[*:0]u8;
+
 pub const Handle = struct {
     output_fd: c.fd_t = -1,
     input_fd: c.fd_t = -1,
@@ -111,6 +114,34 @@ test "opens regular file as output only" {
     const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "diagnostics.log", 64);
     defer std.testing.allocator.free(contents);
     try std.testing.expectEqualStrings("status\n", contents);
+}
+
+test "opens tty path as output and reconnect input" {
+    var master_fd: c.fd_t = -1;
+    var slave_fd: c.fd_t = -1;
+    if (openpty(&master_fd, &slave_fd, null, null, null) != 0) return error.OpenPtyFailed;
+    defer if (master_fd >= 0) posix.close(master_fd);
+    defer if (slave_fd >= 0) posix.close(slave_fd);
+
+    const path_z = ttyname(slave_fd) orelse return error.MissingTtyName;
+    const path = std.mem.span(path_z);
+
+    var diagnostics = try Handle.open(path);
+    defer diagnostics.deinit();
+
+    try std.testing.expect(diagnostics.output_fd >= 0);
+    try std.testing.expect(diagnostics.input_fd == diagnostics.output_fd);
+
+    try io.writeAll(diagnostics.output_fd, "status");
+    var output_buf: [16]u8 = undefined;
+    const output_n = try posix.read(master_fd, &output_buf);
+    try std.testing.expectEqualStrings("status", output_buf[0..output_n]);
+
+    try io.writeAll(master_fd, "R");
+    var input_buf: [16]u8 = undefined;
+    const input_n = c.read(diagnostics.input_fd, &input_buf, input_buf.len);
+    if (input_n < 0) return error.ReadFailed;
+    try std.testing.expectEqualStrings("R", input_buf[0..@intCast(input_n)]);
 }
 
 test "reports uncreatable path" {

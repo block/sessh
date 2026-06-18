@@ -3,7 +3,7 @@ const c = std.c;
 
 const app_allocator = @import("../core/app_allocator.zig");
 const core_fds = @import("../core/fds.zig");
-const session_registry = @import("../runtime/session_registry.zig");
+const guid_ref = @import("../core/guid.zig");
 const socket_transport = @import("../transport/socket.zig");
 const session_runtime = @import("runtime.zig");
 
@@ -24,7 +24,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []const u8) !*session_runtime.TerminalRemoteProcess {
-    const guid = try session_registry.canonicalGuid(allocator, session_guid);
+    const guid = try guid_ref.canonicalSessionGuid(allocator, session_guid);
     errdefer allocator.free(guid);
 
     const socket_path = try terminalRemoteSocketPath(allocator, exe, "terminal");

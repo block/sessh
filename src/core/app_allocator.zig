@@ -9,6 +9,9 @@ var debug_allocator: if (use_debug_allocator) std.heap.DebugAllocator(.{}) else 
 pub fn allocator() std.mem.Allocator {
     if (comptime builtin.is_test) return std.testing.allocator;
     if (comptime use_debug_allocator) return debug_allocator.allocator();
+    // Keep allocator policy centralized. Release builds use Zig's default
+    // production allocator even though sessh processes are single-threaded;
+    // callers should not depend on thread-oriented allocator behavior.
     return std.heap.smp_allocator;
 }
 

@@ -2,14 +2,17 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const app_allocator = @import("../core/app_allocator.zig");
 const io = @import("../core/io.zig");
 const local_boot_time = @import("../core/local_boot_time.zig");
 const process_exit = @import("../core/process_exit.zig");
-const proxy_control = @import("../stream/proxy_control.zig");
+const user_error = @import("../core/user_error.zig");
+const proxy_diagnostics = @import("../stream/proxy_diagnostics_channel.zig");
 const protocol = @import("../protocol/mod.zig");
 const pty_process = @import("../tty/pty_process.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect_title = @import("../reconnect/title.zig");
+const status_output = @import("../stream/status_output.zig");
 const stream_runtime = @import("../stream/runtime.zig");
 const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
@@ -26,8 +29,8 @@ const ProxyClientControl = struct {
     const max_cleanup_title_bytes = 512;
 
     control_fd: c.fd_t = -1,
-    control_reader: proxy_control.Reader,
-    title_tracker: stream_runtime.TerminalTitleTracker = .{},
+    control_reader: proxy_diagnostics.Reader,
+    title_tracker: status_output.TerminalTitleTracker = .{},
     pending_title: [max_title_bytes]u8 = undefined,
     pending_title_len: usize = 0,
     status_line: [max_status_bytes]u8 = undefined,
@@ -42,7 +45,7 @@ const ProxyClientControl = struct {
 
     fn init(allocator: std.mem.Allocator, ctrl_r_allowed: bool, onscreen_status: bool) ProxyClientControl {
         var diagnostics = ProxyClientControl{
-            .control_reader = proxy_control.Reader.init(allocator),
+            .control_reader = proxy_diagnostics.Reader.init(allocator),
             .ctrl_r_allowed = ctrl_r_allowed,
             .onscreen_status = onscreen_status,
         };
@@ -80,8 +83,9 @@ const ProxyClientControl = struct {
 
     fn readControl(self: *ProxyClientControl) void {
         if (self.control_fd < 0) return;
+        const allocator = app_allocator.allocator();
         while (true) {
-            var message = switch (self.control_reader.readReady(std.heap.smp_allocator, self.control_fd) catch {
+            var message = switch (self.control_reader.readReady(allocator, self.control_fd) catch {
                 self.closeControl();
                 return;
             }) {
@@ -92,12 +96,12 @@ const ProxyClientControl = struct {
                 },
                 .message => |value| value,
             };
-            defer message.deinit(std.heap.smp_allocator);
+            defer message.deinit(allocator);
             self.handleMessage(message.message);
         }
     }
 
-    fn handleMessage(self: *ProxyClientControl, message: proxy_control.Message) void {
+    fn handleMessage(self: *ProxyClientControl, message: proxy_diagnostics.Message) void {
         switch (message) {
             .connection_event => |event| self.handleConnectionEvent(event),
             .retry_now => {},
@@ -138,7 +142,7 @@ const ProxyClientControl = struct {
 
     fn sendCtrlR(self: *ProxyClientControl) void {
         if (self.control_fd < 0) return;
-        proxy_control.writeRetryNow(self.control_fd) catch {};
+        proxy_diagnostics.writeRetryNow(self.control_fd) catch {};
     }
 
     fn showUpdate(self: *ProxyClientControl, line: []const u8) void {
@@ -248,8 +252,8 @@ pub fn runArgvWithDiagnostics(
 }
 
 fn waitForChildAndDiagnostics(pid: c.pid_t, diagnostics: *ProxyClientControl) std.process.Child.Term {
-    // BLOCKING_POLL: plain-ssh compatibility mode is a foreground process
-    // waiting for its only child while optionally draining diagnostics. It has
+    // BLOCKING_POLL: the plain-ssh fallback is a foreground process waiting
+    // for its only child while optionally draining diagnostics. It has
     // no process Dispatcher; sesshd-owned SSH transports use the daemon
     // dispatcher instead.
     while (true) {
@@ -427,11 +431,11 @@ fn exitAfterTerm(term: std.process.Child.Term, diagnostic_name: []const u8) !nor
     switch (term) {
         .Exited => |code| return process_exit.request(code),
         .Signal => |signal| {
-            try io.stderrPrint("sessh: {s} ended by signal {}\n", .{ diagnostic_name, signal });
+            try user_error.printLine("{s} ended by signal {}", .{ diagnostic_name, signal });
             return process_exit.request(255);
         },
         else => {
-            try io.stderrPrint("sessh: {s} ended unexpectedly: {t}\n", .{ diagnostic_name, term });
+            try user_error.printLine("{s} ended unexpectedly: {t}", .{ diagnostic_name, term });
             return process_exit.request(255);
         },
     }

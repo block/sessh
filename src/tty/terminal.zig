@@ -290,6 +290,9 @@ fn readTerminalProbeResponses(input_fd: c.fd_t, probe: *TerminalProbe, target: P
     var bytes: [512]u8 = undefined;
     var len: usize = 0;
     const deadline = std.time.milliTimestamp() + terminal_query_timeout_ms;
+    // BLOCKING_POLL: foreground local-terminal probe. It runs before the
+    // visible client enters its main attached-client loop and has no daemon
+    // dispatcher work to service.
     while (std.time.milliTimestamp() < deadline) {
         const remaining = deadline - std.time.milliTimestamp();
         if (remaining <= 0) break;

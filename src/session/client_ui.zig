@@ -5,34 +5,28 @@ const posix = std.posix;
 const app_allocator = @import("../core/app_allocator.zig");
 const client_log = @import("../core/client_log.zig");
 const client_renderer = @import("renderer.zig");
-const diagnostics_jsonl = @import("../diagnostics/jsonl.zig");
+const connection_event = @import("../diagnostics/connection_event.zig");
+const diagnostics_display = @import("../diagnostics/display.zig");
+const reconnect_input = @import("../diagnostics/reconnect_input.zig");
 const io_helpers = @import("../core/io.zig");
 const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
+const overlay = @import("overlay.zig");
+const protocol = @import("../protocol/mod.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect_title = @import("../reconnect/title.zig");
 const terminal = @import("../tty/terminal.zig");
 
 const WindowSize = terminal.WindowSize;
+const pb = protocol.pb;
+pub const OverlayLine = overlay.Line;
+pub const OverlayDrawState = overlay.DrawState;
+pub const drawOverlayLines = overlay.drawLines;
+pub const clearedOverlayViewportOffset = overlay.clearedOverlayViewportOffset;
+pub const eraseOverlayRows = overlay.eraseOverlayRows;
+pub const restoreOverlayExpansion = overlay.restoreOverlayExpansion;
 
-fn copyTitleFallback(dest: []u8, title: []const u8) usize {
-    const len = @min(dest.len, title.len);
-    @memcpy(dest[0..len], title[0..len]);
-    return len;
-}
-
-pub const ReconnectPresentation = enum {
-    none,
-    stderr_plain,
-    title,
-    jsonl,
-    overlay,
-};
-
-pub const ReconnectDecision = enum {
-    wait_elapsed,
-    reconnect_now,
-    client_hangup,
-};
+pub const ReconnectPresentation = diagnostics_display.Presentation;
+pub const ReconnectDecision = reconnect_input.Decision;
 
 pub const ReconnectSwitchDisposition = enum {
     automatic,
@@ -48,12 +42,18 @@ pub const ReconnectUiOptions = struct {
     line_fd: c.fd_t = posix.STDERR_FILENO,
 };
 
-pub const ReconnectUi = struct {
-    const max_diagnostic_overlay_lines = 3;
-    const max_overlay_message_bytes = 256;
-    const max_title_fallback_bytes = 512;
-    const disconnected_input_flash_ms = 35;
+const OverlayDiagnosticLine = struct {
+    bytes: [client_log.max_user_diagnostic_display_bytes]u8 = undefined,
+    len: usize = 0,
 
+    fn slice(self: *const OverlayDiagnosticLine) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+pub const ReconnectUi = struct {
+    const max_diagnostic_overlay_lines = overlay.max_diagnostic_lines;
+    const max_overlay_message_bytes = overlay.max_message_bytes;
     mode_guard: terminal.TerminalModeGuard,
     viewport_offset: u16 = 0,
     overlay_state: ?OverlayDrawState = null,
@@ -68,23 +68,16 @@ pub const ReconnectUi = struct {
     diagnostic_lines: [max_diagnostic_overlay_lines]OverlayDiagnosticLine = [_]OverlayDiagnosticLine{.{}} ** max_diagnostic_overlay_lines,
     diagnostic_line_count: usize = 0,
     cursor_hidden: bool = false,
-    reconnect_acknowledged: bool = false,
-    input_during_disconnect: bool = false,
-    escape_filter: terminal.EscapeFilter = .{},
+    reconnect_input_state: reconnect_input.State = .{},
     cancelled: bool = false,
     input_fd: c.fd_t = posix.STDIN_FILENO,
     output_fd: c.fd_t = posix.STDOUT_FILENO,
     line_fd: c.fd_t = posix.STDERR_FILENO,
-    title_enabled: bool = false,
-    title_fd: c.fd_t = posix.STDOUT_FILENO,
-    title_visible: bool = false,
+    title_state: diagnostics_display.TitleState = .{},
     presentation: ReconnectPresentation = .overlay,
-    cleanup_title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
-    cleanup_title_fallback_len: usize = 0,
     last_size: WindowSize = .{},
     resize_generation: u64 = 0,
     forwarded_resize_generation: u64 = 0,
-    disconnected_input_flash_until_ms: u64 = 0,
     append_only_retry_announced: bool = false,
 
     pub fn begin(viewport_offset: i32) !ReconnectUi {
@@ -96,26 +89,20 @@ pub const ReconnectUi = struct {
     }
 
     pub fn beginWithOptions(viewport_offset: i32, options: ReconnectUiOptions) !ReconnectUi {
+        const title_enabled = (options.presentation == .overlay or options.presentation == .title) and c.isatty(options.output_fd) != 0;
         var ui = ReconnectUi{
             .mode_guard = try terminal.TerminalModeGuard.enable(options.input_fd),
             .clock = try NonSuspendingTimer.start(),
             .input_fd = options.input_fd,
             .output_fd = options.output_fd,
             .line_fd = options.line_fd,
-            .title_enabled = (options.presentation == .overlay or options.presentation == .title) and c.isatty(options.output_fd) != 0,
-            .title_fd = options.output_fd,
+            .title_state = diagnostics_display.TitleState.init(title_enabled, options.output_fd),
             .presentation = options.presentation,
             .last_size = terminal.currentWindowSize(),
         };
         errdefer ui.mode_guard.restore();
         ui.viewport_offset = if (viewport_offset > 0) @intCast(viewport_offset) else 0;
-        if (ui.title_enabled) {
-            const cleanup_title = std.process.getCwdAlloc(app_allocator.allocator()) catch null;
-            if (cleanup_title) |title| {
-                defer app_allocator.allocator().free(title);
-                ui.cleanup_title_fallback_len = copyTitleFallback(&ui.cleanup_title_fallback, title);
-            }
-        }
+        ui.title_state.captureCleanupTitle(app_allocator.allocator());
         ui.diagnostic_cursor = client_log.displayedUserDiagnosticSeq();
         ui.live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq();
         ui.rendered_diagnostic_seq = ui.diagnostic_cursor;
@@ -136,7 +123,7 @@ pub const ReconnectUi = struct {
     }
 
     pub fn deinit(self: *ReconnectUi) void {
-        self.clearDisconnectedInputFlash() catch {};
+        self.reconnect_input_state.clearDisconnectedInputFlash(self.output_fd) catch {};
         self.restoreTitleForEnd();
         if (self.diagnostic_notify_write_fd >= 0) {
             client_log.unregisterUserDiagnosticNotifier(self.diagnostic_notify_write_fd);
@@ -155,7 +142,7 @@ pub const ReconnectUi = struct {
         self.append_only_retry_announced = false;
         try self.drawReconnectOverlay(delay_ms);
         var timer = try NonSuspendingTimer.start();
-        var next_overlay_update_ms = nextOverlayUpdateDelayMs(delay_ms);
+        var next_overlay_update_ms = diagnostics_display.nextOverlayUpdateDelayMs(delay_ms);
 
         while (true) {
             const elapsed_ms = elapsedTimerMs(&timer);
@@ -184,7 +171,7 @@ pub const ReconnectUi = struct {
             if (after_poll_ms >= next_overlay_update_ms and after_poll_ms < delay_ms) {
                 const remaining_ms = delay_ms - after_poll_ms;
                 try self.drawReconnectOverlay(remaining_ms);
-                next_overlay_update_ms = after_poll_ms + nextOverlayUpdateDelayMs(remaining_ms);
+                next_overlay_update_ms = after_poll_ms + diagnostics_display.nextOverlayUpdateDelayMs(remaining_ms);
             }
         }
     }
@@ -203,14 +190,26 @@ pub const ReconnectUi = struct {
         try self.drawReconnectReadyOverlay(disposition, 0);
     }
 
+    pub fn handleConnectionEvent(self: *ReconnectUi, event: pb.ConnectionEvent) !void {
+        switch (connection_event.classify(event)) {
+            .ssh_stderr => |stderr| {
+                client_log.appendSshStderr(stderr.data);
+                try self.refreshOverlayIfDiagnosticsChanged();
+            },
+            .binary_bootstrapping => try self.drawStaticOverlay("sessh: bootstrapping..."),
+            .daemon_connecting => try self.showDisconnectedReconnectInProgress(),
+            .daemon_connected => _ = try self.clearOverlay(),
+            .retry => |retry| try self.drawReconnectOverlay(retry.delay_ms),
+            .ssh_connecting, .ssh_connected, .none => {},
+        }
+    }
+
     pub fn hasReconnectAcknowledgement(self: *const ReconnectUi) bool {
-        return self.reconnect_acknowledged;
+        return self.reconnect_input_state.hasReconnectAcknowledgement();
     }
 
     pub fn consumeReconnectAcknowledgement(self: *ReconnectUi) bool {
-        const acknowledged = self.reconnect_acknowledged;
-        self.reconnect_acknowledged = false;
-        return acknowledged;
+        return self.reconnect_input_state.consumeReconnectAcknowledgement();
     }
 
     pub fn reconnectSwitchDisposition(
@@ -221,7 +220,7 @@ pub const ReconnectUi = struct {
     ) ReconnectSwitchDisposition {
         if (unresponsive) return .manual_unresponsive;
         if (pending_paste_like_input_at_disconnect) return .manual_disconnected;
-        if (pending_input_at_disconnect or self.input_during_disconnect) return .delayed;
+        if (pending_input_at_disconnect or self.reconnect_input_state.input_during_disconnect) return .delayed;
         return .automatic;
     }
 
@@ -241,7 +240,7 @@ pub const ReconnectUi = struct {
         if (self.hasReconnectAcknowledgement()) return .reconnect_now;
         try self.drawReconnectReadyOverlay(.delayed, delay_ms);
         var timer = try NonSuspendingTimer.start();
-        var next_overlay_update_ms = nextOverlayUpdateDelayMs(delay_ms);
+        var next_overlay_update_ms = diagnostics_display.nextOverlayUpdateDelayMs(delay_ms);
 
         while (true) {
             const elapsed_ms = elapsedTimerMs(&timer);
@@ -259,7 +258,7 @@ pub const ReconnectUi = struct {
             if (after_poll_ms >= next_overlay_update_ms and after_poll_ms < delay_ms) {
                 const remaining_ms = delay_ms - after_poll_ms;
                 try self.drawReconnectReadyOverlay(.delayed, remaining_ms);
-                next_overlay_update_ms = after_poll_ms + nextOverlayUpdateDelayMs(remaining_ms);
+                next_overlay_update_ms = after_poll_ms + diagnostics_display.nextOverlayUpdateDelayMs(remaining_ms);
             }
         }
     }
@@ -302,18 +301,6 @@ pub const ReconnectUi = struct {
         return true;
     }
 
-    fn effectivePollTimeout(self: *ReconnectUi, timeout_ms: i32) i32 {
-        var effective_timeout = timeout_ms;
-        if (effective_timeout < 0 and self.presentation == .overlay) effective_timeout = 250;
-        if (self.disconnected_input_flash_until_ms <= 0) return effective_timeout;
-        const now_ms = self.nowMs();
-        if (now_ms >= self.disconnected_input_flash_until_ms) return 0;
-        const remaining_ms = self.disconnected_input_flash_until_ms - now_ms;
-        const flash_timeout: i32 = @intCast(@min(remaining_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
-        if (effective_timeout < 0) return flash_timeout;
-        return @min(effective_timeout, flash_timeout);
-    }
-
     pub fn refreshForResize(self: *ReconnectUi) !void {
         const size = terminal.currentWindowSize();
         if (size.rows == self.last_size.rows and size.cols == self.last_size.cols) return;
@@ -331,73 +318,18 @@ pub const ReconnectUi = struct {
     }
 
     fn pollInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        var pollfds = [_]posix.pollfd{
-            .{
-                .fd = self.input_fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-            .{
-                .fd = self.diagnostic_notify_read_fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-        };
-        const poll_count: usize = if (self.diagnostic_notify_read_fd >= 0) 2 else 1;
-        const ready = try posix.poll(pollfds[0..poll_count], self.effectivePollTimeout(timeout_ms));
-        if (ready == 0) return .wait_elapsed;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .client_hangup;
-        if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
-            self.drainDiagnosticNotifier();
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
-
-        var input: [256]u8 = undefined;
-        var filtered: [512]u8 = undefined;
-        const n = c.read(self.input_fd, &input, input.len);
-        if (n <= 0) return .client_hangup;
-        io_helpers.noteRead(self.input_fd, input[0..@intCast(n)]);
-
-        const bytes = input[0..@intCast(n)];
-        switch (reconnect_control.scanInput(bytes, .{})) {
-            .reconnect_now => {
-                self.reconnect_acknowledged = true;
-                return .reconnect_now;
-            },
-            .none => {},
-        }
-        const result = self.escape_filter.filter(bytes, &filtered);
-        if (result.end) |end| switch (end) {
-            .disconnect => return .client_hangup,
-            .help => {},
-            .repaint => {},
-        };
-        if (bytes.len > 0) {
-            self.input_during_disconnect = true;
-            try self.alertDisconnectedInput();
-        }
-        return .wait_elapsed;
-    }
-
-    fn alertDisconnectedInput(self: *ReconnectUi) !void {
-        try io_helpers.writeAll(self.output_fd, "\x07");
-        if (c.isatty(self.output_fd) == 0) return;
-        if (self.disconnected_input_flash_until_ms <= 0) {
-            try io_helpers.writeAll(self.output_fd, "\x1b[?5h");
-        }
-        self.disconnected_input_flash_until_ms = self.nowMs() +| disconnected_input_flash_ms;
+        return self.reconnect_input_state.poll(
+            self.input_fd,
+            self.output_fd,
+            self.diagnostic_notify_read_fd,
+            timeout_ms,
+            self.presentation == .overlay,
+            self.nowMs(),
+        );
     }
 
     fn refreshDisconnectedInputFlash(self: *ReconnectUi) !void {
-        if (self.disconnected_input_flash_until_ms <= 0) return;
-        if (self.nowMs() < self.disconnected_input_flash_until_ms) return;
-        try self.clearDisconnectedInputFlash();
-    }
-
-    fn clearDisconnectedInputFlash(self: *ReconnectUi) !void {
-        if (self.disconnected_input_flash_until_ms <= 0) return;
-        self.disconnected_input_flash_until_ms = 0;
-        if (c.isatty(self.output_fd) != 0) try io_helpers.writeAll(self.output_fd, "\x1b[?5l");
+        try self.reconnect_input_state.refreshDisconnectedInputFlash(self.output_fd, self.nowMs());
     }
 
     fn nowMs(self: *ReconnectUi) u64 {
@@ -428,7 +360,7 @@ pub const ReconnectUi = struct {
             if (self.append_only_retry_announced) return;
             self.append_only_retry_announced = true;
             var message_buf: [192]u8 = undefined;
-            const message = try appendOnlyRetryStatus(&message_buf, delay_ms, true);
+            const message = try diagnostics_display.appendOnlyRetryStatus(&message_buf, delay_ms, true);
             try self.drawStaticOverlay(message);
             return;
         }
@@ -449,7 +381,7 @@ pub const ReconnectUi = struct {
         const message = switch (disposition) {
             .delayed => blk: {
                 var delay_buf: [16]u8 = undefined;
-                const delay = try formatSwitchDelay(delay_ms, &delay_buf);
+                const delay = try diagnostics_display.formatSwitchDelay(delay_ms, &delay_buf);
                 break :blk try std.fmt.bufPrint(
                     &message_buf,
                     "--- sessh: disconnected: Connection ready. Switch {s}. CTRL-R now ---",
@@ -482,10 +414,10 @@ pub const ReconnectUi = struct {
         switch (self.presentation) {
             .none, .title => return,
             .jsonl => {
-                try writeJsonlStatus(self.line_fd, message);
+                try diagnostics_display.writeJsonlStatus(self.line_fd, message);
                 return;
             },
-            .stderr_plain => {
+            .line => {
                 try io_helpers.writeAll(self.line_fd, message);
                 try io_helpers.writeAll(self.line_fd, "\r\n");
                 return;
@@ -538,7 +470,7 @@ pub const ReconnectUi = struct {
     }
 
     fn appendOnlyPresentation(self: *const ReconnectUi) bool {
-        return self.presentation == .stderr_plain or self.presentation == .jsonl;
+        return self.presentation == .line or self.presentation == .jsonl;
     }
 
     fn consumeDiagnostics(self: *ReconnectUi) !void {
@@ -553,7 +485,7 @@ pub const ReconnectUi = struct {
             if (diagnostic.seq == 0) continue;
             switch (self.presentation) {
                 .overlay => self.appendDiagnosticLine(diagnostic),
-                .stderr_plain => self.writePlainDiagnosticLine(diagnostic),
+                .line => self.writePlainDiagnosticLine(diagnostic),
                 .jsonl => self.writeJsonlDiagnostic(diagnostic),
                 .title, .none => {},
             }
@@ -566,13 +498,13 @@ pub const ReconnectUi = struct {
     fn writePlainDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
         const delayed = diagnostic.seq <= self.live_diagnostic_start_seq;
         var line_buf: [client_log.max_user_diagnostic_display_bytes]u8 = undefined;
-        const len = formatOverlayDiagnostic(line_buf[0..], diagnostic, delayed);
+        const len = diagnostics_display.formatDiagnostic(line_buf[0..], diagnostic, delayed);
         io_helpers.writeAll(self.line_fd, line_buf[0..len]) catch return;
         io_helpers.writeAll(self.line_fd, "\r\n") catch {};
     }
 
     fn writeJsonlDiagnostic(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
-        diagnostics_jsonl.writeMessage(self.line_fd, "diagnostic", diagnostic.slice()) catch return;
+        diagnostics_display.writeJsonlDiagnostic(self.line_fd, diagnostic) catch return;
     }
 
     fn appendDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
@@ -583,23 +515,8 @@ pub const ReconnectUi = struct {
         }
         const delayed = diagnostic.seq <= self.live_diagnostic_start_seq;
         const target = &self.diagnostic_lines[self.diagnostic_line_count];
-        target.len = formatOverlayDiagnostic(target.bytes[0..], diagnostic, delayed);
+        target.len = diagnostics_display.formatDiagnostic(target.bytes[0..], diagnostic, delayed);
         self.diagnostic_line_count += 1;
-    }
-
-    fn drainDiagnosticNotifier(self: *ReconnectUi) void {
-        if (self.diagnostic_notify_read_fd < 0) return;
-        var buf: [128]u8 = undefined;
-        while (true) {
-            const n = c.read(self.diagnostic_notify_read_fd, &buf, buf.len);
-            if (n > 0) continue;
-            if (n == 0) return;
-            switch (posix.errno(n)) {
-                .AGAIN => return,
-                .INTR => continue,
-                else => return,
-            }
-        }
     }
 
     fn hideCursor(self: *ReconnectUi) !void {
@@ -615,415 +532,33 @@ pub const ReconnectUi = struct {
     }
 
     pub fn restoreTitleAfterReconnect(self: *ReconnectUi, app_title_present: ?bool, fallback_title: []const u8) void {
-        if (!self.title_visible) return;
-        if (app_title_present != true) {
-            self.restoreTitleTo(fallback_title);
-        }
-        self.title_visible = false;
+        self.title_state.restoreAfterReconnect(app_title_present, fallback_title);
     }
 
     pub fn restoreTitleForEnd(self: *ReconnectUi) void {
-        if (!self.title_visible) return;
-        self.restoreTitleTo(self.cleanupTitleFallback());
-        self.title_visible = false;
+        self.title_state.restoreForEnd();
     }
 
     fn showRetryTitle(self: *ReconnectUi, delay_ms: u64) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeRetryNowTitle(self.title_fd, delay_ms) catch return;
-        self.title_visible = true;
+        self.title_state.showRetry(delay_ms);
     }
 
     fn showReconnectingTitle(self: *ReconnectUi) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeReconnectingTitle(self.title_fd) catch return;
-        self.title_visible = true;
+        self.title_state.showReconnecting();
     }
 
     fn showReconnectingNowTitle(self: *ReconnectUi) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeReconnectingNowTitle(self.title_fd) catch return;
-        self.title_visible = true;
+        self.title_state.showReconnectingNow();
     }
 
     fn showConnectionReadyTitle(self: *ReconnectUi) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeConnectionReadyTitle(self.title_fd) catch return;
-        self.title_visible = true;
+        self.title_state.showConnectionReady();
     }
 
     fn showSwitchCountdownTitle(self: *ReconnectUi, delay_ms: u64) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeSwitchCountdownTitle(self.title_fd, delay_ms) catch return;
-        self.title_visible = true;
-    }
-
-    fn restoreTitleTo(self: *ReconnectUi, title: []const u8) void {
-        if (!self.title_enabled or self.title_fd < 0) return;
-        reconnect_title.writeTitle(self.title_fd, title) catch {};
-    }
-
-    fn cleanupTitleFallback(self: *const ReconnectUi) []const u8 {
-        return self.cleanup_title_fallback[0..self.cleanup_title_fallback_len];
+        self.title_state.showSwitchCountdown(delay_ms);
     }
 };
-
-pub const OverlayAlign = enum {
-    left,
-    center,
-};
-
-pub const OverlayLine = struct {
-    text: []const u8,
-    alignment: OverlayAlign,
-};
-
-const OverlayDiagnosticLine = struct {
-    bytes: [client_log.max_user_diagnostic_display_bytes]u8 = undefined,
-    len: usize = 0,
-
-    fn slice(self: *const OverlayDiagnosticLine) []const u8 {
-        return self.bytes[0..self.len];
-    }
-};
-
-const max_overlay_diagnostic_line_count = 1 + ReconnectUi.max_diagnostic_overlay_lines;
-const max_overlay_line_count = if (max_overlay_diagnostic_line_count > terminal.escape_help_overlay_lines.len)
-    max_overlay_diagnostic_line_count
-else
-    terminal.escape_help_overlay_lines.len;
-const max_overlay_render_line_bytes = if (ReconnectUi.max_overlay_message_bytes > client_log.max_user_diagnostic_display_bytes)
-    ReconnectUi.max_overlay_message_bytes
-else
-    client_log.max_user_diagnostic_display_bytes;
-
-comptime {
-    std.debug.assert(max_overlay_line_count >= terminal.escape_help_overlay_lines.len);
-    for (terminal.escape_help_overlay_lines) |line| {
-        std.debug.assert(max_overlay_render_line_bytes >= line.len);
-    }
-}
-
-const RenderedOverlayLine = struct {
-    start_col: u16 = 0,
-    len: u16 = 0,
-    bytes: [max_overlay_render_line_bytes]u8 = undefined,
-
-    fn slice(self: *const RenderedOverlayLine) []const u8 {
-        return self.bytes[0..self.len];
-    }
-
-    fn endCol(self: *const RenderedOverlayLine) u16 {
-        return self.start_col + self.len;
-    }
-
-    fn eql(self: *const RenderedOverlayLine, other: *const RenderedOverlayLine) bool {
-        return self.start_col == other.start_col and
-            self.len == other.len and
-            std.mem.eql(u8, self.slice(), other.slice());
-    }
-};
-
-pub const OverlayDrawState = struct {
-    rows: u16,
-    cols: u16,
-    start_row: u16,
-    line_count: u16,
-    viewport_offset: u16,
-    restore_viewport_offset: u16,
-    scroll_top: u16,
-    scroll_lines: u16,
-    restores_expansion: bool = true,
-    lines: [max_overlay_line_count]RenderedOverlayLine = [_]RenderedOverlayLine{.{}} ** max_overlay_line_count,
-};
-
-const OverlayLayout = struct {
-    start_row: u16,
-    visible_line_count: u16,
-    scroll_lines: u16,
-    viewport_offset: u16,
-};
-
-pub fn drawOverlayLines(
-    renderer: client_renderer.Renderer,
-    size: WindowSize,
-    viewport_offset: u16,
-    previous: ?OverlayDrawState,
-    lines: []const OverlayLine,
-) !OverlayDrawState {
-    const terminal_rows = normalizedTerminalRows(size.rows);
-    if (lines.len == 0) {
-        if (previous) |state| try eraseOverlayRows(renderer, state, terminal_rows, size.cols);
-        if (previous) |state| try restoreOverlayExpansion(renderer, state, terminal_rows);
-        const restored_viewport_offset = if (previous) |state| clearedOverlayViewportOffset(state) else viewport_offset;
-        return .{
-            .rows = terminal_rows,
-            .cols = size.cols,
-            .start_row = 0,
-            .line_count = 0,
-            .viewport_offset = restored_viewport_offset,
-            .restore_viewport_offset = restored_viewport_offset,
-            .scroll_top = restored_viewport_offset,
-            .scroll_lines = 0,
-        };
-    }
-
-    const layout = overlayLayoutForSize(terminal_rows, viewport_offset, lines.len);
-    const clamped_viewport_offset = @min(viewport_offset, terminal_rows - 1);
-    const prior_scroll_lines = if (previous) |state| state.scroll_lines else 0;
-    const restore_viewport_offset = if (previous) |state| state.restore_viewport_offset else clamped_viewport_offset;
-    const scroll_lines = prior_scroll_lines +| layout.scroll_lines;
-    const consumes_outer_rows = layout.scroll_lines > 0 and layout.viewport_offset < restore_viewport_offset;
-    const restores_expansion = (if (previous) |state| state.restores_expansion else true) and !consumes_outer_rows;
-    var next_state = OverlayDrawState{
-        .rows = terminal_rows,
-        .cols = size.cols,
-        .start_row = layout.start_row,
-        .line_count = layout.visible_line_count,
-        .viewport_offset = layout.viewport_offset,
-        .restore_viewport_offset = restore_viewport_offset,
-        .scroll_top = layout.viewport_offset,
-        .scroll_lines = scroll_lines,
-        .restores_expansion = restores_expansion,
-    };
-    var row_offset: u16 = 0;
-    while (row_offset < layout.visible_line_count) : (row_offset += 1) {
-        next_state.lines[row_offset] = renderOverlayLine(size.cols, lines[row_offset]);
-    }
-
-    const can_update_in_place = if (previous) |state|
-        layout.scroll_lines == 0 and
-            state.rows == terminal_rows and
-            state.cols == size.cols and
-            state.start_row == layout.start_row
-    else
-        false;
-
-    if (!can_update_in_place) {
-        if (previous) |state| try eraseOverlayRows(renderer, state, terminal_rows, size.cols);
-    }
-    if (layout.scroll_lines > 0) {
-        if (restores_expansion) {
-            try expandOverlayRegion(renderer, layout.viewport_offset, terminal_rows, layout.scroll_lines);
-        } else {
-            try expandOverlayByScrollingTerminal(renderer, terminal_rows, layout.scroll_lines);
-        }
-    }
-
-    row_offset = 0;
-    while (row_offset < layout.visible_line_count) : (row_offset += 1) {
-        const old_line = if (can_update_in_place and row_offset < previous.?.line_count)
-            previous.?.lines[row_offset]
-        else
-            null;
-        if (old_line) |line| {
-            if (next_state.lines[row_offset].eql(&line)) continue;
-        }
-        try drawRenderedOverlayLine(
-            renderer,
-            layout.start_row + row_offset,
-            size.cols,
-            next_state.lines[row_offset],
-            old_line,
-            old_line == null,
-        );
-    }
-    if (can_update_in_place) {
-        row_offset = layout.visible_line_count;
-        while (row_offset < previous.?.line_count) : (row_offset += 1) {
-            try eraseRenderedOverlayLine(renderer, layout.start_row + row_offset, size.cols, previous.?.lines[row_offset]);
-        }
-    }
-    try renderer.restoreOverlayPresentation();
-    try renderer.moveCursor(layout.viewport_offset, 0);
-    return next_state;
-}
-
-pub fn clearedOverlayViewportOffset(self: OverlayDrawState) u16 {
-    return if (self.restores_expansion) self.restore_viewport_offset else self.viewport_offset;
-}
-
-pub fn eraseOverlayRows(renderer: client_renderer.Renderer, state: OverlayDrawState, rows: u16, cols: u16) !void {
-    const terminal_rows = normalizedTerminalRows(rows);
-    try renderer.restoreOverlayPresentation();
-    var i: u16 = 0;
-    while (i < state.line_count) : (i += 1) {
-        const row = state.start_row +| i;
-        if (row >= terminal_rows) break;
-        try eraseRenderedOverlayLine(renderer, row, cols, state.lines[i]);
-    }
-}
-
-fn expandOverlayRegion(renderer: client_renderer.Renderer, top: u16, rows: u16, count: u16) !void {
-    if (count == 0) return;
-    const terminal_rows = normalizedTerminalRows(rows);
-    const bottom = terminal_rows - 1;
-    try renderer.restoreOverlayPresentation();
-    try renderer.setScrollRegion(top, bottom);
-    try renderer.moveCursor(bottom, 0);
-    var i: u16 = 0;
-    while (i < count) : (i += 1) try renderer.newline();
-    try renderer.resetScrollRegion();
-}
-
-fn expandOverlayByScrollingTerminal(renderer: client_renderer.Renderer, rows: u16, count: u16) !void {
-    if (count == 0) return;
-    const terminal_rows = normalizedTerminalRows(rows);
-    const bottom = terminal_rows - 1;
-    try renderer.restoreOverlayPresentation();
-    try renderer.moveCursor(bottom, 0);
-    var i: u16 = 0;
-    while (i < count) : (i += 1) try renderer.newline();
-}
-
-pub fn restoreOverlayExpansion(renderer: client_renderer.Renderer, state: OverlayDrawState, rows: u16) !void {
-    if (state.scroll_lines == 0) return;
-    if (!state.restores_expansion) return;
-    const terminal_rows = normalizedTerminalRows(rows);
-    if (terminal_rows != state.rows) return;
-    const bottom = terminal_rows - 1;
-    try renderer.restoreOverlayPresentation();
-    try renderer.setScrollRegion(state.scroll_top, bottom);
-    try renderer.moveCursor(state.scroll_top, 0);
-    var i: u16 = 0;
-    while (i < state.scroll_lines) : (i += 1) try renderer.reverseIndex();
-    try renderer.resetScrollRegion();
-}
-
-fn renderOverlayLine(cols: u16, line: OverlayLine) RenderedOverlayLine {
-    const visible_len = @min(@min(line.text.len, @as(usize, cols)), max_overlay_render_line_bytes);
-    const col: u16 = switch (line.alignment) {
-        .left => 0,
-        .center => if (cols > visible_len)
-            @intCast((@as(usize, cols) - visible_len) / 2)
-        else
-            0,
-    };
-    var rendered = RenderedOverlayLine{
-        .start_col = col,
-        .len = @intCast(visible_len),
-    };
-    for (line.text[0..visible_len], 0..) |byte, i| {
-        rendered.bytes[i] = overlaySafeByte(byte);
-    }
-    return rendered;
-}
-
-fn drawRenderedOverlayLine(
-    renderer: client_renderer.Renderer,
-    row: u16,
-    cols: u16,
-    line: RenderedOverlayLine,
-    previous: ?RenderedOverlayLine,
-    clear_full_row: bool,
-) !void {
-    if (cols == 0) return;
-    const line_end = line.endCol();
-    var cover_start: u16 = if (clear_full_row) 0 else line.start_col;
-    var cover_end: u16 = if (clear_full_row) cols else line_end;
-    if (!clear_full_row) {
-        if (previous) |old| {
-            cover_start = @min(cover_start, old.start_col);
-            cover_end = @max(cover_end, old.endCol());
-        }
-    }
-    if (cover_end <= cover_start) return;
-
-    try renderer.moveCursor(row, cover_start);
-    try renderer.restoreOverlayPresentation();
-    try writeSpaces(renderer, line.start_col - cover_start);
-    try renderer.writeRaw("\x1b[7m");
-    try renderer.writeRaw(line.slice());
-    try renderer.writeRaw("\x1b[0m");
-    try writeSpaces(renderer, cover_end - line_end);
-}
-
-fn eraseRenderedOverlayLine(renderer: client_renderer.Renderer, row: u16, cols: u16, line: RenderedOverlayLine) !void {
-    const start_col = @min(line.start_col, cols);
-    const end_col = @min(line.endCol(), cols);
-    if (end_col <= start_col) return;
-    try renderer.moveCursor(row, start_col);
-    try renderer.restoreOverlayPresentation();
-    try writeSpaces(renderer, end_col - start_col);
-}
-
-fn writeSpaces(renderer: client_renderer.Renderer, count: usize) !void {
-    const spaces = "                                                                ";
-    var remaining = count;
-    while (remaining > 0) {
-        const n = @min(remaining, spaces.len);
-        try renderer.writeRaw(spaces[0..n]);
-        remaining -= n;
-    }
-}
-
-fn overlaySafeByte(byte: u8) u8 {
-    return switch (byte) {
-        ' '...'~' => byte,
-        else => '?',
-    };
-}
-
-fn normalizedTerminalRows(rows: u16) u16 {
-    return if (rows == 0) 1 else rows;
-}
-
-fn overlayLayoutForSize(rows: u16, top_row: u16, line_count: usize) OverlayLayout {
-    const terminal_rows = normalizedTerminalRows(rows);
-    const visible_line_count: u16 = @intCast(@min(line_count, @as(usize, terminal_rows)));
-    if (visible_line_count == 0) {
-        const viewport_offset = @min(top_row, terminal_rows - 1);
-        return .{ .start_row = viewport_offset, .visible_line_count = 0, .scroll_lines = 0, .viewport_offset = viewport_offset };
-    }
-
-    const clamped_top = @min(top_row, terminal_rows - 1);
-    const preferred_start = @as(usize, clamped_top) + 1;
-    const preferred_end = preferred_start + @as(usize, visible_line_count);
-    if (preferred_end <= terminal_rows) {
-        return .{
-            .start_row = @intCast(preferred_start),
-            .visible_line_count = visible_line_count,
-            .scroll_lines = 0,
-            .viewport_offset = clamped_top,
-        };
-    }
-
-    const scroll_lines: u16 = @intCast(@min(preferred_end - terminal_rows, @as(usize, std.math.maxInt(u16))));
-    const consumed_top = @min(clamped_top, scroll_lines);
-    return .{
-        .start_row = terminal_rows - visible_line_count,
-        .visible_line_count = visible_line_count,
-        .scroll_lines = scroll_lines,
-        .viewport_offset = clamped_top - consumed_top,
-    };
-}
-
-fn countSubstrings(haystack: []const u8, needle: []const u8) usize {
-    if (needle.len == 0) return 0;
-    var count: usize = 0;
-    var index: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, index, needle)) |found| {
-        count += 1;
-        index = found + needle.len;
-    }
-    return count;
-}
-
-fn formatOverlayDiagnostic(
-    out: []u8,
-    diagnostic: *const client_log.UserDiagnosticLine,
-    delayed: bool,
-) usize {
-    var stream = std.io.fixedBufferStream(out);
-    const writer = stream.writer();
-    if (delayed) {
-        writer.print("{s} ts_ms={}: ", .{ diagnostic.tag.label(), diagnostic.ts_ms }) catch return stream.pos;
-    } else {
-        writer.print("{s}: ", .{diagnostic.tag.label()}) catch return stream.pos;
-    }
-    writer.writeAll(diagnostic.slice()) catch {};
-    return stream.pos;
-}
 
 fn setNonBlocking(fd: c.fd_t) !void {
     const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
@@ -1033,124 +568,8 @@ fn setNonBlocking(fd: c.fd_t) !void {
     if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
 }
 
-fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
-    return reconnect_title.formatDelay(delay_ms, buf);
-}
-
-fn writeJsonlStatus(fd: c.fd_t, message: []const u8) !void {
-    try diagnostics_jsonl.writeMessage(fd, "status", message);
-}
-
-fn appendOnlyRetryStatus(buf: []u8, delay_ms: u64, ctrl_r: bool) ![]const u8 {
-    var delay_buf: [16]u8 = undefined;
-    const delay = try formatDelay(delay_ms, &delay_buf);
-    const retry_at_unix_ms = nowUnixMs() +| delay_ms;
-    if (ctrl_r) {
-        return std.fmt.bufPrint(
-            buf,
-            "sessh: disconnected: Retry connecting {s} (retry_at_unix_ms={}). CTRL-R now",
-            .{ delay, retry_at_unix_ms },
-        );
-    }
-    return std.fmt.bufPrint(
-        buf,
-        "sessh: disconnected: Retry connecting {s} (retry_at_unix_ms={})",
-        .{ delay, retry_at_unix_ms },
-    );
-}
-
-fn nowUnixMs() u64 {
-    const ms = std.time.milliTimestamp();
-    if (ms <= 0) return 0;
-    return @intCast(ms);
-}
-
-fn formatSwitchDelay(delay_ms: u64, buf: []u8) ![]const u8 {
-    const seconds = @max(@divTrunc(delay_ms + 999, 1000), 1);
-    return std.fmt.bufPrint(buf, "{}sec", .{seconds});
-}
-
-fn nextOverlayUpdateDelayMs(remaining_ms: u64) u64 {
-    if (remaining_ms <= 1_000) return remaining_ms;
-    if (remaining_ms <= 60_000) return 1_000;
-    return @min(remaining_ms - 59_000, 60_000);
-}
-
 fn elapsedTimerMs(timer: *NonSuspendingTimer) u64 {
     return timer.read() / std.time.ns_per_ms;
-}
-test "formatDelay uses compact reconnect labels" {
-    var buf: [16]u8 = undefined;
-
-    try std.testing.expectEqualStrings("5sec", try formatDelay(5_000, &buf));
-    try std.testing.expectEqualStrings("20sec", try formatDelay(20_000, &buf));
-    try std.testing.expectEqualStrings("1min", try formatDelay(60_000, &buf));
-    try std.testing.expectEqualStrings("10min", try formatDelay(600_000, &buf));
-    try std.testing.expectEqualStrings("60sec", try formatSwitchDelay(60_000, &buf));
-}
-
-test "ReconnectUi restores remote fallback title when no app title is present" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var ui = ReconnectUi{
-        .mode_guard = undefined,
-        .title_enabled = true,
-        .title_fd = fds[1],
-    };
-    ui.showRetryTitle(5_000);
-    ui.restoreTitleAfterReconnect(false, "work.blox");
-    posix.close(fds[1]);
-
-    var buf: [128]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    try std.testing.expectEqualStrings(
-        "\x1b]2;5sec retry CTRL-R\x1b\\\x1b]2;work.blox\x1b\\",
-        buf[0..n],
-    );
-    try std.testing.expect(!ui.title_visible);
-}
-
-test "ReconnectUi leaves restored app title alone after reconnect repaint" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var ui = ReconnectUi{
-        .mode_guard = undefined,
-        .title_enabled = true,
-        .title_fd = fds[1],
-    };
-    ui.showRetryTitle(5_000);
-    ui.restoreTitleAfterReconnect(true, "work.blox");
-    posix.close(fds[1]);
-
-    var buf: [128]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    try std.testing.expectEqualStrings("\x1b]2;5sec retry CTRL-R\x1b\\", buf[0..n]);
-    try std.testing.expect(!ui.title_visible);
-}
-
-test "ReconnectUi restores local cleanup title on end" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-
-    var ui = ReconnectUi{
-        .mode_guard = undefined,
-        .title_enabled = true,
-        .title_fd = fds[1],
-    };
-    ui.cleanup_title_fallback_len = copyTitleFallback(&ui.cleanup_title_fallback, "/tmp/local");
-    ui.showRetryTitle(5_000);
-    ui.restoreTitleForEnd();
-    posix.close(fds[1]);
-
-    var buf: [128]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    try std.testing.expectEqualStrings(
-        "\x1b]2;5sec retry CTRL-R\x1b\\\x1b]2;/tmp/local\x1b\\",
-        buf[0..n],
-    );
-    try std.testing.expect(!ui.title_visible);
 }
 
 test "ReconnectUi records resize event for runtime forwarding" {
@@ -1172,7 +591,7 @@ test "ReconnectUi writes append-only diagnostics to configured line fd" {
 
     var ui = ReconnectUi{
         .mode_guard = undefined,
-        .presentation = .stderr_plain,
+        .presentation = .line,
         .line_fd = fds[1],
         .input_fd = -1,
         .output_fd = -1,
@@ -1224,7 +643,7 @@ test "reconnect switch disposition distinguishes typing paste and unresponsive" 
         ReconnectSwitchDisposition.delayed,
         ui.reconnectSwitchDisposition(true, false, false),
     );
-    ui.input_during_disconnect = true;
+    ui.reconnect_input_state.input_during_disconnect = true;
     try std.testing.expectEqual(
         ReconnectSwitchDisposition.delayed,
         ui.reconnectSwitchDisposition(false, false, false),
@@ -1237,149 +656,4 @@ test "reconnect switch disposition distinguishes typing paste and unresponsive" 
         ReconnectSwitchDisposition.manual_unresponsive,
         ui.reconnectSwitchDisposition(false, false, true),
     );
-}
-
-test "reconnect overlay layout adds rows at terminal bottom" {
-    const single = overlayLayoutForSize(1, 0, 1);
-    try std.testing.expectEqual(@as(u16, 0), single.start_row);
-    try std.testing.expectEqual(@as(u16, 1), single.visible_line_count);
-    try std.testing.expectEqual(@as(u16, 1), single.scroll_lines);
-
-    const normal = overlayLayoutForSize(24, 0, 1);
-    try std.testing.expectEqual(@as(u16, 1), normal.start_row);
-    try std.testing.expectEqual(@as(u16, 0), normal.scroll_lines);
-
-    const bottom = overlayLayoutForSize(24, 23, 1);
-    try std.testing.expectEqual(@as(u16, 23), bottom.start_row);
-    try std.testing.expectEqual(@as(u16, 1), bottom.scroll_lines);
-    try std.testing.expectEqual(@as(u16, 22), bottom.viewport_offset);
-}
-
-test "reconnect overlay draws clipped multiline content and pads stale rows" {
-    var single_row = std.ArrayList(u8).empty;
-    defer single_row.deinit(std.testing.allocator);
-    const single_renderer = client_renderer.Renderer.buffered(&single_row, .{ .kind = .xterm_compatible });
-    _ = try drawOverlayLines(
-        single_renderer,
-        .{ .rows = 1, .cols = 8 },
-        0,
-        null,
-        &.{.{ .text = "single row", .alignment = .center }},
-    );
-    try std.testing.expect(std.mem.indexOf(u8, single_row.items, "\r\n") != null);
-
-    var first = std.ArrayList(u8).empty;
-    defer first.deinit(std.testing.allocator);
-    const renderer = client_renderer.Renderer.buffered(&first, .{ .kind = .xterm_compatible });
-    const first_state = try drawOverlayLines(
-        renderer,
-        .{ .rows = 4, .cols = 8 },
-        0,
-        null,
-        &.{
-            .{ .text = "0123456789", .alignment = .center },
-            .{ .text = "ssh: first", .alignment = .left },
-        },
-    );
-    try std.testing.expect(std.mem.indexOf(u8, first.items, "01234567") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first.items, "ssh: fir") != null);
-    try std.testing.expectEqual(@as(u16, 1), first_state.start_row);
-    try std.testing.expectEqual(@as(u16, 2), first_state.line_count);
-
-    var second = std.ArrayList(u8).empty;
-    defer second.deinit(std.testing.allocator);
-    const second_renderer = client_renderer.Renderer.buffered(&second, .{ .kind = .xterm_compatible });
-    _ = try drawOverlayLines(
-        second_renderer,
-        .{ .rows = 4, .cols = 8 },
-        first_state.viewport_offset,
-        first_state,
-        &.{.{ .text = "new", .alignment = .center }},
-    );
-    try std.testing.expectEqual(@as(usize, 0), countSubstrings(second.items, "\x1b[2K"));
-    try std.testing.expect(std.mem.indexOf(u8, second.items, "new") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second.items, "ssh: fir") == null);
-
-    var third = std.ArrayList(u8).empty;
-    defer third.deinit(std.testing.allocator);
-    const third_renderer = client_renderer.Renderer.buffered(&third, .{ .kind = .xterm_compatible });
-    _ = try drawOverlayLines(
-        third_renderer,
-        .{ .rows = 4, .cols = 8 },
-        first_state.viewport_offset,
-        first_state,
-        &.{
-            .{ .text = "76543210", .alignment = .center },
-            .{ .text = "ssh: first", .alignment = .left },
-        },
-    );
-    try std.testing.expectEqual(@as(usize, 0), countSubstrings(third.items, "\x1b[2K"));
-    try std.testing.expect(std.mem.indexOf(u8, third.items, "76543210") != null);
-    try std.testing.expect(std.mem.indexOf(u8, third.items, "ssh: fir") == null);
-}
-
-test "reconnect overlay restores temporary expansion within sessh-owned rows" {
-    var drawn = std.ArrayList(u8).empty;
-    defer drawn.deinit(std.testing.allocator);
-    const renderer = client_renderer.Renderer.buffered(&drawn, .{ .kind = .xterm_compatible });
-    const state = try drawOverlayLines(
-        renderer,
-        .{ .rows = 4, .cols = 16 },
-        0,
-        null,
-        &.{
-            .{ .text = "one", .alignment = .center },
-            .{ .text = "two", .alignment = .left },
-            .{ .text = "three", .alignment = .left },
-            .{ .text = "four", .alignment = .left },
-        },
-    );
-    try std.testing.expectEqual(@as(u16, 1), state.scroll_lines);
-    try std.testing.expect(state.restores_expansion);
-    try std.testing.expectEqual(@as(u16, 0), state.restore_viewport_offset);
-
-    var cleared = std.ArrayList(u8).empty;
-    defer cleared.deinit(std.testing.allocator);
-    const clear_renderer = client_renderer.Renderer.buffered(&cleared, .{ .kind = .xterm_compatible });
-    try eraseOverlayRows(clear_renderer, state, 4, 16);
-    try restoreOverlayExpansion(clear_renderer, state, 4);
-    try std.testing.expectEqual(@as(usize, 1), countSubstrings(cleared.items, "\x1bM"));
-    try std.testing.expect(std.mem.indexOf(u8, cleared.items, "\x1b[r") != null);
-}
-
-test "reconnect overlay scrolls outer rows into scrollback when expansion consumes them" {
-    var drawn = std.ArrayList(u8).empty;
-    defer drawn.deinit(std.testing.allocator);
-    const renderer = client_renderer.Renderer.buffered(&drawn, .{ .kind = .xterm_compatible });
-    const state = try drawOverlayLines(
-        renderer,
-        .{ .rows = 4, .cols = 16 },
-        3,
-        null,
-        &.{
-            .{ .text = "one", .alignment = .center },
-            .{ .text = "two", .alignment = .left },
-        },
-    );
-    try std.testing.expectEqual(@as(u16, 2), state.scroll_lines);
-    try std.testing.expect(!state.restores_expansion);
-    try std.testing.expectEqual(@as(u16, 1), state.viewport_offset);
-    try std.testing.expectEqual(@as(u16, 3), state.restore_viewport_offset);
-    try std.testing.expect(std.mem.indexOf(u8, drawn.items, "\x1b[2;4r") == null);
-    try std.testing.expect(std.mem.indexOf(u8, drawn.items, "\x1b[4;1H\r\n\r\n") != null);
-
-    var cleared = std.ArrayList(u8).empty;
-    defer cleared.deinit(std.testing.allocator);
-    const clear_renderer = client_renderer.Renderer.buffered(&cleared, .{ .kind = .xterm_compatible });
-    try eraseOverlayRows(clear_renderer, state, 4, 16);
-    try restoreOverlayExpansion(clear_renderer, state, 4);
-    try std.testing.expectEqual(@as(usize, 0), countSubstrings(cleared.items, "\x1bM"));
-    try std.testing.expectEqual(@as(u16, 1), clearedOverlayViewportOffset(state));
-}
-
-test "reconnect overlay updates every second under one minute" {
-    try std.testing.expectEqual(@as(u64, 1_000), nextOverlayUpdateDelayMs(59_000));
-    try std.testing.expectEqual(@as(u64, 1_000), nextOverlayUpdateDelayMs(60_000));
-    try std.testing.expectEqual(@as(u64, 2_000), nextOverlayUpdateDelayMs(61_000));
-    try std.testing.expectEqual(@as(u64, 60_000), nextOverlayUpdateDelayMs(600_000));
 }

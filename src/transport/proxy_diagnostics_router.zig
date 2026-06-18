@@ -3,15 +3,18 @@ const c = std.c;
 
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
+const frame_write_queue = @import("frame_write_queue.zig");
 const protocol = @import("../protocol/mod.zig");
-const session_registry = @import("../runtime/session_registry.zig");
+const protocol_test_helpers = @import("../protocol/test_helpers.zig");
+const guid_ref = @import("../core/guid.zig");
 const pb = protocol.pb;
 
 const Registration = struct {
     allocator: std.mem.Allocator,
     guid: []u8,
-    visible_fd: c.fd_t = -1,
+    visible: ?*VisibleConnection = null,
     stream_fd: c.fd_t = -1,
+    stream_sink: ?StreamSink = null,
 
     fn deinit(self: *Registration) void {
         self.allocator.free(self.guid);
@@ -19,19 +22,31 @@ const Registration = struct {
     }
 };
 
+pub const StreamSink = struct {
+    ctx: *anyopaque,
+    queueFrame: *const fn (*anyopaque, *dispatcher.Dispatcher, protocol.OwnedFrame) anyerror!void,
+};
+
+// PROCESS_GLOBAL_REGISTRY: process-isolated proxy mode keeps a long-lived
+// `sessh-proxy` process between OpenSSH and the daemon, so the visible client
+// cannot share the raw byte fd. This local-daemon registry is the rendezvous
+// between that proxy byte-stream process and the visible client's
+// diagnostics/retry connection, keyed by the proxy GUID generated for that
+// invocation. It is intentionally process-global while there is exactly one
+// dispatcher-owned daemon per process; tests that touch it must clear it.
 var registrations: std.ArrayList(*Registration) = .empty;
 
 pub fn registerOpenFromDaemon(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
     fd: c.fd_t,
-    open: pb.ClientDaemonItem.ProxyControlOpen,
+    open: pb.ClientDaemonItem.ProxyDiagnosticsOpen,
 ) !void {
     const context = try allocator.create(VisibleConnection);
     errdefer allocator.destroy(context);
-    const guid = try session_registry.canonicalProxyGuid(allocator, open.proxy_guid);
+    const guid = try guid_ref.canonicalProxyGuid(allocator, open.proxy_guid);
     errdefer allocator.free(guid);
-    try registerVisible(allocator, guid, fd);
+    try registerVisible(allocator, guid, context);
     errdefer unregisterVisible(fd);
     try core_fds.setNonBlocking(fd);
     context.* = .{
@@ -39,8 +54,10 @@ pub fn registerOpenFromDaemon(
         .fd = fd,
         .guid = guid,
         .reader = protocol.FrameReader.init(allocator),
+        .writer = frame_write_queue.FrameWriteQueue.init(allocator),
     };
     errdefer context.reader.deinit();
+    errdefer context.writer.deinit();
     context.watch_id = try daemon_dispatcher.watchFd(fd, .{ .readable = true }, .{
         .ctx = context,
         .callback = readVisibleConnection,
@@ -52,6 +69,7 @@ const VisibleConnection = struct {
     fd: c.fd_t = -1,
     guid: []u8,
     reader: protocol.FrameReader,
+    writer: frame_write_queue.FrameWriteQueue,
     watch_id: ?dispatcher.FdWatchId = null,
 
     fn deinit(self: *VisibleConnection, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
@@ -65,6 +83,7 @@ const VisibleConnection = struct {
             self.fd = -1;
         }
         self.reader.deinit();
+        self.writer.deinit();
         self.allocator.free(self.guid);
         const allocator = self.allocator;
         self.* = undefined;
@@ -87,11 +106,15 @@ fn readVisibleConnectionInner(
 ) !void {
     const fd_event = switch (event) {
         .fd => |fd| fd,
-        .timer => return error.UnexpectedProxyControlTimer,
+        .timer => return error.UnexpectedProxyDiagnosticsTimer,
     };
     if (fd_event.error_event or fd_event.invalid) {
         connection.deinit(daemon_dispatcher);
         return;
+    }
+    if (fd_event.writable and connection.writer.hasPending()) {
+        _ = try connection.writer.writeReady(connection.fd);
+        try updateVisibleConnectionWatch(daemon_dispatcher, connection);
     }
     if (!fd_event.readable) {
         if (fd_event.hangup) connection.deinit(daemon_dispatcher);
@@ -108,34 +131,48 @@ fn readVisibleConnectionInner(
             .frame => |frame_value| {
                 var frame = frame_value;
                 defer frame.deinit(connection.allocator);
-                if (!try visibleFrameIsAllowed(connection.allocator, frame)) return error.UnexpectedProxyControlFrame;
-                try forwardToStream(connection.guid, frame);
+                if (!try visibleFrameIsAllowed(connection.allocator, frame)) return error.UnexpectedProxyDiagnosticsFrame;
+                try forwardToStream(daemon_dispatcher, connection.guid, frame);
             },
         }
     }
 }
 
-fn registerVisible(allocator: std.mem.Allocator, guid: []const u8, fd: c.fd_t) !void {
-    const registration = try findOrCreateRegistration(allocator, guid);
-    if (registration.visible_fd >= 0 and registration.visible_fd != fd) return error.ProxyControlAlreadyOpen;
-    registration.visible_fd = fd;
+fn updateVisibleConnectionWatch(daemon_dispatcher: *dispatcher.Dispatcher, connection: *VisibleConnection) !void {
+    const watch_id = connection.watch_id orelse return;
+    try daemon_dispatcher.updateFdEvents(watch_id, .{
+        .readable = true,
+        .writable = connection.writer.hasPending(),
+    });
 }
 
-pub fn registerStream(allocator: std.mem.Allocator, guid: []const u8, fd: c.fd_t) !void {
+fn registerVisible(allocator: std.mem.Allocator, guid: []const u8, connection: *VisibleConnection) !void {
+    const registration = try findOrCreateRegistration(allocator, guid);
+    if (registration.visible != null and registration.visible != connection) return error.ProxyDiagnosticsAlreadyOpen;
+    registration.visible = connection;
+}
+
+pub fn registerStream(allocator: std.mem.Allocator, guid: []const u8, fd: c.fd_t, sink: StreamSink) !void {
     const registration = try findOrCreateRegistration(allocator, guid);
     registration.stream_fd = fd;
+    registration.stream_sink = sink;
 }
 
 fn unregisterVisible(fd: c.fd_t) void {
     for (registrations.items) |registration| {
-        if (registration.visible_fd == fd) registration.visible_fd = -1;
+        if (registration.visible) |visible| {
+            if (visible.fd == fd) registration.visible = null;
+        }
     }
     removeUnusedRegistrations();
 }
 
 pub fn unregisterStream(fd: c.fd_t) void {
     for (registrations.items) |registration| {
-        if (registration.stream_fd == fd) registration.stream_fd = -1;
+        if (registration.stream_fd == fd) {
+            registration.stream_fd = -1;
+            registration.stream_sink = null;
+        }
     }
     removeUnusedRegistrations();
 }
@@ -159,7 +196,7 @@ fn removeUnusedRegistrations() void {
     var index: usize = 0;
     while (index < registrations.items.len) {
         const registration = registrations.items[index];
-        if (registration.visible_fd >= 0 or registration.stream_fd >= 0) {
+        if (registration.visible != null or registration.stream_fd >= 0) {
             index += 1;
             continue;
         }
@@ -180,21 +217,28 @@ fn visibleFrameIsAllowed(allocator: std.mem.Allocator, frame: protocol.OwnedFram
     };
 }
 
-fn forwardToStream(guid: []const u8, frame: protocol.OwnedFrame) !void {
-    const stream_fd = streamFd(guid) orelse return;
-    protocol.sendFrame(stream_fd, frame.message_type, frame.payload) catch |err| {
-        unregisterStream(stream_fd);
+fn forwardToStream(daemon_dispatcher: *dispatcher.Dispatcher, guid: []const u8, frame: protocol.OwnedFrame) !void {
+    const registration = streamRegistration(guid) orelse return;
+    const sink = registration.stream_sink orelse return;
+    sink.queueFrame(sink.ctx, daemon_dispatcher, frame) catch |err| {
+        unregisterStream(registration.stream_fd);
         return err;
     };
 }
 
-pub fn forwardFromStream(allocator: std.mem.Allocator, guid: []const u8, frame: protocol.OwnedFrame) !void {
-    if (!try streamFrameIsAllowed(allocator, frame)) return error.UnexpectedProxyControlFrame;
-    const visible_fd = visibleFd(guid) orelse return;
-    protocol.sendFrame(visible_fd, frame.message_type, frame.payload) catch |err| {
-        unregisterVisible(visible_fd);
+pub fn forwardFromStream(
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    guid: []const u8,
+    frame: protocol.OwnedFrame,
+) !void {
+    if (!try streamFrameIsAllowed(allocator, frame)) return error.UnexpectedProxyDiagnosticsFrame;
+    const visible = visibleConnection(guid) orelse return;
+    visible.writer.queueFrame(frame.message_type, frame.payload) catch |err| {
+        unregisterVisible(visible.fd);
         return err;
     };
+    try updateVisibleConnectionWatch(daemon_dispatcher, visible);
 }
 
 fn streamFrameIsAllowed(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !bool {
@@ -207,16 +251,18 @@ fn streamFrameIsAllowed(allocator: std.mem.Allocator, frame: protocol.OwnedFrame
     };
 }
 
-fn visibleFd(guid: []const u8) ?c.fd_t {
+fn visibleConnection(guid: []const u8) ?*VisibleConnection {
     for (registrations.items) |registration| {
-        if (std.mem.eql(u8, registration.guid, guid) and registration.visible_fd >= 0) return registration.visible_fd;
+        if (std.mem.eql(u8, registration.guid, guid)) {
+            if (registration.visible) |visible| return visible;
+        }
     }
     return null;
 }
 
-fn streamFd(guid: []const u8) ?c.fd_t {
+fn streamRegistration(guid: []const u8) ?*Registration {
     for (registrations.items) |registration| {
-        if (std.mem.eql(u8, registration.guid, guid) and registration.stream_fd >= 0) return registration.stream_fd;
+        if (std.mem.eql(u8, registration.guid, guid) and registration.stream_fd >= 0) return registration;
     }
     return null;
 }
@@ -224,10 +270,11 @@ fn streamFd(guid: []const u8) ?c.fd_t {
 test "routes diagnostics and retry by proxy guid" {
     const allocator = std.testing.allocator;
     const guid = "p-550e8400-e29b-41d4-a716-446655440000";
+    var d = try dispatcher.Dispatcher.init(allocator);
+    defer d.deinit();
 
     var visible: [2]c.fd_t = undefined;
     if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &visible) != 0) return error.SocketPairFailed;
-    defer _ = c.close(visible[0]);
     defer _ = c.close(visible[1]);
 
     var stream: [2]c.fd_t = undefined;
@@ -242,62 +289,79 @@ test "routes diagnostics and retry by proxy guid" {
         registrations = .empty;
     }
 
-    try registerVisible(allocator, guid, visible[0]);
-    try registerStream(allocator, guid, stream[0]);
+    const visible_context = try allocator.create(VisibleConnection);
+    const visible_guid = try allocator.dupe(u8, guid);
+    visible_context.* = .{
+        .allocator = allocator,
+        .fd = visible[0],
+        .guid = visible_guid,
+        .reader = protocol.FrameReader.init(allocator),
+        .writer = frame_write_queue.FrameWriteQueue.init(allocator),
+    };
+    defer visible_context.deinit(null);
+    try registerVisible(allocator, guid, visible_context);
 
-    const stderr_payload = try protocol.encodePayload(allocator, pb.ClientDaemonItem{ .payload = .{
-        .connection_event = .{ .event = .{ .ssh_stderr = .{ .data = "proxy stderr line" } } },
-    } });
+    var stream_sink = TestStreamSink{
+        .fd = stream[0],
+        .writer = frame_write_queue.FrameWriteQueue.init(allocator),
+    };
+    defer stream_sink.writer.deinit();
+    try registerStream(allocator, guid, stream[0], .{
+        .ctx = &stream_sink,
+        .queueFrame = TestStreamSink.queueFrame,
+    });
+
+    const stderr_payload = try protocol.encodeConnectionEventPayload(allocator, .{
+        .ssh_stderr = .{ .data = "proxy stderr line" },
+    });
     defer allocator.free(stderr_payload);
-    try forwardFromStream(allocator, guid, .{
+    try forwardFromStream(allocator, &d, guid, .{
         .message_type = .client_daemon,
         .payload = stderr_payload,
     });
+    _ = try visible_context.writer.writeReady(visible[0]);
 
-    var visible_frame = try readFrameForTest(allocator, visible[1]);
+    var visible_frame = try protocol_test_helpers.readFrameForTest(allocator, visible[1]);
     defer visible_frame.deinit(allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, visible_frame.message_type);
     var visible_item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, visible_frame.payload);
     defer visible_item.deinit(allocator);
-    const event = switch (visible_item.payload orelse return error.MissingProxyControlPayload) {
+    const event = switch (visible_item.payload orelse return error.MissingProxyDiagnosticsPayload) {
         .connection_event => |event| event,
-        else => return error.UnexpectedProxyControlFrame,
+        else => return error.UnexpectedProxyDiagnosticsFrame,
     };
-    const stderr = switch (event.event orelse return error.MissingProxyControlPayload) {
+    const stderr = switch (event.event orelse return error.MissingProxyDiagnosticsPayload) {
         .ssh_stderr => |stderr| stderr,
-        else => return error.UnexpectedProxyControlFrame,
+        else => return error.UnexpectedProxyDiagnosticsFrame,
     };
     try std.testing.expectEqualStrings("proxy stderr line", stderr.data);
 
-    const retry_payload = try protocol.encodePayload(allocator, pb.ClientDaemonItem{ .payload = .{
-        .retry_now = .{},
-    } });
+    const retry_payload = try protocol.encodeClientDaemonPayload(allocator, .{ .retry_now = .{} });
     defer allocator.free(retry_payload);
-    try forwardToStream(guid, .{
+    try forwardToStream(&d, guid, .{
         .message_type = .client_daemon,
         .payload = retry_payload,
     });
 
-    var stream_frame = try readFrameForTest(allocator, stream[1]);
+    var stream_frame = try protocol_test_helpers.readFrameForTest(allocator, stream[1]);
     defer stream_frame.deinit(allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, stream_frame.message_type);
     var stream_item = try protocol.decodePayload(pb.ClientDaemonItem, allocator, stream_frame.payload);
     defer stream_item.deinit(allocator);
-    switch (stream_item.payload orelse return error.MissingProxyControlPayload) {
+    switch (stream_item.payload orelse return error.MissingProxyDiagnosticsPayload) {
         .retry_now => {},
-        else => return error.UnexpectedProxyControlFrame,
+        else => return error.UnexpectedProxyDiagnosticsFrame,
     }
 }
 
-fn readFrameForTest(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
-    var reader = protocol.FrameReader.init(allocator);
-    defer reader.deinit();
-    while (true) {
-        switch (try reader.readBlocking(fd)) {
-            .blocked, .progress => continue,
-            .frame => |frame| return frame,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
-        }
+const TestStreamSink = struct {
+    fd: c.fd_t,
+    writer: frame_write_queue.FrameWriteQueue,
+
+    fn queueFrame(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, frame: protocol.OwnedFrame) !void {
+        _ = daemon_dispatcher;
+        const sink: *TestStreamSink = @ptrCast(@alignCast(ctx));
+        try sink.writer.queueFrame(frame.message_type, frame.payload);
+        _ = try sink.writer.writeReady(sink.fd);
     }
-}
+};

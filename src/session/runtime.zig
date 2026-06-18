@@ -6,106 +6,36 @@ const posix = std.posix;
 const config = @import("../core/config.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
-const client_renderer = @import("renderer.zig");
+const input_translation = @import("input_translation.zig");
 const io = @import("../core/io.zig");
 const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
 const pty_process = @import("../tty/pty_process.zig");
 const protocol = @import("../protocol/mod.zig");
-const session_registry = @import("../runtime/session_registry.zig");
+const user_error = @import("../core/user_error.zig");
+const guid_ref = @import("../core/guid.zig");
 const socket_transport = @import("../transport/socket.zig");
-const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
 const vt = @import("vt.zig");
+const remote_process = @import("remote_process.zig");
+const attached_client_router = @import("attached_client_router.zig");
+const runtime_state = @import("runtime_state.zig");
+const runtime_render = @import("runtime_render.zig");
 
-const max_attached_client_output_queue_bytes = 64 * 1024 * 1024;
+const max_session_pty_input_queue_bytes = 16 * 1024 * 1024;
 const preferred_live_output_batch_bytes = 1024;
 const max_live_output_reads_per_batch = 64;
 const synchronized_output_max_hold_ms: i64 = 1000;
-const pty_hangup_reap_poll_ms: i64 = 50;
+const pty_hangup_reap_poll_ms = remote_process.pty_hangup_reap_poll_ms;
+const pty_eof_exit_reap_poll_ms: i64 = 1;
+const pty_eof_exit_status_grace_ms: i64 = 250;
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
 
-// POSIX WNOHANG. Zig 0.15 does not expose a portable constant, and our
-// supported Unix targets use the stable POSIX value.
-const wait_nohang: c_int = 1;
-
-const Session = struct {
-    id: [64]u8 = [_]u8{0} ** 64,
-    id_len: usize = 0,
-    pid: c.pid_t = 0,
-    pty_fd: c.fd_t = -1,
-    pty_closed_for_hangup: bool = false,
-    terminal_model: ?*vt.SessionTerminal = null,
-    rows: u16 = 24,
-    cols: u16 = 80,
-    scrollback_row_count: u32 = config.default_scrollback_row_count,
-    scrollback_epoch: u64 = 1,
-    last_scrollback_clear_epoch: u64 = 1,
-    end_reason: u8 = 0,
-    attached: bool = false,
-    disconnected_at_unix_ms: u64 = 0,
-    reap_ms: u64 = 0,
-    alive: bool = false,
-    pending_plain_output: std.ArrayList(u8) = .empty,
-    pending_plain_starts_at_boundary: bool = false,
-    synchronized_output_since_ms: i64 = 0,
-
-    fn idSlice(self: *const Session) []const u8 {
-        return self.id[0..self.id_len];
-    }
-
-    fn clearPendingPlainOutput(self: *Session) void {
-        self.pending_plain_output.clearRetainingCapacity();
-        self.pending_plain_starts_at_boundary = false;
-    }
-
-    fn appendPendingPlainOutput(
-        self: *Session,
-        bytes: []const u8,
-        starts_at_boundary: bool,
-    ) !void {
-        if (self.pending_plain_output.items.len == 0) {
-            self.pending_plain_starts_at_boundary = starts_at_boundary;
-        }
-        try self.pending_plain_output.appendSlice(app_allocator.allocator(), bytes);
-    }
-
-    fn pendingPlainOutputCanReplay(self: *const Session) bool {
-        return self.pending_plain_output.items.len > 0 and
-            self.pending_plain_starts_at_boundary;
-    }
-
-    fn deinit(self: *Session) void {
-        self.pending_plain_output.deinit(app_allocator.allocator());
-        self.pending_plain_output = .empty;
-        self.pending_plain_starts_at_boundary = false;
-        self.synchronized_output_since_ms = 0;
-    }
-};
-
-const AttachedClient = struct {
-    fd: c.fd_t = -1,
-    rows: u16 = 24,
-    cols: u16 = 80,
-    attached_at_unix_ms: u64 = 0,
-    origin: ?TerminalOrigin = null,
-    active: bool = false,
-    close_after_flush: bool = false,
-    debug_unresponsive_until_ms: i64 = 0,
-    presentation: PresentationState = .{},
-    output: std.ArrayList(u8) = .empty,
-    output_offset: usize = 0,
-    input_pending: [128]u8 = [_]u8{0} ** 128,
-    input_pending_len: usize = 0,
-    reader: protocol.FrameReader = undefined,
-    reader_initialized: bool = false,
-    capture_tty_transcript: bool = false,
-
-    fn queuedBytes(self: *const AttachedClient) usize {
-        return self.output.items.len - self.output_offset;
-    }
-};
+const Session = runtime_state.Session;
+const AttachedClient = attached_client_router.AttachedClient;
+const PendingRuntimeClient = attached_client_router.PendingRuntimeClient;
+const RuntimeFdWatch = attached_client_router.RuntimeFdWatch;
 
 const SessionRuntime = struct {
     session: Session = .{},
@@ -115,37 +45,6 @@ const SessionRuntime = struct {
     monotonic_clock: ?NonSuspendingTimer = null,
     fixed_session_id: ?[]const u8 = null,
     started_session: bool = false,
-};
-
-const PendingRuntimeClient = struct {
-    fd: c.fd_t = -1,
-    active: bool = false,
-    reader: protocol.FrameReader = undefined,
-    reader_initialized: bool = false,
-
-    fn start(self: *PendingRuntimeClient, fd: c.fd_t) void {
-        self.close();
-        self.* = .{
-            .fd = fd,
-            .active = true,
-            .reader = protocol.FrameReader.init(app_allocator.allocator()),
-            .reader_initialized = true,
-        };
-    }
-
-    fn close(self: *PendingRuntimeClient) void {
-        if (self.fd >= 0) {
-            _ = c.close(self.fd);
-        }
-        if (self.reader_initialized) self.reader.deinit();
-        self.* = .{};
-    }
-
-    fn takeFd(self: *PendingRuntimeClient) c.fd_t {
-        const fd = self.fd;
-        self.fd = -1;
-        return fd;
-    }
 };
 
 pub const TerminalRemoteProcessKind = union(enum) {
@@ -171,21 +70,6 @@ pub const TerminalRemoteProcess = struct {
             },
         }
         self.* = undefined;
-    }
-};
-
-const RuntimeFdWatch = struct {
-    id: ?dispatcher.FdWatchId = null,
-    fd: c.fd_t = -1,
-
-    fn cancel(self: *RuntimeFdWatch, daemon_dispatcher: *dispatcher.Dispatcher) void {
-        if (self.id) |id| daemon_dispatcher.cancel(.{ .fd = id });
-        self.* = .{};
-    }
-
-    fn matches(self: *const RuntimeFdWatch, id: dispatcher.FdWatchId) bool {
-        const watch_id = self.id orelse return false;
-        return watch_id.index == id.index and watch_id.generation == id.generation;
     }
 };
 
@@ -246,8 +130,11 @@ const DispatcherSessionRuntime = struct {
 
         const now_ms = sessionRuntimeMonotonicMs(&self.session_runtime);
         const session = &self.session_runtime.session;
-        if (session.alive and session.pty_fd >= 0) {
-            try self.ensureWatch(daemon_dispatcher, &self.session_watch, session.pty_fd, .{ .readable = true });
+        if (session.alive and session.process.hasOpenPty()) {
+            try self.ensureWatch(daemon_dispatcher, &self.session_watch, session.process.pty_fd, .{
+                .readable = true,
+                .writable = sessionHasPendingPtyInput(session),
+            });
         } else {
             self.session_watch.cancel(daemon_dispatcher);
         }
@@ -322,6 +209,10 @@ const DispatcherSessionRuntime = struct {
     }
 };
 
+// PROCESS_GLOBAL_REGISTRY: the local daemon tracks process-isolated terminal
+// remotes here so shutdown and cleanup can see whether useful remote work still
+// exists. The daemon is single-threaded; mutations happen from dispatcher-owned
+// callbacks.
 var terminal_remote_processes: std.ArrayList(*TerminalRemoteProcess) = .empty;
 const PollKind = union(enum) {
     listen,
@@ -330,986 +221,24 @@ const PollKind = union(enum) {
     pending_client,
 };
 
-const ExitInfo = struct {
-    kind: u8 = 0,
-    status: i32 = 0,
-    ended_at_unix_ms: u64 = 0,
-};
-
-const SessionEnvironment = struct {
-    shell: ?[]const u8 = null,
-    entries: std.ArrayList(pty_process.EnvironmentEntry) = .empty,
-
-    fn deinit(self: *SessionEnvironment) void {
-        if (self.shell) |shell| app_allocator.allocator().free(shell);
-        for (self.entries.items) |entry| {
-            app_allocator.allocator().free(entry.name);
-            app_allocator.allocator().free(entry.value);
-        }
-        self.entries.deinit(app_allocator.allocator());
-        self.* = .{};
-    }
-};
-
-// What we believe one attached client currently has on its outer terminal.
-// This is separate from the headless terminal model. It lets us track the
-// inner viewport height and send small redraws when the client is in sync.
-const PresentationState = struct {
-    initialized: bool = false,
-    active_screen: u8 = 0,
-    saved_primary: ?ScreenBufferState = null,
-    rendered_rows: u16 = 0,
-    cursor_row: u16 = 0,
-    cursor_col: u16 = 0,
-    cursor_visible: bool = true,
-    cursor_style: client_renderer.CursorStyle = .default,
-    terminal_modes: client_renderer.TerminalModes = .{},
-    terminal_modes_initialized: bool = false,
-    default_colors: client_renderer.DefaultColors = .{},
-    default_colors_initialized: bool = false,
-    full_height_rendering: bool = false,
-    viewport_offset: i32 = 0,
-
-    fn reset(self: *PresentationState) void {
-        self.* = .{};
-    }
-
-    // Keep scrollback, but redraw the visible screen from scratch.
-    //
-    // The client may have shown a reconnect overlay or skipped stale draws, so
-    // cached cursor, mode, and color state is no longer trustworthy. The old
-    // height is kept only so the next draw can clear stale rows.
-    fn resetForScreenRepaint(self: *PresentationState) void {
-        const active_screen = self.active_screen;
-        const saved_primary = self.saved_primary;
-        const rendered_rows = self.rendered_rows;
-        self.* = .{
-            .active_screen = active_screen,
-            .saved_primary = saved_primary,
-            .rendered_rows = rendered_rows,
-        };
-    }
-
-    // Paint one terminal screen snapshot onto this client. This chooses between
-    // dirty-row updates and a full redraw, then syncs terminal-wide state.
-    fn applyScreen(
-        self: *PresentationState,
-        renderer: client_renderer.Renderer,
-        session_rows: u16,
-        screen: *const vt.RenderedScreen,
-        force_redraw: bool,
-        align_viewport: bool,
-    ) !void {
-        try self.switchActiveScreen(renderer, screen.active_screen);
-
-        const desired_modes = vtModesToClient(screen.modes);
-        const mouse_requested = desired_modes.mouse_tracking != .disabled;
-        if (screen.active_screen == 1 and mouse_requested) {
-            self.full_height_rendering = true;
-        }
-
-        if (align_viewport and screen.active_screen == 0) {
-            try self.alignViewportTop(renderer, session_rows);
-            if (mouse_requested) self.full_height_rendering = true;
-        }
-        const min_rendered_rows: u16 = if (self.full_height_rendering and
-            mouse_requested)
-            session_rows
-        else
-            0;
-
-        const replace_visible_grid = force_redraw or
-            !self.initialized or
-            screen.dirty_state == .full or
-            screen.active_screen_changed;
-
-        if (replace_visible_grid) {
-            try self.render(
-                renderer,
-                screen.rows,
-                screen.cursor_row,
-                screen.cursor_col,
-                screen.cursor_visible,
-                try cursorStyleFromVt(screen.cursor_style),
-                min_rendered_rows,
-            );
-        } else {
-            if (min_rendered_rows > 0) try self.ensureGridRow(renderer, min_rendered_rows - 1);
-            for (screen.rows, 0..) |row, row_index| {
-                if (!row.dirty) continue;
-                try self.moveToGridPosition(renderer, @intCast(row_index), 0);
-                try renderer.clearLine();
-                try renderVtRow(renderer, row);
-                self.cursor_col = renderedCellsDisplayWidth(row.cells);
-                self.rendered_rows = @max(self.rendered_rows, @as(u16, @intCast(row_index + 1)));
-            }
-            try self.moveToGridPosition(renderer, screen.cursor_row, screen.cursor_col);
-            try renderer.setCursorVisible(screen.cursor_visible);
-            try renderer.setCursorStyle(try cursorStyleFromVt(screen.cursor_style));
-            self.cursor_visible = screen.cursor_visible;
-            self.cursor_style = try cursorStyleFromVt(screen.cursor_style);
-        }
-
-        if (screen.title_dirty or (force_redraw and screen.title_present)) {
-            try renderer.setTitle(screen.title);
-        }
-        const modes_to_apply = if (mouse_requested and !self.full_height_rendering)
-            terminalModesWithoutMouse(desired_modes)
-        else
-            desired_modes;
-        try self.applyTerminalModes(renderer, modes_to_apply);
-        try self.applyDefaultColors(renderer, try vtDefaultColorsToClient(screen.default_colors));
-        if (!mouse_requested) {
-            self.full_height_rendering = false;
-        }
-        self.updateViewportOffset(session_rows);
-
-        if (self.initialized and self.rendered_rows < session_rows and
-            (screen.active_screen == 1 or min_rendered_rows > 0))
-        {
-            self.rendered_rows = @max(self.rendered_rows, @as(u16, @intCast(screen.rows.len)));
-        }
-    }
-
-    // Restore a full-height screen before leaving attached-client mode, so the user does
-    // not return to a partially painted alternate/full-screen app.
-    fn applyAttachedClientEndRestoreScreen(
-        self: *PresentationState,
-        renderer: client_renderer.Renderer,
-        session_rows: u16,
-        screen: *const vt.RenderedScreen,
-    ) !void {
-        try self.switchActiveScreen(renderer, screen.active_screen);
-        try self.render(
-            renderer,
-            screen.rows,
-            screen.cursor_row,
-            screen.cursor_col,
-            screen.cursor_visible,
-            try cursorStyleFromVt(screen.cursor_style),
-            session_rows,
-        );
-        if (screen.title_dirty) try renderer.setTitle(screen.title);
-        try self.applyTerminalModes(renderer, vtModesToClient(screen.modes));
-        try self.applyDefaultColors(renderer, try vtDefaultColorsToClient(screen.default_colors));
-        self.full_height_rendering = false;
-    }
-
-    // Grow the outer terminal transcript until our rendered grid starts at the
-    // top of the viewport. This makes mouse coordinates and full-screen redraws
-    // line up with the inner terminal screen.
-    fn alignViewportTop(self: *PresentationState, renderer: client_renderer.Renderer, session_rows: u16) !void {
-        if (session_rows == 0) return;
-        var row: u16 = 0;
-        while (row + 1 < session_rows) : (row += 1) {
-            try renderer.newline();
-        }
-        try renderer.cursorUp(session_rows - 1);
-        try renderer.carriageReturn();
-        self.initialized = false;
-        self.rendered_rows = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.viewport_offset = 0;
-    }
-
-    // The inner terminal cleared its display. Clear the outer visible area too,
-    // then forget our old row/cursor position.
-    fn clearOuterVisibleForScreen(self: *PresentationState, renderer: client_renderer.Renderer, screen: *const vt.RenderedScreen) !void {
-        try self.switchActiveScreen(renderer, screen.active_screen);
-        try renderer.clearVisible();
-        self.initialized = false;
-        self.rendered_rows = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.full_height_rendering = screenWantsMouseReporting(screen);
-        self.viewport_offset = 0;
-    }
-
-    // Draw the visible screen and record the new cursor and rendered height.
-    fn render(
-        self: *PresentationState,
-        renderer: client_renderer.Renderer,
-        rows: []const vt.RenderedRow,
-        cursor_row: u16,
-        cursor_col: u16,
-        cursor_visible: bool,
-        cursor_style: client_renderer.CursorStyle,
-        min_rendered_rows: u16,
-    ) !void {
-        if (!self.initialized) {
-            try self.renderInitial(renderer, rows, cursor_row, cursor_col, min_rendered_rows);
-        } else {
-            try self.redraw(renderer, rows, cursor_row, cursor_col, min_rendered_rows);
-        }
-
-        try renderer.setCursorVisible(cursor_visible);
-        try renderer.setCursorStyle(cursor_style);
-        self.initialized = true;
-        self.rendered_rows = targetRenderedRows(rows.len, cursor_row, min_rendered_rows);
-        self.cursor_row = cursor_row;
-        self.cursor_col = cursor_col;
-        self.cursor_visible = cursor_visible;
-        self.cursor_style = cursor_style;
-    }
-
-    // Add retained scrollback above the currently rendered screen, like normal
-    // terminal output scrolling older rows upward.
-    fn appendScrollbackRows(
-        self: *PresentationState,
-        renderer: client_renderer.Renderer,
-        session_rows: u16,
-        rows: []const vt.RenderedRow,
-    ) !void {
-        if (rows.len == 0) return;
-        if (!self.initialized or self.rendered_rows == 0) {
-            try renderTranscriptRows(renderer, rows);
-            self.updateViewportOffsetForRenderedRows(session_rows, @intCast(@min(rows.len, std.math.maxInt(u16))));
-            return;
-        }
-
-        if (self.rendered_rows < session_rows) {
-            try self.ensureGridRow(renderer, session_rows - 1);
-        }
-
-        for (rows) |row| {
-            try self.moveToRenderedTop(renderer);
-            self.cursor_row = 0;
-            self.cursor_col = 0;
-            try renderer.carriageReturn();
-            try renderer.clearLine();
-            try renderVtRow(renderer, row);
-            self.cursor_col = renderedCellsDisplayWidth(row.cells);
-            try self.moveToGridPosition(renderer, self.rendered_rows - 1, 0);
-            try renderer.newline();
-            self.cursor_row = self.rendered_rows - 1;
-            self.cursor_col = 0;
-        }
-        self.viewport_offset = 0;
-    }
-
-    // Draw when we cannot rely on the old cursor position or cached terminal
-    // state. If resetForScreenRepaint left an old height behind, clear that
-    // old area before drawing the new trimmed screen.
-    fn renderInitial(
-        self: *PresentationState,
-        renderer: client_renderer.Renderer,
-        rows: []const vt.RenderedRow,
-        cursor_row: u16,
-        cursor_col: u16,
-        min_rendered_rows: u16,
-    ) !void {
-        // The new snapshot may be shorter than the screen we previously drew.
-        // Clear any old rows below the new screen so stale text and colors are
-        // not left behind.
-        const rendered_rows = @max(
-            self.rendered_rows,
-            targetRenderedRows(rows.len, cursor_row, min_rendered_rows),
-        );
-        var row_index: u16 = 0;
-        while (row_index < rendered_rows) : (row_index += 1) {
-            if (row_index > 0) try renderer.newline();
-            try renderer.clearLine();
-            if (row_index < rows.len) try renderVtRow(renderer, rows[row_index]);
-        }
-        try moveToSnapshotCursor(renderer, rendered_rows, cursor_row, cursor_col);
-    }
-
-    // Redraw when we know where our old rendered grid is. Clear max(old, new)
-    // rows so a shorter terminal screen does not leave stale content behind.
-    fn redraw(
-        self: *PresentationState,
-        renderer: client_renderer.Renderer,
-        rows: []const vt.RenderedRow,
-        cursor_row: u16,
-        cursor_col: u16,
-        min_rendered_rows: u16,
-    ) !void {
-        try self.moveToRenderedTop(renderer);
-
-        const new_rows = targetRenderedRows(rows.len, cursor_row, min_rendered_rows);
-        const redraw_rows = @max(self.rendered_rows, new_rows);
-        var row_index: u16 = 0;
-        while (row_index < redraw_rows) : (row_index += 1) {
-            try renderer.carriageReturn();
-            try renderer.clearLine();
-            if (row_index < rows.len) try renderVtRow(renderer, rows[row_index]);
-            if (row_index + 1 < redraw_rows) try renderer.newline();
-        }
-
-        try moveToSnapshotCursor(renderer, redraw_rows, cursor_row, cursor_col);
-    }
-
-    // Switch the real terminal buffer to match the inner terminal. We save the
-    // primary-buffer cursor/grid state before entering the outer alternate
-    // screen, because the terminal restores that primary cursor when we leave.
-    fn switchActiveScreen(self: *PresentationState, renderer: client_renderer.Renderer, active_screen: u8) !void {
-        if (active_screen > 1) return error.InvalidActiveScreen;
-        if (self.active_screen == active_screen) return;
-
-        if (active_screen == 1) {
-            self.saved_primary = self.captureScreenBufferState();
-            try renderer.enterAlternateScreen();
-            try renderer.clearVisible();
-            self.restoreScreenBufferState(.{ .full_height_rendering = true });
-        } else {
-            try renderer.leaveAlternateScreen();
-            if (self.saved_primary) |primary| {
-                self.restoreScreenBufferState(primary);
-                self.saved_primary = null;
-            } else {
-                self.restoreScreenBufferState(.{});
-            }
-        }
-
-        self.active_screen = active_screen;
-    }
-
-    fn captureScreenBufferState(self: *const PresentationState) ScreenBufferState {
-        return .{
-            .initialized = self.initialized,
-            .rendered_rows = self.rendered_rows,
-            .cursor_row = self.cursor_row,
-            .cursor_col = self.cursor_col,
-            .cursor_visible = self.cursor_visible,
-            .cursor_style = self.cursor_style,
-            .full_height_rendering = self.full_height_rendering,
-            .viewport_offset = self.viewport_offset,
-        };
-    }
-
-    fn restoreScreenBufferState(self: *PresentationState, state: ScreenBufferState) void {
-        self.initialized = state.initialized;
-        self.rendered_rows = state.rendered_rows;
-        self.cursor_row = state.cursor_row;
-        self.cursor_col = state.cursor_col;
-        self.cursor_visible = state.cursor_visible;
-        self.cursor_style = state.cursor_style;
-        self.full_height_rendering = state.full_height_rendering;
-        self.viewport_offset = state.viewport_offset;
-    }
-
-    // Terminal modes are global settings on the outer terminal. Emit the full
-    // desired mode set only when our cached value differs.
-    fn applyTerminalModes(self: *PresentationState, renderer: client_renderer.Renderer, modes: client_renderer.TerminalModes) !void {
-        if (self.terminal_modes_initialized and self.terminal_modes.eql(modes)) return;
-        try renderer.applyTerminalModes(modes);
-        self.terminal_modes = modes;
-        self.terminal_modes_initialized = true;
-    }
-
-    // Terminal default colors are also global. If the first known value is the
-    // normal default, remember it without sending a reset sequence.
-    fn applyDefaultColors(self: *PresentationState, renderer: client_renderer.Renderer, colors: client_renderer.DefaultColors) !void {
-        if (self.default_colors_initialized and self.default_colors.eql(colors)) return;
-        if (!self.default_colors_initialized and colors.isDefault()) {
-            self.default_colors = colors;
-            self.default_colors_initialized = true;
-            return;
-        }
-        try renderer.applyDefaultColors(colors);
-        self.default_colors = colors;
-        self.default_colors_initialized = true;
-    }
-
-    // Sometimes child output can be forwarded unchanged instead of converted
-    // into a synthetic redraw. Only do that when it cannot disturb hidden
-    // state that PresentationState is tracking.
-    fn canApplyPlainReplay(
-        self: *const PresentationState,
-        screen: *const vt.RenderedScreen,
-        align_viewport: bool,
-        bytes: []const u8,
-        parser_boundary_ok: bool,
-    ) !bool {
-        if (!self.initialized) return false;
-        if (self.full_height_rendering) return false;
-        if (self.viewportOffsetUnknown()) return false;
-        if (align_viewport) return false;
-        if (screen.active_screen != 0) return false;
-        if (screen.active_screen_changed) return false;
-        if (screen.title_dirty or
-            screen.default_colors_dirty or
-            screen.retained_scrollback_clear_dirty or
-            screen.display_clear != null)
-        {
-            return false;
-        }
-        if (!parser_boundary_ok) return false;
-        if (!isSafePlainReplay(bytes)) return false;
-        if (!rowsHaveOnlyDefaultPresentation(screen.rows)) return false;
-        if (!self.terminal_modes_initialized or
-            !self.terminal_modes.eql(vtModesToClient(screen.modes)))
-        {
-            return false;
-        }
-        if (!self.default_colors_initialized or
-            !self.default_colors.eql(try vtDefaultColorsToClient(screen.default_colors)))
-        {
-            return false;
-        }
-        if (self.cursor_visible != screen.cursor_visible) return false;
-        if (self.cursor_style != try cursorStyleFromVt(screen.cursor_style)) return false;
-        return true;
-    }
-
-    // Update our cache after original plain output was replayed successfully.
-    fn assumePlainReplayScreen(self: *PresentationState, session_rows: u16, screen: *const vt.RenderedScreen) !void {
-        if (screen.active_screen > 1) return error.InvalidActiveScreen;
-        if (self.active_screen != screen.active_screen) return error.ActiveScreenSwitchRequiresDraw;
-        self.initialized = true;
-        const row_count: u16 = @intCast(screen.rows.len);
-        const cursor_row_count = screen.cursor_row +| 1;
-        self.rendered_rows = @min(session_rows, @max(self.rendered_rows, @max(row_count, cursor_row_count)));
-        self.cursor_row = screen.cursor_row;
-        self.cursor_col = screen.cursor_col;
-        self.cursor_visible = screen.cursor_visible;
-        self.cursor_style = try cursorStyleFromVt(screen.cursor_style);
-        self.terminal_modes = vtModesToClient(screen.modes);
-        self.terminal_modes_initialized = true;
-        self.default_colors = try vtDefaultColorsToClient(screen.default_colors);
-        self.default_colors_initialized = true;
-        if (screen.modes.mouse_tracking == 0 or !screen.modes.mouse_sgr) {
-            self.full_height_rendering = false;
-        }
-        self.updateViewportOffset(session_rows);
-    }
-
-    // Retained scrollback belongs to the primary buffer. If the outer terminal
-    // is currently showing the alternate buffer, switch back before appending
-    // scrollback rows; the following screen draw can switch to alternate again
-    // if the inner terminal is still there.
-    fn preparePrimaryForScrollback(self: *PresentationState, renderer: client_renderer.Renderer) !void {
-        try self.switchActiveScreen(renderer, 0);
-    }
-
-    fn setViewportOffset(self: *PresentationState, viewport_offset: ?i32) void {
-        self.viewport_offset = viewport_offset orelse 0;
-    }
-
-    fn protocolViewportOffset(self: *const PresentationState) ?i32 {
-        return if (self.viewport_offset == 0) null else self.viewport_offset;
-    }
-
-    fn viewportOffsetUnknown(self: *const PresentationState) bool {
-        return self.viewport_offset < 0;
-    }
-
-    // Keep our viewport-offset estimate consistent with the height we rendered.
-    fn updateViewportOffset(self: *PresentationState, session_rows: u16) void {
-        self.updateViewportOffsetForRenderedRows(session_rows, self.rendered_rows);
-    }
-
-    fn updateViewportOffsetForRenderedRows(self: *PresentationState, session_rows: u16, rendered_rows: u16) void {
-        if (self.viewport_offset <= 0 or session_rows == 0) return;
-        self.viewport_offset = if (rendered_rows >= session_rows)
-            0
-        else
-            @min(self.viewport_offset, @as(i32, @intCast(session_rows - rendered_rows)));
-    }
-
-    // Move from the cached cursor position back to row 0 of our rendered grid.
-    fn moveToRenderedTop(self: *const PresentationState, renderer: client_renderer.Renderer) !void {
-        if (self.rendered_rows == 0) return;
-        try renderer.cursorUp(self.cursor_row);
-        try renderer.carriageReturn();
-    }
-
-    // Move within our rendered grid, extending it with blank lines if needed.
-    fn moveToGridPosition(self: *PresentationState, renderer: client_renderer.Renderer, row: u16, col: u16) !void {
-        try self.ensureGridRow(renderer, row);
-        try self.moveWithinGrid(renderer, row, col);
-    }
-
-    // Make sure a row exists in the outer terminal before we move to it.
-    fn ensureGridRow(self: *PresentationState, renderer: client_renderer.Renderer, row: u16) !void {
-        if (self.rendered_rows == 0) {
-            self.rendered_rows = 1;
-            self.cursor_row = 0;
-        }
-
-        while (row >= self.rendered_rows) {
-            try self.moveWithinGrid(renderer, self.rendered_rows - 1, self.cursor_col);
-            try renderer.newline();
-            self.cursor_row = self.rendered_rows;
-            self.cursor_col = 0;
-            self.rendered_rows += 1;
-        }
-    }
-
-    // Move to an already existing row/column and update the cached cursor.
-    fn moveWithinGrid(self: *PresentationState, renderer: client_renderer.Renderer, row: u16, col: u16) !void {
-        if (self.cursor_row > row) {
-            try renderer.cursorUp(self.cursor_row - row);
-        } else if (row > self.cursor_row) {
-            try renderer.cursorDown(row - self.cursor_row);
-        }
-        try renderer.carriageReturn();
-        try renderer.cursorRight(col);
-        self.cursor_row = row;
-        self.cursor_col = col;
-    }
-};
-
-const TerminalOrigin = struct {
-    row: u16,
-    col: u16,
-};
-
-const ScreenBufferState = struct {
-    initialized: bool = false,
-    rendered_rows: u16 = 0,
-    cursor_row: u16 = 0,
-    cursor_col: u16 = 0,
-    cursor_visible: bool = true,
-    cursor_style: client_renderer.CursorStyle = .default,
-    full_height_rendering: bool = false,
-    viewport_offset: i32 = 0,
-};
-
-const AttachRequest = struct {
-    resize: ResizePayload,
-    session_guid: []u8,
-    capture_tty_transcript: bool,
-
-    fn deinit(self: *AttachRequest) void {
-        app_allocator.allocator().free(self.session_guid);
-        self.* = undefined;
-    }
-};
-
-const SessionCreateRequest = struct {
-    resize: ResizePayload,
-    scrollback_row_count: u32,
-    environment: SessionEnvironment,
-    query_default_colors: vt.DefaultColors,
-    session_guid: []u8,
-    command_argv: [][]u8,
-    shell_command: ?[]u8,
-    tty_settings: ?tty_settings.Settings,
-    reap_ms: u64,
-    capture_tty_transcript: bool,
-
-    fn deinit(self: *SessionCreateRequest) void {
-        app_allocator.allocator().free(self.session_guid);
-        for (self.command_argv) |arg| app_allocator.allocator().free(arg);
-        app_allocator.allocator().free(self.command_argv);
-        if (self.shell_command) |shell_command| app_allocator.allocator().free(shell_command);
-        if (self.tty_settings) |*settings| settings.deinit(app_allocator.allocator());
-        self.environment.deinit();
-        self.* = undefined;
-    }
-};
-
-const RepaintRequest = struct {
-    repaint_request_seq: u64,
-    scrollback_cursor: ?ScrollbackCursor,
-};
-
-const ScrollbackCursor = struct {
-    epoch: u64,
-    per_epoch_cursor: u64,
-};
-
-const encoded_scrollback_cursor_len = 16;
-
-const ResizePayload = struct {
-    rows: u16,
-    cols: u16,
-    viewport_offset: ?i32,
-    repaint_request: ?RepaintRequest,
-};
-
-fn renderTranscriptRows(renderer: client_renderer.Renderer, rows: []const vt.RenderedRow) !void {
-    for (rows) |row| {
-        try renderVtRow(renderer, row);
-        try renderer.newline();
-    }
-}
-
-fn renderVtRow(renderer: client_renderer.Renderer, row: vt.RenderedRow) !void {
-    const allocator = app_allocator.allocator();
-    const cells = try allocator.alloc(client_renderer.Cell, row.cells.len);
-    defer allocator.free(cells);
-    for (row.cells, 0..) |cell, index| {
-        cells[index] = .{
-            .text = cell.text,
-            .display_width = cell.display_width,
-            .attrs = try vtAttrsToClient(cell.attrs),
-            .hyperlink = cell.hyperlink,
-        };
-    }
-    try renderer.renderRow(.{ .cells = cells });
-}
-
-fn renderedCellsDisplayWidth(cells: []const vt.RenderedCell) u16 {
-    var width: u16 = 0;
-    for (cells) |cell| width +|= cell.display_width;
-    return width;
-}
-
-fn rowsHaveOnlyDefaultPresentation(rows: []const vt.RenderedRow) bool {
-    for (rows) |row| {
-        for (row.cells) |cell| {
-            if (!cell.attrs.eql(.{})) return false;
-            if (cell.hyperlink != null) return false;
-        }
-    }
-    return true;
-}
-
-fn isSafePlainReplay(bytes: []const u8) bool {
-    if (bytes.len == 0) return false;
-    // Starting at libghostty-vt ground state plus this byte allowlist preserves
-    // ground state: there is no ESC/control introducer and no partial UTF-8.
-    // The remote terminal process therefore only needs to record whether the batch started at a
-    // plain-text parser boundary before considering original-byte replay.
-    // TAB is intentionally excluded because its visual effect depends on tab
-    // stop state; add it only after modeling and testing that state boundary.
-    for (bytes) |byte| {
-        switch (byte) {
-            '\r', '\n' => {},
-            0x20...0x7e => {},
-            else => return false,
-        }
-    }
-    return true;
-}
-
-// After drawing rows from top to bottom, move to the cursor position reported
-// by the terminal snapshot.
-fn moveToSnapshotCursor(renderer: client_renderer.Renderer, rendered_rows: u16, cursor_row: u16, cursor_col: u16) !void {
-    if (rendered_rows == 0) {
-        try renderer.cursorDown(cursor_row);
-        try renderer.carriageReturn();
-        try renderer.cursorRight(cursor_col);
-        return;
-    }
-    const last_row = rendered_rows - 1;
-    if (cursor_row < last_row) try renderer.cursorUp(last_row - cursor_row);
-    if (cursor_row > last_row) try renderer.cursorDown(cursor_row - last_row);
-    try renderer.carriageReturn();
-    try renderer.cursorRight(cursor_col);
-}
-
-// How many rows of the inner viewport this client currently has mapped onto
-// the outer terminal.
-//
-// A trimmed snapshot can mean two different things: the inner viewport is
-// aligned and the bottom rows are blank, or the viewport is still unaligned and
-// drawing more rows would scroll existing outer-terminal content. After
-// alignment, callers need a way to choose the first meaning; min_rendered_rows
-// lets them do that.
-fn targetRenderedRows(rows_len: usize, cursor_row: u16, min_rendered_rows: u16) u16 {
-    return @max(
-        @max(@as(u16, @intCast(rows_len)), min_rendered_rows),
-        cursor_row +| 1,
-    );
-}
-
-fn vtModesToClient(modes: vt.TerminalModes) client_renderer.TerminalModes {
-    return .{
-        .mode_flags = modes.mode_flags,
-        .mouse_tracking = switch (modes.mouse_tracking) {
-            0 => .disabled,
-            1 => .normal,
-            2 => .button,
-            3 => .any,
-            else => .disabled,
-        },
-        .mouse_sgr = modes.mouse_sgr,
-        .kitty_keyboard_flags = modes.kitty_keyboard_flags,
-    };
-}
-
-fn terminalModesWithoutMouse(modes: client_renderer.TerminalModes) client_renderer.TerminalModes {
-    var without_mouse = modes;
-    without_mouse.mouse_tracking = .disabled;
-    without_mouse.mouse_sgr = false;
-    return without_mouse;
-}
-
-fn vtDefaultColorsToClient(colors: vt.DefaultColors) !client_renderer.DefaultColors {
-    return .{
-        .foreground = try vtColorToClient(colors.foreground_color),
-        .background = try vtColorToClient(colors.background_color),
-    };
-}
-
-test "full-height redraw pads blank rows without indexing past VT rows" {
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-
-    const rows = try std.testing.allocator.alloc(vt.RenderedRow, 0);
-    var screen = vt.RenderedScreen{
-        .rows = rows,
-        .cols = 80,
-        .active_screen = 0,
-        .title = "",
-        .title_present = false,
-        .title_dirty = false,
-        .default_colors = .{},
-        .default_colors_dirty = false,
-        .retained_scrollback_clear_dirty = false,
-        .cursor_row = 0,
-        .cursor_col = 0,
-        .cursor_visible = true,
-        .cursor_style = 0,
-        .modes = .{ .mouse_tracking = 1, .mouse_sgr = true },
-        .dirty_state = .full,
-        .active_screen_changed = false,
-        .display_clear = null,
-    };
-    defer screen.deinit(std.testing.allocator);
-
-    var presentation = PresentationState{
-        .initialized = true,
-        .rendered_rows = 3,
-        .full_height_rendering = true,
-    };
-    try presentation.applyScreen(renderer, 3, &screen, true, false);
-    try std.testing.expectEqual(@as(u16, 3), presentation.rendered_rows);
-}
-
-test "active-screen change uses outer alternate screen" {
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-
-    var first_primary = try testRenderedScreen(
-        std.testing.allocator,
-        0,
-        2,
-        &.{ "PRIMARY0", "PRIMARY1", "PRIMARY2" },
-    );
-    defer first_primary.deinit(std.testing.allocator);
-
-    var presentation = PresentationState{};
-    try presentation.applyScreen(renderer, 4, &first_primary, true, false);
-
-    bytes.clearRetainingCapacity();
-
-    var alt_screen = try testRenderedScreen(
-        std.testing.allocator,
-        1,
-        3,
-        &.{ "ALT0", "ALT1", "ALT2", "ALT3" },
-    );
-    defer alt_screen.deinit(std.testing.allocator);
-
-    try presentation.applyScreen(renderer, 4, &alt_screen, true, false);
-    try std.testing.expect(std.mem.indexOf(u8, bytes.items, "\x1b[?1049h") != null);
-    try std.testing.expectEqual(@as(u16, 3), presentation.cursor_row);
-
-    bytes.clearRetainingCapacity();
-
-    var primary_screen = try testRenderedScreen(
-        std.testing.allocator,
-        0,
-        0,
-        &.{"PRIMARY"},
-    );
-    defer primary_screen.deinit(std.testing.allocator);
-
-    try presentation.applyScreen(renderer, 4, &primary_screen, true, false);
-    try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[?1049l\x1b[2A\r"));
-    try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
-}
-
-test "attached-client-end restore leaves outer alternate screen" {
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-
-    var alt_screen = try testRenderedScreen(
-        std.testing.allocator,
-        1,
-        3,
-        &.{ "ALT0", "ALT1", "ALT2", "ALT3" },
-    );
-    defer alt_screen.deinit(std.testing.allocator);
-
-    var presentation = PresentationState{};
-    try presentation.applyScreen(renderer, 4, &alt_screen, true, false);
-
-    bytes.clearRetainingCapacity();
-
-    var primary_screen = try testRenderedScreen(
-        std.testing.allocator,
-        0,
-        0,
-        &.{"PRIMARY"},
-    );
-    defer primary_screen.deinit(std.testing.allocator);
-
-    try presentation.applyAttachedClientEndRestoreScreen(renderer, 4, &primary_screen);
-    try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[?1049l"));
-    try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
-}
-
-test "initial screen render clears target rows before drawing" {
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-
-    var screen = try testRenderedScreen(
-        std.testing.allocator,
-        0,
-        2,
-        &.{ "short", "", "tiny" },
-    );
-    defer screen.deinit(std.testing.allocator);
-
-    var presentation = PresentationState{};
-    try presentation.applyScreen(renderer, 4, &screen, true, false);
-
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes.items, "\x1b[2K"));
-    try std.testing.expect(std.mem.indexOf(u8, bytes.items, "\x1b[2K\x1b[0mshort") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes.items, "\r\n\x1b[2K\x1b[0m\x1b[0m\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes.items, "\x1b[2K\x1b[0mtiny") != null);
-}
-
-test "screen repaint reset clears previous rows then records new height" {
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-
-    var screen = try testRenderedScreen(
-        std.testing.allocator,
-        0,
-        0,
-        &.{"short"},
-    );
-    defer screen.deinit(std.testing.allocator);
-
-    var presentation = PresentationState{
-        .initialized = true,
-        .rendered_rows = 5,
-    };
-    presentation.resetForScreenRepaint();
-    try presentation.applyScreen(renderer, 5, &screen, true, false);
-
-    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, bytes.items, "\x1b[2K"));
-    try std.testing.expectEqual(@as(u16, 1), presentation.rendered_rows);
-}
-
-fn testRenderedScreen(
-    allocator: std.mem.Allocator,
-    active_screen: u8,
-    cursor_row: u16,
-    labels: []const []const u8,
-) !vt.RenderedScreen {
-    const rows = try allocator.alloc(vt.RenderedRow, labels.len);
-    var rows_filled: usize = 0;
-    errdefer {
-        for (rows[0..rows_filled]) |*row| row.deinit(allocator);
-        allocator.free(rows);
-    }
-
-    for (labels, 0..) |label, index| {
-        rows[index] = try testRenderedRow(allocator, label);
-        rows_filled += 1;
-    }
-
-    return .{
-        .rows = rows,
-        .cols = 80,
-        .active_screen = active_screen,
-        .title = "",
-        .title_present = false,
-        .title_dirty = false,
-        .default_colors = .{},
-        .default_colors_dirty = false,
-        .retained_scrollback_clear_dirty = false,
-        .cursor_row = cursor_row,
-        .cursor_col = 0,
-        .cursor_visible = true,
-        .cursor_style = 0,
-        .modes = .{},
-        .dirty_state = .full,
-        .active_screen_changed = true,
-        .display_clear = null,
-    };
-}
-
-fn testRenderedRow(allocator: std.mem.Allocator, label: []const u8) !vt.RenderedRow {
-    const cells = try allocator.alloc(vt.RenderedCell, 1);
-    errdefer allocator.free(cells);
-    cells[0] = .{
-        .text = try allocator.dupe(u8, label),
-        .display_width = @intCast(label.len),
-        .attrs = .{},
-    };
-    return .{
-        .cells = cells,
-        .width_cols = 80,
-        .flags = 0,
-        .dirty = true,
-    };
-}
-
-fn vtAttrsToClient(attrs: vt.CellAttrs) !client_renderer.CellAttrs {
-    if ((attrs.style_flags & 0xfffff000) != 0) return error.InvalidStyleFlags;
-    const underline = (attrs.style_flags & (1 << 3)) != 0;
-    const underline_style_raw = (attrs.style_flags >> 9) & 0x7;
-    const underline_style: client_renderer.UnderlineStyle = if (underline) switch (underline_style_raw) {
-        0, 1 => .single,
-        2 => .double,
-        3 => .curly,
-        4 => .dotted,
-        5 => .dashed,
-        else => return error.InvalidUnderlineStyle,
-    } else .single;
-    return .{
-        .bold = (attrs.style_flags & (1 << 0)) != 0,
-        .faint = (attrs.style_flags & (1 << 1)) != 0,
-        .italic = (attrs.style_flags & (1 << 2)) != 0,
-        .underline = underline,
-        .underline_style = underline_style,
-        .blink = (attrs.style_flags & (1 << 4)) != 0,
-        .inverse = (attrs.style_flags & (1 << 5)) != 0,
-        .hidden = (attrs.style_flags & (1 << 6)) != 0,
-        .strikethrough = (attrs.style_flags & (1 << 7)) != 0,
-        .overline = (attrs.style_flags & (1 << 8)) != 0,
-        .fg = try vtColorToClient(attrs.fg_color),
-        .bg = try vtColorToClient(attrs.bg_color),
-        .underline_color = try vtColorToClient(attrs.underline_color),
-    };
-}
-
-fn vtColorToClient(raw: u32) !client_renderer.Color {
-    if (raw == vt.CellAttrs.default_color) return .default;
-    if (raw <= 0xff) return .{ .indexed = @intCast(raw) };
-    if ((raw & 0xff000000) == 0x01000000) {
-        return .{ .rgb = .{
-            .r = @intCast((raw >> 16) & 0xff),
-            .g = @intCast((raw >> 8) & 0xff),
-            .b = @intCast(raw & 0xff),
-        } };
-    }
-    return error.InvalidTerminalColor;
-}
-
-fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
-    return switch (value) {
-        0 => .default,
-        1 => .blinking_block,
-        2 => .steady_block,
-        3 => .blinking_underline,
-        4 => .steady_underline,
-        5 => .blinking_bar,
-        6 => .steady_bar,
-        else => error.InvalidCursorStyle,
-    };
-}
+const ExitInfo = remote_process.ExitInfo;
+
+const runtime_requests = @import("runtime_requests.zig");
+const SessionEnvironment = runtime_requests.SessionEnvironment;
+const AttachRequest = runtime_requests.AttachRequest;
+const RepaintRequest = runtime_requests.RepaintRequest;
+const ResizePayload = runtime_requests.ResizePayload;
+const readSessionCreateRequest = runtime_requests.readSessionCreateRequest;
+const resizePayloadFromMessage = runtime_requests.resizePayloadFromMessage;
+const attachRequestFromOpen = runtime_requests.attachRequestFromOpen;
+const repaintRequestFromMessage = runtime_requests.repaintRequestFromMessage;
 
 pub fn startTerminalRuntimeInDaemon(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
     session_guid: []const u8,
 ) !*TerminalRemoteProcess {
-    const guid = try session_registry.canonicalGuid(allocator, session_guid);
+    const guid = try guid_ref.canonicalSessionGuid(allocator, session_guid);
     errdefer allocator.free(guid);
 
     const control = try allocator.create(TerminalRemoteProcess);
@@ -1348,7 +277,7 @@ pub fn runSessionRuntimeLoop(session_guid: []const u8, listen_fd: c.fd_t) !void 
 }
 
 pub fn connectTerminalRemoteProcess(allocator: std.mem.Allocator, guid: []const u8) !c.fd_t {
-    const canonical = try session_registry.canonicalGuid(allocator, guid);
+    const canonical = try guid_ref.canonicalSessionGuid(allocator, guid);
     defer allocator.free(canonical);
 
     const control = lookupRuntime(canonical) orelse return error.SessionNotFound;
@@ -1366,7 +295,7 @@ pub fn connectTerminalRuntime(
     daemon_dispatcher: ?*dispatcher.Dispatcher,
     guid: []const u8,
 ) !c.fd_t {
-    const canonical = try session_registry.canonicalGuid(allocator, guid);
+    const canonical = try guid_ref.canonicalSessionGuid(allocator, guid);
     defer allocator.free(canonical);
 
     const control = lookupRuntime(canonical) orelse return error.SessionNotFound;
@@ -1423,7 +352,7 @@ fn connectTerminalRuntimeControl(
 pub fn requestTerminalRemoteCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
     const fd = try connectTerminalRemoteProcess(allocator, guid);
     defer _ = c.close(fd);
-    try protocol.sendTeStreamPayloadFrame(allocator, fd, .{ .session_hangup_request = .{} });
+    try protocol.sendTerminalEmulatorPayloadFrame(allocator, fd, .{ .session_hangup_request = .{} });
 }
 
 pub fn connectSingleLiveTerminalRemote(allocator: std.mem.Allocator) !c.fd_t {
@@ -1462,7 +391,7 @@ pub fn forgetTerminalRemote(guid: []const u8) void {
                 .in_daemon => return,
             };
             _ = terminal_remote_processes.orderedRemove(index);
-            _ = reapTerminalRemote(process.pid);
+            _ = remote_process.reapPid(process.pid);
             const allocator = control.allocator;
             control.deinit(null);
             allocator.destroy(control);
@@ -1500,7 +429,7 @@ fn pruneExitedTerminalRemotes() void {
 
 fn terminalRuntimeIsExited(control: *const TerminalRemoteProcess) bool {
     return switch (control.kind) {
-        .process => |process| reapTerminalRemote(process.pid),
+        .process => |process| remote_process.reapPid(process.pid),
         // In-daemon runtimes own dispatcher watches. Their dispatcher callback
         // destroys them when the runtime completes; pruning here has no
         // dispatcher to cancel those watches safely.
@@ -1515,18 +444,6 @@ fn destroyRegisteredTerminalRemote(control: *TerminalRemoteProcess, daemon_dispa
     allocator.destroy(control);
 }
 
-fn reapTerminalRemote(pid: c.pid_t) bool {
-    if (pid <= 0) return true;
-    var status: c_int = 0;
-    const result = c.waitpid(pid, &status, wait_nohang);
-    if (result == pid) return true;
-    if (result < 0) return switch (posix.errno(result)) {
-        .CHILD => true,
-        else => false,
-    };
-    return false;
-}
-
 fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, listen_fd: c.fd_t) !void {
     // PROCESS_EVENT_LOOP: terminal remote runtime process. It directly polls
     // its PTY, client connection, and control fds; it is not a daemon helper
@@ -1535,6 +452,7 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, listen_fd: c.fd_t) !
     const now_unix_ms = nowUnixMs();
     clearExpiredDebugUnresponsiveAttachedClients(session_runtime, now_ms);
     if (reapPtyHangupSessionIfExited(session_runtime)) return;
+    if (reapPtyEofSessionIfExited(session_runtime, now_ms, now_unix_ms)) return;
     if (endReapedSessions(session_runtime, now_unix_ms)) return;
 
     var pollfds: [4]posix.pollfd = undefined;
@@ -1545,9 +463,11 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, listen_fd: c.fd_t) !
     kinds[count] = .listen;
     count += 1;
 
-    if (session_runtime.session.alive and session_runtime.session.pty_fd >= 0) {
+    if (session_runtime.session.alive and session_runtime.session.process.hasOpenPty()) {
         const session = &session_runtime.session;
-        pollfds[count] = .{ .fd = session.pty_fd, .events = posix.POLL.IN, .revents = 0 };
+        var events: i16 = posix.POLL.IN;
+        if (sessionHasPendingPtyInput(session)) events |= posix.POLL.OUT;
+        pollfds[count] = .{ .fd = session.process.pty_fd, .events = events, .revents = 0 };
         kinds[count] = .session;
         count += 1;
     }
@@ -1574,13 +494,14 @@ fn sessionRuntimePollOnce(session_runtime: *SessionRuntime, listen_fd: c.fd_t) !
     clearExpiredDebugUnresponsiveAttachedClients(session_runtime, after_poll_ms);
     flushExpiredSynchronizedOutputSessions(session_runtime, after_poll_ms);
     if (reapPtyHangupSessionIfExited(session_runtime)) return;
+    if (reapPtyEofSessionIfExited(session_runtime, after_poll_ms, nowUnixMs())) return;
     if (endReapedSessions(session_runtime, nowUnixMs())) return;
 
     for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
         if (pollfd.revents == 0) continue;
         switch (kind) {
             .listen => handleRuntimeHandoffEvent(session_runtime, listen_fd),
-            .session => drainSessionOutput(session_runtime),
+            .session => handleSessionPtyEvents(session_runtime, pollfd.revents),
             .attached_client => handleAttachedClientEvents(session_runtime, pollfd.revents),
             .pending_client => handlePendingRuntimeClientEvents(session_runtime, pollfd.revents),
         }
@@ -1607,7 +528,7 @@ fn handleDispatcherSessionRuntimeEvent(
                 .timer => return error.UnexpectedRuntimeTimerId,
             };
             if (runtime.session_watch.matches(fd_id)) {
-                drainSessionOutput(&runtime.session_runtime);
+                handleSessionPtyEvents(&runtime.session_runtime, pollReventsFromDispatcherEvent(fd_event));
             } else if (runtime.attached_watch.matches(fd_id)) {
                 handleAttachedClientEvents(&runtime.session_runtime, pollReventsFromDispatcherEvent(fd_event));
             } else if (runtime.pending_watch.matches(fd_id)) {
@@ -1651,7 +572,9 @@ fn runSessionRuntimeMaintenance(session_runtime: *SessionRuntime) void {
     const now_unix_ms = nowUnixMs();
     clearExpiredDebugUnresponsiveAttachedClients(session_runtime, now_ms);
     flushExpiredSynchronizedOutputSessions(session_runtime, now_ms);
-    if (!reapPtyHangupSessionIfExited(session_runtime)) {
+    if (!reapPtyHangupSessionIfExited(session_runtime) and
+        !reapPtyEofSessionIfExited(session_runtime, now_ms, now_unix_ms))
+    {
         _ = endReapedSessions(session_runtime, now_unix_ms);
     }
     stopSessionRuntimeIfComplete(session_runtime);
@@ -1689,8 +612,14 @@ fn sessionRuntimePollTimeoutMs(session_runtime: *const SessionRuntime, now_ms: i
         const clamped_remaining_ms = @max(remaining_ms, 0);
         if (timeout_ms == null or clamped_remaining_ms < timeout_ms.?) timeout_ms = clamped_remaining_ms;
     }
-    if (session.alive and session.pty_closed_for_hangup) {
+    if (session.alive and session.process.pty_closed_for_hangup) {
         if (timeout_ms == null or pty_hangup_reap_poll_ms < timeout_ms.?) timeout_ms = pty_hangup_reap_poll_ms;
+    }
+    if (session.alive and session.pty_eof_wait_started_ms != 0) {
+        const elapsed_ms = now_ms - session.pty_eof_wait_started_ms;
+        const remaining_grace_ms = @max(pty_eof_exit_status_grace_ms - elapsed_ms, 0);
+        const remaining_ms = @min(pty_eof_exit_reap_poll_ms, remaining_grace_ms);
+        if (timeout_ms == null or remaining_ms < timeout_ms.?) timeout_ms = remaining_ms;
     }
     if (sessionReapEnabled(session)) {
         const deadline_ms = session.disconnected_at_unix_ms +| session.reap_ms;
@@ -1741,10 +670,22 @@ test "remote terminal process poll timeout wakes to reap pty hangup" {
     var session_runtime = SessionRuntime{};
     session_runtime.session = .{
         .alive = true,
-        .pty_closed_for_hangup = true,
+        .process = .{ .pty_closed_for_hangup = true },
     };
 
     try std.testing.expectEqual(@as(i32, pty_hangup_reap_poll_ms), sessionRuntimePollTimeoutMs(&session_runtime, 0, 0));
+}
+
+test "remote terminal process poll timeout wakes while pty eof awaits exit status" {
+    var session_runtime = SessionRuntime{};
+    session_runtime.session = .{
+        .alive = true,
+        .pty_eof_wait_started_ms = 10,
+    };
+
+    try std.testing.expectEqual(@as(i32, pty_eof_exit_reap_poll_ms), sessionRuntimePollTimeoutMs(&session_runtime, 10, 0));
+    try std.testing.expectEqual(@as(i32, 1), sessionRuntimePollTimeoutMs(&session_runtime, 259, 0));
+    try std.testing.expectEqual(@as(i32, 0), sessionRuntimePollTimeoutMs(&session_runtime, 260, 0));
 }
 
 fn flushExpiredSynchronizedOutputSessions(session_runtime: *SessionRuntime, now_ms: i64) void {
@@ -1806,7 +747,7 @@ fn drainPendingRuntimeClient(session_runtime: *SessionRuntime) void {
     if (!pending_client.active) return;
     while (true) {
         var frame = switch (pending_client.reader.readReady(pending_client.fd) catch |err| {
-            io.stderrPrint("sessh remote terminal process: client error: {t}\n", .{err}) catch {};
+            user_error.rolePrintLine("sessh-terminal-remote", "client error: {t}", .{err}) catch {};
             pending_client.close();
             return;
         }) {
@@ -1819,7 +760,7 @@ fn drainPendingRuntimeClient(session_runtime: *SessionRuntime) void {
         };
         defer frame.deinit(app_allocator.allocator());
         switch (handlePendingRuntimeClientFrame(session_runtime, pending_client, &frame) catch |err| {
-            io.stderrPrint("sessh remote terminal process: client error: {t}\n", .{err}) catch {};
+            user_error.rolePrintLine("sessh-terminal-remote", "client error: {t}", .{err}) catch {};
             pending_client.close();
             return;
         }) {
@@ -1955,57 +896,6 @@ fn sendErrorFrame(fd: c.fd_t, code: []const u8, message: []const u8, hint: []con
     try protocol.sendFrame(fd, .error_message, payload);
 }
 
-fn queueAttachedClientError(session_runtime: *SessionRuntime, attached_client: *AttachedClient, code: []const u8, message: []const u8, hint: []const u8) !void {
-    _ = session_runtime;
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
-        .code = code,
-        .message = message,
-        .hint = hint,
-    });
-    defer app_allocator.allocator().free(payload);
-    try queueAttachedClientFrame(attached_client, .error_message, payload);
-}
-
-fn queueAttachedClientFrame(attached_client: *AttachedClient, message_type: protocol.MessageType, payload: []const u8) !void {
-    const frame = try protocol.encodeFrame(app_allocator.allocator(), message_type, payload);
-    defer app_allocator.allocator().free(frame);
-    const frame_len = frame.len;
-    if (frame_len > max_attached_client_output_queue_bytes or
-        attached_client.queuedBytes() > max_attached_client_output_queue_bytes - frame_len)
-    {
-        return error.AttachedClientOutputQueueFull;
-    }
-
-    compactAttachedClientOutput(attached_client);
-    try attached_client.output.appendSlice(app_allocator.allocator(), frame);
-}
-
-fn queueAttachedClientTeFrame(attached_client: *AttachedClient, payload: pb.TerminalEmulatorItem.payload_union) !void {
-    const encoded = try protocol.encodePayload(app_allocator.allocator(), pb.ClientRemoteItem{
-        .payload = .{ .terminal_emulator = .{ .payload = payload } },
-    });
-    defer app_allocator.allocator().free(encoded);
-    try queueAttachedClientFrame(attached_client, .client_remote, encoded);
-}
-
-fn compactAttachedClientOutput(attached_client: *AttachedClient) void {
-    if (attached_client.output_offset == 0) return;
-    if (attached_client.output_offset >= attached_client.output.items.len) {
-        attached_client.output.clearRetainingCapacity();
-        attached_client.output_offset = 0;
-        return;
-    }
-
-    const remaining = attached_client.output.items.len - attached_client.output_offset;
-    std.mem.copyForwards(
-        u8,
-        attached_client.output.items[0..remaining],
-        attached_client.output.items[attached_client.output_offset..],
-    );
-    attached_client.output.shrinkRetainingCapacity(remaining);
-    attached_client.output_offset = 0;
-}
-
 fn flushAttachedClientOutput(session_runtime: *SessionRuntime) void {
     const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
@@ -2038,13 +928,6 @@ fn flushAttachedClientOutput(session_runtime: *SessionRuntime) void {
     }
 }
 
-fn sendSessionAttachedForSession(session_runtime: *const SessionRuntime, attached_client: *AttachedClient, session: *const Session) !void {
-    _ = session_runtime;
-    try queueAttachedClientTeFrame(attached_client, .{ .session_attached = .{
-        .session_guid = session.idSlice(),
-    } });
-}
-
 fn handleSessionClientDebugSeverConnectionRequest(session_runtime: *SessionRuntime, fd: c.fd_t, request: pb.TerminalEmulatorItem.SessionClientDebugSeverConnectionRequest) !void {
     _ = request;
     const attached_client = &session_runtime.attached_client;
@@ -2072,37 +955,7 @@ fn handleSessionClientDebugUnresponsiveConnectionRequest(session_runtime: *Sessi
 }
 
 fn sendClientControlResponse(fd: c.fd_t) !void {
-    try protocol.sendTeStreamPayloadFrame(app_allocator.allocator(), fd, .{ .session_client_control_response = .{} });
-}
-
-fn sendSessionEnded(attached_client: *AttachedClient, reason: u8, exit_info: ExitInfo) !void {
-    const exit_status: ?pb.TerminalEmulatorItem.SessionEnded.ExitStatus = switch (exit_info.kind) {
-        1 => .{ .kind = .KIND_EXITED, .status = exit_info.status },
-        2 => .{ .kind = .KIND_SIGNALLED, .status = exit_info.status },
-        else => null,
-    };
-    try queueAttachedClientTeFrame(attached_client, .{ .session_ended = .{
-        .reason = switch (reason) {
-            1 => .REASON_KILLED_BY_REQUEST,
-            2 => .REASON_DAEMON_SHUTDOWN,
-            3 => .REASON_DISCONNECTED_TIMEOUT,
-            else => .REASON_PROCESS_EXITED,
-        },
-        .exit_status = exit_status,
-        .ended_at_unix_ms = if (exit_info.ended_at_unix_ms == 0) null else exit_info.ended_at_unix_ms,
-    } });
-}
-
-fn queueTtyTranscriptChunk(
-    attached_client: *AttachedClient,
-    stream: pb.TerminalEmulatorItem.TtyTranscriptChunk.Stream,
-    bytes: []const u8,
-) !void {
-    if (!attached_client.capture_tty_transcript or bytes.len == 0) return;
-    try queueAttachedClientTeFrame(attached_client, .{ .tty_transcript_chunk = .{
-        .stream = stream,
-        .data = bytes,
-    } });
+    try protocol.sendTerminalEmulatorPayloadFrame(app_allocator.allocator(), fd, .{ .session_client_control_response = .{} });
 }
 
 fn queueTtyTranscriptChunkForSession(
@@ -2114,499 +967,9 @@ fn queueTtyTranscriptChunkForSession(
     const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
     if (attached_client.close_after_flush or !attached_client.capture_tty_transcript) return;
-    queueTtyTranscriptChunk(attached_client, stream, bytes) catch {
+    runtime_render.queueTtyTranscriptChunk(attached_client, stream, bytes) catch {
         disconnectAttachedClient(session_runtime);
     };
-}
-
-fn readDefaultColorValue(color: u32) !u32 {
-    if (color == vt.CellAttrs.default_color) return color;
-    if ((color & 0xff000000) == 0x01000000) return color;
-    return error.InvalidDefaultColor;
-}
-
-fn encodeScrollbackCursor(out: *[encoded_scrollback_cursor_len]u8, epoch: u64, per_epoch_cursor: u64) void {
-    writeU64BigEndian(out[0..8], epoch);
-    writeU64BigEndian(out[8..16], per_epoch_cursor);
-}
-
-fn decodeScrollbackCursor(bytes: []const u8) !ScrollbackCursor {
-    if (bytes.len == 0) return .{ .epoch = 0, .per_epoch_cursor = 0 };
-    if (bytes.len != encoded_scrollback_cursor_len) return error.InvalidScrollbackCursor;
-    return .{
-        .epoch = readU64BigEndian(bytes[0..8]),
-        .per_epoch_cursor = readU64BigEndian(bytes[8..16]),
-    };
-}
-
-fn writeU64BigEndian(bytes: []u8, value: u64) void {
-    bytes[0] = @intCast((value >> 56) & 0xff);
-    bytes[1] = @intCast((value >> 48) & 0xff);
-    bytes[2] = @intCast((value >> 40) & 0xff);
-    bytes[3] = @intCast((value >> 32) & 0xff);
-    bytes[4] = @intCast((value >> 24) & 0xff);
-    bytes[5] = @intCast((value >> 16) & 0xff);
-    bytes[6] = @intCast((value >> 8) & 0xff);
-    bytes[7] = @intCast(value & 0xff);
-}
-
-fn readU64BigEndian(bytes: []const u8) u64 {
-    return (@as(u64, bytes[0]) << 56) |
-        (@as(u64, bytes[1]) << 48) |
-        (@as(u64, bytes[2]) << 40) |
-        (@as(u64, bytes[3]) << 32) |
-        (@as(u64, bytes[4]) << 24) |
-        (@as(u64, bytes[5]) << 16) |
-        (@as(u64, bytes[6]) << 8) |
-        @as(u64, bytes[7]);
-}
-
-fn queueDrawFrame(
-    attached_client: *AttachedClient,
-    session: *const Session,
-    scrollback_cursor: u64,
-    draw_bytes: []const u8,
-    app_title_present: ?bool,
-    attached_client_end_restore_bytes: ?[]const u8,
-) !void {
-    var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
-    encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
-    try queueAttachedClientTeFrame(attached_client, .{ .draw = .{
-        .scrollback_cursor = encoded_cursor[0..],
-        .viewport_offset = attached_client.presentation.protocolViewportOffset(),
-        .draw_bytes = draw_bytes,
-        .app_title_present = app_title_present,
-        .attached_client_end_restore_bytes = attached_client_end_restore_bytes,
-    } });
-}
-
-fn appendDrawCleanup(draw_bytes: *std.ArrayList(u8)) !void {
-    const renderer = client_renderer.Renderer.buffered(draw_bytes, .{ .kind = .xterm_compatible });
-    try renderer.restoreOverlayPresentation();
-}
-
-fn wrapDrawInSynchronizedUpdate(draw_bytes: *std.ArrayList(u8)) !void {
-    if (draw_bytes.items.len == 0) return;
-    try draw_bytes.insertSlice(app_allocator.allocator(), 0, "\x1b[?2026h");
-    try draw_bytes.appendSlice(app_allocator.allocator(), "\x1b[?2026l");
-}
-
-fn appendAttachedClientEndRestoreBytes(
-    attached_client: *const AttachedClient,
-    session: *const Session,
-    screen: *const vt.RenderedScreen,
-    restore_screen: ?*const vt.RenderedScreen,
-    restore_bytes: *std.ArrayList(u8),
-) !?[]const u8 {
-    if (restore_screen) |primary| {
-        var restore_presentation = attached_client.presentation;
-        const restore_renderer = client_renderer.Renderer.buffered(restore_bytes, .{ .kind = .xterm_compatible });
-        try restore_presentation.applyAttachedClientEndRestoreScreen(restore_renderer, session.rows, primary);
-        return restore_bytes.items;
-    }
-    if (screen.active_screen == 0) return "";
-    return null;
-}
-
-fn renderBarrierTargetActiveScreen(barrier: vt.RenderBarrier) u8 {
-    return switch (barrier) {
-        .enter_alternate_screen => 1,
-        .leave_alternate_screen => 0,
-    };
-}
-
-fn renderBarrierAttachedClientEndRestoreBytes(barrier: vt.RenderBarrier) []const u8 {
-    return switch (barrier) {
-        // The primary screen was flushed immediately before this barrier, so
-        // leaving the outer alternate screen is enough to get attached-client cleanup
-        // back to the user's normal terminal buffer.
-        .enter_alternate_screen => "\x1b[?1049l",
-        .leave_alternate_screen => "",
-    };
-}
-
-fn queueRenderBarrierDraw(
-    attached_client: *AttachedClient,
-    session: *const Session,
-    barrier: vt.RenderBarrier,
-    scrollback_cursor: u64,
-) !void {
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try attached_client.presentation.switchActiveScreen(renderer, renderBarrierTargetActiveScreen(barrier));
-    if (bytes.items.len == 0) return;
-    try appendDrawCleanup(&bytes);
-    try wrapDrawInSynchronizedUpdate(&bytes);
-    try queueDrawFrame(
-        attached_client,
-        session,
-        scrollback_cursor,
-        bytes.items,
-        null,
-        renderBarrierAttachedClientEndRestoreBytes(barrier),
-    );
-}
-
-fn queueScrollbackRowsDraw(
-    attached_client: *AttachedClient,
-    session: *const Session,
-    rows: []const vt.RenderedRow,
-    scrollback_cursor: u64,
-) !void {
-    if (rows.len == 0) return;
-    if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try attached_client.presentation.preparePrimaryForScrollback(renderer);
-    try attached_client.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    try wrapDrawInSynchronizedUpdate(&bytes);
-    try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, null, null);
-}
-
-fn queueScrollbackRowsAndScreenDraw(
-    attached_client: *AttachedClient,
-    session: *const Session,
-    rows: []const vt.RenderedRow,
-    screen: *const vt.RenderedScreen,
-    restore_screen: ?*const vt.RenderedScreen,
-    align_viewport: bool,
-    scrollback_cursor: u64,
-) !void {
-    if (rows.len == 0) return;
-    if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
-
-    const plain_replay = session.pending_plain_output.items;
-    if (try attached_client.presentation.canApplyPlainReplay(
-        screen,
-        align_viewport,
-        plain_replay,
-        session.pendingPlainOutputCanReplay(),
-    )) {
-        try attached_client.presentation.assumePlainReplayScreen(session.rows, screen);
-        try queueDrawFrame(attached_client, session, scrollback_cursor, plain_replay, screen.title_present, null);
-        return;
-    }
-
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    // Screen clears first copy the old visible rows into scrollback, then draw
-    // the cleared screen. After that copy, another alignment pass would only
-    // add blank rows to scrollback.
-    const align_after_scrollback = align_viewport and screen.display_clear == null;
-    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, screen, align_after_scrollback);
-    if (shouldClearOuterVisibleForDisplayClear(screen)) {
-        effective_align_viewport = false;
-    }
-    try attached_client.presentation.preparePrimaryForScrollback(renderer);
-    try attached_client.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    if (shouldClearOuterVisibleForDisplayClear(screen)) {
-        // Full-screen clears must happen after copying the old rows. Clearing
-        // first would leave those rows nowhere to go except back on screen.
-        try attached_client.presentation.clearOuterVisibleForScreen(renderer, screen);
-    }
-    try attached_client.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
-    if (effective_align_viewport) attached_client.origin = .{ .row = 0, .col = 0 };
-    updateMouseOriginAfterDraw(attached_client, screen);
-    try appendDrawCleanup(&bytes);
-    try wrapDrawInSynchronizedUpdate(&bytes);
-    var restore_bytes = std.ArrayList(u8).empty;
-    defer restore_bytes.deinit(app_allocator.allocator());
-    const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, screen, restore_screen, &restore_bytes);
-    try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, screen.title_present, restore);
-}
-
-fn queueScrollbackTruncatedDraw(
-    attached_client: *AttachedClient,
-    session: *const Session,
-    truncated_rows: u64,
-    scrollback_cursor: u64,
-) !void {
-    if (truncated_rows == 0) return;
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try attached_client.presentation.preparePrimaryForScrollback(renderer);
-    try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
-    try wrapDrawInSynchronizedUpdate(&bytes);
-    try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, null, null);
-}
-
-fn appendScrollbackTruncatedMarker(bytes: *std.ArrayList(u8), renderer: client_renderer.Renderer, truncated_rows: u64) !void {
-    const marker = try std.fmt.allocPrint(
-        app_allocator.allocator(),
-        "--- sessh scrollback truncated: {} lines ---",
-        .{truncated_rows},
-    );
-    defer app_allocator.allocator().free(marker);
-    try bytes.appendSlice(app_allocator.allocator(), marker);
-    try renderer.newline();
-}
-
-fn updateMouseOriginAfterDraw(attached_client: *AttachedClient, screen: *const vt.RenderedScreen) void {
-    if (!screenWantsMouseReporting(screen)) {
-        attached_client.origin = null;
-        return;
-    }
-
-    if (attached_client.presentation.full_height_rendering) {
-        attached_client.origin = .{ .row = 0, .col = 0 };
-    }
-}
-
-fn screenWantsMouseReporting(screen: *const vt.RenderedScreen) bool {
-    return screen.modes.mouse_tracking != 0;
-}
-
-fn shouldAlignViewportForDraw(attached_client: *const AttachedClient, screen: *const vt.RenderedScreen, requested: bool) bool {
-    if (screen.active_screen == 1) return false;
-    return requested or
-        attached_client.presentation.viewportOffsetUnknown() or
-        (screenWantsMouseReporting(screen) and !attached_client.presentation.full_height_rendering);
-}
-
-fn shouldClearOuterVisibleForDisplayClear(screen: *const vt.RenderedScreen) bool {
-    const clear = screen.display_clear orelse return false;
-    return clear.mode == .complete;
-}
-
-fn queueScreenDraw(
-    attached_client: *AttachedClient,
-    session: *const Session,
-    screen: *const vt.RenderedScreen,
-    restore_screen: ?*const vt.RenderedScreen,
-    force_redraw: bool,
-    align_viewport: bool,
-    scrollback_cursor: u64,
-) !bool {
-    const plain_replay = session.pending_plain_output.items;
-    if (try attached_client.presentation.canApplyPlainReplay(
-        screen,
-        align_viewport,
-        plain_replay,
-        session.pendingPlainOutputCanReplay(),
-    )) {
-        try attached_client.presentation.assumePlainReplayScreen(session.rows, screen);
-        try queueDrawFrame(attached_client, session, scrollback_cursor, plain_replay, screen.title_present, null);
-        return true;
-    }
-
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, screen, align_viewport);
-    if (shouldClearOuterVisibleForDisplayClear(screen)) {
-        try attached_client.presentation.clearOuterVisibleForScreen(renderer, screen);
-        effective_align_viewport = false;
-    }
-    try attached_client.presentation.applyScreen(renderer, session.rows, screen, force_redraw, effective_align_viewport);
-    if (effective_align_viewport) attached_client.origin = .{ .row = 0, .col = 0 };
-    updateMouseOriginAfterDraw(attached_client, screen);
-    if (bytes.items.len > 0) {
-        try appendDrawCleanup(&bytes);
-        try wrapDrawInSynchronizedUpdate(&bytes);
-        var restore_bytes = std.ArrayList(u8).empty;
-        defer restore_bytes.deinit(app_allocator.allocator());
-        const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, screen, restore_screen, &restore_bytes);
-        try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, screen.title_present, restore);
-        return true;
-    }
-    return false;
-}
-
-fn advanceScrollbackEpoch(session: *Session) void {
-    session.scrollback_epoch +%= 1;
-    if (session.scrollback_epoch == 0) session.scrollback_epoch = 1;
-}
-
-fn advanceScrollbackEpochForClear(session: *Session) void {
-    advanceScrollbackEpoch(session);
-    session.last_scrollback_clear_epoch = session.scrollback_epoch;
-}
-
-fn queueRetainedScrollbackClearDraw(attached_client: *AttachedClient, session: *Session) !void {
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    try attached_client.presentation.preparePrimaryForScrollback(renderer);
-    try renderer.clearScrollback();
-    try queueDrawFrame(attached_client, session, 0, bytes.items, null, null);
-}
-
-fn queueRepaintResponseFrame(
-    attached_client: *AttachedClient,
-    session: *const Session,
-    repaint_request_seq: u64,
-    scrollback_cursor: u64,
-    draw_bytes: []const u8,
-    app_title_present: ?bool,
-    attached_client_end_restore_bytes: ?[]const u8,
-) !void {
-    var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
-    encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
-    try queueAttachedClientTeFrame(attached_client, .{ .repaint_response = .{
-        .repaint_request_seq = repaint_request_seq,
-        .draw = .{
-            .scrollback_cursor = encoded_cursor[0..],
-            .viewport_offset = attached_client.presentation.protocolViewportOffset(),
-            .draw_bytes = draw_bytes,
-            .app_title_present = app_title_present,
-            .attached_client_end_restore_bytes = attached_client_end_restore_bytes,
-        },
-    } });
-}
-
-fn queueRepaintResponseDraw(
-    attached_client: *AttachedClient,
-    session: *Session,
-    repaint_request_seq: u64,
-    clear_for_replace: bool,
-    truncated_rows: u64,
-    rows: []const vt.RenderedRow,
-    screen: *const vt.RenderedScreen,
-    restore_screen: ?*const vt.RenderedScreen,
-    scrollback_cursor: u64,
-) !void {
-    if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
-
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    if (clear_for_replace) {
-        try attached_client.presentation.preparePrimaryForScrollback(renderer);
-        try renderer.clearForReplace();
-        attached_client.presentation.reset();
-    }
-    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, screen, false);
-    if (!clear_for_replace and shouldClearOuterVisibleForDisplayClear(screen)) {
-        try attached_client.presentation.clearOuterVisibleForScreen(renderer, screen);
-        effective_align_viewport = false;
-    }
-    if (truncated_rows > 0 or rows.len > 0) {
-        try attached_client.presentation.preparePrimaryForScrollback(renderer);
-    }
-    if (truncated_rows > 0) try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
-    try attached_client.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    try attached_client.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
-    if (effective_align_viewport) attached_client.origin = .{ .row = 0, .col = 0 };
-    updateMouseOriginAfterDraw(attached_client, screen);
-    try appendDrawCleanup(&bytes);
-    try wrapDrawInSynchronizedUpdate(&bytes);
-    var restore_bytes = std.ArrayList(u8).empty;
-    defer restore_bytes.deinit(app_allocator.allocator());
-    const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, screen, restore_screen, &restore_bytes);
-    try queueRepaintResponseFrame(attached_client, session, repaint_request_seq, scrollback_cursor, bytes.items, screen.title_present, restore);
-}
-
-fn queueRepaintSnapshot(
-    attached_client: *AttachedClient,
-    session: *Session,
-    request: RepaintRequest,
-    clear_for_replace: bool,
-) !usize {
-    const model = session.terminal_model orelse return 0;
-    var screen = try model.renderedScreen(app_allocator.allocator());
-    defer screen.deinit(app_allocator.allocator());
-
-    var primary_screen: ?vt.RenderedScreen = null;
-    defer if (primary_screen) |*primary| primary.deinit(app_allocator.allocator());
-    if (screen.active_screen == 1) {
-        primary_screen = try model.renderedPrimaryScreen(app_allocator.allocator());
-    }
-
-    if (request.scrollback_cursor) |requested_cursor| {
-        var scrollback = try model.scrollbackSnapshot(app_allocator.allocator());
-        defer scrollback.deinit(app_allocator.allocator());
-
-        const effective_cursor = if (requested_cursor.epoch == session.scrollback_epoch)
-            requested_cursor.per_epoch_cursor
-        else
-            0;
-        var rows_to_draw = scrollback.rows;
-        var truncated_rows_to_report: u64 = 0;
-        if (effective_cursor < scrollback.truncated_rows) {
-            truncated_rows_to_report = scrollback.truncated_rows - effective_cursor;
-        } else {
-            const skip = effective_cursor -| scrollback.truncated_rows;
-            if (skip >= @as(u64, @intCast(rows_to_draw.len))) {
-                rows_to_draw = rows_to_draw[rows_to_draw.len..];
-            } else {
-                rows_to_draw = rows_to_draw[@intCast(skip)..];
-            }
-        }
-
-        const clear_scrollback_for_stale_clear =
-            requested_cursor.epoch != 0 and requested_cursor.epoch < session.last_scrollback_clear_epoch;
-        try queueRepaintResponseDraw(
-            attached_client,
-            session,
-            request.repaint_request_seq,
-            clear_for_replace or clear_scrollback_for_stale_clear,
-            truncated_rows_to_report,
-            rows_to_draw,
-            &screen,
-            if (primary_screen) |*primary| primary else null,
-            scrollback.absolute_count,
-        );
-    } else {
-        const scrollback_cursor = try model.scrollbackCursor();
-        try queueRepaintResponseDraw(
-            attached_client,
-            session,
-            request.repaint_request_seq,
-            clear_for_replace,
-            0,
-            &.{},
-            &screen,
-            if (primary_screen) |*primary| primary else null,
-            scrollback_cursor,
-        );
-    }
-
-    return screen.rows.len;
-}
-
-fn sendSessionSnapshot(attached_client: *AttachedClient, session: *Session) !void {
-    if (session.terminal_model) |model| {
-        var scrollback = try model.scrollbackSnapshot(app_allocator.allocator());
-        defer scrollback.deinit(app_allocator.allocator());
-        var screen = try model.renderedScreen(app_allocator.allocator());
-        defer screen.deinit(app_allocator.allocator());
-
-        const rows_to_draw = scrollback.rows;
-        const truncated_rows_to_report = scrollback.truncated_rows;
-
-        if (truncated_rows_to_report > 0) {
-            try queueScrollbackTruncatedDraw(attached_client, session, truncated_rows_to_report, truncated_rows_to_report);
-        }
-        if (rows_to_draw.len > 0) try queueScrollbackRowsDraw(attached_client, session, rows_to_draw, scrollback.absolute_count);
-        var primary_screen: ?vt.RenderedScreen = null;
-        defer if (primary_screen) |*primary| primary.deinit(app_allocator.allocator());
-        if (screen.active_screen == 1) {
-            primary_screen = try model.renderedPrimaryScreen(app_allocator.allocator());
-        }
-        _ = try queueScreenDraw(
-            attached_client,
-            session,
-            &screen,
-            if (primary_screen) |*primary| primary else null,
-            true,
-            false,
-            scrollback.absolute_count,
-        );
-        model.markScrollbackReported();
-        model.markRendered(screen.rows.len);
-        return;
-    }
-}
-
-fn sendSessionRepaintSnapshot(attached_client: *AttachedClient, session: *Session, request: RepaintRequest) !void {
-    const model = session.terminal_model orelse return;
-    const screen_rows = try queueRepaintSnapshot(attached_client, session, request, false);
-    model.markScrollbackReported();
-    model.markRendered(screen_rows);
 }
 
 fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
@@ -2615,167 +978,9 @@ fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
     session.cols = cols;
     if (session.terminal_model) |model| {
         model.resize(rows, cols) catch {};
-        if (resized) advanceScrollbackEpoch(session);
+        if (resized) runtime_render.advanceScrollbackEpoch(session);
     }
-    _ = terminal.setPtySize(session.pty_fd, rows, cols);
-}
-
-fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
-    var open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, app_allocator.allocator(), payload);
-    defer open.deinit(app_allocator.allocator());
-    const message = open.create orelse return error.MissingSessionCreate;
-    const resize = open.resize orelse return error.MissingResize;
-    if (!session_registry.isValidSessionGuid(open.session_guid)) return error.InvalidSessionGuid;
-    var environment = SessionEnvironment{};
-    errdefer environment.deinit();
-    var query_default_colors = vt.DefaultColors{};
-    var request_tty_settings: ?tty_settings.Settings = null;
-    errdefer if (request_tty_settings) |*settings| settings.deinit(app_allocator.allocator());
-
-    for (message.environment.items) |entry| {
-        try applySessionEnvironmentEntry(&environment, entry);
-    }
-    if (message.query_default_colors) |colors| {
-        query_default_colors = try readDefaultColors(colors);
-    }
-    if (message.tty_settings) |settings| {
-        request_tty_settings = try readTtySettings(settings);
-    }
-    var source_argv: []const []const u8 = &.{};
-    var shell_command: ?[]const u8 = null;
-    if (message.command) |command| switch (command) {
-        .exec_command => |exec| source_argv = exec.argv.items,
-        .shell_command => |shell| shell_command = shell.command,
-    };
-
-    const command_argv = try app_allocator.allocator().alloc([]u8, source_argv.len);
-    var command_argv_initialized: usize = 0;
-    errdefer {
-        for (command_argv[0..command_argv_initialized]) |arg| app_allocator.allocator().free(arg);
-        app_allocator.allocator().free(command_argv);
-    }
-    for (source_argv, 0..) |arg, i| {
-        if (arg.len == 0) return error.InvalidCommandArgv;
-        command_argv[i] = try app_allocator.allocator().dupe(u8, arg);
-        command_argv_initialized += 1;
-    }
-
-    return .{
-        .resize = try resizePayloadFromMessage(resize),
-        .scrollback_row_count = message.scrollback_row_limit,
-        .environment = environment,
-        .query_default_colors = query_default_colors,
-        .session_guid = try app_allocator.allocator().dupe(u8, open.session_guid),
-        .command_argv = command_argv,
-        .shell_command = if (shell_command) |command|
-            try app_allocator.allocator().dupe(u8, command)
-        else
-            null,
-        .tty_settings = request_tty_settings,
-        .reap_ms = message.reap_ms,
-        .capture_tty_transcript = open.capture_tty_transcript,
-    };
-}
-
-fn readTtySettings(message: pb.TerminalEmulatorItem.SessionCreate.TtySettings) !tty_settings.Settings {
-    var modes = try app_allocator.allocator().alloc(tty_settings.Mode, message.tty_mode.items.len);
-    errdefer app_allocator.allocator().free(modes);
-    for (message.tty_mode.items, 0..) |mode, i| {
-        if (mode.opcode > std.math.maxInt(u8)) return error.InvalidTtySettings;
-        modes[i] = .{
-            .opcode = @intCast(mode.opcode),
-            .value = mode.value,
-        };
-    }
-
-    return .{
-        .term = if (message.term) |term|
-            try app_allocator.allocator().dupe(u8, term)
-        else
-            null,
-        .modes = modes,
-    };
-}
-
-fn applySessionEnvironmentEntry(environment: *SessionEnvironment, entry: pb.EnvironmentEntry) !void {
-    if (!isValidEnvironmentEntry(entry)) return error.InvalidEnvironmentEntry;
-    if (sessionEnvironmentHasEntry(environment, entry.name)) return;
-
-    const name = try app_allocator.allocator().dupeZ(u8, entry.name);
-    errdefer app_allocator.allocator().free(name);
-    const value = try app_allocator.allocator().dupeZ(u8, entry.value);
-    errdefer app_allocator.allocator().free(value);
-    try environment.entries.append(app_allocator.allocator(), .{
-        .name = name,
-        .value = value,
-    });
-
-    if (std.mem.eql(u8, entry.name, "SHELL") and entry.value.len > 0 and environment.shell == null) {
-        environment.shell = try app_allocator.allocator().dupe(u8, entry.value);
-    }
-}
-
-fn sessionEnvironmentHasEntry(environment: *const SessionEnvironment, name: []const u8) bool {
-    for (environment.entries.items) |entry| {
-        if (std.mem.eql(u8, entry.name, name)) return true;
-    }
-    return false;
-}
-
-fn isValidEnvironmentEntry(entry: pb.EnvironmentEntry) bool {
-    return isValidEnvironmentName(entry.name) and
-        std.mem.indexOfScalar(u8, entry.value, 0) == null;
-}
-
-fn isValidEnvironmentName(name: []const u8) bool {
-    return name.len > 0 and
-        std.mem.indexOfScalar(u8, name, '=') == null and
-        std.mem.indexOfScalar(u8, name, 0) == null;
-}
-
-fn readDefaultColors(colors: pb.TerminalEmulatorItem.SessionCreate.DefaultColors) !vt.DefaultColors {
-    return .{
-        .foreground_color = try readDefaultColorValue(colors.foreground_color),
-        .background_color = try readDefaultColorValue(colors.background_color),
-    };
-}
-
-fn resizePayloadFromMessage(message: pb.TerminalEmulatorItem.Resize) !ResizePayload {
-    if (message.terminal_rows > std.math.maxInt(u16) or
-        message.terminal_cols > std.math.maxInt(u16))
-    {
-        return error.IntOutOfRange;
-    }
-    if (message.viewport_offset) |offset| {
-        if (offset < -1) return error.InvalidViewportOffset;
-        if (offset > std.math.maxInt(u16)) return error.IntOutOfRange;
-    }
-    return .{
-        .rows = @intCast(message.terminal_rows),
-        .cols = @intCast(message.terminal_cols),
-        .viewport_offset = message.viewport_offset,
-        .repaint_request = if (message.repaint_request) |repaint| try repaintRequestFromMessage(repaint) else null,
-    };
-}
-
-fn attachRequestFromOpen(message: pb.TerminalEmulatorItem.Open) !AttachRequest {
-    const resize = message.resize orelse return error.MissingResize;
-    if (message.session_guid.len > 0 and !session_registry.isValidSessionGuid(message.session_guid)) return error.InvalidSessionGuid;
-    return .{
-        .resize = try resizePayloadFromMessage(resize),
-        .session_guid = try app_allocator.allocator().dupe(u8, message.session_guid),
-        .capture_tty_transcript = message.capture_tty_transcript,
-    };
-}
-
-fn repaintRequestFromMessage(message: pb.TerminalEmulatorItem.RepaintRequest) !RepaintRequest {
-    return .{
-        .repaint_request_seq = message.repaint_request_seq,
-        .scrollback_cursor = if (message.scrollback_cursor) |cursor|
-            try decodeScrollbackCursor(cursor)
-        else
-            null,
-    };
+    session.process.setPtySize(rows, cols);
 }
 
 fn createSession(
@@ -2802,15 +1007,14 @@ fn createSession(
     );
     errdefer terminal_model.destroy();
 
-    if (!session_registry.isValidSessionGuid(session_guid)) return error.InvalidSessionGuid;
+    if (!guid_ref.isValidSessionGuid(session_guid)) return error.InvalidSessionGuid;
     const session_guid_z = try app_allocator.allocator().dupeZ(u8, session_guid);
     defer app_allocator.allocator().free(session_guid_z);
 
-    const shell_path = session_environment.shell orelse pty_process.defaultShellPath();
-    const child = try pty_process.spawn(app_allocator.allocator(), .{
+    const process = try remote_process.Process.spawn(app_allocator.allocator(), .{
         .rows = rows,
         .cols = cols,
-        .shell = shell_path,
+        .shell = session_environment.shell,
         .command_argv = command_argv,
         .shell_command = shell_command,
         .environment = session_environment.entries.items,
@@ -2818,11 +1022,14 @@ fn createSession(
         .add_sessh_path_to_env = true,
         .tty_settings = settings,
     });
+    errdefer {
+        var close_process = process;
+        close_process.closePty();
+    }
 
     const session = &session_runtime.session;
     session.* = Session{
-        .pid = child.pid,
-        .pty_fd = child.master_fd,
+        .process = process,
         .terminal_model = terminal_model,
         .rows = rows,
         .cols = cols,
@@ -2834,117 +1041,6 @@ fn createSession(
     session.id_len = session_guid.len;
     session_runtime.started_session = true;
     return session;
-}
-
-const PreparedCommand = struct {
-    argv: [:null]?[*:0]const u8,
-    owned_args: [][:0]u8,
-
-    fn deinit(self: *PreparedCommand, allocator: std.mem.Allocator) void {
-        for (self.owned_args) |arg| allocator.free(arg);
-        allocator.free(self.owned_args);
-        allocator.free(self.argv);
-        self.* = undefined;
-    }
-};
-
-fn prepareCommandArgv(allocator: std.mem.Allocator, command_argv: []const []const u8) !PreparedCommand {
-    if (command_argv.len == 0) return error.InvalidCommandArgv;
-    return prepareCommandArgvInner(allocator, command_argv, false);
-}
-
-fn prepareCommandArgvInner(allocator: std.mem.Allocator, command_argv: []const []const u8, allow_empty_args: bool) !PreparedCommand {
-    var owned_args = try allocator.alloc([:0]u8, command_argv.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (owned_args[0..initialized]) |arg| allocator.free(arg);
-        allocator.free(owned_args);
-    }
-
-    var argv = try allocator.allocSentinel(?[*:0]const u8, command_argv.len, null);
-    errdefer allocator.free(argv);
-
-    for (command_argv, 0..) |arg, i| {
-        if (!allow_empty_args and arg.len == 0) return error.InvalidCommandArgv;
-        owned_args[i] = try allocator.dupeZ(u8, arg);
-        initialized += 1;
-        argv[i] = owned_args[i].ptr;
-    }
-    return .{ .argv = argv, .owned_args = owned_args };
-}
-
-fn prepareShellCommand(allocator: std.mem.Allocator, shell_path: []const u8, shell_command: []const u8) !PreparedCommand {
-    const shell_dash_c = [_][]const u8{ shell_path, "-c", shell_command };
-    return prepareCommandArgvInner(allocator, &shell_dash_c, true);
-}
-
-test "prepareShellCommand preserves an explicit empty command" {
-    var command = try prepareShellCommand(std.testing.allocator, "/bin/sh", "");
-    defer command.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("/bin/sh", std.mem.span(command.argv[0].?));
-    try std.testing.expectEqualStrings("-c", std.mem.span(command.argv[1].?));
-    try std.testing.expectEqualStrings("", std.mem.span(command.argv[2].?));
-}
-
-fn loginShellArg0(allocator: std.mem.Allocator, shell_path: []const u8) ![:0]u8 {
-    const base = std.fs.path.basename(shell_path);
-    const name = if (base.len == 0) "sh" else base;
-    var arg = try allocator.allocSentinel(u8, name.len + 1, 0);
-    arg[0] = '-';
-    @memcpy(arg[1 .. 1 + name.len], name);
-    return arg;
-}
-
-fn defaultShellPath() []const u8 {
-    const env_shell = if (c.getenv("SHELL")) |shell_z| std.mem.span(shell_z) else null;
-    const passwd_shell = if (c.getpwuid(c.getuid())) |passwd|
-        if (passwd.shell) |shell_z| std.mem.span(shell_z) else null
-    else
-        null;
-    return chooseDefaultShell(env_shell, passwd_shell);
-}
-
-fn chooseDefaultShell(env_shell: ?[]const u8, passwd_shell: ?[]const u8) []const u8 {
-    if (env_shell) |shell| {
-        if (shell.len > 0) return shell;
-    }
-    if (passwd_shell) |shell| {
-        if (shell.len > 0) return shell;
-    }
-    return "/bin/sh";
-}
-
-fn sesshPathForEnvironment(allocator: std.mem.Allocator) ![:0]u8 {
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
-    defer allocator.free(exe_path);
-    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.InvalidExecutablePath;
-    return allocator.dupeZ(u8, exe_dir);
-}
-
-fn pathWithSesshPathForEnvironment(allocator: std.mem.Allocator, sessh_path: []const u8) ![:0]u8 {
-    if (c.getenv("PATH")) |path_z| {
-        const path = std.mem.span(path_z);
-        if (path.len > 0) {
-            const combined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ path, sessh_path });
-            defer allocator.free(combined);
-            return allocator.dupeZ(u8, combined);
-        }
-    }
-    return allocator.dupeZ(u8, sessh_path);
-}
-
-test "login shell argv0 uses dash-prefixed basename" {
-    const allocator = std.testing.allocator;
-    const arg = try loginShellArg0(allocator, "/usr/local/bin/zsh");
-    defer allocator.free(arg);
-    try std.testing.expectEqualStrings("-zsh", arg);
-}
-
-test "default shell prefers process environment then passwd then sh" {
-    try std.testing.expectEqualStrings("/bin/zsh", chooseDefaultShell("/bin/zsh", "/bin/bash"));
-    try std.testing.expectEqualStrings("/bin/bash", chooseDefaultShell("", "/bin/bash"));
-    try std.testing.expectEqualStrings("/bin/sh", chooseDefaultShell(null, ""));
 }
 
 fn attachSession(
@@ -2974,11 +1070,11 @@ fn attachSession(
         attached_client.output.deinit(app_allocator.allocator());
         attached_client.* = AttachedClient{};
     }
-    try sendSessionAttachedForSession(session_runtime, attached_client, session);
+    try runtime_render.sendSessionAttached(attached_client, session);
     if (resize.repaint_request) |request| {
-        try sendSessionRepaintSnapshot(attached_client, session, request);
+        try runtime_render.sendSessionRepaintSnapshot(attached_client, session, request);
     } else {
-        try sendSessionSnapshot(attached_client, session);
+        try runtime_render.sendSessionSnapshot(attached_client, session);
     }
     refreshAttachedFlag(session_runtime);
     flushAttachedClientOutput(session_runtime);
@@ -3006,6 +1102,18 @@ fn shouldDeferSynchronizedOutput(session_runtime: *SessionRuntime, now_ms: i64) 
     return now_ms - session.synchronized_output_since_ms < synchronized_output_max_hold_ms;
 }
 
+fn handleSessionPtyEvents(session_runtime: *SessionRuntime, revents: i16) void {
+    if ((revents & posix.POLL.OUT) != 0) {
+        if (!flushSessionPtyInput(session_runtime)) {
+            endSessionFromPtyClose(session_runtime);
+            return;
+        }
+    }
+    if ((revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
+        drainSessionOutput(session_runtime);
+    }
+}
+
 fn drainSessionOutput(session_runtime: *SessionRuntime) void {
     const session = &session_runtime.session;
     if (!session.alive) return;
@@ -3014,7 +1122,7 @@ fn drainSessionOutput(session_runtime: *SessionRuntime) void {
         .session_runtime = session_runtime,
     };
     const result = pty_process.drainMasterNonBlocking(
-        session.pty_fd,
+        session.process.pty_fd,
         &context,
         feedSessionPtyBytes,
         .{
@@ -3057,8 +1165,81 @@ fn feedSessionPtyBytes(context: *SessionPtyDrainContext, bytes: []const u8) !voi
     const model = session.terminal_model orelse return;
     const input_responses = model.pendingInputResponses();
     if (input_responses.len == 0) return;
-    io.writeAll(session.pty_fd, input_responses) catch return error.SessionPtyResponseWriteFailed;
+    queueSessionPtyInput(session_runtime, input_responses) catch return error.SessionPtyResponseWriteFailed;
     model.clearPendingInputResponses();
+}
+
+fn sessionHasPendingPtyInput(session: *const Session) bool {
+    return session.pending_pty_input_offset < session.pending_pty_input.items.len;
+}
+
+fn sessionQueuedPtyInputBytes(session: *const Session) usize {
+    return session.pending_pty_input.items.len - session.pending_pty_input_offset;
+}
+
+fn compactSessionPtyInput(session: *Session) void {
+    if (session.pending_pty_input_offset == 0) return;
+    const remaining = session.pending_pty_input.items[session.pending_pty_input_offset..];
+    @memmove(session.pending_pty_input.items[0..remaining.len], remaining);
+    session.pending_pty_input.items.len = remaining.len;
+    session.pending_pty_input_offset = 0;
+}
+
+fn queueSessionPtyInput(session_runtime: *SessionRuntime, bytes: []const u8) !void {
+    if (bytes.len == 0) return;
+    const session = &session_runtime.session;
+    if (!session.alive or !session.process.hasOpenPty()) return error.SessionPtyClosed;
+    compactSessionPtyInput(session);
+    if (bytes.len > max_session_pty_input_queue_bytes or
+        session.pending_pty_input.items.len > max_session_pty_input_queue_bytes - bytes.len)
+    {
+        return error.SessionPtyInputQueueFull;
+    }
+    try session.pending_pty_input.appendSlice(app_allocator.allocator(), bytes);
+    if (!flushSessionPtyInput(session_runtime)) return error.SessionPtyInputWriteFailed;
+}
+
+fn flushSessionPtyInput(session_runtime: *SessionRuntime) bool {
+    const session = &session_runtime.session;
+    if (!session.alive or !session.process.hasOpenPty()) return true;
+    while (sessionHasPendingPtyInput(session)) {
+        const remaining = session.pending_pty_input.items[session.pending_pty_input_offset..];
+        switch (session.process.writeSomeInput(remaining) catch return false) {
+            .would_block => return true,
+            .wrote => |n| {
+                session.pending_pty_input_offset += n;
+                if (session.pending_pty_input_offset == session.pending_pty_input.items.len) {
+                    session.pending_pty_input.clearRetainingCapacity();
+                    session.pending_pty_input_offset = 0;
+                    return true;
+                }
+            },
+        }
+    }
+    return true;
+}
+
+test "session PTY input queue flushes through nonblocking writes" {
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
+    try core_fds.setNonBlocking(pipe[1]);
+
+    var session_runtime = SessionRuntime{
+        .session = .{
+            .process = .{ .pty_fd = pipe[1] },
+            .alive = true,
+        },
+    };
+    defer session_runtime.session.deinit();
+
+    try queueSessionPtyInput(&session_runtime, "abc");
+    try std.testing.expectEqual(@as(usize, 0), sessionQueuedPtyInputBytes(&session_runtime.session));
+
+    var out: [3]u8 = undefined;
+    const n = try posix.read(pipe[0], &out);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("abc", out[0..n]);
 }
 
 const RenderBarrierContext = struct {
@@ -3088,7 +1269,7 @@ fn flushSessionRenderBarrier(session_runtime: *SessionRuntime, barrier: vt.Rende
     const scrollback_cursor = try model.scrollbackCursor();
     const attached_client = &session_runtime.attached_client;
     if (!attached_client.active or attached_client.close_after_flush) return;
-    queueRenderBarrierDraw(attached_client, session, barrier, scrollback_cursor) catch {
+    runtime_render.queueRenderBarrierDraw(attached_client, session, barrier, scrollback_cursor) catch {
         disconnectAttachedClient(session_runtime);
         return;
     };
@@ -3153,7 +1334,7 @@ fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
                 .repaint_request => |repaint| handleRepaintFrame(session_runtime, repaint),
                 .session_hangup_request => handleSessionHangupRequest(session_runtime),
                 else => {
-                    queueAttachedClientError(session_runtime, attached_client, "PROTOCOL_ERROR", "unexpected attached terminal stream item", "") catch {
+                    attached_client.queueError("PROTOCOL_ERROR", "unexpected attached terminal stream item", "") catch {
                         disconnectAttachedClient(session_runtime);
                         return;
                     };
@@ -3168,7 +1349,7 @@ fn drainAttachedClientInput(session_runtime: *SessionRuntime) void {
             };
         },
         else => {
-            queueAttachedClientError(session_runtime, attached_client, "PROTOCOL_ERROR", "unexpected attached message", "") catch {
+            attached_client.queueError("PROTOCOL_ERROR", "unexpected attached message", "") catch {
                 disconnectAttachedClient(session_runtime);
                 return;
             };
@@ -3189,10 +1370,8 @@ fn requestSessionPtyHangup(session_runtime: *SessionRuntime) void {
     }
 
     disconnectAttachedClient(session_runtime);
-    if (session.pty_fd >= 0) {
-        _ = c.close(session.pty_fd);
-        session.pty_fd = -1;
-        session.pty_closed_for_hangup = true;
+    if (session.process.hasOpenPty()) {
+        session.process.closePtyForHangup();
         session.synchronized_output_since_ms = 0;
     }
     _ = reapPtyHangupSessionIfExited(session_runtime);
@@ -3200,28 +1379,50 @@ fn requestSessionPtyHangup(session_runtime: *SessionRuntime) void {
 
 fn reapPtyHangupSessionIfExited(session_runtime: *SessionRuntime) bool {
     const session = &session_runtime.session;
-    if (!session.alive or !session.pty_closed_for_hangup) return false;
-    if (session.pid <= 0) {
+    if (!session.alive or !session.process.pty_closed_for_hangup) return false;
+    if (session.process.pid <= 0) {
         endSessionFromPtyClose(session_runtime);
         return true;
     }
 
-    var status: c_int = 0;
-    const result = c.waitpid(session.pid, &status, wait_nohang);
-    if (result == session.pid) {
-        endSession(session_runtime, session.end_reason, exitInfoFromWaitStatus(status));
+    switch (remote_process.pollExit(session.process.pid, nowUnixMs())) {
+        .exited => |exit_info| {
+            endSession(session_runtime, session.end_reason, exit_info);
+            return true;
+        },
+        .interrupted, .running => return false,
+        .failed => {
+            endSessionFromPtyClose(session_runtime);
+            return true;
+        },
+    }
+}
+
+fn reapPtyEofSessionIfExited(session_runtime: *SessionRuntime, now_ms: i64, now_unix_ms: u64) bool {
+    const session = &session_runtime.session;
+    if (!session.alive or session.pty_eof_wait_started_ms == 0) return false;
+    if (session.process.pid <= 0) {
+        endSessionFromPtyClose(session_runtime);
         return true;
     }
-    if (result < 0) {
-        switch (posix.errno(result)) {
-            .INTR => return false,
-            else => {
+
+    switch (remote_process.pollExit(session.process.pid, now_unix_ms)) {
+        .exited => |exit_info| {
+            endSession(session_runtime, session.end_reason, exit_info);
+            return true;
+        },
+        .failed => {
+            endSessionFromPtyClose(session_runtime);
+            return true;
+        },
+        .interrupted, .running => {
+            if (now_ms - session.pty_eof_wait_started_ms >= pty_eof_exit_status_grace_ms) {
                 endSessionFromPtyClose(session_runtime);
                 return true;
-            },
-        }
+            }
+            return false;
+        },
     }
-    return false;
 }
 
 fn handleInputFrame(session_runtime: *SessionRuntime, input: pb.TerminalEmulatorItem.Input) void {
@@ -3230,7 +1431,7 @@ fn handleInputFrame(session_runtime: *SessionRuntime, input: pb.TerminalEmulator
     if (input.data.len == 0) return;
 
     if (input.input_seq != 0) {
-        queueAttachedClientTeFrame(attached_client, .{ .input_ack = .{
+        attached_client.queueTerminalEmulatorFrame(.{ .input_ack = .{
             .input_seq = input.input_seq,
         } }) catch {
             disconnectAttachedClient(session_runtime);
@@ -3245,446 +1446,36 @@ fn handleInputFrame(session_runtime: *SessionRuntime, input: pb.TerminalEmulator
 
     var translated = std.ArrayList(u8).empty;
     defer translated.deinit(app_allocator.allocator());
-    translateAttachedClientInput(attached_client, session, input.data, &translated) catch {
+    input_translation.translate(
+        app_allocator.allocator(),
+        &attached_client.input_pending,
+        .{
+            .origin = attached_client.origin,
+            .terminal_modes = attached_client.presentation.terminal_modes,
+            .terminal_modes_initialized = attached_client.presentation.terminal_modes_initialized,
+        },
+        .{
+            .rows = session.rows,
+            .cols = session.cols,
+        },
+        input.data,
+        &translated,
+    ) catch {
         disconnectAttachedClient(session_runtime);
         return;
     };
     if (translated.items.len == 0) return;
 
-    queueTtyTranscriptChunk(attached_client, .STREAM_INNER_IN, translated.items) catch {
+    runtime_render.queueTtyTranscriptChunk(attached_client, .STREAM_INNER_IN, translated.items) catch {
         disconnectAttachedClient(session_runtime);
         return;
     };
     flushAttachedClientOutput(session_runtime);
 
-    io.writeAll(session.pty_fd, translated.items) catch {
+    queueSessionPtyInput(session_runtime, translated.items) catch {
         disconnectAttachedClient(session_runtime);
         return;
     };
-}
-
-const SgrMouseReport = struct {
-    button: u32,
-    col: u32,
-    row: u32,
-    suffix: u8,
-    end: usize,
-};
-
-const SgrMouseParse = union(enum) {
-    not_mouse,
-    incomplete,
-    complete: SgrMouseReport,
-};
-
-const XtermModifiedKey = struct {
-    modifier: u32,
-    key_code: u32,
-    end: usize,
-};
-
-const XtermModifiedKeyParse = union(enum) {
-    not_modified,
-    incomplete,
-    complete: XtermModifiedKey,
-};
-
-fn translateAttachedClientInput(
-    attached_client: *AttachedClient,
-    session: *const Session,
-    bytes: []const u8,
-    out: *std.ArrayList(u8),
-) !void {
-    if (!attachedClientLocalInputParserActive(attached_client)) {
-        if (attached_client.input_pending_len > 0) {
-            try out.appendSlice(app_allocator.allocator(), attached_client.input_pending[0..attached_client.input_pending_len]);
-            attached_client.input_pending_len = 0;
-        }
-        try out.appendSlice(app_allocator.allocator(), bytes);
-        return;
-    }
-
-    var input = std.ArrayList(u8).empty;
-    defer input.deinit(app_allocator.allocator());
-    if (attached_client.input_pending_len > 0) {
-        try input.appendSlice(app_allocator.allocator(), attached_client.input_pending[0..attached_client.input_pending_len]);
-        attached_client.input_pending_len = 0;
-    }
-    try input.appendSlice(app_allocator.allocator(), bytes);
-
-    var index: usize = 0;
-    while (index < input.items.len) {
-        if (input.items[index] != 0x1b) {
-            try out.append(app_allocator.allocator(), input.items[index]);
-            index += 1;
-            continue;
-        }
-
-        if (attached_client.presentation.terminal_modes_initialized) {
-            switch (parseSgrMouseReport(input.items, index)) {
-                .complete => |report| {
-                    if (attachedClientSgrMouseActive(attached_client)) {
-                        try appendTranslatedSgrMouseReport(attached_client, session, report, out);
-                    }
-                    index = report.end;
-                    continue;
-                },
-                .incomplete => {
-                    if (attachedClientSgrMouseActive(attached_client)) {
-                        try savePendingAttachedClientInput(attached_client, input.items[index..], out);
-                        return;
-                    }
-                },
-                .not_mouse => {},
-            }
-        }
-
-        switch (parseFocusReport(input.items, index)) {
-            .complete => |report| {
-                if (attachedClientFocusReportingActive(attached_client)) {
-                    try out.appendSlice(app_allocator.allocator(), input.items[index..report.end]);
-                }
-                index = report.end;
-                continue;
-            },
-            .incomplete => {
-                if (attachedClientFocusReportingActive(attached_client)) {
-                    try savePendingAttachedClientInput(attached_client, input.items[index..], out);
-                    return;
-                }
-            },
-            .not_focus => {},
-        }
-
-        if (attachedClientKittyKeyboardActive(attached_client)) {
-            switch (parseXtermModifiedKey(input.items, index)) {
-                .complete => |key| {
-                    try appendKittyKeyboardKey(key, out);
-                    index = key.end;
-                    continue;
-                },
-                .incomplete => {
-                    try savePendingAttachedClientInput(attached_client, input.items[index..], out);
-                    return;
-                },
-                .not_modified => {},
-            }
-        }
-
-        try out.append(app_allocator.allocator(), input.items[index]);
-        index += 1;
-    }
-}
-
-fn savePendingAttachedClientInput(attached_client: *AttachedClient, pending: []const u8, out: *std.ArrayList(u8)) !void {
-    if (pending.len <= attached_client.input_pending.len) {
-        @memcpy(attached_client.input_pending[0..pending.len], pending);
-        attached_client.input_pending_len = pending.len;
-    } else {
-        try out.appendSlice(app_allocator.allocator(), pending);
-    }
-}
-
-fn attachedClientLocalInputParserActive(attached_client: *const AttachedClient) bool {
-    return attached_client.presentation.terminal_modes_initialized;
-}
-
-fn attachedClientSgrMouseActive(attached_client: *const AttachedClient) bool {
-    return attached_client.presentation.terminal_modes_initialized and
-        attached_client.presentation.terminal_modes.mouse_tracking != .disabled and
-        attached_client.presentation.terminal_modes.mouse_sgr;
-}
-
-fn attachedClientKittyKeyboardActive(attached_client: *const AttachedClient) bool {
-    return attached_client.presentation.terminal_modes_initialized and
-        attached_client.presentation.terminal_modes.kitty_keyboard_flags != 0;
-}
-
-fn attachedClientFocusReportingActive(attached_client: *const AttachedClient) bool {
-    return attached_client.presentation.terminal_modes_initialized and
-        (attached_client.presentation.terminal_modes.mode_flags & client_renderer.TerminalModes.focus_reporting) != 0;
-}
-
-const FocusReport = struct {
-    end: usize,
-};
-
-const FocusReportParse = union(enum) {
-    not_focus,
-    incomplete,
-    complete: FocusReport,
-};
-
-fn parseFocusReport(input: []const u8, start: usize) FocusReportParse {
-    const prefix = "\x1b[";
-    if (input.len - start < prefix.len) {
-        const available = input[start..];
-        if (available.len >= 1 and std.mem.eql(u8, available, prefix[0..available.len])) return .incomplete;
-        return .not_focus;
-    }
-    if (!std.mem.eql(u8, input[start .. start + prefix.len], prefix)) return .not_focus;
-    if (input.len - start == prefix.len) return .incomplete;
-    const final = input[start + prefix.len];
-    if (final != 'I' and final != 'O') return .not_focus;
-    return .{ .complete = .{ .end = start + prefix.len + 1 } };
-}
-
-fn parseXtermModifiedKey(input: []const u8, start: usize) XtermModifiedKeyParse {
-    const prefix = "\x1b[27;";
-    if (input.len - start < prefix.len) {
-        const available = input[start..];
-        if (available.len >= 3 and std.mem.eql(u8, available, prefix[0..available.len])) return .incomplete;
-        return .not_modified;
-    }
-    if (!std.mem.eql(u8, input[start .. start + prefix.len], prefix)) return .not_modified;
-
-    var index = start + prefix.len;
-    const modifier = parseCsiNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_modified;
-    if (index >= input.len) return .incomplete;
-    if (input[index] != ';') return .not_modified;
-    index += 1;
-
-    const key_code = parseCsiNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_modified;
-    if (index >= input.len) return .incomplete;
-    if (input[index] != '~') return .not_modified;
-
-    return .{ .complete = .{
-        .modifier = modifier,
-        .key_code = key_code,
-        .end = index + 1,
-    } };
-}
-
-fn parseCsiNumber(input: []const u8, index: *usize) ?u32 {
-    var value: u32 = 0;
-    var digits: usize = 0;
-    while (index.* < input.len) : (index.* += 1) {
-        const byte = input[index.*];
-        if (byte < '0' or byte > '9') break;
-        if (value > 1_000_000) return null;
-        value = value * 10 + @as(u32, byte - '0');
-        digits += 1;
-    }
-    if (digits == 0) return null;
-    return value;
-}
-
-fn appendKittyKeyboardKey(key: XtermModifiedKey, out: *std.ArrayList(u8)) !void {
-    var buf: [32]u8 = undefined;
-    const encoded = try std.fmt.bufPrint(&buf, "\x1b[{};{}u", .{ key.key_code, key.modifier });
-    try out.appendSlice(app_allocator.allocator(), encoded);
-}
-
-fn parseSgrMouseReport(input: []const u8, start: usize) SgrMouseParse {
-    if (input[start] != 0x1b) return .not_mouse;
-    if (start + 1 >= input.len) return .incomplete;
-    if (input[start + 1] != '[') return .not_mouse;
-    if (start + 2 >= input.len) return .incomplete;
-    if (input[start + 2] != '<') return .not_mouse;
-    var index = start + 3;
-
-    const button = parseSgrMouseNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_mouse;
-    if (index >= input.len) return .incomplete;
-    if (input[index] != ';') return .not_mouse;
-    index += 1;
-    const col = parseSgrMouseNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_mouse;
-    if (index >= input.len) return .incomplete;
-    if (input[index] != ';') return .not_mouse;
-    index += 1;
-    const row = parseSgrMouseNumber(input, &index) orelse return if (index >= input.len) .incomplete else .not_mouse;
-    if (index >= input.len) return .incomplete;
-    const suffix = input[index];
-    if (suffix != 'M' and suffix != 'm') return .not_mouse;
-
-    return .{ .complete = .{
-        .button = button,
-        .col = col,
-        .row = row,
-        .suffix = suffix,
-        .end = index + 1,
-    } };
-}
-
-fn parseSgrMouseNumber(input: []const u8, index: *usize) ?u32 {
-    var value: u32 = 0;
-    var digits: usize = 0;
-    while (index.* < input.len) : (index.* += 1) {
-        const byte = input[index.*];
-        if (byte < '0' or byte > '9') break;
-        if (value > 1_000_000) return null;
-        value = value * 10 + @as(u32, byte - '0');
-        digits += 1;
-    }
-    if (digits == 0) return null;
-    return value;
-}
-
-fn appendTranslatedSgrMouseReport(
-    attached_client: *const AttachedClient,
-    session: *const Session,
-    report: SgrMouseReport,
-    out: *std.ArrayList(u8),
-) !void {
-    const origin = attached_client.origin orelse return;
-    if (report.row <= origin.row or report.col <= origin.col) return;
-
-    const inner_row = report.row - origin.row;
-    const inner_col = report.col - origin.col;
-    if (inner_row == 0 or inner_col == 0) return;
-    if (inner_row > session.rows or inner_col > session.cols) return;
-
-    var buf: [64]u8 = undefined;
-    const encoded = try std.fmt.bufPrint(
-        &buf,
-        "\x1b[<{};{};{}{c}",
-        .{ report.button, inner_col, inner_row, report.suffix },
-    );
-    try out.appendSlice(app_allocator.allocator(), encoded);
-}
-
-test "SGR mouse input is translated from outer to inner coordinates" {
-    var attached_client = AttachedClient{
-        .origin = .{ .row = 4, .col = 0 },
-        .presentation = .{
-            .terminal_modes = .{ .mouse_tracking = .normal, .mouse_sgr = true },
-            .terminal_modes_initialized = true,
-        },
-    };
-    const session = Session{ .rows = 24, .cols = 80 };
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(app_allocator.allocator());
-
-    try translateAttachedClientInput(&attached_client, &session, "\x1b[<0;12;5M", &out);
-    try std.testing.expectEqualStrings("\x1b[<0;12;1M", out.items);
-
-    out.clearRetainingCapacity();
-    try translateAttachedClientInput(&attached_client, &session, "\x1b[<0;12;3M", &out);
-    try std.testing.expectEqual(@as(usize, 0), out.items.len);
-}
-
-test "SGR mouse input is dropped when mouse reporting is inactive" {
-    var attached_client = AttachedClient{
-        .origin = .{ .row = 4, .col = 0 },
-        .presentation = .{
-            .terminal_modes = .{},
-            .terminal_modes_initialized = true,
-        },
-    };
-    const session = Session{ .rows = 24, .cols = 80 };
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(app_allocator.allocator());
-
-    try translateAttachedClientInput(&attached_client, &session, "\x1b[<0;12;5M", &out);
-    try std.testing.expectEqual(@as(usize, 0), out.items.len);
-}
-
-test "focus reports are forwarded only while focus reporting is active" {
-    var attached_client = AttachedClient{
-        .presentation = .{
-            .terminal_modes = .{},
-            .terminal_modes_initialized = true,
-        },
-    };
-    const session = Session{ .rows = 24, .cols = 80 };
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(app_allocator.allocator());
-
-    try translateAttachedClientInput(&attached_client, &session, "\x1b[I", &out);
-    try std.testing.expectEqual(@as(usize, 0), out.items.len);
-
-    attached_client.presentation.terminal_modes.mode_flags = client_renderer.TerminalModes.focus_reporting;
-    try translateAttachedClientInput(&attached_client, &session, "\x1b[O", &out);
-    try std.testing.expectEqualStrings("\x1b[O", out.items);
-}
-
-test "xterm modified key input is translated to kitty when kitty keyboard is active" {
-    var attached_client = AttachedClient{
-        .presentation = .{
-            .terminal_modes = .{ .kitty_keyboard_flags = 7 },
-            .terminal_modes_initialized = true,
-        },
-    };
-    const session = Session{ .rows = 24, .cols = 80 };
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(app_allocator.allocator());
-
-    try translateAttachedClientInput(&attached_client, &session, "\x1b[27;2;13~", &out);
-    try std.testing.expectEqualStrings("\x1b[13;2u", out.items);
-}
-
-test "split xterm modified key input is held and translated after completion" {
-    var attached_client = AttachedClient{
-        .presentation = .{
-            .terminal_modes = .{ .kitty_keyboard_flags = 7 },
-            .terminal_modes_initialized = true,
-        },
-    };
-    const session = Session{ .rows = 24, .cols = 80 };
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(app_allocator.allocator());
-
-    try translateAttachedClientInput(&attached_client, &session, "\x1b[27;2;", &out);
-    try std.testing.expectEqual(@as(usize, 0), out.items.len);
-    try std.testing.expect(attached_client.input_pending_len > 0);
-
-    try translateAttachedClientInput(&attached_client, &session, "13~", &out);
-    try std.testing.expectEqualStrings("\x1b[13;2u", out.items);
-}
-
-test "xterm modified key input passes through when kitty keyboard is inactive" {
-    var attached_client = AttachedClient{};
-    const session = Session{ .rows = 24, .cols = 80 };
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(app_allocator.allocator());
-
-    try translateAttachedClientInput(&attached_client, &session, "\x1b[27;2;13~", &out);
-    try std.testing.expectEqualStrings("\x1b[27;2;13~", out.items);
-}
-
-test "non-xterm CSI input passes through when kitty keyboard is active" {
-    var attached_client = AttachedClient{
-        .presentation = .{
-            .terminal_modes = .{ .kitty_keyboard_flags = 7 },
-            .terminal_modes_initialized = true,
-        },
-    };
-    const session = Session{ .rows = 24, .cols = 80 };
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(app_allocator.allocator());
-
-    try translateAttachedClientInput(&attached_client, &session, "\x1b[A", &out);
-    try std.testing.expectEqualStrings("\x1b[A", out.items);
-}
-
-test "plain enter input is not synthesized as kitty when kitty keyboard is active" {
-    var attached_client = AttachedClient{
-        .presentation = .{
-            .terminal_modes = .{ .kitty_keyboard_flags = 7 },
-            .terminal_modes_initialized = true,
-        },
-    };
-    const session = Session{ .rows = 24, .cols = 80 };
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(app_allocator.allocator());
-
-    try translateAttachedClientInput(&attached_client, &session, "\r", &out);
-    try std.testing.expectEqualStrings("\r", out.items);
-}
-
-test "bare escape is not held by kitty keyboard translation" {
-    var attached_client = AttachedClient{
-        .presentation = .{
-            .terminal_modes = .{ .kitty_keyboard_flags = 7 },
-            .terminal_modes_initialized = true,
-        },
-    };
-    const session = Session{ .rows = 24, .cols = 80 };
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(app_allocator.allocator());
-
-    try translateAttachedClientInput(&attached_client, &session, "\x1b", &out);
-    try std.testing.expectEqualStrings("\x1b", out.items);
-    try std.testing.expectEqual(@as(usize, 0), attached_client.input_pending_len);
 }
 
 fn handleResizeFrame(session_runtime: *SessionRuntime, message: pb.TerminalEmulatorItem.Resize) void {
@@ -3721,7 +1512,7 @@ fn handleRepaintRequest(session_runtime: *SessionRuntime, request: RepaintReques
     const model = session.terminal_model orelse return;
     const clear_for_replace = request.scrollback_cursor != null and
         request.scrollback_cursor.?.per_epoch_cursor == 0;
-    const screen_rows = queueRepaintSnapshot(attached_client, session, request, clear_for_replace) catch {
+    const screen_rows = runtime_render.queueRepaintSnapshot(attached_client, session, request, clear_for_replace) catch {
         disconnectAttachedClient(session_runtime);
         return;
     };
@@ -3773,18 +1564,18 @@ fn broadcastSessionPatch(session_runtime: *SessionRuntime) void {
             return;
         };
     }
-    if (screen.retained_scrollback_clear_dirty) advanceScrollbackEpochForClear(session);
+    if (screen.retained_scrollback_clear_dirty) runtime_render.advanceScrollbackEpochForClear(session);
     var delivered = false;
     const attached_client = &session_runtime.attached_client;
     if (attached_client.active and !attached_client.close_after_flush) {
         if (screen.retained_scrollback_clear_dirty) {
-            queueRetainedScrollbackClearDraw(attached_client, session) catch {
+            runtime_render.queueRetainedScrollbackClearDraw(attached_client, session) catch {
                 disconnectAttachedClient(session_runtime);
                 return;
             };
         }
         if (scrollback.rows.len > 0) {
-            queueScrollbackRowsAndScreenDraw(
+            runtime_render.queueScrollbackRowsAndScreenDraw(
                 attached_client,
                 session,
                 scrollback.rows,
@@ -3797,7 +1588,7 @@ fn broadcastSessionPatch(session_runtime: *SessionRuntime) void {
                 return;
             };
         } else if (should_send_screen_draw) {
-            _ = queueScreenDraw(
+            _ = runtime_render.queueScreenDraw(
                 attached_client,
                 session,
                 &screen,
@@ -3836,7 +1627,7 @@ fn hasActiveAttachedClient(session_runtime: *const SessionRuntime) bool {
 fn sendSessionEndedToAttachedClient(session_runtime: *SessionRuntime, reason: u8, exit_info: ExitInfo) void {
     const attached_client = &session_runtime.attached_client;
     if (!attached_client.active) return;
-    sendSessionEnded(attached_client, reason, exit_info) catch {
+    runtime_render.sendSessionEnded(attached_client, reason, exit_info) catch {
         disconnectAttachedClient(session_runtime);
         return;
     };
@@ -3887,7 +1678,7 @@ fn endSession(session_runtime: *SessionRuntime, reason: u8, exit_info: ExitInfo)
     session.synchronized_output_since_ms = 0;
 
     sendSessionEndedToAttachedClient(session_runtime, reason, exit_info);
-    if (session.pty_fd >= 0) _ = c.close(session.pty_fd);
+    session.process.closePty();
     if (session.terminal_model) |model| {
         model.destroy();
         session.terminal_model = null;
@@ -3912,7 +1703,13 @@ fn closeSessionRuntime(session_runtime: *SessionRuntime) void {
 
 fn findSession(session_runtime: *SessionRuntime, id: []const u8) ?*Session {
     const session = &session_runtime.session;
-    if (session.alive and !session.pty_closed_for_hangup and std.mem.eql(u8, session.idSlice(), id)) return session;
+    if (session.alive and
+        !session.process.pty_closed_for_hangup and
+        session.pty_eof_wait_started_ms == 0 and
+        std.mem.eql(u8, session.idSlice(), id))
+    {
+        return session;
+    }
     return null;
 }
 
@@ -3924,35 +1721,19 @@ fn endSessionFromPtyEof(session_runtime: *SessionRuntime) void {
     // Only ask for child status after PTY EOF. Exit status is useful metadata,
     // but checking it before PTY EOF can race with final terminal output that
     // still needs to be drained from the master fd.
-    if (waitForSessionExitInfo(session_runtime.session.pid)) |exit_info| {
+    const now_unix_ms = nowUnixMs();
+    if (remote_process.waitForExitInfo(session_runtime.session.process.pid, now_unix_ms)) |exit_info| {
         endSession(session_runtime, session_runtime.session.end_reason, exit_info);
         return;
     }
-    endSessionFromPtyClose(session_runtime);
-}
 
-fn waitForSessionExitInfo(pid: c.pid_t) ?ExitInfo {
-    var status: c_int = 0;
-    const result = c.waitpid(pid, &status, wait_nohang);
-    if (result == pid) return exitInfoFromWaitStatus(status);
-    return null;
-}
-
-fn exitInfoFromWaitStatus(status: c_int) ExitInfo {
-    const raw: u32 = @bitCast(status);
-    const signal_number = raw & 0x7f;
-    if (signal_number == 0) {
-        return .{
-            .kind = 1,
-            .status = @intCast((raw >> 8) & 0xff),
-            .ended_at_unix_ms = nowUnixMs(),
-        };
-    }
-    return .{
-        .kind = 2,
-        .status = @intCast(signal_number),
-        .ended_at_unix_ms = nowUnixMs(),
-    };
+    const session = &session_runtime.session;
+    broadcastSessionPatch(session_runtime);
+    if (!session.alive) return;
+    session.clearPendingPlainOutput();
+    session.synchronized_output_since_ms = 0;
+    session.process.closePty();
+    session.pty_eof_wait_started_ms = sessionRuntimeMonotonicMs(session_runtime);
 }
 
 fn nowUnixMs() u64 {

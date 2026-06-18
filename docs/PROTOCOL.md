@@ -5,19 +5,71 @@ The handshake uses `HelloFrame`, whose `oneof` carries only `HelloRequest`,
 `HelloOk`, or `Error`. Once both sides have accepted the handshake, all
 subsequent frames use the versioned `Frame` envelope from `sessh.proto`.
 
-Proxy-control traffic uses normal local client connections to `sesshd`. The
-visible client sends `ProxyControlOpen` with the stream's `p-` GUID. The
-ProxyCommand process does not open a separate control channel; its normal
-`ProxyStreamItem.Open` carries the same GUID, and the daemon relays
-`ConnectionEvent` and `RetryNow` frames between the visible client connection and
-that proxy stream. When proxy functionality is handled directly by `sesshd`,
-the ProxyCommand process instead sends `ProxyFdPassOpen` with an SCM_RIGHTS fd
-for the raw OpenSSH byte stream, then exits after `sesshd` accepts the fd.
+Post-handshake frames are grouped by who is talking. `ClientDaemonItem` is the
+local API between a client-side process and its local `sesshd`. `ClientRemoteItem`
+is logical client-to-remote traffic: terminal-emulator and proxy items live
+inside it on local IPC, then inside `DaemonTunnelItem.MuxStreamFrame.Payload`
+when they cross the daemon-to-daemon tunnel.
+
+Proxy diagnostics and retry control also use the local `ClientDaemonItem` API.
+In process-isolated proxy mode, the long-lived `sessh-proxy` process owns the
+OpenSSH byte stream and can use `ProxyDiagnosticsOpen`/`RetryNow` routing for
+diagnostics. In direct daemon placement, `sessh-proxy` instead sends
+`ProxyFdPassOpen` with an SCM_RIGHTS fd for the raw OpenSSH byte stream, waits
+for `ProxyFdPassAccepted`, and exits. The raw OpenSSH byte stream is never the
+framed daemon IPC socket.
 
 The `HelloFrame`/`Frame` separation is designed to allow us maximum protocol
 flexibility in the future. We could migrate off of protobuf for everything past
 `HelloOk` while still emitting clean `Error` responses for incompatible
 versions.
+
+# Attached bytes and file descriptors
+
+Most frames are just the protobuf envelope. Some frames also carry bytes
+immediately after the protobuf envelope, described by `Frame.Attached`.
+
+`RAW` attached bytes are uninterpreted stream data. The daemon can forward those
+bytes without pretending they are protobuf fields.
+
+`SCM_RIGHTS` attached bytes are different: the byte is only a marker that lets a
+Unix-domain-socket `recvmsg` collect the file descriptor attached at that byte
+position. The marker byte is discarded. This is used for `ProxyFdPassOpen`, where
+`sessh-proxy` asks `sesshd` to take ownership of a raw OpenSSH byte stream while
+the framed daemon IPC connection remains framed.
+
+# Daemon tunnel streams
+
+`DaemonTunnelItem.MuxStreamFrame` is the only daemon-to-daemon multiplexing
+envelope. It names the logical stream, then carries one of:
+
+- `Open` / `OpenOk` to start or resume a stream without imposing an extra
+  round trip. They carry the peer's durable receive offset.
+- `Payload` to carry a typed terminal-emulator or proxy item.
+- `Ack` to report receive progress.
+- `Eof` to close one outbound direction gracefully.
+- `Reset` to abort a stream abruptly, in the same spirit as TCP RST or
+  HTTP/2 `RST_STREAM`.
+
+Mux fairness/backpressure is intentionally not expressed as protocol credit yet.
+If one stream fills its local buffer, the daemon should stop reading for that
+stream without freezing unrelated terminal or proxy streams on the same TCP
+connection.
+
+# Connection and cleanup events
+
+`ConnectionEvent` is semantic connection state, not remote process output. It is
+used for ssh connection progress, bootstrapping, remote-daemon connection state,
+transport stderr, disconnected state, and unresponsive state. Visible clients
+decide how to render those events based on diagnostics policy.
+
+Remote process cleanup is daemon-tunnel traffic, not a public session registry.
+When a remote terminal or proxy process becomes a cleanup target, remote `sesshd`
+sends `RemoteProcessStarted`. The local daemon durably records the process
+identity and replies with `RemoteProcessRecorded`. If the local owner later
+dies, the local daemon can ask the remote daemon to clean up that exact
+pid/start-time/socket-path identity with `RemoteProcessCleanupRequest`; the
+remote answers `Cleaned` or `Missing`.
 
 # Client capabilities
 
@@ -46,32 +98,31 @@ missing scrollback and generates accurate repaint instructions for the client.
 
 In the event of a network disconnection, remote `sesshd` will continue
 terminal emulation. The virtual screen may update and/or generate additional
-lines of scrollback. When the client reconnects, it sends a `TeResize` message
-with an embedded `TeRepaintRequest` message containing enough information for the
-remote terminal process to decide:
+lines of scrollback. When the client reconnects, it sends a
+`TerminalEmulatorItem.Resize` message with an embedded `RepaintRequest`
+containing enough information for the remote terminal process to decide:
 1. Are the client's scrollback contents stale? (i.e. are they from before
    scrollback was cleared?)
 2. Which retained scrollback rows, if any, should be sent to the client?
 
-`TeRepaintResponse` includes an embedded `TeDraw` message with instructions to add
+`RepaintResponse` includes an embedded `Draw` message with instructions to add
 missing scrollback rows, possibly clearing older scrollback if stale. These
-instructions also clear and re-render the screen, and restore state (e.g.
-cursor position/visibility/style, terminal modes such as mouse reporting or
-bracketed paste, etc).
+instructions also clear and re-render the screen, and restore state (e.g. cursor
+position/visibility/style, terminal modes such as mouse reporting or bracketed
+paste, etc).
 
 ## Smart resize
 
 When the terminal window is resized our client receives a SIGWINCH which we
-handle by sending a `TeResize` message to the remote, the same message that gets
-embedded within `TeSessionAttach`. Resizing is treated as a logical reconnection.
+handle by sending a `TerminalEmulatorItem.Resize` message to the remote.
+Resizing is treated as a logical reconnection.
 
-The `TeResize` contains a `TeRepaintRequest` and we drop any `TeDraw` packets until
-the matching `TeRepaintResponse` is received. It doesn't make sense to try to apply
-rendering operations that were generated for a different sized window.
+The `Resize` contains a `RepaintRequest` and we drop any `Draw` packets until
+the matching `RepaintResponse` is received. It doesn't make sense to try to
+apply rendering operations that were generated for a different sized window.
 
-`TeResize` carries the client's current viewport offset when known. The remote
-the remote side answers an unknown offset by aligning the viewport in the repaint
-response.
+`Resize` carries the client's current viewport offset when known. The remote side
+answers an unknown offset by aligning the viewport in the repaint response.
 
 ## Client-side overlay rendering
 
@@ -79,28 +130,29 @@ We allow for the possibility of the client to render overlays independently of
 the remote, but the client doesn't have the ability to remove the overlays by
 itself. It can redraw a different overlay, but the only way it can remove an
 overlay is by asking the remote to repaint. After requesting repaint, the client
-ignores subsequent `TeDraw` packets up until the matching `TeRepaintResponse` so that
+ignores subsequent `Draw` packets up until the matching `RepaintResponse` so that
 the overlay doesn't end up in the outer terminal's scrollback.
 
 The client uses overlays to notify the user when the connection has died or
 become unresponsive.
 
-## TeInput acknowledgements
+## Input Acknowledgements
 
-Each `TeInput` frame carries a client-assigned sequence number. Remote `sesshd`
-answers with `TeInputAck` after receiving a nonzero input sequence. The client uses
-the highest acknowledged sequence to know whether input was still pending when
-a connection died, and to detect unresponsive connections after user input.
+Each `TerminalEmulatorItem.Input` frame carries a client-assigned sequence
+number. Remote `sesshd` answers with `InputAck` after receiving a nonzero input
+sequence. The client uses the highest acknowledged sequence to know whether
+input was still pending when a connection died, and to detect unresponsive
+connections after user input.
 
 ## Client-side state cleanup
 
 Both of the previous capabilities rely on the remote generating well-formed
-packets of rendering instructions. The `TeDraw` message contains rendering
+packets of rendering instructions. The `Draw` message contains rendering
 instructions, but the remote guarantees that they avoid leaking incidental
 rendering state (e.g. bold/inverse/colors, OSC 8 hyperlinks, cursor movement,
 etc): If any earlier instructions modify that state, then there must be later
-instructions within that same `TeDraw` message to restore that state.
+instructions within that same `Draw` message to restore that state.
 
-A `TeDraw` may intentionally leave terminal state set when that state is part of
+A `Draw` may intentionally leave terminal state set when that state is part of
 the modeled session (e.g. alternate screen), but it contains a separate field
 with instructions to restore that state when `sessh` exits.

@@ -44,6 +44,10 @@ def artifact_path(env, artifact_hash):
     return Path(env["XDG_CACHE_HOME"]) / "sessh" / "bin" / "test-set" / artifact_hash / "sessh"
 
 
+def artifact_role_path(env, artifact_hash, role):
+    return artifact_path(env, artifact_hash).with_name(role)
+
+
 def write_fake_uname(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -69,33 +73,35 @@ def test_cache_hit_execs_without_platform_or_tool_probe(tmp):
     fake_bin = tmp / "fake-bin"
     fake_bin.mkdir()
     env["PATH"] = str(fake_bin)
-    artifact = b"#!/bin/sh\nprintf 'CACHED %s\\n' \"$*\"\n"
+    artifact = b"#!/bin/sh\nname=${0##*/}\nprintf 'CACHED argv0=%s argc=%s\\n' \"$name\" \"$#\"\n"
     artifact_hash = sha256(artifact)
     write_executable(artifact_path(env, artifact_hash), artifact)
 
-    result = run_bootstrapper(f"EXEC test-set {artifact_hash} -- :broker:\n", env)
+    result = run_bootstrapper(f"EXEC test-set {artifact_hash} -- sessh-broker\n", env)
 
     assert_ok(result)
-    if result.stdout != "OK\nCACHED :broker:\n":
+    if result.stdout != "OK\nCACHED argv0=sessh-broker argc=0\n":
         raise AssertionError(result.stdout)
+    if not artifact_role_path(env, artifact_hash, "sessh-broker").is_symlink():
+        raise AssertionError("bootstrapper did not create sessh-broker role symlink")
 
 
-def test_cache_hit_execs_explicit_broker_command(tmp):
+def test_cache_hit_execs_explicit_broker_role(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-bin"
     fake_bin.mkdir()
     env["PATH"] = str(fake_bin)
-    artifact = b"#!/bin/sh\nprintf 'CACHED %s\\n' \"$*\"\n"
+    artifact = b"#!/bin/sh\nname=${0##*/}\nprintf 'CACHED argv0=%s argc=%s\\n' \"$name\" \"$#\"\n"
     artifact_hash = sha256(artifact)
     write_executable(artifact_path(env, artifact_hash), artifact)
 
     result = run_bootstrapper(
-        f"EXEC test-set {artifact_hash} -- :broker:\n",
+        f"EXEC test-set {artifact_hash} -- sessh-broker\n",
         env,
     )
 
     assert_ok(result)
-    expected = "OK\nCACHED :broker:\n"
+    expected = "OK\nCACHED argv0=sessh-broker argc=0\n"
     if result.stdout != expected:
         raise AssertionError(result.stdout)
 
@@ -137,12 +143,12 @@ def test_cache_hit_decodes_encoded_exec_args(tmp):
 
 def test_upload_installs_and_execs(tmp):
     env = isolated_env(tmp)
-    artifact = b"#!/bin/sh\nprintf 'UPLOADED %s\\n' \"$*\"\n"
+    artifact = b"#!/bin/sh\nname=${0##*/}\nprintf 'UPLOADED argv0=%s argc=%s\\n' \"$name\" \"$#\"\n"
     artifact_hash = sha256(artifact)
     encoded = base64.b64encode(artifact).decode()
 
     result = run_bootstrapper(
-        f"EXEC test-set {artifact_hash} -- :broker:\n"
+        f"EXEC test-set {artifact_hash} -- sessh-broker\n"
         f"UPLOAD sessh-test-linux-x86_64 {artifact_hash} {encoded}\n",
         env,
     )
@@ -155,7 +161,7 @@ def test_upload_installs_and_execs(tmp):
         raise AssertionError(result.stdout)
     if lines[1] != "OK":
         raise AssertionError(result.stdout)
-    if lines[2] != "UPLOADED :broker:":
+    if lines[2] != "UPLOADED argv0=sessh-broker argc=0":
         raise AssertionError(result.stdout)
 
     installed = artifact_path(env, artifact_hash)
@@ -163,6 +169,8 @@ def test_upload_installs_and_execs(tmp):
         raise AssertionError("uploaded artifact was not installed")
     if not os.access(installed, os.X_OK):
         raise AssertionError("uploaded artifact is not executable")
+    if not artifact_role_path(env, artifact_hash, "sessh-broker").is_symlink():
+        raise AssertionError("uploaded artifact role symlink was not created")
 
 
 def test_invalid_artifact_set_is_rejected(tmp):
@@ -196,7 +204,7 @@ def test_cache_hit_trusts_cached_executable(tmp):
     expected_hash = sha256(expected)
     write_executable(artifact_path(env, expected_hash), wrong)
 
-    result = run_bootstrapper(f"EXEC test-set {expected_hash} -- :broker:\n", env)
+    result = run_bootstrapper(f"EXEC test-set {expected_hash} -- sessh-broker\n", env)
 
     assert_ok(result)
     if result.stdout != "OK\nWRONG\n":
@@ -210,7 +218,7 @@ def test_cache_miss_reports_platform_before_tool_probe(tmp):
     env["PATH"] = str(fake_bin)
 
     result = run_bootstrapper(
-        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- :broker:\n",
+        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-broker\n",
         env,
         extra_env={
             "SESSH_FAKE_UNAME_S": "Linux",
@@ -238,7 +246,7 @@ def test_platform_strings_are_canonicalized(tmp):
     )
     for os_name, arch, expected in cases:
         result = run_bootstrapper(
-            "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- :broker:\n",
+            "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-broker\n",
             env,
             extra_env={
                 "SESSH_FAKE_UNAME_S": os_name,
@@ -257,7 +265,7 @@ def test_unsupported_platform_is_structured_error(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
 
     result = run_bootstrapper(
-        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- :broker:\n",
+        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-broker\n",
         env,
         extra_env={
             "SESSH_FAKE_UNAME_S": "Plan9",
@@ -282,7 +290,7 @@ def run_test(name, fn):
 def main():
     tests = (
         ("cache hit execs without platform or tool probe", test_cache_hit_execs_without_platform_or_tool_probe),
-        ("cache hit execs explicit broker command", test_cache_hit_execs_explicit_broker_command),
+        ("cache hit execs explicit broker role", test_cache_hit_execs_explicit_broker_role),
         ("cache hit decodes encoded exec args", test_cache_hit_decodes_encoded_exec_args),
         ("upload installs and execs", test_upload_installs_and_execs),
         ("invalid artifact set is rejected", test_invalid_artifact_set_is_rejected),

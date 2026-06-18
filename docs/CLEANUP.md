@@ -40,7 +40,7 @@ daemon replies; if the transport dies first, the next periodic scan retries.
 If the receiving remote daemon owns the socket path specified in the request,
 it will hang up the process directly. Otherwise it falls back to sending
 `SIGHUP` directly after verifying the remote pid and start time. This is
-intentionally a last-resort compatibility path; normally the daemon that owns
+intentionally a last-resort cross-version fallback; normally the daemon that owns
 the process can perform a more ssh-shaped cleanup.
 
 Once the process is signaled, or if it no longer exists,

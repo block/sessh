@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const client_log = @import("../core/client_log.zig");
-const session_registry = @import("../runtime/session_registry.zig");
+const config = @import("../core/config.zig");
 
 const default_ipqos_option_prefix = "-oIPQoS=";
 const ssh_config_query_max_output_bytes = 256 * 1024;
@@ -58,7 +58,7 @@ pub fn resolveSshConfig(allocator: std.mem.Allocator, ssh_options: []const []con
 }
 
 fn fallbackResolvedSshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) !ResolvedSshConfig {
-    const explicit_port = explicitSshPort(ssh_options) orelse session_registry.default_ssh_port;
+    const explicit_port = explicitSshPort(ssh_options) orelse config.default_ssh_port;
     return .{
         .user = try fallbackSshUser(allocator),
         .hostname = try allocator.dupe(u8, host),
@@ -146,7 +146,7 @@ pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_opti
     if (user == null) user = try fallbackSshUser(allocator);
     if (hostname == null) hostname = try allocator.dupe(u8, fallback_host);
     if (port == null) {
-        const explicit_port = explicitSshPort(ssh_options) orelse session_registry.default_ssh_port;
+        const explicit_port = explicitSshPort(ssh_options) orelse config.default_ssh_port;
         port = try allocator.dupe(u8, explicit_port);
     }
     return .{
