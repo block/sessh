@@ -12,6 +12,17 @@ const max_artifact_bytes = 64 * 1024 * 1024;
 const max_artifact_manifest_bytes = 16 * 1024;
 const artifact_manifest_filename = "artifacts.manifest";
 
+pub const ReconnectIoContext = struct {
+    reconnect_ui: ?*client_ui.ReconnectUi = null,
+    poll_reconnect_input: bool = false,
+
+    pub fn shouldCancel(self: ReconnectIoContext) !bool {
+        const reconnect_ui = self.reconnect_ui orelse return false;
+        if (!self.poll_reconnect_input) return reconnect_ui.isCancelled();
+        return reconnect_ui.pollClientHangup(0);
+    }
+};
+
 pub const ArtifactSet = struct {
     allocator: std.mem.Allocator,
     artifact_set_id: []u8,
@@ -29,63 +40,60 @@ pub const ArtifactSet = struct {
         fd: c.fd_t,
         entrypoint: remote_shell.Entrypoint,
         entrypoint_args: []const []const u8,
-        reconnect_ui: ?*client_ui.ReconnectUi,
-        poll_reconnect_input: bool,
+        reconnect_io: ReconnectIoContext,
     ) !void {
-        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_ui, poll_reconnect_input);
-        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_io);
+        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_io);
         for (self.entries) |entry| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_ui, poll_reconnect_input);
+            try writeAllMaybeCancellable(fd, " ", reconnect_io);
+            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_io);
         }
-        try writeAllMaybeCancellable(fd, " --", reconnect_ui, poll_reconnect_input);
-        try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-        try writeAllMaybeCancellable(fd, entrypoint.arg(), reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, " --", reconnect_io);
+        try writeAllMaybeCancellable(fd, " ", reconnect_io);
+        try writeAllMaybeCancellable(fd, entrypoint.arg(), reconnect_io);
         for (entrypoint_args) |arg| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-            try self.writeExecArg(fd, arg, reconnect_ui, poll_reconnect_input);
+            try writeAllMaybeCancellable(fd, " ", reconnect_io);
+            try self.writeExecArg(fd, arg, reconnect_io);
         }
-        try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, "\n", reconnect_io);
     }
 
     pub fn sendExecArgs(
         self: *const ArtifactSet,
         fd: c.fd_t,
         exec_args: []const []const u8,
-        reconnect_ui: ?*client_ui.ReconnectUi,
-        poll_reconnect_input: bool,
+        reconnect_io: ReconnectIoContext,
     ) !void {
-        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_ui, poll_reconnect_input);
-        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_io);
+        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_io);
         for (self.entries) |entry| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_ui, poll_reconnect_input);
+            try writeAllMaybeCancellable(fd, " ", reconnect_io);
+            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_io);
         }
-        try writeAllMaybeCancellable(fd, " --", reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, " --", reconnect_io);
         for (exec_args) |arg| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-            try self.writeExecArg(fd, arg, reconnect_ui, poll_reconnect_input);
+            try writeAllMaybeCancellable(fd, " ", reconnect_io);
+            try self.writeExecArg(fd, arg, reconnect_io);
         }
-        try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, "\n", reconnect_io);
     }
 
     fn writeExecArg(
         self: *const ArtifactSet,
         fd: c.fd_t,
         arg: []const u8,
-        reconnect_ui: ?*client_ui.ReconnectUi,
-        poll_reconnect_input: bool,
+        reconnect_io: ReconnectIoContext,
     ) !void {
         if (!remote_shell.needsEncodedExecArg(arg)) {
-            try writeAllMaybeCancellable(fd, arg, reconnect_ui, poll_reconnect_input);
+            try writeAllMaybeCancellable(fd, arg, reconnect_io);
             return;
         }
 
         const encoded = try self.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(arg.len));
         defer self.allocator.free(encoded);
         _ = std.base64.standard.Encoder.encode(encoded, arg);
-        try writeAllMaybeCancellable(fd, remote_shell.bootstrap_exec_encoded_arg_prefix, reconnect_ui, poll_reconnect_input);
-        try writeAllMaybeCancellable(fd, encoded, reconnect_ui, poll_reconnect_input);
+        try writeAllMaybeCancellable(fd, remote_shell.bootstrap_exec_encoded_arg_prefix, reconnect_io);
+        try writeAllMaybeCancellable(fd, encoded, reconnect_io);
     }
 
     pub fn find(self: *const ArtifactSet, platform: Platform) ?*const ArtifactEntry {
@@ -368,8 +376,7 @@ pub fn sendUpload(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     artifact: *const ArtifactEntry,
-    reconnect_ui: ?*client_ui.ReconnectUi,
-    poll_reconnect_input: bool,
+    reconnect_io: ReconnectIoContext,
 ) !void {
     const file = try std.fs.openFileAbsolute(artifact.path, .{});
     defer file.close();
@@ -389,13 +396,13 @@ pub fn sendUpload(
     defer allocator.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, bytes);
 
-    try writeAllMaybeCancellable(fd, "UPLOAD ", reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, artifact.id, reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, &artifact.hash_hex, reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, " ", reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, encoded, reconnect_ui, poll_reconnect_input);
-    try writeAllMaybeCancellable(fd, "\n", reconnect_ui, poll_reconnect_input);
+    try writeAllMaybeCancellable(fd, "UPLOAD ", reconnect_io);
+    try writeAllMaybeCancellable(fd, artifact.id, reconnect_io);
+    try writeAllMaybeCancellable(fd, " ", reconnect_io);
+    try writeAllMaybeCancellable(fd, &artifact.hash_hex, reconnect_io);
+    try writeAllMaybeCancellable(fd, " ", reconnect_io);
+    try writeAllMaybeCancellable(fd, encoded, reconnect_io);
+    try writeAllMaybeCancellable(fd, "\n", reconnect_io);
 }
 
 pub fn parseMissingPlatform(line: []const u8) !Platform {
@@ -456,10 +463,9 @@ fn isLowerSha256Hex(value: []const u8) bool {
 fn writeAllMaybeCancellable(
     fd: c.fd_t,
     bytes: []const u8,
-    reconnect_ui: ?*client_ui.ReconnectUi,
-    poll_reconnect_input: bool,
+    reconnect_io: ReconnectIoContext,
 ) !void {
-    if (reconnect_ui == null) {
+    if (reconnect_io.reconnect_ui == null) {
         try io.writeAll(fd, bytes);
         return;
     }
@@ -474,7 +480,7 @@ fn writeAllMaybeCancellable(
             .revents = 0,
         }};
         const ready = try posix.poll(&pollfds, 50);
-        if (try reconnectShouldCancel(reconnect_ui.?, poll_reconnect_input)) return error.ReconnectCancelled;
+        if (try reconnect_io.shouldCancel()) return error.ReconnectCancelled;
         if (ready == 0) continue;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
         if ((pollfds[0].revents & posix.POLL.OUT) == 0) continue;
@@ -489,8 +495,7 @@ fn writeAllMaybeCancellable(
 pub fn readBootstrapLine(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    reconnect_ui: ?*client_ui.ReconnectUi,
-    poll_reconnect_input: bool,
+    reconnect_io: ReconnectIoContext,
 ) ![]u8 {
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
@@ -503,10 +508,8 @@ pub fn readBootstrapLine(
             .events = posix.POLL.IN,
             .revents = 0,
         }};
-        const ready = try posix.poll(&pollfds, if (reconnect_ui == null) -1 else 50);
-        if (reconnect_ui) |ui| {
-            if (try reconnectShouldCancel(ui, poll_reconnect_input)) return error.ReconnectCancelled;
-        }
+        const ready = try posix.poll(&pollfds, if (reconnect_io.reconnect_ui == null) -1 else 50);
+        if (try reconnect_io.shouldCancel()) return error.ReconnectCancelled;
         if (ready == 0) continue;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
             (pollfds[0].revents & posix.POLL.IN) == 0)
@@ -529,11 +532,6 @@ pub fn readBootstrapLine(
     return error.BootstrapLineTooLong;
 }
 
-fn reconnectShouldCancel(reconnect_ui: *client_ui.ReconnectUi, poll_reconnect_input: bool) !bool {
-    if (!poll_reconnect_input) return reconnect_ui.isCancelled();
-    return reconnect_ui.pollClientHangup(0);
-}
-
 test "readBootstrapLine returns the first line without the newline" {
     var fds: [2]c.fd_t = undefined;
     if (c.pipe(&fds) != 0) return error.PipeFailed;
@@ -541,7 +539,7 @@ test "readBootstrapLine returns the first line without the newline" {
     defer _ = c.close(fds[1]);
 
     try io.writeAll(fds[1], "MISSING linux x86_64\nextra\n");
-    const line = try readBootstrapLine(std.testing.allocator, fds[0], null, false);
+    const line = try readBootstrapLine(std.testing.allocator, fds[0], .{});
     defer std.testing.allocator.free(line);
 
     try std.testing.expectEqualStrings("MISSING linux x86_64", line);

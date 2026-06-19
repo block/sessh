@@ -2,6 +2,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_fds = @import("../core/fds.zig");
 const terminal = @import("terminal.zig");
 const tty_settings = @import("settings.zig");
 
@@ -148,16 +149,8 @@ pub fn readMaster(fd: c.fd_t, buf: []u8) !MasterRead {
 }
 
 pub fn readMasterNonBlocking(fd: c.fd_t, buf: []u8) !MasterRead {
-    const original_flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (original_flags < 0) return error.PtyMasterReadFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    const changed_flags = (original_flags & nonblocking_flag) == 0;
-    if (changed_flags and c.fcntl(fd, c.F.SETFL, original_flags | nonblocking_flag) < 0) {
-        return error.PtyMasterReadFailed;
-    }
-    defer {
-        if (changed_flags) _ = c.fcntl(fd, c.F.SETFL, original_flags);
-    }
+    var flags_guard = core_fds.StatusFlagsGuard.setNonBlocking(fd) catch return error.PtyMasterReadFailed;
+    defer flags_guard.restore();
     return readMasterInner(fd, buf);
 }
 

@@ -12,12 +12,12 @@ const frame_write_queue = @import("../transport/frame_write_queue.zig");
 const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
+const worker_endpoint = @import("../daemon/worker_endpoint.zig");
 const terminal_worker = @import("terminal_worker.zig");
 const terminal_worker_process = @import("terminal_worker_process.zig");
 const guid_ref = @import("../core/guid.zig");
 
 const pb = protocol.pb;
-const hpb = protocol.hpb;
 
 pub fn registerFrameWithTerminalRemoteFromDaemon(
     allocator: std.mem.Allocator,
@@ -156,12 +156,7 @@ pub fn registerDebugFrameWithTerminalRemoteFromDaemon(
 
 pub const TerminalMuxStream = struct {
     stream_id: u64,
-    process_fd: c.fd_t = -1,
-    process_watch_id: ?dispatcher.FdWatchId = null,
-    reader: protocol.FrameReader = undefined,
-    reader_initialized: bool = false,
-    process_writer: frame_write_queue.FrameWriteQueue = undefined,
-    writer_initialized: bool = false,
+    endpoint: worker_endpoint.Endpoint = .{},
     session_guid: []u8 = &.{},
     inbound_next_offset: u64 = 0,
     outbound_next_offset: u64 = 0,
@@ -187,16 +182,11 @@ pub fn closeTerminalMuxStream(
     send_hangup: bool,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) void {
-    if (daemon_dispatcher) |d| {
-        if (stream.process_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
-    }
-    if (stream.process_fd >= 0) {
-        if (send_hangup and !stream.cleanup_recorded) sendTerminalHangupToRemote(stream.process_fd) catch {};
-        _ = c.close(stream.process_fd);
-    }
     var moved_stream = stream;
-    if (moved_stream.reader_initialized) moved_stream.reader.deinit();
-    if (moved_stream.writer_initialized) moved_stream.process_writer.deinit();
+    if (moved_stream.endpoint.fd >= 0) {
+        if (send_hangup and !moved_stream.cleanup_recorded) sendTerminalHangupToRemote(moved_stream.endpoint.fd) catch {};
+    }
+    moved_stream.endpoint.close(daemon_dispatcher);
     if (stream.session_guid.len != 0) allocator.free(stream.session_guid);
 }
 
@@ -251,7 +241,7 @@ fn handleTerminalMuxPayloadOpen(
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) !void {
     const stream_index = findTerminalMuxStreamIndex(sessions, stream_id) orelse return error.UnexpectedFrame;
-    if (sessions.items[stream_index].process_fd >= 0) return;
+    if (sessions.items[stream_index].endpoint.active()) return;
     const action = teStreamActionName(te_open);
     const open_started_ms = std.time.milliTimestamp();
     daemon_log.infof(
@@ -301,20 +291,15 @@ fn handleTerminalMuxPayloadOpen(
         .process = daemon_cleanup.makeRemoteProcessIdentity(identity, te_open.session_guid),
     } });
     try sendTerminalMuxOpenOk(allocator, mux_writer, stream_id);
-    sessions.items[stream_index].process_fd = process_fd;
-    sessions.items[stream_index].process_writer = frame_write_queue.FrameWriteQueue.init(allocator);
-    sessions.items[stream_index].writer_initialized = true;
+    sessions.items[stream_index].endpoint.fd = process_fd;
+    sessions.items[stream_index].endpoint.initWriter(allocator);
     var remote_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, allocator, remote_payload);
     defer remote_open.deinit(allocator);
     try queueTerminalProcessPayload(allocator, &sessions.items[stream_index], .{ .open = remote_open });
     if (daemon_dispatcher) |d| {
         const handler = process_watch_handler orelse return error.MissingTerminalRemoteHandler;
-        sessions.items[stream_index].reader = protocol.FrameReader.init(allocator);
-        sessions.items[stream_index].reader_initialized = true;
-        sessions.items[stream_index].process_watch_id = try d.watchFd(process_fd, terminalProcessWatchEvents(&sessions.items[stream_index]), .{
-            .ctx = handler.ctx,
-            .callback = handler.callback,
-        });
+        sessions.items[stream_index].endpoint.initReader(allocator);
+        try sessions.items[stream_index].endpoint.watch(d, handler);
     }
     sessions.items[stream_index].session_guid = session_guid;
     sessions.items[stream_index].inbound_next_offset = @max(sessions.items[stream_index].inbound_next_offset, payload_offset +| 1);
@@ -383,7 +368,7 @@ fn handleTerminalMuxPayload(
             return;
         }
     }
-    if (stream.process_fd < 0) return error.UnexpectedFrame;
+    if (!stream.endpoint.active()) return error.UnexpectedFrame;
     stream.inbound_next_offset = @max(stream.inbound_next_offset, payload.offset +| 1);
     if (te_item.payload) |te_payload| {
         if (te_payload == .session_hangup_request) {
@@ -395,17 +380,14 @@ fn handleTerminalMuxPayload(
         }
     }
     try queueTerminalProcessItem(allocator, stream, te_item);
-    if (daemon_dispatcher) |d| try updateTerminalProcessWatch(stream, d);
+    if (daemon_dispatcher) |d| try stream.endpoint.updateWatch(d);
 }
 
 pub fn drainTerminalProcessWrites(
     stream: *TerminalMuxStream,
     daemon_dispatcher: *dispatcher.Dispatcher,
 ) !frame_write_queue.WriteQueueStatus {
-    if (!stream.writer_initialized or stream.process_fd < 0) return .drained;
-    const status = try stream.process_writer.writeReady(stream.process_fd);
-    try updateTerminalProcessWatch(stream, daemon_dispatcher);
-    return status;
+    return stream.endpoint.drainWrites(daemon_dispatcher);
 }
 
 fn queueTerminalProcessPayload(
@@ -421,22 +403,12 @@ fn queueTerminalProcessItem(
     stream: *TerminalMuxStream,
     item: pb.TerminalEmulatorItem,
 ) !void {
-    if (!stream.writer_initialized) return error.TerminalProcessWriterMissing;
     const encoded = try protocol.encodeTerminalEmulatorItemPayload(allocator, item);
     defer allocator.free(encoded);
-    try stream.process_writer.queueFrame(.client_remote, encoded);
-}
-
-fn terminalProcessWatchEvents(stream: *const TerminalMuxStream) dispatcher.FdEvents {
-    return .{
-        .readable = true,
-        .writable = stream.writer_initialized and stream.process_writer.hasPending(),
+    stream.endpoint.queueFrame(.client_remote, encoded) catch |err| switch (err) {
+        error.WorkerEndpointWriterMissing => return error.TerminalProcessWriterMissing,
+        else => return err,
     };
-}
-
-fn updateTerminalProcessWatch(stream: *TerminalMuxStream, daemon_dispatcher: *dispatcher.Dispatcher) !void {
-    const watch_id = stream.process_watch_id orelse return;
-    try daemon_dispatcher.updateFdEvents(watch_id, terminalProcessWatchEvents(stream));
 }
 
 pub fn forwardTerminalRemoteFrameToMux(
@@ -478,7 +450,7 @@ pub fn forwardTerminalRemoteFrameToMux(
 
 pub fn findTerminalMuxStreamIndexByWatch(sessions: *const std.ArrayList(TerminalMuxStream), watch_id: dispatcher.FdWatchId) ?usize {
     for (sessions.items, 0..) |stream, index| {
-        const process_watch_id = stream.process_watch_id orelse continue;
+        const process_watch_id = stream.endpoint.watch_id orelse continue;
         if (process_watch_id.index == watch_id.index and process_watch_id.generation == watch_id.generation) return index;
     }
     return null;
@@ -546,13 +518,8 @@ fn sendTerminalMuxReset(
     code: []const u8,
     message: []const u8,
 ) !void {
-    try sendTerminalMuxFrame(allocator, mux_writer, .{
-        .stream_id = stream_id,
-        .message = .{ .reset = .{
-            .code = code,
-            .message = message,
-        } },
-    });
+    _ = allocator;
+    try mux_writer.queueMuxStreamFrame(protocol.muxStreamResetFrame(stream_id, code, message));
 }
 
 fn sendTerminalMuxResetForError(
@@ -686,13 +653,7 @@ fn appendEnvironmentEntry(
 }
 
 fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
-        .code = code,
-        .message = message,
-        .hint = hint,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .error_message, payload);
+    try protocol.sendErrorFrame(app_allocator.allocator(), fd, code, message, hint);
 }
 
 test "terminal mux close hangs up unrecorded remote process" {
@@ -701,7 +662,7 @@ test "terminal mux close hangs up unrecorded remote process" {
 
     closeTerminalMuxStream(std.testing.allocator, .{
         .stream_id = 1,
-        .process_fd = fds[1],
+        .endpoint = .{ .fd = fds[1] },
         .cleanup_recorded = false,
     }, true, null);
 
@@ -719,7 +680,7 @@ test "terminal mux close after cleanup record sends no startup hangup" {
 
     closeTerminalMuxStream(std.testing.allocator, .{
         .stream_id = 1,
-        .process_fd = fds[1],
+        .endpoint = .{ .fd = fds[1] },
         .cleanup_recorded = true,
     }, true, null);
 

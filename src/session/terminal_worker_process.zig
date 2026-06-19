@@ -2,25 +2,23 @@ const std = @import("std");
 const c = std.c;
 
 const app_allocator = @import("../core/app_allocator.zig");
-const core_fds = @import("../core/fds.zig");
 const guid_ref = @import("../core/guid.zig");
 const socket_transport = @import("../transport/socket.zig");
 const terminal_worker = @import("terminal_worker.zig");
+const worker_process = @import("../core/worker_process.zig");
 
 var terminal_remote_socket_sequence: u64 = 0;
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    _ = allocator;
-    if (args.len != 3) return error.InvalidTerminalRemoteArgs;
-    const listen_fd = try std.fmt.parseInt(c.fd_t, args[0], 10);
-    const socket_path = args[1];
+    var listener = try worker_process.prepareInheritedListener(allocator, .{
+        .args = args,
+        .expected_arg_count = 3,
+        .invalid_args_error = error.InvalidTerminalRemoteArgs,
+    });
+    defer listener.deinit();
     const session_guid = args[2];
-    core_fds.closeInheritedNonStdioFileDescriptorsExcept(listen_fd);
-    socket_transport.publishSesshRuntimeDirSymlinkOnce(app_allocator.allocator());
-    defer _ = c.close(listen_fd);
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
 
-    try terminal_worker.runTerminalWorkerLoop(session_guid, listen_fd);
+    try terminal_worker.runTerminalWorkerLoop(session_guid, listener.fd);
 }
 
 pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []const u8) !*terminal_worker.TerminalWorkerHandle {
@@ -29,11 +27,6 @@ pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []cons
 
     const socket_path = try terminalRemoteSocketPath(allocator, exe, "terminal");
     errdefer allocator.free(socket_path);
-    try socket_transport.ensureSocketDir(allocator, socket_path);
-    const listen_fd = try socket_transport.listenSocket(socket_path);
-    errdefer _ = c.close(listen_fd);
-    try socket_transport.clearCloseOnExec(listen_fd);
-
     const control = try allocator.create(terminal_worker.TerminalWorkerHandle);
     errdefer allocator.destroy(control);
     control.* = .{
@@ -48,16 +41,12 @@ pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []cons
     try terminal_worker.registerTerminalWorker(control);
     errdefer terminal_worker.unregisterTerminalWorker(control);
 
-    const listen_fd_arg = try std.fmt.allocPrint(allocator, "{}", .{listen_fd});
-    defer allocator.free(listen_fd_arg);
-    const argv = [_][]const u8{ exe, listen_fd_arg, socket_path, guid };
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    _ = c.close(listen_fd);
-    control.kind.process.pid = @intCast(child.id);
+    const child_id = try worker_process.spawnWithInheritedListener(allocator, .{
+        .exe = exe,
+        .socket_path = socket_path,
+        .args_after_socket_path = &.{guid},
+    });
+    control.kind.process.pid = @intCast(child_id);
     return control;
 }
 

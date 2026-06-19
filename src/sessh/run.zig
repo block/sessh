@@ -17,19 +17,18 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return process_exit.request(64);
     }
 
-    return transport_ssh.runRemoteNewSession(
-        allocator,
-        args[0],
-        parsed.ssh_options,
-        parsed.host,
-        parsed.common,
-        .{
+    return transport_ssh.runRemoteNewSession(allocator, .{
+        .exe = args[0],
+        .ssh_options = parsed.ssh_options,
+        .host = parsed.host,
+        .common = parsed.common,
+        .new = .{
             .shell_command_args = parsed.command_args,
             .tty_request = parsed.tty_request,
             .proxy_required = parsed.proxy_required,
         },
-        .{
+        .failure_policy = .{
             .allow_plain_ssh_fallback = parsed.command_args.len == 0,
         },
-    );
+    });
 }

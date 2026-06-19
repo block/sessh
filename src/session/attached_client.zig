@@ -14,11 +14,11 @@ const client_ui = @import("client_ui.zig");
 const connection_event = @import("../diagnostics/connection_event.zig");
 const connection_monitor_mod = @import("connection_monitor.zig");
 const core_fds = @import("../core/fds.zig");
+const dispatcher_mod = @import("../core/dispatcher.zig");
 const error_payload = @import("error_payload.zig");
 const input_ack = @import("input_ack.zig");
 const io_helpers = @import("../core/io.zig");
 const local_terminal_mod = @import("local_terminal.zig");
-const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
 const presentation_guard_mod = @import("presentation_guard.zig");
 const protocol = @import("../protocol/mod.zig");
 const protocol_test_helpers = @import("../protocol/test_helpers.zig");
@@ -142,18 +142,8 @@ test "attached client drains pending session end before monitor timeout" {
         .reason = .REASON_PROCESS_EXITED,
     } });
 
-    var presentation_guard = PresentationGuard.init(1);
-    var scrollback_cursor = ScrollbackCursor{};
-    var viewport_offset: i32 = 0;
-    var pending_repaint = PendingRepaint{};
-    var attached_client_end_restore = std.ArrayList(u8).empty;
-    defer attached_client_end_restore.deinit(app_allocator.allocator());
-    var input_ack_tracker = InputAckTracker{};
-    var app_title_present: ?bool = null;
-    var input_escape_filter = terminal.EscapeFilter{};
-    var paste_like_input_classifier = PasteLikeInputClassifier{};
-    var initial_cursor_position: ?terminal.CursorPosition = null;
-    var initial_draw_alignment_pending = false;
+    var session = AttachedSessionState{};
+    defer session.deinit();
 
     try std.testing.expectEqual(
         AttachedClientEnd.session_ended,
@@ -161,18 +151,7 @@ test "attached client drains pending session end before monitor timeout" {
             input[0],
             remote_to_client[0],
             @as(c.fd_t, -1),
-            &input_escape_filter,
-            &presentation_guard,
-            &scrollback_cursor,
-            &viewport_offset,
-            &pending_repaint,
-            &attached_client_end_restore,
-            &input_ack_tracker,
-            &paste_like_input_classifier,
-            null,
-            &app_title_present,
-            &initial_cursor_position,
-            &initial_draw_alignment_pending,
+            &session,
             .{ .monitor_connection = true },
         ),
     );
@@ -186,18 +165,8 @@ test "attached client treats input write failure as transport closed" {
     defer posix.close(remote_to_client[0]);
     defer posix.close(remote_to_client[1]);
 
-    var presentation_guard = PresentationGuard.init(1);
-    var scrollback_cursor = ScrollbackCursor{};
-    var viewport_offset: i32 = 0;
-    var pending_repaint = PendingRepaint{};
-    var attached_client_end_restore = std.ArrayList(u8).empty;
-    defer attached_client_end_restore.deinit(app_allocator.allocator());
-    var input_ack_tracker = InputAckTracker{};
-    var input_escape_filter = terminal.EscapeFilter{};
-    var paste_like_input_classifier = PasteLikeInputClassifier{};
-    var app_title_present: ?bool = null;
-    var initial_cursor_position: ?terminal.CursorPosition = null;
-    var initial_draw_alignment_pending = false;
+    var session = AttachedSessionState{};
+    defer session.deinit();
 
     try io_helpers.writeAll(input[1], "typed");
 
@@ -207,18 +176,7 @@ test "attached client treats input write failure as transport closed" {
             input[0],
             remote_to_client[0],
             @as(c.fd_t, -1),
-            &input_escape_filter,
-            &presentation_guard,
-            &scrollback_cursor,
-            &viewport_offset,
-            &pending_repaint,
-            &attached_client_end_restore,
-            &input_ack_tracker,
-            &paste_like_input_classifier,
-            null,
-            &app_title_present,
-            &initial_cursor_position,
-            &initial_draw_alignment_pending,
+            &session,
             .{ .monitor_connection = true },
         ),
     );
@@ -268,7 +226,12 @@ test "draw payload updates terminal worker app title presence state" {
         .draw_bytes = "",
         .app_title_present = false,
         .attached_client_end_restore_bytes = null,
-    }, null, &scrollback_cursor, &viewport_offset, &app_title_present);
+    }, .{
+        .attached_client_end_restore = null,
+        .scrollback_cursor = &scrollback_cursor,
+        .viewport_offset = &viewport_offset,
+        .app_title_present = &app_title_present,
+    });
 
     try std.testing.expect(app_title_present != null);
     try std.testing.expect(!app_title_present.?);
@@ -359,18 +322,32 @@ test "repaint response applies only latest outstanding request" {
     defer restore.deinit(app_allocator.allocator());
     var cursor = ScrollbackCursor{};
     var viewport_offset: i32 = 0;
+    const draw_context = DrawApplyContext{
+        .attached_client_end_restore = &restore,
+        .scrollback_cursor = &cursor,
+        .viewport_offset = &viewport_offset,
+    };
     var no_pending = PendingRepaint{};
-    try std.testing.expect(!try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &no_pending, null));
+    try std.testing.expect(!try handleRepaintResponseFrame(payload, .{
+        .draw = draw_context,
+        .pending_repaint = &no_pending,
+    }));
     try std.testing.expectEqual(@as(usize, 0), cursor.len);
     try std.testing.expectEqual(@as(i32, 0), viewport_offset);
 
     var older_pending = PendingRepaint{ .repaint_request_seq = 8 };
-    try std.testing.expect(!try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &older_pending, null));
+    try std.testing.expect(!try handleRepaintResponseFrame(payload, .{
+        .draw = draw_context,
+        .pending_repaint = &older_pending,
+    }));
     try std.testing.expectEqual(@as(u64, 8), older_pending.repaint_request_seq);
     try std.testing.expectEqual(@as(usize, 0), cursor.len);
 
     var matching_pending = PendingRepaint{ .repaint_request_seq = 7 };
-    try std.testing.expect(try handleRepaintResponseFrame(payload, &restore, &cursor, &viewport_offset, &matching_pending, null));
+    try std.testing.expect(try handleRepaintResponseFrame(payload, .{
+        .draw = draw_context,
+        .pending_repaint = &matching_pending,
+    }));
     try std.testing.expect(!matching_pending.active());
     try std.testing.expectEqualStrings("cursor-v7", cursor.slice());
     try std.testing.expectEqual(@as(i32, 4), viewport_offset);
@@ -558,16 +535,7 @@ fn finishReconnectRepaintInner(
                 switch (item_payload) {
                     .draw => {},
                     .repaint_response => |response| {
-                        _ = try handleRepaintResponseMessageWithInitialAlignment(
-                            response,
-                            &session.attached_client_end_restore,
-                            &session.scrollback_cursor,
-                            &session.viewport_offset,
-                            &session.pending_repaint,
-                            &session.app_title_present,
-                            null,
-                            null,
-                        );
+                        _ = try handleRepaintResponseMessage(response, RepaintApplyContext.forSession(session, .ignore));
                     },
                     .input_ack => |ack| {
                         _ = handleInputAckMessage(ack, &session.input_ack_tracker);
@@ -605,18 +573,7 @@ pub fn runAttachedClient(
     return runAttachedClientLoop(
         read_fd,
         write_fd,
-        &session.input_escape_filter,
-        &session.scrollback_cursor,
-        &session.viewport_offset,
-        &session.pending_repaint,
-        &session.attached_client_end_restore,
-        &session.input_ack_tracker,
-        &session.paste_like_input_classifier,
-        &session.ended_process_exit_code,
-        &session.app_title_present,
-        &session.initial_cursor_position,
-        &session.initial_draw_alignment_pending,
-        session.initial_kitty_keyboard_flags,
+        session,
         .{
             .monitor_connection = options.monitor_connection,
             .responsiveness_timeout_floor_ms = @max(options.responsiveness_timeout_floor_ms, session.unresponsive_timeout_floor_ms),
@@ -625,38 +582,93 @@ pub fn runAttachedClient(
 }
 
 pub fn drainLocalTransportDiagnostics(read_fd: c.fd_t, timeout_ms: u64) void {
-    var timer = NonSuspendingTimer.start() catch return;
-    var reader = protocol.FrameReader.init(app_allocator.allocator());
-    defer reader.deinit();
-    // BLOCKING_POLL: foreground visible-client diagnostic drain. It runs while
-    // the client is already handling a local transport close and has no daemon
-    // dispatcher work to make progress on.
-    while (true) {
-        const elapsed_ms = @divTrunc(timer.read(), std.time.ns_per_ms);
-        if (elapsed_ms >= timeout_ms) return;
-        const remaining_ms: i32 = @intCast(@min(timeout_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
-        var pollfds = [_]posix.pollfd{.{
-            .fd = read_fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&pollfds, remaining_ms) catch return;
-        if (ready == 0) return;
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) return;
+    var context = LocalTransportDiagnosticsDrain.init(read_fd) catch return;
+    defer context.deinit();
+    context.run(timeout_ms) catch {};
+}
 
-        var frame = switch (reader.readReady(read_fd) catch return) {
-            .blocked, .progress => continue,
-            .frame => |frame| frame,
-            .eof, .truncated_frame => return,
+const LocalTransportDiagnosticsDrain = struct {
+    dispatcher: dispatcher_mod.Dispatcher,
+    read_fd: c.fd_t,
+    reader: protocol.FrameReader,
+    read_watch_id: ?dispatcher_mod.FdWatchId = null,
+    timer_watch_id: ?dispatcher_mod.TimerWatchId = null,
+
+    fn init(read_fd: c.fd_t) !LocalTransportDiagnosticsDrain {
+        return .{
+            .dispatcher = try dispatcher_mod.Dispatcher.init(app_allocator.allocator()),
+            .read_fd = read_fd,
+            .reader = protocol.FrameReader.init(app_allocator.allocator()),
         };
-        defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .client_daemon => switch (handleClientDaemonFrame(frame.payload) catch return) {
-                .handled => {},
-                .transport_closed, .unexpected => return,
-            },
-            else => return,
+    }
+
+    fn deinit(self: *LocalTransportDiagnosticsDrain) void {
+        self.dispatcher.deinit();
+        self.reader.deinit();
+    }
+
+    fn run(self: *LocalTransportDiagnosticsDrain, timeout_ms: u64) !void {
+        self.read_watch_id = try self.dispatcher.watchFd(self.read_fd, .{ .readable = true }, .{
+            .ctx = self,
+            .callback = handleLocalTransportDiagnosticsDrainEvent,
+        });
+        self.timer_watch_id = try self.dispatcher.watchTimerAfter(timeout_ms, .{
+            .ctx = self,
+            .callback = handleLocalTransportDiagnosticsDrainEvent,
+        });
+        try self.dispatcher.run();
+    }
+
+    fn drainReadable(self: *LocalTransportDiagnosticsDrain) !void {
+        while (true) {
+            var frame = switch (try self.reader.readReady(self.read_fd)) {
+                .blocked, .progress => return,
+                .frame => |frame| frame,
+                .eof, .truncated_frame => {
+                    self.dispatcher.stop();
+                    return;
+                },
+            };
+            defer frame.deinit(app_allocator.allocator());
+            switch (frame.message_type) {
+                .client_daemon => switch (try handleClientDaemonFrame(frame.payload)) {
+                    .handled => {},
+                    .transport_closed, .unexpected => {
+                        self.dispatcher.stop();
+                        return;
+                    },
+                },
+                else => {
+                    self.dispatcher.stop();
+                    return;
+                },
+            }
         }
+    }
+};
+
+fn handleLocalTransportDiagnosticsDrainEvent(
+    ctx: *anyopaque,
+    _: *dispatcher_mod.Dispatcher,
+    id: dispatcher_mod.WatchId,
+    event: dispatcher_mod.Event,
+) !void {
+    const context: *LocalTransportDiagnosticsDrain = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .fd => |fd_event| {
+            if (!watchMatches(id, context.read_watch_id)) return;
+            if (fd_event.readable) {
+                try context.drainReadable();
+            } else if (fd_event.hangup or fd_event.error_event or fd_event.invalid) {
+                context.dispatcher.stop();
+            }
+        },
+        .timer => {
+            if (timerWatchMatches(id, context.timer_watch_id)) {
+                context.timer_watch_id = null;
+                context.dispatcher.stop();
+            }
+        },
     }
 }
 
@@ -665,22 +677,76 @@ pub fn pollTerminalWorkerRecovery(
     session: *AttachedSessionState,
     timeout_ms: i32,
 ) !?TerminalWorkerRecovery {
-    // BLOCKING_POLL: foreground reconnect UI waits for one terminal worker frame or a
-    // short timeout so it can keep refreshing diagnostics between attempts.
-    var pollfds = [_]posix.pollfd{.{
-        .fd = read_fd,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try posix.poll(&pollfds, timeout_ms);
-    if (ready == 0) return null;
-    if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-        (pollfds[0].revents & posix.POLL.IN) == 0)
-    {
-        return .transport_closed;
-    }
-    if ((pollfds[0].revents & posix.POLL.IN) == 0) return null;
+    var context = try TerminalWorkerRecoveryPoll.init(read_fd, session);
+    defer context.deinit();
+    try context.run(timeout_ms);
+    return context.result;
+}
 
+const TerminalWorkerRecoveryPoll = struct {
+    dispatcher: dispatcher_mod.Dispatcher,
+    read_fd: c.fd_t,
+    session: *AttachedSessionState,
+    read_watch_id: ?dispatcher_mod.FdWatchId = null,
+    timer_watch_id: ?dispatcher_mod.TimerWatchId = null,
+    result: ?TerminalWorkerRecovery = null,
+
+    fn init(read_fd: c.fd_t, session: *AttachedSessionState) !TerminalWorkerRecoveryPoll {
+        return .{
+            .dispatcher = try dispatcher_mod.Dispatcher.init(app_allocator.allocator()),
+            .read_fd = read_fd,
+            .session = session,
+        };
+    }
+
+    fn deinit(self: *TerminalWorkerRecoveryPoll) void {
+        self.dispatcher.deinit();
+    }
+
+    fn run(self: *TerminalWorkerRecoveryPoll, timeout_ms: i32) !void {
+        self.read_watch_id = try self.dispatcher.watchFd(self.read_fd, .{ .readable = true }, .{
+            .ctx = self,
+            .callback = handleTerminalWorkerRecoveryPollEvent,
+        });
+        if (timeout_ms >= 0) {
+            self.timer_watch_id = try self.dispatcher.watchTimerAfter(@intCast(timeout_ms), .{
+                .ctx = self,
+                .callback = handleTerminalWorkerRecoveryPollEvent,
+            });
+        }
+        try self.dispatcher.run();
+    }
+};
+
+fn handleTerminalWorkerRecoveryPollEvent(
+    ctx: *anyopaque,
+    _: *dispatcher_mod.Dispatcher,
+    id: dispatcher_mod.WatchId,
+    event: dispatcher_mod.Event,
+) !void {
+    const context: *TerminalWorkerRecoveryPoll = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .fd => |fd_event| {
+            if (!watchMatches(id, context.read_watch_id)) return;
+            if ((fd_event.hangup or fd_event.error_event or fd_event.invalid) and !fd_event.readable) {
+                context.result = .transport_closed;
+                context.dispatcher.stop();
+                return;
+            }
+            if (!fd_event.readable) return;
+            context.result = try readTerminalWorkerRecoveryFrame(context.read_fd, context.session);
+            context.dispatcher.stop();
+        },
+        .timer => {
+            if (timerWatchMatches(id, context.timer_watch_id)) {
+                context.timer_watch_id = null;
+                context.dispatcher.stop();
+            }
+        },
+    }
+}
+
+fn readTerminalWorkerRecoveryFrame(read_fd: c.fd_t, session: *AttachedSessionState) !?TerminalWorkerRecovery {
     const reader = session.recoveryReader(read_fd);
     var frame = switch (try reader.readReady(read_fd)) {
         .blocked, .progress => return null,
@@ -696,20 +762,11 @@ pub fn pollTerminalWorkerRecovery(
             switch (item_payload) {
                 .draw => |draw| {
                     if (session.pending_repaint.active()) return null;
-                    try handleDrawMessageWithInitialAlignment(draw, &session.attached_client_end_restore, &session.scrollback_cursor, &session.viewport_offset, &session.app_title_present, null, null);
+                    try handleDrawMessage(draw, DrawApplyContext.forSession(session, .ignore));
                     return .recovered;
                 },
                 .repaint_response => |response| {
-                    const applied = try handleRepaintResponseMessageWithInitialAlignment(
-                        response,
-                        &session.attached_client_end_restore,
-                        &session.scrollback_cursor,
-                        &session.viewport_offset,
-                        &session.pending_repaint,
-                        &session.app_title_present,
-                        null,
-                        null,
-                    );
+                    const applied = try handleRepaintResponseMessage(response, RepaintApplyContext.forSession(session, .ignore));
                     return if (applied) .recovered else null;
                 },
                 .input_ack => |ack| {
@@ -767,53 +824,119 @@ pub fn pollAndForwardReconnectInput(
     }
     try reconnect_ui.refreshOverlayIfDiagnosticsChanged();
 
-    // BLOCKING_POLL: foreground reconnect UI input pump. It waits only for the
-    // caller-provided timeout so the surrounding reconnect loop can redraw and
-    // retry on schedule.
-    var pollfds = [_]posix.pollfd{.{
-        .fd = posix.STDIN_FILENO,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try posix.poll(&pollfds, timeout_ms);
-    if (ready == 0) return .wait_elapsed;
-    if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .client_hangup;
-    if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
+    var context = try ReconnectInputPoll.init(write_fd, session, reconnect_ui);
+    defer context.deinit();
+    try context.run(timeout_ms);
+    return context.result;
+}
 
-    var input: [4096]u8 = undefined;
-    var filtered: [8192]u8 = undefined;
-    const n = c.read(posix.STDIN_FILENO, &input, input.len);
-    if (n <= 0) return .client_hangup;
-    const bytes = input[0..@intCast(n)];
-    io_helpers.noteRead(posix.STDIN_FILENO, bytes);
+const ReconnectInputPoll = struct {
+    dispatcher: dispatcher_mod.Dispatcher,
+    write_fd: c.fd_t,
+    session: *AttachedSessionState,
+    reconnect_ui: *client_ui.ReconnectUi,
+    input_watch_id: ?dispatcher_mod.FdWatchId = null,
+    timer_watch_id: ?dispatcher_mod.TimerWatchId = null,
+    result: ReconnectInputPumpResult = .wait_elapsed,
 
-    for (bytes) |byte| {
-        if (byte == 0x12) {
-            reconnect_ui.reconnect_acknowledged = true;
-            return .reconnect_now;
-        }
-    }
-
-    const result = session.input_escape_filter.filter(bytes, &filtered);
-    if (result.bytes.len > 0) {
-        const paste_like = session.paste_like_input_classifier.classify(result.bytes.len);
-        attached_client_messages.sendInputChunks(write_fd, result.bytes, &session.input_ack_tracker, paste_like) catch |err| switch (err) {
-            error.WriteFailed => return .transport_closed,
-            else => return err,
+    fn init(
+        write_fd: c.fd_t,
+        session: *AttachedSessionState,
+        reconnect_ui: *client_ui.ReconnectUi,
+    ) !ReconnectInputPoll {
+        return .{
+            .dispatcher = try dispatcher_mod.Dispatcher.init(app_allocator.allocator()),
+            .write_fd = write_fd,
+            .session = session,
+            .reconnect_ui = reconnect_ui,
         };
     }
 
-    if (result.end) |end| switch (end) {
-        .disconnect => return .client_hangup,
-        .help => {},
-        .repaint => attached_client_messages.sendRepaint(write_fd, "", &session.pending_repaint) catch |err| switch (err) {
-            error.WriteFailed => return .transport_closed,
-            else => return err,
-        },
-    };
+    fn deinit(self: *ReconnectInputPoll) void {
+        self.dispatcher.deinit();
+    }
 
-    try reconnect_ui.refreshOverlayIfDiagnosticsChanged();
-    return .wait_elapsed;
+    fn run(self: *ReconnectInputPoll, timeout_ms: i32) !void {
+        self.input_watch_id = try self.dispatcher.watchFd(posix.STDIN_FILENO, .{ .readable = true }, .{
+            .ctx = self,
+            .callback = handleReconnectInputPollEvent,
+        });
+        if (timeout_ms >= 0) {
+            self.timer_watch_id = try self.dispatcher.watchTimerAfter(@intCast(timeout_ms), .{
+                .ctx = self,
+                .callback = handleReconnectInputPollEvent,
+            });
+        }
+        try self.dispatcher.run();
+    }
+
+    fn readAndForward(self: *ReconnectInputPoll) !ReconnectInputPumpResult {
+        const session = self.session;
+        const reconnect_ui = self.reconnect_ui;
+        const write_fd = self.write_fd;
+        var input: [4096]u8 = undefined;
+        var filtered: [8192]u8 = undefined;
+        const n = c.read(posix.STDIN_FILENO, &input, input.len);
+        if (n <= 0) return .client_hangup;
+        const bytes = input[0..@intCast(n)];
+        io_helpers.noteRead(posix.STDIN_FILENO, bytes);
+
+        for (bytes) |byte| {
+            if (byte == 0x12) {
+                reconnect_ui.reconnect_acknowledged = true;
+                return .reconnect_now;
+            }
+        }
+
+        const result = session.input_escape_filter.filter(bytes, &filtered);
+        if (result.bytes.len > 0) {
+            const paste_like = session.paste_like_input_classifier.classify(result.bytes.len);
+            attached_client_messages.sendInputChunks(write_fd, result.bytes, &session.input_ack_tracker, paste_like) catch |err| switch (err) {
+                error.WriteFailed => return .transport_closed,
+                else => return err,
+            };
+        }
+
+        if (result.end) |end| switch (end) {
+            .disconnect => return .client_hangup,
+            .help => {},
+            .repaint => attached_client_messages.sendRepaint(write_fd, "", &session.pending_repaint) catch |err| switch (err) {
+                error.WriteFailed => return .transport_closed,
+                else => return err,
+            },
+        };
+
+        try reconnect_ui.refreshOverlayIfDiagnosticsChanged();
+        return .wait_elapsed;
+    }
+};
+
+fn handleReconnectInputPollEvent(
+    ctx: *anyopaque,
+    _: *dispatcher_mod.Dispatcher,
+    id: dispatcher_mod.WatchId,
+    event: dispatcher_mod.Event,
+) !void {
+    const context: *ReconnectInputPoll = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .fd => |fd_event| {
+            if (!watchMatches(id, context.input_watch_id)) return;
+            if ((fd_event.hangup or fd_event.error_event or fd_event.invalid) and !fd_event.readable) {
+                context.result = .client_hangup;
+                context.dispatcher.stop();
+                return;
+            }
+            if (!fd_event.readable) return;
+            context.result = try context.readAndForward();
+            context.dispatcher.stop();
+        },
+        .timer => {
+            if (timerWatchMatches(id, context.timer_watch_id)) {
+                context.timer_watch_id = null;
+                context.dispatcher.stop();
+            }
+        },
+    }
 }
 
 fn readAttachedSessionState(read_fd: c.fd_t) !AttachedSessionState {
@@ -923,32 +1046,101 @@ fn readFrameMaybeCancelled(
     cancelled: ?*const bool,
 ) !protocol.OwnedFrame {
     const flag = cancelled orelse return readVisibleClientFrameBlocking(fd);
-    var reader = protocol.FrameReader.init(app_allocator.allocator());
-    defer reader.deinit();
-    // BLOCKING_POLL: foreground reconnect setup wait. The short timeout lets a
-    // racing reconnect attempt notice cancellation while waiting for the remote
-    // terminal worker's next frame.
-    while (true) {
-        if (flag.*) return error.ReconnectCancelled;
-        var pollfds = [_]posix.pollfd{.{
+    var context = try CancellableFrameRead.init(fd, flag);
+    defer context.deinit();
+    try context.run();
+    if (context.err) |err| return err;
+    return context.frame orelse error.EndOfStream;
+}
+
+const CancellableFrameRead = struct {
+    dispatcher: dispatcher_mod.Dispatcher,
+    fd: c.fd_t,
+    cancelled: *const bool,
+    reader: protocol.FrameReader,
+    fd_watch_id: ?dispatcher_mod.FdWatchId = null,
+    timer_watch_id: ?dispatcher_mod.TimerWatchId = null,
+    frame: ?protocol.OwnedFrame = null,
+    err: ?anyerror = null,
+
+    fn init(fd: c.fd_t, cancelled: *const bool) !CancellableFrameRead {
+        return .{
+            .dispatcher = try dispatcher_mod.Dispatcher.init(app_allocator.allocator()),
             .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, 50);
-        if (flag.*) return error.ReconnectCancelled;
-        if (ready == 0) continue;
-        if ((pollfds[0].revents & posix.POLL.IN) != 0) {
-            switch (try reader.readReady(fd)) {
-                .blocked, .progress => continue,
-                .frame => |frame| return frame,
-                .eof => return error.EndOfStream,
-                .truncated_frame => return error.TruncatedFrame,
+            .cancelled = cancelled,
+            .reader = protocol.FrameReader.init(app_allocator.allocator()),
+        };
+    }
+
+    fn deinit(self: *CancellableFrameRead) void {
+        self.dispatcher.deinit();
+        self.reader.deinit();
+    }
+
+    fn run(self: *CancellableFrameRead) !void {
+        if (self.cancelled.*) return error.ReconnectCancelled;
+        self.fd_watch_id = try self.dispatcher.watchFd(self.fd, .{ .readable = true }, .{
+            .ctx = self,
+            .callback = handleCancellableFrameReadEvent,
+        });
+        try self.armTimer();
+        try self.dispatcher.run();
+    }
+
+    fn armTimer(self: *CancellableFrameRead) !void {
+        self.timer_watch_id = try self.dispatcher.watchTimerAfter(50, .{
+            .ctx = self,
+            .callback = handleCancellableFrameReadEvent,
+        });
+    }
+
+    fn completeWithError(self: *CancellableFrameRead, err: anyerror) void {
+        self.err = err;
+        self.dispatcher.stop();
+    }
+};
+
+fn handleCancellableFrameReadEvent(
+    ctx: *anyopaque,
+    _: *dispatcher_mod.Dispatcher,
+    id: dispatcher_mod.WatchId,
+    event: dispatcher_mod.Event,
+) !void {
+    const context: *CancellableFrameRead = @ptrCast(@alignCast(ctx));
+    if (context.cancelled.*) {
+        context.completeWithError(error.ReconnectCancelled);
+        return;
+    }
+    switch (event) {
+        .fd => |fd_event| {
+            if (!watchMatches(id, context.fd_watch_id)) return;
+            if (fd_event.readable) {
+                switch (try context.reader.readReady(context.fd)) {
+                    .blocked, .progress => return,
+                    .frame => |frame| {
+                        context.frame = frame;
+                        context.dispatcher.stop();
+                        return;
+                    },
+                    .eof => {
+                        context.completeWithError(error.EndOfStream);
+                        return;
+                    },
+                    .truncated_frame => {
+                        context.completeWithError(error.TruncatedFrame);
+                        return;
+                    },
+                }
             }
-        }
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            return error.EndOfStream;
-        }
+            if (fd_event.hangup or fd_event.error_event or fd_event.invalid) {
+                context.completeWithError(error.EndOfStream);
+            }
+        },
+        .timer => {
+            if (!timerWatchMatches(id, context.timer_watch_id)) return;
+            context.timer_watch_id = null;
+            try context.armTimer();
+        },
     }
 }
 
@@ -1083,18 +1275,7 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
 fn runAttachedClientLoop(
     read_fd: c.fd_t,
     write_fd: c.fd_t,
-    input_escape_filter: *terminal.EscapeFilter,
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    pending_repaint: *PendingRepaint,
-    attached_client_end_restore: *std.ArrayList(u8),
-    input_ack_tracker: *InputAckTracker,
-    paste_like_input_classifier: *PasteLikeInputClassifier,
-    ended_process_exit_code: ?*?u8,
-    app_title_present: *?bool,
-    initial_cursor_position: *?terminal.CursorPosition,
-    initial_draw_alignment_pending: *bool,
-    initial_kitty_keyboard_flags: u5,
+    session: *AttachedSessionState,
     options: AttachedClientOptions,
 ) !AttachedClientEnd {
     const output_is_tty = c.isatty(posix.STDOUT_FILENO) != 0;
@@ -1107,12 +1288,12 @@ fn runAttachedClientLoop(
             PresentationGuard.initWithCleanupTitleAndInitialKittyKeyboardFlags(
                 posix.STDOUT_FILENO,
                 title,
-                initial_kitty_keyboard_flags,
+                session.initial_kitty_keyboard_flags,
             )
         else
-            PresentationGuard.initWithInitialKittyKeyboardFlags(posix.STDOUT_FILENO, initial_kitty_keyboard_flags);
+            PresentationGuard.initWithInitialKittyKeyboardFlags(posix.STDOUT_FILENO, session.initial_kitty_keyboard_flags);
     } else guard: {
-        var inactive = PresentationGuard.initWithInitialKittyKeyboardFlags(posix.STDOUT_FILENO, initial_kitty_keyboard_flags);
+        var inactive = PresentationGuard.initWithInitialKittyKeyboardFlags(posix.STDOUT_FILENO, session.initial_kitty_keyboard_flags);
         inactive.active = false;
         break :guard inactive;
     };
@@ -1122,236 +1303,264 @@ fn runAttachedClientLoop(
         posix.STDIN_FILENO,
         read_fd,
         write_fd,
-        input_escape_filter,
-        &presentation_guard,
-        scrollback_cursor,
-        viewport_offset,
-        pending_repaint,
-        attached_client_end_restore,
-        input_ack_tracker,
-        paste_like_input_classifier,
-        ended_process_exit_code,
-        app_title_present,
-        initial_cursor_position,
-        initial_draw_alignment_pending,
+        session,
         options,
     );
     if (end == .client_hangup) writeClientCloseBoundary();
     return end;
 }
 
+const AttachedTerminalLoop = struct {
+    const Mode = enum {
+        normal,
+        escape_help,
+    };
+
+    input_fd: c.fd_t,
+    read_fd: c.fd_t,
+    write_fd: c.fd_t,
+    session: *AttachedSessionState,
+    read_fd_flags_guard: ?core_fds.StatusFlagsGuard = null,
+    mode: Mode = .normal,
+    dispatcher: dispatcher_mod.Dispatcher,
+    input_watch_id: ?dispatcher_mod.FdWatchId = null,
+    worker_watch_id: ?dispatcher_mod.FdWatchId = null,
+    timer_watch_id: ?dispatcher_mod.TimerWatchId = null,
+    end: ?AttachedClientEnd = null,
+    help_overlay_state: ?client_ui.OverlayDrawState = null,
+    help_last_size: WindowSize = .{ .rows = 0, .cols = 0 },
+    input_buf: [4096]u8 = undefined,
+    filtered_buf: [8192]u8 = undefined,
+    last_size: WindowSize,
+    connection_monitor: ConnectionMonitor,
+    worker_reader: protocol.FrameReader,
+
+    fn init(
+        input_fd: c.fd_t,
+        read_fd: c.fd_t,
+        write_fd: c.fd_t,
+        session: *AttachedSessionState,
+        options: AttachedClientOptions,
+    ) !AttachedTerminalLoop {
+        const read_fd_flags_guard = core_fds.StatusFlagsGuard.setNonBlocking(read_fd) catch null;
+        return .{
+            .input_fd = input_fd,
+            .read_fd = read_fd,
+            .write_fd = write_fd,
+            .session = session,
+            .read_fd_flags_guard = read_fd_flags_guard,
+            .dispatcher = try dispatcher_mod.Dispatcher.init(app_allocator.allocator()),
+            .last_size = terminal.currentWindowSize(),
+            .connection_monitor = .{
+                .enabled = options.monitor_connection,
+                .responsiveness_timeout_floor_ms = options.responsiveness_timeout_floor_ms,
+            },
+            .worker_reader = protocol.FrameReader.init(app_allocator.allocator()),
+        };
+    }
+
+    fn deinit(self: *AttachedTerminalLoop) void {
+        self.dispatcher.deinit();
+        self.worker_reader.deinit();
+        if (self.read_fd_flags_guard) |*guard| guard.restore();
+    }
+
+    fn run(self: *AttachedTerminalLoop) !AttachedClientEnd {
+        self.input_watch_id = try self.dispatcher.watchFd(self.input_fd, .{ .readable = true }, .{
+            .ctx = self,
+            .callback = handleAttachedTerminalLoopEvent,
+        });
+        self.worker_watch_id = try self.dispatcher.watchFd(self.read_fd, .{ .readable = true }, .{
+            .ctx = self,
+            .callback = handleAttachedTerminalLoopEvent,
+        });
+        try self.updateTimer();
+        try self.dispatcher.run();
+        return self.end orelse .transport_closed;
+    }
+
+    fn setEnd(self: *AttachedTerminalLoop, end: AttachedClientEnd) void {
+        self.end = end;
+        self.dispatcher.stop();
+    }
+
+    fn updateTimer(self: *AttachedTerminalLoop) !void {
+        if (self.timer_watch_id) |id| self.dispatcher.cancel(.{ .timer = id });
+        self.timer_watch_id = try self.dispatcher.watchTimerAfter(@intCast(self.connection_monitor.pollTimeoutMs()), .{
+            .ctx = self,
+            .callback = handleAttachedTerminalLoopEvent,
+        });
+    }
+
+    fn handleWorkerEvent(self: *AttachedTerminalLoop, event: dispatcher_mod.FdEvent) !void {
+        if (!event.readable and (event.hangup or event.error_event or event.invalid)) {
+            self.setEnd(finishAttachedClient(.transport_closed, &self.session.attached_client_end_restore));
+            return;
+        }
+        if (!event.readable) return;
+        if (self.mode == .escape_help) {
+            if (try drainEscapeHelpTerminalWorkerFrames(self)) |end| {
+                try self.clearEscapeHelpOverlay();
+                self.setEnd(finishAttachedClient(end, &self.session.attached_client_end_restore));
+            }
+            return;
+        }
+        if (try drainAttachedClientTerminalWorkerFrames(self)) |end| {
+            self.setEnd(finishAttachedClient(end, &self.session.attached_client_end_restore));
+        }
+    }
+
+    fn handleInputEvent(self: *AttachedTerminalLoop, event: dispatcher_mod.FdEvent) !void {
+        if (!event.readable and (event.hangup or event.error_event or event.invalid)) {
+            if (self.mode == .escape_help) try self.clearEscapeHelpOverlay();
+            self.setEnd(finishAttachedClient(clientHangup(), &self.session.attached_client_end_restore));
+            return;
+        }
+        if (!event.readable) return;
+        if (self.mode == .escape_help) {
+            const n = c.read(self.input_fd, &self.input_buf, self.input_buf.len);
+            if (n <= 0) {
+                try self.clearEscapeHelpOverlay();
+                self.setEnd(finishAttachedClient(clientHangup(), &self.session.attached_client_end_restore));
+                return;
+            }
+            io_helpers.noteRead(self.input_fd, self.input_buf[0..@intCast(n)]);
+            try self.dismissEscapeHelpOverlay();
+            return;
+        }
+
+        const session = self.session;
+        const n = c.read(self.input_fd, &self.input_buf, self.input_buf.len);
+        if (n <= 0) {
+            self.setEnd(finishAttachedClient(clientHangup(), &session.attached_client_end_restore));
+            return;
+        }
+        io_helpers.noteRead(self.input_fd, self.input_buf[0..@intCast(n)]);
+        const result = session.input_escape_filter.filter(self.input_buf[0..@intCast(n)], &self.filtered_buf);
+        if (result.bytes.len > 0) {
+            const paste_like = session.paste_like_input_classifier.classify(result.bytes.len);
+            attached_client_messages.sendInputChunks(self.write_fd, result.bytes, &session.input_ack_tracker, paste_like) catch |err| switch (err) {
+                error.WriteFailed => {
+                    self.setEnd(try finishAttachedClientAfterTerminalWorkerWriteFailed(self));
+                    return;
+                },
+                else => return err,
+            };
+            self.connection_monitor.afterInput();
+        }
+        if (result.end) |end| switch (end) {
+            .disconnect => self.setEnd(finishAttachedClient(clientHangup(), &session.attached_client_end_restore)),
+            .help => try self.enterEscapeHelpOverlay(),
+            .repaint => attached_client_messages.sendRepaint(self.write_fd, "", &session.pending_repaint) catch |err| switch (err) {
+                error.WriteFailed => self.setEnd(try finishAttachedClientAfterTerminalWorkerWriteFailed(self)),
+                else => return err,
+            },
+        };
+    }
+
+    fn runMaintenance(self: *AttachedTerminalLoop) !void {
+        if (self.mode == .escape_help) {
+            try self.refreshEscapeHelpOverlayForResize();
+            return;
+        }
+        const session = self.session;
+        attached_client_messages.maybeSendResize(self.write_fd, &self.last_size, &session.scrollback_cursor, &session.viewport_offset, &session.pending_repaint) catch |err| switch (err) {
+            error.WriteFailed => {
+                self.setEnd(try finishAttachedClientAfterTerminalWorkerWriteFailed(self));
+                return;
+            },
+            else => return err,
+        };
+        if (checkResizeRepaintTimeout(&session.pending_repaint, &session.viewport_offset, std.time.milliTimestamp())) |end| {
+            self.setEnd(end);
+            return;
+        }
+        if (self.connection_monitor.isUnresponsive()) {
+            self.setEnd(.unresponsive);
+        }
+    }
+
+    fn enterEscapeHelpOverlay(self: *AttachedTerminalLoop) !void {
+        self.mode = .escape_help;
+        self.help_last_size = terminal.currentWindowSize();
+        try drawEscapeHelpOverlay(client_renderer.Renderer.init(posix.STDOUT_FILENO), self.help_last_size, &self.session.viewport_offset, &self.help_overlay_state);
+    }
+
+    fn dismissEscapeHelpOverlay(self: *AttachedTerminalLoop) !void {
+        try self.clearEscapeHelpOverlay();
+        attached_client_messages.sendScreenRepaint(self.write_fd, &self.session.pending_repaint) catch |err| switch (err) {
+            error.WriteFailed => self.setEnd(.transport_closed),
+            else => return err,
+        };
+    }
+
+    fn clearEscapeHelpOverlay(self: *AttachedTerminalLoop) !void {
+        if (self.mode != .escape_help and self.help_overlay_state == null) return;
+        const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
+        try clearEscapeHelpOverlayDraw(renderer, &self.session.viewport_offset, &self.help_overlay_state);
+        self.mode = .normal;
+    }
+
+    fn refreshEscapeHelpOverlayForResize(self: *AttachedTerminalLoop) !void {
+        const size = terminal.currentWindowSize();
+        if (size.rows == self.help_last_size.rows and size.cols == self.help_last_size.cols) return;
+        self.help_last_size = size;
+        try drawEscapeHelpOverlay(client_renderer.Renderer.init(posix.STDOUT_FILENO), size, &self.session.viewport_offset, &self.help_overlay_state);
+    }
+};
+
+fn watchMatches(id: dispatcher_mod.WatchId, expected: ?dispatcher_mod.FdWatchId) bool {
+    const expected_id = expected orelse return false;
+    const fd_id = switch (id) {
+        .fd => |fd| fd,
+        .timer => return false,
+    };
+    return fd_id.index == expected_id.index and fd_id.generation == expected_id.generation;
+}
+
+fn timerWatchMatches(id: dispatcher_mod.WatchId, expected: ?dispatcher_mod.TimerWatchId) bool {
+    const expected_id = expected orelse return false;
+    const timer_id = switch (id) {
+        .timer => |timer| timer,
+        .fd => return false,
+    };
+    return timer_id.index == expected_id.index and timer_id.generation == expected_id.generation;
+}
+
+fn handleAttachedTerminalLoopEvent(
+    ctx: *anyopaque,
+    _: *dispatcher_mod.Dispatcher,
+    id: dispatcher_mod.WatchId,
+    event: dispatcher_mod.Event,
+) !void {
+    const loop: *AttachedTerminalLoop = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .fd => |fd_event| {
+            if (watchMatches(id, loop.worker_watch_id)) {
+                try loop.handleWorkerEvent(fd_event);
+            } else if (watchMatches(id, loop.input_watch_id)) {
+                try loop.handleInputEvent(fd_event);
+            }
+        },
+        .timer => {
+            if (timerWatchMatches(id, loop.timer_watch_id)) loop.timer_watch_id = null;
+        },
+    }
+    if (loop.end != null) return;
+    try loop.runMaintenance();
+    if (loop.end == null) try loop.updateTimer();
+}
+
 fn runAttachedTerminal(
     input_fd: c.fd_t,
     read_fd: c.fd_t,
     write_fd: c.fd_t,
-    input_escape_filter: *terminal.EscapeFilter,
-    presentation_guard: *PresentationGuard,
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    pending_repaint: *PendingRepaint,
-    attached_client_end_restore: *std.ArrayList(u8),
-    input_ack_tracker: *InputAckTracker,
-    paste_like_input_classifier: *PasteLikeInputClassifier,
-    ended_process_exit_code: ?*?u8,
-    app_title_present: *?bool,
-    initial_cursor_position: *?terminal.CursorPosition,
-    initial_draw_alignment_pending: *bool,
+    session: *AttachedSessionState,
     options: AttachedClientOptions,
 ) !AttachedClientEnd {
-    var pollfds = [_]posix.pollfd{
-        .{ .fd = input_fd, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = read_fd, .events = posix.POLL.IN, .revents = 0 },
-    };
-    var buf: [4096]u8 = undefined;
-    var filtered: [8192]u8 = undefined;
-    var last_size = terminal.currentWindowSize();
-    var connection_monitor = ConnectionMonitor{
-        .enabled = options.monitor_connection,
-        .responsiveness_timeout_floor_ms = options.responsiveness_timeout_floor_ms,
-    };
-    var worker_reader = protocol.FrameReader.init(app_allocator.allocator());
-    defer worker_reader.deinit();
-    _ = presentation_guard;
-
-    // PROCESS_EVENT_LOOP: the visible terminal client owns this foreground poll
-    // loop. Dispatcher ownership is a sesshd rule; this process directly
-    // arbitrates stdin, terminal terminal worker frames, and local responsiveness state.
-    while (true) {
-        _ = try posix.poll(&pollfds, connection_monitor.pollTimeoutMs());
-
-        if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (try drainAttachedClientTerminalWorkerFrames(
-                read_fd,
-                write_fd,
-                &worker_reader,
-                &connection_monitor,
-                scrollback_cursor,
-                viewport_offset,
-                pending_repaint,
-                attached_client_end_restore,
-                input_ack_tracker,
-                ended_process_exit_code,
-                app_title_present,
-                initial_cursor_position,
-                initial_draw_alignment_pending,
-            )) |end| return finishAttachedClient(end, attached_client_end_restore);
-        }
-
-        if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            const n = c.read(input_fd, &buf, buf.len);
-            if (n <= 0) return finishAttachedClient(clientHangup(), attached_client_end_restore);
-            io_helpers.noteRead(input_fd, buf[0..@intCast(n)]);
-            const result = input_escape_filter.filter(buf[0..@intCast(n)], &filtered);
-            if (result.bytes.len > 0) {
-                const paste_like = paste_like_input_classifier.classify(result.bytes.len);
-                attached_client_messages.sendInputChunks(write_fd, result.bytes, input_ack_tracker, paste_like) catch |err| switch (err) {
-                    error.WriteFailed => return try finishAttachedClientAfterTerminalWorkerWriteFailed(
-                        read_fd,
-                        &worker_reader,
-                        &connection_monitor,
-                        scrollback_cursor,
-                        viewport_offset,
-                        pending_repaint,
-                        attached_client_end_restore,
-                        input_ack_tracker,
-                        ended_process_exit_code,
-                        app_title_present,
-                        initial_cursor_position,
-                        initial_draw_alignment_pending,
-                    ),
-                    else => return err,
-                };
-                connection_monitor.afterInput();
-            }
-            if (result.end) |end| switch (end) {
-                .disconnect => return finishAttachedClient(clientHangup(), attached_client_end_restore),
-                .help => {
-                    if (try showEscapeHelpModal(
-                        input_fd,
-                        read_fd,
-                        write_fd,
-                        &worker_reader,
-                        viewport_offset,
-                        pending_repaint,
-                        input_ack_tracker,
-                        ended_process_exit_code,
-                    )) |modal_end| return finishAttachedClient(modal_end, attached_client_end_restore);
-                },
-                .repaint => attached_client_messages.sendRepaint(write_fd, "", pending_repaint) catch |err| switch (err) {
-                    error.WriteFailed => return try finishAttachedClientAfterTerminalWorkerWriteFailed(
-                        read_fd,
-                        &worker_reader,
-                        &connection_monitor,
-                        scrollback_cursor,
-                        viewport_offset,
-                        pending_repaint,
-                        attached_client_end_restore,
-                        input_ack_tracker,
-                        ended_process_exit_code,
-                        app_title_present,
-                        initial_cursor_position,
-                        initial_draw_alignment_pending,
-                    ),
-                    else => return err,
-                },
-            };
-        }
-
-        attached_client_messages.maybeSendResize(write_fd, &last_size, scrollback_cursor, viewport_offset, pending_repaint) catch |err| switch (err) {
-            error.WriteFailed => return try finishAttachedClientAfterTerminalWorkerWriteFailed(
-                read_fd,
-                &worker_reader,
-                &connection_monitor,
-                scrollback_cursor,
-                viewport_offset,
-                pending_repaint,
-                attached_client_end_restore,
-                input_ack_tracker,
-                ended_process_exit_code,
-                app_title_present,
-                initial_cursor_position,
-                initial_draw_alignment_pending,
-            ),
-            else => return err,
-        };
-
-        if (checkResizeRepaintTimeout(pending_repaint, viewport_offset, std.time.milliTimestamp())) |end| return end;
-
-        if (connection_monitor.isUnresponsive()) {
-            return .unresponsive;
-        }
-    }
-}
-
-fn showEscapeHelpModal(
-    input_fd: c.fd_t,
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    worker_reader: *protocol.FrameReader,
-    viewport_offset: *i32,
-    pending_repaint: *PendingRepaint,
-    input_ack_tracker: *InputAckTracker,
-    ended_process_exit_code: ?*?u8,
-) !?AttachedClientEnd {
-    // The help overlay is local UI, not part of the remote terminal model. While
-    // it is visible, remote draw frames are discarded and a repaint is requested
-    // after dismissal so the client resumes from the remote terminal process's latest
-    // screen state.
-    const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
-    var overlay_state: ?client_ui.OverlayDrawState = null;
-    var last_size = terminal.currentWindowSize();
-    try drawEscapeHelpOverlay(renderer, last_size, viewport_offset, &overlay_state);
-
-    // PROCESS_EVENT_LOOP: modal foreground terminal UI. While the local help
-    // overlay is visible, this loop owns stdin and terminal-worker-drain decisions until
-    // it requests a repaint and returns to the main attached-client loop.
-    while (true) {
-        var pollfds = [_]posix.pollfd{
-            .{ .fd = input_fd, .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = read_fd, .events = posix.POLL.IN, .revents = 0 },
-        };
-        _ = try posix.poll(&pollfds, 250);
-
-        if ((pollfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            if (try drainEscapeHelpTerminalWorkerFrames(
-                read_fd,
-                write_fd,
-                worker_reader,
-                input_ack_tracker,
-                ended_process_exit_code,
-            )) |end| {
-                try clearEscapeHelpOverlay(renderer, viewport_offset, &overlay_state);
-                return end;
-            }
-        }
-
-        if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-            var input: [256]u8 = undefined;
-            const n = c.read(input_fd, &input, input.len);
-            if (n <= 0) {
-                try clearEscapeHelpOverlay(renderer, viewport_offset, &overlay_state);
-                return clientHangup();
-            }
-            const bytes = input[0..@intCast(n)];
-            io_helpers.noteRead(input_fd, bytes);
-            // The key that dismisses the help screen is local UI input. Do not
-            // forward it to the remote session after the repaint.
-            break;
-        }
-
-        const size = terminal.currentWindowSize();
-        if (size.rows != last_size.rows or size.cols != last_size.cols) {
-            last_size = size;
-            try drawEscapeHelpOverlay(renderer, size, viewport_offset, &overlay_state);
-        }
-    }
-
-    try clearEscapeHelpOverlay(renderer, viewport_offset, &overlay_state);
-    attached_client_messages.sendScreenRepaint(write_fd, pending_repaint) catch |err| switch (err) {
-        error.WriteFailed => return .transport_closed,
-        else => return err,
-    };
-    return null;
+    var loop = try AttachedTerminalLoop.init(input_fd, read_fd, write_fd, session, options);
+    defer loop.deinit();
+    return loop.run();
 }
 
 fn drawEscapeHelpOverlay(
@@ -1376,7 +1585,7 @@ fn drawEscapeHelpOverlay(
     overlay_state.* = next;
 }
 
-fn clearEscapeHelpOverlay(
+fn clearEscapeHelpOverlayDraw(
     renderer: client_renderer.Renderer,
     viewport_offset: *i32,
     overlay_state: *?client_ui.OverlayDrawState,
@@ -1391,44 +1600,28 @@ fn clearEscapeHelpOverlay(
     try renderer.moveCursor(cleared, 0);
 }
 
-fn drainEscapeHelpTerminalWorkerFrames(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    worker_reader: *protocol.FrameReader,
-    input_ack_tracker: *InputAckTracker,
-    ended_process_exit_code: ?*?u8,
-) !?AttachedClientEnd {
-    while (true) {
-        var worker_poll = [_]posix.pollfd{.{
-            .fd = read_fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        _ = try posix.poll(&worker_poll, 0);
-        const revents = worker_poll[0].revents;
-        if ((revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (revents & posix.POLL.IN) == 0)
-        {
-            return .transport_closed;
-        }
-        if ((revents & posix.POLL.IN) == 0) return null;
+const TerminalWorkerFrameAction = union(enum) {
+    blocked,
+    handled,
+    end: AttachedClientEnd,
+};
 
-        if (try handleEscapeHelpTerminalWorkerFrame(read_fd, write_fd, worker_reader, input_ack_tracker, ended_process_exit_code)) |end| return end;
+fn drainEscapeHelpTerminalWorkerFrames(loop: *AttachedTerminalLoop) !?AttachedClientEnd {
+    while (true) {
+        switch (try handleEscapeHelpTerminalWorkerFrame(loop)) {
+            .blocked => return null,
+            .handled => continue,
+            .end => |end| return end,
+        }
     }
 }
 
-fn handleEscapeHelpTerminalWorkerFrame(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    worker_reader: *protocol.FrameReader,
-    input_ack_tracker: *InputAckTracker,
-    ended_process_exit_code: ?*?u8,
-) !?AttachedClientEnd {
-    _ = write_fd;
-    var frame = switch (try worker_reader.readReady(read_fd)) {
-        .blocked, .progress => return null,
+fn handleEscapeHelpTerminalWorkerFrame(loop: *AttachedTerminalLoop) !TerminalWorkerFrameAction {
+    const session = loop.session;
+    var frame = switch (try loop.worker_reader.readReady(loop.read_fd)) {
+        .blocked, .progress => return .blocked,
         .frame => |frame| frame,
-        .eof, .truncated_frame => return .transport_closed,
+        .eof, .truncated_frame => return .{ .end = .transport_closed },
     };
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
@@ -1441,137 +1634,56 @@ fn handleEscapeHelpTerminalWorkerFrame(
                 // remote draws here would interleave two renderers;
                 // repaint-after-dismiss is the boundary that gets us back to a
                 // single source of screen truth.
-                .draw, .repaint_response => return null,
+                .draw, .repaint_response => return .handled,
                 .tty_transcript_chunk => |chunk| {
                     handleTtyTranscriptChunkMessage(chunk);
-                    return null;
+                    return .handled;
                 },
                 .input_ack => |ack| {
-                    _ = handleInputAckMessage(ack, input_ack_tracker);
-                    return null;
+                    _ = handleInputAckMessage(ack, &session.input_ack_tracker);
+                    return .handled;
                 },
                 .session_ended => |ended| {
-                    if (ended_process_exit_code) |exit_code| {
-                        exit_code.* = attached_client_state.processExitCodeFromSessionEnded(ended);
-                    }
-                    return .session_ended;
+                    session.recordSessionEnded(ended);
+                    return .{ .end = .session_ended };
                 },
                 else => return error.UnexpectedFrame,
             }
         },
         .client_daemon => switch (try handleClientDaemonFrame(frame.payload)) {
-            .handled => return null,
-            .transport_closed => return .remote_transport_closed,
+            .handled => return .handled,
+            .transport_closed => return .{ .end = .remote_transport_closed },
             .unexpected => return error.UnexpectedFrame,
         },
         .error_message => {
             try printErrorPayload(frame.payload);
-            return .session_ended;
+            return .{ .end = .session_ended };
         },
         else => return error.UnexpectedFrame,
     }
 }
 
-fn drainAttachedClientTerminalWorkerFrames(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    worker_reader: *protocol.FrameReader,
-    connection_monitor: *ConnectionMonitor,
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    pending_repaint: *PendingRepaint,
-    attached_client_end_restore: *std.ArrayList(u8),
-    input_ack_tracker: *InputAckTracker,
-    ended_process_exit_code: ?*?u8,
-    app_title_present: *?bool,
-    initial_cursor_position: *?terminal.CursorPosition,
-    initial_draw_alignment_pending: *bool,
-) !?AttachedClientEnd {
+fn drainAttachedClientTerminalWorkerFrames(loop: *AttachedTerminalLoop) !?AttachedClientEnd {
     while (true) {
-        var worker_poll = [_]posix.pollfd{.{
-            .fd = read_fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        _ = try posix.poll(&worker_poll, 0);
-        const revents = worker_poll[0].revents;
-        if ((revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (revents & posix.POLL.IN) == 0)
-        {
-            return .transport_closed;
+        switch (try handleAttachedClientTerminalWorkerFrame(loop)) {
+            .blocked => return null,
+            .handled => continue,
+            .end => |end| return end,
         }
-        if ((revents & posix.POLL.IN) == 0) return null;
-
-        if (try handleAttachedClientTerminalWorkerFrame(
-            read_fd,
-            write_fd,
-            worker_reader,
-            connection_monitor,
-            scrollback_cursor,
-            viewport_offset,
-            pending_repaint,
-            attached_client_end_restore,
-            input_ack_tracker,
-            ended_process_exit_code,
-            app_title_present,
-            initial_cursor_position,
-            initial_draw_alignment_pending,
-        )) |end| return end;
     }
 }
 
-fn finishAttachedClientAfterTerminalWorkerWriteFailed(
-    read_fd: c.fd_t,
-    worker_reader: *protocol.FrameReader,
-    connection_monitor: *ConnectionMonitor,
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    pending_repaint: *PendingRepaint,
-    attached_client_end_restore: *std.ArrayList(u8),
-    input_ack_tracker: *InputAckTracker,
-    ended_process_exit_code: ?*?u8,
-    app_title_present: *?bool,
-    initial_cursor_position: *?terminal.CursorPosition,
-    initial_draw_alignment_pending: *bool,
-) !AttachedClientEnd {
-    if (try drainAttachedClientTerminalWorkerFrames(
-        read_fd,
-        @as(c.fd_t, -1),
-        worker_reader,
-        connection_monitor,
-        scrollback_cursor,
-        viewport_offset,
-        pending_repaint,
-        attached_client_end_restore,
-        input_ack_tracker,
-        ended_process_exit_code,
-        app_title_present,
-        initial_cursor_position,
-        initial_draw_alignment_pending,
-    )) |end| return finishAttachedClient(end, attached_client_end_restore);
+fn finishAttachedClientAfterTerminalWorkerWriteFailed(loop: *AttachedTerminalLoop) !AttachedClientEnd {
+    if (try drainAttachedClientTerminalWorkerFrames(loop)) |end| return finishAttachedClient(end, &loop.session.attached_client_end_restore);
     return .transport_closed;
 }
 
-fn handleAttachedClientTerminalWorkerFrame(
-    read_fd: c.fd_t,
-    write_fd: c.fd_t,
-    worker_reader: *protocol.FrameReader,
-    connection_monitor: *ConnectionMonitor,
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    pending_repaint: *PendingRepaint,
-    attached_client_end_restore: *std.ArrayList(u8),
-    input_ack_tracker: *InputAckTracker,
-    ended_process_exit_code: ?*?u8,
-    app_title_present: *?bool,
-    initial_cursor_position: *?terminal.CursorPosition,
-    initial_draw_alignment_pending: *bool,
-) !?AttachedClientEnd {
-    _ = write_fd;
-    var frame = switch (try worker_reader.readReady(read_fd)) {
-        .blocked, .progress => return null,
+fn handleAttachedClientTerminalWorkerFrame(loop: *AttachedTerminalLoop) !TerminalWorkerFrameAction {
+    const session = loop.session;
+    var frame = switch (try loop.worker_reader.readReady(loop.read_fd)) {
+        .blocked, .progress => return .blocked,
         .frame => |frame| frame,
-        .eof, .truncated_frame => return .transport_closed,
+        .eof, .truncated_frame => return .{ .end = .transport_closed },
     };
     defer frame.deinit(app_allocator.allocator());
     switch (frame.message_type) {
@@ -1581,58 +1693,39 @@ fn handleAttachedClientTerminalWorkerFrame(
             const item_payload = item.payload orelse return error.UnexpectedFrame;
             switch (item_payload) {
                 .draw => |draw| {
-                    if (!pending_repaint.active()) {
-                        try handleDrawMessageWithInitialAlignment(
-                            draw,
-                            attached_client_end_restore,
-                            scrollback_cursor,
-                            viewport_offset,
-                            app_title_present,
-                            initial_cursor_position,
-                            initial_draw_alignment_pending,
-                        );
+                    if (!session.pending_repaint.active()) {
+                        try handleDrawMessage(draw, DrawApplyContext.forSession(session, .restore));
                     }
-                    return null;
+                    return .handled;
                 },
                 .repaint_response => |response| {
-                    _ = try handleRepaintResponseMessageWithInitialAlignment(
-                        response,
-                        attached_client_end_restore,
-                        scrollback_cursor,
-                        viewport_offset,
-                        pending_repaint,
-                        app_title_present,
-                        initial_cursor_position,
-                        initial_draw_alignment_pending,
-                    );
-                    return null;
+                    _ = try handleRepaintResponseMessage(response, RepaintApplyContext.forSession(session, .restore));
+                    return .handled;
                 },
                 .tty_transcript_chunk => |chunk| {
                     handleTtyTranscriptChunkMessage(chunk);
-                    return null;
+                    return .handled;
                 },
                 .input_ack => |ack_message| {
-                    const ack = handleInputAckMessage(ack_message, input_ack_tracker);
-                    if (ack.progressed) connection_monitor.noteInputAckProgress(ack.still_pending);
-                    return null;
+                    const ack = handleInputAckMessage(ack_message, &session.input_ack_tracker);
+                    if (ack.progressed) loop.connection_monitor.noteInputAckProgress(ack.still_pending);
+                    return .handled;
                 },
                 .session_ended => |ended| {
-                    if (ended_process_exit_code) |exit_code| {
-                        exit_code.* = attached_client_state.processExitCodeFromSessionEnded(ended);
-                    }
-                    return .session_ended;
+                    session.recordSessionEnded(ended);
+                    return .{ .end = .session_ended };
                 },
                 else => return error.UnexpectedFrame,
             }
         },
         .client_daemon => switch (try handleClientDaemonFrame(frame.payload)) {
-            .handled => return null,
-            .transport_closed => return .remote_transport_closed,
+            .handled => return .handled,
+            .transport_closed => return .{ .end = .remote_transport_closed },
             .unexpected => return error.UnexpectedFrame,
         },
         .error_message => {
             try printErrorPayload(frame.payload);
-            return .session_ended;
+            return .{ .end = .session_ended };
         },
         else => return error.UnexpectedFrame,
     }
@@ -1668,50 +1761,60 @@ fn writeClientCloseBoundary() void {
     io_helpers.writeAll(posix.STDOUT_FILENO, "\r\n") catch {};
 }
 
-fn handleRepaintResponseFrame(
-    payload: []const u8,
+const InitialAlignmentMode = enum {
+    ignore,
+    restore,
+};
+
+const DrawApplyContext = struct {
     attached_client_end_restore: ?*std.ArrayList(u8),
     scrollback_cursor: *ScrollbackCursor,
     viewport_offset: *i32,
+    app_title_present: ?*?bool = null,
+    initial_cursor_position: ?*?terminal.CursorPosition = null,
+    initial_draw_alignment_pending: ?*bool = null,
+
+    fn forSession(session: *AttachedSessionState, initial_alignment: InitialAlignmentMode) DrawApplyContext {
+        return .{
+            .attached_client_end_restore = &session.attached_client_end_restore,
+            .scrollback_cursor = &session.scrollback_cursor,
+            .viewport_offset = &session.viewport_offset,
+            .app_title_present = &session.app_title_present,
+            .initial_cursor_position = if (initial_alignment == .restore) &session.initial_cursor_position else null,
+            .initial_draw_alignment_pending = if (initial_alignment == .restore) &session.initial_draw_alignment_pending else null,
+        };
+    }
+};
+
+const RepaintApplyContext = struct {
+    draw: DrawApplyContext,
     pending_repaint: *PendingRepaint,
-    app_title_present: ?*?bool,
+
+    fn forSession(session: *AttachedSessionState, initial_alignment: InitialAlignmentMode) RepaintApplyContext {
+        return .{
+            .draw = DrawApplyContext.forSession(session, initial_alignment),
+            .pending_repaint = &session.pending_repaint,
+        };
+    }
+};
+
+fn handleRepaintResponseFrame(
+    payload: []const u8,
+    context: RepaintApplyContext,
 ) !bool {
     var response = try protocol.decodePayload(pb.TerminalEmulatorItem.RepaintResponse, app_allocator.allocator(), payload);
     defer response.deinit(app_allocator.allocator());
-    return handleRepaintResponseMessageWithInitialAlignment(
-        response,
-        attached_client_end_restore,
-        scrollback_cursor,
-        viewport_offset,
-        pending_repaint,
-        app_title_present,
-        null,
-        null,
-    );
+    return handleRepaintResponseMessage(response, context);
 }
 
-fn handleRepaintResponseMessageWithInitialAlignment(
+fn handleRepaintResponseMessage(
     response: pb.TerminalEmulatorItem.RepaintResponse,
-    attached_client_end_restore: ?*std.ArrayList(u8),
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    pending_repaint: *PendingRepaint,
-    app_title_present: ?*?bool,
-    initial_cursor_position: ?*?terminal.CursorPosition,
-    initial_draw_alignment_pending: ?*bool,
+    context: RepaintApplyContext,
 ) !bool {
-    if (!pending_repaint.active() or !pending_repaint.matches(response.repaint_request_seq)) return false;
+    if (!context.pending_repaint.active() or !context.pending_repaint.matches(response.repaint_request_seq)) return false;
     const response_draw = response.draw orelse return error.MissingDraw;
-    try handleDrawMessageWithInitialAlignment(
-        response_draw,
-        attached_client_end_restore,
-        scrollback_cursor,
-        viewport_offset,
-        app_title_present,
-        initial_cursor_position,
-        initial_draw_alignment_pending,
-    );
-    pending_repaint.clear();
+    try handleDrawMessage(response_draw, context.draw);
+    context.pending_repaint.clear();
     return true;
 }
 
@@ -1768,66 +1871,30 @@ fn handleInputAckMessage(ack: pb.TerminalEmulatorItem.InputAck, input_ack_tracke
 
 fn handleDrawPayload(
     draw: DrawPayload,
-    attached_client_end_restore: ?*std.ArrayList(u8),
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    app_title_present: ?*?bool,
+    context: DrawApplyContext,
 ) !void {
-    try handleDrawPayloadWithInitialAlignment(
-        draw,
-        attached_client_end_restore,
-        scrollback_cursor,
-        viewport_offset,
-        app_title_present,
-        null,
-        null,
-    );
-}
-
-fn handleDrawPayloadWithInitialAlignment(
-    draw: DrawPayload,
-    attached_client_end_restore: ?*std.ArrayList(u8),
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    app_title_present: ?*?bool,
-    initial_cursor_position: ?*?terminal.CursorPosition,
-    initial_draw_alignment_pending: ?*bool,
-) !void {
-    try restoreInitialCursorAndClearBelow(initial_cursor_position, initial_draw_alignment_pending);
+    try restoreInitialCursorAndClearBelow(context.initial_cursor_position, context.initial_draw_alignment_pending);
     try io_helpers.writeAll(posix.STDOUT_FILENO, draw.draw_bytes);
-    if (attached_client_end_restore) |target| {
+    if (context.attached_client_end_restore) |target| {
         if (draw.attached_client_end_restore_bytes) |restore| {
             target.clearRetainingCapacity();
             try target.appendSlice(app_allocator.allocator(), restore);
         }
     }
-    try scrollback_cursor.set(draw.scrollback_cursor);
-    viewport_offset.* = draw.viewport_offset;
-    if (app_title_present) |target| {
+    try context.scrollback_cursor.set(draw.scrollback_cursor);
+    context.viewport_offset.* = draw.viewport_offset;
+    if (context.app_title_present) |target| {
         if (draw.app_title_present) |present| target.* = present;
     }
 }
 
-fn handleDrawMessageWithInitialAlignment(
+fn handleDrawMessage(
     message: pb.TerminalEmulatorItem.Draw,
-    attached_client_end_restore: ?*std.ArrayList(u8),
-    scrollback_cursor: *ScrollbackCursor,
-    viewport_offset: *i32,
-    app_title_present: ?*?bool,
-    initial_cursor_position: ?*?terminal.CursorPosition,
-    initial_draw_alignment_pending: ?*bool,
+    context: DrawApplyContext,
 ) !void {
     const draw = try drawPayloadFromMessage(message);
     defer freeDrawPayload(draw);
-    try handleDrawPayloadWithInitialAlignment(
-        draw,
-        attached_client_end_restore,
-        scrollback_cursor,
-        viewport_offset,
-        app_title_present,
-        initial_cursor_position,
-        initial_draw_alignment_pending,
-    );
+    try handleDrawPayload(draw, context);
 }
 
 fn restoreInitialCursorAndClearBelow(

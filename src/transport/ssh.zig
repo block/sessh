@@ -139,6 +139,15 @@ fn remoteSessionConfig(
     return result;
 }
 
+pub const RunRemoteNewSessionOptions = struct {
+    exe: []const u8,
+    ssh_options: []const []const u8,
+    host: []const u8,
+    common: CommonSessionOptions,
+    new: RemoteNewSession,
+    failure_policy: BootstrapFailurePolicy,
+};
+
 /// Start the ssh transport by running the bootstrapper as the remote command.
 ///
 /// The bootstrapper installs or finds the remote sessh binary, then execs the
@@ -148,14 +157,9 @@ fn remoteSessionConfig(
 /// current binary for same-platform development tests.
 pub fn runRemoteNewSession(
     allocator: std.mem.Allocator,
-    exe: []const u8,
-    ssh_options: []const []const u8,
-    host: []const u8,
-    common: CommonSessionOptions,
-    new: RemoteNewSession,
-    failure_policy: BootstrapFailurePolicy,
+    options: RunRemoteNewSessionOptions,
 ) !void {
-    var session_config = remoteSessionConfig(allocator, common, ssh_options) catch |err| {
+    var session_config = remoteSessionConfig(allocator, options.common, options.ssh_options) catch |err| {
         try user_error.printLine("invalid config: {t}", .{err});
         return process_exit.request(64);
     };
@@ -168,18 +172,18 @@ pub fn runRemoteNewSession(
         };
     }
 
-    const target = SshTarget{ .options = ssh_options, .host = host };
+    const target = SshTarget{ .options = options.ssh_options, .host = options.host };
     const stdin_is_tty = c.isatty(posix.STDIN_FILENO) != 0;
     const stdout_is_tty = c.isatty(posix.STDOUT_FILENO) != 0;
-    if (sessh_routing.shouldUseProxyStream(new, session_config.common, stdin_is_tty, stdout_is_tty)) {
+    if (sessh_routing.shouldUseProxyStream(options.new, session_config.common, stdin_is_tty, stdout_is_tty)) {
         if (session_config.common.capture_tty_transcript != null) {
             try user_error.line("--capture-tty-transcript is not supported with proxy stream mode");
             return process_exit.request(64);
         }
-        try runProxyStreamSsh(allocator, exe, target, session_config.common, session_config.daemon_dir_name, new);
+        try runProxyStreamSsh(allocator, options.exe, target, session_config.common, session_config.daemon_dir_name, options.new);
     }
 
-    const shell_command = try shellCommandFromRemoteArgs(allocator, new.shell_command_args);
+    const shell_command = try shellCommandFromRemoteArgs(allocator, options.new.shell_command_args);
     defer if (shell_command) |command| allocator.free(command);
 
     var local_terminal_probe = attached_client.LocalTerminalProbe.start(allocator);
@@ -194,7 +198,7 @@ pub fn runRemoteNewSession(
 
     var transport = try openTerminalDaemonTransport(
         allocator,
-        exe,
+        options.exe,
         target,
         session_config.common,
         session_config.daemon_dir_name,
@@ -208,7 +212,7 @@ pub fn runRemoteNewSession(
         transport.writeFd(),
         session_config.common.scrollback_row_count,
         new_guid,
-        new.command_argv,
+        options.new.command_argv,
         shell_command,
         session_config.disconnected_reap_ms,
         &local_terminal,
@@ -219,13 +223,13 @@ pub fn runRemoteNewSession(
                 try user_error.line("--capture-tty-transcript requires a compatible sessh remote");
                 return process_exit.request(1);
             }
-            if (new.command_argv.len > 0 or shell_command != null) {
+            if (options.new.command_argv.len > 0 or shell_command != null) {
                 try user_error.line("persistent command sessions require a compatible sessh remote");
                 return process_exit.request(1);
             }
             try runPlainSshFallbackAfterVersionMismatch(allocator, target);
         }
-        if (err == error.UnsupportedRemotePlatform and failure_policy.allow_plain_ssh_fallback) {
+        if (err == error.UnsupportedRemotePlatform and options.failure_policy.allow_plain_ssh_fallback) {
             transport.close();
             try runPlainSshFallback(allocator, target, null);
         }
@@ -238,7 +242,7 @@ pub fn runRemoteNewSession(
     session.setTitleFallback(target.host);
     try runAttachedRemoteClient(
         allocator,
-        exe,
+        options.exe,
         target,
         session_config,
         &transport,
@@ -711,14 +715,14 @@ fn runProxyStreamSsh(
         .use_daemon_control = false,
         .wrap_visible_ssh = false,
         .client_ctrl_r = false,
-    } else diagnostics_policy.proxyStreamPlan(
-        target.options,
-        common.filter_level,
-        new.tty_request,
-        remote_command_args,
-        c.isatty(posix.STDIN_FILENO) != 0,
-        c.isatty(posix.STDOUT_FILENO) != 0,
-    );
+    } else diagnostics_policy.proxyStreamPlan(.{
+        .ssh_options = target.options,
+        .filter_level = common.filter_level,
+        .tty_request = new.tty_request,
+        .shell_command_args = remote_command_args,
+        .stdin_is_tty = c.isatty(posix.STDIN_FILENO) != 0,
+        .stdout_is_tty = c.isatty(posix.STDOUT_FILENO) != 0,
+    });
     var diagnostics_guid: ?[]u8 = null;
     defer if (diagnostics_guid) |guid| allocator.free(guid);
     var client_control_fd: c.fd_t = -1;
@@ -734,11 +738,13 @@ fn runProxyStreamSsh(
     }
     const auto_diagnostics_file = try diagnostics_policy.autoProxyDiagnosticsFile(
         allocator,
-        common.diagnostics_file,
-        diagnostics_plan.use_daemon_control,
-        diagnostics_plan.wrap_visible_ssh,
-        posix.STDIN_FILENO,
-        posix.STDERR_FILENO,
+        .{
+            .explicit_diagnostics_file = common.diagnostics_file,
+            .use_daemon_control = diagnostics_plan.use_daemon_control,
+            .wrap_visible_ssh = diagnostics_plan.wrap_visible_ssh,
+            .stdin_fd = posix.STDIN_FILENO,
+            .stderr_fd = posix.STDERR_FILENO,
+        },
     );
     defer if (auto_diagnostics_file) |path| allocator.free(path);
     const diagnostics_file_path = common.diagnostics_file orelse auto_diagnostics_file;
@@ -749,19 +755,18 @@ fn runProxyStreamSsh(
     var namespace_executables = try daemon_executable.namespaceExecutablePaths(allocator, proxy_daemon_dir_name);
     defer namespace_executables.deinit();
 
-    const proxy_command_option = try proxy_command.commandOption(
-        allocator,
-        namespace_executables.proxy,
-        target.options,
-        diagnostics_guid,
-        diagnostics_plan.command_level,
-        common.diagnostics_level,
-        proxy_client_ctrl_r,
-        diagnostics_file_path,
-        common.bootstrap,
-        daemon_dir_name,
-        use_fd_pass,
-    );
+    const proxy_command_option = try proxy_command.commandOption(allocator, .{
+        .exe = namespace_executables.proxy,
+        .ssh_options = target.options,
+        .diagnostics_guid = diagnostics_guid,
+        .filter_level = diagnostics_plan.command_level,
+        .diagnostics_level = common.diagnostics_level,
+        .client_ctrl_r = proxy_client_ctrl_r,
+        .diagnostics_file = diagnostics_file_path,
+        .bootstrap = common.bootstrap,
+        .daemon_dir_name = daemon_dir_name,
+        .use_fd_pass = use_fd_pass,
+    });
     defer allocator.free(proxy_command_option);
 
     const default_options = defaultSshOptionsLen(target);

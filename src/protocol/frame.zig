@@ -3,6 +3,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const c = std.c;
 const posix = std.posix;
 
+const core_fds = @import("../core/fds.zig");
 const fd_passing = @import("../core/fd_passing.zig");
 const io = @import("../core/io.zig");
 const test_helpers = @import("test_helpers.zig");
@@ -469,19 +470,11 @@ const ReadSomeResult = union(enum) {
 
 fn readSome(fd: c.fd_t, buf: []u8, mode: FrameReadMode) !ReadSomeResult {
     if (buf.len == 0) return .{ .bytes = buf };
-    const original_flags = if (mode == .ready) flags: {
-        const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-        if (flags < 0) return error.ReadFailed;
-        break :flags flags;
-    } else 0;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    const changed_flags = mode == .ready and (original_flags & nonblocking_flag) == 0;
-    if (changed_flags and c.fcntl(fd, c.F.SETFL, original_flags | nonblocking_flag) < 0) {
-        return error.ReadFailed;
-    }
-    defer {
-        if (changed_flags) _ = c.fcntl(fd, c.F.SETFL, original_flags);
-    }
+    var flags_guard = if (mode == .ready)
+        core_fds.StatusFlagsGuard.setNonBlocking(fd) catch return error.ReadFailed
+    else
+        core_fds.StatusFlagsGuard{ .fd = fd, .original = 0 };
+    defer flags_guard.restore();
 
     while (true) {
         const n = c.read(fd, buf.ptr, buf.len);

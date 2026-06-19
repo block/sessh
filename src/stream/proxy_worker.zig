@@ -294,60 +294,14 @@ const StreamAttachedClient = struct {
         const state = self.state;
         if (state.complete()) return .complete;
 
-        // PROCESS_EVENT_LOOP: foreground proxy-stream client loop. It owns the
-        // raw byte source, mux transport, diagnostics control, replacement
-        // listener, and reconnect input for this process; sesshd-owned proxy
-        // streams use the daemon dispatcher instead.
         const now_before_poll_ms = nowMillis();
-        var pollfds: [1 + 1 + 1 + 1 + 2]posix.pollfd = undefined;
-        var count: usize = 0;
-        const transport_index = count;
-        pollfds[count] = .{ .fd = self.transport_read_fd, .events = posix.POLL.IN, .revents = 0 };
-        count += 1;
-
-        var source_poll_index: ?usize = null;
-        const source = self.options.source;
-        if (source.fd >= 0 and !state.outbound.outbound_eof and state.bufferedBytes() < max_buffered_bytes) {
-            source_poll_index = count;
-            pollfds[count] = .{ .fd = source.fd, .events = source_poll_events, .revents = 0 };
-            count += 1;
-        }
-
-        var replacement_index: ?usize = null;
-        if (self.options.replacement_listen_fd >= 0) {
-            replacement_index = count;
-            pollfds[count] = .{ .fd = self.options.replacement_listen_fd, .events = posix.POLL.IN, .revents = 0 };
-            count += 1;
-        }
-
-        var control_index: ?usize = null;
-        if (self.options.control_fd >= 0 and self.options.control_input != null) {
-            control_index = count;
-            pollfds[count] = .{ .fd = self.options.control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-            count += 1;
-        }
-        var reconnect_input_index: ?usize = null;
-        if (self.options.reconnect_input_fd >= 0 and self.options.control_input != null) {
-            if (self.options.control_input) |control| {
-                if (reconnectInputPollEnabled(control)) {
-                    reconnect_input_index = count;
-                    pollfds[count] = .{ .fd = self.options.reconnect_input_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-                    count += 1;
-                }
-            }
-        }
-        var interrupt_index: ?usize = null;
-        if (self.interrupt_fd >= 0) {
-            interrupt_index = count;
-            pollfds[count] = .{ .fd = self.interrupt_fd, .events = posix.POLL.IN, .revents = 0 };
-            count += 1;
-        }
-
         const timeout_ms = self.liveness.pollTimeoutMs(now_before_poll_ms, requested_timeout_ms);
-        const ready = try posix.poll(pollfds[0..count], timeout_ms);
+        var poll = try StreamAttachedClientStepPoll.init(self);
+        defer poll.deinit();
+        try poll.run(timeout_ms);
         const now_after_poll_ms = nowMillis();
 
-        if (ready == 0) {
+        if (!poll.hasFdEvent()) {
             if (self.liveness.timedOut(now_after_poll_ms)) return .unresponsive;
             if (self.liveness.pingDue(now_after_poll_ms)) {
                 protocol.sendPing(self.transport_write_fd) catch return .transport_closed;
@@ -356,35 +310,31 @@ const StreamAttachedClient = struct {
             return .idle;
         }
 
-        if (replacement_index) |index| {
-            if ((pollfds[index].revents & posix.POLL.IN) != 0) {
+        if (poll.replacement_event) |replacement_event| {
+            if (replacement_event.readable) {
                 if (acceptWorkerClient(self.options.replacement_listen_fd)) |fd| return .{ .replacement = fd };
             }
         }
-        if (interrupt_index) |index| {
-            if (pollfds[index].revents != 0) return .interrupted;
+        if (poll.interrupt_event != null) {
+            return .interrupted;
         }
-        if (control_index) |index| {
-            if (pollfds[index].revents != 0) {
-                if (self.options.control_input) |control| {
-                    if (!readControlInput(self.options.control_fd, control, &self.control_reader)) self.options.control_fd = -1;
-                }
+        if (poll.control_event != null) {
+            if (self.options.control_input) |control| {
+                if (!readControlInput(self.options.control_fd, control, &self.control_reader)) self.options.control_fd = -1;
             }
         }
-        if (reconnect_input_index) |index| {
-            if (pollfds[index].revents != 0) {
-                if (self.options.control_input) |control| {
-                    readReconnectControlInput(self.options.reconnect_input_fd, control);
-                }
+        if (poll.reconnect_input_event != null) {
+            if (self.options.control_input) |control| {
+                readReconnectControlInput(self.options.reconnect_input_fd, control);
             }
         }
 
-        if ((pollfds[transport_index].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[transport_index].revents & posix.POLL.IN) == 0)
-        {
-            return .transport_closed;
+        if (poll.transport_event) |transport_event| {
+            if ((transport_event.hangup or transport_event.error_event or transport_event.invalid) and !transport_event.readable) {
+                return .transport_closed;
+            }
         }
-        if ((pollfds[transport_index].revents & posix.POLL.IN) != 0) {
+        if (if (poll.transport_event) |transport_event| transport_event.readable else false) {
             const frame = switch (self.transport_reader.readReady(self.transport_read_fd) catch return .transport_closed) {
                 .blocked => return .idle,
                 .progress => {
@@ -422,8 +372,8 @@ const StreamAttachedClient = struct {
         }
 
         const source_ready = blk: {
-            const poll_index = source_poll_index orelse break :blk false;
-            if (pollfds[poll_index].revents != 0) {
+            const source = self.options.source;
+            if (poll.source_event != null) {
                 try readStreamSource(state, source);
                 break :blk true;
             }
@@ -448,6 +398,134 @@ const StreamAttachedClient = struct {
         return true;
     }
 };
+
+const StreamAttachedClientStepPoll = struct {
+    poll_dispatcher: dispatcher.Dispatcher,
+    client: *StreamAttachedClient,
+    transport_watch_id: ?dispatcher.FdWatchId = null,
+    source_watch_id: ?dispatcher.FdWatchId = null,
+    replacement_watch_id: ?dispatcher.FdWatchId = null,
+    control_watch_id: ?dispatcher.FdWatchId = null,
+    reconnect_input_watch_id: ?dispatcher.FdWatchId = null,
+    interrupt_watch_id: ?dispatcher.FdWatchId = null,
+    timer_watch_id: ?dispatcher.TimerWatchId = null,
+    transport_event: ?dispatcher.FdEvent = null,
+    source_event: ?dispatcher.FdEvent = null,
+    replacement_event: ?dispatcher.FdEvent = null,
+    control_event: ?dispatcher.FdEvent = null,
+    reconnect_input_event: ?dispatcher.FdEvent = null,
+    interrupt_event: ?dispatcher.FdEvent = null,
+    timer_fired: bool = false,
+
+    fn init(client: *StreamAttachedClient) !StreamAttachedClientStepPoll {
+        return .{
+            .poll_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator()),
+            .client = client,
+        };
+    }
+
+    fn deinit(self: *StreamAttachedClientStepPoll) void {
+        self.poll_dispatcher.deinit();
+    }
+
+    fn run(self: *StreamAttachedClientStepPoll, timeout_ms: i32) !void {
+        self.transport_watch_id = try self.poll_dispatcher.watchFd(self.client.transport_read_fd, .{ .readable = true }, .{
+            .ctx = self,
+            .callback = handleStreamAttachedClientStepPollEvent,
+        });
+
+        const state = self.client.state;
+        const source = self.client.options.source;
+        if (source.fd >= 0 and !state.outbound.outbound_eof and state.bufferedBytes() < max_buffered_bytes) {
+            self.source_watch_id = try self.poll_dispatcher.watchFd(source.fd, .{ .readable = true }, .{
+                .ctx = self,
+                .callback = handleStreamAttachedClientStepPollEvent,
+            });
+        }
+        if (self.client.options.replacement_listen_fd >= 0) {
+            self.replacement_watch_id = try self.poll_dispatcher.watchFd(self.client.options.replacement_listen_fd, .{ .readable = true }, .{
+                .ctx = self,
+                .callback = handleStreamAttachedClientStepPollEvent,
+            });
+        }
+        if (self.client.options.control_fd >= 0 and self.client.options.control_input != null) {
+            self.control_watch_id = try self.poll_dispatcher.watchFd(self.client.options.control_fd, .{ .readable = true }, .{
+                .ctx = self,
+                .callback = handleStreamAttachedClientStepPollEvent,
+            });
+        }
+        if (self.client.options.reconnect_input_fd >= 0 and self.client.options.control_input != null) {
+            if (self.client.options.control_input) |control| {
+                if (reconnectInputPollEnabled(control)) {
+                    self.reconnect_input_watch_id = try self.poll_dispatcher.watchFd(self.client.options.reconnect_input_fd, .{ .readable = true }, .{
+                        .ctx = self,
+                        .callback = handleStreamAttachedClientStepPollEvent,
+                    });
+                }
+            }
+        }
+        if (self.client.interrupt_fd >= 0) {
+            self.interrupt_watch_id = try self.poll_dispatcher.watchFd(self.client.interrupt_fd, .{ .readable = true }, .{
+                .ctx = self,
+                .callback = handleStreamAttachedClientStepPollEvent,
+            });
+        }
+        if (timeout_ms >= 0) {
+            self.timer_watch_id = try self.poll_dispatcher.watchTimerAfter(@intCast(timeout_ms), .{
+                .ctx = self,
+                .callback = handleStreamAttachedClientStepPollEvent,
+            });
+        }
+        try self.poll_dispatcher.run();
+    }
+
+    fn hasFdEvent(self: *const StreamAttachedClientStepPoll) bool {
+        return self.transport_event != null or
+            self.source_event != null or
+            self.replacement_event != null or
+            self.control_event != null or
+            self.reconnect_input_event != null or
+            self.interrupt_event != null;
+    }
+
+    fn noteFdEvent(self: *StreamAttachedClientStepPoll, id: dispatcher.WatchId, event: dispatcher.FdEvent) void {
+        if (reconnectInputPollWatchMatches(id, self.transport_watch_id)) {
+            self.transport_event = event;
+        } else if (reconnectInputPollWatchMatches(id, self.source_watch_id)) {
+            self.source_event = event;
+        } else if (reconnectInputPollWatchMatches(id, self.replacement_watch_id)) {
+            self.replacement_event = event;
+        } else if (reconnectInputPollWatchMatches(id, self.control_watch_id)) {
+            self.control_event = event;
+        } else if (reconnectInputPollWatchMatches(id, self.reconnect_input_watch_id)) {
+            self.reconnect_input_event = event;
+        } else if (reconnectInputPollWatchMatches(id, self.interrupt_watch_id)) {
+            self.interrupt_event = event;
+        }
+    }
+};
+
+fn handleStreamAttachedClientStepPollEvent(
+    ctx: *anyopaque,
+    _: *dispatcher.Dispatcher,
+    id: dispatcher.WatchId,
+    event: dispatcher.Event,
+) !void {
+    const poll: *StreamAttachedClientStepPoll = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .fd => |fd_event| {
+            poll.noteFdEvent(id, fd_event);
+            poll.poll_dispatcher.stop();
+        },
+        .timer => {
+            if (reconnectInputPollTimerMatches(id, poll.timer_watch_id)) {
+                poll.timer_watch_id = null;
+                poll.timer_fired = true;
+                poll.poll_dispatcher.stop();
+            }
+        },
+    }
+}
 
 fn readStreamSource(state: *StreamState, source: StreamSource) !void {
     if (state.outbound.outbound_eof) return;
@@ -513,14 +591,6 @@ fn readStreamSourceFdNonBlocking(source: StreamSource, buf: []u8) !ReadSomeResul
     return readSomeNonBlocking(source.fd, buf);
 }
 
-fn setNonBlockingFd(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    if ((flags & nonblocking_flag) != 0) return;
-    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-}
-
 fn setCloseOnExec(fd: c.fd_t) !void {
     const flags = c.fcntl(fd, c.F.GETFD, @as(c_int, 0));
     if (flags < 0) return error.FcntlFailed;
@@ -543,8 +613,8 @@ const LocalStreamInterrupt = struct {
         };
         errdefer interrupt.closeFds();
 
-        try setNonBlockingFd(interrupt.read_fd);
-        try setNonBlockingFd(interrupt.write_fd);
+        try core_fds.setNonBlocking(interrupt.read_fd);
+        try core_fds.setNonBlocking(interrupt.write_fd);
         try setCloseOnExec(interrupt.read_fd);
         try setCloseOnExec(interrupt.write_fd);
 
@@ -674,39 +744,87 @@ fn waitForReplacementWhileDisconnected(
     replacement_listen_fd: c.fd_t,
     options: *const StreamAttachedClientOptions,
 ) !c.fd_t {
-    // PROCESS_EVENT_LOOP: remote proxy worker without an active transport.
-    // It must keep draining its remote fd and accepting a replacement transport;
-    // this is the process's main loop, not a helper-owned Dispatcher.
     while (true) {
         // The remote proxy process is durable even when no ssh transport is currently
         // attached. It must keep draining remote fds into the offset-tracked
         // buffers; otherwise the remote TCP peer can block before a
         // replacement transport attaches.
-        var pollfds: [1 + 1]posix.pollfd = undefined;
-        var count: usize = 0;
-        const replacement_index = count;
-        pollfds[count] = .{ .fd = replacement_listen_fd, .events = posix.POLL.IN, .revents = 0 };
-        count += 1;
-
-        var source_poll_index: ?usize = null;
-        const source = options.source;
-        if (source.fd >= 0 and !state.outbound.outbound_eof and state.bufferedBytes() < max_buffered_bytes) {
-            source_poll_index = count;
-            pollfds[count] = .{ .fd = source.fd, .events = source_poll_events, .revents = 0 };
-            count += 1;
-        }
-
-        _ = try posix.poll(pollfds[0..count], -1);
-        if ((pollfds[replacement_index].revents & posix.POLL.IN) != 0) {
+        var poll = try DisconnectedReplacementPoll.init(state, replacement_listen_fd, options);
+        defer poll.deinit();
+        try poll.run();
+        if (if (poll.replacement_event) |event| event.readable else false) {
             if (acceptWorkerClient(replacement_listen_fd)) |fd| return fd;
         }
 
-        if (source_poll_index) |poll_index| {
-            if (pollfds[poll_index].revents != 0) {
-                try readStreamSource(state, source);
-            }
+        if (poll.source_event != null) {
+            try readStreamSource(state, options.source);
         }
         try drainStreamSourcesNonBlocking(state, options);
+    }
+}
+
+const DisconnectedReplacementPoll = struct {
+    poll_dispatcher: dispatcher.Dispatcher,
+    state: *StreamState,
+    replacement_listen_fd: c.fd_t,
+    options: *const StreamAttachedClientOptions,
+    replacement_watch_id: ?dispatcher.FdWatchId = null,
+    source_watch_id: ?dispatcher.FdWatchId = null,
+    replacement_event: ?dispatcher.FdEvent = null,
+    source_event: ?dispatcher.FdEvent = null,
+
+    fn init(
+        state: *StreamState,
+        replacement_listen_fd: c.fd_t,
+        options: *const StreamAttachedClientOptions,
+    ) !DisconnectedReplacementPoll {
+        return .{
+            .poll_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator()),
+            .state = state,
+            .replacement_listen_fd = replacement_listen_fd,
+            .options = options,
+        };
+    }
+
+    fn deinit(self: *DisconnectedReplacementPoll) void {
+        self.poll_dispatcher.deinit();
+    }
+
+    fn run(self: *DisconnectedReplacementPoll) !void {
+        self.replacement_watch_id = try self.poll_dispatcher.watchFd(self.replacement_listen_fd, .{ .readable = true }, .{
+            .ctx = self,
+            .callback = handleDisconnectedReplacementPollEvent,
+        });
+
+        const source = self.options.source;
+        if (source.fd >= 0 and !self.state.outbound.outbound_eof and self.state.bufferedBytes() < max_buffered_bytes) {
+            self.source_watch_id = try self.poll_dispatcher.watchFd(source.fd, .{ .readable = true }, .{
+                .ctx = self,
+                .callback = handleDisconnectedReplacementPollEvent,
+            });
+        }
+
+        try self.poll_dispatcher.run();
+    }
+};
+
+fn handleDisconnectedReplacementPollEvent(
+    ctx: *anyopaque,
+    _: *dispatcher.Dispatcher,
+    id: dispatcher.WatchId,
+    event: dispatcher.Event,
+) !void {
+    const poll: *DisconnectedReplacementPoll = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .fd => |fd_event| {
+            if (reconnectInputPollWatchMatches(id, poll.replacement_watch_id)) {
+                poll.replacement_event = fd_event;
+            } else if (reconnectInputPollWatchMatches(id, poll.source_watch_id)) {
+                poll.source_event = fd_event;
+            }
+            poll.poll_dispatcher.stop();
+        },
+        .timer => {},
     }
 }
 
@@ -730,8 +848,8 @@ pub fn runLocalStream(
 ) !u8 {
     const Transport = @TypeOf(start_transport.start() catch unreachable);
     var control_fd = options.control_fd;
-    if (control_fd >= 0) setNonBlockingFd(control_fd) catch {};
-    if (options.reconnect_input_fd >= 0) setNonBlockingFd(options.reconnect_input_fd) catch {};
+    if (control_fd >= 0) core_fds.setNonBlocking(control_fd) catch {};
+    if (options.reconnect_input_fd >= 0) core_fds.setNonBlocking(options.reconnect_input_fd) catch {};
 
     var state = StreamState.init(allocator, options.guid, options.proxy_host, options.proxy_port);
     defer state.deinit();
@@ -750,6 +868,15 @@ pub fn runLocalStream(
     defer reconnect_status.deinit();
     var local_interrupt = try LocalStreamInterrupt.install();
     defer local_interrupt.deinit();
+    var reconnect_context = ProxyReconnectControlContext.init(.{
+        .state = &state,
+        .source_fd = options.source_fd,
+        .reconnect_input_fd = options.reconnect_input_fd,
+        .control_fd = &control_fd,
+        .input_control = &input_control,
+        .interrupt = &local_interrupt,
+    });
+    defer reconnect_context.deinit();
 
     var attempt: usize = 0;
     var had_transport = false;
@@ -768,7 +895,7 @@ pub fn runLocalStream(
             }
             if (try disconnectedSourceClosed(&state, options.source_fd, &input_control)) return 0;
             const delay_ms = reconnect.delayMs(attempt);
-            const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, options.reconnect_input_fd, &control_fd, &input_control, &local_interrupt);
+            const action = waitBeforeReconnect(&reconnect_status, delay_ms, &reconnect_context);
             if (options.reset_on_source_eof and state.source_eof) return 0;
             if (action == .disconnect) return 0;
             if (action == .interrupt) return 255;
@@ -839,7 +966,7 @@ pub fn runLocalStream(
                         const new_transport = start_transport.start() catch |err| {
                             client_log.userDiagnosticInfo("stream reconnect failed: transport: {t}", .{err});
                             const delay_ms = reconnect.delayMs(attempt);
-                            const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, options.reconnect_input_fd, &control_fd, &input_control, &local_interrupt);
+                            const action = waitBeforeReconnect(&reconnect_status, delay_ms, &reconnect_context);
                             if (action == .disconnect) return 0;
                             if (action == .interrupt) return 255;
                             attempt = reconnect.nextAttempt(attempt, action == .reconnect);
@@ -898,7 +1025,7 @@ pub fn runLocalStream(
         }
 
         const delay_ms = reconnect.delayMs(attempt);
-        const action = waitBeforeReconnect(&reconnect_status, delay_ms, &state, options.source_fd, options.reconnect_input_fd, &control_fd, &input_control, &local_interrupt);
+        const action = waitBeforeReconnect(&reconnect_status, delay_ms, &reconnect_context);
         if (options.reset_on_source_eof and state.source_eof) return 0;
         if (action == .disconnect) return 0;
         if (action == .interrupt) return 255;
@@ -1178,13 +1305,7 @@ fn sendEof(state: *StreamState, fd: c.fd_t, offset: u64) !void {
 }
 
 fn sendReset(state: *StreamState, fd: c.fd_t, code: []const u8, message: []const u8) !void {
-    try sendMuxStreamFrame(state.allocator, fd, .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .reset = .{
-            .code = code,
-            .message = message,
-        } },
-    });
+    try protocol.sendMuxStreamResetFrame(state.allocator, fd, proxy_mux_stream_id, code, message);
 }
 
 fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
@@ -1257,15 +1378,8 @@ fn readSome(fd: c.fd_t, buf: []u8) !ReadSomeResult {
 }
 
 fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) !ReadSomeResult {
-    const original_flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (original_flags < 0) return error.StreamReadFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    const changed_flags = (original_flags & nonblocking_flag) == 0;
-    if (changed_flags and c.fcntl(fd, c.F.SETFL, original_flags | nonblocking_flag) < 0) return error.StreamReadFailed;
-    defer {
-        if (changed_flags) _ = c.fcntl(fd, c.F.SETFL, original_flags);
-    }
-
+    var flags_guard = core_fds.StatusFlagsGuard.setNonBlocking(fd) catch return error.StreamReadFailed;
+    defer flags_guard.restore();
     return readSome(fd, buf);
 }
 
@@ -1289,24 +1403,52 @@ fn elapsedMs(start_ms: u64, end_ms: u64) u64 {
     return if (end_ms >= start_ms) end_ms - start_ms else 0;
 }
 
-fn waitBeforeReconnect(
-    status: *StreamReconnectStatus,
-    delay_ms: u64,
+const ProxyReconnectControlContext = struct {
     state: *StreamState,
     source_fd: c.fd_t,
     reconnect_input_fd: c.fd_t,
     control_fd: *c.fd_t,
     input_control: *StreamInputControl,
+    control_reader: proxy_diagnostics.Reader,
     interrupt: ?*LocalStreamInterrupt,
+
+    const Init = struct {
+        state: *StreamState,
+        source_fd: c.fd_t,
+        reconnect_input_fd: c.fd_t,
+        control_fd: *c.fd_t,
+        input_control: *StreamInputControl,
+        interrupt: ?*LocalStreamInterrupt,
+    };
+
+    fn init(init_options: Init) ProxyReconnectControlContext {
+        return .{
+            .state = init_options.state,
+            .source_fd = init_options.source_fd,
+            .reconnect_input_fd = init_options.reconnect_input_fd,
+            .control_fd = init_options.control_fd,
+            .input_control = init_options.input_control,
+            .control_reader = proxy_diagnostics.Reader.init(init_options.state.allocator),
+            .interrupt = init_options.interrupt,
+        };
+    }
+
+    fn deinit(self: *ProxyReconnectControlContext) void {
+        self.control_reader.deinit();
+    }
+};
+
+fn waitBeforeReconnect(
+    status: *StreamReconnectStatus,
+    delay_ms: u64,
+    control: *ProxyReconnectControlContext,
 ) StreamControlAction {
     var remaining_ms = delay_ms;
-    var control_reader = proxy_diagnostics.Reader.init(state.allocator);
-    defer control_reader.deinit();
     while (remaining_ms > 0) {
         status.showRetry(remaining_ms);
-        input_control.status_visible = true;
+        control.input_control.status_visible = true;
         const step_ms = @min(remaining_ms, 1_000);
-        const action = pollReconnectInput(state, source_fd, reconnect_input_fd, control_fd, input_control, &control_reader, interrupt, @intCast(step_ms));
+        const action = pollReconnectInput(control, @intCast(step_ms));
         if (action == .help) {
             status.showEscapeHelp();
             continue;
@@ -1315,7 +1457,7 @@ fn waitBeforeReconnect(
         remaining_ms -= step_ms;
         status.flushDiagnostics();
     }
-    const action = input_control.consumeAction();
+    const action = control.input_control.consumeAction();
     if (action == .help) {
         status.showEscapeHelp();
         return .none;
@@ -1324,78 +1466,136 @@ fn waitBeforeReconnect(
 }
 
 fn pollReconnectInput(
-    state: *StreamState,
-    source_fd: c.fd_t,
-    reconnect_input_fd: c.fd_t,
-    control_fd: *c.fd_t,
-    input_control: *StreamInputControl,
-    control_reader: *proxy_diagnostics.Reader,
-    interrupt: ?*LocalStreamInterrupt,
+    control: *ProxyReconnectControlContext,
     timeout_ms: i32,
 ) StreamControlAction {
-    // BLOCKING_POLL: foreground proxy-stream reconnect/control helper. It is
-    // called by the stream client loop to multiplex local reconnect input and
-    // diagnostics control without creating a second process dispatcher.
-    var pollfds: [4]posix.pollfd = undefined;
-    var count: usize = 0;
-    var interrupt_index: ?usize = null;
-    if (interrupt) |local_interrupt| {
-        if (local_interrupt.read_fd >= 0) {
-            interrupt_index = count;
-            pollfds[count] = .{ .fd = local_interrupt.read_fd, .events = posix.POLL.IN, .revents = 0 };
-            count += 1;
-        }
-    }
-    var input_index: ?usize = null;
-    if (source_fd >= 0 and reconnectInputPollEnabled(input_control)) {
-        input_index = count;
-        pollfds[count] = .{ .fd = source_fd, .events = posix.POLL.IN, .revents = 0 };
-        count += 1;
-    }
-    var reconnect_input_index: ?usize = null;
-    if (reconnect_input_fd >= 0 and reconnectInputPollEnabled(input_control)) {
-        reconnect_input_index = count;
-        pollfds[count] = .{ .fd = reconnect_input_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-        count += 1;
-    }
-    var control_index: ?usize = null;
-    if (control_fd.* >= 0) {
-        control_index = count;
-        pollfds[count] = .{ .fd = control_fd.*, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-        count += 1;
+    var poll = ReconnectInputDispatcherPoll.init(control) catch return control.input_control.consumeAction();
+    defer poll.deinit();
+    poll.run(timeout_ms) catch return control.input_control.consumeAction();
+    return poll.result;
+}
+
+const ReconnectInputDispatcherPoll = struct {
+    poll_dispatcher: dispatcher.Dispatcher,
+    control: *ProxyReconnectControlContext,
+    interrupt_watch_id: ?dispatcher.FdWatchId = null,
+    input_watch_id: ?dispatcher.FdWatchId = null,
+    reconnect_input_watch_id: ?dispatcher.FdWatchId = null,
+    control_watch_id: ?dispatcher.FdWatchId = null,
+    timer_watch_id: ?dispatcher.TimerWatchId = null,
+    result: StreamControlAction = .none,
+    done: bool = false,
+
+    fn init(control: *ProxyReconnectControlContext) !ReconnectInputDispatcherPoll {
+        return .{
+            .poll_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator()),
+            .control = control,
+            .result = control.input_control.consumeAction(),
+        };
     }
 
-    if (count == 0) {
-        // BLOCKING_POLL: no reconnect/control fds are currently active, so this
-        // foreground stream process has nothing else to service until the next
-        // scheduled input-control check.
-        if (timeout_ms > 0) _ = posix.poll(pollfds[0..0], timeout_ms) catch 0;
-        return input_control.consumeAction();
+    fn deinit(self: *ReconnectInputDispatcherPoll) void {
+        self.poll_dispatcher.deinit();
     }
-    const ready = posix.poll(pollfds[0..count], timeout_ms) catch return input_control.consumeAction();
-    if (ready == 0) return input_control.consumeAction();
-    if (interrupt_index) |index| {
-        if (pollfds[index].revents != 0) {
-            if (interrupt) |local_interrupt| local_interrupt.consume();
-            return .interrupt;
+
+    fn run(self: *ReconnectInputDispatcherPoll, timeout_ms: i32) !void {
+        var has_watch = false;
+        if (self.control.interrupt) |local_interrupt| {
+            if (local_interrupt.read_fd >= 0) {
+                self.interrupt_watch_id = try self.poll_dispatcher.watchFd(local_interrupt.read_fd, .{ .readable = true }, .{
+                    .ctx = self,
+                    .callback = handleReconnectInputDispatcherPollEvent,
+                });
+                has_watch = true;
+            }
         }
-    }
-    if (input_index) |index| {
-        if (pollfds[index].revents != 0) {
-            return readReconnectInput(state, source_fd, input_control);
+        if (self.control.source_fd >= 0 and reconnectInputPollEnabled(self.control.input_control)) {
+            self.input_watch_id = try self.poll_dispatcher.watchFd(self.control.source_fd, .{ .readable = true }, .{
+                .ctx = self,
+                .callback = handleReconnectInputDispatcherPollEvent,
+            });
+            has_watch = true;
         }
-    }
-    if (reconnect_input_index) |index| {
-        if (pollfds[index].revents != 0) {
-            readReconnectControlInput(reconnect_input_fd, input_control);
+        if (self.control.reconnect_input_fd >= 0 and reconnectInputPollEnabled(self.control.input_control)) {
+            self.reconnect_input_watch_id = try self.poll_dispatcher.watchFd(self.control.reconnect_input_fd, .{ .readable = true }, .{
+                .ctx = self,
+                .callback = handleReconnectInputDispatcherPollEvent,
+            });
+            has_watch = true;
         }
-    }
-    if (control_index) |index| {
-        if (pollfds[index].revents != 0) {
-            if (!readControlInput(control_fd.*, input_control, control_reader)) control_fd.* = -1;
+        if (self.control.control_fd.* >= 0) {
+            self.control_watch_id = try self.poll_dispatcher.watchFd(self.control.control_fd.*, .{ .readable = true }, .{
+                .ctx = self,
+                .callback = handleReconnectInputDispatcherPollEvent,
+            });
+            has_watch = true;
         }
+        if (timeout_ms >= 0) {
+            self.timer_watch_id = try self.poll_dispatcher.watchTimerAfter(@intCast(timeout_ms), .{
+                .ctx = self,
+                .callback = handleReconnectInputDispatcherPollEvent,
+            });
+            has_watch = true;
+        }
+        if (has_watch) try self.poll_dispatcher.run();
     }
-    return input_control.consumeAction();
+
+    fn finish(self: *ReconnectInputDispatcherPoll, result: StreamControlAction) void {
+        self.result = result;
+        self.done = true;
+        self.poll_dispatcher.stop();
+    }
+};
+
+fn reconnectInputPollWatchMatches(id: dispatcher.WatchId, expected: ?dispatcher.FdWatchId) bool {
+    const expected_id = expected orelse return false;
+    const fd_id = switch (id) {
+        .fd => |fd| fd,
+        .timer => return false,
+    };
+    return fd_id.index == expected_id.index and fd_id.generation == expected_id.generation;
+}
+
+fn reconnectInputPollTimerMatches(id: dispatcher.WatchId, expected: ?dispatcher.TimerWatchId) bool {
+    const expected_id = expected orelse return false;
+    const timer_id = switch (id) {
+        .timer => |timer| timer,
+        .fd => return false,
+    };
+    return timer_id.index == expected_id.index and timer_id.generation == expected_id.generation;
+}
+
+fn handleReconnectInputDispatcherPollEvent(
+    ctx: *anyopaque,
+    _: *dispatcher.Dispatcher,
+    id: dispatcher.WatchId,
+    event: dispatcher.Event,
+) !void {
+    const poll: *ReconnectInputDispatcherPoll = @ptrCast(@alignCast(ctx));
+    if (poll.done) return;
+    switch (event) {
+        .fd => |fd_event| {
+            if (!fd_event.readable and !fd_event.hangup and !fd_event.error_event and !fd_event.invalid) return;
+            if (reconnectInputPollWatchMatches(id, poll.interrupt_watch_id)) {
+                if (poll.control.interrupt) |local_interrupt| local_interrupt.consume();
+                poll.finish(.interrupt);
+            } else if (reconnectInputPollWatchMatches(id, poll.input_watch_id)) {
+                poll.finish(readReconnectInput(poll.control.state, poll.control.source_fd, poll.control.input_control));
+            } else if (reconnectInputPollWatchMatches(id, poll.reconnect_input_watch_id)) {
+                readReconnectControlInput(poll.control.reconnect_input_fd, poll.control.input_control);
+                poll.finish(poll.control.input_control.consumeAction());
+            } else if (reconnectInputPollWatchMatches(id, poll.control_watch_id)) {
+                if (!readControlInput(poll.control.control_fd.*, poll.control.input_control, &poll.control.control_reader)) poll.control.control_fd.* = -1;
+                poll.finish(poll.control.input_control.consumeAction());
+            }
+        },
+        .timer => {
+            if (reconnectInputPollTimerMatches(id, poll.timer_watch_id)) {
+                poll.timer_watch_id = null;
+                poll.finish(poll.control.input_control.consumeAction());
+            }
+        },
+    }
 }
 
 fn reconnectInputPollEnabled(input_control: *const StreamInputControl) bool {
@@ -1736,7 +1936,7 @@ test "proxy mux close resets unrecorded remote process startup" {
 
     closeProxyMuxStream(std.testing.allocator, .{
         .stream_id = 42,
-        .process_fd = fds[1],
+        .endpoint = .{ .fd = fds[1] },
         .open = .{},
         .cleanup_recorded = false,
     }, true, null);
@@ -1750,7 +1950,7 @@ test "proxy mux close after cleanup record sends no startup reset" {
 
     closeProxyMuxStream(std.testing.allocator, .{
         .stream_id = 42,
-        .process_fd = fds[1],
+        .endpoint = .{ .fd = fds[1] },
         .open = .{},
         .cleanup_recorded = true,
     }, true, null);

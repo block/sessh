@@ -70,6 +70,33 @@ pub fn encodeMuxStreamFramePayload(
     return encodeDaemonTunnelPayload(allocator, .{ .mux_stream = message });
 }
 
+pub fn muxStreamResetFrame(
+    stream_id: u64,
+    code: []const u8,
+    message: []const u8,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return .{
+        .stream_id = stream_id,
+        .message = .{ .reset = .{
+            .code = code,
+            .message = message,
+        } },
+    };
+}
+
+pub fn encodeErrorPayload(
+    allocator: std.mem.Allocator,
+    code: []const u8,
+    message: []const u8,
+    hint: []const u8,
+) ![]u8 {
+    return frame.encodePayload(allocator, frame.hpb.Error{
+        .code = code,
+        .message = message,
+        .hint = hint,
+    });
+}
+
 pub fn encodeTerminalEmulatorItemPayload(
     allocator: std.mem.Allocator,
     item: pb.TerminalEmulatorItem,
@@ -107,12 +134,34 @@ pub fn sendClientRemotePayloadFrame(
     try frame.sendFrame(fd, .client_remote, encoded);
 }
 
+pub fn sendErrorFrame(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    code: []const u8,
+    message: []const u8,
+    hint: []const u8,
+) !void {
+    const encoded = try encodeErrorPayload(allocator, code, message, hint);
+    defer allocator.free(encoded);
+    try frame.sendFrame(fd, .error_message, encoded);
+}
+
 pub fn sendMuxStreamFrame(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     message: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !void {
     try sendDaemonTunnelPayloadFrame(allocator, fd, .{ .mux_stream = message });
+}
+
+pub fn sendMuxStreamResetFrame(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    stream_id: u64,
+    code: []const u8,
+    message: []const u8,
+) !void {
+    try sendMuxStreamFrame(allocator, fd, muxStreamResetFrame(stream_id, code, message));
 }
 
 pub fn sendTerminalEmulatorItemFrame(

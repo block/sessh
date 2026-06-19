@@ -62,24 +62,28 @@ pub fn activeMuxConnectionCount() usize {
     return active_mux_connections;
 }
 
-pub fn registerMuxConnectionFromDaemon(
-    allocator: std.mem.Allocator,
-    daemon_dispatcher: *dispatcher.Dispatcher,
+pub const RegisterMuxConnectionOptions = struct {
     terminal_remote_exe: []const u8,
     proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     initial_frames: []const protocol.OwnedFrame,
     fd: c.fd_t,
+};
+
+pub fn registerMuxConnectionFromDaemon(
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    options: RegisterMuxConnectionOptions,
 ) !void {
     const connection = try allocator.create(MuxConnection);
     errdefer allocator.destroy(connection);
     connection.* = .{
         .allocator = allocator,
-        .terminal_remote_exe = terminal_remote_exe,
-        .proxy_remote_exe = proxy_remote_exe,
-        .identity = identity,
+        .terminal_remote_exe = options.terminal_remote_exe,
+        .proxy_remote_exe = options.proxy_remote_exe,
+        .identity = options.identity,
         .counted_active = true,
-        .mux_fd = fd,
+        .mux_fd = options.fd,
         .mux_reader = protocol.FrameReader.init(allocator),
         .mux_writer = frame_write_queue.FrameWriteQueue.init(allocator),
         .stream_registry = mux_tunnel.StreamRegistry.init(allocator),
@@ -87,11 +91,11 @@ pub fn registerMuxConnectionFromDaemon(
     active_mux_connections += 1;
     errdefer connection.deinit(daemon_dispatcher);
 
-    try core_fds.setNonBlocking(fd);
-    for (initial_frames) |frame| {
+    try core_fds.setNonBlocking(options.fd);
+    for (options.initial_frames) |frame| {
         try handleMuxConnectionFrame(connection, daemon_dispatcher, frame);
     }
-    connection.mux_watch_id = try daemon_dispatcher.watchFd(fd, muxWatchEvents(connection), .{
+    connection.mux_watch_id = try daemon_dispatcher.watchFd(options.fd, muxWatchEvents(connection), .{
         .ctx = connection,
         .callback = readMuxConnection,
     });
@@ -411,7 +415,7 @@ fn readTerminalRemoteInner(
     while (true) {
         const current_index = session_daemon_handler.findTerminalMuxStreamIndexByWatch(&connection.terminal_sessions, id.fd) orelse return;
         var stream = &connection.terminal_sessions.items[current_index];
-        switch (try stream.reader.readReady(stream.process_fd)) {
+        switch (try stream.endpoint.reader.readReady(stream.endpoint.fd)) {
             .blocked => return,
             .progress => continue,
             .eof, .truncated_frame => {
@@ -488,7 +492,7 @@ fn readProxyRemoteInner(
     while (true) {
         const current_index = proxy_worker.findProxyMuxStreamIndexByWatch(&connection.proxy_streams, id.fd) orelse return;
         var stream = &connection.proxy_streams.items[current_index];
-        switch (try stream.reader.readReady(stream.process_fd)) {
+        switch (try stream.endpoint.reader.readReady(stream.endpoint.fd)) {
             .blocked => return,
             .progress => continue,
             .eof, .truncated_frame => {
@@ -534,11 +538,5 @@ fn sendMuxReset(
     message: []const u8,
 ) !void {
     _ = allocator;
-    try mux_writer.queueMuxStreamFrame(.{
-        .stream_id = stream_id,
-        .message = .{ .reset = .{
-            .code = code,
-            .message = message,
-        } },
-    });
+    try mux_writer.queueMuxStreamFrame(protocol.muxStreamResetFrame(stream_id, code, message));
 }

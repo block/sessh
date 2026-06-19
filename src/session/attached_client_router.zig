@@ -7,7 +7,6 @@ const protocol = @import("../protocol/mod.zig");
 const input_translation = @import("input_translation.zig");
 const attached_client_presentation = @import("attached_client_presentation.zig");
 
-const hpb = protocol.hpb;
 const pb = protocol.pb;
 const max_output_queue_bytes = 64 * 1024 * 1024;
 
@@ -33,11 +32,7 @@ pub const AttachedClient = struct {
     }
 
     pub fn queueError(self: *AttachedClient, code: []const u8, message: []const u8, hint: []const u8) !void {
-        const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
-            .code = code,
-            .message = message,
-            .hint = hint,
-        });
+        const payload = try protocol.encodeErrorPayload(app_allocator.allocator(), code, message, hint);
         defer app_allocator.allocator().free(payload);
         try self.queueFrame(.error_message, payload);
     }

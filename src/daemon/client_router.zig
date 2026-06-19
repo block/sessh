@@ -313,15 +313,13 @@ fn transferInitialRequestToDispatcherOwner(
         if (try handleDaemonTunnelControlFrame(context.allocator, context.identity, frame.*, context.fd)) return .consumed;
         var initial_frames = [_]protocol.OwnedFrame{frame.*};
         daemon_dispatcher.cancel(id);
-        try daemon_tunnel.registerMuxConnectionFromDaemon(
-            context.allocator,
-            daemon_dispatcher,
-            context.terminal_remote_exe,
-            context.proxy_remote_exe,
-            context.identity,
-            initial_frames[0..],
-            context.fd,
-        );
+        try daemon_tunnel.registerMuxConnectionFromDaemon(context.allocator, daemon_dispatcher, .{
+            .terminal_remote_exe = context.terminal_remote_exe,
+            .proxy_remote_exe = context.proxy_remote_exe,
+            .identity = context.identity,
+            .initial_frames = initial_frames[0..],
+            .fd = context.fd,
+        });
         context.fd = -1;
         return .transferred;
     }
@@ -506,11 +504,5 @@ fn handleDaemonTunnelControlFrame(
 }
 
 fn sendError(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
-        .code = code,
-        .message = message,
-        .hint = hint,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .error_message, payload);
+    try protocol.sendErrorFrame(app_allocator.allocator(), fd, code, message, hint);
 }

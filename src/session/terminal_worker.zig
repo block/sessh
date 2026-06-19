@@ -34,7 +34,6 @@ const terminal_worker_poll_timing = terminal_worker_lifecycle.PollTiming{
 };
 
 const pb = protocol.pb;
-const hpb = protocol.hpb;
 
 const Session = terminal_worker_state.Session;
 const AttachedClient = attached_client_router.AttachedClient;
@@ -79,8 +78,9 @@ pub const TerminalWorkerHandle = struct {
 
 const DispatcherTerminalWorker = struct {
     allocator: std.mem.Allocator,
-    control: *TerminalWorkerHandle,
+    control: ?*TerminalWorkerHandle = null,
     terminal_worker: TerminalWorker,
+    listen_watch: WorkerFdWatch = .{},
     session_watch: WorkerFdWatch = .{},
     attached_watch: WorkerFdWatch = .{},
     pending_watch: WorkerFdWatch = .{},
@@ -88,6 +88,7 @@ const DispatcherTerminalWorker = struct {
 
     fn deinit(self: *DispatcherTerminalWorker, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
         if (daemon_dispatcher) |d| {
+            self.listen_watch.cancel(d);
             self.session_watch.cancel(d);
             self.attached_watch.cancel(d);
             self.pending_watch.cancel(d);
@@ -96,6 +97,14 @@ const DispatcherTerminalWorker = struct {
         self.timer_watch_id = null;
         closeTerminalWorker(&self.terminal_worker);
         self.* = undefined;
+    }
+
+    fn finish(self: *DispatcherTerminalWorker, daemon_dispatcher: *dispatcher.Dispatcher) void {
+        if (self.control) |control| {
+            destroyRegisteredTerminalWorker(control, daemon_dispatcher);
+        } else {
+            daemon_dispatcher.stop();
+        }
     }
 
     fn connect(self: *DispatcherTerminalWorker, daemon_dispatcher: *dispatcher.Dispatcher) !c.fd_t {
@@ -128,7 +137,7 @@ const DispatcherTerminalWorker = struct {
 
     fn updateWatches(self: *DispatcherTerminalWorker, daemon_dispatcher: *dispatcher.Dispatcher) !void {
         if (!self.terminal_worker.running) {
-            destroyRegisteredTerminalWorker(self.control, daemon_dispatcher);
+            self.finish(daemon_dispatcher);
             return;
         }
 
@@ -203,13 +212,19 @@ const DispatcherTerminalWorker = struct {
 
     fn runMaintenance(self: *DispatcherTerminalWorker) void {
         runTerminalWorkerMaintenance(&self.terminal_worker);
-        if (!self.terminal_worker.started_session and
+        const waiting_for_initial_process_client = self.listen_watch.id != null and !self.terminal_worker.started_session;
+        if (!waiting_for_initial_process_client and
+            !self.terminal_worker.started_session and
             !self.terminal_worker.pending_client.active and
             !self.terminal_worker.attached_client.active and
             !self.terminal_worker.session.alive)
         {
             self.terminal_worker.running = false;
         }
+    }
+
+    fn watchListenFd(self: *DispatcherTerminalWorker, daemon_dispatcher: *dispatcher.Dispatcher, listen_fd: c.fd_t) !void {
+        try self.ensureWatch(daemon_dispatcher, &self.listen_watch, listen_fd, .{ .readable = true });
     }
 };
 
@@ -218,13 +233,6 @@ const DispatcherTerminalWorker = struct {
 // exists. The daemon is single-threaded; mutations happen from dispatcher-owned
 // callbacks.
 var terminal_worker_handles: std.ArrayList(*TerminalWorkerHandle) = .empty;
-const PollKind = union(enum) {
-    listen,
-    session,
-    attached_client,
-    pending_client,
-};
-
 const ExitInfo = remote_process.ExitInfo;
 
 const terminal_worker_requests = @import("terminal_worker_requests.zig");
@@ -268,16 +276,19 @@ pub fn startTerminalWorkerInDaemon(
 }
 
 pub fn runTerminalWorkerLoop(session_guid: []const u8, listen_fd: c.fd_t) !void {
-    var terminal_worker = TerminalWorker{
-        .fixed_session_id = session_guid,
+    var worker = DispatcherTerminalWorker{
+        .allocator = app_allocator.allocator(),
+        .terminal_worker = .{
+            .fixed_session_id = session_guid,
+        },
     };
+    var worker_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator());
+    defer worker_dispatcher.deinit();
+    defer worker.deinit(&worker_dispatcher);
 
-    defer closeTerminalWorker(&terminal_worker);
-
-    while (terminal_worker.running) {
-        try terminalWorkerPollOnce(&terminal_worker, listen_fd);
-        stopTerminalWorkerIfComplete(&terminal_worker);
-    }
+    try worker.watchListenFd(&worker_dispatcher, listen_fd);
+    try worker.updateWatches(&worker_dispatcher);
+    try worker_dispatcher.run();
 }
 
 pub fn connectTerminalWorkerHandle(allocator: std.mem.Allocator, guid: []const u8) !c.fd_t {
@@ -448,70 +459,6 @@ fn destroyRegisteredTerminalWorker(control: *TerminalWorkerHandle, daemon_dispat
     allocator.destroy(control);
 }
 
-fn terminalWorkerPollOnce(terminal_worker: *TerminalWorker, listen_fd: c.fd_t) !void {
-    // PROCESS_EVENT_LOOP: terminal worker process. It directly polls
-    // its PTY, client connection, and control fds; it is not a daemon helper
-    // constructing a private Dispatcher.
-    const now_ms = terminalWorkerMonotonicMs(terminal_worker);
-    const now_unix_ms = nowUnixMs();
-    clearExpiredDebugUnresponsiveAttachedClients(terminal_worker, now_ms);
-    if (reapPtyHangupSessionIfExited(terminal_worker)) return;
-    if (reapPtyEofSessionIfExited(terminal_worker, now_ms, now_unix_ms)) return;
-    if (endReapedSessions(terminal_worker, now_unix_ms)) return;
-
-    var pollfds: [4]posix.pollfd = undefined;
-    var kinds: [4]PollKind = undefined;
-    var count: usize = 0;
-
-    pollfds[count] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
-    kinds[count] = .listen;
-    count += 1;
-
-    if (terminal_worker.session.alive and terminal_worker.session.process.hasOpenPty()) {
-        const session = &terminal_worker.session;
-        var events: i16 = posix.POLL.IN;
-        if (sessionHasPendingPtyInput(session)) events |= posix.POLL.OUT;
-        pollfds[count] = .{ .fd = session.process.pty_fd, .events = events, .revents = 0 };
-        kinds[count] = .session;
-        count += 1;
-    }
-
-    if (terminal_worker.attached_client.active) {
-        const attached_client = &terminal_worker.attached_client;
-        const debug_unresponsive = attached_client.debug_unresponsive_until_ms > now_ms;
-        var events: i16 = if (attached_client.close_after_flush or debug_unresponsive) 0 else posix.POLL.IN;
-        if (!debug_unresponsive and attached_client.queuedBytes() > 0) events |= posix.POLL.OUT;
-        pollfds[count] = .{ .fd = attached_client.fd, .events = events, .revents = 0 };
-        kinds[count] = .attached_client;
-        count += 1;
-    }
-
-    if (terminal_worker.pending_client.active) {
-        const pending_client = &terminal_worker.pending_client;
-        pollfds[count] = .{ .fd = pending_client.fd, .events = posix.POLL.IN, .revents = 0 };
-        kinds[count] = .pending_client;
-        count += 1;
-    }
-
-    _ = try posix.poll(pollfds[0..count], terminalWorkerPollTimeoutMs(terminal_worker, now_ms, now_unix_ms));
-    const after_poll_ms = terminalWorkerMonotonicMs(terminal_worker);
-    clearExpiredDebugUnresponsiveAttachedClients(terminal_worker, after_poll_ms);
-    flushExpiredSynchronizedOutputSessions(terminal_worker, after_poll_ms);
-    if (reapPtyHangupSessionIfExited(terminal_worker)) return;
-    if (reapPtyEofSessionIfExited(terminal_worker, after_poll_ms, nowUnixMs())) return;
-    if (endReapedSessions(terminal_worker, nowUnixMs())) return;
-
-    for (pollfds[0..count], kinds[0..count]) |pollfd, kind| {
-        if (pollfd.revents == 0) continue;
-        switch (kind) {
-            .listen => handleWorkerHandoffEvent(terminal_worker, listen_fd),
-            .session => handleSessionPtyEvents(terminal_worker, pollfd.revents),
-            .attached_client => handleAttachedClientEvents(terminal_worker, pollfd.revents),
-            .pending_client => handlePendingWorkerClientEvents(terminal_worker, pollfd.revents),
-        }
-    }
-}
-
 fn handleDispatcherTerminalWorkerEvent(
     ctx: *anyopaque,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -521,7 +468,7 @@ fn handleDispatcherTerminalWorkerEvent(
     const worker: *DispatcherTerminalWorker = @ptrCast(@alignCast(ctx));
     worker.runMaintenance();
     if (!worker.terminal_worker.running) {
-        destroyRegisteredTerminalWorker(worker.control, daemon_dispatcher);
+        worker.finish(daemon_dispatcher);
         return;
     }
 
@@ -537,6 +484,8 @@ fn handleDispatcherTerminalWorkerEvent(
                 handleAttachedClientEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(fd_event));
             } else if (worker.pending_watch.matches(fd_id)) {
                 handlePendingWorkerClientEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(fd_event));
+            } else if (worker.listen_watch.matches(fd_id)) {
+                if (fd_event.readable) handleWorkerHandoffEvent(&worker.terminal_worker, fd_event.fd);
             }
         },
         .timer => {
@@ -555,7 +504,7 @@ fn handleDispatcherTerminalWorkerEvent(
 
     worker.runMaintenance();
     if (!worker.terminal_worker.running) {
-        destroyRegisteredTerminalWorker(worker.control, daemon_dispatcher);
+        worker.finish(daemon_dispatcher);
         return;
     }
     try worker.updateWatches(daemon_dispatcher);
@@ -787,19 +736,18 @@ fn handlePendingWorkerOpen(
         return .close;
     };
     defer request.deinit();
-    _ = try createSession(
-        terminal_worker,
-        request.resize.rows,
-        request.resize.cols,
-        request.scrollback_row_count,
-        request.environment,
-        request.query_default_colors,
-        request.session_guid,
-        request.command_argv,
-        request.shell_command,
-        request.tty_settings,
-        request.reap_ms,
-    );
+    _ = try createSession(terminal_worker, .{
+        .rows = request.resize.rows,
+        .cols = request.resize.cols,
+        .scrollback_row_count = request.scrollback_row_count,
+        .environment = request.environment,
+        .query_default_colors = request.query_default_colors,
+        .session_guid = request.session_guid,
+        .command_argv = request.command_argv,
+        .shell_command = request.shell_command,
+        .tty_settings = request.tty_settings,
+        .reap_ms = request.reap_ms,
+    });
     return try attachPendingWorkerClient(terminal_worker, pending_client, request.resize, request.capture_tty_transcript);
 }
 
@@ -823,13 +771,7 @@ fn sendError(terminal_worker: *TerminalWorker, fd: c.fd_t, code: []const u8, mes
 }
 
 fn sendErrorFrame(fd: c.fd_t, code: []const u8, message: []const u8, hint: []const u8) !void {
-    const payload = try protocol.encodePayload(app_allocator.allocator(), hpb.Error{
-        .code = code,
-        .message = message,
-        .hint = hint,
-    });
-    defer app_allocator.allocator().free(payload);
-    try protocol.sendFrame(fd, .error_message, payload);
+    try protocol.sendErrorFrame(app_allocator.allocator(), fd, code, message, hint);
 }
 
 fn flushAttachedClientOutput(terminal_worker: *TerminalWorker) void {
@@ -919,44 +861,48 @@ fn updateSessionSize(session: *Session, rows: u16, cols: u16) void {
     session.process.setPtySize(rows, cols);
 }
 
-fn createSession(
-    terminal_worker: *TerminalWorker,
+const SessionCreateSpec = struct {
     rows: u16,
     cols: u16,
     scrollback_row_count: u32,
-    session_environment: SessionEnvironment,
+    environment: SessionEnvironment,
     query_default_colors: vt.DefaultColors,
     session_guid: []const u8,
     command_argv: []const []const u8,
     shell_command: ?[]const u8,
-    settings: ?tty_settings.Settings,
+    tty_settings: ?tty_settings.Settings,
     reap_ms: u64,
+};
+
+fn createSession(
+    terminal_worker: *TerminalWorker,
+    spec: SessionCreateSpec,
 ) !*Session {
     if (terminal_worker.started_session or terminal_worker.session.alive or terminal_worker.attached_client.active) return error.TooManySessions;
 
     const terminal_model = try vt.SessionTerminal.createWithDefaultColors(
         app_allocator.allocator(),
-        rows,
-        cols,
-        scrollback_row_count,
-        query_default_colors,
+        spec.rows,
+        spec.cols,
+        spec.scrollback_row_count,
+        spec.query_default_colors,
     );
     errdefer terminal_model.destroy();
 
-    if (!guid_ref.isValidSessionGuid(session_guid)) return error.InvalidSessionGuid;
-    const session_guid_z = try app_allocator.allocator().dupeZ(u8, session_guid);
+    if (!guid_ref.isValidSessionGuid(spec.session_guid)) return error.InvalidSessionGuid;
+    const session_guid_z = try app_allocator.allocator().dupeZ(u8, spec.session_guid);
     defer app_allocator.allocator().free(session_guid_z);
 
     const process = try remote_process.Process.spawn(app_allocator.allocator(), .{
-        .rows = rows,
-        .cols = cols,
-        .shell = session_environment.shell,
-        .command_argv = command_argv,
-        .shell_command = shell_command,
-        .environment = session_environment.entries.items,
+        .rows = spec.rows,
+        .cols = spec.cols,
+        .shell = spec.environment.shell,
+        .command_argv = spec.command_argv,
+        .shell_command = spec.shell_command,
+        .environment = spec.environment.entries.items,
         .session_guid = session_guid_z,
         .add_sessh_path_to_env = true,
-        .tty_settings = settings,
+        .tty_settings = spec.tty_settings,
     });
     errdefer {
         var close_process = process;
@@ -967,14 +913,14 @@ fn createSession(
     session.* = Session{
         .process = process,
         .terminal_model = terminal_model,
-        .rows = rows,
-        .cols = cols,
-        .scrollback_row_count = scrollback_row_count,
-        .reap_ms = reap_ms,
+        .rows = spec.rows,
+        .cols = spec.cols,
+        .scrollback_row_count = spec.scrollback_row_count,
+        .reap_ms = spec.reap_ms,
         .alive = true,
     };
-    @memcpy(session.id[0..session_guid.len], session_guid);
-    session.id_len = session_guid.len;
+    @memcpy(session.id[0..spec.session_guid.len], spec.session_guid);
+    session.id_len = spec.session_guid.len;
     terminal_worker.started_session = true;
     return session;
 }

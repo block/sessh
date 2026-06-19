@@ -78,11 +78,7 @@ pub const PresentationState = struct {
         if (replace_visible_grid) {
             try self.render(
                 renderer,
-                screen.rows,
-                screen.cursor_row,
-                screen.cursor_col,
-                screen.cursor_visible,
-                try cursorStyleFromVt(screen.cursor_style),
+                screen,
                 min_rendered_rows,
             );
         } else {
@@ -134,11 +130,7 @@ pub const PresentationState = struct {
         try self.switchActiveScreen(renderer, screen.active_screen);
         try self.render(
             renderer,
-            screen.rows,
-            screen.cursor_row,
-            screen.cursor_col,
-            screen.cursor_visible,
-            try cursorStyleFromVt(screen.cursor_style),
+            screen,
             session_rows,
         );
         if (screen.title_dirty) try renderer.setTitle(screen.title);
@@ -178,30 +170,40 @@ pub const PresentationState = struct {
         self.viewport_offset = 0;
     }
 
+    const RenderRequest = struct {
+        screen: *const vt.RenderedScreen,
+        min_rendered_rows: u16,
+
+        fn targetRows(self: RenderRequest) u16 {
+            return targetRenderedRows(self.screen.rows.len, self.screen.cursor_row, self.min_rendered_rows);
+        }
+    };
+
     // Draw the visible screen and record the new cursor and rendered height.
     fn render(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
-        rows: []const vt.RenderedRow,
-        cursor_row: u16,
-        cursor_col: u16,
-        cursor_visible: bool,
-        cursor_style: client_renderer.CursorStyle,
+        screen: *const vt.RenderedScreen,
         min_rendered_rows: u16,
     ) !void {
+        const request = RenderRequest{
+            .screen = screen,
+            .min_rendered_rows = min_rendered_rows,
+        };
         if (!self.initialized) {
-            try self.renderInitial(renderer, rows, cursor_row, cursor_col, min_rendered_rows);
+            try self.renderInitial(renderer, request);
         } else {
-            try self.redraw(renderer, rows, cursor_row, cursor_col, min_rendered_rows);
+            try self.redraw(renderer, request);
         }
 
-        try renderer.setCursorVisible(cursor_visible);
+        const cursor_style = try cursorStyleFromVt(screen.cursor_style);
+        try renderer.setCursorVisible(screen.cursor_visible);
         try renderer.setCursorStyle(cursor_style);
         self.initialized = true;
-        self.rendered_rows = targetRenderedRows(rows.len, cursor_row, min_rendered_rows);
-        self.cursor_row = cursor_row;
-        self.cursor_col = cursor_col;
-        self.cursor_visible = cursor_visible;
+        self.rendered_rows = request.targetRows();
+        self.cursor_row = screen.cursor_row;
+        self.cursor_col = screen.cursor_col;
+        self.cursor_visible = screen.cursor_visible;
         self.cursor_style = cursor_style;
     }
 
@@ -246,25 +248,23 @@ pub const PresentationState = struct {
     fn renderInitial(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
-        rows: []const vt.RenderedRow,
-        cursor_row: u16,
-        cursor_col: u16,
-        min_rendered_rows: u16,
+        request: RenderRequest,
     ) !void {
+        const screen = request.screen;
         // The new snapshot may be shorter than the screen we previously drew.
         // Clear any old rows below the new screen so stale text and colors are
         // not left behind.
         const rendered_rows = @max(
             self.rendered_rows,
-            targetRenderedRows(rows.len, cursor_row, min_rendered_rows),
+            request.targetRows(),
         );
         var row_index: u16 = 0;
         while (row_index < rendered_rows) : (row_index += 1) {
             if (row_index > 0) try renderer.newline();
             try renderer.clearLine();
-            if (row_index < rows.len) try renderVtRow(renderer, rows[row_index]);
+            if (row_index < screen.rows.len) try renderVtRow(renderer, screen.rows[row_index]);
         }
-        try moveToSnapshotCursor(renderer, rendered_rows, cursor_row, cursor_col);
+        try moveToSnapshotCursor(renderer, rendered_rows, screen.cursor_row, screen.cursor_col);
     }
 
     // Redraw when we know where our old rendered grid is. Clear max(old, new)
@@ -272,24 +272,22 @@ pub const PresentationState = struct {
     fn redraw(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
-        rows: []const vt.RenderedRow,
-        cursor_row: u16,
-        cursor_col: u16,
-        min_rendered_rows: u16,
+        request: RenderRequest,
     ) !void {
+        const screen = request.screen;
         try self.moveToRenderedTop(renderer);
 
-        const new_rows = targetRenderedRows(rows.len, cursor_row, min_rendered_rows);
+        const new_rows = request.targetRows();
         const redraw_rows = @max(self.rendered_rows, new_rows);
         var row_index: u16 = 0;
         while (row_index < redraw_rows) : (row_index += 1) {
             try renderer.carriageReturn();
             try renderer.clearLine();
-            if (row_index < rows.len) try renderVtRow(renderer, rows[row_index]);
+            if (row_index < screen.rows.len) try renderVtRow(renderer, screen.rows[row_index]);
             if (row_index + 1 < redraw_rows) try renderer.newline();
         }
 
-        try moveToSnapshotCursor(renderer, redraw_rows, cursor_row, cursor_col);
+        try moveToSnapshotCursor(renderer, redraw_rows, screen.cursor_row, screen.cursor_col);
     }
 
     // Switch the real terminal buffer to match the inner terminal. We save the

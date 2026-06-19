@@ -33,6 +33,31 @@ pub const ScreenSnapshot = struct {
     scrollback_cursor: u64,
 };
 
+const DrawFrame = struct {
+    scrollback_cursor: u64,
+    draw_bytes: []const u8,
+    app_title_present: ?bool = null,
+    attached_client_end_restore_bytes: ?[]const u8 = null,
+};
+
+const RepaintResponseFrame = struct {
+    repaint_request_seq: u64,
+    scrollback_cursor: u64,
+    draw_bytes: []const u8,
+    app_title_present: ?bool = null,
+    attached_client_end_restore_bytes: ?[]const u8 = null,
+};
+
+const RepaintDrawRequest = struct {
+    repaint_request_seq: u64,
+    clear_for_replace: bool,
+    truncated_rows: u64,
+    rows: []const vt.RenderedRow,
+    screen: *const vt.RenderedScreen,
+    restore_screen: ?*const vt.RenderedScreen,
+    scrollback_cursor: u64,
+};
+
 pub const DrawEmitter = struct {
     attached_client: *AttachedClient,
     session: *Session,
@@ -61,27 +86,11 @@ pub const DrawEmitter = struct {
     }
 
     pub fn emitScrollbackAndScreen(self: DrawEmitter, snapshot: ScrollbackAndScreenSnapshot) !void {
-        try queueScrollbackRowsAndScreenDraw(
-            self.attached_client,
-            self.session,
-            snapshot.rows,
-            snapshot.screen,
-            snapshot.restore_screen,
-            snapshot.align_viewport,
-            snapshot.scrollback_cursor,
-        );
+        try queueScrollbackRowsAndScreenDraw(self.attached_client, self.session, snapshot);
     }
 
     pub fn emitScreen(self: DrawEmitter, snapshot: ScreenSnapshot) !bool {
-        return queueScreenDraw(
-            self.attached_client,
-            self.session,
-            snapshot.screen,
-            snapshot.restore_screen,
-            snapshot.align_viewport,
-            snapshot.materialize,
-            snapshot.scrollback_cursor,
-        );
+        return queueScreenDraw(self.attached_client, self.session, snapshot);
     }
 
     pub fn emitRenderBarrier(self: DrawEmitter, barrier: vt.RenderBarrier, scrollback_cursor: u64) !void {
@@ -128,19 +137,16 @@ pub fn queueTtyTranscriptChunk(
 fn queueDrawFrame(
     attached_client: *AttachedClient,
     session: *const Session,
-    scrollback_cursor: u64,
-    draw_bytes: []const u8,
-    app_title_present: ?bool,
-    attached_client_end_restore_bytes: ?[]const u8,
+    draw: DrawFrame,
 ) !void {
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
-    encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
+    encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, draw.scrollback_cursor);
     try attached_client.queueTerminalEmulatorFrame(.{ .draw = .{
         .scrollback_cursor = encoded_cursor[0..],
         .viewport_offset = attached_client.presentation.protocolViewportOffset(),
-        .draw_bytes = draw_bytes,
-        .app_title_present = app_title_present,
-        .attached_client_end_restore_bytes = attached_client_end_restore_bytes,
+        .draw_bytes = draw.draw_bytes,
+        .app_title_present = draw.app_title_present,
+        .attached_client_end_restore_bytes = draw.attached_client_end_restore_bytes,
     } });
 }
 
@@ -202,14 +208,11 @@ pub fn queueRenderBarrierDraw(
     if (bytes.items.len == 0) return;
     try appendDrawCleanup(&bytes);
     try wrapDrawInSynchronizedUpdate(&bytes);
-    try queueDrawFrame(
-        attached_client,
-        session,
-        scrollback_cursor,
-        bytes.items,
-        null,
-        renderBarrierAttachedClientEndRestoreBytes(barrier),
-    );
+    try queueDrawFrame(attached_client, session, .{
+        .scrollback_cursor = scrollback_cursor,
+        .draw_bytes = bytes.items,
+        .attached_client_end_restore_bytes = renderBarrierAttachedClientEndRestoreBytes(barrier),
+    });
 }
 
 fn queueScrollbackRowsDraw(
@@ -226,30 +229,33 @@ fn queueScrollbackRowsDraw(
     try attached_client.presentation.preparePrimaryForScrollback(renderer);
     try attached_client.presentation.appendScrollbackRows(renderer, session.rows, rows);
     try wrapDrawInSynchronizedUpdate(&bytes);
-    try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, null, null);
+    try queueDrawFrame(attached_client, session, .{
+        .scrollback_cursor = scrollback_cursor,
+        .draw_bytes = bytes.items,
+    });
 }
 
 pub fn queueScrollbackRowsAndScreenDraw(
     attached_client: *AttachedClient,
     session: *const Session,
-    rows: []const vt.RenderedRow,
-    screen: *const vt.RenderedScreen,
-    restore_screen: ?*const vt.RenderedScreen,
-    align_viewport: bool,
-    scrollback_cursor: u64,
+    snapshot: ScrollbackAndScreenSnapshot,
 ) !void {
-    if (rows.len == 0) return;
-    if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
+    if (snapshot.rows.len == 0) return;
+    if (snapshot.rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
 
     const plain_replay = session.pending_plain_output.items;
     if (try attached_client.presentation.canApplyPlainReplay(
-        screen,
-        align_viewport,
+        snapshot.screen,
+        snapshot.align_viewport,
         plain_replay,
         session.pendingPlainOutputCanReplay(),
     )) {
-        try attached_client.presentation.assumePlainReplayScreen(session.rows, screen);
-        try queueDrawFrame(attached_client, session, scrollback_cursor, plain_replay, screen.title_present, null);
+        try attached_client.presentation.assumePlainReplayScreen(session.rows, snapshot.screen);
+        try queueDrawFrame(attached_client, session, .{
+            .scrollback_cursor = snapshot.scrollback_cursor,
+            .draw_bytes = plain_replay,
+            .app_title_present = snapshot.screen.title_present,
+        });
         return;
     }
 
@@ -259,27 +265,32 @@ pub fn queueScrollbackRowsAndScreenDraw(
     // Screen clears first copy the old visible rows into scrollback, then draw
     // the cleared screen. After that copy, another alignment pass would only
     // add blank rows to scrollback.
-    const align_after_scrollback = align_viewport and screen.display_clear == null;
-    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, screen, align_after_scrollback);
-    if (shouldClearOuterVisibleForDisplayClear(screen)) {
+    const align_after_scrollback = snapshot.align_viewport and snapshot.screen.display_clear == null;
+    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, snapshot.screen, align_after_scrollback);
+    if (shouldClearOuterVisibleForDisplayClear(snapshot.screen)) {
         effective_align_viewport = false;
     }
     try attached_client.presentation.preparePrimaryForScrollback(renderer);
-    try attached_client.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    if (shouldClearOuterVisibleForDisplayClear(screen)) {
+    try attached_client.presentation.appendScrollbackRows(renderer, session.rows, snapshot.rows);
+    if (shouldClearOuterVisibleForDisplayClear(snapshot.screen)) {
         // Full-screen clears must happen after copying the old rows. Clearing
         // first would leave those rows nowhere to go except back on screen.
-        try attached_client.presentation.clearOuterVisibleForScreen(renderer, screen);
+        try attached_client.presentation.clearOuterVisibleForScreen(renderer, snapshot.screen);
     }
-    try attached_client.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
+    try attached_client.presentation.applyScreen(renderer, session.rows, snapshot.screen, true, effective_align_viewport);
     if (effective_align_viewport) attached_client.origin = .{ .row = 0, .col = 0 };
-    updateMouseOriginAfterDraw(attached_client, screen);
+    updateMouseOriginAfterDraw(attached_client, snapshot.screen);
     try appendDrawCleanup(&bytes);
     try wrapDrawInSynchronizedUpdate(&bytes);
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
-    const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, screen, restore_screen, &restore_bytes);
-    try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, screen.title_present, restore);
+    const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, snapshot.screen, snapshot.restore_screen, &restore_bytes);
+    try queueDrawFrame(attached_client, session, .{
+        .scrollback_cursor = snapshot.scrollback_cursor,
+        .draw_bytes = bytes.items,
+        .app_title_present = snapshot.screen.title_present,
+        .attached_client_end_restore_bytes = restore,
+    });
 }
 
 fn queueScrollbackTruncatedDraw(
@@ -295,7 +306,10 @@ fn queueScrollbackTruncatedDraw(
     try attached_client.presentation.preparePrimaryForScrollback(renderer);
     try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
     try wrapDrawInSynchronizedUpdate(&bytes);
-    try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, null, null);
+    try queueDrawFrame(attached_client, session, .{
+        .scrollback_cursor = scrollback_cursor,
+        .draw_bytes = bytes.items,
+    });
 }
 
 fn appendScrollbackTruncatedMarker(bytes: *std.ArrayList(u8), renderer: client_renderer.Renderer, truncated_rows: u64) !void {
@@ -339,42 +353,47 @@ fn shouldClearOuterVisibleForDisplayClear(screen: *const vt.RenderedScreen) bool
 pub fn queueScreenDraw(
     attached_client: *AttachedClient,
     session: *const Session,
-    screen: *const vt.RenderedScreen,
-    restore_screen: ?*const vt.RenderedScreen,
-    force_redraw: bool,
-    align_viewport: bool,
-    scrollback_cursor: u64,
+    snapshot: ScreenSnapshot,
 ) !bool {
     const plain_replay = session.pending_plain_output.items;
     if (try attached_client.presentation.canApplyPlainReplay(
-        screen,
-        align_viewport,
+        snapshot.screen,
+        snapshot.align_viewport,
         plain_replay,
         session.pendingPlainOutputCanReplay(),
     )) {
-        try attached_client.presentation.assumePlainReplayScreen(session.rows, screen);
-        try queueDrawFrame(attached_client, session, scrollback_cursor, plain_replay, screen.title_present, null);
+        try attached_client.presentation.assumePlainReplayScreen(session.rows, snapshot.screen);
+        try queueDrawFrame(attached_client, session, .{
+            .scrollback_cursor = snapshot.scrollback_cursor,
+            .draw_bytes = plain_replay,
+            .app_title_present = snapshot.screen.title_present,
+        });
         return true;
     }
 
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, screen, align_viewport);
-    if (shouldClearOuterVisibleForDisplayClear(screen)) {
-        try attached_client.presentation.clearOuterVisibleForScreen(renderer, screen);
+    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, snapshot.screen, snapshot.align_viewport);
+    if (shouldClearOuterVisibleForDisplayClear(snapshot.screen)) {
+        try attached_client.presentation.clearOuterVisibleForScreen(renderer, snapshot.screen);
         effective_align_viewport = false;
     }
-    try attached_client.presentation.applyScreen(renderer, session.rows, screen, force_redraw, effective_align_viewport);
+    try attached_client.presentation.applyScreen(renderer, session.rows, snapshot.screen, snapshot.materialize, effective_align_viewport);
     if (effective_align_viewport) attached_client.origin = .{ .row = 0, .col = 0 };
-    updateMouseOriginAfterDraw(attached_client, screen);
+    updateMouseOriginAfterDraw(attached_client, snapshot.screen);
     if (bytes.items.len > 0) {
         try appendDrawCleanup(&bytes);
         try wrapDrawInSynchronizedUpdate(&bytes);
         var restore_bytes = std.ArrayList(u8).empty;
         defer restore_bytes.deinit(app_allocator.allocator());
-        const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, screen, restore_screen, &restore_bytes);
-        try queueDrawFrame(attached_client, session, scrollback_cursor, bytes.items, screen.title_present, restore);
+        const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, snapshot.screen, snapshot.restore_screen, &restore_bytes);
+        try queueDrawFrame(attached_client, session, .{
+            .scrollback_cursor = snapshot.scrollback_cursor,
+            .draw_bytes = bytes.items,
+            .app_title_present = snapshot.screen.title_present,
+            .attached_client_end_restore_bytes = restore,
+        });
         return true;
     }
     return false;
@@ -396,28 +415,27 @@ pub fn queueRetainedScrollbackClearDraw(attached_client: *AttachedClient, sessio
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
     try attached_client.presentation.preparePrimaryForScrollback(renderer);
     try renderer.clearScrollback();
-    try queueDrawFrame(attached_client, session, 0, bytes.items, null, null);
+    try queueDrawFrame(attached_client, session, .{
+        .scrollback_cursor = 0,
+        .draw_bytes = bytes.items,
+    });
 }
 
 fn queueRepaintResponseFrame(
     attached_client: *AttachedClient,
     session: *const Session,
-    repaint_request_seq: u64,
-    scrollback_cursor: u64,
-    draw_bytes: []const u8,
-    app_title_present: ?bool,
-    attached_client_end_restore_bytes: ?[]const u8,
+    response: RepaintResponseFrame,
 ) !void {
     var encoded_cursor: [encoded_scrollback_cursor_len]u8 = undefined;
-    encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, scrollback_cursor);
+    encodeScrollbackCursor(&encoded_cursor, session.scrollback_epoch, response.scrollback_cursor);
     try attached_client.queueTerminalEmulatorFrame(.{ .repaint_response = .{
-        .repaint_request_seq = repaint_request_seq,
+        .repaint_request_seq = response.repaint_request_seq,
         .draw = .{
             .scrollback_cursor = encoded_cursor[0..],
             .viewport_offset = attached_client.presentation.protocolViewportOffset(),
-            .draw_bytes = draw_bytes,
-            .app_title_present = app_title_present,
-            .attached_client_end_restore_bytes = attached_client_end_restore_bytes,
+            .draw_bytes = response.draw_bytes,
+            .app_title_present = response.app_title_present,
+            .attached_client_end_restore_bytes = response.attached_client_end_restore_bytes,
         },
     } });
 }
@@ -425,43 +443,43 @@ fn queueRepaintResponseFrame(
 fn queueRepaintResponseDraw(
     attached_client: *AttachedClient,
     session: *Session,
-    repaint_request_seq: u64,
-    clear_for_replace: bool,
-    truncated_rows: u64,
-    rows: []const vt.RenderedRow,
-    screen: *const vt.RenderedScreen,
-    restore_screen: ?*const vt.RenderedScreen,
-    scrollback_cursor: u64,
+    request: RepaintDrawRequest,
 ) !void {
-    if (rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
+    if (request.rows.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
 
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
     const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
-    if (clear_for_replace) {
+    if (request.clear_for_replace) {
         try attached_client.presentation.preparePrimaryForScrollback(renderer);
         try renderer.clearForReplace();
         attached_client.presentation.reset();
     }
-    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, screen, false);
-    if (!clear_for_replace and shouldClearOuterVisibleForDisplayClear(screen)) {
-        try attached_client.presentation.clearOuterVisibleForScreen(renderer, screen);
+    var effective_align_viewport = shouldAlignViewportForDraw(attached_client, request.screen, false);
+    if (!request.clear_for_replace and shouldClearOuterVisibleForDisplayClear(request.screen)) {
+        try attached_client.presentation.clearOuterVisibleForScreen(renderer, request.screen);
         effective_align_viewport = false;
     }
-    if (truncated_rows > 0 or rows.len > 0) {
+    if (request.truncated_rows > 0 or request.rows.len > 0) {
         try attached_client.presentation.preparePrimaryForScrollback(renderer);
     }
-    if (truncated_rows > 0) try appendScrollbackTruncatedMarker(&bytes, renderer, truncated_rows);
-    try attached_client.presentation.appendScrollbackRows(renderer, session.rows, rows);
-    try attached_client.presentation.applyScreen(renderer, session.rows, screen, true, effective_align_viewport);
+    if (request.truncated_rows > 0) try appendScrollbackTruncatedMarker(&bytes, renderer, request.truncated_rows);
+    try attached_client.presentation.appendScrollbackRows(renderer, session.rows, request.rows);
+    try attached_client.presentation.applyScreen(renderer, session.rows, request.screen, true, effective_align_viewport);
     if (effective_align_viewport) attached_client.origin = .{ .row = 0, .col = 0 };
-    updateMouseOriginAfterDraw(attached_client, screen);
+    updateMouseOriginAfterDraw(attached_client, request.screen);
     try appendDrawCleanup(&bytes);
     try wrapDrawInSynchronizedUpdate(&bytes);
     var restore_bytes = std.ArrayList(u8).empty;
     defer restore_bytes.deinit(app_allocator.allocator());
-    const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, screen, restore_screen, &restore_bytes);
-    try queueRepaintResponseFrame(attached_client, session, repaint_request_seq, scrollback_cursor, bytes.items, screen.title_present, restore);
+    const restore = try appendAttachedClientEndRestoreBytes(attached_client, session, request.screen, request.restore_screen, &restore_bytes);
+    try queueRepaintResponseFrame(attached_client, session, .{
+        .repaint_request_seq = request.repaint_request_seq,
+        .scrollback_cursor = request.scrollback_cursor,
+        .draw_bytes = bytes.items,
+        .app_title_present = request.screen.title_present,
+        .attached_client_end_restore_bytes = restore,
+    });
 }
 
 pub fn queueRepaintSnapshot(
@@ -507,30 +525,26 @@ pub fn queueRepaintSnapshot(
 
         const clear_scrollback_for_stale_clear =
             requested_cursor.epoch != 0 and requested_cursor.epoch < session.last_scrollback_clear_epoch;
-        try queueRepaintResponseDraw(
-            attached_client,
-            session,
-            request.repaint_request_seq,
-            clear_for_replace or clear_scrollback_for_stale_clear,
-            truncated_rows_to_report,
-            rows_to_draw,
-            &screen,
-            if (primary_screen) |*primary| primary else null,
-            scrollback.absolute_count,
-        );
+        try queueRepaintResponseDraw(attached_client, session, .{
+            .repaint_request_seq = request.repaint_request_seq,
+            .clear_for_replace = clear_for_replace or clear_scrollback_for_stale_clear,
+            .truncated_rows = truncated_rows_to_report,
+            .rows = rows_to_draw,
+            .screen = &screen,
+            .restore_screen = if (primary_screen) |*primary| primary else null,
+            .scrollback_cursor = scrollback.absolute_count,
+        });
     } else {
         const scrollback_cursor = try model.scrollbackCursor();
-        try queueRepaintResponseDraw(
-            attached_client,
-            session,
-            request.repaint_request_seq,
-            clear_for_replace,
-            0,
-            &.{},
-            &screen,
-            if (primary_screen) |*primary| primary else null,
-            scrollback_cursor,
-        );
+        try queueRepaintResponseDraw(attached_client, session, .{
+            .repaint_request_seq = request.repaint_request_seq,
+            .clear_for_replace = clear_for_replace,
+            .truncated_rows = 0,
+            .rows = &.{},
+            .screen = &screen,
+            .restore_screen = if (primary_screen) |*primary| primary else null,
+            .scrollback_cursor = scrollback_cursor,
+        });
     }
 
     return screen.rows.len;
@@ -555,15 +569,13 @@ pub fn sendSessionSnapshot(attached_client: *AttachedClient, session: *Session) 
         if (screen.active_screen == 1) {
             primary_screen = try model.renderedPrimaryScreen(app_allocator.allocator());
         }
-        _ = try queueScreenDraw(
-            attached_client,
-            session,
-            &screen,
-            if (primary_screen) |*primary| primary else null,
-            true,
-            false,
-            scrollback.absolute_count,
-        );
+        _ = try queueScreenDraw(attached_client, session, .{
+            .screen = &screen,
+            .restore_screen = if (primary_screen) |*primary| primary else null,
+            .align_viewport = false,
+            .materialize = true,
+            .scrollback_cursor = scrollback.absolute_count,
+        });
         model.markScrollbackReported();
         model.markRendered(screen.rows.len);
         return;

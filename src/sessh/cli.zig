@@ -72,15 +72,31 @@ pub fn parse(scratch: *Scratch, args: []const []const u8) !Invocation {
         if (std.mem.eql(u8, arg, "--")) {
             i += 1;
             if (i >= args.len) return error.MissingHost;
-            return finish(scratch, &ssh_options, common, args[i], args[i + 1 ..], tty_request, proxy_required);
+            return finish(scratch, &ssh_options, .{
+                .common = common,
+                .host = args[i],
+                .command_args = args[i + 1 ..],
+                .tty_request = tty_request,
+                .proxy_required = proxy_required,
+            });
         }
 
         if (!std.mem.startsWith(u8, arg, "-") or std.mem.eql(u8, arg, "-")) {
-            return finish(scratch, &ssh_options, common, arg, args[i + 1 ..], tty_request, proxy_required);
+            return finish(scratch, &ssh_options, .{
+                .common = common,
+                .host = arg,
+                .command_args = args[i + 1 ..],
+                .tty_request = tty_request,
+                .proxy_required = proxy_required,
+            });
         }
 
         if (isSesshLongOption(arg)) {
-            try parseSesshOptionBeforeHost(args, &i, &common);
+            try (SesshOptionParser{
+                .args = args,
+                .index = &i,
+                .common = &common,
+            }).parseBeforeHost();
             continue;
         }
 
@@ -92,75 +108,85 @@ pub fn parse(scratch: *Scratch, args: []const []const u8) !Invocation {
     return error.MissingHost;
 }
 
-fn finish(
-    scratch: *Scratch,
-    ssh_options: *std.ArrayList([]const u8),
+const FinishOptions = struct {
     common: CommonSessionOptions,
     host: []const u8,
     command_args: []const []const u8,
     tty_request: SshTtyRequest,
     proxy_required: bool,
+};
+
+fn finish(
+    scratch: *Scratch,
+    ssh_options: *std.ArrayList([]const u8),
+    options: FinishOptions,
 ) !Invocation {
     return .{
-        .host = host,
+        .host = options.host,
         .ssh_options = try scratch.ownSshOptions(ssh_options),
-        .command_args = command_args,
-        .tty_request = tty_request,
-        .proxy_required = proxy_required,
-        .common = common,
+        .command_args = options.command_args,
+        .tty_request = options.tty_request,
+        .proxy_required = options.proxy_required,
+        .common = options.common,
     };
 }
 
-fn parseSesshOptionBeforeHost(args: []const []const u8, index: *usize, common: *CommonSessionOptions) !void {
-    const arg = args[index.*];
-    if (isConfigOnlyDirectSesshOption(arg)) return error.UnsupportedSesshOption;
+const SesshOptionParser = struct {
+    args: []const []const u8,
+    index: *usize,
+    common: *CommonSessionOptions,
 
-    if (std.mem.eql(u8, arg, "--log-level")) {
-        index.* += 1;
-        if (index.* >= args.len) return error.MissingClientLogLevel;
-        common.client_log_level = try client_log.parseLevel(args[index.*]);
-        common.client_log_level_set = true;
-        index.* += 1;
-    } else if (std.mem.eql(u8, arg, "--terminal-emulator")) {
-        common.terminal_emulator = true;
-        common.terminal_emulator_set = true;
-        index.* += 1;
-    } else if (std.mem.eql(u8, arg, "--no-terminal-emulator")) {
-        common.terminal_emulator = false;
-        common.terminal_emulator_set = true;
-        index.* += 1;
-    } else if (std.mem.eql(u8, arg, "--filter-level")) {
-        index.* += 1;
-        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingFilterLevel;
-        common.filter_level = try config.parseFilterLevel(args[index.*]);
-        common.filter_level_set = true;
-        index.* += 1;
-    } else if (std.mem.eql(u8, arg, "--diagnostics-level")) {
-        index.* += 1;
-        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingDiagnosticsLevel;
-        common.diagnostics_level = try config.parseDiagnosticsLevel(args[index.*]);
-        common.diagnostics_level_set = true;
-        index.* += 1;
-    } else if (std.mem.eql(u8, arg, "--isolation-mode")) {
-        index.* += 1;
-        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingIsolationMode;
-        common.isolation_mode = try config.parseIsolationMode(args[index.*]);
-        common.isolation_mode_set = true;
-        index.* += 1;
-    } else if (std.mem.eql(u8, arg, "--diagnostics-file")) {
-        index.* += 1;
-        if (index.* >= args.len or args[index.*].len == 0 or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingDiagnosticsFile;
-        common.diagnostics_file = args[index.*];
-        index.* += 1;
-    } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
-        index.* += 1;
-        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "--")) return error.MissingTtyTranscriptPath;
-        common.capture_tty_transcript = args[index.*];
-        index.* += 1;
-    } else {
-        return error.MissingHost;
+    fn parseBeforeHost(self: SesshOptionParser) !void {
+        const arg = self.args[self.index.*];
+        if (isConfigOnlyDirectSesshOption(arg)) return error.UnsupportedSesshOption;
+
+        if (std.mem.eql(u8, arg, "--log-level")) {
+            self.common.client_log_level = try client_log.parseLevel(try self.requiredValue(error.MissingClientLogLevel));
+            self.common.client_log_level_set = true;
+        } else if (std.mem.eql(u8, arg, "--terminal-emulator")) {
+            self.common.terminal_emulator = true;
+            self.common.terminal_emulator_set = true;
+            self.advance();
+        } else if (std.mem.eql(u8, arg, "--no-terminal-emulator")) {
+            self.common.terminal_emulator = false;
+            self.common.terminal_emulator_set = true;
+            self.advance();
+        } else if (std.mem.eql(u8, arg, "--filter-level")) {
+            self.common.filter_level = try config.parseFilterLevel(try self.requiredValue(error.MissingFilterLevel));
+            self.common.filter_level_set = true;
+        } else if (std.mem.eql(u8, arg, "--diagnostics-level")) {
+            self.common.diagnostics_level = try config.parseDiagnosticsLevel(try self.requiredValue(error.MissingDiagnosticsLevel));
+            self.common.diagnostics_level_set = true;
+        } else if (std.mem.eql(u8, arg, "--isolation-mode")) {
+            self.common.isolation_mode = try config.parseIsolationMode(try self.requiredValue(error.MissingIsolationMode));
+            self.common.isolation_mode_set = true;
+        } else if (std.mem.eql(u8, arg, "--diagnostics-file")) {
+            self.common.diagnostics_file = try self.requiredNonEmptyValue(error.MissingDiagnosticsFile);
+        } else if (std.mem.eql(u8, arg, "--capture-tty-transcript")) {
+            self.common.capture_tty_transcript = try self.requiredValue(error.MissingTtyTranscriptPath);
+        } else {
+            return error.MissingHost;
+        }
     }
-}
+
+    fn advance(self: SesshOptionParser) void {
+        self.index.* += 1;
+    }
+
+    fn requiredValue(self: SesshOptionParser, missing_error: anyerror) ![]const u8 {
+        self.advance();
+        if (self.index.* >= self.args.len or std.mem.startsWith(u8, self.args[self.index.*], "--")) return missing_error;
+        const value = self.args[self.index.*];
+        self.advance();
+        return value;
+    }
+
+    fn requiredNonEmptyValue(self: SesshOptionParser, missing_error: anyerror) ![]const u8 {
+        const value = try self.requiredValue(missing_error);
+        if (value.len == 0) return missing_error;
+        return value;
+    }
+};
 
 fn isSesshLongOption(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--scrollback-limit") or
@@ -300,6 +326,45 @@ test "parse rejects config-only sessh options on direct ssh transport" {
         "-F cfg",
         "example.com",
     }));
+}
+
+test "parse rejects missing public sessh option values before host" {
+    const Case = struct {
+        args: []const []const u8,
+        expected_error: anyerror,
+    };
+    const cases = [_]Case{
+        .{
+            .args = &.{ "sessh", "--log-level" },
+            .expected_error = error.MissingClientLogLevel,
+        },
+        .{
+            .args = &.{ "sessh", "--filter-level", "--diagnostics-level", "status", "example.com" },
+            .expected_error = error.MissingFilterLevel,
+        },
+        .{
+            .args = &.{ "sessh", "--diagnostics-level" },
+            .expected_error = error.MissingDiagnosticsLevel,
+        },
+        .{
+            .args = &.{ "sessh", "--isolation-mode" },
+            .expected_error = error.MissingIsolationMode,
+        },
+        .{
+            .args = &.{ "sessh", "--diagnostics-file", "", "example.com" },
+            .expected_error = error.MissingDiagnosticsFile,
+        },
+        .{
+            .args = &.{ "sessh", "--capture-tty-transcript", "--log-level", "debug", "example.com" },
+            .expected_error = error.MissingTtyTranscriptPath,
+        },
+    };
+
+    for (cases) |case| {
+        var scratch = Scratch{ .allocator = std.testing.allocator };
+        defer scratch.deinit();
+        try std.testing.expectError(case.expected_error, parse(&scratch, case.args));
+    }
 }
 
 test "parse rejects protocol-breaking ssh options" {

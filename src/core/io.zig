@@ -2,6 +2,8 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_fds = @import("fds.zig");
+
 pub const WriteHook = *const fn (fd: c.fd_t, bytes: []const u8) void;
 pub const ReadHook = *const fn (fd: c.fd_t, bytes: []const u8) void;
 
@@ -73,17 +75,8 @@ pub const WriteSomeResult = union(enum) {
 pub fn writeSomeNonBlocking(fd: c.fd_t, bytes: []const u8) !WriteSomeResult {
     if (bytes.len == 0) return .{ .wrote = 0 };
 
-    const original_flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (original_flags < 0) return error.WriteFailed;
-
-    const nonblocking_flag = nonblockingFlag();
-    const changed_flags = (original_flags & nonblocking_flag) == 0;
-    if (changed_flags and c.fcntl(fd, c.F.SETFL, original_flags | nonblocking_flag) < 0) {
-        return error.WriteFailed;
-    }
-    defer {
-        if (changed_flags) _ = c.fcntl(fd, c.F.SETFL, original_flags);
-    }
+    var flags_guard = core_fds.StatusFlagsGuard.setNonBlocking(fd) catch return error.WriteFailed;
+    defer flags_guard.restore();
 
     while (true) {
         const n = c.write(fd, bytes.ptr, bytes.len);
@@ -96,10 +89,6 @@ pub fn writeSomeNonBlocking(fd: c.fd_t, bytes: []const u8) !WriteSomeResult {
             else => return error.WriteFailed,
         }
     }
-}
-
-fn nonblockingFlag() c_int {
-    return @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
 }
 
 pub fn stderrPrint(comptime fmt: []const u8, args: anytype) !void {

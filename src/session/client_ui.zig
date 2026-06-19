@@ -4,6 +4,7 @@ const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
 const client_log = @import("../core/client_log.zig");
+const core_fds = @import("../core/fds.zig");
 const client_renderer = @import("renderer.zig");
 const connection_event = @import("../diagnostics/connection_event.zig");
 const diagnostics_display = @import("../diagnostics/display.zig");
@@ -113,8 +114,8 @@ pub const ReconnectUi = struct {
             posix.close(ui.diagnostic_notify_read_fd);
             posix.close(ui.diagnostic_notify_write_fd);
         }
-        try setNonBlocking(ui.diagnostic_notify_read_fd);
-        try setNonBlocking(ui.diagnostic_notify_write_fd);
+        try core_fds.setNonBlocking(ui.diagnostic_notify_read_fd);
+        try core_fds.setNonBlocking(ui.diagnostic_notify_write_fd);
         client_log.registerUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
         errdefer client_log.unregisterUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
         try ui.consumeDiagnostics();
@@ -559,14 +560,6 @@ pub const ReconnectUi = struct {
         self.title_state.showSwitchCountdown(delay_ms);
     }
 };
-
-fn setNonBlocking(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    if ((flags & nonblocking_flag) != 0) return;
-    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-}
 
 fn elapsedTimerMs(timer: *NonSuspendingTimer) u64 {
     return timer.read() / std.time.ns_per_ms;

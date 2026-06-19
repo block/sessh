@@ -2,6 +2,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
 
@@ -21,32 +22,14 @@ pub fn forwardRawDuplex(left_read_fd: c.fd_t, left_write_fd: c.fd_t, right_fd: c
         .write_fd = left_write_fd,
     };
 
-    // PROCESS_EVENT_LOOP: foreground raw proxy bridge. This process exists only
-    // to relay bytes between two fds, so a direct poll loop is the event loop.
-    while (!left_to_right.done() or !right_to_left.done()) {
-        var pollfds: [4]posix.pollfd = undefined;
-        var refs: [4]PollRef = undefined;
-        var count: usize = 0;
-        left_to_right.appendPoll(&pollfds, &refs, &count, .left_to_right);
-        right_to_left.appendPoll(&pollfds, &refs, &count, .right_to_left);
-        if (count == 0) return;
-        _ = try posix.poll(pollfds[0..count], -1);
-
-        for (pollfds[0..count], refs[0..count]) |pollfd, poll_ref| {
-            const direction = switch (poll_ref.direction) {
-                .left_to_right => &left_to_right,
-                .right_to_left => &right_to_left,
-            };
-            switch (poll_ref.kind) {
-                .read => if ((pollfd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-                    direction.readReady();
-                },
-                .write => if ((pollfd.revents & (posix.POLL.OUT | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-                    direction.writeReady();
-                },
-            }
-        }
-    }
+    var raw_dispatcher = try dispatcher.Dispatcher.init(std.heap.page_allocator);
+    defer raw_dispatcher.deinit();
+    var bridge = RawBridge{
+        .left_to_right = &left_to_right,
+        .right_to_left = &right_to_left,
+    };
+    try bridge.watch(&raw_dispatcher);
+    try raw_dispatcher.run();
 }
 
 const DirectionId = enum {
@@ -59,10 +42,66 @@ const PollKind = enum {
     write,
 };
 
-const PollRef = struct {
+const RawBridge = struct {
+    left_to_right: *RawDirection,
+    right_to_left: *RawDirection,
+    watches: [4]dispatcher.FdWatchId = undefined,
+    watch_contexts: [4]RawWatchContext = undefined,
+
+    fn watch(self: *RawBridge, raw_dispatcher: *dispatcher.Dispatcher) !void {
+        self.watch_contexts = .{
+            .{ .bridge = self, .direction = .left_to_right, .kind = .read },
+            .{ .bridge = self, .direction = .left_to_right, .kind = .write },
+            .{ .bridge = self, .direction = .right_to_left, .kind = .read },
+            .{ .bridge = self, .direction = .right_to_left, .kind = .write },
+        };
+        self.watches[0] = try raw_dispatcher.watchFd(self.left_to_right.read_fd, .{}, .{ .ctx = &self.watch_contexts[0], .callback = handleRawBridgeEvent });
+        self.watches[1] = try raw_dispatcher.watchFd(self.left_to_right.write_fd, .{}, .{ .ctx = &self.watch_contexts[1], .callback = handleRawBridgeEvent });
+        self.watches[2] = try raw_dispatcher.watchFd(self.right_to_left.read_fd, .{}, .{ .ctx = &self.watch_contexts[2], .callback = handleRawBridgeEvent });
+        self.watches[3] = try raw_dispatcher.watchFd(self.right_to_left.write_fd, .{}, .{ .ctx = &self.watch_contexts[3], .callback = handleRawBridgeEvent });
+        try self.updateWatches(raw_dispatcher);
+    }
+
+    fn direction(self: *RawBridge, id: DirectionId) *RawDirection {
+        return switch (id) {
+            .left_to_right => self.left_to_right,
+            .right_to_left => self.right_to_left,
+        };
+    }
+
+    fn updateWatches(self: *RawBridge, raw_dispatcher: *dispatcher.Dispatcher) !void {
+        try raw_dispatcher.updateFdEvents(self.watches[0], .{ .readable = self.left_to_right.wantsRead() });
+        try raw_dispatcher.updateFdEvents(self.watches[1], .{ .writable = self.left_to_right.wantsWrite() });
+        try raw_dispatcher.updateFdEvents(self.watches[2], .{ .readable = self.right_to_left.wantsRead() });
+        try raw_dispatcher.updateFdEvents(self.watches[3], .{ .writable = self.right_to_left.wantsWrite() });
+        if (self.left_to_right.done() and self.right_to_left.done()) raw_dispatcher.stop();
+    }
+};
+
+const RawWatchContext = struct {
+    bridge: *RawBridge,
     direction: DirectionId,
     kind: PollKind,
 };
+
+fn handleRawBridgeEvent(ctx: *anyopaque, raw_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+    _ = id;
+    const watch: *RawWatchContext = @ptrCast(@alignCast(ctx));
+    const fd_event = switch (event) {
+        .fd => |fd| fd,
+        .timer => return error.UnexpectedRawBridgeTimer,
+    };
+    const direction = watch.bridge.direction(watch.direction);
+    switch (watch.kind) {
+        .read => if (fd_event.readable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
+            direction.readReady();
+        },
+        .write => if (fd_event.writable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
+            direction.writeReady();
+        },
+    }
+    try watch.bridge.updateWatches(raw_dispatcher);
+}
 
 const RawDirection = struct {
     read_fd: c.fd_t,
@@ -77,23 +116,12 @@ const RawDirection = struct {
         return self.read_closed and self.len == 0 and self.write_closed;
     }
 
-    fn appendPoll(
-        self: *const RawDirection,
-        pollfds: *[4]posix.pollfd,
-        refs: *[4]PollRef,
-        count: *usize,
-        direction: DirectionId,
-    ) void {
-        if (!self.read_closed and self.len == 0) {
-            pollfds[count.*] = .{ .fd = self.read_fd, .events = posix.POLL.IN, .revents = 0 };
-            refs[count.*] = .{ .direction = direction, .kind = .read };
-            count.* += 1;
-        }
-        if (!self.write_closed and self.len > 0) {
-            pollfds[count.*] = .{ .fd = self.write_fd, .events = posix.POLL.OUT, .revents = 0 };
-            refs[count.*] = .{ .direction = direction, .kind = .write };
-            count.* += 1;
-        }
+    fn wantsRead(self: *const RawDirection) bool {
+        return !self.read_closed and self.len == 0;
+    }
+
+    fn wantsWrite(self: *const RawDirection) bool {
+        return !self.write_closed and self.len > 0;
     }
 
     fn readReady(self: *RawDirection) void {

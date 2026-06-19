@@ -2,14 +2,11 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_fds = @import("../core/fds.zig");
 const frame = @import("frame.zig");
 
 pub fn setNonBlockingFdForTest(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    if ((flags & nonblocking_flag) != 0) return;
-    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
+    try core_fds.setNonBlocking(fd);
 }
 
 pub fn closePipeForTest(pipe: [2]c.fd_t) void {

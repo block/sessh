@@ -8,12 +8,30 @@ const ssh_opts = @import("../transport/ssh_options.zig");
 const proxy_worker = @import("../stream/proxy_worker.zig");
 
 extern "c" fn ttyname(fd: c_int) ?[*:0]u8;
+extern "c" fn openpty(amaster: *c_int, aslave: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp: ?*c.winsize) c_int;
 
 pub const ProxyStreamPlan = struct {
     command_level: config.FilterLevel,
     use_daemon_control: bool,
     wrap_visible_ssh: bool,
     client_ctrl_r: bool,
+};
+
+pub const ProxyStreamPlanRequest = struct {
+    ssh_options: []const []const u8,
+    filter_level: config.FilterLevel,
+    tty_request: ssh_opts.SshTtyRequest,
+    shell_command_args: []const []const u8,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+};
+
+pub const AutoProxyDiagnosticsFileRequest = struct {
+    explicit_diagnostics_file: ?[]const u8,
+    use_daemon_control: bool,
+    wrap_visible_ssh: bool,
+    stdin_fd: c.fd_t,
+    stderr_fd: c.fd_t,
 };
 
 pub fn terminalPresentation(
@@ -56,15 +74,8 @@ pub fn streamStatusMode(
     };
 }
 
-pub fn proxyStreamPlan(
-    ssh_options: []const []const u8,
-    filter_level: config.FilterLevel,
-    tty_request: ssh_opts.SshTtyRequest,
-    shell_command_args: []const []const u8,
-    stdin_is_tty: bool,
-    stdout_is_tty: bool,
-) ProxyStreamPlan {
-    return switch (filter_level) {
+pub fn proxyStreamPlan(request: ProxyStreamPlanRequest) ProxyStreamPlan {
+    return switch (request.filter_level) {
         .unhygienic => .{
             .command_level = .unhygienic,
             .use_daemon_control = false,
@@ -72,18 +83,18 @@ pub fn proxyStreamPlan(
             .client_ctrl_r = false,
         },
         .hygienic, .emulated => blk: {
-            if (!stdin_is_tty or !stdout_is_tty) break :blk .{
+            if (!request.stdin_is_tty or !request.stdout_is_tty) break :blk .{
                 .command_level = .unhygienic,
                 .use_daemon_control = false,
                 .wrap_visible_ssh = false,
                 .client_ctrl_r = false,
             };
-            const wrap_visible_ssh = outerSshAllocatesTty(ssh_options, tty_request, shell_command_args, stdin_is_tty);
+            const wrap_visible_ssh = outerSshAllocatesTty(request.ssh_options, request.tty_request, request.shell_command_args, request.stdin_is_tty);
             break :blk .{
                 .command_level = .hygienic,
                 .use_daemon_control = true,
                 .wrap_visible_ssh = wrap_visible_ssh,
-                .client_ctrl_r = wrap_visible_ssh and stdin_is_tty,
+                .client_ctrl_r = wrap_visible_ssh and request.stdin_is_tty,
             };
         },
     };
@@ -98,16 +109,12 @@ pub fn isolationModeUsesDirectProxyPlacement(mode: config.IsolationMode) bool {
 
 pub fn autoProxyDiagnosticsFile(
     allocator: std.mem.Allocator,
-    explicit_diagnostics_file: ?[]const u8,
-    use_daemon_control: bool,
-    wrap_visible_ssh: bool,
-    stdin_fd: c.fd_t,
-    stderr_fd: c.fd_t,
+    request: AutoProxyDiagnosticsFileRequest,
 ) !?[]u8 {
-    if (explicit_diagnostics_file != null) return null;
-    if (!use_daemon_control or wrap_visible_ssh) return null;
-    if (!sameTerminalFd(stdin_fd, stderr_fd)) return null;
-    return try ttyPathForFd(allocator, stderr_fd);
+    if (request.explicit_diagnostics_file != null) return null;
+    if (!request.use_daemon_control or request.wrap_visible_ssh) return null;
+    if (!sameTerminalFd(request.stdin_fd, request.stderr_fd)) return null;
+    return try ttyPathForFd(allocator, request.stderr_fd);
 }
 
 fn sameTerminalFd(left: c.fd_t, right: c.fd_t) bool {
@@ -236,19 +243,40 @@ test "terminal presentation follows diagnostics level" {
 }
 
 test "proxy stream plan maps emulated proxy output to daemon control when stdio is tty" {
-    const interactive = proxyStreamPlan(&.{}, .emulated, .none, &.{}, true, true);
+    const interactive = proxyStreamPlan(.{
+        .ssh_options = &.{},
+        .filter_level = .emulated,
+        .tty_request = .none,
+        .shell_command_args = &.{},
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
     try std.testing.expectEqual(config.FilterLevel.hygienic, interactive.command_level);
     try std.testing.expect(interactive.use_daemon_control);
     try std.testing.expect(interactive.wrap_visible_ssh);
     try std.testing.expect(interactive.client_ctrl_r);
 
-    const no_stdout = proxyStreamPlan(&.{}, .emulated, .none, &.{}, true, false);
+    const no_stdout = proxyStreamPlan(.{
+        .ssh_options = &.{},
+        .filter_level = .emulated,
+        .tty_request = .none,
+        .shell_command_args = &.{},
+        .stdin_is_tty = true,
+        .stdout_is_tty = false,
+    });
     try std.testing.expectEqual(config.FilterLevel.unhygienic, no_stdout.command_level);
     try std.testing.expect(!no_stdout.use_daemon_control);
     try std.testing.expect(!no_stdout.wrap_visible_ssh);
     try std.testing.expect(!no_stdout.client_ctrl_r);
 
-    const no_stdin = proxyStreamPlan(&.{}, .emulated, .none, &.{}, false, true);
+    const no_stdin = proxyStreamPlan(.{
+        .ssh_options = &.{},
+        .filter_level = .emulated,
+        .tty_request = .none,
+        .shell_command_args = &.{},
+        .stdin_is_tty = false,
+        .stdout_is_tty = true,
+    });
     try std.testing.expectEqual(config.FilterLevel.unhygienic, no_stdin.command_level);
     try std.testing.expect(!no_stdin.use_daemon_control);
     try std.testing.expect(!no_stdin.wrap_visible_ssh);
@@ -256,17 +284,77 @@ test "proxy stream plan maps emulated proxy output to daemon control when stdio 
 }
 
 test "proxy stream plan honors unhygienic level" {
-    const result = proxyStreamPlan(&.{}, .unhygienic, .none, &.{}, true, true);
+    const result = proxyStreamPlan(.{
+        .ssh_options = &.{},
+        .filter_level = .unhygienic,
+        .tty_request = .none,
+        .shell_command_args = &.{},
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
     try std.testing.expectEqual(config.FilterLevel.unhygienic, result.command_level);
     try std.testing.expect(!result.use_daemon_control);
 }
 
 test "proxy stream plan disables ctrl-r when visible ssh is not wrapped" {
-    const result = proxyStreamPlan(&.{"-T"}, .hygienic, .none, &.{}, true, true);
+    const result = proxyStreamPlan(.{
+        .ssh_options = &.{"-T"},
+        .filter_level = .hygienic,
+        .tty_request = .none,
+        .shell_command_args = &.{},
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+    });
     try std.testing.expectEqual(config.FilterLevel.hygienic, result.command_level);
     try std.testing.expect(result.use_daemon_control);
     try std.testing.expect(!result.wrap_visible_ssh);
     try std.testing.expect(!result.client_ctrl_r);
+}
+
+test "auto proxy diagnostics file only infers a matching diagnostics tty" {
+    var master_fd: c.fd_t = -1;
+    var slave_fd: c.fd_t = -1;
+    if (openpty(&master_fd, &slave_fd, null, null, null) != 0) return error.OpenPtyFailed;
+    defer if (master_fd >= 0) posix.close(master_fd);
+    defer if (slave_fd >= 0) posix.close(slave_fd);
+
+    const explicit = try autoProxyDiagnosticsFile(std.testing.allocator, .{
+        .explicit_diagnostics_file = "/tmp/sessh-diagnostics.log",
+        .use_daemon_control = true,
+        .wrap_visible_ssh = false,
+        .stdin_fd = slave_fd,
+        .stderr_fd = slave_fd,
+    });
+    try std.testing.expect(explicit == null);
+
+    const wrapped = try autoProxyDiagnosticsFile(std.testing.allocator, .{
+        .explicit_diagnostics_file = null,
+        .use_daemon_control = true,
+        .wrap_visible_ssh = true,
+        .stdin_fd = slave_fd,
+        .stderr_fd = slave_fd,
+    });
+    try std.testing.expect(wrapped == null);
+
+    const no_daemon_control = try autoProxyDiagnosticsFile(std.testing.allocator, .{
+        .explicit_diagnostics_file = null,
+        .use_daemon_control = false,
+        .wrap_visible_ssh = false,
+        .stdin_fd = slave_fd,
+        .stderr_fd = slave_fd,
+    });
+    try std.testing.expect(no_daemon_control == null);
+
+    const inferred = try autoProxyDiagnosticsFile(std.testing.allocator, .{
+        .explicit_diagnostics_file = null,
+        .use_daemon_control = true,
+        .wrap_visible_ssh = false,
+        .stdin_fd = slave_fd,
+        .stderr_fd = slave_fd,
+    });
+    defer if (inferred) |path| std.testing.allocator.free(path);
+    const path_z = ttyname(slave_fd) orelse return error.MissingTtyName;
+    try std.testing.expectEqualStrings(std.mem.span(path_z), inferred.?);
 }
 
 test "diagnostics doc describes current public levels and diagnostics file behavior" {

@@ -8,6 +8,7 @@ const daemon_identity = @import("../daemon/identity.zig");
 const daemon_log = @import("../daemon/log.zig");
 const protocol = @import("../protocol/mod.zig");
 const socket_transport = @import("../transport/socket.zig");
+const worker_process = @import("../core/worker_process.zig");
 
 const proxy_mux_stream_id: u64 = 1;
 
@@ -110,13 +111,7 @@ pub fn requestCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
         else => return err,
     };
     defer _ = c.close(fd);
-    protocol.sendMuxStreamFrame(allocator, fd, .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .reset = .{
-            .code = "CLEANUP_REQUESTED",
-            .message = "remote cleanup requested",
-        } },
-    }) catch {};
+    protocol.sendMuxStreamResetFrame(allocator, fd, proxy_mux_stream_id, "CLEANUP_REQUESTED", "remote cleanup requested") catch {};
     terminateAndForget(control);
 }
 
@@ -159,11 +154,6 @@ fn start(
     proxy_host: []const u8,
     proxy_port: u16,
 ) !*Process {
-    try socket_transport.ensureSocketDir(allocator, socket_path);
-    const listen_fd = try socket_transport.listenSocket(socket_path);
-    errdefer _ = c.close(listen_fd);
-    try socket_transport.clearCloseOnExec(listen_fd);
-
     const control = try allocator.create(Process);
     errdefer allocator.destroy(control);
     const control_guid = try allocator.dupe(u8, guid);
@@ -181,17 +171,13 @@ fn start(
 
     const port_arg = try std.fmt.allocPrint(allocator, "{}", .{proxy_port});
     defer allocator.free(port_arg);
-    const listen_fd_arg = try std.fmt.allocPrint(allocator, "{}", .{listen_fd});
-    defer allocator.free(listen_fd_arg);
-    const argv = [_][]const u8{ exe, listen_fd_arg, socket_path, guid, proxy_host, port_arg };
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    errdefer posix.kill(@intCast(child.id), posix.SIG.HUP) catch {};
-    _ = c.close(listen_fd);
-    control.pid = @intCast(child.id);
+    const child_id = try worker_process.spawnWithInheritedListener(allocator, .{
+        .exe = exe,
+        .socket_path = socket_path,
+        .args_after_socket_path = &.{ guid, proxy_host, port_arg },
+    });
+    errdefer posix.kill(@intCast(child_id), posix.SIG.HUP) catch {};
+    control.pid = @intCast(child_id);
     control.owned_child = true;
     control.start_time = try daemon_identity.processStartTime(allocator, @intCast(control.pid));
     try writeIdentityFile(allocator, control.socket_path, control.pid, control.start_time.?);

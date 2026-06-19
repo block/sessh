@@ -5,23 +5,24 @@ const remote_shell = @import("remote_shell.zig");
 const sessh_cli = @import("../sessh/cli.zig");
 const ssh_opts = @import("ssh_options.zig");
 
-pub fn commandOption(
-    allocator: std.mem.Allocator,
+pub const CommandOptions = struct {
     exe: []const u8,
-    ssh_options: []const []const u8,
-    diagnostics_guid: ?[]const u8,
+    ssh_options: []const []const u8 = &.{},
+    diagnostics_guid: ?[]const u8 = null,
     filter_level: config.FilterLevel,
     diagnostics_level: config.DiagnosticsLevel,
-    client_ctrl_r: bool,
-    diagnostics_file: ?[]const u8,
+    client_ctrl_r: bool = false,
+    diagnostics_file: ?[]const u8 = null,
     bootstrap: bool,
-    daemon_dir_name: ?[]const u8,
-    use_fd_pass: bool,
-) ![]u8 {
+    daemon_dir_name: ?[]const u8 = null,
+    use_fd_pass: bool = false,
+};
+
+pub fn commandOption(allocator: std.mem.Allocator, options: CommandOptions) ![]u8 {
     var command: std.ArrayList(u8) = .empty;
     defer command.deinit(allocator);
 
-    try appendShellToken(allocator, &command, exe);
+    try appendShellToken(allocator, &command, options.exe);
     try appendShellToken(allocator, &command, "--host");
     // Use the original host token so the inner ssh sees the same Host block.
     // `%h` is already resolved to HostName and can lose alias-scoped options.
@@ -31,26 +32,26 @@ pub fn commandOption(
     try appendShellToken(allocator, &command, "--user");
     try appendShellToken(allocator, &command, "%r");
     try appendShellToken(allocator, &command, "--filter-level");
-    try appendShellToken(allocator, &command, filter_level.label());
+    try appendShellToken(allocator, &command, options.filter_level.label());
     try appendShellToken(allocator, &command, "--diagnostics-level");
-    try appendShellToken(allocator, &command, diagnostics_level.label());
-    if (use_fd_pass) try appendShellToken(allocator, &command, "--use-fd-pass");
-    if (diagnostics_file) |path| {
+    try appendShellToken(allocator, &command, options.diagnostics_level.label());
+    if (options.use_fd_pass) try appendShellToken(allocator, &command, "--use-fd-pass");
+    if (options.diagnostics_file) |path| {
         try appendShellToken(allocator, &command, "--diagnostics-file");
         try appendShellToken(allocator, &command, path);
     }
-    try appendShellToken(allocator, &command, if (bootstrap) "--bootstrap" else "--no-bootstrap");
-    if (daemon_dir_name) |dir_name| {
+    try appendShellToken(allocator, &command, if (options.bootstrap) "--bootstrap" else "--no-bootstrap");
+    if (options.daemon_dir_name) |dir_name| {
         try appendShellToken(allocator, &command, "--daemon-namespace");
         try appendShellToken(allocator, &command, dir_name);
     }
-    if (diagnostics_guid) |guid| {
+    if (options.diagnostics_guid) |guid| {
         try appendShellToken(allocator, &command, "--diagnostics-guid");
         try appendShellToken(allocator, &command, guid);
         try appendShellToken(allocator, &command, "--client-ctrl-r");
-        try appendShellToken(allocator, &command, if (client_ctrl_r) "1" else "0");
+        try appendShellToken(allocator, &command, if (options.client_ctrl_r) "1" else "0");
     }
-    try appendProxyTransportSshOptions(allocator, &command, ssh_options);
+    try appendProxyTransportSshOptions(allocator, &command, options.ssh_options);
 
     return std.fmt.allocPrint(allocator, "-oProxyCommand={s}", .{command.items});
 }
@@ -133,7 +134,17 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     });
     try std.testing.expect(parsed.proxy_required);
 
-    const option = try commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.ssh_options, "p-550e8400-e29b-41d4-a716-446655440000", .hygienic, .status, true, "/dev/ttys001", true, "3.conn.test", false);
+    const option = try commandOption(std.testing.allocator, .{
+        .exe = "/tmp/sessh-test/sessh-proxy",
+        .ssh_options = parsed.ssh_options,
+        .diagnostics_guid = "p-550e8400-e29b-41d4-a716-446655440000",
+        .filter_level = .hygienic,
+        .diagnostics_level = .status,
+        .client_ctrl_r = true,
+        .diagnostics_file = "/dev/ttys001",
+        .bootstrap = true,
+        .daemon_dir_name = "3.conn.test",
+    });
     defer std.testing.allocator.free(option);
 
     try std.testing.expect(std.mem.indexOf(u8, option, "sessh-proxy") != null);
@@ -161,11 +172,24 @@ test "proxy command keeps outer-only options off bootstrap ssh" {
     try std.testing.expect(std.mem.indexOf(u8, option, "'-X'") == null);
     try std.testing.expect(std.mem.indexOf(u8, option, "'-tt'") == null);
 
-    const no_bootstrap_option = try commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.ssh_options, null, .unhygienic, .overlay, false, null, false, null, false);
+    const no_bootstrap_option = try commandOption(std.testing.allocator, .{
+        .exe = "/tmp/sessh-test/sessh-proxy",
+        .ssh_options = parsed.ssh_options,
+        .filter_level = .unhygienic,
+        .diagnostics_level = .overlay,
+        .bootstrap = false,
+    });
     defer std.testing.allocator.free(no_bootstrap_option);
     try std.testing.expect(std.mem.indexOf(u8, no_bootstrap_option, "--no-bootstrap") != null);
 
-    const fd_pass_option = try commandOption(std.testing.allocator, "/tmp/sessh-test/sessh-proxy", parsed.ssh_options, null, .unhygienic, .overlay, false, null, true, null, true);
+    const fd_pass_option = try commandOption(std.testing.allocator, .{
+        .exe = "/tmp/sessh-test/sessh-proxy",
+        .ssh_options = parsed.ssh_options,
+        .filter_level = .unhygienic,
+        .diagnostics_level = .overlay,
+        .bootstrap = true,
+        .use_fd_pass = true,
+    });
     defer std.testing.allocator.free(fd_pass_option);
     try std.testing.expect(std.mem.indexOf(u8, fd_pass_option, "--use-fd-pass") != null);
 }

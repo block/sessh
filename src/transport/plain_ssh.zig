@@ -3,6 +3,8 @@ const c = std.c;
 const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
+const core_fds = @import("../core/fds.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const io = @import("../core/io.zig");
 const local_boot_time = @import("../core/local_boot_time.zig");
 const process_exit = @import("../core/process_exit.zig");
@@ -66,7 +68,7 @@ const ProxyClientControl = struct {
     fn setControlFd(self: *ProxyClientControl, fd: c.fd_t) void {
         if (self.control_fd >= 0) posix.close(self.control_fd);
         self.control_fd = fd;
-        setNonBlockingFd(fd) catch {};
+        core_fds.setNonBlocking(fd) catch {};
     }
 
     fn closeControl(self: *ProxyClientControl) void {
@@ -252,29 +254,102 @@ pub fn runArgvWithDiagnostics(
 }
 
 fn waitForChildAndDiagnostics(pid: c.pid_t, diagnostics: *ProxyClientControl) std.process.Child.Term {
-    // BLOCKING_POLL: the plain-ssh fallback is a foreground process waiting
-    // for its only child while optionally draining diagnostics. It has
-    // no process Dispatcher; sesshd-owned SSH transports use the daemon
-    // dispatcher instead.
-    while (true) {
-        if (checkChildExit(pid)) |term| return term;
+    var context = ChildDiagnosticsWait.init(pid, diagnostics) catch return .{ .Unknown = 0 };
+    defer context.deinit();
+    context.run() catch return .{ .Unknown = 0 };
+    return context.term orelse .{ .Unknown = 0 };
+}
 
-        var pollfds: [1]posix.pollfd = undefined;
-        const fds = if (diagnostics.control_fd >= 0) blk: {
-            pollfds[0] = .{
-                .fd = diagnostics.control_fd,
-                .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR,
-                .revents = 0,
-            };
-            break :blk pollfds[0..1];
-        } else pollfds[0..0];
+const ChildDiagnosticsWait = struct {
+    wait_dispatcher: dispatcher.Dispatcher,
+    pid: c.pid_t,
+    diagnostics: *ProxyClientControl,
+    control_watch_id: ?dispatcher.FdWatchId = null,
+    timer_watch_id: ?dispatcher.TimerWatchId = null,
+    term: ?std.process.Child.Term = null,
 
-        const ready = posix.poll(fds, child_wait_poll_ms) catch return .{ .Unknown = 0 };
-        if (ready == 0) continue;
-        if (diagnostics.control_fd >= 0 and pollfds[0].revents != 0) {
-            diagnostics.readControl();
-        }
+    fn init(pid: c.pid_t, diagnostics: *ProxyClientControl) !ChildDiagnosticsWait {
+        return .{
+            .wait_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator()),
+            .pid = pid,
+            .diagnostics = diagnostics,
+        };
     }
+
+    fn deinit(self: *ChildDiagnosticsWait) void {
+        self.wait_dispatcher.deinit();
+    }
+
+    fn run(self: *ChildDiagnosticsWait) !void {
+        if (checkChildExit(self.pid)) |term| {
+            self.term = term;
+            return;
+        }
+        if (self.diagnostics.control_fd >= 0) {
+            self.control_watch_id = try self.wait_dispatcher.watchFd(self.diagnostics.control_fd, .{ .readable = true }, .{
+                .ctx = self,
+                .callback = handleChildDiagnosticsWaitEvent,
+            });
+        }
+        try self.armTimer();
+        try self.wait_dispatcher.run();
+    }
+
+    fn armTimer(self: *ChildDiagnosticsWait) !void {
+        self.timer_watch_id = try self.wait_dispatcher.watchTimerAfter(child_wait_poll_ms, .{
+            .ctx = self,
+            .callback = handleChildDiagnosticsWaitEvent,
+        });
+    }
+};
+
+fn handleChildDiagnosticsWaitEvent(
+    ctx: *anyopaque,
+    d: *dispatcher.Dispatcher,
+    id: dispatcher.WatchId,
+    event: dispatcher.Event,
+) !void {
+    const wait: *ChildDiagnosticsWait = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .fd => |fd_event| {
+            if (!plainSshFdWatchMatches(id, wait.control_watch_id)) return;
+            if (fd_event.readable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
+                wait.diagnostics.readControl();
+                if (wait.diagnostics.control_fd < 0) {
+                    if (wait.control_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
+                    wait.control_watch_id = null;
+                }
+            }
+        },
+        .timer => {
+            if (!plainSshTimerWatchMatches(id, wait.timer_watch_id)) return;
+            wait.timer_watch_id = null;
+            if (checkChildExit(wait.pid)) |term| {
+                wait.term = term;
+                wait.wait_dispatcher.stop();
+            } else {
+                try wait.armTimer();
+            }
+        },
+    }
+}
+
+fn plainSshFdWatchMatches(id: dispatcher.WatchId, expected: ?dispatcher.FdWatchId) bool {
+    const expected_id = expected orelse return false;
+    const fd_id = switch (id) {
+        .fd => |fd| fd,
+        .timer => return false,
+    };
+    return fd_id.index == expected_id.index and fd_id.generation == expected_id.generation;
+}
+
+fn plainSshTimerWatchMatches(id: dispatcher.WatchId, expected: ?dispatcher.TimerWatchId) bool {
+    const expected_id = expected orelse return false;
+    const timer_id = switch (id) {
+        .timer => |timer| timer,
+        .fd => return false,
+    };
+    return timer_id.index == expected_id.index and timer_id.generation == expected_id.generation;
 }
 
 fn checkChildExit(pid: c.pid_t) ?std.process.Child.Term {
@@ -317,9 +392,9 @@ pub fn runArgvUnderLocalPty(
     var mode_guard = try terminal.TerminalModeGuard.enable(posix.STDIN_FILENO);
     defer mode_guard.restore();
 
-    var stdin_flags_guard = try FdStatusFlagsGuard.setNonBlocking(posix.STDIN_FILENO);
+    var stdin_flags_guard = try core_fds.StatusFlagsGuard.setNonBlocking(posix.STDIN_FILENO);
     defer stdin_flags_guard.restore();
-    setNonBlockingFd(child.master_fd) catch {};
+    core_fds.setNonBlocking(child.master_fd) catch {};
 
     var diagnostics = ProxyClientControl.init(allocator, client_ctrl_r, false);
     if (control_fd >= 0) diagnostics.setControlFd(control_fd);
@@ -328,31 +403,14 @@ pub fn runArgvUnderLocalPty(
         diagnostics.deinit();
     }
 
-    // PROCESS_EVENT_LOOP: this is the visible foreground tty wrapper around a
-    // ssh transport process. It is intentionally a direct poll loop rather than a
-    // daemon Dispatcher helper.
     while (true) {
         refreshLocalPtySize(child.master_fd, &size);
-
-        var pollfds: [3]posix.pollfd = undefined;
-        var count: usize = 0;
-        const pty_index = count;
-        pollfds[count] = .{ .fd = child.master_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-        count += 1;
-        const stdin_index = count;
-        pollfds[count] = .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-        count += 1;
-        var control_index: ?usize = null;
-        if (diagnostics.control_fd >= 0) {
-            control_index = count;
-            pollfds[count] = .{ .fd = diagnostics.control_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-            count += 1;
-        }
-
-        _ = posix.poll(pollfds[0..count], -1) catch continue;
+        var poll = LocalPtyRelayPoll.init(child.master_fd, diagnostics.control_fd) catch continue;
+        defer poll.deinit();
+        poll.run() catch continue;
         refreshLocalPtySize(child.master_fd, &size);
 
-        if ((pollfds[pty_index].revents & posix.POLL.IN) != 0) {
+        if (if (poll.pty_event) |event| event.readable else false) {
             var buf: [8192]u8 = undefined;
             switch (try pty_process.readMaster(child.master_fd, &buf)) {
                 .bytes => |bytes| {
@@ -368,16 +426,16 @@ pub fn runArgvUnderLocalPty(
                 },
             }
         }
-        if ((pollfds[pty_index].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
-            (pollfds[pty_index].revents & posix.POLL.IN) == 0)
-        {
-            const term = child.wait();
-            child.closeMaster();
-            diagnostics.clear();
-            return exitAfterLocalPtyTerm(term, diagnostic_name, &mode_guard, &stdin_flags_guard);
+        if (poll.pty_event) |event| {
+            if ((event.hangup or event.error_event or event.invalid) and !event.readable) {
+                const term = child.wait();
+                child.closeMaster();
+                diagnostics.clear();
+                return exitAfterLocalPtyTerm(term, diagnostic_name, &mode_guard, &stdin_flags_guard);
+            }
         }
 
-        if ((pollfds[stdin_index].revents & posix.POLL.IN) != 0) {
+        if (if (poll.stdin_event) |event| event.readable else false) {
             var input: [4096]u8 = undefined;
             const n = c.read(posix.STDIN_FILENO, &input, input.len);
             if (n > 0) {
@@ -386,11 +444,77 @@ pub fn runArgvUnderLocalPty(
             }
         }
 
-        if (control_index) |index| {
-            if (pollfds[index].revents != 0) {
-                diagnostics.readControl();
-            }
+        if (poll.control_event != null) {
+            diagnostics.readControl();
         }
+    }
+}
+
+const LocalPtyRelayPoll = struct {
+    relay_dispatcher: dispatcher.Dispatcher,
+    pty_fd: c.fd_t,
+    control_fd: c.fd_t,
+    pty_watch_id: ?dispatcher.FdWatchId = null,
+    stdin_watch_id: ?dispatcher.FdWatchId = null,
+    control_watch_id: ?dispatcher.FdWatchId = null,
+    pty_event: ?dispatcher.FdEvent = null,
+    stdin_event: ?dispatcher.FdEvent = null,
+    control_event: ?dispatcher.FdEvent = null,
+
+    fn init(pty_fd: c.fd_t, control_fd: c.fd_t) !LocalPtyRelayPoll {
+        return .{
+            .relay_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator()),
+            .pty_fd = pty_fd,
+            .control_fd = control_fd,
+        };
+    }
+
+    fn deinit(self: *LocalPtyRelayPoll) void {
+        self.relay_dispatcher.deinit();
+    }
+
+    fn run(self: *LocalPtyRelayPoll) !void {
+        self.pty_watch_id = try self.relay_dispatcher.watchFd(self.pty_fd, .{ .readable = true }, .{
+            .ctx = self,
+            .callback = handleLocalPtyRelayPollEvent,
+        });
+        self.stdin_watch_id = try self.relay_dispatcher.watchFd(posix.STDIN_FILENO, .{ .readable = true }, .{
+            .ctx = self,
+            .callback = handleLocalPtyRelayPollEvent,
+        });
+        if (self.control_fd >= 0) {
+            self.control_watch_id = try self.relay_dispatcher.watchFd(self.control_fd, .{ .readable = true }, .{
+                .ctx = self,
+                .callback = handleLocalPtyRelayPollEvent,
+            });
+        }
+        try self.relay_dispatcher.run();
+    }
+
+    fn noteFdEvent(self: *LocalPtyRelayPoll, id: dispatcher.WatchId, event: dispatcher.FdEvent) void {
+        if (plainSshFdWatchMatches(id, self.pty_watch_id)) {
+            self.pty_event = event;
+        } else if (plainSshFdWatchMatches(id, self.stdin_watch_id)) {
+            self.stdin_event = event;
+        } else if (plainSshFdWatchMatches(id, self.control_watch_id)) {
+            self.control_event = event;
+        }
+    }
+};
+
+fn handleLocalPtyRelayPollEvent(
+    ctx: *anyopaque,
+    _: *dispatcher.Dispatcher,
+    id: dispatcher.WatchId,
+    event: dispatcher.Event,
+) !void {
+    const poll: *LocalPtyRelayPoll = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .fd => |fd_event| {
+            poll.noteFdEvent(id, fd_event);
+            poll.relay_dispatcher.stop();
+        },
+        .timer => {},
     }
 }
 
@@ -398,7 +522,7 @@ fn exitAfterLocalPtyTerm(
     term: std.process.Child.Term,
     diagnostic_name: []const u8,
     mode_guard: *terminal.TerminalModeGuard,
-    stdin_flags_guard: *FdStatusFlagsGuard,
+    stdin_flags_guard: *core_fds.StatusFlagsGuard,
 ) !noreturn {
     stdin_flags_guard.restore();
     mode_guard.restore();
@@ -440,41 +564,6 @@ fn exitAfterTerm(term: std.process.Child.Term, diagnostic_name: []const u8) !nor
         },
     }
 }
-
-fn setNonBlockingFd(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    if ((flags & nonblocking_flag) != 0) return;
-    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-}
-
-const FdStatusFlagsGuard = struct {
-    fd: c.fd_t,
-    original: c_int,
-    active: bool = false,
-
-    // We use F_SETFL to put stdin into non-blocking mode so that we can
-    // process IO across multiple file descriptors without additional threads.
-    // But the open file description of stdin is shared with the invoking
-    // shell, so we need to restore it prior to exiting. Otherwise the shell
-    // might get EAGAIN instead of waiting for input, which could cause all
-    // kinds of problems.
-    fn setNonBlocking(fd: c.fd_t) !FdStatusFlagsGuard {
-        const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-        if (flags < 0) return error.FcntlFailed;
-        const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-        if ((flags & nonblocking_flag) != 0) return .{ .fd = fd, .original = flags };
-        if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
-        return .{ .fd = fd, .original = flags, .active = true };
-    }
-
-    fn restore(self: *FdStatusFlagsGuard) void {
-        if (!self.active) return;
-        _ = c.fcntl(self.fd, c.F.SETFL, self.original);
-        self.active = false;
-    }
-};
 
 pub fn runArgv(allocator: std.mem.Allocator, ssh_args: []const []const u8, diagnostic_name: []const u8) !noreturn {
     const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);

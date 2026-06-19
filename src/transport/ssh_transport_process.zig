@@ -3,6 +3,7 @@ const c = std.c;
 const posix = std.posix;
 
 const config = @import("../core/config.zig");
+const core_fds = @import("../core/fds.zig");
 const daemon_log = @import("../daemon/log.zig");
 const ssh_opts = @import("ssh_options.zig");
 
@@ -130,16 +131,8 @@ pub fn spawnSshTransportProcess(
     const stderr_file = connection.child.stderr.?;
     connection.child.stderr = null;
     connection.stderr_fd = stderr_file.handle;
-    try setNonBlockingFd(connection.stderr_fd);
+    try core_fds.setNonBlocking(connection.stderr_fd);
     return connection;
-}
-
-pub fn setNonBlockingFd(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const nonblocking_flag = @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
-    if ((flags & nonblocking_flag) != 0) return;
-    if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
 }
 
 fn closeChildStdin(child: *std.process.Child) void {

@@ -6,12 +6,21 @@ const app_allocator = @import("../core/app_allocator.zig");
 const io = @import("../core/io.zig");
 const client_ui = @import("../session/client_ui.zig");
 const protocol = @import("../protocol/mod.zig");
+const protocol_test_helpers = @import("../protocol/test_helpers.zig");
 const transport_bootstrap = @import("bootstrap.zig");
 const remote_shell = @import("remote_shell.zig");
 
 pub const ArtifactSet = transport_bootstrap.ArtifactSet;
 pub const ArtifactEntry = transport_bootstrap.ArtifactEntry;
 pub const Entrypoint = remote_shell.Entrypoint;
+pub const ReconnectIoContext = transport_bootstrap.ReconnectIoContext;
+
+pub const ReadLineWithSshStderrRequest = struct {
+    stdout_fd: c.fd_t,
+    stderr_fd: c.fd_t,
+    client_fd: c.fd_t,
+    reconnect_io: ReconnectIoContext = .{},
+};
 
 pub fn buildExecBytes(
     allocator: std.mem.Allocator,
@@ -81,14 +90,13 @@ pub fn buildUploadBytes(
 
 pub fn readLineWithSshStderr(
     allocator: std.mem.Allocator,
-    stdout_fd: c.fd_t,
-    stderr_fd: c.fd_t,
-    client_fd: c.fd_t,
-    reconnect_ui: ?*client_ui.ReconnectUi,
-    poll_reconnect_input: bool,
+    request: ReadLineWithSshStderrRequest,
 ) ![]u8 {
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
+    const stdout_fd = request.stdout_fd;
+    const stderr_fd = request.stderr_fd;
+    const client_fd = request.client_fd;
     var stderr_open = stderr_fd >= 0;
 
     // BLOCKING_POLL: foreground SSH bootstrap read that also drains ssh
@@ -107,10 +115,8 @@ pub fn readLineWithSshStderr(
                 .revents = 0,
             },
         };
-        const ready = try posix.poll(&pollfds, if (reconnect_ui == null) -1 else 50);
-        if (reconnect_ui) |ui| {
-            if (try reconnectShouldCancel(ui, poll_reconnect_input)) return error.ReconnectCancelled;
-        }
+        const ready = try posix.poll(&pollfds, if (request.reconnect_io.reconnect_ui == null) -1 else 50);
+        if (try request.reconnect_io.shouldCancel()) return error.ReconnectCancelled;
         if (ready == 0) continue;
 
         if (stderr_open and pollfds[1].revents != 0) {
@@ -137,11 +143,6 @@ pub fn readLineWithSshStderr(
     }
 
     return error.BootstrapLineTooLong;
-}
-
-fn reconnectShouldCancel(reconnect_ui: *client_ui.ReconnectUi, poll_reconnect_input: bool) !bool {
-    if (!poll_reconnect_input) return reconnect_ui.isCancelled();
-    return reconnect_ui.pollClientHangup(0);
 }
 
 pub fn forwardSshStderrFromFd(allocator: std.mem.Allocator, fd: c.fd_t, client_fd: c.fd_t) !bool {
@@ -217,4 +218,44 @@ test "buildExecBytes writes role entrypoint and encodes reserved args" {
         "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-broker 3.dev.test b64:YjY0OmxpdGVyYWw=\n",
         bytes,
     );
+}
+
+test "readLineWithSshStderr reads stdout line and forwards stderr diagnostics" {
+    const stdout_pipe = try posix.pipe();
+    defer posix.close(stdout_pipe[0]);
+    defer posix.close(stdout_pipe[1]);
+    const stderr_pipe = try posix.pipe();
+    defer posix.close(stderr_pipe[0]);
+    const client_pipe = try posix.pipe();
+    defer posix.close(client_pipe[0]);
+    defer posix.close(client_pipe[1]);
+
+    try io.writeAll(stderr_pipe[1], "ssh warning\n");
+    posix.close(stderr_pipe[1]);
+    try io.writeAll(stdout_pipe[1], "READY\n");
+
+    const line = try readLineWithSshStderr(std.testing.allocator, .{
+        .stdout_fd = stdout_pipe[0],
+        .stderr_fd = stderr_pipe[0],
+        .client_fd = client_pipe[1],
+    });
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("READY", line);
+
+    var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, client_pipe[0]);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol.MessageType.client_daemon, frame.message_type);
+    var item = try protocol.decodePayload(protocol.pb.ClientDaemonItem, std.testing.allocator, frame.payload);
+    defer item.deinit(std.testing.allocator);
+    const payload = item.payload orelse return error.MissingClientDaemonPayload;
+    const event = switch (payload) {
+        .connection_event => |event| event,
+        else => return error.UnexpectedClientDaemonPayload,
+    };
+    const event_payload = event.event orelse return error.MissingConnectionEvent;
+    const stderr = switch (event_payload) {
+        .ssh_stderr => |stderr| stderr,
+        else => return error.UnexpectedConnectionEvent,
+    };
+    try std.testing.expectEqualStrings("ssh warning\n", stderr.data);
 }
