@@ -218,7 +218,7 @@ def test_ssh_terminal_emulator_tty_propagates_resize(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_remote_command_uses_proxy_stream(tmp):
+def test_ssh_filter_level_hygienic_remote_command_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -227,7 +227,7 @@ def test_ssh_no_terminal_emulator_remote_command_uses_proxy_stream(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     seed_remote_artifact_cache(env)
 
-    result = run_sessh(["--no-terminal-emulator", "test-host", "echo", "hello"], env, timeout=5.0)
+    result = run_sessh(["--filter-level", "hygienic", "test-host", "echo", "hello"], env, timeout=5.0)
 
     if result.returncode != 0:
         raise AssertionError(result)
@@ -240,7 +240,7 @@ def test_ssh_no_terminal_emulator_remote_command_uses_proxy_stream(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_no_terminal_emulator_remote_command_preserves_exit_status(tmp):
+def test_ssh_filter_level_hygienic_remote_command_preserves_exit_status(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -249,13 +249,13 @@ def test_ssh_no_terminal_emulator_remote_command_preserves_exit_status(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     seed_remote_artifact_cache(env)
 
-    result = run_sessh(["--no-terminal-emulator", "test-host", "exit 11"], env, timeout=5.0)
+    result = run_sessh(["--filter-level", "hygienic", "test-host", "exit 11"], env, timeout=5.0)
 
     if result.returncode != 11:
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_tty_preserves_exit_status(tmp):
+def test_ssh_filter_level_hygienic_tty_preserves_exit_status(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -265,7 +265,7 @@ def test_ssh_no_terminal_emulator_tty_preserves_exit_status(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "-tt", "test-host", "exit 13"],
+        ["--filter-level", "hygienic", "-tt", "test-host", "exit 13"],
         env,
         (),
         timeout=10.0,
@@ -275,7 +275,7 @@ def test_ssh_no_terminal_emulator_tty_preserves_exit_status(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_tty_propagates_resize(tmp):
+def test_ssh_filter_level_hygienic_tty_propagates_resize(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -286,7 +286,7 @@ def test_ssh_no_terminal_emulator_tty_propagates_resize(tmp):
 
     command = "printf 'READY:%s\\n' \"$(stty size)\"; IFS= read -r _; printf 'RESIZED:%s\\n' \"$(stty size)\""
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "-tt", "test-host", command],
+        ["--filter-level", "hygienic", "-tt", "test-host", command],
         env,
         (
             (b"READY:24 100", resize_pty_then_send(32, 121, b"\n")),
@@ -299,7 +299,7 @@ def test_ssh_no_terminal_emulator_tty_propagates_resize(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_forced_tty_uses_proxy_stream(tmp):
+def test_ssh_filter_level_hygienic_forced_tty_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -309,7 +309,7 @@ def test_ssh_no_terminal_emulator_forced_tty_uses_proxy_stream(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "-tt", "test-host", "tty"],
+        ["--filter-level", "hygienic", "-tt", "test-host", "tty"],
         env,
         ((b"/dev/", None),),
         timeout=10.0,
@@ -324,7 +324,7 @@ def test_ssh_no_terminal_emulator_forced_tty_uses_proxy_stream(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_no_terminal_emulator_requested_tty_uses_stream_path(tmp):
+def test_ssh_filter_level_hygienic_requested_tty_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -334,7 +334,7 @@ def test_ssh_no_terminal_emulator_requested_tty_uses_stream_path(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "-t", "test-host", "tty"],
+        ["--filter-level", "hygienic", "-t", "test-host", "tty"],
         env,
         ((b"/dev/", None),),
         timeout=10.0,
@@ -347,7 +347,7 @@ def test_ssh_no_terminal_emulator_requested_tty_uses_stream_path(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_interleaved_tty_and_no_terminal_emulator_preserves_exit_status(tmp):
+def test_ssh_interleaved_tty_and_filter_level_hygienic_preserves_exit_status(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -357,7 +357,7 @@ def test_ssh_interleaved_tty_and_no_terminal_emulator_preserves_exit_status(tmp)
     seed_remote_artifact_cache(env)
 
     result = run_sessh_in_pty(
-        ["-t", "--no-terminal-emulator", "test-host", "exit 3"],
+        ["-t", "--filter-level", "hygienic", "test-host", "exit 3"],
         env,
         (),
         timeout=10.0,
@@ -370,12 +370,12 @@ def test_ssh_interleaved_tty_and_no_terminal_emulator_preserves_exit_status(tmp)
         raise AssertionError(log_text)
 
 
-def test_ssh_terminal_emulator_false_config_uses_stream_path(tmp):
+def test_ssh_filter_level_hygienic_config_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     write_fake_ssh(fake_bin / "ssh")
-    write_sessh_config(env, "terminal-emulator=false\n")
+    write_sessh_config(env, "filter-level=hygienic\n")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     seed_remote_artifact_cache(env)
@@ -394,18 +394,18 @@ def test_ssh_terminal_emulator_false_config_uses_stream_path(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_terminal_emulator_cli_overrides_disabled_config(tmp):
+def test_ssh_filter_level_emulated_cli_overrides_hygienic_config(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     write_fake_ssh(fake_bin / "ssh")
-    write_sessh_config(env, "terminal-emulator=no\n")
+    write_sessh_config(env, "filter-level=hygienic\n")
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     seed_remote_artifact_cache(env)
 
     result = run_sessh_in_pty(
-        ["--terminal-emulator", "-t", "test-host", "tty"],
+        ["--filter-level", "emulated", "-t", "test-host", "tty"],
         env,
         ((b"/dev/", None),),
         timeout=10.0,
@@ -418,7 +418,7 @@ def test_ssh_terminal_emulator_cli_overrides_disabled_config(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_no_terminal_emulator_command_in_tty_uses_proxy_stream(tmp):
+def test_ssh_filter_level_hygienic_command_in_tty_uses_proxy_stream(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -428,7 +428,7 @@ def test_ssh_no_terminal_emulator_command_in_tty_uses_proxy_stream(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "test-host", "echo", "hello"],
+        ["--filter-level", "hygienic", "test-host", "echo", "hello"],
         env,
         ((b"hello", None),),
         timeout=10.0,
@@ -466,7 +466,7 @@ def test_ssh_tty_uses_emulated_term_not_outer_term(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_tty_copies_outer_term(tmp):
+def test_ssh_filter_level_hygienic_tty_copies_outer_term(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -477,7 +477,7 @@ def test_ssh_no_terminal_emulator_tty_copies_outer_term(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "-tt", "test-host", "printf '%s\\n' \"$TERM\""],
+        ["--filter-level", "hygienic", "-tt", "test-host", "printf '%s\\n' \"$TERM\""],
         env,
         ((b"ansi", None),),
         timeout=10.0,
@@ -487,7 +487,7 @@ def test_ssh_no_terminal_emulator_tty_copies_outer_term(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_tty_copies_local_tty_modes(tmp):
+def test_ssh_filter_level_hygienic_tty_copies_local_tty_modes(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -504,18 +504,18 @@ def test_ssh_no_terminal_emulator_tty_copies_local_tty_modes(tmp):
         "printf 'REMOTE_TTY_MODES\\r\\n' || { stty -a; exit 7; }"
     )
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "-tt", "test-host", command],
+        ["--filter-level", "hygienic", "-tt", "test-host", command],
         env,
         ((b"REMOTE_TTY_MODES", None),),
         timeout=10.0,
-        child_tty_setup=set_no_terminal_emulator_tty_mode_probe,
+        child_tty_setup=set_filter_level_hygienic_tty_mode_probe,
     )
 
     if result.returncode != 0:
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_tty_copies_local_output_modes(tmp):
+def test_ssh_filter_level_hygienic_tty_copies_local_output_modes(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -530,18 +530,18 @@ def test_ssh_no_terminal_emulator_tty_copies_local_output_modes(tmp):
         "printf 'REMOTE_OUTPUT_MODES\\r\\n' || { stty -a; exit 7; }"
     )
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "-tt", "test-host", command],
+        ["--filter-level", "hygienic", "-tt", "test-host", command],
         env,
         ((b"REMOTE_OUTPUT_MODES", None),),
         timeout=10.0,
-        child_tty_setup=set_no_terminal_emulator_output_mode_probe,
+        child_tty_setup=set_filter_level_hygienic_output_mode_probe,
     )
 
     if result.returncode != 0:
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_tty_sets_ssh_tty(tmp):
+def test_ssh_filter_level_hygienic_tty_sets_ssh_tty(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -552,7 +552,7 @@ def test_ssh_no_terminal_emulator_tty_sets_ssh_tty(tmp):
 
     command = "test -n \"${SSH_TTY:-}\" && test -c \"$SSH_TTY\" && printf 'SSH_TTY_OK\\r\\n'"
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "-tt", "test-host", command],
+        ["--filter-level", "hygienic", "-tt", "test-host", command],
         env,
         ((b"SSH_TTY_OK", None),),
         timeout=10.0,
@@ -562,7 +562,7 @@ def test_ssh_no_terminal_emulator_tty_sets_ssh_tty(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_interactive_shell_keeps_prompt_aligned(tmp):
+def test_ssh_filter_level_hygienic_interactive_shell_keeps_prompt_aligned(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -586,7 +586,7 @@ def test_ssh_no_terminal_emulator_interactive_shell_keeps_prompt_aligned(tmp):
     seed_remote_artifact_cache(env)
 
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "test-host"],
+        ["--filter-level", "hygienic", "test-host"],
         env,
         (
             (b"REMOTE_PROMPT\r\n% ", b"echo hello\n"),
@@ -601,7 +601,7 @@ def test_ssh_no_terminal_emulator_interactive_shell_keeps_prompt_aligned(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_no_terminal_emulator_release_artifact_restores_local_tty_on_exit(tmp):
+def test_ssh_filter_level_hygienic_release_artifact_restores_local_tty_on_exit(tmp):
     artifact = local_artifact()
     if not artifact.exists():
         print(f"SKIP release artifact tty restore test; missing {artifact}", file=sys.stderr)
@@ -629,7 +629,7 @@ def test_ssh_no_terminal_emulator_release_artifact_restores_local_tty_on_exit(tm
     seed_remote_artifact_cache(env, artifact)
 
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "test-host"],
+        ["--filter-level", "hygienic", "test-host"],
         env,
         ((b"REMOTE_READY\r\n% ", b"exit\n"),),
         timeout=10.0,
@@ -641,7 +641,7 @@ def test_ssh_no_terminal_emulator_release_artifact_restores_local_tty_on_exit(tm
         raise AssertionError(result)
     if result.tty_attrs_before != result.tty_attrs_after:
         raise AssertionError(
-            "no-terminal-emulator release artifact did not restore local tty modes\n"
+            "filter-level hygienic release artifact did not restore local tty modes\n"
             f"before: {tty_attr_summary(result.tty_attrs_before)}\n"
             f"after:  {tty_attr_summary(result.tty_attrs_after)}\n"
             f"output: {result.stdout!r}"
@@ -711,7 +711,7 @@ def test_ssh_requested_tty_with_piped_stdout_does_not_emit_local_cleanup(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_no_terminal_emulator_tty_uses_proxy_with_hygienic_diagnostics(tmp):
+def test_ssh_filter_level_hygienic_tty_uses_proxy_with_hygienic_diagnostics(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -720,12 +720,12 @@ def test_ssh_no_terminal_emulator_tty_uses_proxy_with_hygienic_diagnostics(tmp):
     env["SESSH_FAKE_SSH_LOG"] = str(fake_log)
     seed_remote_artifact_cache(env)
 
-    command = "printf 'NO_TERMINAL_EMULATOR_READY\\r\\n'; exit 255"
+    command = "printf 'FILTER_LEVEL_HYGIENIC_READY\\r\\n'; exit 255"
     result = run_sessh_in_pty(
-        ["--no-terminal-emulator", "-tt", "test-host", command],
+        ["--filter-level", "hygienic", "-tt", "test-host", command],
         env,
         (
-            (b"NO_TERMINAL_EMULATOR_READY", None),
+            (b"FILTER_LEVEL_HYGIENIC_READY", None),
         ),
         timeout=30.0,
     )
@@ -1104,4 +1104,3 @@ def test_ssh_version_mismatch_fallback_message_is_precise(tmp):
     log_text = fake_log.read_text()
     if "direct_broker=1" not in log_text or "plain_ssh=1" not in log_text:
         raise AssertionError(log_text)
-

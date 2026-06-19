@@ -92,7 +92,7 @@ test "sessh top-level options do not match remote command arguments" {
     try std.testing.expect(topLevelArgIs(&.{ "sessh-dev", "--daemon-log" }, &.{"--daemon-log"}));
     try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "-V" }));
     try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "-vV", "example.com" }));
-    try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "--no-terminal-emulator", "-V", "example.com" }));
+    try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "--filter-level", "hygienic", "-V", "example.com" }));
     try std.testing.expect(sesshShortVersionRequested(&.{ "sessh-dev", "--diagnostics-file", "/tmp/sessh.log", "-V", "example.com" }));
     try std.testing.expect(!topLevelArgIs(&.{ "sessh-dev", "example.com", "--version" }, &.{"--version"}));
     try std.testing.expect(!sesshShortVersionRequested(&.{ "sessh-dev", "example.com", "-V" }));
@@ -107,7 +107,6 @@ test "user manual documents public usage options and config defaults" {
     const expected_snippets = [_][]const u8{
         "sessh [ssh-option ...] destination [command [argument ...]]",
         "`--log-level quiet|error|warn|info|debug|verbose`",
-        "`--terminal-emulator` / `--no-terminal-emulator`",
         "`--filter-level unhygienic|hygienic|emulated`",
         "`--diagnostics-level overlay|status|title|line|jsonl`",
         "`--isolation-mode full|process|none`",
@@ -117,7 +116,6 @@ test "user manual documents public usage options and config defaults" {
         "scrollback-limit=2000",
         "client-log-level=warn",
         "bootstrap=true",
-        "terminal-emulator=true",
         "filter-level=emulated",
         "diagnostics-level=overlay",
         "isolation-mode=process",

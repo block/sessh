@@ -29,7 +29,6 @@ Sessh-specific options must appear before `destination`; after `destination`,
 all tokens are treated as the remote command, matching `ssh`.
 
 - `--log-level quiet|error|warn|info|debug|verbose`
-- `--terminal-emulator` / `--no-terminal-emulator`
 - `--filter-level unhygienic|hygienic|emulated`
 - `--diagnostics-level overlay|status|title|line|jsonl`
 - `--isolation-mode full|process|none`
@@ -71,7 +70,6 @@ Supported keys with defaults:
 scrollback-limit=2000
 client-log-level=warn
 bootstrap=true
-terminal-emulator=true
 filter-level=emulated
 diagnostics-level=overlay
 isolation-mode=process

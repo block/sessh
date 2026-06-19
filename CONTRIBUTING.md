@@ -3,7 +3,17 @@
 Start with [README.md](README.md), then read
 [Architecture](docs/ARCHITECTURE.md).
 
+## Guidelines
+
 Keep docs high-level. Details live in comments in code.
+
+Trivial blocks of code don't need comments, but all substantial blocks should
+have comments summarizing what they do, and why (if it's not obvious)
+
+Favor small sets of arguments to functions. When larger sets of arguments are
+warranted and the arguments are non-obvious, use named-parameter-structs.
+
+Don't use threads. Use non-blocking IO instead.
 
 ## Development Setup
 
@@ -33,16 +43,22 @@ to build and install a binary in ~/.local/bin/sessh
 
 ## Testing
 
-Prefer process-level tests that invoke the `sessh` binary and exercise real
-protocol, socket, PTY, filesystem, and terminal behavior (i.e. avoid mocks).
+Structure test/debug code so that it is compiled out of release artifacts.
 
-Most behavior should be tested without ssh by using the `.` transport.
-Use Podman only for slower end-to-end coverage across a real ssh boundary.
+Structure code for modularity and testability. Avoid mocks.
+
+Test at the module level and at the process level.
+
+Process-level tests should invoke the `sessh` binary and exercise real
+protocol, socket, PTY, filesystem, and terminal behavior (i.e. avoid mocks).
+Most behavior should be tested without `ssh` in the interests of speed -
+instead we fake out `ssh` and run locally.
+
+For limited test cases where it's beneficial to use actual `ssh`, use Podman.
 
 When fixing a bug or introducing new functionality, write a test first, and
 ensure it fails in the correct way. Commit these tests together with the code
-changes. You can use test-driven development for removing old features, but
-don't commit tests that simply check if old functionality is no longer there.
+changes.
 
 ## Releases
 

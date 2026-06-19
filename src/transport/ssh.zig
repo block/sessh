@@ -113,9 +113,6 @@ fn remoteSessionConfig(
     if (!result.common.bootstrap_set) {
         if (file_config.bootstrap) |enabled| result.common.bootstrap = enabled;
     }
-    if (!result.common.terminal_emulator_set) {
-        if (file_config.terminal_emulator) |enabled| result.common.terminal_emulator = enabled;
-    }
     if (!result.common.filter_level_set) {
         if (file_config.filter_level) |level| result.common.filter_level = level;
     }

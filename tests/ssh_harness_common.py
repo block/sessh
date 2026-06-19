@@ -476,9 +476,9 @@ def run_sessh_in_pty(
         os.close(fd)
 
 
-def set_no_terminal_emulator_tty_mode_probe(fd):
+def set_filter_level_hygienic_tty_mode_probe(fd):
     # This runs in the child side of pty.fork before sessh starts. In
-    # no-terminal-emulator mode, the visible ssh process owns the PTY and should
+    # filter-level hygienic mode, the visible ssh process owns the PTY and should
     # propagate these local modes.
     attrs = termios.tcgetattr(fd)
     attrs[0] &= ~termios.ICRNL
@@ -486,7 +486,7 @@ def set_no_terminal_emulator_tty_mode_probe(fd):
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
-def set_no_terminal_emulator_output_mode_probe(fd):
+def set_filter_level_hygienic_output_mode_probe(fd):
     attrs = termios.tcgetattr(fd)
     attrs[1] &= ~termios.OPOST
     if hasattr(termios, "ONLCR"):

@@ -52,9 +52,8 @@ fn sshVerbosity(ssh_options: []const []const u8) usize {
     return total;
 }
 
-pub fn shouldUseStreamPath(new: RemoteNewSession, common: CommonSessionOptions, stdin_is_tty: bool) bool {
+pub fn shouldUseStreamPath(new: RemoteNewSession, stdin_is_tty: bool) bool {
     if (new.command_argv.len != 0) return false;
-    if (!common.terminal_emulator) return true;
     if (!hasRemoteShellCommand(new.shell_command_args)) return false;
 
     // Match ssh's PTY allocation rules for remote commands. Plain
@@ -81,8 +80,8 @@ pub fn shouldUseProxyStream(new: RemoteNewSession, common: CommonSessionOptions,
     if (new.command_argv.len != 0) return false;
     if (filterLevelForcesProxy(common.filter_level) or new.proxy_required) return true;
     if ((!stdin_is_tty or !stdout_is_tty) and common.filter_level == .emulated) return true;
-    if (!hasRemoteShellCommand(new.shell_command_args)) return !common.terminal_emulator;
-    return shouldUseStreamPath(new, common, stdin_is_tty);
+    if (!hasRemoteShellCommand(new.shell_command_args)) return false;
+    return shouldUseStreamPath(new, stdin_is_tty);
 }
 
 pub fn hasRemoteShellCommand(args: []const []const u8) bool {

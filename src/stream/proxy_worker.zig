@@ -2008,7 +2008,7 @@ test "stream control-only input never forwards bytes" {
     try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
 }
 
-test "stream input control uses ssh disconnect escape for no-terminal-emulator streams" {
+test "stream input control uses ssh disconnect escape for proxy streams" {
     var control = StreamInputControl{
         .enabled = true,
         .escape_enabled = true,

@@ -23,8 +23,6 @@ pub const CommonSessionOptions = struct {
     client_log_level_set: bool = false,
     bootstrap: bool = true,
     bootstrap_set: bool = false,
-    terminal_emulator: bool = true,
-    terminal_emulator_set: bool = false,
     filter_level: config.FilterLevel = config.default_filter_level,
     filter_level_set: bool = false,
     diagnostics_level: config.DiagnosticsLevel = config.default_diagnostics_level,
@@ -143,14 +141,6 @@ const SesshOptionParser = struct {
         if (std.mem.eql(u8, arg, "--log-level")) {
             self.common.client_log_level = try client_log.parseLevel(try self.requiredValue(error.MissingClientLogLevel));
             self.common.client_log_level_set = true;
-        } else if (std.mem.eql(u8, arg, "--terminal-emulator")) {
-            self.common.terminal_emulator = true;
-            self.common.terminal_emulator_set = true;
-            self.advance();
-        } else if (std.mem.eql(u8, arg, "--no-terminal-emulator")) {
-            self.common.terminal_emulator = false;
-            self.common.terminal_emulator_set = true;
-            self.advance();
         } else if (std.mem.eql(u8, arg, "--filter-level")) {
             self.common.filter_level = try config.parseFilterLevel(try self.requiredValue(error.MissingFilterLevel));
             self.common.filter_level_set = true;
@@ -193,8 +183,6 @@ fn isSesshLongOption(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--log-level") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--no-bootstrap") or
-        std.mem.eql(u8, arg, "--terminal-emulator") or
-        std.mem.eql(u8, arg, "--no-terminal-emulator") or
         std.mem.eql(u8, arg, "--filter-level") or
         std.mem.eql(u8, arg, "--diagnostics-level") or
         std.mem.eql(u8, arg, "--isolation-mode") or
@@ -261,7 +249,8 @@ test "parse accepts interleaved ssh and sessh options before host" {
     const parsed = try parse(&scratch, &.{
         "sessh",
         "-t",
-        "--no-terminal-emulator",
+        "--filter-level",
+        "hygienic",
         "-p",
         "2222",
         "--log-level",
@@ -273,8 +262,8 @@ test "parse accepts interleaved ssh and sessh options before host" {
 
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqual(client_log.Level.debug, parsed.common.client_log_level);
-    try std.testing.expect(!parsed.common.terminal_emulator);
-    try std.testing.expect(parsed.common.terminal_emulator_set);
+    try std.testing.expectEqual(config.FilterLevel.hygienic, parsed.common.filter_level);
+    try std.testing.expect(parsed.common.filter_level_set);
     try std.testing.expectEqual(SshTtyRequest.requested, parsed.tty_request);
     try expectArgvEqual(&.{ "-t", "-p", "2222" }, parsed.ssh_options);
     try expectArgvEqual(&.{ "exit", "3" }, parsed.command_args);
@@ -289,15 +278,14 @@ test "parse treats every direct post-host token as remote command" {
         "example.com",
         "rsync",
         "--version",
-        "--no-terminal-emulator",
+        "--remote-flag",
         "--remote-name",
         "work",
         "-t",
     });
 
     try std.testing.expectEqualStrings("example.com", parsed.host);
-    try std.testing.expect(!parsed.common.terminal_emulator_set);
-    try expectArgvEqual(&.{ "rsync", "--version", "--no-terminal-emulator", "--remote-name", "work", "-t" }, parsed.command_args);
+    try expectArgvEqual(&.{ "rsync", "--version", "--remote-flag", "--remote-name", "work", "-t" }, parsed.command_args);
 }
 
 test "parse rejects config-only sessh options on direct ssh transport" {

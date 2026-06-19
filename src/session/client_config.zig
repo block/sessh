@@ -8,7 +8,6 @@ pub const FileConfig = struct {
     scrollback_row_count: ?u32 = null,
     client_log_level: ?client_log.Level = null,
     bootstrap: ?bool = null,
-    terminal_emulator: ?bool = null,
     filter_level: ?config.FilterLevel = null,
     diagnostics_level: ?config.DiagnosticsLevel = null,
     isolation_mode: ?config.IsolationMode = null,
@@ -70,8 +69,6 @@ fn parseEnvConfig(bytes: []const u8) !FileConfig {
             parsed.client_log_level = try client_log.parseLevel(value);
         } else if (keyMatches(key, "bootstrap")) {
             parsed.bootstrap = try parseBool(value);
-        } else if (keyMatches(key, "terminal-emulator")) {
-            parsed.terminal_emulator = try parseBool(value);
         } else if (keyMatches(key, "filter-level")) {
             parsed.filter_level = try config.parseFilterLevel(value);
         } else if (keyMatches(key, "diagnostics-level")) {
@@ -152,7 +149,6 @@ test "parseEnvConfig accepts sessh env keys" {
         \\scrollback-limit=42
         \\client-log-level=debug
         \\bootstrap=false
-        \\terminal-emulator=no
         \\filter-level=hygienic
         \\diagnostics-level=status
         \\isolation-mode=full
@@ -164,7 +160,6 @@ test "parseEnvConfig accepts sessh env keys" {
     try std.testing.expectEqual(@as(?u32, 42), parsed.scrollback_row_count);
     try std.testing.expectEqual(@as(?client_log.Level, .debug), parsed.client_log_level);
     try std.testing.expectEqual(@as(?bool, false), parsed.bootstrap);
-    try std.testing.expectEqual(@as(?bool, false), parsed.terminal_emulator);
     try std.testing.expectEqual(@as(?config.FilterLevel, .hygienic), parsed.filter_level);
     try std.testing.expectEqual(@as(?config.DiagnosticsLevel, .status), parsed.diagnostics_level);
     try std.testing.expectEqual(@as(?config.IsolationMode, .full), parsed.isolation_mode);

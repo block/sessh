@@ -39,7 +39,7 @@ fn remoteNewFromParsedSessh(parsed: ParsedSesshForTest) routing.RemoteNewSession
 }
 
 fn shouldUseStreamPathForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool) bool {
-    return routing.shouldUseStreamPath(remoteNewFromParsedSessh(parsed), parsed.invocation.common, stdin_is_tty);
+    return routing.shouldUseStreamPath(remoteNewFromParsedSessh(parsed), stdin_is_tty);
 }
 
 fn shouldUseProxyStreamForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool) bool {
@@ -216,70 +216,61 @@ test "emulated mode falls back to proxy stream when stdin or stdout is not a tty
     try std.testing.expect(shouldUseProxyStreamForTestWithStdout(interactive, true, false));
 }
 
-test "no terminal emulator forces stream path and preserves ssh tty semantics" {
-    var terminal_emulator = try parseSshArgsForTest(std.testing.allocator, &.{
-        "sessh",
-        "--terminal-emulator",
-        "example.com",
-    });
-    defer terminal_emulator.deinit(std.testing.allocator);
-    try std.testing.expect(terminal_emulator.invocation.common.terminal_emulator);
-    try std.testing.expect(terminal_emulator.invocation.common.terminal_emulator_set);
-    try std.testing.expect(!shouldUseStreamPathForTest(terminal_emulator, true));
-    try std.testing.expect(!shouldUseStreamPathForTest(terminal_emulator, false));
-
+test "hygienic filter level forces proxy path and preserves ssh tty semantics" {
     var interactive = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
-        "--no-terminal-emulator",
+        "--filter-level",
+        "hygienic",
         "example.com",
     });
     defer interactive.deinit(std.testing.allocator);
-    try std.testing.expect(!interactive.invocation.common.terminal_emulator);
-    try std.testing.expect(interactive.invocation.common.terminal_emulator_set);
-    try std.testing.expect(shouldUseStreamPathForTest(interactive, true));
-    try std.testing.expect(shouldUseStreamPathForTest(interactive, false));
+    try std.testing.expectEqual(config.FilterLevel.hygienic, interactive.invocation.common.filter_level);
+    try std.testing.expect(interactive.invocation.common.filter_level_set);
+    try std.testing.expect(!shouldUseStreamPathForTest(interactive, true));
+    try std.testing.expect(!shouldUseStreamPathForTest(interactive, false));
     try std.testing.expect(shouldUseProxyStreamForTest(interactive, true));
     try std.testing.expect(shouldUseProxyStreamForTest(interactive, false));
 
     var command = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
-        "--no-terminal-emulator",
+        "--filter-level",
+        "hygienic",
         "example.com",
         "echo",
         "hello",
     });
     defer command.deinit(std.testing.allocator);
-    try std.testing.expect(!command.invocation.common.terminal_emulator);
     try std.testing.expect(shouldUseStreamPathForTest(command, true));
     try std.testing.expect(shouldUseProxyStreamForTest(command, true));
 
     var forced = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
-        "--no-terminal-emulator",
+        "--filter-level",
+        "hygienic",
         "-tt",
         "example.com",
         "tty",
     });
     defer forced.deinit(std.testing.allocator);
-    try std.testing.expect(!forced.invocation.common.terminal_emulator);
     try std.testing.expect(shouldUseStreamPathForTest(forced, false));
     try std.testing.expect(shouldUseProxyStreamForTest(forced, false));
 
     var requested_with_tty = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
-        "--no-terminal-emulator",
+        "--filter-level",
+        "hygienic",
         "-t",
         "example.com",
         "tty",
     });
     defer requested_with_tty.deinit(std.testing.allocator);
-    try std.testing.expect(!requested_with_tty.invocation.common.terminal_emulator);
-    try std.testing.expect(shouldUseStreamPathForTest(requested_with_tty, true));
+    try std.testing.expect(!shouldUseStreamPathForTest(requested_with_tty, true));
     try std.testing.expect(shouldUseProxyStreamForTest(requested_with_tty, true));
 
     var requested_without_tty = try parseSshArgsForTest(std.testing.allocator, &.{
         "sessh",
-        "--no-terminal-emulator",
+        "--filter-level",
+        "hygienic",
         "-t",
         "example.com",
         "tty",
