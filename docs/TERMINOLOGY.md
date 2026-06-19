@@ -60,3 +60,25 @@ the role-shaped symlinks used to make process names clear.
 
 Durable cleanup records are not runtime files. They live in the state directory
 because they must survive daemon death and laptop reboot.
+
+# Event Loops And Blocking Waits
+
+Long-lived daemon work runs on the daemon dispatcher loop. Daemon-owned fds
+should be registered with the dispatcher and advanced by small state-machine
+callbacks. A daemon callback must not enter its own blocking wait, because that
+would stop unrelated clients, tunnels, cleanup work, and log subscribers from
+making progress.
+
+`PROCESS_EVENT_LOOP` marks a direct `poll(2)` loop that is the whole foreground
+process. Examples include a visible terminal client, a raw proxy bridge, or a
+remote worker process that has no daemon dispatcher of its own. These loops are
+allowed to block because there is no broader daemon workload hidden behind
+them.
+
+`BLOCKING_POLL` marks a short foreground wait helper. These helpers are allowed
+only when the current process has no dispatcher work to service or when the
+helper is part of an explicitly foreground UI wait.
+
+`BLOCKING_FRAME_READ` marks a synchronous frame read. Production uses should be
+rare, foreground-only, and documented at the call site. Daemon-owned protocol
+fds should use `FrameReader` from dispatcher callbacks instead.

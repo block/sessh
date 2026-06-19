@@ -18,6 +18,7 @@ const proxy_diagnostics_router = @import("proxy_diagnostics_router.zig");
 const remote_shell = @import("remote_shell.zig");
 const send_env_filter = @import("send_env.zig");
 const ssh_transport_process = @import("ssh_transport_process.zig");
+const mux_tunnel = @import("mux_tunnel.zig");
 const guid_ref = @import("../core/guid.zig");
 const ssh_transport_acquire = @import("ssh_transport_acquire.zig");
 const ssh_opts = @import("ssh_options.zig");
@@ -39,7 +40,7 @@ const resolveSshConfig = ssh_opts.resolveSshConfig;
 const pooled_ssh_transport_idle_close_ms: i32 = 60_000;
 const bootstrap_child_exit_poll_ms: u64 = 10;
 const bootstrap_child_exit_timeout_ms: u64 = 250;
-const proxy_mux_stream_id: u64 = 1;
+const proxy_mux_stream_id: u64 = mux_tunnel.first_stream_id;
 const raw_proxy_read_buffer_len: usize = 16 * 1024;
 
 const ResolvedSshTarget = struct {
@@ -78,20 +79,7 @@ const PooledSshTransportRawWriteKind = enum {
 // Mux fairness comes from the dispatcher rotating ready fd dispatch order: when
 // several client streams have data, each completed remote write gives the next
 // ready client a turn instead of permanently favoring the lowest poll slot.
-const PooledSshTransportRawWrite = struct {
-    bytes: []u8,
-    offset: usize = 0,
-    kind: PooledSshTransportRawWriteKind,
-
-    fn remaining(self: *const PooledSshTransportRawWrite) []const u8 {
-        return self.bytes[self.offset..];
-    }
-
-    fn deinit(self: *PooledSshTransportRawWrite, allocator: std.mem.Allocator) void {
-        allocator.free(self.bytes);
-        self.* = undefined;
-    }
-};
+const PooledSshTransportRawWrite = mux_tunnel.TaggedRawWrite(PooledSshTransportRawWriteKind);
 
 const PooledSshTransportFrameWriteKind = union(enum) {
     hello_request,
@@ -144,30 +132,10 @@ const PooledSshTransportClientWriteKind = union(enum) {
     },
 };
 
-const PooledSshTransportClientFrameWrite = struct {
-    frame: protocol.FrameWriteState,
-    kind: PooledSshTransportClientWriteKind,
+const PooledSshTransportClientFrameWrite = mux_tunnel.TaggedFrameWrite(PooledSshTransportClientWriteKind);
+const PooledSshTransportClientFrameWriteQueue = mux_tunnel.TaggedFrameWriteQueue(PooledSshTransportClientWriteKind);
 
-    fn deinit(self: *PooledSshTransportClientFrameWrite) void {
-        self.frame.deinit();
-        self.* = undefined;
-    }
-};
-
-const PooledSshTransportClientRawWrite = struct {
-    bytes: []u8,
-    offset: usize = 0,
-    kind: PooledSshTransportClientWriteKind,
-
-    fn remaining(self: *const PooledSshTransportClientRawWrite) []const u8 {
-        return self.bytes[self.offset..];
-    }
-
-    fn deinit(self: *PooledSshTransportClientRawWrite, allocator: std.mem.Allocator) void {
-        allocator.free(self.bytes);
-        self.* = undefined;
-    }
-};
+const PooledSshTransportClientRawWrite = mux_tunnel.TaggedRawWrite(PooledSshTransportClientWriteKind);
 
 const PooledSshTransportClientWrite = union(enum) {
     frame: PooledSshTransportClientFrameWrite,
@@ -237,7 +205,7 @@ const PooledSshTransportClient = struct {
     watch_id: ?dispatcher.FdWatchId = null,
     reader: protocol.FrameReader = undefined,
     write: ?PooledSshTransportClientWrite = null,
-    pending_frame_writes: std.ArrayList(PooledSshTransportClientFrameWrite) = .empty,
+    pending_frame_writes: PooledSshTransportClientFrameWriteQueue = undefined,
     read_paused: bool = false,
     stream_id: u64 = 0,
     local_stream_id: u64 = 0,
@@ -267,13 +235,13 @@ const PooledSshTransportClient = struct {
 
     fn initReader(self: *PooledSshTransportClient, allocator: std.mem.Allocator) void {
         self.reader = protocol.FrameReader.init(allocator);
+        self.pending_frame_writes = PooledSshTransportClientFrameWriteQueue.init(allocator);
     }
 
     fn deinit(self: *PooledSshTransportClient, allocator: std.mem.Allocator) void {
         self.reader.deinit();
         if (self.write) |*write| write.deinit(allocator);
-        for (self.pending_frame_writes.items) |*write| write.deinit();
-        self.pending_frame_writes.deinit(allocator);
+        self.pending_frame_writes.deinit();
         if (self.local_start_time) |start_time| allocator.free(start_time);
         freeStringList(allocator, self.send_env);
         freeEnvironmentEntries(allocator, &self.client_environment);
@@ -330,7 +298,7 @@ const PooledSshTransport = struct {
     connection: ?SshTransportProcess = null,
     stderr_fd: c.fd_t = -1,
     remote_daemon_namespace: ?[]u8 = null,
-    next_stream_id: u64 = 1,
+    stream_ids: mux_tunnel.StreamIdAllocator = .{},
     bootstrap_artifacts: ?ArtifactSet = null,
     bootstrap_line: std.ArrayList(u8) = .empty,
     remote_write: ?PooledSshTransportRemoteWrite = null,
@@ -783,6 +751,7 @@ test "pooled mux backpressure is per logical stream" {
         .fd = -1,
         .transport = &transport,
         .state = .active,
+        .pending_frame_writes = PooledSshTransportClientFrameWriteQueue.init(allocator),
     };
     var open = PooledSshTransportClient{
         .fd = -1,
@@ -805,10 +774,9 @@ test "pooled mux backpressure is per logical stream" {
     defer allocator.free(queued_payload);
     var queued_frame = try protocol.FrameWriteState.init(allocator, .client_daemon, queued_payload);
     errdefer queued_frame.deinit();
-    try blocked.pending_frame_writes.append(allocator, .{ .frame = queued_frame, .kind = .forwarded_from_daemon });
+    try blocked.pending_frame_writes.appendWrite(.{ .frame = queued_frame, .kind = .forwarded_from_daemon });
     defer {
-        for (blocked.pending_frame_writes.items) |*write| write.deinit();
-        blocked.pending_frame_writes.deinit(allocator);
+        blocked.pending_frame_writes.deinit();
     }
 
     try std.testing.expect(!pooledSshTransportClientReadable(&blocked));
@@ -1452,7 +1420,7 @@ fn writePooledSshTransportRemoteInner(
     const fd = transport.connection.?.child.stdin.?.handle;
 
     const done = switch (write.*) {
-        .raw => |*raw| try writePooledSshTransportRaw(fd, raw),
+        .raw => |*raw| try raw.writeReady(fd),
         .frame => |*frame| try writePooledSshTransportFrame(fd, frame),
     };
     if (!done) return;
@@ -1474,26 +1442,6 @@ fn writePooledSshTransportRemoteInner(
         },
         .frame => |*frame| try completePooledSshTransportRemoteFrameWrite(transport, daemon_dispatcher, frame),
     }
-}
-
-fn writePooledSshTransportRaw(
-    fd: c.fd_t,
-    raw: *PooledSshTransportRawWrite,
-) !bool {
-    while (raw.remaining().len != 0) {
-        const chunk = raw.remaining();
-        const n = c.write(fd, chunk.ptr, chunk.len);
-        if (n < 0) switch (posix.errno(n)) {
-            .AGAIN => return false,
-            .INTR => continue,
-            else => return error.WriteFailed,
-        };
-        if (n == 0) return error.WriteFailed;
-        const written: usize = @intCast(n);
-        io.noteWrite(fd, chunk[0..written]);
-        raw.offset += written;
-    }
-    return true;
 }
 
 fn writePooledSshTransportFrame(fd: c.fd_t, frame: *PooledSshTransportFrameWrite) !bool {
@@ -1716,7 +1664,7 @@ fn writePooledSshTransportClient(
             .blocked, .progress => false,
             .done => true,
         },
-        .raw => |*raw| try writePooledSshTransportClientRaw(client.fd, raw),
+        .raw => |*raw| try raw.writeReady(client.fd),
     };
     if (!done) return true;
 
@@ -1752,29 +1700,9 @@ fn writePooledSshTransportClient(
     return true;
 }
 
-fn writePooledSshTransportClientRaw(
-    fd: c.fd_t,
-    raw: *PooledSshTransportClientRawWrite,
-) !bool {
-    while (raw.remaining().len != 0) {
-        const chunk = raw.remaining();
-        const n = c.write(fd, chunk.ptr, chunk.len);
-        if (n < 0) switch (posix.errno(n)) {
-            .AGAIN => return false,
-            .INTR => continue,
-            else => return error.WriteFailed,
-        };
-        if (n == 0) return error.WriteFailed;
-        const written: usize = @intCast(n);
-        io.noteWrite(fd, chunk[0..written]);
-        raw.offset += written;
-    }
-    return true;
-}
-
 fn pooledSshTransportHasClientWrites(transport: *const PooledSshTransport) bool {
     for (transport.clients.items) |client| {
-        if (client.state != .done and (client.write != null or client.pending_frame_writes.items.len != 0)) return true;
+        if (client.state != .done and (client.write != null or client.pending_frame_writes.hasPending())) return true;
     }
     return false;
 }
@@ -1800,7 +1728,7 @@ fn readPooledRawProxyClient(
         const bytes = buf[0..@as(usize, @intCast(n))];
         io.noteRead(client.fd, bytes);
         const offset = client.outbound_next_offset;
-        const frame_bytes = try encodeMuxFrameBytes(transport.allocator, .{
+        const frame_bytes = try mux_tunnel.encodeMuxStreamFrameBytes(transport.allocator, .{
             .stream_id = client.stream_id,
             .message = .{ .payload = .{
                 .offset = offset,
@@ -1822,12 +1750,7 @@ fn sendPooledRawProxyAck(
     transport: *PooledSshTransport,
     client: *PooledSshTransportClient,
 ) !void {
-    const payload = try encodeDaemonTunnelFramePayload(transport.allocator, .{ .mux_stream = .{
-        .stream_id = client.stream_id,
-        .message = .{ .ack = .{
-            .recv_next_offset = client.inbound_next_offset,
-        } },
-    } });
+    const payload = try mux_tunnel.encodeAckPayload(transport.allocator, client.stream_id, client.inbound_next_offset);
     defer transport.allocator.free(payload);
     try startPooledSshTransportRemoteFrameWrite(transport, daemon_dispatcher, .daemon_tunnel, payload, .proxy_ack);
 }
@@ -1837,12 +1760,7 @@ fn sendPooledRawProxyOpenOk(
     transport: *PooledSshTransport,
     client: *PooledSshTransportClient,
 ) !void {
-    const payload = try encodeDaemonTunnelFramePayload(transport.allocator, .{ .mux_stream = .{
-        .stream_id = client.stream_id,
-        .message = .{ .open_ok = .{
-            .recv_next_offset = client.inbound_next_offset,
-        } },
-    } });
+    const payload = try mux_tunnel.encodeOpenOkPayload(transport.allocator, client.stream_id, client.inbound_next_offset);
     defer transport.allocator.free(payload);
     try startPooledSshTransportRemoteFrameWrite(transport, daemon_dispatcher, .daemon_tunnel, payload, .proxy_ack);
 }
@@ -1873,7 +1791,7 @@ fn startPooledSshTransportClientFrameWrite(
     var frame = try protocol.FrameWriteState.init(client.transport.allocator, message_type, payload);
     errdefer frame.deinit();
     if (client.write != null) {
-        try client.pending_frame_writes.append(client.transport.allocator, .{ .frame = frame, .kind = kind });
+        try client.pending_frame_writes.appendWrite(.{ .frame = frame, .kind = kind });
         try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
         return;
     }
@@ -1885,8 +1803,8 @@ fn startNextQueuedPooledSshTransportClientFrameWrite(
     daemon_dispatcher: *dispatcher.Dispatcher,
     client: *PooledSshTransportClient,
 ) !bool {
-    if (client.write != null or client.pending_frame_writes.items.len == 0) return false;
-    const next = client.pending_frame_writes.orderedRemove(0);
+    if (client.write != null) return false;
+    const next = client.pending_frame_writes.popFirst() orelse return false;
     client.write = .{ .frame = next };
     try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
     return true;
@@ -1898,7 +1816,7 @@ fn startPooledSshTransportClientRawWrite(
     bytes: []u8,
     kind: PooledSshTransportClientWriteKind,
 ) !void {
-    if (client.write != null or client.pending_frame_writes.items.len != 0) return error.PooledSshTransportClientWriteAlreadyQueued;
+    if (client.write != null or client.pending_frame_writes.hasPending()) return error.PooledSshTransportClientWriteAlreadyQueued;
     errdefer client.transport.allocator.free(bytes);
     client.write = .{ .raw = .{ .bytes = bytes, .kind = kind } };
     try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
@@ -1963,22 +1881,6 @@ fn failPooledSshTransportClientWithError(
     return false;
 }
 
-fn encodeDaemonTunnelFramePayload(
-    allocator: std.mem.Allocator,
-    payload: protocol.DaemonTunnelPayload,
-) ![]u8 {
-    return protocol.encodeDaemonTunnelPayload(allocator, payload);
-}
-
-fn encodeMuxFrameBytes(
-    allocator: std.mem.Allocator,
-    mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
-) ![]u8 {
-    const payload = try protocol.encodeMuxStreamFramePayload(allocator, mux_frame);
-    defer allocator.free(payload);
-    return protocol.encodeFrame(allocator, .daemon_tunnel, payload);
-}
-
 fn closeIdlePooledSshTransport(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
     _ = id;
     const transport: *PooledSshTransport = @ptrCast(@alignCast(ctx));
@@ -2015,8 +1917,7 @@ fn activatePendingPooledSshTransportClients(daemon_dispatcher: *dispatcher.Dispa
             index += 1;
             continue;
         }
-        client.stream_id = transport.next_stream_id;
-        transport.next_stream_id += 1;
+        client.stream_id = transport.stream_ids.take();
         client.state = .opening_stream;
         if (client.raw_proxy) {
             sendPooledRawProxyMuxOpen(daemon_dispatcher, transport, client) catch {
@@ -2296,7 +2197,7 @@ fn sendPooledTerminalMuxOpen(
     client: *PooledSshTransportClient,
     request: pb.TerminalEmulatorItem.Open,
 ) !void {
-    const typed_open_bytes = try encodeMuxFrameBytes(transport.allocator, .{
+    const typed_open_bytes = try mux_tunnel.encodeMuxStreamFrameBytes(transport.allocator, .{
         .stream_id = client.stream_id,
         .message = .{ .payload = .{
             .offset = client.outbound_next_offset,
@@ -2304,12 +2205,7 @@ fn sendPooledTerminalMuxOpen(
         } },
     });
     errdefer transport.allocator.free(typed_open_bytes);
-    const envelope_bytes = try encodeMuxFrameBytes(transport.allocator, .{
-        .stream_id = client.stream_id,
-        .message = .{ .open = .{
-            .recv_next_offset = client.inbound_next_offset,
-        } },
-    });
+    const envelope_bytes = try mux_tunnel.encodeOpenEnvelopeBytes(transport.allocator, client.stream_id, client.inbound_next_offset);
     errdefer transport.allocator.free(envelope_bytes);
     client.read_paused = true;
     try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
@@ -2339,7 +2235,7 @@ fn sendPooledProxyMuxOpen(
     client.kind = .proxy;
     client.local_stream_id = mux_frame.stream_id;
     mux_frame.stream_id = client.stream_id;
-    const bytes = try encodeMuxFrameBytes(transport.allocator, mux_frame);
+    const bytes = try mux_tunnel.encodeMuxStreamFrameBytes(transport.allocator, mux_frame);
     errdefer transport.allocator.free(bytes);
     client.read_paused = true;
     try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
@@ -2354,7 +2250,7 @@ fn sendPooledRawProxyMuxOpen(
     client: *PooledSshTransportClient,
 ) !void {
     const proxy_host = client.raw_proxy_host orelse return error.MissingProxyHost;
-    const typed_open_bytes = try encodeMuxFrameBytes(transport.allocator, .{
+    const typed_open_bytes = try mux_tunnel.encodeMuxStreamFrameBytes(transport.allocator, .{
         .stream_id = client.stream_id,
         .message = .{ .payload = .{
             .offset = 0,
@@ -2366,12 +2262,7 @@ fn sendPooledRawProxyMuxOpen(
         } },
     });
     errdefer transport.allocator.free(typed_open_bytes);
-    const envelope_bytes = try encodeMuxFrameBytes(transport.allocator, .{
-        .stream_id = client.stream_id,
-        .message = .{ .open = .{
-            .recv_next_offset = client.inbound_next_offset,
-        } },
-    });
+    const envelope_bytes = try mux_tunnel.encodeOpenEnvelopeBytes(transport.allocator, client.stream_id, client.inbound_next_offset);
     errdefer transport.allocator.free(envelope_bytes);
     client.read_paused = true;
     try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
@@ -2394,7 +2285,7 @@ fn sendPooledProxyMuxFrame(
     if (mux_frame.stream_id != client.local_stream_id) return error.UnexpectedDaemonFrame;
     try maybeRegisterProxyDiagnosticsStream(transport.allocator, client, mux_frame);
     mux_frame.stream_id = client.stream_id;
-    const bytes = try encodeMuxFrameBytes(transport.allocator, mux_frame);
+    const bytes = try mux_tunnel.encodeMuxStreamFrameBytes(transport.allocator, mux_frame);
     errdefer transport.allocator.free(bytes);
     client.read_paused = true;
     try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
@@ -2443,7 +2334,7 @@ fn sendPooledTerminalMuxPayload(
     client: *PooledSshTransportClient,
     item: pb.TerminalEmulatorItem,
 ) !void {
-    const bytes = try encodeMuxFrameBytes(transport.allocator, .{
+    const bytes = try mux_tunnel.encodeMuxStreamFrameBytes(transport.allocator, .{
         .stream_id = client.stream_id,
         .message = .{ .payload = .{
             .offset = client.outbound_next_offset,
@@ -2572,7 +2463,7 @@ fn handlePooledRemoteMuxStreamFrame(
         }
         owned_mux_frame.stream_id = client.local_stream_id;
         try pausePooledSshTransportRemoteRead(daemon_dispatcher, transport);
-        const payload = try encodeDaemonTunnelFramePayload(transport.allocator, .{ .mux_stream = owned_mux_frame });
+        const payload = try mux_tunnel.encodeMuxStreamPayload(transport.allocator, owned_mux_frame);
         defer transport.allocator.free(payload);
         try startPooledSshTransportClientFrameWrite(daemon_dispatcher, client, .daemon_tunnel, payload, .forwarded_from_daemon);
         return true;
@@ -2745,7 +2636,7 @@ fn handlePooledRemoteProcessStarted(
         return;
     };
     try pausePooledSshTransportRemoteRead(daemon_dispatcher, transport);
-    const payload = try encodeDaemonTunnelFramePayload(transport.allocator, .{ .remote_process_recorded = .{
+    const payload = try mux_tunnel.encodeDaemonTunnelPayload(transport.allocator, .{ .remote_process_recorded = .{
         .stream_id = started.stream_id,
     } });
     defer transport.allocator.free(payload);
@@ -2767,7 +2658,7 @@ fn startPooledRemoteProcessCleanupRequest(
         "cleanup request sending host={s} guid={s}",
         .{ transport.display_host, remote.guid },
     );
-    const payload = try encodeDaemonTunnelFramePayload(transport.allocator, .{
+    const payload = try mux_tunnel.encodeDaemonTunnelPayload(transport.allocator, .{
         .remote_process_cleanup_request = .{ .process = remote.toProto() },
     });
     defer transport.allocator.free(payload);

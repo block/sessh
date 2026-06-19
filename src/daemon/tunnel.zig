@@ -10,20 +10,9 @@ const protocol = @import("../protocol/mod.zig");
 const session_daemon_handler = @import("../session/daemon_handler.zig");
 const proxy_worker = @import("../stream/proxy_worker.zig");
 const frame_write_queue = @import("../transport/frame_write_queue.zig");
+const mux_tunnel = @import("../transport/mux_tunnel.zig");
 
 const pb = protocol.pb;
-
-const StreamKind = enum {
-    unknown,
-    terminal,
-    proxy,
-};
-
-const StreamEntry = struct {
-    stream_id: u64,
-    kind: StreamKind = .unknown,
-    pending_open: ?pb.DaemonTunnelItem.MuxStreamFrame.Open = null,
-};
 
 const MuxConnection = struct {
     allocator: std.mem.Allocator,
@@ -35,7 +24,7 @@ const MuxConnection = struct {
     mux_watch_id: ?dispatcher.FdWatchId = null,
     mux_reader: protocol.FrameReader = undefined,
     mux_writer: frame_write_queue.FrameWriteQueue = undefined,
-    stream_entries: std.ArrayList(StreamEntry) = .empty,
+    stream_registry: mux_tunnel.StreamRegistry,
     terminal_sessions: std.ArrayList(session_daemon_handler.TerminalMuxStream) = .empty,
     proxy_streams: std.ArrayList(proxy_worker.ProxyMuxStream) = .empty,
 
@@ -46,7 +35,7 @@ const MuxConnection = struct {
         self.mux_watch_id = null;
         session_daemon_handler.closeTerminalMuxStreams(self.allocator, &self.terminal_sessions, daemon_dispatcher);
         proxy_worker.closeProxyMuxStreams(self.allocator, &self.proxy_streams, daemon_dispatcher);
-        self.stream_entries.deinit(self.allocator);
+        self.stream_registry.deinit();
         self.mux_writer.deinit();
         self.mux_reader.deinit();
         if (self.mux_fd >= 0) {
@@ -93,6 +82,7 @@ pub fn registerMuxConnectionFromDaemon(
         .mux_fd = fd,
         .mux_reader = protocol.FrameReader.init(allocator),
         .mux_writer = frame_write_queue.FrameWriteQueue.init(allocator),
+        .stream_registry = mux_tunnel.StreamRegistry.init(allocator),
     };
     active_mux_connections += 1;
     errdefer connection.deinit(daemon_dispatcher);
@@ -224,132 +214,41 @@ fn handleMuxStreamFrame(
     mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !void {
     const stream_id = mux_frame.stream_id;
-    const message = mux_frame.message orelse return error.UnexpectedDaemonMuxFrame;
-    switch (message) {
-        .open => |open| {
-            try noteMuxOpen(connection, stream_id, open);
+    const route = try mux_tunnel.routeIncomingFrame(&connection.stream_registry, mux_frame);
+    switch (route) {
+        .pending_open => {
             var owned = mux_frame;
-            switch (streamKind(connection, stream_id)) {
-                .terminal => try session_daemon_handler.handleTerminalMuxStreamFrame(
-                    connection.allocator,
-                    connection.terminal_remote_exe,
-                    connection.identity,
-                    &connection.terminal_sessions,
-                    &connection.mux_writer,
-                    owned,
-                    .{ .ctx = connection, .callback = readTerminalRemote },
-                    daemon_dispatcher,
-                ),
-                .proxy => try proxy_worker.handleProxyMuxStreamFrame(
-                    connection.allocator,
-                    connection.proxy_remote_exe,
-                    connection.identity,
-                    &connection.proxy_streams,
-                    &connection.mux_writer,
-                    owned,
-                    .{ .ctx = connection, .callback = readProxyRemote },
-                    daemon_dispatcher,
-                ),
-                .unknown => {},
-            }
-            if (streamKind(connection, stream_id) == .unknown) owned.deinit(connection.allocator);
+            owned.deinit(connection.allocator);
+            return;
         },
-        .payload => |payload| {
-            const kind = payloadKind(payload) orelse return error.UnexpectedDaemonMuxFrame;
-            try ensureStreamKind(connection, daemon_dispatcher, stream_id, kind);
-            const owned = mux_frame;
-            if (kind == .terminal) {
-                try session_daemon_handler.handleTerminalMuxStreamFrame(
-                    connection.allocator,
-                    connection.terminal_remote_exe,
-                    connection.identity,
-                    &connection.terminal_sessions,
-                    &connection.mux_writer,
-                    owned,
-                    .{ .ctx = connection, .callback = readTerminalRemote },
-                    daemon_dispatcher,
-                );
-            } else {
-                try proxy_worker.handleProxyMuxStreamFrame(
-                    connection.allocator,
-                    connection.proxy_remote_exe,
-                    connection.identity,
-                    &connection.proxy_streams,
-                    &connection.mux_writer,
-                    owned,
-                    .{ .ctx = connection, .callback = readProxyRemote },
-                    daemon_dispatcher,
-                );
-            }
-        },
-        .ack, .open_ok, .eof, .reset => {
-            const kind = streamKind(connection, stream_id);
+        .changed_kind => {
             var owned = mux_frame;
-            const closes_stream = message == .eof or message == .reset;
-            switch (kind) {
-                .terminal => try session_daemon_handler.handleTerminalMuxStreamFrame(
-                    connection.allocator,
-                    connection.terminal_remote_exe,
-                    connection.identity,
-                    &connection.terminal_sessions,
-                    &connection.mux_writer,
-                    owned,
-                    .{ .ctx = connection, .callback = readTerminalRemote },
-                    daemon_dispatcher,
-                ),
-                .proxy => try proxy_worker.handleProxyMuxStreamFrame(
-                    connection.allocator,
-                    connection.proxy_remote_exe,
-                    connection.identity,
-                    &connection.proxy_streams,
-                    &connection.mux_writer,
-                    owned,
-                    .{ .ctx = connection, .callback = readProxyRemote },
-                    daemon_dispatcher,
-                ),
-                .unknown => {
-                    owned.deinit(connection.allocator);
-                    return error.UnexpectedDaemonMuxFrame;
-                },
+            defer owned.deinit(connection.allocator);
+            try sendMuxReset(connection.allocator, &connection.mux_writer, stream_id, "PROTOCOL_ERROR", "mux stream changed payload type");
+            return error.UnexpectedDaemonMuxFrame;
+        },
+        .unexpected => {
+            var owned = mux_frame;
+            owned.deinit(connection.allocator);
+            return error.UnexpectedDaemonMuxFrame;
+        },
+        .stream => |stream_route| {
+            if (stream_route.open_before_dispatch) |open| {
+                try handleMuxStreamOpen(connection, daemon_dispatcher, stream_id, stream_route.kind, open);
             }
-            if (closes_stream) removeStreamEntry(connection, stream_id);
+            try dispatchMuxStreamFrame(connection, daemon_dispatcher, stream_route.kind, mux_frame);
+            if (stream_route.closes_after_dispatch) connection.stream_registry.remove(stream_id);
         },
     }
 }
 
-fn payloadKind(payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload) ?StreamKind {
-    const item = payload.item orelse return null;
-    return switch (item) {
-        .terminal_emulator => .terminal,
-        .proxy => .proxy,
-    };
-}
-
-fn noteMuxOpen(
-    connection: *MuxConnection,
-    stream_id: u64,
-    open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
-) !void {
-    const index = try streamEntryIndexOrAppend(connection, stream_id);
-    connection.stream_entries.items[index].pending_open = open;
-}
-
-fn ensureStreamKind(
+fn handleMuxStreamOpen(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
     stream_id: u64,
-    kind: StreamKind,
+    kind: mux_tunnel.StreamKind,
+    open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
 ) !void {
-    const index = try streamEntryIndexOrAppend(connection, stream_id);
-    const entry = &connection.stream_entries.items[index];
-    if (entry.kind == kind) return;
-    if (entry.kind != .unknown) {
-        try sendMuxReset(connection.allocator, &connection.mux_writer, stream_id, "PROTOCOL_ERROR", "mux stream changed payload type");
-        return error.UnexpectedDaemonMuxFrame;
-    }
-
-    entry.kind = kind;
-    const open = entry.pending_open orelse pb.DaemonTunnelItem.MuxStreamFrame.Open{};
     switch (kind) {
         .terminal => try session_daemon_handler.handleTerminalMuxOpen(connection.allocator, &connection.terminal_sessions, stream_id, open),
         .proxy => try proxy_worker.handleProxyMuxOpen(connection.allocator, &connection.proxy_streams, stream_id, open, daemon_dispatcher),
@@ -357,27 +256,35 @@ fn ensureStreamKind(
     }
 }
 
-fn streamEntryIndexOrAppend(connection: *MuxConnection, stream_id: u64) !usize {
-    if (streamEntryIndex(connection, stream_id)) |index| return index;
-    try connection.stream_entries.append(connection.allocator, .{ .stream_id = stream_id });
-    return connection.stream_entries.items.len - 1;
-}
-
-fn streamEntryIndex(connection: *const MuxConnection, stream_id: u64) ?usize {
-    for (connection.stream_entries.items, 0..) |entry, index| {
-        if (entry.stream_id == stream_id) return index;
+fn dispatchMuxStreamFrame(
+    connection: *MuxConnection,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    kind: mux_tunnel.StreamKind,
+    mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
+) !void {
+    switch (kind) {
+        .terminal => try session_daemon_handler.handleTerminalMuxStreamFrame(
+            connection.allocator,
+            connection.terminal_remote_exe,
+            connection.identity,
+            &connection.terminal_sessions,
+            &connection.mux_writer,
+            mux_frame,
+            .{ .ctx = connection, .callback = readTerminalRemote },
+            daemon_dispatcher,
+        ),
+        .proxy => try proxy_worker.handleProxyMuxStreamFrame(
+            connection.allocator,
+            connection.proxy_remote_exe,
+            connection.identity,
+            &connection.proxy_streams,
+            &connection.mux_writer,
+            mux_frame,
+            .{ .ctx = connection, .callback = readProxyRemote },
+            daemon_dispatcher,
+        ),
+        .unknown => return error.UnexpectedDaemonMuxFrame,
     }
-    return null;
-}
-
-fn streamKind(connection: *const MuxConnection, stream_id: u64) StreamKind {
-    const index = streamEntryIndex(connection, stream_id) orelse return .unknown;
-    return connection.stream_entries.items[index].kind;
-}
-
-fn removeStreamEntry(connection: *MuxConnection, stream_id: u64) void {
-    const index = streamEntryIndex(connection, stream_id) orelse return;
-    _ = connection.stream_entries.swapRemove(index);
 }
 
 fn markCleanupRecorded(connection: *MuxConnection, stream_id: u64) void {
@@ -401,6 +308,7 @@ test "active mux connection count follows connection lifetime" {
         .counted_active = true,
         .mux_reader = protocol.FrameReader.init(allocator),
         .mux_writer = frame_write_queue.FrameWriteQueue.init(allocator),
+        .stream_registry = mux_tunnel.StreamRegistry.init(allocator),
     };
     active_mux_connections += 1;
     try std.testing.expectEqual(before + 1, activeMuxConnectionCount());
@@ -418,11 +326,12 @@ test "remote process recorded marks only matching terminal stream cleanup record
         .identity = .{ .pid = 0, .start_time = "", .socket_path = "" },
         .mux_reader = protocol.FrameReader.init(allocator),
         .mux_writer = frame_write_queue.FrameWriteQueue.init(allocator),
+        .stream_registry = mux_tunnel.StreamRegistry.init(allocator),
     };
     defer {
         connection.terminal_sessions.deinit(allocator);
         connection.proxy_streams.deinit(allocator);
-        connection.stream_entries.deinit(allocator);
+        connection.stream_registry.deinit();
         connection.mux_reader.deinit();
         connection.mux_writer.deinit();
     }
@@ -447,11 +356,12 @@ test "remote process recorded before stream open is ignored until stream exists"
         .identity = .{ .pid = 0, .start_time = "", .socket_path = "" },
         .mux_reader = protocol.FrameReader.init(allocator),
         .mux_writer = frame_write_queue.FrameWriteQueue.init(allocator),
+        .stream_registry = mux_tunnel.StreamRegistry.init(allocator),
     };
     defer {
         connection.terminal_sessions.deinit(allocator);
         connection.proxy_streams.deinit(allocator);
-        connection.stream_entries.deinit(allocator);
+        connection.stream_registry.deinit();
         connection.mux_reader.deinit();
         connection.mux_writer.deinit();
     }
@@ -539,7 +449,7 @@ fn closeTerminalRemoteAfterProcessClose(
     }
     const stream = connection.terminal_sessions.swapRemove(stream_index);
     session_daemon_handler.closeTerminalMuxStream(connection.allocator, stream, false, daemon_dispatcher);
-    removeStreamEntry(connection, stream_id);
+    connection.stream_registry.remove(stream_id);
 }
 
 fn readProxyRemote(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
@@ -612,7 +522,7 @@ fn closeProxyRemoteAfterProcessClose(
 ) void {
     const stream = connection.proxy_streams.swapRemove(stream_index);
     proxy_worker.queueProxyMuxReset(connection.allocator, &connection.mux_writer, stream.stream_id, "REMOTE_PROCESS_CLOSED", "remote proxy process closed") catch {};
-    removeStreamEntry(connection, stream.stream_id);
+    connection.stream_registry.remove(stream.stream_id);
     proxy_worker.closeProxyMuxStream(connection.allocator, stream, false, daemon_dispatcher);
 }
 

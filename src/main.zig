@@ -12,6 +12,7 @@ const terminal_worker = @import("session/terminal_worker.zig");
 const terminal_worker_process = @import("session/terminal_worker_process.zig");
 const sessh_run = @import("sessh/run.zig");
 const proxy_worker = @import("stream/proxy_worker.zig");
+const proxy_worker_process = @import("stream/proxy_worker_process.zig");
 const terminal = @import("tty/terminal.zig");
 const transport_ssh = @import("transport/ssh.zig");
 
@@ -55,7 +56,7 @@ fn runMain() !void {
         return terminal_worker_process.run(allocator, args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-proxy-remote")) {
-        return proxy_worker.runProxyRemoteProcess(allocator, args[1..]);
+        return proxy_worker_process.run(allocator, args[1..]);
     }
 
     if (args.len == 1) return usage(0);
@@ -73,7 +74,7 @@ fn runMain() !void {
     }
 
     if (std.mem.eql(u8, args[1], ":proxy-remote:")) {
-        return proxy_worker.runProxyRemoteProcess(allocator, args[2..]);
+        return proxy_worker_process.run(allocator, args[2..]);
     }
 
     if (topLevelArgIs(args, &.{ "--help", "-h" })) return usage(0);
@@ -246,6 +247,8 @@ test {
     _ = @import("sessh/routing_tests.zig");
     _ = @import("session/attached_client.zig");
     _ = @import("session/terminal_worker.zig");
+    _ = @import("session/terminal_worker_lifecycle.zig");
+    _ = @import("session/terminal_worker_protocol.zig");
     _ = @import("session/terminal_worker_requests.zig");
     _ = @import("session/attached_client_presentation.zig");
     _ = @import("session/daemon_handler.zig");
@@ -262,8 +265,10 @@ test {
     _ = @import("session/renderer.zig");
     _ = @import("session/vt.zig");
     _ = @import("sessh/run.zig");
+    _ = @import("stream/byte_stream.zig");
     _ = @import("stream/mux_proxy.zig");
     _ = @import("stream/proxy_worker.zig");
+    _ = @import("stream/proxy_worker_process.zig");
     _ = @import("stream/raw_bridge.zig");
     _ = @import("stream/status_output.zig");
     _ = @import("stream/proxy_diagnostics_channel.zig");
@@ -276,6 +281,7 @@ test {
     _ = @import("transport/bootstrap.zig");
     _ = @import("transport/bootstrap_client.zig");
     _ = @import("transport/frame_forwarder.zig");
+    _ = @import("transport/mux_tunnel.zig");
     _ = @import("transport/plain_ssh.zig");
     _ = @import("transport/pooled_ssh.zig");
     _ = @import("transport/proxy_entry.zig");

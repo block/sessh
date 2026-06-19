@@ -20,14 +20,18 @@ const remote_process = @import("remote_process.zig");
 const attached_client_router = @import("attached_client_router.zig");
 const terminal_worker_state = @import("terminal_worker_state.zig");
 const terminal_worker_render = @import("terminal_worker_render.zig");
+const terminal_worker_protocol = @import("terminal_worker_protocol.zig");
+const terminal_worker_lifecycle = @import("terminal_worker_lifecycle.zig");
 
 const max_session_pty_input_queue_bytes = 16 * 1024 * 1024;
 const preferred_live_output_batch_bytes = 1024;
 const max_live_output_reads_per_batch = 64;
 const synchronized_output_max_hold_ms: i64 = 1000;
-const pty_hangup_reap_poll_ms = remote_process.pty_hangup_reap_poll_ms;
-const pty_eof_exit_reap_poll_ms: i64 = 1;
 const pty_eof_exit_status_grace_ms: i64 = 250;
+const terminal_worker_poll_timing = terminal_worker_lifecycle.PollTiming{
+    .synchronized_output_max_hold_ms = synchronized_output_max_hold_ms,
+    .pty_eof_exit_status_grace_ms = pty_eof_exit_status_grace_ms,
+};
 
 const pb = protocol.pb;
 const hpb = protocol.hpb;
@@ -599,93 +603,20 @@ fn clearExpiredDebugUnresponsiveAttachedClients(terminal_worker: *TerminalWorker
 }
 
 fn terminalWorkerPollTimeoutMs(terminal_worker: *const TerminalWorker, now_ms: i64, now_unix_ms: u64) i32 {
-    var timeout_ms: ?i64 = null;
-    const attached_client = &terminal_worker.attached_client;
-    if (attached_client.active and attached_client.debug_unresponsive_until_ms > now_ms) {
-        const remaining_ms = attached_client.debug_unresponsive_until_ms - now_ms;
-        if (timeout_ms == null or remaining_ms < timeout_ms.?) timeout_ms = remaining_ms;
-    }
-    const session = &terminal_worker.session;
-    if (session.alive and session.synchronized_output_since_ms != 0) {
-        const elapsed_ms = now_ms - session.synchronized_output_since_ms;
-        const remaining_ms = synchronized_output_max_hold_ms - elapsed_ms;
-        const clamped_remaining_ms = @max(remaining_ms, 0);
-        if (timeout_ms == null or clamped_remaining_ms < timeout_ms.?) timeout_ms = clamped_remaining_ms;
-    }
-    if (session.alive and session.process.pty_closed_for_hangup) {
-        if (timeout_ms == null or pty_hangup_reap_poll_ms < timeout_ms.?) timeout_ms = pty_hangup_reap_poll_ms;
-    }
-    if (session.alive and session.pty_eof_wait_started_ms != 0) {
-        const elapsed_ms = now_ms - session.pty_eof_wait_started_ms;
-        const remaining_grace_ms = @max(pty_eof_exit_status_grace_ms - elapsed_ms, 0);
-        const remaining_ms = @min(pty_eof_exit_reap_poll_ms, remaining_grace_ms);
-        if (timeout_ms == null or remaining_ms < timeout_ms.?) timeout_ms = remaining_ms;
-    }
-    if (sessionReapEnabled(session)) {
-        const deadline_ms = session.disconnected_at_unix_ms +| session.reap_ms;
-        const remaining_ms: i64 = if (deadline_ms <= now_unix_ms)
-            0
-        else
-            @intCast(@min(deadline_ms - now_unix_ms, @as(u64, @intCast(std.math.maxInt(i64)))));
-        if (timeout_ms == null or remaining_ms < timeout_ms.?) timeout_ms = remaining_ms;
-    }
-    const ms = timeout_ms orelse return -1;
-    return @intCast(@min(ms, std.math.maxInt(i32)));
+    return terminal_worker_lifecycle.pollTimeoutMs(
+        &terminal_worker.session,
+        &terminal_worker.attached_client,
+        now_ms,
+        now_unix_ms,
+        terminal_worker_poll_timing,
+    );
 }
 
 fn endReapedSessions(terminal_worker: *TerminalWorker, now_unix_ms: u64) bool {
     const session = &terminal_worker.session;
-    if (!sessionReapEnabled(session)) return false;
-    const deadline_ms = session.disconnected_at_unix_ms +| session.reap_ms;
-    if (now_unix_ms < deadline_ms) return false;
+    if (!terminal_worker_lifecycle.shouldReapDisconnected(session, now_unix_ms)) return false;
     endSession(terminal_worker, 3, .{ .ended_at_unix_ms = now_unix_ms });
     return true;
-}
-
-fn sessionReapEnabled(session: *const Session) bool {
-    return session.alive and
-        !session.attached and
-        session.disconnected_at_unix_ms != 0 and
-        session.reap_ms != 0;
-}
-
-test "remote terminal process poll timeout includes reap deadline" {
-    var terminal_worker = TerminalWorker{};
-    terminal_worker.session = .{
-        .alive = true,
-        .attached = false,
-        .disconnected_at_unix_ms = 1_000,
-        .reap_ms = 5_000,
-    };
-
-    try std.testing.expectEqual(@as(i32, 5_000), terminalWorkerPollTimeoutMs(&terminal_worker, 0, 1_000));
-    try std.testing.expectEqual(@as(i32, 1), terminalWorkerPollTimeoutMs(&terminal_worker, 0, 5_999));
-    try std.testing.expectEqual(@as(i32, 0), terminalWorkerPollTimeoutMs(&terminal_worker, 0, 6_000));
-
-    terminal_worker.session.attached = true;
-    try std.testing.expectEqual(@as(i32, -1), terminalWorkerPollTimeoutMs(&terminal_worker, 0, 6_000));
-}
-
-test "remote terminal process poll timeout wakes to reap pty hangup" {
-    var terminal_worker = TerminalWorker{};
-    terminal_worker.session = .{
-        .alive = true,
-        .process = .{ .pty_closed_for_hangup = true },
-    };
-
-    try std.testing.expectEqual(@as(i32, pty_hangup_reap_poll_ms), terminalWorkerPollTimeoutMs(&terminal_worker, 0, 0));
-}
-
-test "remote terminal process poll timeout wakes while pty eof awaits exit status" {
-    var terminal_worker = TerminalWorker{};
-    terminal_worker.session = .{
-        .alive = true,
-        .pty_eof_wait_started_ms = 10,
-    };
-
-    try std.testing.expectEqual(@as(i32, pty_eof_exit_reap_poll_ms), terminalWorkerPollTimeoutMs(&terminal_worker, 10, 0));
-    try std.testing.expectEqual(@as(i32, 1), terminalWorkerPollTimeoutMs(&terminal_worker, 259, 0));
-    try std.testing.expectEqual(@as(i32, 0), terminalWorkerPollTimeoutMs(&terminal_worker, 260, 0));
 }
 
 fn flushExpiredSynchronizedOutputSessions(terminal_worker: *TerminalWorker, now_ms: i64) void {
@@ -786,40 +717,45 @@ fn handlePendingWorkerClientFrame(
     frame: *protocol.OwnedFrame,
 ) !PendingWorkerFrameResult {
     const fd = pending_client.fd;
-    switch (frame.message_type) {
-        .daemon_tunnel => {
-            _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, fd);
-            return .continue_reading;
-        },
-        .client_remote => {
-            var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
-            defer item.deinit(app_allocator.allocator());
+    var decoded = try terminal_worker_protocol.decodePendingClientFrame(app_allocator.allocator(), frame, fd);
+    defer decoded.deinit(app_allocator.allocator());
+    switch (decoded) {
+        .continue_reading => return .continue_reading,
+        .terminal_item => |*item| {
             const item_payload = item.payload orelse {
                 try sendError(terminal_worker, fd, "PROTOCOL_ERROR", "unexpected empty terminal stream item", "");
                 return .close;
             };
-            switch (item_payload) {
+            switch (terminal_worker_protocol.classifyFirstTerminalItem(item)) {
                 .resize => return .continue_reading,
-                .open => |open| return try handlePendingWorkerOpen(terminal_worker, pending_client, open),
-                .debug_sever_connection_request => |request| {
-                    try handleSessionClientDebugSeverConnectionRequest(terminal_worker, fd, request);
+                .open => return try handlePendingWorkerOpen(terminal_worker, pending_client, item_payload.open),
+                .debug_sever_connection_request => {
+                    try handleSessionClientDebugSeverConnectionRequest(terminal_worker, fd, item_payload.debug_sever_connection_request);
                     return .close;
                 },
-                .debug_unresponsive_connection_request => |request| {
-                    try handleSessionClientDebugUnresponsiveConnectionRequest(terminal_worker, fd, request);
+                .debug_unresponsive_connection_request => {
+                    try handleSessionClientDebugUnresponsiveConnectionRequest(terminal_worker, fd, item_payload.debug_unresponsive_connection_request);
                     return .close;
                 },
                 .session_hangup_request => {
                     handleSessionHangupRequest(terminal_worker);
                     return .close;
                 },
-                else => {
+                .unexpected => {
                     try sendError(terminal_worker, fd, "PROTOCOL_ERROR", "unexpected first terminal stream item", "");
                     return .close;
                 },
             }
         },
-        else => {
+        .unexpected_empty_terminal_item => {
+            try sendError(terminal_worker, fd, "PROTOCOL_ERROR", "unexpected empty terminal stream item", "");
+            return .close;
+        },
+        .unexpected_first_terminal_item => {
+            try sendError(terminal_worker, fd, "PROTOCOL_ERROR", "unexpected first terminal stream item", "");
+            return .close;
+        },
+        .unexpected_first_action => {
             try sendError(terminal_worker, fd, "PROTOCOL_ERROR", "unexpected first action", "");
             return .close;
         },
@@ -1071,10 +1007,11 @@ fn attachSession(
         attached_client.* = AttachedClient{};
     }
     try terminal_worker_render.sendSessionAttached(attached_client, session);
+    const draw_emitter = terminal_worker_render.DrawEmitter.init(attached_client, session);
     if (resize.repaint_request) |request| {
-        try terminal_worker_render.sendSessionRepaintSnapshot(attached_client, session, request);
+        try draw_emitter.emitRepaintSnapshot(request);
     } else {
-        try terminal_worker_render.sendSessionSnapshot(attached_client, session);
+        try draw_emitter.emitSessionSnapshot();
     }
     refreshAttachedFlag(terminal_worker);
     flushAttachedClientOutput(terminal_worker);
@@ -1269,7 +1206,8 @@ fn flushSessionRenderBarrier(terminal_worker: *TerminalWorker, barrier: vt.Rende
     const scrollback_cursor = try model.scrollbackCursor();
     const attached_client = &terminal_worker.attached_client;
     if (!attached_client.active or attached_client.close_after_flush) return;
-    terminal_worker_render.queueRenderBarrierDraw(attached_client, session, barrier, scrollback_cursor) catch {
+    const draw_emitter = terminal_worker_render.DrawEmitter.init(attached_client, session);
+    draw_emitter.emitRenderBarrier(barrier, scrollback_cursor) catch {
         disconnectAttachedClient(terminal_worker);
         return;
     };
@@ -1512,7 +1450,8 @@ fn handleRepaintRequest(terminal_worker: *TerminalWorker, request: RepaintReques
     const model = session.terminal_model orelse return;
     const clear_for_replace = request.scrollback_cursor != null and
         request.scrollback_cursor.?.per_epoch_cursor == 0;
-    const screen_rows = terminal_worker_render.queueRepaintSnapshot(attached_client, session, request, clear_for_replace) catch {
+    const draw_emitter = terminal_worker_render.DrawEmitter.init(attached_client, session);
+    const screen_rows = draw_emitter.emitRepaint(request, clear_for_replace) catch {
         disconnectAttachedClient(terminal_worker);
         return;
     };
@@ -1568,35 +1507,32 @@ fn broadcastSessionPatch(terminal_worker: *TerminalWorker) void {
     var delivered = false;
     const attached_client = &terminal_worker.attached_client;
     if (attached_client.active and !attached_client.close_after_flush) {
+        const draw_emitter = terminal_worker_render.DrawEmitter.init(attached_client, session);
         if (screen.retained_scrollback_clear_dirty) {
-            terminal_worker_render.queueRetainedScrollbackClearDraw(attached_client, session) catch {
+            draw_emitter.emitRetainedScrollbackClear() catch {
                 disconnectAttachedClient(terminal_worker);
                 return;
             };
         }
         if (scrollback.rows.len > 0) {
-            terminal_worker_render.queueScrollbackRowsAndScreenDraw(
-                attached_client,
-                session,
-                scrollback.rows,
-                &screen,
-                if (primary_screen) |*primary| primary else null,
-                materialize_screen_after_scrollback,
-                scrollback.absolute_count,
-            ) catch {
+            draw_emitter.emitScrollbackAndScreen(.{
+                .rows = scrollback.rows,
+                .screen = &screen,
+                .restore_screen = if (primary_screen) |*primary| primary else null,
+                .align_viewport = materialize_screen_after_scrollback,
+                .scrollback_cursor = scrollback.absolute_count,
+            }) catch {
                 disconnectAttachedClient(terminal_worker);
                 return;
             };
         } else if (should_send_screen_draw) {
-            _ = terminal_worker_render.queueScreenDraw(
-                attached_client,
-                session,
-                &screen,
-                if (primary_screen) |*primary| primary else null,
-                materialize_screen_after_scrollback,
-                materialize_screen_after_scrollback,
-                scrollback.absolute_count,
-            ) catch {
+            _ = draw_emitter.emitScreen(.{
+                .screen = &screen,
+                .restore_screen = if (primary_screen) |*primary| primary else null,
+                .align_viewport = materialize_screen_after_scrollback,
+                .materialize = materialize_screen_after_scrollback,
+                .scrollback_cursor = scrollback.absolute_count,
+            }) catch {
                 disconnectAttachedClient(terminal_worker);
                 return;
             };
@@ -1653,20 +1589,11 @@ fn closeAttachedClientAfterFlush(terminal_worker: *TerminalWorker) void {
 }
 
 fn refreshAttachedFlag(terminal_worker: *TerminalWorker) void {
-    const session = &terminal_worker.session;
-    if (!session.alive) {
-        session.attached = false;
-        return;
-    }
-
-    const now_attached = hasActiveAttachedClient(terminal_worker);
-    const was_attached = session.attached;
-    session.attached = now_attached;
-    if (now_attached) {
-        session.disconnected_at_unix_ms = 0;
-    } else if (was_attached or session.disconnected_at_unix_ms == 0) {
-        session.disconnected_at_unix_ms = nowUnixMs();
-    }
+    terminal_worker_lifecycle.applyAttachedState(
+        &terminal_worker.session,
+        hasActiveAttachedClient(terminal_worker),
+        nowUnixMs(),
+    );
 }
 
 fn endSession(terminal_worker: *TerminalWorker, reason: u8, exit_info: ExitInfo) void {

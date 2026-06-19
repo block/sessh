@@ -7,13 +7,13 @@ const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const app_allocator = @import("../core/app_allocator.zig");
 const daemon_log = @import("../daemon/log.zig");
-const socket_transport = @import("../transport/socket.zig");
 const protocol = @import("../protocol/mod.zig");
 const protocol_test_helpers = @import("../protocol/test_helpers.zig");
 const client_log = @import("../core/client_log.zig");
 const proxy_diagnostics = @import("proxy_diagnostics_channel.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const reconnect = @import("../reconnect/mod.zig");
+const byte_stream = @import("byte_stream.zig");
 const mux_proxy = @import("mux_proxy.zig");
 const proxy_remote = @import("proxy_remote.zig");
 const raw_bridge = @import("raw_bridge.zig");
@@ -26,6 +26,7 @@ const max_chunk_bytes = 16 * 1024;
 const transport_ping_interval_ms: u64 = 1_000;
 const stream_unresponsive_after_ms: u64 = 10_000;
 const proxy_mux_stream_id: u64 = 1;
+const StreamState = byte_stream.StreamState;
 
 const StreamOutcome = union(enum) {
     complete,
@@ -81,95 +82,6 @@ fn handleLocalStreamInterrupt(_: c_int) callconv(.c) void {
     var byte = [_]u8{1};
     _ = c.write(fd, &byte, byte.len);
 }
-
-const StreamByteState = struct {
-    outbound: std.ArrayList(u8) = .empty,
-    outbound_base: u64 = 0,
-    recv_next_offset: u64 = 0,
-    peer_recv: u64 = 0,
-    // Highest outbound offset already written to the currently attached
-    // transport. This is intentionally separate from peer_recv: ACKs decide
-    // what can be dropped, while this prevents overlapping sends before an ACK
-    // has had time to come back.
-    outbound_sent_next: u64 = 0,
-    outbound_eof: bool = false,
-    outbound_eof_sent: bool = false,
-    outbound_eof_acked: bool = false,
-    inbound_eof: bool = false,
-
-    fn outboundNext(self: *const StreamByteState) u64 {
-        return self.outbound_base + self.outbound.items.len;
-    }
-
-    fn bufferedBytes(self: *const StreamByteState) usize {
-        return self.outbound.items.len;
-    }
-
-    fn deinit(self: *StreamByteState, allocator: std.mem.Allocator) void {
-        self.outbound.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-// Tracks one byte stream in each direction. The local side appends source bytes
-// to `outbound`; peer data advances `inbound.recv_next_offset`.
-const StreamState = struct {
-    allocator: std.mem.Allocator,
-    guid: []const u8,
-    proxy_host: []const u8 = "",
-    proxy_port: u16 = 0,
-    outbound: StreamByteState = .{},
-    inbound: StreamByteState = .{},
-    peer_ready: bool = false,
-    source_eof: bool = false,
-
-    fn init(allocator: std.mem.Allocator, guid: []const u8, proxy_host: []const u8, proxy_port: u16) StreamState {
-        return .{
-            .allocator = allocator,
-            .guid = guid,
-            .proxy_host = proxy_host,
-            .proxy_port = proxy_port,
-        };
-    }
-
-    fn deinit(self: *StreamState) void {
-        self.outbound.deinit(self.allocator);
-        self.inbound.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    fn appendOutbound(self: *StreamState, bytes: []const u8) !void {
-        try self.outbound.outbound.appendSlice(self.allocator, bytes);
-    }
-
-    fn dropOutboundThrough(self: *StreamState, offset: u64) !void {
-        if (offset < self.outbound.outbound_base) return;
-        if (offset > self.outbound.outboundNext()) return error.StreamAckOutOfRange;
-        const drop: usize = @intCast(offset - self.outbound.outbound_base);
-        if (drop == 0) return;
-        const remaining = self.outbound.outbound.items.len - drop;
-        std.mem.copyForwards(u8, self.outbound.outbound.items[0..remaining], self.outbound.outbound.items[drop..]);
-        self.outbound.outbound.shrinkRetainingCapacity(remaining);
-        self.outbound.outbound_base = offset;
-    }
-
-    fn bufferedBytes(self: *const StreamState) usize {
-        return self.outbound.bufferedBytes();
-    }
-
-    fn complete(self: *const StreamState) bool {
-        return self.outbound.outbound_eof and
-            self.outbound.outbound_eof_acked and
-            self.outbound.outbound.items.len == 0 and
-            self.inbound.inbound_eof;
-    }
-
-    fn hasProgress(self: *const StreamState) bool {
-        return self.inbound.recv_next_offset != 0 or
-            self.outbound.outbound_base != 0 or
-            self.outbound.outbound.items.len != 0;
-    }
-};
 
 const StreamStepOutcome = union(enum) {
     idle,
@@ -720,7 +632,7 @@ const ProxyEndpoint = struct {
     }
 };
 
-fn runProxyRemote(allocator: std.mem.Allocator, guid: []const u8, replacement_listen_fd: c.fd_t, proxy_host: []const u8, proxy_port: u16) !void {
+pub fn runRemoteWorker(allocator: std.mem.Allocator, guid: []const u8, replacement_listen_fd: c.fd_t, proxy_host: []const u8, proxy_port: u16) !void {
     var endpoint = try ProxyEndpoint.connect(allocator, proxy_host, proxy_port);
     defer endpoint.deinit();
 
@@ -1151,18 +1063,11 @@ fn handleProxyStreamPayload(
 }
 
 fn handleResumeOffset(state: *StreamState, offset: u64) !void {
-    state.outbound.peer_recv = offset;
-    try state.dropOutboundThrough(offset);
-    state.outbound.outbound_sent_next = offset;
+    try state.resumeOutbound(offset);
 }
 
 fn handleAck(state: *StreamState, offset: u64) !void {
-    state.outbound.peer_recv = offset;
-    try state.dropOutboundThrough(offset);
-    if (state.outbound.outbound_sent_next < offset) state.outbound.outbound_sent_next = offset;
-    if (state.outbound.outbound_eof_sent and offset == state.outbound.outboundNext()) {
-        state.outbound.outbound_eof_acked = true;
-    }
+    try state.ackOutbound(offset);
 }
 
 fn handleInboundData(
@@ -1173,26 +1078,9 @@ fn handleInboundData(
     data: []const u8,
 ) !void {
     const sink = options.sink;
-    if (offset < state.inbound.recv_next_offset) {
-        // Reconnect retransmits from the peer's last confirmed offset. If a
-        // frame overlaps bytes already delivered, keep only the new suffix.
-        const already_received: usize = @intCast(state.inbound.recv_next_offset - offset);
-        if (already_received < data.len) {
-            const new_data = data[already_received..];
-            if (sink.fd < 0) return error.StreamSinkClosed;
-            try deliverInboundData(options, sink.fd, new_data);
-            state.inbound.recv_next_offset += new_data.len;
-        }
-        sendAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
-            error.WriteFailed => return error.StreamTransportWriteFailed,
-            else => return err,
-        };
-        return;
-    }
-    if (offset != state.inbound.recv_next_offset) return error.StreamOffsetGap;
-    if (data.len != 0 and sink.fd < 0) return error.StreamSinkClosed;
-    if (data.len != 0) try deliverInboundData(options, sink.fd, data);
-    state.inbound.recv_next_offset += data.len;
+    const inbound = try state.acceptInboundData(offset, data);
+    if (inbound.new_data.len != 0 and sink.fd < 0) return error.StreamSinkClosed;
+    if (inbound.new_data.len != 0) try deliverInboundData(options, sink.fd, inbound.new_data);
     sendAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
         error.WriteFailed => return error.StreamTransportWriteFailed,
         else => return err,
@@ -1205,8 +1093,7 @@ fn handleInboundEof(
     options: *const StreamAttachedClientOptions,
     final_offset: u64,
 ) !void {
-    if (final_offset != state.inbound.recv_next_offset) return error.StreamOffsetGap;
-    state.inbound.inbound_eof = true;
+    try state.markInboundEof(final_offset);
     const sink = options.sink;
     if (sink.shutdown_on_eof and sink.fd >= 0) _ = c.shutdown(sink.fd, c.SHUT.WR);
     if (sink.close_fd_on_eof) |sink_fd_ptr| {
@@ -1216,15 +1103,7 @@ fn handleInboundEof(
         }
     }
     if (options.close_outbound_on_inbound_eof and state.inbound.inbound_eof) {
-        const final_outbound_offset = state.outbound.outboundNext();
-        state.outbound.outbound.shrinkRetainingCapacity(0);
-        state.outbound.outbound_base = final_outbound_offset;
-        state.outbound.peer_recv = final_outbound_offset;
-        state.outbound.outbound_sent_next = final_outbound_offset;
-        state.outbound.outbound_eof = true;
-        state.outbound.outbound_eof_sent = true;
-        state.outbound.outbound_eof_acked = true;
-        state.source_eof = true;
+        state.completeOutboundAfterInboundEof();
     }
     sendAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
         error.WriteFailed => return error.StreamTransportWriteFailed,
@@ -1392,20 +1271,6 @@ fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) !ReadSomeResult {
 
 pub fn requestProxyRemoteCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
     return proxy_remote.requestCleanup(allocator, guid);
-}
-
-pub fn runProxyRemoteProcess(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len != 5) return error.InvalidProxyRemoteArgs;
-    const listen_fd = try std.fmt.parseInt(c.fd_t, args[0], 10);
-    const socket_path = args[1];
-    const guid = args[2];
-    const proxy_host = args[3];
-    const proxy_port = try std.fmt.parseInt(u16, args[4], 10);
-    core_fds.closeInheritedNonStdioFileDescriptorsExcept(listen_fd);
-    defer _ = c.close(listen_fd);
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
-
-    try runProxyRemote(allocator, guid, listen_fd, proxy_host, proxy_port);
 }
 
 pub fn forgetProxyRemote(guid: []const u8) void {

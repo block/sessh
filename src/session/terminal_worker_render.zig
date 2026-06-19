@@ -17,6 +17,78 @@ const Session = terminal_worker_state.Session;
 const encoded_scrollback_cursor_len = terminal_worker_requests.encoded_scrollback_cursor_len;
 const encodeScrollbackCursor = terminal_worker_requests.encodeScrollbackCursor;
 
+pub const ScrollbackAndScreenSnapshot = struct {
+    rows: []const vt.RenderedRow,
+    screen: *const vt.RenderedScreen,
+    restore_screen: ?*const vt.RenderedScreen,
+    align_viewport: bool,
+    scrollback_cursor: u64,
+};
+
+pub const ScreenSnapshot = struct {
+    screen: *const vt.RenderedScreen,
+    restore_screen: ?*const vt.RenderedScreen,
+    align_viewport: bool,
+    materialize: bool,
+    scrollback_cursor: u64,
+};
+
+pub const DrawEmitter = struct {
+    attached_client: *AttachedClient,
+    session: *Session,
+
+    pub fn init(attached_client: *AttachedClient, session: *Session) DrawEmitter {
+        return .{
+            .attached_client = attached_client,
+            .session = session,
+        };
+    }
+
+    pub fn emitSessionSnapshot(self: DrawEmitter) !void {
+        try sendSessionSnapshot(self.attached_client, self.session);
+    }
+
+    pub fn emitRepaintSnapshot(self: DrawEmitter, request: RepaintRequest) !void {
+        try sendSessionRepaintSnapshot(self.attached_client, self.session, request);
+    }
+
+    pub fn emitRepaint(self: DrawEmitter, request: RepaintRequest, clear_for_replace: bool) !usize {
+        return queueRepaintSnapshot(self.attached_client, self.session, request, clear_for_replace);
+    }
+
+    pub fn emitRetainedScrollbackClear(self: DrawEmitter) !void {
+        try queueRetainedScrollbackClearDraw(self.attached_client, self.session);
+    }
+
+    pub fn emitScrollbackAndScreen(self: DrawEmitter, snapshot: ScrollbackAndScreenSnapshot) !void {
+        try queueScrollbackRowsAndScreenDraw(
+            self.attached_client,
+            self.session,
+            snapshot.rows,
+            snapshot.screen,
+            snapshot.restore_screen,
+            snapshot.align_viewport,
+            snapshot.scrollback_cursor,
+        );
+    }
+
+    pub fn emitScreen(self: DrawEmitter, snapshot: ScreenSnapshot) !bool {
+        return queueScreenDraw(
+            self.attached_client,
+            self.session,
+            snapshot.screen,
+            snapshot.restore_screen,
+            snapshot.align_viewport,
+            snapshot.materialize,
+            snapshot.scrollback_cursor,
+        );
+    }
+
+    pub fn emitRenderBarrier(self: DrawEmitter, barrier: vt.RenderBarrier, scrollback_cursor: u64) !void {
+        try queueRenderBarrierDraw(self.attached_client, self.session, barrier, scrollback_cursor);
+    }
+};
+
 pub fn sendSessionAttached(attached_client: *AttachedClient, session: *const Session) !void {
     try attached_client.queueTerminalEmulatorFrame(.{ .session_attached = .{
         .session_guid = session.idSlice(),
