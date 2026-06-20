@@ -1,3 +1,6 @@
+// Local control parsing for proxy streams. It recognizes sessh escape controls
+// without corrupting the raw stream and keeps incomplete escape sequences in a
+// bounded scratch buffer.
 const std = @import("std");
 
 const reconnect_control = @import("../reconnect/control.zig");
@@ -23,6 +26,9 @@ pub const StreamInputControl = struct {
     escape_filter: terminal.EscapeFilter = .{},
 
     pub fn filter(self: *StreamInputControl, bytes: []const u8, out: []u8) []const u8 {
+        // The proxy byte stream remains raw unless diagnostics UI is visible.
+        // In that window, strip local controls such as Ctrl-R/~? while passing
+        // every other byte through unchanged.
         var input = bytes;
         var scratch: [filter_scratch_bytes]u8 = undefined;
         if (self.escape_enabled) {

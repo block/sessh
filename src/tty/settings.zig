@@ -1,3 +1,6 @@
+// Portable representation of terminal modes passed between local probes and
+// spawned PTYs. It translates the subset sessh cares about into termios changes
+// without exposing platform-specific constants to session code.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -8,6 +11,11 @@ extern "c" fn cfgetospeed(termios_p: *const posix.termios) posix.speed_t;
 extern "c" fn cfsetispeed(termios_p: *posix.termios, speed: posix.speed_t) c_int;
 extern "c" fn cfsetospeed(termios_p: *posix.termios, speed: posix.speed_t) c_int;
 
+// SSH's `pty-req` channel request does not send native termios structs. It
+// sends a list of terminal-mode opcodes defined by RFC 4254 section 8: opcode
+// 0 terminates the list, 128/129 carry input/output baud rates, and the
+// numbered mode tables below are the wire numbers OpenSSH uses for POSIX
+// control characters and flags.
 pub const op_end = 0;
 pub const op_ispeed = 128;
 pub const op_ospeed = 129;
@@ -178,6 +186,9 @@ fn captureTerm(allocator: std.mem.Allocator) !?[]u8 {
 }
 
 fn modesFromTermios(allocator: std.mem.Allocator, termios: posix.termios) ![]Mode {
+    // Capture local termios into SSH pty-req mode opcodes so the remote PTY can
+    // inherit line discipline and control characters without sharing native
+    // struct layouts across platforms.
     var modes: std.ArrayList(Mode) = .empty;
     errdefer modes.deinit(allocator);
 
@@ -189,6 +200,8 @@ fn modesFromTermios(allocator: std.mem.Allocator, termios: posix.termios) ![]Mod
     inline for (iflag_modes) |mode| try writer.appendFlag(termios.iflag, mode);
     inline for (lflag_modes) |mode| try writer.appendFlag(termios.lflag, mode);
     inline for (oflag_modes) |mode| try writer.appendFlag(termios.oflag, mode);
+    // Character size is encoded as the SSH CS7/CS8 opcodes, not as the native
+    // CSIZE bitmask. That keeps the captured mode list portable across OSes.
     try modes.append(allocator, .{ .opcode = 90, .value = @intFromBool(termios.cflag.CSIZE == .CS7) });
     try modes.append(allocator, .{ .opcode = 91, .value = @intFromBool(termios.cflag.CSIZE == .CS8) });
     inline for (cflag_modes) |mode| try writer.appendFlag(termios.cflag, mode);
@@ -260,6 +273,10 @@ const ModeWriter = struct {
 };
 
 fn applyMode(termios: *posix.termios, opcode: u8, value: u32) void {
+    // Reverse RFC 4254/OpenSSH pty-req mode opcodes back onto the local
+    // platform's termios shape. Unknown or unsupported opcodes are ignored like
+    // OpenSSH does, which matters when client and remote platforms expose
+    // different tty knobs.
     switch (opcode) {
         op_ispeed => setInputSpeed(termios, value),
         op_ospeed => setOutputSpeed(termios, value),

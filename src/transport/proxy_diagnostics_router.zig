@@ -1,3 +1,6 @@
+// Local-daemon rendezvous for process-isolated proxy diagnostics. It pairs the
+// visible client's diagnostics/control connection with the long-lived
+// `sessh-proxy` byte-stream process for the same proxy GUID.
 const std = @import("std");
 const c = std.c;
 
@@ -43,6 +46,9 @@ pub const RegisterOpenFromDaemonOptions = struct {
 };
 
 pub fn registerOpenFromDaemon(options: RegisterOpenFromDaemonOptions) !void {
+    // Register the visible diagnostics side channel for one proxy guid. Later
+    // proxy-stream connection events are routed through this socket without
+    // involving the raw proxy byte stream.
     const allocator = options.allocator;
     const fd = options.fd;
     const context = try allocator.create(VisibleConnection);
@@ -111,6 +117,9 @@ fn readVisibleConnectionInner(
     daemon_dispatcher: *dispatcher.Dispatcher,
     event: dispatcher.Event,
 ) !void {
+    // Diagnostics clients are optional side channels for visible proxy UI. They
+    // receive connection events from the daemon but must never be allowed to
+    // block the daemon's pooled SSH transport or proxy streams.
     const fd_event = switch (event) {
         .fd => |fd| fd,
         .timer => return error.UnexpectedProxyDiagnosticsTimer,

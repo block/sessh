@@ -1,3 +1,6 @@
+// Terminal-worker side of a visible-client connection. It owns queued output,
+// input translation state, and dispatcher watches for the client fd after the
+// daemon has routed the client to this worker.
 const std = @import("std");
 const c = std.c;
 

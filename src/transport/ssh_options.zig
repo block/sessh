@@ -1,3 +1,6 @@
+// OpenSSH option parsing and `ssh -G` resolution helpers. This module is the
+// boundary where sessh decides which ssh options affect routing, pooling, proxy
+// compatibility, and remote command shape.
 const std = @import("std");
 
 const client_log = @import("../core/client_log.zig");
@@ -76,6 +79,8 @@ fn fallbackSshUser(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn querySshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) ![]u8 {
+    // Ask OpenSSH to expand Host aliases/config. sessh uses this resolved view
+    // for pooling and SendEnv policy instead of reimplementing ssh_config.
     const transport_options = transportSshOptionsLen(ssh_options);
     const argv = try allocator.alloc([]const u8, transport_options + 3);
     defer allocator.free(argv);
@@ -113,6 +118,9 @@ const ParseSshConfigOptions = struct {
 };
 
 fn parseSshConfig(options: ParseSshConfigOptions) !ResolvedSshConfig {
+    // Parse the subset of `ssh -G` output needed to key daemon transport reuse.
+    // OpenSSH has already applied Host aliases and config files, so this is the
+    // canonical user/host/port/IPQoS view rather than the raw CLI tokens.
     const allocator = options.allocator;
     const output = options.output;
     const ssh_options = options.ssh_options;
@@ -175,6 +183,8 @@ fn parseSshConfig(options: ParseSshConfigOptions) !ResolvedSshConfig {
 }
 
 fn explicitSshPort(ssh_options: []const []const u8) ?[]const u8 {
+    // Fallback path when `ssh -G` is unavailable: recognize the common explicit
+    // port spellings so the transport key is still better than host-only.
     var i: usize = 0;
     while (i < ssh_options.len) : (i += 1) {
         const option = ssh_options[i];
@@ -264,6 +274,9 @@ pub const SshOptionParseState = struct {
 };
 
 pub fn consumeSshOption(state: SshOptionParseState) !void {
+    // Classify one OpenSSH-style short option cluster. Some options force proxy
+    // mode, some are unsafe for sessh to emulate, and value-taking options must
+    // advance over either `-xVALUE` or `-x VALUE` spellings.
     const args = state.args;
     const index = state.index;
     const classification = state.classification;
@@ -373,6 +386,9 @@ pub fn isProxyRequiredSshOptionWithValue(option: u8) bool {
 }
 
 fn validateSshConfigOption(raw_option: []const u8) !void {
+    // In emulated modes, options that change who owns the session/stdio are not
+    // safe to preserve locally. Reject them unless the value is equivalent to
+    // OpenSSH's default behavior.
     const key = sshConfigKey(raw_option);
     if (std.ascii.eqlIgnoreCase(key, "RemoteCommand")) return error.UnsafeSshOption;
 
@@ -395,6 +411,9 @@ fn validateSshConfigOption(raw_option: []const u8) !void {
 }
 
 pub fn sshConfigOptionRequiresProxy(raw_option: []const u8) !bool {
+    // Some `-o` settings require OpenSSH itself to own the connection behavior,
+    // such as forwarding or RemoteCommand. Those force proxy-mode routing rather
+    // than terminal-emulator mode.
     const key = sshConfigKey(raw_option);
     if (sshConfigKeyIs(raw_option, "RemoteCommand")) return true;
     if (sshConfigKeyIs(raw_option, "ForwardAgent")) return !sshConfigValueIs(raw_option, key.len, "no");

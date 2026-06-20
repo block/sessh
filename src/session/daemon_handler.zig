@@ -1,3 +1,6 @@
+// Daemon-side terminal-session mux handling. It accepts logical terminal
+// streams from a daemon tunnel, starts or connects the worker that owns the PTY,
+// and forwards frames between that worker and the mux stream.
 const std = @import("std");
 const c = std.c;
 
@@ -128,6 +131,10 @@ const TerminalRemoteDebugRegistration = struct {
     client_fd: c.fd_t,
 };
 
+/// Connect a one-shot debug request to the currently live terminal worker. This
+/// path intentionally bypasses normal open handling because the request targets
+/// an already-running worker and should either relay exactly one frame or return
+/// a clear protocol error.
 pub fn registerDebugFrameWithTerminalRemoteFromDaemon(options: TerminalRemoteDebugRegistration) !void {
     const allocator = options.allocator;
     const daemon_dispatcher = options.daemon_dispatcher;
@@ -245,6 +252,9 @@ pub fn closeTerminalMuxStream(options: CloseTerminalMuxStreamOptions) void {
     if (options.stream.session_guid.len != 0) options.allocator.free(options.stream.session_guid);
 }
 
+/// Apply one mux-stream frame for terminal-emulator traffic. Open/payload errors
+/// are translated into mux resets so the daemon tunnel survives one bad logical
+/// stream.
 pub fn handleTerminalMuxStreamFrame(
     ctx: TerminalMuxContext,
     mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
@@ -292,6 +302,9 @@ const TerminalMuxPayloadOpen = struct {
     open: pb.TerminalEmulatorItem.Open,
 };
 
+// Complete terminal stream startup: create/connect the worker endpoint, publish
+// remote cleanup identity, acknowledge the mux open, and forward the terminal
+// open payload to the worker in that order.
 fn handleTerminalMuxPayloadOpen(
     ctx: TerminalMuxContext,
     request: TerminalMuxPayloadOpen,
@@ -396,6 +409,9 @@ const TerminalMuxOpenOptions = struct {
     open_started_ms: i64,
 };
 
+// Resolve the terminal open into either an existing worker connection or a new
+// worker process/in-daemon worker, depending on whether the payload is a create
+// request and which isolation mode was selected.
 fn openTerminalMuxStream(
     ctx: TerminalMuxContext,
     options: TerminalMuxOpenOptions,
@@ -424,6 +440,9 @@ fn openTerminalMuxStream(
     return process_fd;
 }
 
+// Forward a terminal-emulator payload from the tunnel into the worker endpoint.
+// The first payload may itself be the terminal open; subsequent payloads must
+// target an active endpoint and advance the inbound offset.
 fn handleTerminalMuxPayload(
     ctx: TerminalMuxContext,
     stream_id: u64,
@@ -504,6 +523,9 @@ pub const ForwardTerminalRemoteFrameToMuxOptions = struct {
     frame: *protocol.OwnedFrame,
 };
 
+/// Forward one frame from the terminal worker endpoint to its mux stream. Returns
+/// false when the worker produced a terminal error or final session state that
+/// should close the stream locally.
 pub fn forwardTerminalRemoteFrameToMux(options: ForwardTerminalRemoteFrameToMuxOptions) !bool {
     const allocator = options.allocator;
     const mux_writer = options.mux_writer;
@@ -652,6 +674,9 @@ fn queueTerminalHangupAndCloseEndpoint(
     endpoint: *worker_endpoint.Endpoint,
     daemon_dispatcher: *dispatcher.Dispatcher,
 ) !void {
+    // Client disconnect is represented by closing the client endpoint after a
+    // hang-up request frame. The terminal worker then closes the PTY, matching
+    // sshd's behavior when a session's client connection disappears.
     var fd = core_fds.OwnedFd.init(endpoint.takeFd(daemon_dispatcher));
     if (fd.get() < 0) return;
     defer fd.deinit();
@@ -695,6 +720,8 @@ const StartTerminalWorkerRequest = struct {
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 };
 
+// Start the worker that will own the PTY, then immediately connect to it so the
+// mux open can finish without exposing a create-without-client state.
 fn startTerminalWorkerAndConnect(request: StartTerminalWorkerRequest) !c.fd_t {
     const allocator = request.allocator;
     const started_ms = std.time.milliTimestamp();

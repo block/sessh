@@ -1,3 +1,6 @@
+// Rendering-independent diagnostics formatting. Callers choose a presentation
+// mode, and this module turns connection events into overlay lines, title text,
+// plain lines, or JSONL-friendly messages.
 const std = @import("std");
 const c = std.c;
 

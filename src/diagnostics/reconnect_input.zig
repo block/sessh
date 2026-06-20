@@ -1,3 +1,6 @@
+// Reconnect-control input state for foreground UI loops. It recognizes local
+// sessh controls, schedules short visual feedback, and keeps ordinary input
+// untouched whenever reconnect interception is disabled.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -34,6 +37,10 @@ pub const State = struct {
         self: *State,
         options: PollOptions,
     ) !Decision {
+        // Reconnect UI is intentionally local to the visible client process. It
+        // watches terminal input plus an optional diagnostics notifier, filters
+        // sessh controls, and leaves ordinary user input untouched until a
+        // disconnected/unresponsive state asks us to intercept it.
         var pollfds = [_]posix.pollfd{
             .{
                 .fd = options.terminal_fds.input,

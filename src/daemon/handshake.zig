@@ -1,3 +1,6 @@
+// Local-client handshake helpers for sesshd IPC. The compatibility check is
+// deliberately small and foreground-oriented so callers can fail before handing
+// a socket to a long-lived daemon route.
 const std = @import("std");
 const c = std.c;
 

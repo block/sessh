@@ -1,3 +1,6 @@
+// Type-focused helpers for building protobuf frame payloads. Common message
+// construction lives at the protocol boundary, including nested `oneof`
+// envelopes used by many callers.
 const std = @import("std");
 
 const frame = @import("frame.zig");

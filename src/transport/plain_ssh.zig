@@ -1,3 +1,6 @@
+// Plain OpenSSH fallback and foreground PTY wrapper. These paths preserve
+// ssh-shaped behavior for cases that bypass daemon transport, while still
+// applying the requested diagnostics policy.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -115,6 +118,9 @@ const ProxyClientControl = struct {
     }
 
     fn handleConnectionEvent(self: *ProxyClientControl, event: protocol.pb.ConnectionEvent) void {
+        // Plain ssh fallback still receives daemon-style connection diagnostics.
+        // Translate them into stderr/status/title updates without attempting to
+        // participate in sessh's mux or reconnect protocol.
         switch (event.event orelse return) {
             .ssh_connecting => self.showUpdate("sessh: connecting..."),
             .ssh_connected => {},
@@ -229,6 +235,9 @@ pub const RunArgvWithDiagnosticsOptions = struct {
 };
 
 pub fn runArgvWithDiagnostics(options: RunArgvWithDiagnosticsOptions) !noreturn {
+    // Run a visible OpenSSH command while a side-channel control fd updates
+    // diagnostics. ssh owns stdio; sessh only mirrors important connection
+    // status and exits with ssh's resulting status.
     const allocator = options.allocator;
     const ssh_args = options.ssh_args;
     const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);

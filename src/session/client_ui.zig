@@ -1,3 +1,6 @@
+// Foreground reconnect UI for terminal sessions. It owns overlay/title/status
+// presentation and local retry input, while session transport code owns the
+// connection attempts that produce those diagnostics.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -127,6 +130,9 @@ pub const ReconnectUi = struct {
     }
 
     pub fn beginWithOptions(viewport_offset: i32, options: ReconnectUiOptions) !ReconnectUi {
+        // Reconnect UI temporarily owns the diagnostics terminal: raw mode is
+        // needed for Ctrl-R/~. controls, while title/status/overlay rendering
+        // depends on whether the diagnostics destination is a tty.
         const title_enabled = (options.presentation == .overlay or options.presentation == .title) and c.isatty(options.terminal_fds.output) != 0;
         var ui = ReconnectUi{
             .mode_guard = try terminal.TerminalModeGuard.enable(options.terminal_fds.input),
@@ -158,6 +164,10 @@ pub const ReconnectUi = struct {
         self.mode_guard.restore();
     }
 
+    /// Show reconnect diagnostics while waiting for the next scheduled retry.
+    /// The loop also watches reconnect keystrokes, terminal resizes, and new
+    /// diagnostic log lines so the overlay/title/line output stays current
+    /// without busy waiting.
     pub fn waitForReconnect(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
         self.append_only_retry_announced = false;
         try self.drawReconnectOverlay(delay_ms);
@@ -252,6 +262,9 @@ pub const ReconnectUi = struct {
     }
 
     pub fn waitForReconnectSwitchOrTimeout(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
+        // After a replacement transport is ready, keep showing "ready" state for
+        // a bounded window so late user input can force an immediate switch
+        // without hiding the fact that sessh has already reconnected.
         if (self.hasReconnectAcknowledgement()) return .reconnect_now;
         try self.drawReconnectReadyOverlay(.delayed, delay_ms);
         var timer = try NonSuspendingTimer.start();
@@ -369,6 +382,9 @@ pub const ReconnectUi = struct {
     }
 
     fn drawReconnectOverlay(self: *ReconnectUi, delay_ms: u64) !void {
+        // Overlay/title/status modes share the same retry state, but append-only
+        // line/jsonl destinations cannot erase countdowns. Emit one durable line
+        // there and keep frequent updates to mutable presentations only.
         self.showRetryTitle(delay_ms);
         if (self.appendOnlyPresentation()) {
             if (self.append_only_retry_announced) return;
@@ -425,6 +441,9 @@ pub const ReconnectUi = struct {
         try self.drawStaticOverlay(message);
     }
 
+    // Render the current diagnostic message according to the chosen presentation
+    // policy. Overlay mode edits the terminal viewport; line/jsonl modes append
+    // durable diagnostic records and never try to erase previous output.
     fn drawCurrentOverlay(self: *ReconnectUi) !void {
         const message = self.overlay_message.slice();
         switch (self.presentation) {
@@ -496,6 +515,9 @@ pub const ReconnectUi = struct {
     }
 
     fn consumeDiagnostics(self: *ReconnectUi) !void {
+        // Pull user-visible diagnostics from the process-global ring into the
+        // active presentation. Overlay mode keeps a small retained list; line and
+        // jsonl modes write immediately because they cannot update in place.
         var diagnostics = [_]client_log.UserDiagnosticLine{.{}} ** max_diagnostic_overlay_lines;
         const new_cursor = client_log.copyUserDiagnosticsSince(self.diagnostic_cursor, &diagnostics);
         if (new_cursor == self.diagnostic_cursor) {

@@ -14,6 +14,9 @@ pub const RegisterOptions = struct {
 };
 
 pub fn registerFrameAndClose(options: RegisterOptions) !void {
+    // Some setup paths need to send exactly one framed response and then give up
+    // the fd. Register that write with the daemon dispatcher instead of blocking
+    // the caller until the peer becomes writable.
     var writer = try protocol.FrameWriteState.init(options.allocator, options.message_type, options.payload);
     errdefer writer.deinit();
 
@@ -59,6 +62,9 @@ const OneShotFrameWriter = struct {
     }
 
     fn onWritable(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+        // Keep ownership of the fd until the encoded frame is completely
+        // flushed. Any peer close/error abandons the response and releases the
+        // fd because there is no later state machine to recover it.
         const d = handler_event.dispatcher;
         const id = handler_event.id;
         const event = handler_event.event;

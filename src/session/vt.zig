@@ -205,6 +205,10 @@ pub const SessionTerminal = struct {
         query_default_colors: DefaultColors = .{},
     };
 
+    /// Create the in-memory terminal model that sits between the remote PTY and
+    /// the visible client. libghostty-vt owns escape parsing and screen storage;
+    /// this wrapper adds sessh-specific query replies, scrollback accounting, and
+    /// repaint state.
     pub fn create(options: CreateOptions) !*SessionTerminal {
         const allocator = options.allocator;
         const size = options.size;
@@ -270,6 +274,10 @@ pub const SessionTerminal = struct {
         try self.stream.nextSlice(bytes);
     }
 
+    /// Feed PTY bytes while letting the caller flush a draw before screen-mode
+    /// transitions such as entering/leaving the alternate screen. Without these
+    /// barriers, bytes before and after the transition could be rendered against
+    /// the wrong screen model.
     pub fn feedWithRenderBarriers(
         self: *SessionTerminal,
         request: FeedWithRenderBarriersRequest,
@@ -365,6 +373,10 @@ pub const SessionTerminal = struct {
         active_screen_changed: bool,
     };
 
+    // Convert libghostty-vt's render state into the compact screen description
+    // sent over sessh. Dirty-state is upgraded to full when row count, active
+    // screen, cursor/modes, default colors, title, or clear state changed outside
+    // per-row dirtiness.
     fn renderedScreenFromState(self: *SessionTerminal, options: RenderedScreenFromStateOptions) !RenderedScreen {
         const allocator = options.allocator;
         const state = options.state;
@@ -473,6 +485,9 @@ pub const SessionTerminal = struct {
     }
 
     pub fn terminalModes(self: *const SessionTerminal) TerminalModes {
+        // Export only the terminal modes the visible client needs for input
+        // translation. These are modeled by libghostty-vt but encoded in
+        // sessh's smaller protocol-specific bitset.
         var mode_flags: u32 = 0;
         if (self.terminal.modes.get(.insert)) mode_flags |= TerminalModes.insert_mode;
         if (self.terminal.modes.get(.origin)) mode_flags |= TerminalModes.origin_mode;
@@ -514,8 +529,10 @@ pub const SessionTerminal = struct {
 
     fn deviceAttributes(self: *SessionTerminal, req: ghostty_vt.DeviceAttributeReq) !void {
         switch (req) {
-            // VT220-level response with color text. We do not advertise sixel or
-            // clipboard access here because sessh has not modeled those yet.
+            // Device Attributes is the terminal "what are you?" query. The
+            // primary reply below identifies a VT220-class terminal with color
+            // text support; sessh does not advertise sixel or clipboard support
+            // because the VT model does not expose those capabilities yet.
             .primary => try self.queueInputResponse("\x1b[?62;22c"),
             .secondary => try self.queueInputResponse("\x1b[>1;10;0c"),
             else => {},
@@ -524,6 +541,9 @@ pub const SessionTerminal = struct {
 
     fn deviceStatusReport(self: *SessionTerminal, req: ghostty_vt.device_status.Request) !void {
         switch (req) {
+            // DSR means Device Status Report. `CSI 0 n` means "ready/no
+            // malfunction"; `CSI row ; col R` reports the cursor using
+            // one-based terminal coordinates.
             .operating_status => try self.queueInputResponse("\x1b[0n"),
             .cursor_position => {
                 const pos = self.reportedCursorPosition();
@@ -534,6 +554,9 @@ pub const SessionTerminal = struct {
     }
 
     fn requestMode(self: *SessionTerminal, mode: ghostty_vt.Mode) !void {
+        // DECRQM means Request Mode. Replies use `CSI ? mode ; state $ y` for
+        // private DEC modes, or the same form without `?` for ANSI modes.
+        // State 1 means set, state 2 means reset.
         const tag: ghostty_vt.modes.ModeTag = @bitCast(@intFromEnum(mode));
         const code: u8 = if (self.terminal.modes.get(mode)) 1 else 2;
         try self.queueInputResponseFmt("\x1b[{s}{};{}$y", .{
@@ -551,6 +574,8 @@ pub const SessionTerminal = struct {
     }
 
     fn kittyKeyboardQuery(self: *SessionTerminal) !void {
+        // Kitty keyboard protocol lets programs ask which enhanced-keyboard
+        // flags are active with `CSI ? u`; the answer is `CSI ? flags u`.
         try self.queueInputResponseFmt("\x1b[?{}u", .{
             self.terminal.screens.active.kitty_keyboard.current().int(),
         });
@@ -558,6 +583,9 @@ pub const SessionTerminal = struct {
 
     fn sizeReport(self: *SessionTerminal, style: ghostty_vt.SizeReportStyle) !void {
         switch (style) {
+            // `CSI 18 t` is an xterm window-operation query for text-area size.
+            // The reply is `CSI 8 ; rows ; cols t`, using character cells rather
+            // than pixels.
             .csi_18_t => try self.queueInputResponseFmt("\x1b[8;{};{}t", .{
                 self.terminal.rows,
                 self.terminal.cols,
@@ -567,6 +595,9 @@ pub const SessionTerminal = struct {
     }
 
     fn reportXtversion(self: *SessionTerminal) !void {
+        // XTVERSION is an xterm DCS query for terminal implementation/version.
+        // Report sessh here because the remote program is talking to sessh's VT
+        // model, not directly to the user's outer terminal.
         try self.queueInputResponseFmt("\x1bP>|sessh {s}\x1b\\", .{config.version});
     }
 
@@ -589,30 +620,54 @@ pub const SessionTerminal = struct {
     }
 
     fn dcsCommand(self: *SessionTerminal, cmd: *ghostty_vt.dcs.Command) !void {
-        const xtgettcap_term_name = "544E"; // TN
-        const xtgettcap_color_count = "436F"; // Co
-        const xtgettcap_rgb_bits = "524742"; // RGB
+        // DCS means Device Control String: a terminal escape-sequence envelope
+        // that starts with ESC P and ends with ST (ESC \). Remote programs use
+        // DCS commands as queries; this function answers the supported command
+        // families by queueing reply bytes as input back to the PTY.
+        //
+        // XTGETTCAP is an xterm extension carried as `DCS + q ... ST`. Programs
+        // use it to ask the terminal for termcap/terminfo capabilities such as
+        // terminal name or color depth. The capability names and values are not
+        // sent as plain text; xterm encodes the ASCII bytes as uppercase hex.
+        // For example, `544E` decodes to `TN` (terminal name).
+        const xtgettcap_term_name = "544E";
+        const xtgettcap_color_count = "436F";
+        const xtgettcap_rgb_bits = "524742";
+        const xtgettcap_value_term_name = "787465726D2D323536636F6C6F72"; // xterm-256color
+        const xtgettcap_value_color_count = "323536"; // 256
+        const xtgettcap_value_rgb_bits = "38"; // 8
 
         switch (cmd.*) {
             .xtgettcap => |*gettcap| {
                 while (gettcap.next()) |key| {
                     if (std.mem.eql(u8, key, xtgettcap_term_name)) {
-                        try self.queueXtgettcapOk(key, "787465726D2D323536636F6C6F72");
+                        try self.queueXtgettcapOk(key, xtgettcap_value_term_name);
                     } else if (std.mem.eql(u8, key, xtgettcap_color_count)) {
-                        try self.queueXtgettcapOk(key, "323536");
+                        try self.queueXtgettcapOk(key, xtgettcap_value_color_count);
                     } else if (std.mem.eql(u8, key, xtgettcap_rgb_bits)) {
-                        try self.queueXtgettcapOk(key, "38");
+                        try self.queueXtgettcapOk(key, xtgettcap_value_rgb_bits);
                     } else {
                         try self.queueXtgettcapUnsupported(key);
                     }
                 }
             },
+            // DECRQSS means DEC Request Status String. Programs send it as
+            // `DCS $ q ... ST` to ask for the current value of settings such as
+            // graphic rendition, cursor style, or scroll margins. Those answers
+            // must reflect the VT model because startup probes often use them
+            // before drawing.
             .decrqss => |decrqss_req| try self.decrqss(decrqss_req),
+            // tmux passthrough is a DCS wrapper that asks tmux to forward bytes
+            // to the terminal outside tmux. The worker's model is the terminal
+            // boundary here, so there is no further outer terminal to pass this
+            // through to.
             .tmux => {},
         }
     }
 
     fn queueXtgettcapOk(self: *SessionTerminal, key: []const u8, value_hex: []const u8) !void {
+        // XTGETTCAP success replies use `DCS 1 + r key=value ST`; both key and
+        // value are still ASCII-hex strings.
         try self.pending_input_responses.appendSlice(self.allocator, "\x1bP1+r");
         try self.pending_input_responses.appendSlice(self.allocator, key);
         try self.pending_input_responses.append(self.allocator, '=');
@@ -621,15 +676,21 @@ pub const SessionTerminal = struct {
     }
 
     fn queueXtgettcapUnsupported(self: *SessionTerminal, key: []const u8) !void {
+        // XTGETTCAP unsupported replies use `DCS 0 + r key ST`.
         try self.pending_input_responses.appendSlice(self.allocator, "\x1bP0+r");
         try self.pending_input_responses.appendSlice(self.allocator, key);
         try self.pending_input_responses.appendSlice(self.allocator, "\x1b\\");
     }
 
     fn decrqss(self: *SessionTerminal, req: ghostty_vt.dcs.Command.DECRQSS) !void {
+        // DEC Request Status String asks for current terminal settings. The
+        // answer must come from sessh's VT model, because the remote process is
+        // drawing against that model rather than the outer terminal directly.
         var response: [128]u8 = undefined;
         var stream = std.io.fixedBufferStream(&response);
         const writer = stream.writer();
+        // DECRQSS replies use `DCS valid $ r value ST`, where valid is 1 when
+        // sessh can answer the requested setting and 0 when it cannot.
         const prefix_fmt = "\x1bP{}$r";
         const prefix_len = std.fmt.comptimePrint(prefix_fmt, .{0}).len;
         stream.pos = prefix_len;
@@ -680,6 +741,10 @@ pub const SessionTerminal = struct {
         return self.rendered_row_count;
     }
 
+    /// Return the retained scrollback window for a full snapshot or reconnect.
+    /// The result merges libghostty's real history with synthetic rows captured
+    /// before display clears that would otherwise erase visible content before
+    /// sessh had a chance to move it into the outer terminal's scrollback.
     pub fn scrollbackSnapshot(self: *SessionTerminal, allocator: std.mem.Allocator) !ScrollbackSnapshot {
         self.consumeSyntheticHistoryForRealScrollback();
         try self.discardSyntheticRedrawRows();
@@ -717,6 +782,9 @@ pub const SessionTerminal = struct {
         };
     }
 
+    /// Return only scrollback rows not yet reported to the visible client. The
+    /// absolute_count is the cursor clients use later to request reconnect
+    /// repaint from a known point.
     pub fn scrollbackDelta(self: *SessionTerminal, allocator: std.mem.Allocator) !ScrollbackSnapshot {
         self.consumeSyntheticHistoryForRealScrollback();
         try self.discardSyntheticRedrawRows();
@@ -855,6 +923,9 @@ pub const SessionTerminal = struct {
     }
 
     fn colorOperation(self: *SessionTerminal, value: ghostty_vt.StreamAction.ColorOperation) !void {
+        // OSC color operations can set, reset, or query dynamic colors and
+        // palette entries. Keep libghostty's palette model updated and answer
+        // queries from sessh's tracked default-color state.
         var it = value.requests.constIterator(0);
         while (it.next()) |request| {
             switch (request.*) {
@@ -879,6 +950,9 @@ pub const SessionTerminal = struct {
     }
 
     fn dynamicColorReport(self: *SessionTerminal, dynamic: ghostty_vt.color.Dynamic, terminator: ghostty_vt.osc.Terminator) !void {
+        // Dynamic color queries should prefer colors the application explicitly
+        // set, then fall back to the outer terminal colors captured at startup.
+        // Cursor color defaults to foreground to match common terminal behavior.
         const modeled_color = switch (dynamic) {
             .foreground => self.default_colors.foreground_color,
             .background => self.default_colors.background_color,
@@ -913,6 +987,9 @@ pub const SessionTerminal = struct {
     }
 
     fn queueDynamicColorReport(self: *SessionTerminal, report: DynamicColorReport) !void {
+        // OSC 10/11/12 query dynamic colors such as default foreground,
+        // background, and cursor color. Replies use the same OSC number followed
+        // by `rgb:rr/gg/bb`.
         try self.queueInputResponseFmt("\x1b]{};rgb:{x:0>2}/{x:0>2}/{x:0>2}{s}", .{
             @intFromEnum(report.dynamic),
             report.rgb.r,
@@ -956,8 +1033,9 @@ pub const SessionTerminal = struct {
     }
 
     fn captureDisplayClearRowsForSyntheticHistory(self: *SessionTerminal, mode: DisplayClearMode) !void {
-        // This callback runs before Ghostty applies the screen clear. Use a
-        // throwaway snapshot for the rows we copy to scrollback; advancing
+        // A full/partial clear can erase useful startup output before Ghostty
+        // turns it into normal scrollback. This callback runs before Ghostty
+        // applies the clear, so use a throwaway snapshot; advancing
         // self.render_state here would make the later draw think the pre-clear
         // rows were already rendered after the clear.
         var state: RenderState = .empty;
@@ -1040,6 +1118,9 @@ pub const SessionTerminal = struct {
         );
     }
 
+    // Remove synthetic rows that were only a temporary copy of content the app
+    // later redrew on the active screen. This avoids duplicating prompt/status
+    // lines in scrollback after full-screen clears and redraws.
     fn discardSyntheticRedrawRows(self: *SessionTerminal) !void {
         const start = self.reported_synthetic_history_rows;
         if (start >= self.synthetic_history_rows.items.len) return;
@@ -1083,6 +1164,9 @@ pub const SessionTerminal = struct {
         }
     }
 
+    // Find the suffix of newly captured synthetic history that matches the
+    // active screen from the bottom up. Matching from the bottom handles apps
+    // that clear and repaint a stable prompt/status area.
     fn syntheticRedrawSuffixStart(self: *SessionTerminal, start: usize) !usize {
         const row_data = self.render_state.row_data.slice();
         const row_cells = row_data.items(.cells);
@@ -1125,6 +1209,9 @@ const ModelTrackingHandler = struct {
         self.readonly.deinit();
     }
 
+    /// libghostty-vt callback hook. sessh observes selected terminal actions to
+    /// maintain extra state and answer query escapes, then delegates to the
+    /// readonly handler so libghostty's normal model update still happens.
     pub fn vt(
         self: *ModelTrackingHandler,
         comptime action: ghostty_vt.StreamAction.Tag,
@@ -1192,6 +1279,8 @@ fn rowHasContent(cells: std.MultiArrayList(RenderState.Cell)) bool {
     return false;
 }
 
+// Convert a libghostty render row into sessh's transport shape, preserving
+// grapheme text, display width, style attributes, and OSC 8 hyperlink URIs.
 fn rowCellsAlloc(
     allocator: std.mem.Allocator,
     cells: std.MultiArrayList(RenderState.Cell),
@@ -1236,6 +1325,8 @@ fn rowFromPinAlloc(allocator: std.mem.Allocator, pin: ghostty_vt.Pin) !RenderedR
 }
 
 fn cloneRowAlloc(allocator: std.mem.Allocator, row: RenderedRow) !RenderedRow {
+    // Deep-copy rendered rows because snapshots/deltas outlive the transient
+    // libghostty render state that produced their cell text and hyperlinks.
     const cells = try allocator.alloc(RenderedCell, row.cells.len);
     var cells_filled: usize = 0;
     errdefer {
@@ -1291,6 +1382,9 @@ fn rowIsDefaultBlank(row: RenderedRow) bool {
     return true;
 }
 
+// Convert a pinned scrollback row from libghostty's page storage. History rows
+// do not come through RenderState, so styles/graphemes/hyperlinks are looked up
+// directly from the page.
 fn rowCellsFromPageAlloc(allocator: std.mem.Allocator, pin: ghostty_vt.Pin) ![]RenderedCell {
     const page = &pin.node.data;
     const row = page.getRow(pin.y);
@@ -1381,6 +1475,8 @@ fn styleForCell(cell: ghostty_vt.Cell, style: ghostty_vt.Style) ghostty_vt.Style
 }
 
 fn attrsFromStyle(style: ghostty_vt.Style) CellAttrs {
+    // Pack libghostty style flags into sessh's protocol bitset. The renderer
+    // later unpacks this into SGR attributes for the visible terminal.
     var flags: u32 = 0;
     if (style.flags.bold) flags |= 1 << 0;
     if (style.flags.faint) flags |= 1 << 1;

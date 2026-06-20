@@ -26,6 +26,9 @@ pub fn watchIdle(context: *Context, daemon_dispatcher: *dispatcher.Dispatcher) !
 }
 
 fn checkDaemonIdle(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+    // sesshd should disappear when it has no clients, transports, workers, log
+    // subscribers, or cleanup work. The grace window prevents rapid
+    // start/stop churn between short sequential sessh invocations.
     const daemon_dispatcher = handler_event.dispatcher;
     const event = handler_event.event;
     const idle_context: *Context = @ptrCast(@alignCast(ctx));

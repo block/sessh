@@ -1,3 +1,6 @@
+// Pooled daemon-to-daemon ssh transport. One OpenSSH process can carry many
+// logical terminal/proxy streams, so this module owns pooling, bootstrap,
+// mux-frame IO, backpressure, reconnect diagnostics, and cleanup delivery.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -286,6 +289,9 @@ pub const RegisterPooledSshTransportOptions = struct {
     request: pb.ClientDaemonItem.SshTransportAcquire,
 };
 
+/// Handle a local client request for an SSH transport. The daemon resolves the
+/// ssh target once, folds resolved config into the acquire request, and then
+/// attaches the client to a compatible pooled daemon-to-daemon tunnel.
 pub fn registerPooledSshTransportFromDaemon(options: RegisterPooledSshTransportOptions) !void {
     const allocator = options.allocator;
     const daemon_dispatcher = options.daemon_dispatcher;
@@ -322,6 +328,9 @@ const ProxyFdPassOpenRegistration = struct {
     request: pb.ClientDaemonItem.ProxyFdPassOpen,
 };
 
+/// Handle ProxyUseFdPass setup from sessh-proxy. The setup socket stays framed
+/// for success/error reporting; the passed fd becomes the raw byte stream that
+/// OpenSSH will use after the proxy process exits.
 pub fn registerProxyFdPassOpenFromDaemon(options: ProxyFdPassOpenRegistration) !void {
     const allocator = options.allocator;
     const daemon_dispatcher = options.daemon_dispatcher;
@@ -409,6 +418,9 @@ const PooledTransportProcessStartOptions = struct {
     request: pb.ClientDaemonItem.SshTransportAcquire,
 };
 
+// Spawn the OpenSSH process that carries the daemon tunnel. Bootstrap mode first
+// runs the remote bootstrap script; no-bootstrap mode invokes the broker already
+// available in PATH on the remote host.
 fn startPooledSshTransportProcessForDaemon(options: PooledTransportProcessStartOptions) !void {
     const allocator = options.allocator;
     const transport = options.transport;
@@ -490,6 +502,9 @@ fn createPooledClientFromAcquire(
     allocator: std.mem.Allocator,
     options: CreatePooledClientOptions,
 ) !*PooledSshTransportClient {
+    // A client acquire request becomes one logical stream on a pooled SSH
+    // transport. Clone every request-owned slice because the foreground daemon
+    // client can disconnect before the stream finishes.
     const request = options.request;
     const client = try allocator.create(PooledSshTransportClient);
     errdefer allocator.destroy(client);
@@ -515,6 +530,8 @@ fn createPooledClientFromAcquire(
     return client;
 }
 
+// Add a framed terminal/proxy client to a pooled transport, creating the
+// underlying OpenSSH tunnel if this is the first compatible client.
 fn registerPooledSshTransportClientFromDaemon(registration: PooledClientRegistration) !void {
     const allocator = registration.allocator;
     const request = registration.request;
@@ -559,6 +576,9 @@ const PooledRawProxyRegistration = struct {
     proxy_open: pb.ProxyStreamItem.Open,
 };
 
+// Add a raw fd-pass proxy client to a pooled transport. Unlike framed clients,
+// this client's local fd carries raw OpenSSH proxy bytes, while setup success is
+// reported separately on the one-shot setup fd.
 fn registerPooledRawProxyClientFromDaemon(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -624,6 +644,9 @@ fn acquirePooledSshTransport(options: AcquirePooledSshTransportOptions) !PooledS
     return acquire;
 }
 
+// Look up a live pooled transport by the conservative reuse key. Closed/closing
+// transports are skipped so a new client never attaches to a tunnel that is
+// already delivering failure/cleanup events.
 fn findOrCreatePooledSshTransport(
     allocator: std.mem.Allocator,
     target: SshTarget,
@@ -792,6 +815,9 @@ const PooledTransportStartOptions = struct {
     request: pb.ClientDaemonItem.SshTransportAcquire,
 };
 
+// Start a newly-created pooled transport and register the dispatcher watches
+// needed for stdout frames, stderr diagnostics, and initial stdin bootstrap or
+// handshake writes.
 fn startNewPooledSshTransport(options: PooledTransportStartOptions) !void {
     const allocator = options.allocator;
     const daemon_dispatcher = options.daemon_dispatcher;
@@ -856,6 +882,8 @@ fn failStartingPooledSshTransport(
     transport: *PooledSshTransport,
     err: anyerror,
 ) void {
+    // Startup failure belongs to every client waiting on this pool. Notify each
+    // one with a transport error before the shared SSH process is closed.
     daemon_log.infof(
         transport.allocator,
         "pooled ssh transport startup failed host={s} pool={s} error={t}",
@@ -876,6 +904,9 @@ fn failStartingPooledSshTransport(
     if (transport.clients.items.len == 0) finishPooledSshTransport(daemon_dispatcher, transport);
 }
 
+/// Queue a cleanup request for a stale remote process, using the same pooled
+/// transport machinery as user traffic. This may create a transport whose only
+/// purpose is to deliver cleanup bookkeeping.
 pub fn enqueueCleanupRequestToRemote(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -931,6 +962,9 @@ fn readPooledSshTransportRemote(ctx: *anyopaque, handler_event: dispatcher.Handl
     };
 }
 
+// Read from the OpenSSH stdout side of the pooled tunnel. Startup states consume
+// bootstrap lines or hello frames; ready state reads multiplexed daemon frames
+// until backpressure pauses remote reads.
 fn readPooledSshTransportRemoteInner(
     transport: *PooledSshTransport,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -992,6 +1026,9 @@ fn readPooledSshTransportBootstrapLine(
     transport: *PooledSshTransport,
     fd: c.fd_t,
 ) !void {
+    // The remote bootstrapper emits line-oriented progress before the sessh
+    // framed tunnel exists. Accumulate one bounded line at a time from SSH
+    // stdout, then feed it to the bootstrap state machine.
     while (transport.bootstrap_line.items.len < 4096) {
         var byte: [1]u8 = undefined;
         const n = c.read(fd, &byte, 1);
@@ -1118,6 +1155,9 @@ fn readPooledSshTransportHandshake(
     transport: *PooledSshTransport,
     fd: c.fd_t,
 ) !void {
+    // Once bootstrap has exec'd the remote broker, stdout becomes framed sessh
+    // protocol. Complete the hello exchange before activating queued logical
+    // clients on the pooled transport.
     while (true) {
         switch (try transport.remote_reader.readReady(fd)) {
             .blocked, .progress => return,
@@ -1135,6 +1175,8 @@ fn readPooledSshTransportHandshake(
     }
 }
 
+// Complete the daemon-to-daemon compatibility handshake on a pooled transport.
+// The transport becomes ready only after both directions have accepted hello.
 fn handlePooledSshTransportHandshakeFrame(
     daemon_dispatcher: *dispatcher.Dispatcher,
     transport: *PooledSshTransport,
@@ -1180,6 +1222,9 @@ fn handlePooledSshTransportHandshakeFrame(
 }
 
 fn completePooledSshTransportStartup(daemon_dispatcher: *dispatcher.Dispatcher, transport: *PooledSshTransport) void {
+    // The remote daemon tunnel is ready. Wake queued clients, emit connection
+    // diagnostics, and then drain any cleanup work that was waiting for a live
+    // transport to this host.
     transport.state = .ready;
     daemon_log.infof(
         transport.allocator,
@@ -1207,6 +1252,9 @@ const PooledSshTransportFailure = struct {
     term: ?std.process.Child.Term = null,
 };
 
+// Fail every client waiting on a transport that never reached ready. Where
+// possible, report ssh's own exit/stderr shape so visible sessh behavior remains
+// close to plain ssh.
 fn failPooledSshTransportStartup(
     daemon_dispatcher: *dispatcher.Dispatcher,
     transport: *PooledSshTransport,
@@ -1295,6 +1343,8 @@ fn schedulePooledSshTransportBootstrapExitPoll(
     transport: *PooledSshTransport,
     err: anyerror,
 ) void {
+    // After bootstrap read failure, briefly poll the SSH process for its final
+    // exit term so the user sees the best available failure message.
     if (transport.bootstrap_failure_timer_id != null) return;
     const now_ms = daemon_dispatcher.nowMs();
     if (transport.bootstrap_failure_started_ms == 0) {
@@ -1338,6 +1388,9 @@ fn sendPooledSshTransportConnectionEvent(
     transport: *PooledSshTransport,
     event: pb.ConnectionEvent.event_union,
 ) void {
+    // Connection events are for foreground clients, not raw fd-pass proxy
+    // streams. Pause remote reads if starting those writes consumed the shared
+    // write slot, preserving mux ordering.
     var started_write = false;
     for (transport.clients.items) |client| {
         if (client.state == .done) continue;
@@ -1357,6 +1410,9 @@ fn sendPooledSshTransportConnectionEvent(
 }
 
 fn readPooledSshTransportStderr(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+    // OpenSSH stderr is diagnostic data that may arrive before, during, or after
+    // mux startup. Forward what is readable, then unregister the stderr watch
+    // once the pipe closes.
     const daemon_dispatcher = handler_event.dispatcher;
     const event = handler_event.event;
     const transport: *PooledSshTransport = @ptrCast(@alignCast(ctx));
@@ -1417,6 +1473,9 @@ fn waitForBootstrapReadAfterWriteFailure(
     transport.state = .bootstrap_wait_line;
 }
 
+// Advance the single pending write to the remote daemon tunnel. There is only
+// one transport-level write in flight at a time so the stream frame ordering on
+// the shared SSH stdin pipe stays explicit.
 fn writePooledSshTransportRemoteInner(
     transport: *PooledSshTransport,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -1463,6 +1522,9 @@ fn writePooledSshTransportFrame(fd: c.fd_t, frame: *PooledSshTransportFrameWrite
     };
 }
 
+// Apply the state transition associated with a completed remote frame write.
+// Some logical writes are two physical frames: the mux-open envelope must be
+// followed by the typed open payload before client reads can resume.
 fn completePooledSshTransportRemoteFrameWrite(
     transport: *PooledSshTransport,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -1628,6 +1690,9 @@ fn readPooledSshTransportClient(ctx: *anyopaque, handler_event: dispatcher.Handl
     };
 }
 
+// Service one local client attached to the pool. Reads are paused whenever the
+// shared remote tunnel already has an in-flight write, preserving frame order and
+// giving backpressure a single place to act.
 fn readPooledSshTransportClientInner(
     client: *PooledSshTransportClient,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -1679,6 +1744,9 @@ fn readPooledSshTransportClientInner(
     }
 }
 
+// Advance a queued write back to one local client. Completing a client write can
+// unblock remote reads or emit a raw-proxy ACK, so the caller uses the boolean to
+// know whether the client survived the write.
 fn writePooledSshTransportClient(ctx: PooledClientContext) !bool {
     const daemon_dispatcher = ctx.daemon_dispatcher;
     const transport = ctx.transport;
@@ -1732,6 +1800,8 @@ fn pooledSshTransportHasClientWrites(transport: *const PooledSshTransport) bool 
     return false;
 }
 
+// Read raw bytes from the fd passed to OpenSSH's ProxyUseFdPass path and wrap
+// them as proxy mux data with monotonically increasing outbound offsets.
 fn readPooledRawProxyClient(ctx: PooledClientContext) !void {
     const daemon_dispatcher = ctx.daemon_dispatcher;
     const transport = ctx.transport;
@@ -1788,6 +1858,9 @@ fn sendPooledRawProxyOpenOk(ctx: PooledClientContext) !void {
 }
 
 fn sendPooledRawProxyFdPassAccepted(ctx: PooledClientContext) !void {
+    // Acknowledge ProxyUseFdPass setup only after the daemon has accepted the raw
+    // fd and associated it with a mux stream. The setup fd is closed after this
+    // one-shot response.
     const daemon_dispatcher = ctx.daemon_dispatcher;
     const client = ctx.client;
     const setup_fd = blk: {
@@ -1946,6 +2019,9 @@ fn failPooledSshTransportClientWithError(ctx: PooledClientContext, error_info: P
 }
 
 fn closeIdlePooledSshTransport(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+    // Idle close is delayed so short sequential sessh invocations can reuse the
+    // SSH connection. Any active client, cleanup request, or non-idle state
+    // cancels the close attempt.
     const daemon_dispatcher = handler_event.dispatcher;
     const event = handler_event.event;
     const transport: *PooledSshTransport = @ptrCast(@alignCast(ctx));
@@ -1966,6 +2042,9 @@ fn closeIdlePooledSshTransport(ctx: *anyopaque, handler_event: dispatcher.Handle
     finishPooledSshTransport(daemon_dispatcher, transport);
 }
 
+// Move clients waiting on transport startup into stream-opening state once the
+// pooled tunnel is ready. Each client gets a fresh remote stream id from the
+// transport's pool.
 fn activatePendingPooledSshTransportClients(daemon_dispatcher: *dispatcher.Dispatcher, transport: *PooledSshTransport) void {
     if (transport.idle_timer_id) |timer_id| {
         daemon_dispatcher.cancel(.{ .timer = timer_id });
@@ -2015,6 +2094,9 @@ fn schedulePooledSshTransportIdleClose(daemon_dispatcher: *dispatcher.Dispatcher
 }
 
 fn beginClosingPooledSshTransport(daemon_dispatcher: *dispatcher.Dispatcher, transport: *PooledSshTransport) void {
+    // Stop observing the SSH process before closing it so no further callbacks
+    // race against teardown. Clients are failed/finished by the caller or close
+    // path that requested this transition.
     if (transport.state == .closed or transport.state == .closing) return;
     transport.state = .closing;
     if (transport.remote_watch_id) |watch_id| {
@@ -2086,6 +2168,9 @@ fn ensurePooledSshTransportClientWatch(
     daemon_dispatcher: *dispatcher.Dispatcher,
     client: *PooledSshTransportClient,
 ) !void {
+    // A pooled client watch follows the client's current backpressure state.
+    // Register once, then update readable/writable interests as queued writes or
+    // paused reads change.
     if (client.watch_id) |_| {
         try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
         return;
@@ -2158,6 +2243,9 @@ fn handlePooledSshTransportClientControlFrame(
     }
 }
 
+// Interpret the first frame from a local client as its logical stream open. This
+// sets the stream kind, injects filtered environment for terminal creates, and
+// starts the mux-open sequence on the shared transport.
 fn openPooledSshTransportClientStream(
     ctx: PooledClientContext,
     frame: *const protocol.OwnedFrame,
@@ -2199,6 +2287,9 @@ fn openPooledSshTransportClientStream(
     return true;
 }
 
+// Forward an active client's frames to the matching mux stream. Terminal,
+// proxy, and proxy-diagnostics frames are deliberately separated so a client
+// cannot switch protocols after opening its stream.
 fn forwardPooledSshTransportClientFrame(
     ctx: PooledClientContext,
     frame: *const protocol.OwnedFrame,
@@ -2270,6 +2361,9 @@ fn appendFilteredClientEnvironmentToTerminalOpen(
     }
 }
 
+// Send a terminal mux open as an open envelope followed by the typed terminal
+// open payload. Splitting the two lets the remote allocate the stream before it
+// sees terminal-specific data without requiring an extra round trip.
 fn sendPooledTerminalMuxOpen(
     ctx: PooledClientContext,
     request: pb.TerminalEmulatorItem.Open,
@@ -2301,6 +2395,8 @@ fn sendPooledTerminalMuxOpen(
     client.startup_timing.noteMuxOpenSent();
 }
 
+// Remap a framed proxy client's local stream id onto the pooled transport's
+// remote stream id before sending the proxy open over the shared tunnel.
 fn sendPooledProxyMuxOpen(
     ctx: PooledClientContext,
     payload: []const u8,
@@ -2328,6 +2424,9 @@ fn sendPooledProxyMuxOpen(
     client.startup_timing.noteMuxOpenSent();
 }
 
+// Open a proxy stream for a raw fd-pass client. The local side has no framed
+// proxy worker, so this builds the proxy open payload directly from raw_proxy
+// metadata.
 fn sendPooledRawProxyMuxOpen(ctx: PooledClientContext) !void {
     const daemon_dispatcher = ctx.daemon_dispatcher;
     const transport = ctx.transport;
@@ -2380,6 +2479,9 @@ fn sendPooledProxyMuxFrame(
     try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, .{ .bytes = bytes, .kind = .{ .client_to_daemon = client } });
 }
 
+// The first proxy open frame carries the proxy guid used by diagnostics. Register
+// that guid lazily so later client-daemon diagnostic frames can be routed back to
+// this local client fd.
 fn maybeRegisterProxyDiagnosticsStream(
     allocator: std.mem.Allocator,
     client: *PooledSshTransportClient,
@@ -2424,6 +2526,8 @@ fn sendPooledTerminalMuxPayload(
     ctx: PooledClientContext,
     item: pb.TerminalEmulatorItem,
 ) !void {
+    // Convert a client_remote terminal item into a daemon-tunnel mux payload and
+    // pause client reads until that frame is accepted by the shared SSH writer.
     const daemon_dispatcher = ctx.daemon_dispatcher;
     const transport = ctx.transport;
     const client = ctx.client;
@@ -2442,6 +2546,9 @@ fn sendPooledTerminalMuxPayload(
     client.outbound_next_offset +|= 1;
 }
 
+// Dispatch one frame from the remote daemon. Tunnel-level cleanup/control is
+// handled on the transport; mux-stream frames are routed to the client that owns
+// the remote stream id.
 fn handlePooledRemoteFrame(
     daemon_dispatcher: *dispatcher.Dispatcher,
     transport: *PooledSshTransport,
@@ -2497,6 +2604,9 @@ fn handlePooledTransportControlFrame(
     transport: *PooledSshTransport,
     frame: *const protocol.OwnedFrame,
 ) !bool {
+    // Transport-control frames are tunnel-level health checks, not logical
+    // stream payloads. Handle ping/pong here before stream routing tries to
+    // decode the frame as terminal or proxy traffic.
     if (frame.message_type != .daemon_tunnel) return false;
     var item = try protocol.decodePayload(pb.DaemonTunnelItem, transport.allocator, frame.payload);
     defer item.deinit(transport.allocator);
@@ -2541,6 +2651,8 @@ fn notePooledMuxFirstPayload(transport: *PooledSshTransport, client: *PooledSshT
     logPooledSshTransportClientStartupTiming(transport, client);
 }
 
+// Forward a framed proxy stream frame back to the local proxy client after
+// remapping the pooled remote stream id to the client's original local stream id.
 fn handlePooledRemoteProxyMuxStreamFrame(
     ctx: PooledClientContext,
     mux_frame: *pb.DaemonTunnelItem.MuxStreamFrame,
@@ -2582,6 +2694,8 @@ fn handlePooledRemoteProxyMuxStreamFrame(
     return true;
 }
 
+// Forward terminal mux output to the visible client. Reset and EOF are terminal
+// stream endings, while payload frames are rewrapped as client_remote messages.
 fn handlePooledRemoteTerminalMuxStreamFrame(
     ctx: PooledClientContext,
     message: protocol.MuxStreamMessage,
@@ -2616,6 +2730,9 @@ fn handlePooledRemoteTerminalMuxPayload(
     ctx: PooledClientContext,
     payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload,
 ) !void {
+    // Terminal mux payloads become client_remote frames for the visible client.
+    // The mux offset is tracked before forwarding so reconnect can resume from
+    // the correct terminal stream point.
     const daemon_dispatcher = ctx.daemon_dispatcher;
     const transport = ctx.transport;
     const client = ctx.client;
@@ -2636,6 +2753,9 @@ fn handlePooledRemoteTerminalMuxPayload(
     }
 }
 
+// Apply remote proxy frames to a raw fd-pass client. Payload offsets are used to
+// drop duplicated retransmits, reject gaps, and ACK only after bytes have been
+// queued to the local raw fd.
 fn handlePooledRemoteRawProxyMuxStreamFrame(
     ctx: PooledClientContext,
     message: protocol.MuxStreamMessage,
@@ -2714,6 +2834,9 @@ fn handlePooledRemoteRawProxyMuxStreamFrame(
     return true;
 }
 
+// Persist cleanup identity for the remote worker/session before acknowledging it
+// to the remote daemon. If the local client dies later, this record is what lets
+// another daemon ask the remote side to hang up the process.
 fn handlePooledRemoteProcessStarted(
     daemon_dispatcher: *dispatcher.Dispatcher,
     transport: *PooledSshTransport,
@@ -2779,6 +2902,9 @@ fn startPooledRemoteProcessCleanupRequest(
     transport.cleanup_requests_in_flight += 1;
 }
 
+// Serialize cleanup requests on the same remote write slot used by mux traffic.
+// This avoids interleaving a cleanup request with a partially-written stream
+// frame on the shared SSH stdin pipe.
 fn startNextPendingCleanupRequest(
     daemon_dispatcher: *dispatcher.Dispatcher,
     transport: *PooledSshTransport,
@@ -2805,6 +2931,9 @@ fn queuePendingRemoteCleanupRequest(
     transport: *PooledSshTransport,
     remote: RemoteCleanupIdentity,
 ) void {
+    // Cleanup requests share the pooled SSH transport with user streams. Queue
+    // them behind any active write so local client teardown never blocks on a
+    // remote cleanup command.
     var pending = PendingCleanupRequest.fromRemote(transport.allocator, remote) catch |err| {
         daemon_log.infof(
             transport.allocator,
@@ -2839,6 +2968,9 @@ fn findPooledSshTransportClient(transport: *PooledSshTransport, stream_id: u64) 
     return null;
 }
 
+// Finish one local client and decide whether remote cleanup is required. Normal
+// terminal/proxy completion deletes the durable record; local disconnect before
+// remote end sends or queues a cleanup request.
 fn finishPooledSshTransportClient(ctx: PooledClientContext, hangup: RemoteHangup) void {
     const daemon_dispatcher = ctx.daemon_dispatcher;
     const transport = ctx.transport;
@@ -2892,6 +3024,9 @@ fn finishPooledSshTransportClient(ctx: PooledClientContext, hangup: RemoteHangup
     schedulePooledSshTransportIdleClose(daemon_dispatcher, transport);
 }
 
+// Handle loss of the pooled daemon tunnel. Clients are told the remote transport
+// closed unless their current queued write can finish first; raw fd-pass clients
+// are closed because OpenSSH owns that visible byte stream directly.
 fn notifyPooledSshTransportRemoteClosed(daemon_dispatcher: *dispatcher.Dispatcher, transport: *PooledSshTransport) void {
     daemon_log.infof(transport.allocator, "ssh transport disconnected from daemon host={s}", .{transport.display_host});
     beginClosingPooledSshTransport(daemon_dispatcher, transport);
@@ -2923,6 +3058,9 @@ fn forwardPooledSshTransportStderr(
     daemon_dispatcher: *dispatcher.Dispatcher,
     transport: *PooledSshTransport,
 ) !void {
+    // Fan OpenSSH stderr to visible clients as connection diagnostics. Raw
+    // fd-pass proxies are excluded because their visible stream belongs directly
+    // to OpenSSH.
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = c.read(transport.stderr_fd, &buf, buf.len);
@@ -2946,6 +3084,9 @@ fn forwardPooledSshTransportStderr(
     }
 }
 
+// Tear down a pooled transport and all clients still attached to it. This is the
+// only path that decrements the active transport count and frees the registry
+// entry.
 fn finishPooledSshTransport(daemon_dispatcher: *dispatcher.Dispatcher, transport: *PooledSshTransport) void {
     if (transport.state == .closed) return;
     daemon_log.infof(
@@ -2986,6 +3127,9 @@ fn destroyPooledSshTransportClient(
     transport: *PooledSshTransport,
     client: *PooledSshTransportClient,
 ) void {
+    // A pooled transport can outlive any individual visible client. Destroying a
+    // client therefore only removes its fd/watch and stream bookkeeping; the
+    // shared SSH process stays alive until idle policy closes the pool.
     if (client.done) return;
     logPooledSshTransportClientStartupTiming(transport, client);
     daemon_log.infof(
@@ -3078,6 +3222,9 @@ fn sendDaemonTransportErrorAndClose(options: DaemonTransportErrorCloseOptions) !
 }
 
 fn startPooledClientSshFailure(ctx: PooledClientContext, target: SshTarget, term: ?std.process.Child.Term) !bool {
+    // If SSH fails before the mux tunnel is ready, surface that failure to the
+    // waiting client as a daemon error frame. Once SSH exits successfully or
+    // after the tunnel is established, normal stream close handling takes over.
     const client = ctx.client;
     const value = term orelse return false;
     switch (value) {

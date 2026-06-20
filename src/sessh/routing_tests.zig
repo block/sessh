@@ -1,3 +1,6 @@
+// Route-level parser tests for public sessh invocations. They exercise the
+// ssh-shaped CLI contract without requiring a real ssh process or daemon for
+// every option-routing case.
 const std = @import("std");
 
 const client_log = @import("../core/client_log.zig");

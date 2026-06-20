@@ -1,3 +1,6 @@
+// Reconnect overlay drawing for terminal sessions. The remote side may be
+// disconnected while the overlay is visible, so drawing records enough outer
+// terminal geometry to erase itself later.
 const std = @import("std");
 
 const client_log = @import("../core/client_log.zig");
@@ -278,6 +281,9 @@ fn drawRenderedLine(
     renderer: client_renderer.Renderer,
     request: DrawRenderedLineRequest,
 ) !void {
+    // Redraw the union of old and new overlay coverage so shrinking messages do
+    // not leave stale highlighted cells behind. Overlay text is inverse-video
+    // status UI, not terminal application output.
     const cols = request.cols;
     const line = request.line;
     const previous = request.previous;
@@ -341,6 +347,9 @@ fn normalizedTerminalRows(rows: u16) u16 {
 }
 
 fn overlayLayoutForSize(rows: u16, top_row: u16, line_count: usize) OverlayLayout {
+    // Prefer drawing below the current cursor, but scroll just enough when the
+    // overlay would otherwise fall off the bottom. The viewport_offset records
+    // how much the underlying terminal was displaced.
     const terminal_rows = normalizedTerminalRows(rows);
     const visible_line_count: u16 = @intCast(@min(line_count, @as(usize, terminal_rows)));
     if (visible_line_count == 0) {

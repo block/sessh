@@ -1,3 +1,6 @@
+// Spawns and tracks the OpenSSH process that carries one pooled daemon tunnel.
+// Higher-level pooling decides when to reuse or reconnect; this module owns the
+// process argv, fd setup, and exit-status polling.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -97,6 +100,9 @@ pub const SpawnOptions = struct {
 };
 
 pub fn spawnSshTransportProcess(options: SpawnOptions) !SshTransportProcess {
+    // Start the daemon-owned OpenSSH process that carries the sessh mux tunnel.
+    // It always runs `ssh -T <host> <remote-command>` because sessh, not
+    // OpenSSH, owns terminal allocation and logical stream multiplexing.
     const allocator = options.allocator;
     const target = options.target;
     const remote_command = options.remote_command;

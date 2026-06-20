@@ -6,6 +6,9 @@ const user_error = @import("../core/user_error.zig");
 const sessh_cli = @import("cli.zig");
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    // Public sessh is an ssh-shaped CLI adapter. After parsing, all real work
+    // goes through the transport/session path that owns daemon startup,
+    // bootstrap, proxy routing, and terminal emulation.
     var scratch = sessh_cli.Scratch{ .allocator = allocator };
     defer scratch.deinit();
     const parsed = sessh_cli.parse(&scratch, args) catch |err| {

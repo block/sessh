@@ -1,3 +1,6 @@
+// JSONL diagnostics formatting for users and harnesses that need machine-readable
+// connection events. It mirrors the human diagnostics vocabulary without tying
+// callers to a terminal presentation mode.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -94,6 +97,8 @@ fn writeFinalFailure(fd: c.fd_t, message: []const u8) !void {
 }
 
 fn writeString(fd: c.fd_t, value: []const u8) !void {
+    // Minimal JSON string writer for diagnostics. It escapes control characters
+    // so JSONL consumers can parse each event as one physical line.
     try io.writeAll(fd, "\"");
     for (value) |byte| switch (byte) {
         '"' => try io.writeAll(fd, "\\\""),

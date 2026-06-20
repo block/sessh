@@ -1,3 +1,6 @@
+// Frame-level relay utilities for connections that mostly forward bytes without
+// interpreting every protobuf payload. The dispatcher path preserves
+// backpressure by pairing bounded buffers with fd readiness.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -276,6 +279,9 @@ const DispatcherFrameRelay = struct {
     }
 
     fn handleEvent(self: *DispatcherFrameRelay, handler_event: dispatcher.HandlerEvent) !void {
+        // A relay fd can be both readable and writable in the same dispatcher
+        // turn. Drain pending output first, then read more input so buffers do
+        // not grow while the opposite fd is ready to accept bytes.
         const d = handler_event.dispatcher;
         const id = handler_event.id;
         const event = handler_event.event;
@@ -446,6 +452,9 @@ const FrameRelayRegistration = struct {
 };
 
 pub fn registerFrameRelayWithInitialWrites(options: FrameRelayRegistration) !void {
+    // Register a transparent framed relay and optionally flush prebuilt setup
+    // frames before forwarding live data. This is used when a connection has
+    // already consumed enough protocol to decide it should now become a pipe.
     const allocator = options.allocator;
     const d = options.dispatcher;
     const endpoints = options.endpoints;

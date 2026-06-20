@@ -1,3 +1,6 @@
+// User config loading for client-visible sessh behavior. This module owns the
+// file format and environment locations; CLI parsing decides how config values
+// combine with command-line options.
 const std = @import("std");
 const c = std.c;
 
@@ -51,6 +54,9 @@ fn configPath(allocator: std.mem.Allocator) !?[]u8 {
 }
 
 fn parseEnvConfig(bytes: []const u8) !FileConfig {
+    // Config files intentionally use shell-like `KEY=value` lines so users can
+    // source them elsewhere, but sessh parses them itself to keep accepted keys
+    // explicit and reject typos instead of silently changing behavior.
     var parsed = FileConfig{};
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |raw_line| {

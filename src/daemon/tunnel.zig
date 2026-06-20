@@ -1,3 +1,6 @@
+// Remote daemon-tunnel endpoint. This module owns mux connection registration
+// and dispatches opened logical streams to terminal-session or proxy-stream
+// handlers while preserving cleanup identity ordering.
 const std = @import("std");
 const c = std.c;
 
@@ -29,6 +32,9 @@ const MuxConnection = struct {
     proxy_streams: std.ArrayList(proxy_worker.ProxyMuxStream) = .empty,
 
     fn deinit(self: *MuxConnection, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
+        // A mux connection owns every stream registered on that daemon-to-daemon
+        // tunnel. Closing it tears down terminal and proxy stream endpoints
+        // before dropping the shared fd/watch.
         if (daemon_dispatcher) |d| {
             if (self.mux_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
         }
@@ -70,6 +76,9 @@ pub const RegisterMuxConnectionOptions = struct {
     fd: c.fd_t,
 };
 
+/// Take ownership of a daemon-to-daemon tunnel fd and start routing multiplexed
+/// stream frames. Any frames already read by the generic client router are
+/// processed before the fd watch is installed, preserving wire order.
 pub fn registerMuxConnectionFromDaemon(
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -114,6 +123,9 @@ fn readMuxConnection(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !v
     };
 }
 
+// Event-loop body for the daemon tunnel fd. It drains queued tunnel writes,
+// reads as many complete frames as are available, and then updates interest in
+// writability only when backpressure leaves data queued.
 fn readMuxConnectionInner(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -183,6 +195,9 @@ fn updateMuxWatch(connection: *MuxConnection, daemon_dispatcher: *dispatcher.Dis
     try daemon_dispatcher.updateFdEvents(watch_id, muxWatchEvents(connection));
 }
 
+// Handle tunnel-level control messages before stream routing. Stream frames are
+// handed to StreamRegistry so opens, closes, and type changes are interpreted in
+// one place before dispatching to terminal or proxy owners.
 fn handleMuxConnectionFrame(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -235,6 +250,9 @@ fn handleMuxTransportControlFrame(
     }
 }
 
+// Route one logical mux-stream frame. Open frames may create a terminal/proxy
+// worker before the same frame is dispatched, while close/reset removes the
+// stream registry entry after the owner has seen the final event.
 fn handleMuxStreamFrame(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -448,6 +466,9 @@ fn readTerminalRemote(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !
     };
 }
 
+// Bridge frames from a terminal remote worker back into the daemon tunnel. If
+// the worker closes before sending its terminal-ended frame, the entire mux
+// connection is considered suspect because the remote PTY may still need cleanup.
 fn readTerminalRemoteInner(
     connection: *MuxConnection,
     handler_event: dispatcher.HandlerEvent,
@@ -509,6 +530,9 @@ fn closeTerminalRemoteAfterProcessClose(
     daemon_dispatcher: *dispatcher.Dispatcher,
     stream_index: usize,
 ) void {
+    // Terminal workers normally send an ended frame before their process socket
+    // closes. If the socket closes first, treat the whole mux connection as
+    // suspect; otherwise remove just the completed stream endpoint.
     const stream_id = connection.terminal_sessions.items[stream_index].stream_id;
     if (!connection.terminal_sessions.items[stream_index].ended) {
         daemon_log.infof(
@@ -538,6 +562,9 @@ fn readProxyRemote(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !voi
     };
 }
 
+// Bridge frames from a proxy remote worker back into the daemon tunnel. Proxy
+// workers can also send local control frames that only affect their process-side
+// write queue, so those are handled before forwarding stream data.
 fn readProxyRemoteInner(
     connection: *MuxConnection,
     handler_event: dispatcher.HandlerEvent,

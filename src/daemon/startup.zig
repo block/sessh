@@ -1,3 +1,6 @@
+// Foreground startup synchronization for sesshd. Clients use the startup lock
+// and ready pipe to avoid racing another process that is already launching the
+// daemon for the same namespace.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;

@@ -11,6 +11,9 @@ fn FixedGuid(
     comptime invalid_error: anyerror,
     comptime isValid: fn ([]const u8) bool,
 ) type {
+    // Fixed-size storage for ids that cross process boundaries. Avoiding heap
+    // ownership here keeps long-lived session/proxy state structs cheap to move
+    // and easy to reset.
     return struct {
         bytes: [len]u8 = [_]u8{0} ** len,
         filled: bool = false,
@@ -92,6 +95,9 @@ pub fn generateProxyGuid(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn generatePrefixedUuid(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    // Generate RFC 4122 version-4 UUID bytes and render them with sessh's
+    // namespace prefix (`s-` or `p-`). The prefix is part of the public id, not
+    // metadata kept elsewhere.
     var bytes: [16]u8 = undefined;
     std.crypto.random.bytes(&bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

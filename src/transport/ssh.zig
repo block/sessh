@@ -1,3 +1,6 @@
+// High-level ssh transport orchestration for public sessh invocations. It ties
+// CLI routing, daemon startup, bootstrap policy, terminal-session clients, and
+// proxy-stream OpenSSH commands together.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -105,6 +108,9 @@ fn remoteSessionConfig(
     common: CommonSessionOptions,
     ssh_options: []const []const u8,
 ) !RemoteSessionConfig {
+    // Merge command-line options with sessh.env defaults. CLI values win, while
+    // full isolation allocates a private daemon namespace so one connection does
+    // not accidentally reuse another connection's pooled SSH transport.
     var result = RemoteSessionConfig{
         .common = common,
     };
@@ -272,6 +278,9 @@ const TerminalDaemonTransportOpen = struct {
 };
 
 fn openTerminalDaemonTransport(options: TerminalDaemonTransportOpen) !TerminalTransport {
+    // Open a local daemon IPC connection and ask it to acquire a pooled SSH
+    // transport for a terminal-emulator session. The returned fd remains framed
+    // client/remote protocol for the visible client.
     const allocator = options.allocator;
     const exe = options.exe;
     const target = options.target;
@@ -338,6 +347,9 @@ const RemoteClientContext = struct {
 };
 
 fn runVisibleRemoteClient(ctx: RemoteClientContext) !void {
+    // The visible client owns terminal presentation, while the daemon transport
+    // may be replaced after a remote disconnect. Loop until the session ends,
+    // the local daemon fails, or reconnect swaps in a fresh transport.
     while (true) {
         const end = visible_client.runVisibleClient(
             .{
@@ -687,6 +699,9 @@ const DaemonStreamClientStarter = struct {
     daemon_dir_name: ?[]const u8 = null,
 
     pub fn start(self: *DaemonStreamClientStarter) !DaemonStreamClientTransport {
+        // Proxy streams use the same daemon transport acquisition path as
+        // terminal sessions, but the foreground client will speak proxy-stream
+        // protocol over the resulting fd.
         const fd = if (self.daemon_dir_name) |dir_name|
             try daemon_client.connectOrStartForDirName(self.allocator, self.exe, dir_name)
         else
@@ -958,6 +973,9 @@ const ProxyStreamFdPassOptions = struct {
 };
 
 fn runProxyStreamFdPass(options: ProxyStreamFdPassOptions) !void {
+    // fd-pass proxy mode keeps setup framed and proxy bytes raw. The proxy
+    // command asks sesshd to acquire the SSH transport, passes one socketpair end
+    // with SCM_RIGHTS, and gives the other end to OpenSSH.
     var daemon_fd = core_fds.OwnedFd.init(if (options.invocation.daemon_dir_name) |dir_name|
         try daemon_client.connectOrStartForDirName(options.allocator, options.exe, dir_name)
     else
@@ -1026,6 +1044,9 @@ fn runPlainSshFallbackArgv(allocator: std.mem.Allocator, target: SshTarget) !nor
 }
 
 pub fn printSshArgError(err: anyerror) !void {
+    // Convert parser errors into ssh-shaped one-line diagnostics. The parser is
+    // deliberately strict about sessh options appearing before HOST so remote
+    // command arguments are not reinterpreted.
     switch (err) {
         error.MissingHost => try user_error.line("missing host"),
         error.MissingScrollbackRowCount => try user_error.line("--scrollback-limit requires a value"),

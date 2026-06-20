@@ -1,3 +1,6 @@
+// Remote process management for `sessh-proxy-remote`, the endpoint that opens
+// localhost:sshd on the far side of a proxy stream. This module tracks the
+// worker process and the identity needed for cleanup fallback.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -92,6 +95,9 @@ pub const ConnectOrStartOptions = struct {
 };
 
 pub fn connectOrStart(options: ConnectOrStartOptions) !*Process {
+    // Proxy workers are per proxy stream, but reconnects may rediscover a
+    // still-running worker by socket path. Prefer the in-memory registry, then
+    // a live socket, and only spawn when neither exists.
     const allocator = options.allocator;
     pruneExited();
     const canonical = try guid_ref.canonicalProxyGuid(allocator, options.guid);
@@ -230,6 +236,9 @@ const StartOptions = struct {
 };
 
 fn start(options: StartOptions) !*Process {
+    // Start a process-isolated remote proxy worker with its listener inherited
+    // from the daemon. The daemon records the worker identity immediately after
+    // spawn so later cleanup can avoid signaling an unrelated reused pid.
     const allocator = options.allocator;
     const control = try allocator.create(Process);
     errdefer allocator.destroy(control);
@@ -265,6 +274,9 @@ fn registerExisting(
     guid: []u8,
     socket_path: []u8,
 ) !*Process {
+    // Rediscovered workers may have been started by an earlier daemon process.
+    // Register their socket immediately, and attach identity only when the
+    // sidecar still matches a live process.
     const control = try allocator.create(Process);
     errdefer allocator.destroy(control);
     var endpoint = try ProcessEndpoint.clone(allocator, guid, socket_path);
@@ -395,6 +407,9 @@ fn writeIdentityFile(
     socket_path: []const u8,
     identity: OwnedProcessIdentity,
 ) !void {
+    // The identity sidecar lets a later daemon rediscover a worker after the
+    // original daemon process exits. Write through a pid-suffixed temp path and
+    // rename so readers never observe partial JSON.
     const path = try identityPath(allocator, socket_path);
     defer allocator.free(path);
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ path, c.getpid() });
@@ -431,6 +446,9 @@ fn readIdentityFile(
     allocator: std.mem.Allocator,
     socket_path: []const u8,
 ) !OwnedProcessIdentity {
+    // Read and validate the sidecar used to distinguish a live proxy worker from
+    // a stale socket path. Re-query the pid start token instead of trusting the
+    // file blindly, because pids can be reused.
     const path = try identityPath(allocator, socket_path);
     defer allocator.free(path);
     const file = try std.fs.openFileAbsolute(path, .{});

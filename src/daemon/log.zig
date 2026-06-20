@@ -1,3 +1,6 @@
+// Live daemon-log fanout. Subscribers attach over framed local IPC and then
+// receive each new daemon event as a one-way stream until their socket closes or
+// a write fails.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -89,6 +92,9 @@ fn destroySubscriber(allocator: std.mem.Allocator, subscriber: *Subscriber) void
 }
 
 fn writeSubscriber(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+    // Log subscribers are best-effort observers. Drain their bounded frame queue
+    // only when their socket is writable, and drop the subscriber on socket
+    // errors so daemon logging never becomes required work.
     const subscriber: *Subscriber = @ptrCast(@alignCast(ctx));
     const daemon_dispatcher = handler_event.dispatcher;
     const id = handler_event.id;
@@ -155,6 +161,9 @@ fn removeFailedSubscriber(allocator: std.mem.Allocator, subscriber: *Subscriber)
 }
 
 fn sendEntry(allocator: std.mem.Allocator, entry: pb.ClientDaemonItem.DaemonLogEntry) !void {
+    // Fan one encoded log entry to all current subscribers. Subscribers that
+    // fail to enqueue are removed in-place; successful subscribers keep their
+    // own bounded queues and write watches.
     const item_payload = try protocol.encodeClientDaemonPayload(allocator, .{ .log_entry = entry });
     defer allocator.free(item_payload);
 

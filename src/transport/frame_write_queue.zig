@@ -1,3 +1,6 @@
+// Bounded non-blocking frame writer. Owners queue complete encoded frames here
+// and drive writes from fd readiness, so backpressure remains explicit instead
+// of becoming an unbounded allocation path.
 const std = @import("std");
 const c = std.c;
 

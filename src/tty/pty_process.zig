@@ -1,3 +1,6 @@
+// PTY-backed process spawning for terminal workers and local ssh wrappers. It
+// applies portable terminal settings at the fork boundary so higher-level code
+// can request a PTY without carrying termios details.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -80,6 +83,9 @@ pub const DrainResult = struct {
 };
 
 pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !PtyProcess {
+    // Create the remote-side PTY and child process that emulates an ssh session.
+    // forkpty gives the child a controlling terminal; the parent keeps the
+    // master fd for the terminal worker's VT model and IO loop.
     if (options.command_argv.len > 0 and options.shell_command != null) return error.InvalidSessionCommand;
 
     const shell_path = options.shell orelse defaultShellPath();
@@ -172,6 +178,8 @@ fn readMasterInner(fd: c.fd_t, buf: []u8) !MasterRead {
 }
 
 pub fn drainMasterNonBlocking(options: anytype) !DrainResult {
+    // Drain a PTY master within caller-supplied limits so a worker callback can
+    // make progress without starving other dispatcher events.
     const limits = options.limits;
     var result = DrainResult{};
     while (result.read_count < limits.max_reads and result.byte_count < limits.max_bytes) {
@@ -221,6 +229,9 @@ const PrepareCommandArgvOptions = struct {
 };
 
 fn prepareCommandArgvInner(options: PrepareCommandArgvOptions) !PreparedCommand {
+    // Convert a remote exec argv into C-compatible owned argv storage for the
+    // forked child. Empty args are rejected for public command paths but allowed
+    // in tests that exercise exact argv behavior.
     const allocator = options.allocator;
     const command_argv = options.command_argv;
 

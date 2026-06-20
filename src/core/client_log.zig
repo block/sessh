@@ -1,3 +1,6 @@
+// In-process logging used by foreground clients and daemons for operator-facing
+// diagnostics. It keeps bounded recent history so long-running processes can
+// stream useful events without turning logs into another unbounded queue.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -141,6 +144,9 @@ pub fn markUserDiagnosticsDisplayedThrough(seq: u64) void {
 }
 
 pub fn copyUserDiagnosticsSince(since_seq: u64, out: []UserDiagnosticLine) u64 {
+    // Copy only diagnostics newer than the caller's sequence number, preserving
+    // the most recent entries that fit in `out`. The returned sequence lets UI
+    // callers later ask for "anything since the last display pass".
     var count: usize = 0;
     const oldest = oldestDiagnosticIndex();
     var offset: usize = 0;

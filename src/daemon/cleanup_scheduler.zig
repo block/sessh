@@ -1,3 +1,6 @@
+// Periodic cleanup maintenance for sesshd. It coordinates the cheap startup
+// sweep, hourly-ish fallback scans, and idle-shutdown decisions around the same
+// cleanup lock to avoid duplicate stale-host sweeps.
 const std = @import("std");
 
 const dispatcher = @import("../core/dispatcher.zig");
@@ -23,6 +26,10 @@ pub const Context = struct {
         present,
     };
 
+    /// Run one cleanup-maintenance tick and return whether cleanup work should
+    /// keep the daemon alive. Live clients get an immediate pre-existing-record
+    /// sweep; idle daemons only stay alive long enough to perform one final
+    /// sweep or let another daemon holding the lock do it.
     pub fn maintain(self: *Context, now_ms: u64, local_client_presence: LocalClientPresence) !bool {
         if (!self.enabled()) {
             self.releaseSweepLock();
@@ -122,6 +129,9 @@ const CleanupMaintenanceDecision = struct {
     shutdown_satisfied_on_acquire_failure: bool = false,
 };
 
+// Pure decision table for cleanup lock/sweep behavior. Keeping this separate
+// from filesystem and SSH side effects makes the idle-shutdown edge cases
+// testable without constructing a daemon.
 fn cleanupMaintenanceDecision(input: CleanupMaintenanceInput) CleanupMaintenanceDecision {
     if (!input.has_records) {
         return .{

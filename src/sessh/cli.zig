@@ -1,3 +1,6 @@
+// Parser for the public `sessh` command-line shape. It accepts ssh-like argv,
+// extracts sessh-owned options before the destination, and leaves the remaining
+// ssh options in their original form for the transport layer.
 const std = @import("std");
 
 const client_config = @import("../session/client_config.zig");
@@ -54,6 +57,9 @@ pub const Scratch = struct {
     }
 };
 
+/// Parse ssh-shaped argv without losing the original SSH option spelling. sessh
+/// consumes only its own options before the destination host; everything else is
+/// classified for routing but preserved for OpenSSH.
 pub fn parse(scratch: *Scratch, args: []const []const u8) !Invocation {
     if (args.len < 2) return error.MissingHost;
 
@@ -136,6 +142,9 @@ const SesshOptionParser = struct {
     common: *CommonSessionOptions,
 
     fn parseBeforeHost(self: SesshOptionParser) !void {
+        // Only sessh-owned options are accepted before the host. Unknown tokens
+        // at this point become the SSH destination, which keeps normal ssh
+        // option parsing from stealing remote command arguments.
         const arg = self.args[self.index.*];
         if (isConfigOnlyDirectSesshOption(arg)) return error.UnsupportedSesshOption;
 

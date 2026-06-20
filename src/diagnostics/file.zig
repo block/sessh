@@ -1,3 +1,6 @@
+// Opens the optional diagnostics file/TTY and records whether it can also serve
+// as an input source for reconnect controls. This keeps diagnostics destination
+// setup out of session and proxy runtime code.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -13,6 +16,9 @@ pub const Handle = struct {
     mode_guard: terminal.TerminalModeGuard = undefined,
     mode_guard_enabled: bool = false,
 
+    /// Open the diagnostics destination as output, and as input too when it is a
+    /// tty. A non-tty file can receive diagnostics but cannot provide reconnect
+    /// keystrokes, so it deliberately falls back to output-only behavior.
     pub fn open(path: ?[]const u8) !Handle {
         const file_path = path orelse return .{};
         if (file_path.len == 0) return .{};
@@ -89,6 +95,9 @@ fn openOutputOnly(path: []const u8) !Handle {
 }
 
 pub fn validatePath(path: []const u8) !void {
+    // Validate early using the same access pattern as runtime diagnostics:
+    // ttys must be openable read/write, ordinary files must be creatable and
+    // appendable. This catches bad `--diagnostics-file` paths before ssh starts.
     const probe_fd = posix.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch {
         const output_fd = try posix.open(path, .{
             .ACCMODE = .WRONLY,

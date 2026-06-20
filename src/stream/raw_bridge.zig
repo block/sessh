@@ -1,3 +1,6 @@
+// Non-blocking raw byte bridge between split local fds and one peer fd. This is
+// used for uninterpreted bytes, so the bridge only tracks readiness, EOF, and
+// bounded in-memory buffering.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -14,6 +17,9 @@ pub const SplitEndpointFds = struct {
 };
 
 pub fn forwardRawDuplex(left: SplitEndpointFds, right_fd: c.fd_t) !void {
+    // Bridge two raw byte directions without interpreting sessh frames. This is
+    // used after setup has handed one side to OpenSSH or another process that
+    // expects an ordinary stream socket.
     try core_fds.setNonBlocking(left.read);
     try core_fds.setNonBlocking(left.write);
     try core_fds.setNonBlocking(right_fd);
@@ -56,6 +62,9 @@ const RawBridge = struct {
     watch_contexts: [4]RawWatchContext = undefined,
 
     fn watch(self: *RawBridge, raw_dispatcher: *dispatcher.Dispatcher) !void {
+        // Four watches model two independent directions. Reads are enabled while
+        // the opposite buffer has room; writes are enabled while that direction
+        // has queued bytes.
         self.watch_contexts = .{
             .{ .bridge = self, .direction = .left_to_right, .kind = .read },
             .{ .bridge = self, .direction = .left_to_right, .kind = .write },

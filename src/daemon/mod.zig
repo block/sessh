@@ -1,3 +1,6 @@
+// Main sesshd process loop. It claims the namespace lock, publishes role
+// executables, accepts local clients, schedules cleanup maintenance, and exits
+// once no live daemon work remains.
 const std = @import("std");
 const c = std.c;
 
@@ -61,6 +64,10 @@ pub fn reexecDaemonOrRun(allocator: std.mem.Allocator, exe: []const u8, args: []
     return daemon_executable.reexec(allocator, namespace_executables.daemon, args);
 }
 
+/// Run the daemon in its selected socket namespace. Startup keeps the namespace
+/// lock until the listening socket, role symlinks, cleanup scheduler, and single
+/// process-wide dispatcher are all installed, then exits only after idle
+/// shutdown sees no clients, mux tunnels, or cleanup work.
 pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     var ready_fd = daemon_startup.inheritedReadyFd();
     var startup_lock_fd = daemon_startup.inheritedStartupLockFd();

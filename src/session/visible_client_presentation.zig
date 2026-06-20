@@ -1,3 +1,7 @@
+// Client-facing presentation cache for one visible terminal connection.
+// This is separate from the headless terminal model: reconnect overlays,
+// skipped stale draws, and terminal resize recovery can invalidate what the
+// user sees without changing the remote PTY's terminal state.
 const std = @import("std");
 const builtin = @import("builtin");
 const app_allocator = @import("../core/app_allocator.zig");
@@ -19,10 +23,6 @@ pub const PlainReplayRequest = struct {
     parser_boundary_ok: bool,
 };
 
-// Client-facing presentation cache for one visible terminal connection.
-// This is separate from the headless terminal model: reconnect overlays,
-// skipped stale draws, and terminal resize recovery can invalidate what the
-// user sees without changing the remote PTY's terminal state.
 pub const PresentationState = struct {
     initialized: bool = false,
     active_screen: u8 = 0,
@@ -195,8 +195,8 @@ pub const PresentationState = struct {
         self.rendered_rows = target_rows;
     }
 
-    // Add retained scrollback above the rendered screen, like normal terminal
-    // output scrolling earlier rows upward.
+    // Retained scrollback appears above the rendered screen, matching normal
+    // terminal output that scrolls earlier rows upward.
     pub fn appendScrollbackRows(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
@@ -239,7 +239,7 @@ pub const PresentationState = struct {
         target_rows: u16,
     ) !void {
         // Include the cached height in the clear pass. Repaint resets keep that
-        // height specifically so a shorter replacement cannot leave old rows
+        // height specifically so a shorter replacement cannot leave stale rows
         // stranded below the new snapshot.
         const rendered_rows = @max(
             self.rendered_rows,
@@ -781,6 +781,9 @@ const testing = if (builtin.is_test) struct {
     };
 
     fn renderedScreen(allocator: std.mem.Allocator, fixture: RenderedScreenFixture) !vt.RenderedScreen {
+        // Build the smallest RenderedScreen needed by presentation tests. Real
+        // screens carry per-cell text and attributes; these fixtures only care
+        // about row identity and cursor/alternate-screen state.
         const labels = fixture.labels;
         const rows = try allocator.alloc(vt.RenderedRow, labels.len);
         var rows_filled: usize = 0;
@@ -830,6 +833,9 @@ const testing = if (builtin.is_test) struct {
 } else struct {};
 
 fn vtAttrsToClient(attrs: vt.CellAttrs) !client_renderer.CellAttrs {
+    // Translate the compact VT wire representation back into renderer attrs.
+    // The bit layout is owned by sessh's protocol, while Renderer uses named
+    // fields that map directly to ANSI SGR output.
     if ((attrs.style_flags & 0xfffff000) != 0) return error.InvalidStyleFlags;
     const underline = (attrs.style_flags & (1 << 3)) != 0;
     const underline_style_raw = (attrs.style_flags >> 9) & 0x7;

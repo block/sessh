@@ -1,3 +1,6 @@
+// Decoders and encoders for requests sent to a terminal worker. The worker loop
+// receives explicit request structs while this module handles raw protobuf
+// fields.
 const std = @import("std");
 const app_allocator = @import("../core/app_allocator.zig");
 const guid_ref = @import("../core/guid.zig");
@@ -122,6 +125,10 @@ fn readU64BigEndian(bytes: []const u8) u64 {
 }
 
 pub fn readSessionCreateRequest(payload: []const u8) !SessionCreateRequest {
+    // Convert the protobuf open payload into owned worker state. The visible
+    // client may disappear after this frame is processed, so argv, environment,
+    // tty settings, and terminal probe results must no longer borrow from the
+    // decoded protobuf arena.
     var open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, app_allocator.allocator(), payload);
     defer open.deinit(app_allocator.allocator());
     const message = open.create orelse return error.MissingSessionCreate;

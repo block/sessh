@@ -20,6 +20,9 @@ pub const LocalStreamInterrupt = struct {
     installed: bool = false,
 
     pub fn install() !LocalStreamInterrupt {
+        // Convert SIGINT into a readable pipe event. The actual proxy loop can
+        // then cleanly abort streams and restore state outside the signal
+        // handler, while still returning ssh-compatible failure status.
         const pipe_fds = try posix.pipe();
         var interrupt = LocalStreamInterrupt{
             .read_fd = pipe_fds[0],

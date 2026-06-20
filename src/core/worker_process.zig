@@ -56,6 +56,10 @@ pub fn spawnWithInheritedListener(
     allocator: std.mem.Allocator,
     options: SpawnWithInheritedListenerOptions,
 ) !std.process.Child.Id {
+    // Workers accept handoff connections on a listener created by their parent.
+    // That avoids a startup race where the parent tries to connect before the
+    // worker has bound its socket, while still letting exec give the process a
+    // role-specific argv[0].
     try socket_transport.ensureSocketDir(allocator, options.socket_path);
     const listen_fd = try socket_transport.listenSocket(options.socket_path);
     var owned_listen_fd = core_fds.OwnedFd.init(listen_fd);

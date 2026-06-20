@@ -1,3 +1,6 @@
+// Proxy-stream worker and reconnect loop. It keeps OpenSSH's byte stream clean
+// while bridging raw proxy bytes through the daemon tunnel and presenting
+// diagnostics on a separate local channel when available.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -154,6 +157,9 @@ const StreamActiveClient = struct {
         transport_fds: TransportFds,
         options: StreamActiveClientOptions,
     ) !StreamActiveClient {
+        // A new active transport starts with the peer unready and no EOF sent.
+        // Resume/open frames will re-establish offsets before source bytes are
+        // allowed to drain onto the mux tunnel.
         state.peer_ready = false;
         state.outbound.outbound_eof_sent = false;
         try core_fds.setNonBlocking(transport_fds.read);
@@ -208,6 +214,9 @@ const StreamActiveClient = struct {
     };
 
     fn queueResumeMessage(self: *StreamActiveClient, mode: ResumeMessageMode) !void {
+        // Every proxy transport starts by advertising the inbound offset it has
+        // already delivered. Replacement transports may also resend the proxy
+        // open payload so the other side can rebuild stream routing.
         try self.queueMuxStreamFrame(.{
             .stream_id = proxy_mux_stream_id,
             .message = .{ .open = .{
@@ -261,6 +270,9 @@ const StreamActiveClient = struct {
         try self.queueMuxStreamFrame(protocol.muxStreamResetFrame(proxy_mux_stream_id, code, message));
     }
 
+    // Queue outbound data/EOS that the peer has not acknowledged yet. The same
+    // StreamState survives reconnects, so offsets are absolute within the proxy
+    // stream rather than relative to one TCP/SSH transport instance.
     fn queuePending(self: *StreamActiveClient) !void {
         if (!self.state.peer_ready) return;
         const outbound = &self.state.outbound;
@@ -311,6 +323,9 @@ const StreamActiveClient = struct {
     }
 
     fn drainSinkWrites(self: *StreamActiveClient) !bool {
+        // Write ordered inbound bytes to the local sink and advance receive
+        // offset only after the sink accepted them. That offset is what future
+        // reconnects use to suppress duplicate delivery.
         var made_progress = false;
         while (self.state.pendingInboundData().len != 0) {
             const sink = self.options.sink;
@@ -503,6 +518,9 @@ const StreamActiveClientStepPoll = struct {
     fn deinit(_: *StreamActiveClientStepPoll) void {}
 
     fn run(self: *StreamActiveClientStepPoll, timeout_ms: i32) !void {
+        // The proxy worker is still process-local, so this is its complete
+        // event wait. Each poll slot maps back to a state-machine input; the
+        // subsequent step decides how backpressure affects the paired fds.
         var poll_set = StreamActiveClientPollSet{};
         if (self.client.canReadTransport()) {
             poll_set.add(self.client.transport_fds.read, posix.POLL.IN, .transport);
@@ -622,6 +640,10 @@ fn drainStreamSourcesNonBlocking(
     state: *StreamState,
     options: *const StreamActiveClientOptions,
 ) !void {
+    // Fill the outbound buffer opportunistically before the main relay loop
+    // starts. This is especially useful for fd-pass proxy streams where
+    // OpenSSH may have already written bytes before the worker has finished
+    // sending the mux open frame.
     const source = options.source;
     if (source.fd < 0) return;
     while (!state.outbound.outbound_eof and state.bufferedBytes() < max_buffered_bytes) {
@@ -699,6 +721,9 @@ pub const RemoteWorkerOptions = struct {
     proxy_port: u16,
 };
 
+/// Run the remote proxy worker that connects to the real proxy destination
+/// socket. When the daemon tunnel drops, the worker keeps StreamState and waits
+/// for a replacement local-daemon connection so unacknowledged bytes can resume.
 pub fn runRemoteWorker(options: RemoteWorkerOptions) !void {
     const allocator = options.allocator;
     const replacement_listen_fd = options.replacement_listen_fd;
@@ -746,6 +771,9 @@ fn waitForReplacementWhileDisconnected(
     replacement_listen_fd: c.fd_t,
     options: *const StreamActiveClientOptions,
 ) !c.fd_t {
+    // While disconnected, the worker keeps buffering remote-side bytes and waits
+    // for the next daemon transport to attach. Returning the accepted fd hands
+    // those durable offsets to the replacement active-client loop.
     while (true) {
         // The remote proxy process is durable while no ssh transport is
         // connected. It must keep draining remote fds into the offset-tracked
@@ -881,7 +909,7 @@ pub fn runLocalStream(
         if (retrying) reconnect_status.showReconnecting();
         transport = start_transport.start() catch |err| {
             // Before the first successful transport, a start failure usually
-            // means ssh could not authenticate in BatchMode. Return that to
+            // means ssh could not authenticate in BatchMode. The error goes to
             // the outer ssh instead of retrying forever.
             if (!had_transport and !state.hasProgress()) {
                 reconnect_status.flushDiagnostics();
@@ -1047,6 +1075,9 @@ fn disconnectedSourceClosed(
     return state.source_eof;
 }
 
+// Drive a proxy stream while one transport connection is alive. Completion means
+// the logical stream ended; transport_closed/unresponsive means callers should
+// reconnect and reuse the same StreamState.
 fn runConnectedStream(
     state: *StreamState,
     transport_fds: TransportFds,
@@ -1070,6 +1101,9 @@ fn runConnectedStream(
     }
 }
 
+// Decode one frame from the daemon tunnel side. Transport control affects
+// liveness/diagnostics, while mux stream frames advance the durable proxy-stream
+// offset protocol.
 fn handleTransportFrame(
     active_client: *StreamActiveClient,
     options: *const StreamActiveClientOptions,
@@ -1130,6 +1164,9 @@ fn handleTransportControlFrame(
     return true;
 }
 
+// Apply one logical proxy mux-stream frame. Open/OpenOk establish the peer's
+// receive cursor, payload data is ordered by offset, ACKs release outbound
+// buffer space, and EOF/reset finish the corresponding half or whole stream.
 fn handleMuxStreamFrame(
     active_client: *StreamActiveClient,
     options: *const StreamActiveClientOptions,
@@ -1254,6 +1291,9 @@ const test_frames = if (builtin.is_test) struct {
     }
 
     fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
+        // Test helper that sends exactly the frames the live relay would emit:
+        // new bytes from the outbound window, followed by EOF once source EOF
+        // has advanced past all pending data.
         if (!state.peer_ready) return;
         const outbound = &state.outbound;
         if (outbound.peer_recv < outbound.outbound_base or
@@ -1376,6 +1416,9 @@ fn waitBeforeReconnect(
     delay_ms: u64,
     control: *ProxyReconnectControlContext,
 ) StreamControlAction {
+    // Proxy reconnect delay is user-interruptible. Update diagnostics at coarse
+    // intervals, but let Ctrl-R, help, interrupt, or disconnect break the wait
+    // immediately.
     const deadline_ms = nowMillis() +| delay_ms;
     while (remainingDelayMs(deadline_ms, nowMillis())) |remaining_ms| {
         status.showRetry(remaining_ms);
@@ -1424,6 +1467,9 @@ const ReconnectInputDispatcherPoll = struct {
 
     fn deinit(_: *ReconnectInputDispatcherPoll) void {}
 
+    // Wait for reconnect-control input while disconnected. This small foreground
+    // poll loop is separate from the active stream loop because there may be no
+    // transport fd to watch yet.
     fn run(self: *ReconnectInputDispatcherPoll, timeout_ms: i32) !void {
         var poll_set = ReconnectInputPollSet{};
         if (self.control.interrupt) |local_interrupt| {
@@ -1579,6 +1625,8 @@ const test_support = if (builtin.is_test) struct {
     }
 
     fn expectProxyDataFrame(fd: c.fd_t, expected_offset: u64, expected_data: []const u8) !void {
+        // Test assertion for the proxy data envelope: daemon-tunnel frame,
+        // fixed proxy stream id, proxy payload, expected offset, expected bytes.
         var mux = try expectMuxStreamFrame(fd);
         defer mux.deinit(std.testing.allocator);
         const message = mux.message orelse return error.UnexpectedMuxFrame;
@@ -1636,6 +1684,9 @@ const test_support = if (builtin.is_test) struct {
         transport_write_fd: c.fd_t,
         options: StreamActiveClientOptions,
     ) !StreamActiveClient {
+        // Construct the smallest active client needed by state-machine tests:
+        // no readable transport, optional writable transport, and caller-owned
+        // source/sink fds.
         if (transport_write_fd >= 0) try core_fds.setNonBlocking(transport_write_fd);
         return .{
             .state = state,

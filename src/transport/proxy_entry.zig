@@ -1,3 +1,6 @@
+// Entry point for generated ProxyCommand processes. It parses the role-shaped
+// proxy argv and chooses between fd-pass setup through sesshd and a
+// process-isolated proxy bridge.
 const std = @import("std");
 const c = std.c;
 
@@ -156,6 +159,8 @@ fn clearOwnedDaemonDirName(allocator: std.mem.Allocator, invocation: *Invocation
 }
 
 pub fn printArgError(err: anyerror) !void {
+    // ProxyCommand argument errors need to be terse and ssh-like because they
+    // appear in OpenSSH's connection failure path, often before sessh UI exists.
     switch (err) {
         error.MissingProxyHost => try user_error.line("proxy mode requires --host HOST"),
         error.MissingProxyPort => try user_error.line("proxy mode requires --port PORT"),
@@ -187,6 +192,9 @@ pub const FdPassSetupOptions = struct {
 };
 
 pub fn runFdPassSetup(options: FdPassSetupOptions) !void {
+    // ProxyUseFdPass requires the proxy command to hand OpenSSH a raw connected
+    // fd and then exit. Keep framed daemon IPC on one socket, create a separate
+    // raw socketpair for OpenSSH bytes, and pass the daemon end with SCM_RIGHTS.
     const allocator = options.allocator;
     var raw_pair: [2]c.fd_t = undefined;
     if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &raw_pair) != 0) return error.SocketPairFailed;
@@ -232,6 +240,9 @@ fn sendRawFdMessageImmediate(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd
 }
 
 fn waitFdPassAccepted(allocator: std.mem.Allocator, daemon_fd: c.fd_t) !void {
+    // ProxyUseFdPass setup must not exit until sesshd has received the passed fd
+    // and associated it with a mux stream; otherwise OpenSSH could inherit a
+    // socket whose peer has not been adopted yet.
     var frame = try foreground_frame_io.readFrame(.{
         .allocator = allocator,
         .fd = daemon_fd,

@@ -1,3 +1,6 @@
+// Pure lifecycle decisions for terminal workers. The worker loop supplies a
+// clock and connection/process state; this module returns poll deadlines and
+// state transitions that are easy to unit-test.
 const std = @import("std");
 
 const visible_client_router = @import("visible_client_router.zig");
@@ -27,14 +30,17 @@ pub const PollTimeoutOptions = struct {
 };
 
 pub fn pollTimeoutMs(options: PollTimeoutOptions) i32 {
+    // The terminal worker is event-driven; this computes the next time it must
+    // wake even if no fd changes. The minimum deadline wins so synchronized
+    // output, PTY reap checks, debug unresponsive state, and disconnected reap
+    // policy can share one dispatcher timeout.
     const session = options.session;
     const visible_client = options.visible_client;
     const clock = options.clock;
     const timing = options.timing;
     var timeout_ms: ?i64 = null;
 
-    // The worker loop should sleep until the next pending maintenance deadline,
-    // but no longer. Every branch below contributes one possible wakeup time.
+    // Every branch below contributes one possible wakeup time.
     if (visible_client.active and visible_client.debug_unresponsive_until_ms > clock.monotonic_ms) {
         const remaining_ms = visible_client.debug_unresponsive_until_ms - clock.monotonic_ms;
         includeEarlierTimeout(&timeout_ms, remaining_ms);

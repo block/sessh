@@ -1,3 +1,6 @@
+// Framed diagnostics/control channel between a visible proxy client and the
+// process-isolated proxy byte stream. The raw OpenSSH bytes stay elsewhere; this
+// channel only carries reconnect status and retry requests.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;

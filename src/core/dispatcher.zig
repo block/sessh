@@ -152,6 +152,9 @@ pub const Dispatcher = struct {
         };
     }
 
+    /// Register an fd with a stable slot so later event-mask updates do not
+    /// rebuild the pollfd array. The generation in the returned id prevents a
+    /// canceled watch from accidentally mutating a reused slot.
     pub fn watchFd(self: *Dispatcher, request: FdWatchRequest) !FdWatchId {
         const reused = self.free_fd_watches.items.len != 0;
         const index = if (reused) self.free_fd_watches.items[self.free_fd_watches.items.len - 1] else self.fd_watches.items.len;
@@ -187,6 +190,9 @@ pub const Dispatcher = struct {
         };
     }
 
+    /// Register a one-shot timer in the min-heap. Timer ids use the same
+    /// stable-slot/generation pattern as fd watches, while heap_index lets cancel
+    /// remove an arbitrary timer without scanning the whole heap.
     pub fn watchTimerAt(
         self: *Dispatcher,
         deadline_ms: u64,
@@ -256,6 +262,10 @@ pub const Dispatcher = struct {
         }
     }
 
+    /// Wait for fd readiness or the nearest timer deadline, collect the ready
+    /// events into a temporary list, and then dispatch callbacks. Collecting
+    /// first makes callback-side cancellation safe and rotates the fd start index
+    /// so a constantly-ready low-numbered fd cannot starve later watches.
     pub fn runOnce(self: *Dispatcher) !usize {
         if (self.active_count == 0) return 0;
 
@@ -424,6 +434,9 @@ pub const Dispatcher = struct {
     }
 
     fn removeTimerHeapIndex(self: *Dispatcher, heap_index: usize) void {
+        // Timer ids point to stable slots, while the heap only stores ids in
+        // deadline order. Removing from the heap must keep the moved timer's
+        // back-pointer accurate before restoring heap order.
         const removed_id = self.timer_heap.items[heap_index];
         const last_index = self.timer_heap.items.len - 1;
         if (heap_index != last_index) {

@@ -1,3 +1,6 @@
+// User-visible diagnostics for proxy streams. It tracks enough terminal escape
+// state to separate reconnect status from application bytes when possible, and
+// falls back to append-only lines or JSONL when the output shape requires it.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -26,6 +29,20 @@ pub const Mode = enum {
     client_control,
 };
 
+// Tracks just enough terminal grammar to know when sessh can safely write local
+// reconnect status into the same terminal stream as application output.
+//
+// CSI means Control Sequence Introducer: ESC [ ... final-byte. We watch CSI
+// `?2026h`/`?2026l` because those enter/leave synchronized-output mode, where a
+// terminal may buffer title changes until the update ends.
+//
+// OSC means Operating System Command: ESC ] command ; text BEL/ST. OSC 0 and
+// OSC 2 set the terminal/window title; tracking them lets sessh restore the app
+// title after temporarily showing reconnect status in title mode.
+//
+// Other string-like escape families such as DCS are skipped until their
+// terminator so local UI is not injected into the middle of application control
+// bytes.
 pub const TerminalTitleTracker = struct {
     const max_title_bytes = 512;
     const OscCommand = fixed_buffer.FixedBuffer(8);
@@ -71,6 +88,10 @@ pub const TerminalTitleTracker = struct {
         return self.title.slice();
     }
 
+    // Incrementally parse just enough terminal output to know when local title
+    // diagnostics are safe. We do not emulate the whole terminal here; we only
+    // avoid writing OSC title updates in the middle of a remote CSI/OSC/string
+    // sequence and keep track of the app's latest OSC title.
     fn observeByte(self: *TerminalTitleTracker, byte: u8) void {
         switch (self.state) {
             .ground => {
@@ -267,6 +288,9 @@ pub const Status = struct {
     }
 
     pub fn showEscapeHelp(self: *Status) void {
+        // Direct proxy diagnostics may share a terminal with raw remote output.
+        // If the parser says we are inside a control sequence, defer local help
+        // text until a safe point so we do not corrupt the user's terminal.
         switch (self.mode) {
             .title => {
                 if (!self.canWriteTitle()) {
@@ -290,6 +314,9 @@ pub const Status = struct {
         }
     }
 
+    /// Apply one connection diagnostic event to the configured output mode. Title
+    /// mode waits for terminal safe-points; line/jsonl modes are append-only; the
+    /// client-control mode forwards structured events to the visible client.
     pub fn handleConnectionEvent(self: *Status, event: pb.ConnectionEvent) void {
         switch (connection_event.classify(event)) {
             .ssh_stderr => |stderr| {
@@ -428,6 +455,9 @@ pub const Status = struct {
         self.title_visible = false;
     }
 
+    // Flush newly buffered ssh stderr/user diagnostics into modes that can show
+    // diagnostic text. In status-line mode, each diagnostic is printed above the
+    // active status line and then the status line is redrawn.
     fn refreshDiagnostics(self: *Status) void {
         if (self.mode != .line and self.mode != .status_line and self.mode != .client_control and self.mode != .jsonl) return;
         if (client_log.currentUserDiagnosticSeq() == self.rendered_diagnostic_seq) return;

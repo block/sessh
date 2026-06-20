@@ -55,3 +55,6 @@ TODO comments are encouraged. When you encounter some code that is problematic,
 but that it doesn't make sense to address in the moment, you should describe
 the problem in a `// TODO(agent): ...` style comment (the `agent` clarifies
 that the TODO was added by an AI agent).
+
+Humans write guidelines. Agents follow them. Don't write new guidelines in docs
+unless specifically requested by a human.

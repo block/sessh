@@ -1,3 +1,6 @@
+// Process entry point and role dispatcher. Public `sessh` invocations and
+// role-named helper processes share one binary, so this file maps argv/process
+// name into the small module that owns that role.
 const std = @import("std");
 const posix = std.posix;
 
@@ -33,6 +36,10 @@ pub fn main() !void {
 }
 
 fn runMain() !void {
+    // The installed binary is shared by every role. Normal packaging creates
+    // role-named symlinks (`sesshd`, `sessh-broker`, etc.), while the colon
+    // commands remain explicit internal entry points for bootstrap paths that
+    // only know how to invoke `sessh` itself.
     const allocator = app_allocator.allocator();
 
     const argv = try std.process.argsAlloc(allocator);

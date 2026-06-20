@@ -34,6 +34,9 @@ pub fn decodePendingClientFrame(
     allocator: std.mem.Allocator,
     frame: *const protocol.OwnedFrame,
 ) !PendingClientFrame {
+    // A pending client has not proven whether it is opening a session, resizing
+    // one, or sending transport control. Decode only enough to route the first
+    // meaningful action.
     switch (frame.message_type) {
         .daemon_tunnel => {
             return if (try protocol.decodeTransportControlFrame(allocator, frame.message_type, frame.payload)) |control|

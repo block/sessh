@@ -1,3 +1,6 @@
+// Logical stream registry for daemon-to-daemon tunnels. It tracks stream IDs,
+// typed opens, and pending frames so tunnel dispatch can stay independent of
+// terminal-session and proxy-stream implementations.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -108,6 +111,9 @@ pub fn routeIncomingFrame(
     registry: *StreamRegistry,
     mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !RouteResult {
+    // Stream type is learned from the typed payload, but open frames can arrive
+    // before payload frames. Keep the open pending until the first terminal or
+    // proxy payload tells the daemon which handler owns the stream.
     const stream_id = mux_frame.stream_id;
     const message = mux_frame.message orelse return .unexpected;
     switch (message) {
@@ -237,6 +243,9 @@ pub fn TaggedFrameWrite(comptime Kind: type) type {
 }
 
 pub fn TaggedRawWrite(comptime Kind: type) type {
+    // Raw writes are used where the bytes are not themselves sessh frames, but
+    // the caller still needs to remember which logical operation the write will
+    // complete after handling short writes.
     return struct {
         bytes: []u8,
         offset: usize = 0,
@@ -271,6 +280,9 @@ pub fn TaggedRawWrite(comptime Kind: type) type {
 }
 
 pub fn TaggedFrameWriteQueue(comptime Kind: type) type {
+    // Small FIFO of encoded frames tagged with caller-owned state. The tag lets
+    // write completion drive the surrounding state machine without decoding the
+    // already-serialized frame.
     return struct {
         const Self = @This();
         const Write = TaggedFrameWrite(Kind);

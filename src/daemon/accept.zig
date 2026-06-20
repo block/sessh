@@ -17,6 +17,9 @@ pub const Context = struct {
     active_local_clients: *usize,
 };
 
+/// Accept one local daemon client and hand it to the protocol router.
+/// The accept callback deliberately does no client protocol work so the daemon
+/// listener remains responsive while individual clients progress independently.
 pub fn acceptDaemonClient(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
     const daemon_dispatcher = handler_event.dispatcher;
     const event = handler_event.event;

@@ -25,6 +25,9 @@ pub fn resolve(
     options: []const []const u8,
     host: []const u8,
 ) !ResolvedTarget {
+    // Resolve OpenSSH config once and build the transport-pool identity from
+    // that canonical view. Raw CLI host aliases are kept for ssh invocation, but
+    // pooling uses resolved user/host/port/IPQoS.
     var resolved_config = try ssh_options.resolveSshConfig(allocator, options, host);
     errdefer resolved_config.deinit(allocator);
     const default_ipqos_option = try resolved_config.defaultIpQosOption(allocator);

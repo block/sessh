@@ -1,3 +1,6 @@
+// Terminal worker lifecycle and event loop. A worker owns one remote PTY and
+// headless VT model, accepts at most one visible client, and emits serialized
+// screen/repaint state back through daemon-owned mux streams.
 const std = @import("std");
 const app_allocator = @import("../core/app_allocator.zig");
 const c = std.c;
@@ -147,6 +150,9 @@ const DispatcherTerminalWorker = struct {
     }
 
     fn connect(self: *DispatcherTerminalWorker, daemon_dispatcher: *dispatcher.Dispatcher) !c.fd_t {
+        // Attach a daemon-side endpoint to a running worker using a socketpair.
+        // The worker half becomes a pending visible client until the open frame
+        // proves which client/session it belongs to.
         if (!self.terminal_worker.running) return error.SessionNotFound;
         if (self.terminal_worker.pending_client.active) return error.PendingWorkerClientBusy;
 
@@ -167,6 +173,10 @@ const DispatcherTerminalWorker = struct {
         return daemon_fd.take();
     }
 
+    /// Recompute all fd and timer interests for the worker after any state
+    /// change. The worker owns three independent edges: PTY, visible client, and
+    /// pending handoff client; backpressure on each edge is expressed by toggling
+    /// writable/readable interest here rather than blocking in handlers.
     fn updateWatches(self: *DispatcherTerminalWorker, daemon_dispatcher: *dispatcher.Dispatcher) !void {
         if (!self.terminal_worker.running) {
             self.finish(daemon_dispatcher);
@@ -228,6 +238,9 @@ const DispatcherTerminalWorker = struct {
     };
 
     fn ensureWatch(self: *DispatcherTerminalWorker, options: EnsureWatchOptions) !void {
+        // Worker fds can change when clients reconnect. Reuse an existing watch
+        // only while it still points at the same fd; otherwise cancel and
+        // register a fresh dispatcher slot.
         const daemon_dispatcher = options.daemon_dispatcher;
         const watch = options.watch;
         const fd = options.fd;
@@ -310,6 +323,9 @@ pub fn startTerminalWorkerInDaemon(
     daemon_dispatcher: *dispatcher.Dispatcher,
     session_guid: []const u8,
 ) !*TerminalWorkerHandle {
+    // Start a terminal worker hosted in the daemon process. The handle is the
+    // daemon's registry entry; the worker state machine itself owns PTY IO and
+    // visible-client handoff.
     const guid = try guid_ref.canonicalSessionGuid(allocator, session_guid);
     errdefer allocator.free(guid);
 
@@ -572,6 +588,10 @@ fn destroyRegisteredTerminalWorker(control: *TerminalWorkerHandle, daemon_dispat
     allocator.destroy(control);
 }
 
+// Single dispatcher entry point for terminal-worker events. Each callback first
+// runs maintenance to reap completed PTYs or expired timers, dispatches the
+// actual fd/timer event, then recomputes watches because almost every branch can
+// transfer ownership, close a client, or queue output.
 fn handleDispatcherTerminalWorkerEvent(
     ctx: *anyopaque,
     handler_event: dispatcher.HandlerEvent,
@@ -759,6 +779,10 @@ fn flushPendingWorkerClientOutput(terminal_worker: *TerminalWorker) void {
     }
 }
 
+// Read the handshake/open frames from a newly connected client that has not yet
+// become the visible client. The pending fd is either rejected, closed after a
+// queued error, or transferred into visible_client once the open request matches
+// an existing/new session.
 fn drainPendingWorkerClient(terminal_worker: *TerminalWorker) void {
     const pending_client = &terminal_worker.pending_client;
     if (!pending_client.active) return;
@@ -799,6 +823,9 @@ const PendingWorkerFrameResult = enum {
     transferred_to_visible_client,
 };
 
+// Interpret the first terminal-emulator item on a pending client connection.
+// Only open/debug/hangup control is valid here; ordinary input/draw traffic is
+// accepted only after connectPendingWorkerClient installs the visible client.
 fn handlePendingWorkerClientFrame(
     terminal_worker: *TerminalWorker,
     pending_client: *PendingWorkerClient,
@@ -860,6 +887,8 @@ fn handlePendingWorkerTransportControl(pending_client: *PendingWorkerClient, con
     }
 }
 
+// Resolve an open request into either an attach to the worker's existing session
+// or creation of the single PTY session this worker will own for its lifetime.
 fn handlePendingWorkerOpen(
     terminal_worker: *TerminalWorker,
     pending_client: *PendingWorkerClient,
@@ -1039,6 +1068,9 @@ const SessionCreateSpec = struct {
     reap_ms: u64,
 };
 
+// Create the worker's one PTY-backed terminal session. The terminal model must
+// be initialized before spawning so the first visible client can receive a
+// coherent snapshot as soon as the process starts producing output.
 fn createSession(
     terminal_worker: *TerminalWorker,
     spec: SessionCreateSpec,
@@ -1093,6 +1125,9 @@ const ConnectVisibleClientOptions = struct {
     capture_tty_transcript: bool,
 };
 
+// Promote a pending client fd into the active visible client. This sends
+// session-ready plus either an initial snapshot or the requested repaint before
+// enabling normal bidirectional traffic.
 fn connectVisibleClient(options: ConnectVisibleClientOptions) !void {
     const terminal_worker = options.terminal_worker;
     const client_fd = options.client_fd;
@@ -1166,6 +1201,9 @@ fn handleSessionPtyEvents(terminal_worker: *TerminalWorker, revents: i16) void {
     }
 }
 
+// Drain PTY output in bounded batches, feed it through the VT model, and then
+// broadcast a patch unless synchronized-output mode asks us to hold updates
+// briefly for an atomic redraw.
 fn drainSessionOutput(terminal_worker: *TerminalWorker) void {
     const session = &terminal_worker.session;
     if (!session.alive) return;
@@ -1232,6 +1270,9 @@ fn handleSessionRenderBarrier(context: *anyopaque, model: *vt.SessionTerminal, b
 }
 
 fn flushSessionRenderBarrier(terminal_worker: *TerminalWorker, barrier: vt.RenderBarrier) !void {
+    // Render barriers split PTY output around screen-mode transitions. Flush the
+    // VT state before applying the transition so the visible client never draws
+    // primary-screen bytes as alternate-screen bytes, or vice versa.
     const session = &terminal_worker.session;
     if (!session.alive) return;
     if (session.terminal_model == null) return;
@@ -1256,6 +1297,9 @@ fn flushSessionRenderBarrier(terminal_worker: *TerminalWorker, barrier: vt.Rende
 }
 
 fn feedSessionOutputBytes(terminal_worker: *TerminalWorker, bytes: []const u8) !void {
+    // PTY output is both transcript data and terminal-model input. Plain output
+    // can be replayed as raw bytes until an escape sequence or render barrier
+    // forces us to switch to model-derived draw frames.
     const session = &terminal_worker.session;
     queueTtyTranscriptChunkForSession(terminal_worker, .STREAM_INNER_OUT, bytes);
     if (session.terminal_model) |model| {
@@ -1277,6 +1321,9 @@ fn feedSessionOutputBytes(terminal_worker: *TerminalWorker, bytes: []const u8) !
     }
 }
 
+// Consume one visible-client frame and apply it to the session. Client input is
+// translated through the current terminal modes before it reaches the PTY; resize
+// and repaint requests update presentation state instead.
 fn drainVisibleClientInput(terminal_worker: *TerminalWorker) void {
     const visible_client = &terminal_worker.visible_client;
     if (!visible_client.active) return;
@@ -1377,6 +1424,9 @@ fn requestSessionPtyHangup(terminal_worker: *TerminalWorker) void {
 }
 
 fn reapPtyHangupSessionIfExited(terminal_worker: *TerminalWorker) bool {
+    // After a client hang-up closes the PTY, poll for child exit without
+    // blocking the worker loop. A still-running child will be checked again by
+    // the worker maintenance timer.
     const session = &terminal_worker.session;
     if (!session.alive or !session.process.pty_closed_for_hangup) return false;
     if (session.process.pid <= 0) {
@@ -1397,6 +1447,9 @@ fn reapPtyHangupSessionIfExited(terminal_worker: *TerminalWorker) bool {
     }
 }
 
+// After PTY EOF, wait briefly for process exit status so the visible client can
+// report the real ssh-like status. If the child does not report in time, treat
+// the closed PTY as authoritative and finish the session.
 fn reapPtyEofSessionIfExited(terminal_worker: *TerminalWorker, now_ms: i64, now_unix_ms: u64) bool {
     const session = &terminal_worker.session;
     if (!session.alive or session.pty_eof_wait_started_ms == 0) return false;
@@ -1424,6 +1477,9 @@ fn reapPtyEofSessionIfExited(terminal_worker: *TerminalWorker, now_ms: i64, now_
     }
 }
 
+// Acknowledge ordered input from the visible client, translate terminal-specific
+// escape reports into the inner PTY's coordinate/key protocol, and queue the
+// translated bytes to the PTY writer.
 fn handleInputFrame(terminal_worker: *TerminalWorker, input: pb.TerminalEmulatorItem.Input) void {
     const visible_client = &terminal_worker.visible_client;
     const session = &terminal_worker.session;

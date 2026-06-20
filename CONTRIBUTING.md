@@ -7,8 +7,9 @@ Start with [README.md](README.md), then read
 
 Keep docs high-level. Details live in comments in code.
 
-Trivial blocks of code don't need comments, but all substantial blocks should
-have comments summarizing what they do, and why (if it's not obvious)
+Trivial blocks of code don't need comments, but all substantial blocks
+(including substantial functions/structs/etc) should have comments summarizing
+what they do, and why (if it's not obvious)
 
 Don't use threads for production code. Use non-blocking IO instead. Test code
 can use threads when that is the cleanest way to exercise the behavior under

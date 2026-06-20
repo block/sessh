@@ -1,3 +1,6 @@
+// Remote bootstrap protocol for getting a compatible sessh binary running on
+// the far side of ssh. It stays line-oriented until the remote broker can enter
+// the framed daemon-tunnel protocol.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -123,6 +126,9 @@ fn loadPackagedArtifactSet(allocator: std.mem.Allocator, exe_path: []const u8) !
 }
 
 fn loadPackagedArtifactSetFromDir(allocator: std.mem.Allocator, artifact_dir: []const u8) !?ArtifactSet {
+    // Development builds may have either a manifest or loose per-platform
+    // binaries. Prefer the manifest because it carries stable artifact ids and
+    // hashes; loose files are accepted for simple local packaging layouts.
     if (try loadPackagedArtifactManifest(allocator, artifact_dir)) |artifact_set| {
         return artifact_set;
     }
@@ -189,6 +195,9 @@ fn parsePackagedArtifactManifest(
     artifact_dir: []const u8,
     bytes: []const u8,
 ) !ArtifactSet {
+    // Manifest rows are `filename sha256hex`. Requiring exactly one row per
+    // supported target makes bootstrap selection deterministic and catches
+    // partially packaged releases before we try to copy them to a remote host.
     var entries = try allocator.alloc(ArtifactEntry, packaged_artifact_targets.len);
     errdefer allocator.free(entries);
     var seen = [_]bool{false} ** packaged_artifact_targets.len;
@@ -242,6 +251,9 @@ const ArtifactEntryFromManifestOptions = struct {
 };
 
 fn artifactEntryFromManifest(options: ArtifactEntryFromManifestOptions) !ArtifactEntry {
+    // Convert one manifest row into the in-memory artifact entry used by
+    // bootstrap selection. The path is already owned by the caller and becomes
+    // owned by the returned entry on success.
     const allocator = options.allocator;
     errdefer allocator.free(options.owned_path);
 
@@ -296,6 +308,8 @@ fn loadArtifactEntryForPlatform(
     path: []const u8,
     platform: Platform,
 ) !ArtifactEntry {
+    // Loose artifact discovery has no manifest, so hash the file immediately and
+    // synthesize the same metadata shape a manifest-backed entry would have.
     const file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
 
@@ -378,6 +392,9 @@ fn readBootstrapLine(
     fd: c.fd_t,
     reconnect_io: ReconnectIoContext,
 ) ![]u8 {
+    // Bootstrap scripts report structured progress one line at a time over the
+    // SSH command pipe. Read one bounded line while giving reconnect UI a chance
+    // to cancel between polls.
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
 

@@ -1,3 +1,6 @@
+// `sessh-broker` bridges OpenSSH stdio to the local daemon. It deliberately
+// owns no session or stream state; once connected, it is just the process that
+// carries framed daemon-to-daemon traffic across ssh.
 const std = @import("std");
 const c = std.c;
 
@@ -54,6 +57,9 @@ fn forwardBrokerFramesToDaemon(
     allocator: std.mem.Allocator,
     fds: BrokerBridgeFds,
 ) !void {
+    // sessh-broker is the OpenSSH-facing process in ProxyCommand mode. It
+    // speaks framed sessh protocol on OpenSSH stdio and forwards those frames to
+    // local sesshd; it does not interpret terminal or proxy stream payloads.
     defer {
         _ = c.shutdown(fds.stdin, c.SHUT.WR);
         if (fds.stdout != fds.stdin) _ = c.shutdown(fds.stdout, c.SHUT.WR);
@@ -108,6 +114,9 @@ const BrokerBridge = struct {
     watch_contexts: [3]BrokerWatchContext = undefined,
 
     fn watch(self: *BrokerBridge, broker_dispatcher: *dispatcher.Dispatcher) !void {
+        // The bridge has three fd interests: OpenSSH input, OpenSSH output, and
+        // daemon IPC. Store one stable context per watch so dispatcher callbacks
+        // can identify which side became ready without allocation.
         self.watch_contexts = .{
             .{ .bridge = self, .kind = .stdin },
             .{ .bridge = self, .kind = .stdout },
@@ -142,6 +151,9 @@ const BrokerBridge = struct {
 };
 
 fn handleBrokerBridgeEvent(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+    // Each ready fd advances only its matching half of the bridge. The
+    // BrokerFramePipe objects remember partial frame reads/writes, so a short
+    // write to OpenSSH or sesshd does not block unrelated progress.
     const broker_dispatcher = handler_event.dispatcher;
     const event = handler_event.event;
     const watch: *BrokerWatchContext = @ptrCast(@alignCast(ctx));

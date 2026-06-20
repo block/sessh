@@ -1,3 +1,6 @@
+// Persistent cleanup records for remote worker processes. The fast path asks
+// the paired daemon to hang up work immediately; these records are the fallback
+// that survives a local client, daemon, or laptop crash.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -205,6 +208,9 @@ pub fn tryAcquireSweepLock(
     return tryAcquireSweepLockPath(allocator, path);
 }
 
+// Try to become the one daemon doing the periodic stale-record sweep. This is a
+// non-blocking flock: if another daemon holds it, this daemon just skips the
+// sweep and stays responsive to its own clients.
 fn tryAcquireSweepLockPath(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -264,6 +270,10 @@ pub const SweepRecordsOptions = struct {
     clean_fn: SweepCleanFn,
 };
 
+/// Scan durable remote-process records and ask the supplied cleaner to clean up
+/// records whose local process is no longer alive. Records are one file per guid
+/// so normal process startup can publish cleanup state with an atomic rename
+/// instead of contending on one append log.
 pub fn sweepRecords(options: SweepRecordsOptions) !void {
     const allocator = options.allocator;
     const cleanup_retry_limit_ms = options.cleanup_retry_limit_ms;
@@ -372,6 +382,8 @@ fn writeRecord(allocator: std.mem.Allocator, record: Record) !void {
     try writeRecordInProcsDir(allocator, procs_dir, record);
 }
 
+// Persist a cleanup record with write+fsync+rename so a crash cannot leave a
+// partially-written JSON file with a valid final name.
 fn writeRecordInProcsDir(allocator: std.mem.Allocator, procs_dir: []const u8, record: Record) !void {
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ procs_dir, record.guid });
     defer allocator.free(path);
@@ -480,6 +492,9 @@ const SweepRecordOptions = struct {
     clean_fn: SweepCleanFn,
 };
 
+// Evaluate one durable cleanup record. The local process identity prevents pid
+// reuse from triggering cleanup of a live session, and record mtime is the retry
+// age so old records can be abandoned without rewriting them on every sweep.
 fn sweepRecordPath(options: SweepRecordOptions) !void {
     const allocator = options.allocator;
     const path = options.path;

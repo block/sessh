@@ -1,3 +1,6 @@
+// Foreground terminal client for one emulated sessh session. It connects local
+// stdin/stdout, reconnect UI, input ACK tracking, and terminal-worker frames
+// while preserving the user's terminal presentation on exit.
 const std = @import("std");
 const builtin = @import("builtin");
 const app_allocator = @import("../core/app_allocator.zig");
@@ -504,6 +507,9 @@ fn repaintVisibleClientSessionState(
     try finishReconnectRepaint(worker_fds.read, session);
 }
 
+// During reconnect, keep reading worker frames until the requested repaint is
+// complete. Draw/input-ack/transcript frames can arrive interleaved with the
+// repaint response, so this loop applies only the pieces that advance recovery.
 fn finishReconnectRepaintInner(
     read_fd: c.fd_t,
     session: *VisibleClientSessionState,
@@ -590,6 +596,9 @@ const LocalTransportDiagnosticsDrain = struct {
     }
 
     fn run(self: *LocalTransportDiagnosticsDrain, timeout_ms: u64) !void {
+        // Give the local daemon a short chance to deliver terminal diagnostics
+        // after the main session loop has ended. This keeps final error text
+        // from being lost without making normal exit depend on daemon liveness.
         var clock = try NonSuspendingTimer.start();
         const deadline_ms = visibleClientNowMs(&clock) +| timeout_ms;
         while (true) {
@@ -668,6 +677,10 @@ fn pollTerminalWorkerRecovery(
     return null;
 }
 
+// Interpret one worker frame while deciding whether a previously unresponsive
+// connection has recovered. Recovery requires a fresh draw/repaint boundary, not
+// just arbitrary bytes, so stale output is ignored until the repaint state allows
+// it.
 fn readTerminalWorkerRecoveryFrame(read_fd: c.fd_t, session: *VisibleClientSessionState) !?TerminalWorkerRecovery {
     const reader = session.recoveryReader(read_fd);
     var frame = switch (try reader.readReady(read_fd)) {
@@ -723,6 +736,9 @@ fn readTerminalWorkerRecoveryFrame(read_fd: c.fd_t, session: *VisibleClientSessi
 }
 
 fn readVisibleClientSessionState(read_fd: c.fd_t) !VisibleClientSessionState {
+    // Initial session creation waits for either a session_ready item or a daemon
+    // error. Client-daemon diagnostics may arrive first, so consume handled
+    // daemon items until the terminal worker answers.
     while (true) {
         var frame = try readVisibleClientFrameMaybeCancelled(read_fd, null);
         defer frame.deinit(app_allocator.allocator());
@@ -758,6 +774,8 @@ fn readSessionReadyInner(
     read_fd: c.fd_t,
     cancelled: ?*const bool,
 ) !void {
+    // Reconnect opens wait for a fresh session_ready but may be cancelled by the
+    // visible UI if the user hangs up before the replacement transport wins.
     while (true) {
         var frame = try readVisibleClientFrameMaybeCancelled(read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
@@ -783,6 +801,9 @@ fn readSessionReadyInner(
 }
 
 fn initialSessionError(payload: []const u8) anyerror {
+    // Convert daemon error frames into public sessh errors. Some errors are
+    // control-flow signals for fallback/reconnect; other transport failures are
+    // already user-facing and should be printed before returning an exit code.
     const parsed = try parseErrorPayload(payload);
     if (std.mem.eql(u8, parsed.code, "VERSION_MISMATCH")) {
         freeErrorPayload(parsed);
@@ -829,6 +850,9 @@ fn writeVisibleClientFrameForeground(
     });
 }
 
+// Build and send the terminal open/create request. This is where local tty
+// settings, environment, command form, initial window size, and repaint request
+// are frozen into the remote session's startup payload.
 fn sendSessionCreate(
     options: StartNewSessionOptions,
 ) !u64 {
@@ -883,6 +907,9 @@ fn sendSessionOpen(
     size: WindowSize,
     session: *const VisibleClientSessionState,
 ) !u64 {
+    // Re-open an existing visible session after reconnect. The scrollback cursor
+    // tells the worker which retained rows the client already has so repaint can
+    // be incremental.
     const repaint_request_seq = repaint_mod.allocateRequestSeq();
     const message = pb.TerminalEmulatorItem.Open{
         .session_guid = session.guidSlice(),
@@ -912,6 +939,9 @@ fn sendTerminalEmulatorPayloadForeground(
 }
 
 fn readSessionEndedOrError(conn: c.fd_t) !bool {
+    // After sending a hang-up/open failure path, drain until the worker confirms
+    // session end or reports a terminal error. Returning true means an error was
+    // printed and should influence the caller's exit path.
     while (true) {
         var frame = try readVisibleClientFrameMaybeCancelled(conn, null);
         defer frame.deinit(app_allocator.allocator());
@@ -939,6 +969,9 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
     }
 }
 
+// Wrap the foreground terminal for the lifetime of one visible client: enable
+// raw-ish local input, install presentation cleanup, run the event loop, and
+// restore terminal state before returning the ssh-shaped end reason.
 fn runVisibleClientLoop(
     worker_fds: TerminalWorkerFds,
     session: *VisibleClientSessionState,
@@ -1010,6 +1043,9 @@ const VisibleTerminalLoop = struct {
     worker_write_queue: frame_write_queue.FrameWriteQueue,
 
     fn init(params: VisibleTerminalRun) !VisibleTerminalLoop {
+        // The visible terminal loop owns local stdin/stdout and one worker
+        // transport. Put the worker fds in nonblocking mode here because the
+        // dispatcher is the only place allowed to wait.
         var read_fd_flags_guard = try core_fds.StatusFlagsGuard.setNonBlocking(params.worker_fds.read);
         errdefer read_fd_flags_guard.restore();
         var write_fd_flags_guard = if (params.worker_fds.write == params.worker_fds.read)
@@ -1046,6 +1082,9 @@ const VisibleTerminalLoop = struct {
         if (self.read_fd_flags_guard) |*guard| guard.restore();
     }
 
+    // Register stdin, worker-read, worker-write, and timer watches for the
+    // foreground client. Input readability is later disabled while worker writes
+    // are pending so local paste cannot grow an unbounded queue.
     fn run(self: *VisibleTerminalLoop) !VisibleClientEnd {
         self.input_watch_id = try self.dispatcher.watchFd(.{
             .fd = self.input_fd,
@@ -1124,6 +1163,9 @@ const VisibleTerminalLoop = struct {
         }
     }
 
+    // Read local terminal input, filter sessh escape controls, and queue
+    // remaining bytes to the worker. Escape-help mode consumes one keypress to
+    // dismiss the overlay instead of forwarding it to the remote PTY.
     fn handleInputEvent(self: *VisibleTerminalLoop, event: dispatcher_mod.FdEvent) !void {
         if (!event.readable and (event.hangup or event.error_event or event.invalid)) {
             if (self.mode == .escape_help) try self.clearEscapeHelpOverlay();
@@ -1265,6 +1307,9 @@ fn handleVisibleTerminalLoopEvent(
     ctx: *anyopaque,
     handler_event: dispatcher_mod.HandlerEvent,
 ) !void {
+    // Demultiplex dispatcher callbacks into the visible-loop state machine, then
+    // run maintenance that may update timers, repaint overlays, or change fd
+    // interests for the next poll.
     const id = handler_event.id;
     const event = handler_event.event;
     const loop: *VisibleTerminalLoop = @ptrCast(@alignCast(ctx));
@@ -1302,6 +1347,8 @@ const EscapeHelpOverlayDrawOptions = struct {
 };
 
 fn drawEscapeHelpOverlay(options: EscapeHelpOverlayDrawOptions) !void {
+    // Escape help is drawn with the same overlay machinery as reconnect status
+    // so it can coexist with viewport displacement and be erased cleanly.
     const renderer = options.renderer;
     const size = options.size;
     const session = options.session;
@@ -1364,6 +1411,9 @@ fn drainEscapeHelpTerminalWorkerFrames(loop: *VisibleTerminalLoop) !?VisibleClie
     }
 }
 
+// While the help overlay is visible, worker frames are still consumed so input
+// acks and session end state are not lost, but draw/repaint output is deferred
+// until the overlay is dismissed and a repaint restores a single screen truth.
 fn handleEscapeHelpTerminalWorkerFrame(loop: *VisibleTerminalLoop) !TerminalWorkerFrameAction {
     const session = loop.session;
     var frame = switch (try loop.worker_reader.readReady(loop.worker_fds.read)) {
@@ -1426,6 +1476,9 @@ fn finishVisibleClientAfterTerminalWorkerWriteFailed(loop: *VisibleTerminalLoop)
     return .transport_closed;
 }
 
+// Normal worker-frame drain for the visible client. Draws are applied unless a
+// repaint is pending, repaint responses advance recovery, and input acks drive
+// responsiveness monitoring.
 fn handleVisibleClientTerminalWorkerFrame(loop: *VisibleTerminalLoop) !TerminalWorkerFrameAction {
     const session = loop.session;
     var frame = switch (try loop.worker_reader.readReady(loop.worker_fds.read)) {

@@ -42,6 +42,9 @@ pub fn appendFilteredToTerminalCreate(
     send_env: []const []const u8,
     create: *pb.TerminalEmulatorItem.SessionCreate,
 ) !void {
+    // Apply OpenSSH SendEnv-style filtering to the captured visible-client
+    // environment before it becomes terminal-worker state. Existing explicit
+    // entries win over forwarded environment variables.
     for (entries) |entry| {
         // SessionCreate uses SHELL as the remote terminal worker's login shell
         // convention. OpenSSH SendEnv must not let the visible client's SHELL

@@ -44,6 +44,9 @@ fn procStatField(fields_from_state: []const u8, field_number: usize) ![]const u8
 }
 
 fn processStartTimeFromPs(allocator: std.mem.Allocator, pid: u64) ![]u8 {
+    // Fallback process identity for platforms without a cheap `/proc` start
+    // token. The value is opaque: cleanup only compares exact strings to avoid
+    // signaling a process after pid reuse.
     const pid_arg = try std.fmt.allocPrint(allocator, "{}", .{pid});
     defer allocator.free(pid_arg);
 

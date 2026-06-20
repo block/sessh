@@ -1,3 +1,6 @@
+// Foreground visible-client session state shared across reconnect attempts. It
+// keeps terminal presentation, input ACKs, repaint sequencing, transcript state,
+// and local title fallback together for one user-visible session.
 const std = @import("std");
 const c = std.c;
 

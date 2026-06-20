@@ -1,3 +1,6 @@
+// Client-side helpers for finding, starting, connecting to, and subscribing to
+// the local sesshd instance. This is foreground setup code; the daemon's own
+// accept loop and request routing live in daemon/mod and daemon/client_router.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -85,6 +88,9 @@ const DaemonSpawnOptions = struct {
 };
 
 fn spawnDaemonIfNamespaceUnlocked(options: DaemonSpawnOptions) !bool {
+    // Only the process holding the namespace startup lock may create/update the
+    // role symlinks and spawn sesshd. Contenders wait for the ready pipe instead
+    // of starting a second daemon for the same socket namespace.
     const allocator = options.allocator;
     const exe = options.exe;
     const dir_name = options.dir_name;
@@ -223,6 +229,9 @@ fn handleDaemonLogEvent(
     ctx: *anyopaque,
     handler_event: dispatcher.HandlerEvent,
 ) !void {
+    // `sessh --daemon-log` first writes a subscription request, then switches
+    // the same socket to a read-only stream of log frames. Keeping both phases
+    // in one watch avoids a helper thread just to tail daemon output.
     const event_dispatcher = handler_event.dispatcher;
     const id = handler_event.id;
     const event = handler_event.event;
@@ -362,6 +371,9 @@ test "daemon log subscriber reads frames with dispatcher" {
         }
 
         fn runInner(peer: *@This()) !void {
+            // Test peer for daemon-log subscription: assert the foreground
+            // client sends the subscription request, then deliver one daemon log
+            // entry through the same framed socket.
             defer _ = c.close(peer.fd);
             var request = protocol_test_helpers.readFrameForTest(std.testing.allocator, peer.fd) catch |err| switch (err) {
                 error.EndOfStream => return error.MissingDaemonLogRequest,

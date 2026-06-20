@@ -1,3 +1,6 @@
+// Daemon-side proxy-stream mux handling. It connects logical proxy streams from
+// the daemon tunnel to a remote proxy worker and records cleanup identity before
+// acknowledging the stream as usable.
 const std = @import("std");
 const c = std.c;
 
@@ -41,6 +44,9 @@ pub fn closeProxyMuxStreams(
     streams: *std.ArrayList(ProxyMuxStream),
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 ) void {
+    // Closing a mux connection owns all proxy streams on it. If a stream never
+    // recorded cleanup identity, notify its worker that startup failed before
+    // dropping the endpoint.
     for (streams.items) |stream| {
         if (daemon_dispatcher) |d| {
             closeProxyMuxStream(.{
@@ -98,6 +104,9 @@ pub fn handleProxyMuxOpen(
     stream_id: u64,
     open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
 ) !void {
+    // Mux open may arrive before the proxy payload that identifies the worker.
+    // Store it until payload open connects the worker, then forward it to the
+    // worker-local fixed stream id.
     const streams = ctx.streams;
     if (findProxyMuxStreamIndex(streams, stream_id)) |index| {
         streams.items[index].open = open;
@@ -116,6 +125,9 @@ pub fn handleProxyMuxOpen(
     });
 }
 
+// Decode the proxy-specific payload inside a daemon mux frame. The first proxy
+// open starts/connects the remote worker; later data frames are remapped onto the
+// worker's fixed internal stream id.
 fn handleProxyMuxPayload(
     ctx: ProxyMuxContext,
     mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
@@ -148,9 +160,10 @@ fn handleProxyMuxPayloadOpen(
     stream_id: u64,
     request: pb.ProxyStreamItem.Open,
 ) !void {
-    // The proxy worker is a local endpoint on the remote host. Once it exists,
-    // the daemon records its identity for cleanup and remaps the pooled tunnel
-    // stream onto the worker's fixed proxy stream id.
+    // A proxy open binds a mux stream to a remote proxy worker. After this
+    // point daemon-tunnel stream ids and worker-local stream ids differ. The
+    // daemon records the worker identity for cleanup and remaps later frames
+    // through the recorded endpoint.
     const index = findProxyMuxStreamIndex(ctx.streams, stream_id) orelse return error.StreamUnexpectedFrame;
     if (ctx.streams.items[index].endpoint.active()) return;
     if (!guid_ref.isValidProxyGuid(request.proxy_guid)) return error.InvalidStreamGuid;
@@ -279,6 +292,8 @@ fn sendProxyStartupFailedAndClose(
     stream: *ProxyMuxStream,
     daemon_dispatcher: *dispatcher.Dispatcher,
 ) !void {
+    // If cleanup identity was never acknowledged, fail the worker explicitly so
+    // it does not assume the remote proxy process was durably recorded.
     const payload = try protocol.encodeMuxStreamFramePayload(allocator, protocol.muxStreamResetFrame(
         proxy_mux_stream_id,
         "STARTUP_FAILED",

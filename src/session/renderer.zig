@@ -1,3 +1,6 @@
+// Small xterm-compatible rendering surface used by visible-client presentation
+// and tests. It centralizes escape-sequence emission so higher-level session
+// code can work in terminal concepts.
 const std = @import("std");
 const app_allocator = @import("../core/app_allocator.zig");
 const c = std.c;
@@ -143,6 +146,10 @@ pub const Renderer = struct {
 
     pub fn restorePresentation(self: Renderer, kitty_keyboard_flags: u5) !void {
         if (!self.caps.supportsRendering()) return;
+        // Undo terminal presentation modes that sessh may have enabled while
+        // drawing overlays or mirroring the remote app. These are DEC/xterm
+        // private modes, OSC state, and Kitty keyboard flags; leaving any of
+        // them set after exit would make the user's shell feel broken.
         try self.restoreOverlayPresentation();
         try self.disableMouseTracking();
         try self.setPrivateMode(1, .disabled);
@@ -269,6 +276,9 @@ pub const Renderer = struct {
     }
 
     pub fn renderRow(self: Renderer, row: Row) !void {
+        // Render cells in runs so SGR attributes and OSC 8 hyperlinks are only
+        // changed when needed. This keeps repaint output smaller and avoids
+        // splitting grapheme clusters across style transitions.
         var current = CellAttrs{};
         var current_hyperlink: ?[]const u8 = null;
         var text_run = std.ArrayList(u8).empty;
@@ -313,6 +323,9 @@ pub const Renderer = struct {
 
     pub fn setTitle(self: Renderer, title: []const u8) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
+        // OSC 2 sets the window title. Text is sanitized because BEL and ST
+        // terminate OSC strings, so passing them through would let title text
+        // escape into later terminal output.
         try self.write("\x1b]2;");
         try self.writeSanitizedOscText(title);
         try self.write("\x1b\\");
@@ -352,6 +365,9 @@ pub const Renderer = struct {
     }
 
     fn setPrivateMode(self: Renderer, mode: u16, state: PrivateModeState) !void {
+        // DEC private modes use CSI `? mode h` to set and CSI `? mode l` to
+        // reset. Common examples here are 1000/1002/1003 mouse tracking, 1006
+        // SGR mouse coordinates, 1004 focus reporting, and 2004 bracketed paste.
         var buf: [32]u8 = undefined;
         const seq = try std.fmt.bufPrint(&buf, "\x1b[?{}{s}", .{
             mode,
@@ -364,17 +380,25 @@ pub const Renderer = struct {
     }
 
     fn setKittyKeyboardFlags(self: Renderer, flags: u5) !void {
+        // Kitty's keyboard protocol is opt-in terminal state. `CSI = flags u`
+        // installs the active flags; restoring the initial flags avoids leaking
+        // enhanced-keyboard behavior back into the user's shell.
         var buf: [16]u8 = undefined;
         const seq = try std.fmt.bufPrint(&buf, "\x1b[={}u", .{flags});
         try self.write(seq);
     }
 
     pub fn resetDefaultColors(self: Renderer) !void {
+        // OSC 110/111 reset the dynamic default foreground/background colors
+        // that OSC 10/11 can set.
         try self.write("\x1b]110\x1b\\");
         try self.write("\x1b]111\x1b\\");
     }
 
     fn applyDefaultColor(self: Renderer, osc: u8, color: Color) !void {
+        // OSC 10 changes the terminal default foreground; OSC 11 changes the
+        // default background. These are terminal-global defaults, distinct from
+        // per-cell SGR foreground/background colors.
         switch (color) {
             .default => {
                 var buf: [16]u8 = undefined;
@@ -396,6 +420,8 @@ pub const Renderer = struct {
     }
 
     fn setHyperlink(self: Renderer, uri: ?[]const u8) !void {
+        // OSC 8 opens or closes a hyperlink annotation. Empty URI closes the
+        // current link so later cells are plain text again.
         try self.write("\x1b]8;;");
         if (uri) |value| try self.write(value);
         try self.write("\x1b\\");
@@ -416,6 +442,9 @@ pub const Renderer = struct {
     }
 
     fn applyAttrs(self: Renderer, attrs: CellAttrs) !void {
+        // SGR means Select Graphic Rendition: CSI numeric-parameters `m`.
+        // Reset first, then rebuild the exact cell style so stale attributes
+        // from the previous run cannot bleed into the current row.
         try self.write("\x1b[0m");
         if (attrs.bold) try self.write("\x1b[1m");
         if (attrs.faint) try self.write("\x1b[2m");
@@ -448,6 +477,10 @@ pub const Renderer = struct {
     }
 
     fn applyColor(self: Renderer, prefix: u8, color: Color) !void {
+        // SGR color prefixes are 38 for foreground, 48 for background, and 58
+        // for underline color. `;5;n` selects a palette index; `;2;r;g;b`
+        // selects truecolor. The first 16 fg/bg palette colors also have short
+        // legacy SGR forms such as 31 or 94.
         switch (color) {
             .default => {},
             .indexed => |index| {

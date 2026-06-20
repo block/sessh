@@ -1,3 +1,6 @@
+// Chooses the least invasive diagnostics behavior that still matches the user's
+// requested filter level and the actual stdio shape. This keeps policy separate
+// from the terminal/proxy code that implements each display path.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -77,6 +80,9 @@ pub fn streamStatusMode(request: StreamStatusModeRequest) proxy_worker.StreamRec
 }
 
 pub fn proxyStreamPlan(request: ProxyStreamPlanRequest) ProxyStreamPlan {
+    // Proxy mode only gets hygienic diagnostics when both visible stdio streams
+    // are ttys; otherwise OpenSSH should see raw proxy bytes with no wrapper UI.
+    // The outer ssh tty decision controls whether Ctrl-R can be intercepted.
     return switch (request.filter_level) {
         .unhygienic => .{
             .command_level = .unhygienic,
@@ -147,6 +153,10 @@ fn outerSshAllocatesTty(request: ProxyStreamPlanRequest) bool {
 }
 
 fn explicitTtyRequest(options: []const []const u8) ?ssh_opts.SshTtyRequest {
+    // OpenSSH has several spellings for tty allocation. `-T` disables it, one
+    // `-t` requests it only with a local tty, repeated `-t` forces it, and
+    // `-o RequestTTY=...` is the config-key form. Diagnostics policy needs the
+    // effective request before deciding whether overlay/status UI is possible.
     var result: ?ssh_opts.SshTtyRequest = null;
     var i: usize = 0;
     while (i < options.len) {

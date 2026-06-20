@@ -50,6 +50,9 @@ pub fn buildUploadBytes(
     allocator: std.mem.Allocator,
     artifact: *const ArtifactEntry,
 ) ![]u8 {
+    // Upload messages are shell-script lines: verify the local artifact hash,
+    // base64 the bytes, and include the artifact id so the remote bootstrapper
+    // can store it under a deterministic name.
     const file = try std.fs.openFileAbsolute(artifact.path, .{});
     defer file.close();
     const file_bytes = try file.readToEndAlloc(allocator, 64 * 1024 * 1024);

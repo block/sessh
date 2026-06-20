@@ -1,3 +1,6 @@
+// TTY transcript capture for debugging terminal behavior. It records inner and
+// outer byte streams with enough metadata to inspect presentation problems while
+// keeping capture decisions explicit at the call site.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -87,6 +90,10 @@ pub const Recorder = struct {
     }
 
     fn manifestJson(self: *const Recorder) ![]u8 {
+        // The transcript archive stores raw byte streams plus a manifest that
+        // names their direction. Keep the manifest hand-written so the archive
+        // format is stable and does not depend on a generic JSON serializer's
+        // field ordering.
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.allocator);
 
@@ -131,6 +138,9 @@ pub const Recorder = struct {
     }
 
     fn tarBytes(self: *const Recorder, manifest: []const u8) ![]u8 {
+        // Store transcript streams as separate tar entries so replay/debug tools
+        // can inspect each direction independently without parsing an interleaved
+        // event log.
         var writer: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer writer.deinit();
 
@@ -281,6 +291,9 @@ fn hexDigit(value: u8) u8 {
 }
 
 fn writeGzipFile(path: []const u8, bytes: []const u8) !void {
+    // Emit a gzip file using uncompressed deflate blocks. Transcript recording
+    // values correctness and portability over compression ratio, and this keeps
+    // archive writing independent of optional compression libraries.
     var file = try createArchiveFile(path);
     var keep_file = false;
     defer file.close();

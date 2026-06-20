@@ -1,3 +1,6 @@
+// Protocol fixtures used by Zig unit tests. These helpers produce real framed
+// sessh messages so tests exercise the same encoding and fd behavior as the
+// daemon, without depending on a running ssh transport.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;

@@ -1,3 +1,6 @@
+// Terminal primitives shared by session, diagnostics, and tty helpers: window
+// size, cursor state, terminal probing, local escape controls, and mode
+// snapshots.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -137,6 +140,11 @@ const terminal_query_timeout_ms: u64 = 150;
 const terminal_query_poll_ms: u64 = 25;
 const TerminalProbeBytes = fixed_buffer.FixedBuffer(512);
 const kitty_keyboard_query = "\x1b[?u";
+// Startup asks the outer terminal a few questions before sessh starts drawing:
+// `CSI ? u` reports kitty keyboard flags, `OSC 60 ; ? ST` reports which title
+// and color operations are allowed, `CSI 6 n` reports cursor position, and
+// `OSC 10/11 ; ? ST` report default foreground/background colors. CSI is
+// `ESC [`; OSC is `ESC ]`; ST is the string terminator `ESC \`.
 const terminal_probe_request =
     kitty_keyboard_query ++
     "\x1b]60;?\x1b\\" ++
@@ -190,14 +198,17 @@ pub const escape_help_overlay_lines = [_][]const u8{
     "~~  send ~",
 };
 
-/// Removes local sessh escape sequences from terminal input before forwarding
-/// bytes to the remote PTY. These are ssh-style line-start escapes so input
-/// such as `~r`, which OpenSSH already owns, still reaches the remote side.
+/// Local sessh escape sequences are filtered before terminal input reaches the
+/// remote PTY. These are ssh-style line-start escapes so input such as `~r`,
+/// which OpenSSH already owns, still reaches the remote side.
 pub const EscapeFilter = struct {
     at_line_start: bool = true,
     pending_tilde: bool = false,
 
     pub fn filter(self: *EscapeFilter, input: []const u8, out: []u8) FilterResult {
+        // SSH escape sequences only count at line start, and `~~` is the escape
+        // hatch for sending a literal tilde. Preserve that contract so sessh
+        // controls feel like OpenSSH controls rather than global hotkeys.
         var written: usize = 0;
         for (input, 0..) |byte, index| {
             if (self.pending_tilde) {
@@ -380,6 +391,9 @@ const ProbeReadTarget = enum {
 };
 
 fn readTerminalProbeResponses(input_fd: c.fd_t, probe: *TerminalProbe, target: ProbeReadTarget) !void {
+    // Local terminal probes are asynchronous escape-sequence queries. A single
+    // read can contain partial or multiple replies, so accumulate bytes and feed
+    // them to the probe parser until the requested facts are known or timeout.
     var bytes = TerminalProbeBytes{};
     const deadline_ms = terminalProbeNowMs() + terminal_query_timeout_ms;
     // BLOCKING_POLL: foreground local-terminal probe. It runs before the
@@ -461,6 +475,9 @@ pub fn setPtySize(fd: c.fd_t, size: WindowSize) bool {
 }
 
 fn makeRaw(term: *posix.termios) void {
+    // Local foreground loops need byte-at-a-time input and literal output, so
+    // disable canonical processing, echo, CR/LF translation, and software flow
+    // control in the same spirit as cfmakeraw.
     term.iflag.BRKINT = false;
     term.iflag.ICRNL = false;
     term.iflag.INPCK = false;
@@ -511,6 +528,8 @@ fn csiFinalIndex(bytes: []const u8) ?usize {
 }
 
 fn parseCursorPositionResponse(bytes: []const u8) ?CursorPosition {
+    // Cursor position replies are CSI row;col R with one-based coordinates.
+    // Ignore unrelated CSI replies in the same probe buffer until one matches.
     var rest = bytes;
     while (std.mem.indexOf(u8, rest, "\x1b[")) |start| {
         const response = rest[start + 2 ..];
@@ -541,6 +560,9 @@ fn parseTerminalProbeResponses(bytes: []const u8, probe: *TerminalProbe) void {
 }
 
 fn parseKittyKeyboardFlagsResponse(bytes: []const u8) ?u5 {
+    // Kitty's keyboard protocol replies to `CSI ? u` with `CSI ? flags u`.
+    // The flags are a small bitset describing which extended-keyboard features
+    // the terminal currently enables.
     var rest = bytes;
     while (std.mem.indexOf(u8, rest, "\x1b[")) |start| {
         const response = rest[start + 2 ..];
@@ -556,6 +578,9 @@ fn parseKittyKeyboardFlagsResponse(bytes: []const u8) ?u5 {
 }
 
 fn parseOscProbeResponses(bytes: []const u8, probe: *TerminalProbe) void {
+    // OSC replies may end with BEL or ST, and terminals can return them in any
+    // order relative to the CSI replies. Scan the growing byte buffer for every
+    // complete OSC record we have so far.
     var rest = bytes;
     while (std.mem.indexOf(u8, rest, "\x1b]")) |start| {
         const content_start = start + 2;

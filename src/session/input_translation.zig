@@ -1,3 +1,6 @@
+// Translates local terminal input into the coordinate space expected by the
+// remote PTY. Plain bytes pass through; structured escape reports are buffered
+// until complete so they can be rewritten safely.
 const std = @import("std");
 
 const fixed_buffer = @import("../core/fixed_buffer.zig");
@@ -225,6 +228,10 @@ fn parseFocusReport(input: []const u8, start: usize) FocusReportParse {
 }
 
 fn parseXtermModifiedKey(input: []const u8, start: usize) XtermModifiedKeyParse {
+    // Some terminals encode modified special keys as xterm CSI sequences:
+    // `ESC [ 27 ; modifier ; key_code ~`. When the remote app enabled kitty's
+    // keyboard protocol, sessh translates this to kitty's `CSI key;modifier u`
+    // form so the app sees the protocol it requested from the inner terminal.
     const prefix = "\x1b[27;";
     if (input.len - start < prefix.len) {
         const available = input[start..];
@@ -275,6 +282,10 @@ fn appendKittyKeyboardKey(
 }
 
 fn parseSgrMouseReport(input: []const u8, start: usize) SgrMouseParse {
+    // SGR mouse mode is the modern xterm pointer-event format:
+    // `ESC [ < button ; col ; row M/m`. sessh parses it because the visible
+    // terminal and inner PTY can have different viewport origins, so 1-based
+    // outer coordinates may need translation before forwarding.
     if (input[start] != 0x1b) return .not_mouse;
     if (start + 1 >= input.len) return .incomplete;
     if (input[start + 1] != '[') return .not_mouse;
@@ -327,6 +338,9 @@ const TranslatedSgrMouseReportOptions = struct {
 };
 
 fn appendTranslatedSgrMouseReport(options: TranslatedSgrMouseReportOptions) !void {
+    // Mouse reports outside the inner viewport are dropped. Reports inside the
+    // viewport are rewritten from outer-terminal coordinates to inner PTY
+    // coordinates before being sent to the remote application.
     const allocator = options.allocator;
     const mode = options.mode;
     const session_size = options.session_size;

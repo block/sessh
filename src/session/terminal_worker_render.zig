@@ -1,3 +1,6 @@
+// Converts the terminal worker's VT model into frames for the visible client.
+// This is the boundary where scrollback, screen deltas, repaint responses, and
+// cleanup identity are serialized into protocol messages.
 const std = @import("std");
 
 const app_allocator = @import("../core/app_allocator.zig");
@@ -192,6 +195,9 @@ fn queueRenderBarrierDraw(
     emitter: DrawEmitter,
     barrier: vt.RenderBarrier,
 ) !void {
+    // Tell the visible client about an alternate-screen boundary after the
+    // pre-barrier state has been flushed. The draw is synchronized so the outer
+    // terminal does not expose an intermediate half-switched frame.
     const model = emitter.session.terminal_model orelse return;
     const scrollback_cursor = try model.scrollbackCursor();
     var bytes = std.ArrayList(u8).empty;
@@ -229,6 +235,9 @@ fn queueScrollbackRowsDraw(
     });
 }
 
+// Emit retained scrollback rows and the current screen as one visible update.
+// It first tries byte-for-byte replay of pending plain output for the fast path;
+// if that is unsafe, it materializes the VT model into renderer operations.
 fn queueScrollbackRowsAndScreenDraw(
     emitter: DrawEmitter,
     snapshot: ScrollbackAndScreenSnapshot,
@@ -356,6 +365,9 @@ fn shouldClearOuterVisibleForDisplayClear(screen: *const vt.RenderedScreen) bool
     return clear.mode == .complete;
 }
 
+// Emit a screen-only draw. The return value tells callers whether anything was
+// actually queued, which lets the worker avoid treating an unchanged model as a
+// repaint boundary.
 fn queueScreenDraw(
     emitter: DrawEmitter,
     snapshot: ScreenSnapshot,
@@ -454,6 +466,9 @@ fn queueRepaintResponseFrame(
     } });
 }
 
+// Build the draw payload for an explicit repaint request. Unlike incremental
+// draws, repaint may need to replace the entire visible area and replay a slice
+// of retained scrollback selected by the client's cursor.
 fn queueRepaintResponseDraw(
     emitter: DrawEmitter,
     request: RepaintDrawRequest,
@@ -505,6 +520,10 @@ fn queueRepaintResponseDraw(
     });
 }
 
+// Resolve the client's scrollback cursor into rows to replay, then send a
+// repaint response containing those rows plus the current screen. Epoch changes
+// mean the cursor came from an older clear/reset boundary and must be treated as
+// stale.
 fn queueRepaintSnapshot(emitter: DrawEmitter, request: RepaintRequest, clear_for_replace: bool) !usize {
     const session = emitter.session;
 
@@ -575,6 +594,9 @@ fn queueRepaintSnapshot(emitter: DrawEmitter, request: RepaintRequest, clear_for
     return screen.rows.len;
 }
 
+// Send the initial visible-client snapshot: retained scrollback, active screen,
+// and restoration bytes for the current terminal modes. After this point the VT
+// model marks those rows as reported so later draws can be deltas.
 fn sendSessionSnapshot(emitter: DrawEmitter) !void {
     const session = emitter.session;
     if (session.terminal_model) |model| {

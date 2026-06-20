@@ -21,6 +21,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []const u8) !*terminal_worker.TerminalWorkerHandle {
+    // Start a process-isolated terminal worker and register its control socket
+    // with the daemon. The inherited listener removes the race between spawn
+    // and the daemon's first connect attempt.
     var guid: ?[]u8 = try guid_ref.canonicalSessionGuid(allocator, session_guid);
     errdefer if (guid) |owned_guid| allocator.free(owned_guid);
 

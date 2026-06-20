@@ -31,6 +31,9 @@ pub fn inferredClientLogLevel(ssh_options: []const []const u8) client_log.Level 
 }
 
 fn sshVerbosity(ssh_options: []const []const u8) usize {
+    // Infer sessh client log level from OpenSSH's `-v` clusters while skipping
+    // value-taking options. `ssh -vvv` users expect the wrapper to become more
+    // chatty without needing a separate sessh flag.
     var total: usize = 0;
     var i: usize = 0;
     while (i < ssh_options.len) {

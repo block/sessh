@@ -1,3 +1,6 @@
+// Thin IO wrappers used where sessh needs auditable hooks around raw read/write
+// syscalls. Production code gets the normal POSIX behavior; tests and
+// transcripts can observe bytes without changing call sites.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;

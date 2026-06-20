@@ -1,3 +1,6 @@
+// Synchronous framed IO for short foreground setup phases. Long-lived daemon
+// paths use dispatcher-owned readers/writers; this module is for bounded setup
+// handshakes that still need cancellation and SCM_RIGHTS handling.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -16,6 +19,9 @@ pub const ReadOptions = struct {
 };
 
 pub fn readFrame(options: ReadOptions) !protocol.OwnedFrame {
+    // Read one complete frame during foreground setup. The loop is synchronous
+    // by design, but uses poll so callers with reconnect cancellation can wake
+    // periodically instead of blocking forever in read(2).
     var reader = protocol.FrameReader.init(options.allocator);
     defer reader.deinit();
 
@@ -91,6 +97,10 @@ pub const ScmRightsWriteOptions = struct {
 };
 
 pub fn writeFrameWithScmRightsFd(options: ScmRightsWriteOptions) !void {
+    // Send a frame whose attached marker byte carries one SCM_RIGHTS fd. The
+    // normal frame prefix is written first; only the explicit attached byte is
+    // associated with the descriptor, which keeps fd passing out of unrelated
+    // framed traffic.
     var owned_fd = core_fds.OwnedFd.init(options.passed_fd);
     defer owned_fd.deinit();
 

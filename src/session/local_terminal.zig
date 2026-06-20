@@ -51,6 +51,9 @@ pub const Probe = struct {
 };
 
 pub fn capture() State {
+    // Capture everything the remote terminal worker needs from the visible
+    // terminal before the session starts. The worker gets tty modes, size,
+    // cursor/viewport position, default colors, and initial kitty keyboard flags.
     var state = State{
         .size = terminal.currentWindowSize(),
     };

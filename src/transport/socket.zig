@@ -1,3 +1,6 @@
+// Socket and namespace filesystem helpers for sessh runtime directories. The
+// paths here are intentionally short and lock-aware because Unix-domain socket
+// length limits and daemon startup races are part of the runtime contract.
 const std = @import("std");
 const app_allocator = @import("../core/app_allocator.zig");
 const builtin = @import("builtin");
@@ -72,6 +75,9 @@ pub fn publishSesshRuntimeDirSymlinkOnce(allocator: std.mem.Allocator) void {
 }
 
 fn publishSesshRuntimeDirSymlink(allocator: std.mem.Allocator, sessh_runtime_dir: []const u8) !void {
+    // Publish a stable cache-dir symlink for humans/debug tooling while keeping
+    // the actual socket namespace in XDG_RUNTIME_DIR. Rename makes updates
+    // atomic for readers.
     const root = cacheRoot(allocator) catch |err| switch (err) {
         error.MissingCacheHome => return,
         else => return err,
@@ -115,6 +121,9 @@ pub fn listenSocket(path: []const u8) !c.fd_t {
 }
 
 pub fn connectSocket(path: []const u8) !c.fd_t {
+    // Connect only to a socket path inside a validated sessh runtime directory.
+    // If connect fails, inspect the path to distinguish missing daemons from
+    // unsafe non-socket files.
     try validateSocketDir(path);
 
     const fd = socket(c.AF.UNIX, c.SOCK.STREAM, 0);

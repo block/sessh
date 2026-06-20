@@ -1,3 +1,6 @@
+// RAII-style restoration for visible terminal presentation. The guard records
+// the terminal modes sessh changes and restores them even when a session exits
+// through an error path.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;

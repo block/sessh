@@ -12,10 +12,10 @@ pub const PasteLikeInputClassifier = struct {
     clock: ?NonSuspendingTimer = null,
 
     pub fn classify(self: *PasteLikeInputClassifier, forwarded_bytes: usize) bool {
-        if (forwarded_bytes == 0) return false;
         // Input reaches this boundary as byte chunks rather than decoded
         // terminal-input events, so paste detection has to use transport-level
         // shape: large single reads and dense short windows are paste-like.
+        if (forwarded_bytes == 0) return false;
         if (forwarded_bytes >= paste_like_single_read_bytes) return true;
 
         const now = self.nowMs();

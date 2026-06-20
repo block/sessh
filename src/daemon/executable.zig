@@ -1,3 +1,6 @@
+// Publishes the role-named executables inside a daemon namespace. The daemon's
+// locked namespace is the source of truth, so helper process names and symlinks
+// stay matched to the running sesshd binary.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -136,6 +139,9 @@ pub fn reexec(
     executable: []const u8,
     args: []const []const u8,
 ) !void {
+    // Re-exec through the role-named symlink so process listings show sesshd,
+    // sessh-broker, etc. Build a null-terminated argv because execvpe is the
+    // final boundary before leaving Zig-owned memory behind.
     var owned_args = try allocator.alloc([:0]u8, args.len + 1);
     var initialized: usize = 0;
     defer {
@@ -173,6 +179,9 @@ fn replaceSymlink(allocator: std.mem.Allocator, target: []const u8, path: []cons
 }
 
 fn resolveExecutablePath(allocator: std.mem.Allocator, exe: []const u8) ![]u8 {
+    // Role symlinks should point at the actual sessh executable when possible.
+    // Resolve PATH-relative invocations so restarting the daemon from a
+    // different shell does not leave stale symlinks to an old working directory.
     if (std.mem.indexOfScalar(u8, exe, '/') != null) {
         if (std.fs.path.isAbsolute(exe)) {
             return std.fs.realpathAlloc(allocator, exe) catch allocator.dupe(u8, exe);

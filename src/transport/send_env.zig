@@ -27,6 +27,9 @@ const MatchState = struct {
 };
 
 fn patternMatchesFrom(state: MatchState) bool {
+    // OpenSSH SendEnv patterns support `*` and `?` globs over environment names.
+    // This recursive matcher is small because patterns are config-sized, not
+    // user-input streams.
     if (state.pattern_index == state.pattern.len) return state.name_index == state.name.len;
     const char = state.pattern[state.pattern_index];
     if (char == '*') {

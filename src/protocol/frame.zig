@@ -1,3 +1,6 @@
+// Framed protobuf transport used after the compatibility handshake. The reader
+// and writer code here is fd-aware because local daemon IPC can attach
+// SCM_RIGHTS descriptors while daemon-to-daemon tunnels carry plain bytes.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -297,6 +300,9 @@ pub fn encodeFrameWithAttachedKindAndBytes(
     allocator: std.mem.Allocator,
     options: AttachedFrameOptions,
 ) ![]u8 {
+    // The outer frame length covers the protobuf message plus any attached raw
+    // bytes. SCM_RIGHTS uses a one-byte attached marker so the receiver knows
+    // exactly which frame carried the fd.
     const message = try encodeMessagePayload(allocator, .{
         .message_type = options.message_type,
         .payload = options.payload,
@@ -324,6 +330,9 @@ pub const DecodedMessageEnvelope = struct {
     attached_kind: pb.Frame.Attached.Kind = .RAW,
 };
 
+/// Decode only the protobuf message portion of a frame. Attached raw bytes and
+/// SCM_RIGHTS marker bytes are not present in `message_bytes`; the returned
+/// metadata tells the caller how much out-of-band payload still has to be read.
 pub fn decodeMessageEnvelopeAlloc(allocator: std.mem.Allocator, message_bytes: []const u8) !DecodedMessageEnvelope {
     if (message_bytes.len == 0) return error.UnknownFrame;
     if (isHelloFrameEnvelope(message_bytes)) return .{
@@ -406,6 +415,9 @@ fn readSome(fd: c.fd_t, buf: []u8) !ReadSomeResult {
     }
 }
 
+// Re-wrap a typed message payload into the correct top-level protobuf envelope.
+// Hello messages deliberately stay in HelloFrame, while post-handshake messages
+// share Frame and can advertise attached raw bytes or an SCM_RIGHTS carrier.
 fn encodeMessagePayload(
     allocator: std.mem.Allocator,
     options: MessagePayloadOptions,
@@ -771,6 +783,9 @@ const ScmRightsFrameForTestOptions = struct {
     passed_fd: c.fd_t,
 };
 
+// Build the same two-part SCM_RIGHTS frame production code expects: write the
+// length-prefixed protobuf message normally, then send the one-byte attachment
+// with the descriptor attached to that byte via sendmsg.
 fn sendScmRightsFrameForTest(options: ScmRightsFrameForTestOptions) !void {
     const marker = [_]u8{0};
     const frame_bytes = try encodeFrameWithAttachedKindAndBytes(

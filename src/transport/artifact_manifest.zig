@@ -1,6 +1,9 @@
 const std = @import("std");
 
 pub fn main() !void {
+    // Build-time helper: write the bootstrap artifact manifest consumed by
+    // sessh's remote installer. Each row binds an artifact filename to the hash
+    // the client will verify before upload/use.
     const allocator = std.heap.page_allocator;
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);

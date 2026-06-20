@@ -1,3 +1,6 @@
+// Builds the ProxyCommand argv inserted into the visible OpenSSH invocation.
+// This keeps ssh option routing separate from the proxy process parser that
+// later consumes the generated role-shaped flags.
 const std = @import("std");
 
 const config = @import("../core/config.zig");
@@ -19,6 +22,9 @@ pub const CommandOptions = struct {
 };
 
 pub fn commandOption(allocator: std.mem.Allocator, options: CommandOptions) ![]u8 {
+    // ProxyCommand is parsed by the user's shell on the way into OpenSSH, so
+    // every token must be shell-quoted here. `%n/%p/%r` are OpenSSH expansion
+    // tokens evaluated later, preserving alias-specific Host configuration.
     var command: std.ArrayList(u8) = .empty;
     defer command.deinit(allocator);
 
@@ -61,6 +67,9 @@ fn appendProxyTransportSshOptions(
     command: *std.ArrayList(u8),
     options: []const []const u8,
 ) !void {
+    // The generated ProxyCommand should receive only options needed for the
+    // inner transport connection. Options already consumed by the outer ssh
+    // process, such as tty allocation and proxy-forcing flags, are omitted.
     var i: usize = 0;
     while (i < options.len) {
         const value_index = ssh_opts.sshOptionSeparateValueIndex(options, i);

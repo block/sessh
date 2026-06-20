@@ -10,6 +10,9 @@ pub fn visibleMessage(
     target: SshTarget,
     term: std.process.Child.Term,
 ) ![]u8 {
+    // Build a user-facing failure line that names the exact ssh command shape
+    // sessh tried to run, quoting arguments enough that spaces/control bytes do
+    // not obscure which option failed.
     var message = std.ArrayList(u8).empty;
     errdefer message.deinit(allocator);
     try message.appendSlice(allocator, "`ssh");

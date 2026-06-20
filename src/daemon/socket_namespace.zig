@@ -1,3 +1,6 @@
+// Names and paths for one daemon compatibility namespace. Keeping executable
+// names, socket names, and namespace selection together prevents role helpers
+// from drifting away from their daemon namespace.
 const std = @import("std");
 
 const config = @import("../core/config.zig");

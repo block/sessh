@@ -1,5 +1,8 @@
 const std = @import("std");
 
+/// Small fixed-capacity byte buffer for parser/status text that must not
+/// allocate. Callers can write directly into the remaining storage and then
+/// commit the byte count, which keeps low-level IO/parser code allocation-free.
 pub fn FixedBuffer(comptime capacity: usize) type {
     return struct {
         const Self = @This();

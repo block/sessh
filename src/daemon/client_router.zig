@@ -1,3 +1,6 @@
+// Routes accepted local-daemon clients after their handshake. Each client type
+// either transfers ownership to a role-specific module or gets a one-shot
+// response before the generic daemon context is destroyed.
 const std = @import("std");
 const c = std.c;
 
@@ -28,6 +31,9 @@ pub const RegisterAcceptedClientOptions = struct {
     active_local_clients: *usize,
 };
 
+/// Put a newly accepted daemon client into the handshake state machine. The
+/// generic router owns the fd only until it can identify a role-specific owner
+/// such as pooled SSH transport, terminal session, proxy fd-pass, or log tail.
 pub fn registerAcceptedClient(options: RegisterAcceptedClientOptions) !void {
     const allocator = options.allocator;
     const context = try allocator.create(ClientContext);
@@ -111,6 +117,10 @@ fn readDaemonClient(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !vo
     };
 }
 
+// Dispatcher callback body for the generic daemon-client fd. It drains pending
+// writes before reads so protocol errors and hello replies are not stranded
+// behind more input, then transfers ownership once the first real request is
+// decoded.
 fn readDaemonClientInner(context: *ClientContext, handler_event: dispatcher.HandlerEvent) !void {
     const daemon_dispatcher = handler_event.dispatcher;
     const id = handler_event.id;
@@ -204,6 +214,9 @@ const DaemonClientFrame = struct {
     }
 };
 
+// Advance the client protocol stage for one decoded frame. The first two stages
+// perform the compatibility handshake; after that, initial request frames either
+// move the fd to a specialized dispatcher owner or get rejected here.
 fn handleDaemonClientFrame(
     context: *ClientContext,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -264,6 +277,9 @@ fn handleDaemonClientFrame(
     }
 }
 
+// Some initial frames are only meaningful after a terminal/proxy owner exists.
+// Consume those quietly at the generic-router boundary so callers get a protocol
+// response instead of accidentally creating a worker for a resize-only request.
 fn dispatcherConsumesInitialRequest(
     context: *ClientContext,
     frame: *protocol.OwnedFrame,
@@ -444,6 +460,9 @@ fn closeDaemonClient(context: *ClientContext, daemon_dispatcher: *dispatcher.Dis
     context.deinit();
 }
 
+// Handle post-handshake frames that stayed with the generic router. Most
+// long-lived traffic should never reach this point; this is the guardrail that
+// keeps role-specific protocols from running without their owning dispatcher.
 fn handleClientFrameAfterHandshake(context: *ClientContext, frame: protocol.OwnedFrame) !bool {
     switch (frame.message_type) {
         .client_remote => {
@@ -514,6 +533,9 @@ fn handleClientFrameAfterHandshake(context: *ClientContext, frame: protocol.Owne
     }
 }
 
+// Cleanup requests can arrive before a full mux owner is installed. Serve those
+// in-place so stale remote process records can be drained over a short-lived
+// daemon tunnel control connection.
 fn handleDaemonTunnelControlFrame(
     context: *ClientContext,
     frame: protocol.OwnedFrame,
@@ -592,6 +614,9 @@ fn drainDaemonClientWrites(
     daemon_dispatcher: *dispatcher.Dispatcher,
     id: dispatcher.WatchId,
 ) !bool {
+    // Flush queued response frames before closing or resuming reads. This keeps
+    // daemon errors/log replies ordered while still respecting socket
+    // backpressure from slow foreground clients.
     if (!context.writer.hasPending()) {
         try updateDaemonClientEvents(context, daemon_dispatcher, id);
         return false;

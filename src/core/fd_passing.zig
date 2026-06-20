@@ -1,3 +1,6 @@
+// Unix-domain socket fd-passing helpers. This module hides the SCM_RIGHTS ABI
+// details behind progress objects so callers can use non-blocking sendmsg and
+// recvmsg without losing descriptor ownership on partial IO.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -46,6 +49,9 @@ const scm_rights = switch (builtin.os.tag) {
     else => 1,
 };
 
+/// Progress object for one stream write/read that may carry one SCM_RIGHTS fd.
+/// The byte offset and descriptor ownership have to move together because Unix
+/// stream sockets attach ancillary data to a particular byte position.
 fn BufferWithFdProgress(comptime Slice: type) type {
     return struct {
         // Byte buffer and fd state for a single logical transfer. On send,
@@ -94,6 +100,9 @@ pub const SendBufferWithFdProgress = BufferWithFdProgress([]const u8);
 pub const RecvBufferWithFdProgress = BufferWithFdProgress([]u8);
 
 fn ByteProgress(comptime Slice: type) type {
+    // Progress tracker for ordinary bytes that do not carry an fd. It mirrors
+    // the SCM_RIGHTS progress type so setup code can write a plain prefix and
+    // then the fd-bearing marker with the same state-machine shape.
     return struct {
         buffer: Slice = &.{},
         offset: usize = 0,
@@ -162,6 +171,8 @@ pub fn sendBufferWithFdProgress(sock_fd: c.fd_t, progress: *SendBufferWithFdProg
     return sendBufferWithFdProgressWithFlags(sock_fd, progress, c.MSG.DONTWAIT);
 }
 
+// Internal form used by tests and production wrappers to choose blocking vs
+// non-blocking sendmsg flags while preserving the same ownership contract.
 fn sendBufferWithFdProgressWithFlags(
     sock_fd: c.fd_t,
     progress: *SendBufferWithFdProgress,
@@ -206,6 +217,9 @@ const SendFdPrefixOptions = struct {
     flags: u32,
 };
 
+// Send the first non-empty byte prefix together with one descriptor. If sendmsg
+// accepts any byte, the descriptor has been delivered to the peer as well; the
+// remaining bytes can then be sent with ordinary send(2).
 fn sendFdPrefix(options: SendFdPrefixOptions) !usize {
     // SCM_RIGHTS does not send an integer fd value. The kernel duplicates the
     // underlying open file description into the receiver and reports the new fd
@@ -271,6 +285,9 @@ const SendBytesOptions = struct {
 };
 
 fn sendBytes(options: SendBytesOptions) !usize {
+    // Thin send(2) wrapper that turns transient socket state into WouldBlock and
+    // keeps EINTR invisible to callers. SCM_RIGHTS send paths use the same
+    // error vocabulary so their state machines can share retry logic.
     const bytes = options.bytes;
     if (bytes.len == 0) return 0;
 
@@ -323,6 +340,9 @@ pub fn recvBufferWithFdProgress(sock_fd: c.fd_t, progress: *RecvBufferWithFdProg
     return recvBufferWithFdProgressWithFlags(sock_fd, progress, c.MSG.DONTWAIT);
 }
 
+// Receive bytes and any SCM_RIGHTS data delivered at the same stream position.
+// The caller treats malformed control data as socket-fatal because recvmsg may
+// already have consumed the corresponding bytes before we can validate it.
 fn recvBufferWithFdProgressWithFlags(
     sock_fd: c.fd_t,
     progress: *RecvBufferWithFdProgress,
@@ -391,6 +411,9 @@ fn recvBufferWithFdProgressWithFlags(
     }
 }
 
+// Parse the raw msghdr.msg_control buffer after recvmsg. The successful case is
+// exactly zero or one SCM_RIGHTS descriptor; every invalid multi-fd shape closes
+// the descriptors it already installed into this process before returning.
 fn receivedFdFromControl(control: []u8) !?c.fd_t {
     var offset: usize = 0;
     var received_fd: ?c.fd_t = null;

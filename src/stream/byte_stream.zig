@@ -102,6 +102,9 @@ pub const StreamState = struct {
     }
 
     pub fn queueInboundData(self: *StreamState, offset: u64, data: []const u8) !usize {
+        // Inbound data may be retransmitted after reconnect. Trim bytes already
+        // delivered or already queued, then require the remainder to continue
+        // exactly at the next expected offset.
         var new_offset = offset;
         var new_data = data;
 
